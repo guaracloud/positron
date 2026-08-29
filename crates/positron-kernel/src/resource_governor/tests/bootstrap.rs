@@ -1,16 +1,15 @@
 use std::mem::size_of;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64};
+use std::sync::atomic::{AtomicU8, AtomicU64};
 
 use positron_domain::identity::TenantId;
 
 use super::*;
-use crate::resource_governor::accounting::{GovernorInner, KernelOwnership};
+use crate::resource_governor::accounting::KernelOwnership;
 use crate::resource_governor::ledger::GrantRecord;
 use crate::resource_governor::{
     DetectedCapacity, DiskObservation, DiskPressureThresholds, GovernorPolicy,
-    InventoryCardinalityLimits, MAX_TENANT_QUOTAS, OperatorLimits, OrdinaryPoolPolicy,
-    RecoveryPoolCapacities, RecoveryReserve, ResourceGovernorConfiguration, ResourceInventory,
+    InventoryCardinalityLimits, OperatorLimits, OrdinaryPoolPolicy, RecoveryPoolCapacities,
+    RecoveryReserve, ResourceGovernorConfiguration, ResourceInventory,
 };
 
 fn uniform(value: u64) -> ResourceAmounts {
@@ -163,11 +162,19 @@ fn establishment_moves_every_retained_payload_without_reallocation() {
     let configuration = ResourceGovernorConfiguration::new(inventory(), policy(), recovery_pools())
         .expect("configuration is valid");
     let before = configuration.inner.payload_addresses_for_test();
-    let authority = StorageKernelResourceAuthority {
-        inner: GovernorInner::new(KernelOwnership::TestOnly, configuration.inner),
-        catalog_writer_held: AtomicBool::new(false),
-        active_segment_scopes: Mutex::new([None; MAX_TENANT_QUOTAS]),
-    };
+    let active_segment_scopes_before = configuration.active_segment_scopes.as_ptr();
+    let authority = StorageKernelResourceAuthority::from_configuration(
+        KernelOwnership::TestOnly,
+        configuration,
+    );
     let after = authority.inner.payload_addresses_for_test();
     assert_eq!(after, before);
+    assert_eq!(
+        authority
+            .active_segment_scopes
+            .lock()
+            .expect("scope inventory lock is available")
+            .as_ptr(),
+        active_segment_scopes_before
+    );
 }

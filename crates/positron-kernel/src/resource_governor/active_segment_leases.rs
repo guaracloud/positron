@@ -1,9 +1,9 @@
 use std::sync::Mutex;
 
-use super::{MAX_TENANT_QUOTAS, StorageKernelResourceAuthority};
+use super::{ActiveSegmentScopes, StorageKernelResourceAuthority};
 
 pub(crate) struct ActiveSegmentLedgerLease<'authority> {
-    scopes: &'authority Mutex<[Option<[u8; 22]>; MAX_TENANT_QUOTAS]>,
+    scopes: &'authority Mutex<Box<ActiveSegmentScopes>>,
     key: [u8; 22],
 }
 

@@ -3,7 +3,6 @@
 use std::mem::size_of;
 use std::sync::atomic::{AtomicU8, AtomicU64};
 
-use super::StorageKernelResourceAuthority;
 #[cfg(test)]
 use super::accounting::AccountingState;
 use super::failure::GovernorFailure;
@@ -12,12 +11,14 @@ use super::ledger::GrantRecord;
 use super::model::{ResourceAmounts, ResourceDimension};
 use super::policy::PoolCapacities;
 use super::recovery_policy::{RecoveryPoolCapacities, RecoveryPoolUsage};
+use super::{ActiveSegmentScopes, MAX_TENANT_QUOTAS, StorageKernelResourceAuthority};
 
 pub(super) const RETAINED_PRIMARY_DATA_VOLUME_FILE_DESCRIPTORS: u64 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum BootstrapAllocationStage {
     PolicyTenantQuotas,
+    ActiveSegmentScopes,
     OrdinaryTenantFairCapacities,
     RecoveryTenantSharedFair,
     RecoveryTenantPoolFair,
@@ -33,7 +34,8 @@ pub(super) enum BootstrapAllocationStage {
 }
 
 #[cfg(test)]
-pub(super) const CONFIGURATION_ALLOCATION_STAGES: [BootstrapAllocationStage; 12] = [
+pub(super) const CONFIGURATION_ALLOCATION_STAGES: [BootstrapAllocationStage; 13] = [
+    BootstrapAllocationStage::ActiveSegmentScopes,
     BootstrapAllocationStage::OrdinaryTenantFairCapacities,
     BootstrapAllocationStage::RecoveryTenantSharedFair,
     BootstrapAllocationStage::RecoveryTenantPoolFair,
@@ -51,8 +53,8 @@ pub(super) const CONFIGURATION_ALLOCATION_STAGES: [BootstrapAllocationStage; 12]
 /// One checked authority for retained logical payload and fixed root bytes.
 ///
 /// Allocator metadata and platform allocation rounding are deliberately not
-/// claimed. Every payload vector has exactly the requested capacity before it
-/// is filled; the fixed root size counts its Box/Vec headers once.
+/// claimed. Every heap payload has exactly the requested capacity before it is
+/// filled; the fixed root size counts its Box/Vec headers once.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct BootstrapInventoryLayout {
     tenant_count: usize,
@@ -79,10 +81,12 @@ impl BootstrapInventoryLayout {
             .and_then(|count| count.checked_div(64))
             .ok_or(GovernorFailure::InvalidConfiguration)?;
         let fixed = size_of::<StorageKernelResourceAuthority>();
+        let active_segment_scope_payload = size_of::<ActiveSegmentScopes>();
         let tenant_payload = tenant_payload_bytes(tenant_count)?;
         let ledger_payload = ledger_payload_bytes(outstanding_count, pending_word_count)?;
         let memory_bytes = fixed
-            .checked_add(tenant_payload)
+            .checked_add(active_segment_scope_payload)
+            .and_then(|bytes| bytes.checked_add(tenant_payload))
             .and_then(|bytes| bytes.checked_add(ledger_payload))
             .and_then(|bytes| u64::try_from(bytes).ok())
             .ok_or(GovernorFailure::InvalidConfiguration)?;
@@ -119,6 +123,22 @@ impl BootstrapInventoryLayout {
     pub(super) const fn memory_bytes(self) -> u64 {
         self.memory_bytes
     }
+}
+
+pub(super) fn allocate_active_segment_scopes(
+    required: ResourceAmounts,
+    fail_at: Option<BootstrapAllocationStage>,
+) -> Result<Box<ActiveSegmentScopes>, GovernorFailure> {
+    let mut allocation: Vec<Option<[u8; 22]>> = allocate_exact(
+        MAX_TENANT_QUOTAS,
+        required,
+        BootstrapAllocationStage::ActiveSegmentScopes,
+        fail_at,
+    )?;
+    allocation.resize(MAX_TENANT_QUOTAS, None);
+    into_boxed_exact(allocation, required)?
+        .try_into()
+        .map_err(|_| GovernorFailure::GovernorBootstrapInventoryUnavailable { required })
 }
 
 pub(super) fn policy_payload_requirement(

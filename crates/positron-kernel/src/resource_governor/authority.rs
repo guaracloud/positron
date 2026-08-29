@@ -1,6 +1,22 @@
 use super::*;
 
 impl StorageKernelResourceAuthority {
+    pub(super) fn from_configuration(
+        ownership: KernelOwnership,
+        configuration: ResourceGovernorConfiguration,
+    ) -> Self {
+        let ResourceGovernorConfiguration {
+            inner,
+            active_segment_scopes,
+            volume_binding: _,
+        } = configuration;
+        Self {
+            inner: GovernorInner::new(ownership, inner),
+            catalog_writer_held: AtomicBool::new(false),
+            active_segment_scopes: Mutex::new(active_segment_scopes),
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn establish_for_test(
         inventory: ResourceInventory,
@@ -8,11 +24,10 @@ impl StorageKernelResourceAuthority {
         recovery_pools: RecoveryPoolCapacities,
     ) -> Result<Self, GovernorFailure> {
         let configuration = ResourceGovernorConfiguration::new(inventory, policy, recovery_pools)?;
-        Ok(Self {
-            inner: GovernorInner::new(KernelOwnership::TestOnly, configuration.inner),
-            catalog_writer_held: AtomicBool::new(false),
-            active_segment_scopes: Mutex::new([None; MAX_TENANT_QUOTAS]),
-        })
+        Ok(Self::from_configuration(
+            KernelOwnership::TestOnly,
+            configuration,
+        ))
     }
 
     /// Establishes an isolated complete authority for the fuzz harness.
@@ -24,11 +39,10 @@ impl StorageKernelResourceAuthority {
         recovery_pools: RecoveryPoolCapacities,
     ) -> Result<Self, GovernorFailure> {
         let configuration = ResourceGovernorConfiguration::new(inventory, policy, recovery_pools)?;
-        Ok(Self {
-            inner: GovernorInner::new(KernelOwnership::TestOnly, configuration.inner),
-            catalog_writer_held: AtomicBool::new(false),
-            active_segment_scopes: Mutex::new([None; MAX_TENANT_QUOTAS]),
-        })
+        Ok(Self::from_configuration(
+            KernelOwnership::TestOnly,
+            configuration,
+        ))
     }
 
     /// Establishes fuzz-only authority while retaining a real owned test volume.
@@ -41,11 +55,10 @@ impl StorageKernelResourceAuthority {
         recovery_pools: RecoveryPoolCapacities,
     ) -> Result<Self, GovernorFailure> {
         let configuration = ResourceGovernorConfiguration::new(inventory, policy, recovery_pools)?;
-        Ok(Self {
-            inner: GovernorInner::new(KernelOwnership::Owned { volume }, configuration.inner),
-            catalog_writer_held: AtomicBool::new(false),
-            active_segment_scopes: Mutex::new([None; MAX_TENANT_QUOTAS]),
-        })
+        Ok(Self::from_configuration(
+            KernelOwnership::Owned { volume },
+            configuration,
+        ))
     }
 
     /// Establishes the sole governor after earlier private bootstrap/recovery steps.
@@ -68,11 +81,10 @@ impl StorageKernelResourceAuthority {
                 configuration,
             });
         }
-        Ok(Self {
-            inner: GovernorInner::new(KernelOwnership::Owned { volume }, configuration.inner),
-            catalog_writer_held: AtomicBool::new(false),
-            active_segment_scopes: Mutex::new([None; MAX_TENANT_QUOTAS]),
-        })
+        Ok(Self::from_configuration(
+            KernelOwnership::Owned { volume },
+            configuration,
+        ))
     }
 
     /// Borrows ordinary admission authority without permitting duplication.

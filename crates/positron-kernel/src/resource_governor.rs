@@ -40,7 +40,9 @@ use std::sync::{Arc, Mutex};
 
 use accounting::{GovernorConfiguration, GovernorInner, GovernorSetupInput, KernelOwnership};
 pub(crate) use active_segment_leases::{ActiveSegmentLeaseFailure, ActiveSegmentLedgerLease};
-use bootstrap::{BootstrapAllocationStage, BootstrapInventoryLayout};
+use bootstrap::{
+    BootstrapAllocationStage, BootstrapInventoryLayout, allocate_active_segment_scopes,
+};
 #[cfg(fuzzing)]
 #[doc(hidden)]
 pub use capacity_observation::fuzz_linux_capacity_parsers;
@@ -138,8 +140,10 @@ pub struct ResourceGovernor<'authority> {
 pub struct StorageKernelResourceAuthority {
     inner: GovernorInner,
     catalog_writer_held: AtomicBool,
-    active_segment_scopes: Mutex<[Option<[u8; 22]>; MAX_TENANT_QUOTAS]>,
+    active_segment_scopes: Mutex<Box<ActiveSegmentScopes>>,
 }
+
+type ActiveSegmentScopes = [Option<[u8; 22]>; MAX_TENANT_QUOTAS];
 
 pub(crate) struct CatalogWriterLease<'authority> {
     held: &'authority AtomicBool,
@@ -160,6 +164,7 @@ impl std::fmt::Debug for StorageKernelResourceAuthority {
 /// Fully validated resource-governor configuration without admission authority.
 pub struct ResourceGovernorConfiguration {
     inner: GovernorConfiguration,
+    active_segment_scopes: Box<ActiveSegmentScopes>,
     volume_binding: Option<capacity_observation::ObservedVolumeBinding>,
 }
 
@@ -312,6 +317,7 @@ impl ResourceGovernorConfiguration {
             return Err(GovernorFailure::InvalidConfiguration);
         }
         let volume_binding = inventory.take_volume_binding();
+        let active_segment_scopes = allocate_active_segment_scopes(bootstrap_overhead, fail_at)?;
         let inner = GovernorInner::configure(GovernorSetupInput {
             raw_effective: inventory.effective,
             bootstrap_overhead,
@@ -328,6 +334,7 @@ impl ResourceGovernorConfiguration {
         })?;
         Ok(Self {
             inner,
+            active_segment_scopes,
             volume_binding,
         })
     }
