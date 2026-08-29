@@ -127,18 +127,14 @@ impl CleanupAccumulator {
         tasks: &mut RunningTasks,
     ) {
         cancellation.cancel();
-        let mut retry = Vec::new();
-        for (index, (_, task)) in tasks.iter_mut().enumerate().rev() {
+        let mut retry_mask = 0_u8;
+        for (role, task) in tasks.iter_mut().rev() {
             if task.abort().is_err() {
-                retry.push(index);
+                retry_mask |= task_bit(*role);
             }
         }
-        for index in retry {
-            let Some((role, task)) = tasks.get_mut(index) else {
-                self.failure.overflowed = true;
-                continue;
-            };
-            if task.abort().is_err() {
+        for (role, task) in tasks.iter_mut().rev() {
+            if retry_mask & task_bit(*role) != 0 && task.abort().is_err() {
                 self.record(CleanupRole::Task(*role));
             }
         }
@@ -284,5 +280,72 @@ const fn outcome_from_primary(primary: CleanupPrimary) -> ExitOutcome {
         CleanupPrimary::ListenerUnavailable(role) => ExitOutcome::ListenerUnavailable(role),
         CleanupPrimary::TaskUnavailable(role) => ExitOutcome::TaskUnavailable(role),
         CleanupPrimary::Fenced => ExitOutcome::Fenced,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn primary_contexts_round_trip_without_cleanup_ambiguity() {
+        for outcome in [
+            ExitOutcome::Graceful,
+            ExitOutcome::Forced,
+            ExitOutcome::InvalidConfiguration,
+            ExitOutcome::StartupUnavailable(BootstrapFailureCode::StorageUnavailable),
+            ExitOutcome::ListenerUnavailable(ListenerRole::Api),
+            ExitOutcome::TaskUnavailable(TaskRole::OtlpGrpc),
+            ExitOutcome::Fenced,
+        ] {
+            assert_eq!(CleanupAccumulator::new(outcome).outcome(), outcome);
+        }
+    }
+
+    #[test]
+    fn cleanup_ambiguity_is_typed_and_deduplicated() {
+        let mut cleanup = CleanupAccumulator::new(ExitOutcome::Graceful);
+        cleanup.record(CleanupRole::Task(TaskRole::Control));
+        cleanup.record(CleanupRole::Task(TaskRole::Control));
+        cleanup.record(CleanupRole::Listener(ListenerRole::Api));
+        cleanup.record(CleanupRole::Listener(ListenerRole::Api));
+        cleanup.record_schema_checkpoint();
+        cleanup.record_schema_checkpoint();
+        cleanup.set_primary(ExitOutcome::Forced);
+
+        let ExitOutcome::InternalCleanupFailure(failure) = cleanup.outcome() else {
+            panic!("cleanup ambiguity must remain explicit");
+        };
+        assert_eq!(failure.primary(), CleanupPrimary::Graceful);
+        assert_eq!(failure.first_task(), Some(TaskRole::Control));
+        assert_eq!(failure.task_failures(), 1);
+        assert_eq!(failure.listener_failures(), 1);
+        assert!(failure.schema_checkpoint_failed());
+        assert_eq!(
+            failure.failed_roles().collect::<Vec<_>>(),
+            [
+                CleanupRole::Task(TaskRole::Control),
+                CleanupRole::Listener(ListenerRole::Api),
+                CleanupRole::SchemaCheckpoint,
+            ]
+        );
+        assert!(!failure.overflowed());
+    }
+
+    #[test]
+    fn later_internal_cleanup_truth_merges_without_losing_the_primary_outcome() {
+        let mut source = CleanupAccumulator::new(ExitOutcome::Fenced);
+        source.record(CleanupRole::Task(TaskRole::LokiPush));
+        let source_failure = match source.outcome() {
+            ExitOutcome::InternalCleanupFailure(failure) => failure,
+            outcome => panic!("unexpected source outcome: {outcome:?}"),
+        };
+
+        let mut cleanup = CleanupAccumulator::empty();
+        cleanup.set_primary(ExitOutcome::InternalCleanupFailure(source_failure));
+        assert_eq!(
+            cleanup.outcome(),
+            ExitOutcome::InternalCleanupFailure(source_failure)
+        );
     }
 }

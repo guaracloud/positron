@@ -7,6 +7,7 @@ fn empty_cleanup_failure_has_no_synthetic_truth() {
     assert_eq!(cleanup.first_task(), None);
     assert_eq!(cleanup.task_failures(), 0);
     assert_eq!(cleanup.listener_failures(), 0);
+    assert!(!cleanup.schema_checkpoint_failed());
     assert_eq!(cleanup.failed_roles().count(), 0);
     assert!(!cleanup.overflowed());
 }
