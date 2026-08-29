@@ -75,7 +75,10 @@ impl ResultResumeKey {
             2 => ResultResumeKind::Aggregate,
             _ => return Err(QueryFailure::new(QueryFailureCode::InvalidCursor)),
         };
-        if bytes[51..].iter().any(|byte| *byte != 0) {
+        let padding = bytes
+            .get(51..)
+            .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
+        if padding.iter().any(|byte| *byte != 0) {
             return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
         }
         let ordering_time = i64::from_be_bytes(

@@ -140,7 +140,10 @@ impl LedgerStorage {
         if let Some(length) =
             injected_partial_write_length(LedgerFileEvent::PartialSegmentHeaderWrite, header.len())
         {
-            file.write_all(&header[..length])
+            let partial_header = header.get(..length).ok_or_else(|| {
+                LedgerFailure::post_mutation(LedgerFailureCode::IntegrityCorruption)
+            })?;
+            file.write_all(partial_header)
                 .map_err(|error| LedgerFailure::post_mutation(map_io_error(error).code()))?;
             return Err(LedgerFailure::post_mutation(
                 LedgerFailureCode::StorageUnavailable,

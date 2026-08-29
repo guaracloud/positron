@@ -215,7 +215,9 @@ fn remove_path(record: &mut NativeLogCandidate, path: &PolicyAttributePath) -> b
         record.attributes_mut().remove(position);
         return true;
     }
-    let attribute = &mut record.attributes_mut()[position];
+    let Some(attribute) = record.attributes_mut().get_mut(position) else {
+        return false;
+    };
     let changed = if path.segments.is_empty() {
         match path.occurrence {
             PolicyOccurrence::All => false,

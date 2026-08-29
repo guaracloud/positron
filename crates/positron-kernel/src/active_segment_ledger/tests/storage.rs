@@ -145,6 +145,23 @@ fn segment_write_tracks_the_exact_first_successful_byte_boundary() {
     assert_eq!(overflow_failure.code(), LedgerFailureCode::LimitExceeded);
 }
 
+#[test]
+fn segment_write_fails_closed_when_writer_overreports_progress() {
+    let failure = match write_segment_bytes(
+        &mut OverreportingWriter,
+        b"frame",
+        SegmentMutation::NotStarted,
+    ) {
+        Err(AppendFailure::SegmentMutated(failure)) => failure,
+        _ => panic!("impossible writer progress must require recovery"),
+    };
+    assert_eq!(failure.code(), LedgerFailureCode::LimitExceeded);
+    assert_eq!(
+        failure.completion_state(),
+        LedgerCompletionState::RecoveryRequired
+    );
+}
+
 struct ZeroWriter;
 
 impl Write for ZeroWriter {
@@ -200,6 +217,18 @@ impl Write for PartialThenOverflow {
         } else {
             Ok(1)
         }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+struct OverreportingWriter;
+
+impl Write for OverreportingWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        Ok(buffer.len().saturating_add(1))
     }
 
     fn flush(&mut self) -> io::Result<()> {

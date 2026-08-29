@@ -77,11 +77,10 @@ pub(crate) fn format_secret(secret: &[u8; 32]) -> String {
 }
 
 const fn hex_digit(value: u8) -> char {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    if value < 16 {
-        DIGITS[value as usize] as char
-    } else {
-        '?'
+    match value {
+        0..=9 => (b'0' + value) as char,
+        10..=15 => (b'a' + value - 10) as char,
+        _ => '?',
     }
 }
 

@@ -27,7 +27,12 @@ impl LedgerStorage {
         emit_event(LedgerFileEvent::WriteFrame).map_err(|failure| unchanged.failure(failure))?;
         let prefix = frame_bytes.to_be_bytes();
         let partial = injected_partial_write_length(LedgerFileEvent::PartialFrameWrite, 4);
-        let prefix_bytes = partial.map_or(prefix.as_slice(), |length| &prefix[..length]);
+        let prefix_bytes = match partial {
+            Some(length) => prefix.get(..length).ok_or_else(|| {
+                unchanged.failure(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))
+            })?,
+            None => prefix.as_slice(),
+        };
         let mutation = write_segment_bytes(&mut file, prefix_bytes, SegmentMutation::NotStarted)?;
         if partial.is_some() {
             return Err(mutation.failure(LedgerFailure::new(LedgerFailureCode::StorageUnavailable)));
@@ -67,13 +72,20 @@ pub(in crate::active_segment_ledger) fn write_segment_bytes(
 ) -> Result<SegmentMutation, AppendFailure> {
     let mut written = 0_usize;
     while written < bytes.len() {
-        match file.write(&bytes[written..]) {
+        let remaining = bytes.get(written..).ok_or_else(|| {
+            mutation.failure(LedgerFailure::new(LedgerFailureCode::LimitExceeded))
+        })?;
+        match file.write(remaining) {
             Ok(0) => {
                 return Err(mutation.failure(map_io_error(std::io::Error::from(
                     std::io::ErrorKind::WriteZero,
                 ))));
             },
             Ok(count) => {
+                if count > remaining.len() {
+                    return Err(SegmentMutation::BytesWritten
+                        .failure(LedgerFailure::new(LedgerFailureCode::LimitExceeded)));
+                }
                 written = written.checked_add(count).ok_or_else(|| {
                     mutation.failure(LedgerFailure::new(LedgerFailureCode::LimitExceeded))
                 })?;

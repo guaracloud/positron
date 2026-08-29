@@ -33,7 +33,15 @@ impl GovernorInner {
     ) -> Result<AccountingSnapshot, GovernorFailure> {
         let contention = self.contention_count.load(Ordering::Acquire);
         let mut rejection_counts = state.rejection_counts;
-        rejection_counts[AdmissionFailureCode::GovernorContended.index()] = contention;
+        let contention_slot = rejection_counts
+            .get_mut(AdmissionFailureCode::GovernorContended.index())
+            .ok_or_else(|| {
+                self.drop_ledger
+                    .pending_fence
+                    .store(true, Ordering::Release);
+                GovernorFailure::InternalFenced
+            })?;
+        *contention_slot = contention;
         let rejection_count = rejection_counts
             .iter()
             .try_fold(0_u64, |total, count| total.checked_add(*count))
@@ -46,7 +54,8 @@ impl GovernorInner {
         let throttle_counts = std::array::from_fn(|index| {
             AdmissionFailureCode::from_index(index)
                 .filter(|code| code.is_throttle())
-                .map_or(0, |_| rejection_counts[index])
+                .and_then(|_| rejection_counts.get(index).copied())
+                .unwrap_or(0)
         });
         Ok(AccountingSnapshot {
             outstanding: state.outstanding,

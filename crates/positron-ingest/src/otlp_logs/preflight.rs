@@ -257,7 +257,7 @@ impl<'message> Cursor<'message> {
 
     fn skip_group(&mut self, first_field: u64) -> Result<(), ReceiveFailure> {
         let mut groups = [0_u64; MAX_GROUP_DEPTH];
-        groups[0] = first_field;
+        *groups.first_mut().ok_or(ReceiveFailure::MalformedPayload)? = first_field;
         let mut depth = 1_usize;
         while depth > 0 {
             let (field, wire) = self.take_key()?;
@@ -266,7 +266,9 @@ impl<'message> Cursor<'message> {
                     if depth == MAX_GROUP_DEPTH {
                         return Err(ReceiveFailure::MalformedPayload);
                     }
-                    groups[depth] = field;
+                    *groups
+                        .get_mut(depth)
+                        .ok_or(ReceiveFailure::MalformedPayload)? = field;
                     depth += 1;
                 },
                 4 => {

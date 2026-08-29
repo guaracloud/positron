@@ -137,7 +137,11 @@ impl TailCursorState {
             return Err(invalid());
         }
         positions.sort_unstable();
-        if positions.windows(2).any(|w| w[0].shard == w[1].shard) {
+        if positions
+            .iter()
+            .zip(positions.iter().skip(1))
+            .any(|(left, right)| left.shard == right.shard)
+        {
             return Err(invalid());
         }
         Ok(Self {
@@ -287,8 +291,9 @@ impl TailCursorState {
         }
         bindings.sort_unstable_by_key(|binding| binding.shard);
         if bindings
-            .windows(2)
-            .any(|pair| pair[0].shard == pair[1].shard)
+            .iter()
+            .zip(bindings.iter().skip(1))
+            .any(|(left, right)| left.shard == right.shard)
         {
             return Err(invalid());
         }

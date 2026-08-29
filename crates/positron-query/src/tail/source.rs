@@ -33,15 +33,19 @@ impl<'kernel, 'catalog, 'ledger> TailSourceSet<'kernel, 'catalog, 'ledger> {
         {
             return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
         }
-        if readers.windows(2).any(|pair| {
-            let left = pair[0].scope();
-            let right = pair[1].scope();
-            left.shard_id() == right.shard_id()
-                || left.tenant_id() != first.tenant_id()
-                || left.signal_kind() != first.signal_kind()
-                || right.tenant_id() != first.tenant_id()
-                || right.signal_kind() != first.signal_kind()
-        }) {
+        if readers
+            .iter()
+            .zip(readers.iter().skip(1))
+            .any(|(left, right)| {
+                let left = left.scope();
+                let right = right.scope();
+                left.shard_id() == right.shard_id()
+                    || left.tenant_id() != first.tenant_id()
+                    || left.signal_kind() != first.signal_kind()
+                    || right.tenant_id() != first.tenant_id()
+                    || right.signal_kind() != first.signal_kind()
+            })
+        {
             return Err(QueryFailure::new(QueryFailureCode::Unauthorized));
         }
         Ok(Self {

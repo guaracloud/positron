@@ -134,7 +134,10 @@ impl CleanupAccumulator {
             }
         }
         for index in retry {
-            let (role, task) = &mut tasks[index];
+            let Some((role, task)) = tasks.get_mut(index) else {
+                self.failure.overflowed = true;
+                continue;
+            };
             if task.abort().is_err() {
                 self.record(CleanupRole::Task(*role));
             }
@@ -228,8 +231,8 @@ impl CleanupAccumulator {
             },
         }
         let index = usize::from(self.failure.role_count);
-        if index < MAX_CLEANUP_ROLES {
-            self.failure.roles[index] = Some(role);
+        if let Some(slot) = self.failure.roles.get_mut(index) {
+            *slot = Some(role);
             self.failure.role_count = self.failure.role_count.saturating_add(1);
         } else {
             self.failure.overflowed = true;

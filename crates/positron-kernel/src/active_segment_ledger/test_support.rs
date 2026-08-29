@@ -27,7 +27,12 @@ pub fn publish_snapshot_lease_marker_for_test(
                     .ok_or_else(|| {
                         crate::CatalogFailure::new(crate::CatalogFailureCode::LimitExceeded)
                     })?;
-                bytes[119..127].copy_from_slice(&repeats.to_be_bytes());
+                bytes
+                    .get_mut(119..127)
+                    .ok_or_else(|| {
+                        crate::CatalogFailure::new(crate::CatalogFailureCode::IntegrityCorruption)
+                    })?
+                    .copy_from_slice(&repeats.to_be_bytes());
                 found = true;
             }
             CatalogObject::new(bytes)

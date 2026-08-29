@@ -257,7 +257,10 @@ impl GovernanceFixtureObject {
         let suffix = plaintext
             .get_mut(start..)
             .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::IntegrityCorruption))?;
-        suffix[0] = match lifecycle {
+        let lifecycle_byte = suffix
+            .first_mut()
+            .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::IntegrityCorruption))?;
+        *lifecycle_byte = match lifecycle {
             TenantLifecycleState::Active => 1,
             TenantLifecycleState::ReadOnly => 2,
             TenantLifecycleState::Suspended => 3,

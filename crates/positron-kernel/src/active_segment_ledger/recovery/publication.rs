@@ -60,7 +60,10 @@ pub(in crate::active_segment_ledger) fn publish_frontier(
     if let Some(partial) =
         injected_partial_write_length(LedgerFileEvent::PartialFrontierWrite, encoded.len())
     {
-        file.write_all(&encoded[..partial])
+        let partial_bytes = encoded
+            .get(..partial)
+            .ok_or_else(|| LedgerFailure::post_mutation(LedgerFailureCode::IntegrityCorruption))?;
+        file.write_all(partial_bytes)
             .map_err(|error| LedgerFailure::post_mutation(map_io_error(error).code()))?;
         return Err(LedgerFailure::post_mutation(
             LedgerFailureCode::StorageUnavailable,

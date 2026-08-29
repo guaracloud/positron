@@ -175,7 +175,10 @@ impl<'json> Cursor<'json> {
                 .ok_or(ReceiveFailure::MalformedPayload)?;
             match byte {
                 b'"' => {
-                    let raw = &self.input[start..self.offset];
+                    let raw = self
+                        .input
+                        .get(start..self.offset)
+                        .ok_or(ReceiveFailure::MalformedPayload)?;
                     self.offset += 1;
                     return Ok(StringToken { raw, decoded_len });
                 },
@@ -191,7 +194,11 @@ impl<'json> Cursor<'json> {
                     decoded_len += 1;
                 },
                 _ => {
-                    let (encoded, decoded) = validated_utf8_scalar(&self.input[self.offset..])?;
+                    let remaining = self
+                        .input
+                        .get(self.offset..)
+                        .ok_or(ReceiveFailure::MalformedPayload)?;
+                    let (encoded, decoded) = validated_utf8_scalar(remaining)?;
                     self.offset += encoded;
                     decoded_len = decoded_len
                         .checked_add(decoded)
