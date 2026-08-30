@@ -1,6 +1,8 @@
 use positron_domain::routing::CommitPosition;
 
-use crate::catalog::{Catalog, CatalogObject, CatalogProposal, FormatEpoch, TransactionId};
+use crate::catalog::{
+    Catalog, CatalogFailureCode, CatalogObject, CatalogProposal, FormatEpoch, TransactionId,
+};
 use crate::data_protection::DataProtection;
 
 use super::format::{SegmentMetadata, SegmentState};
@@ -50,7 +52,7 @@ pub(super) fn publish_segments(
             .get(..16)
             .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::StorageUnavailable))?,
     );
-    catalog.commit(
+    let publication = catalog.commit(
         basis.identity(),
         CatalogProposal::new(
             TransactionId::new(transaction)?,
@@ -58,6 +60,30 @@ pub(super) fn publish_segments(
             objects,
         )?,
         None,
-    )?;
-    Ok(())
+    );
+    match publication {
+        Ok(_) => Ok(()),
+        Err(failure) => {
+            // A generation marker rename may have made the proposal durable
+            // before its directory synchronization reported failure. Reconcile
+            // the catalog authority before exposing an ordinary rejection to
+            // callers whose live ledger still reflects the prior generation.
+            if failure.code() == CatalogFailureCode::StorageUnavailable
+                && catalog.refresh_state().is_ok()
+                && catalog.pin().ok().is_some_and(|snapshot| {
+                    basis.number().checked_add(1) == Some(snapshot.number())
+                        && storage.catalog_segments(&snapshot, scope).ok().is_some_and(
+                            |published| {
+                                published.len() == metadata.len()
+                                    && metadata.iter().all(|expected| published.contains(expected))
+                            },
+                        )
+                })
+            {
+                Ok(())
+            } else {
+                Err(failure.into())
+            }
+        },
+    }
 }

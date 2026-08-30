@@ -1,6 +1,6 @@
 use positron_domain::routing::VirtualShardId;
 use positron_kernel::{LedgerSnapshot, ResourceGovernor, StoreBlockIdentity};
-use positron_signals::{LogRecord, ScanObserver, SchemaDelta, SchemaFailure};
+use positron_signals::{LogRecord, ScanObserver, SchemaDelta};
 
 use super::{SchemaSessionFailure, TenantSchemaSession, ensure_frontier_slot, reconcile_pending};
 
@@ -79,92 +79,8 @@ impl TenantSchemaSession {
 }
 
 fn map_stage_failure(failure: positron_signals::LogStoreFailure) -> SchemaSessionFailure {
-    classify_stage_failure_code(failure.code())
-}
-
-const fn classify_stage_failure_code(
-    code: positron_signals::LogStoreFailureCode,
-) -> SchemaSessionFailure {
-    match code {
-        positron_signals::LogStoreFailureCode::InvalidInput
-        | positron_signals::LogStoreFailureCode::MalformedBlock
-        | positron_signals::LogStoreFailureCode::PhysicalScopeMismatch => {
-            SchemaSessionFailure::Schema(SchemaFailure::InvalidValue)
-        },
-        positron_signals::LogStoreFailureCode::LimitExceeded => {
-            SchemaSessionFailure::Schema(SchemaFailure::LimitExceeded)
-        },
-        positron_signals::LogStoreFailureCode::ResourceExhausted
-        | positron_signals::LogStoreFailureCode::StorageExhausted
-        | positron_signals::LogStoreFailureCode::BudgetExhausted
-        | positron_signals::LogStoreFailureCode::ResourceAdmissionRefused
-        | positron_signals::LogStoreFailureCode::ClockUnavailable
-        | positron_signals::LogStoreFailureCode::StorageUnavailable
-        | positron_signals::LogStoreFailureCode::ConcurrentWriter
-        | positron_signals::LogStoreFailureCode::StaleGeneration
-        | positron_signals::LogStoreFailureCode::Internal => {
-            SchemaSessionFailure::Schema(SchemaFailure::AllocationUnavailable)
-        },
-        positron_signals::LogStoreFailureCode::IntegrityCorruption
-        | positron_signals::LogStoreFailureCode::AuthenticationFailed
-        | positron_signals::LogStoreFailureCode::UnsupportedFormat
-        | positron_signals::LogStoreFailureCode::IdempotencyConflict
-        | positron_signals::LogStoreFailureCode::RecoveryRequired
-        | positron_signals::LogStoreFailureCode::SnapshotExpired
-        | positron_signals::LogStoreFailureCode::StaleResumeMarker => {
-            SchemaSessionFailure::Schema(SchemaFailure::InvalidValue)
-        },
+    match failure.code() {
         positron_signals::LogStoreFailureCode::Cancelled => SchemaSessionFailure::Cancelled,
-    }
-}
-
-#[cfg(test)]
-mod failure_classification_tests {
-    use super::{SchemaSessionFailure, classify_stage_failure_code};
-    use positron_signals::{LogStoreFailureCode as Store, SchemaFailure};
-
-    #[test]
-    fn staging_preserves_schema_capacity_cancellation_and_integrity_classes() {
-        for code in [
-            Store::InvalidInput,
-            Store::MalformedBlock,
-            Store::PhysicalScopeMismatch,
-            Store::IntegrityCorruption,
-            Store::AuthenticationFailed,
-            Store::UnsupportedFormat,
-            Store::IdempotencyConflict,
-            Store::RecoveryRequired,
-            Store::SnapshotExpired,
-            Store::StaleResumeMarker,
-        ] {
-            assert_eq!(
-                classify_stage_failure_code(code),
-                SchemaSessionFailure::Schema(SchemaFailure::InvalidValue)
-            );
-        }
-        assert_eq!(
-            classify_stage_failure_code(Store::LimitExceeded),
-            SchemaSessionFailure::Schema(SchemaFailure::LimitExceeded)
-        );
-        for code in [
-            Store::ResourceExhausted,
-            Store::StorageExhausted,
-            Store::BudgetExhausted,
-            Store::ResourceAdmissionRefused,
-            Store::ClockUnavailable,
-            Store::StorageUnavailable,
-            Store::ConcurrentWriter,
-            Store::StaleGeneration,
-            Store::Internal,
-        ] {
-            assert_eq!(
-                classify_stage_failure_code(code),
-                SchemaSessionFailure::Schema(SchemaFailure::AllocationUnavailable)
-            );
-        }
-        assert_eq!(
-            classify_stage_failure_code(Store::Cancelled),
-            SchemaSessionFailure::Cancelled
-        );
+        code => SchemaSessionFailure::LogStore(code),
     }
 }

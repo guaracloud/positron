@@ -1,7 +1,9 @@
 use positron_domain::identity::TenantId;
 use positron_domain::routing::SignalKind;
 use positron_domain::time::UnixNanoseconds;
-use positron_kernel::{ActiveSegmentLedger, IngestTime, LifecycleClock, LifecycleClockSource};
+use positron_kernel::{
+    ActiveSegmentLedger, IngestTime, LifecycleClock, SystemLifecycleClockSource,
+};
 
 use super::{LogStoreFailure, codec};
 
@@ -104,9 +106,9 @@ impl LogRetentionOutcome {
     }
 }
 
-pub(super) fn enforce_retention<'kernel, 'catalog, S: LifecycleClockSource>(
+pub(super) fn enforce_retention<'kernel, 'catalog>(
     ledger: &ActiveSegmentLedger<'kernel, 'catalog>,
-    clock: &LifecycleClock<S>,
+    clock: &LifecycleClock<SystemLifecycleClockSource>,
     tenant: TenantId,
     policy: LogRetentionPolicy,
     cancellation: &dyn super::ScanCancellation,
@@ -147,7 +149,7 @@ pub(super) fn enforce_retention<'kernel, 'catalog, S: LifecycleClockSource>(
                     .map_err(|_| LogStoreFailure::limit_exceeded())?,
             )
             .map_err(LogStoreFailure::observation)?;
-        let latest = codec::block_retention_range_observed(
+        codec::block_retention_range_observed(
             tenant,
             &snapshot,
             block.payload(),
@@ -157,7 +159,7 @@ pub(super) fn enforce_retention<'kernel, 'catalog, S: LifecycleClockSource>(
         .ok_or_else(LogStoreFailure::malformed_block)?;
         evidence.push(
             snapshot
-                .retention_evidence(block, latest, retention_seconds)
+                .retention_evidence(block, retention_seconds)
                 .map_err(map_kernel_failure)?,
         );
     }

@@ -27,6 +27,7 @@ use super::{
 };
 
 mod append;
+pub(in crate::active_segment_ledger) use append::NextFrontier;
 mod catalog;
 #[cfg(test)]
 pub(super) use append::write_segment_bytes;

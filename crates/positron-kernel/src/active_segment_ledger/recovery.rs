@@ -16,11 +16,13 @@ use super::io::{map_errno, map_integrity_read, map_io_error, open_regular, synch
 use super::receipt::receipt_authenticator;
 use super::{
     CommittedBlock, LedgerFailure, LedgerFailureCode, MAX_ENCODED_FRAME_BYTES,
-    MAX_RETAINED_BLOCK_BYTES, SegmentId, StoreBlockIdentity, map_frame_failure,
+    MAX_RETAINED_BLOCK_BYTES, SegmentId, SegmentRetention, StoreBlockIdentity, map_frame_failure,
 };
+use crate::IngestTime;
 const FRONTIER_MAGIC: &[u8; 8] = b"PFRONT02";
 const FRONTIER_PREFIX_BYTES: usize = 8 + 2 + 2 + 4;
-const FRONTIER_PLAINTEXT_BYTES: usize = 8 + 8 + 8;
+const FRONTIER_V1_PLAINTEXT_BYTES: usize = 8 + 8 + 8;
+const FRONTIER_V2_PLAINTEXT_BYTES: usize = FRONTIER_V1_PLAINTEXT_BYTES + 1 + 8;
 const MAX_FRONTIER_FRAME_BYTES: u32 = 512;
 const MAX_RECOVERED_BLOCKS: usize = 1_024;
 
@@ -41,6 +43,7 @@ struct PublishedFrontier {
     durable_bytes: u64,
     next_sequence: u64,
     position: CommitPosition,
+    segment_retention: SegmentRetention,
 }
 
 #[cfg(test)]
@@ -82,6 +85,7 @@ pub(super) fn recover_with_mode(
         durable_bytes,
         next_sequence,
         position,
+        segment_retention,
     }) = frontier
     else {
         if file_length < header_length {
@@ -130,6 +134,7 @@ pub(super) fn recover_with_mode(
         metadata.id,
         header_length,
         key,
+        segment_retention,
     )?;
     let expected_blocks = usize::try_from(next_sequence)
         .map_err(|_| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?;
@@ -156,6 +161,7 @@ pub(super) fn read_blocks(
     segment: SegmentId,
     header_bytes: u64,
     key: &ObjectDataKey,
+    segment_retention: SegmentRetention,
 ) -> Result<Vec<CommittedBlock>, LedgerFailure> {
     let mut blocks = Vec::new();
     let mut consumed = 0_u64;
@@ -243,6 +249,7 @@ pub(super) fn read_blocks(
             content_digest,
             segment,
             frontier_authenticator,
+            segment_retention,
         });
     }
     Ok(blocks)
@@ -271,7 +278,13 @@ fn read_frontier(
     {
         return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
     }
-    if prefix.get(10..12) != Some(1_u16.to_be_bytes().as_slice()) {
+    let format_version = u16::from_be_bytes(
+        prefix
+            .get(10..12)
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?,
+    );
+    if !matches!(format_version, 1 | 2) {
         return Err(LedgerFailure::new(LedgerFailureCode::UnsupportedFormat));
     }
     let frame_bytes = usize::try_from(u32::from_be_bytes(
@@ -318,7 +331,12 @@ fn read_frontier(
     let (frame_sequence, verified) =
         opened.ok_or_else(|| LedgerFailure::new(LedgerFailureCode::AuthenticationFailed))?;
     let plaintext = verified.as_plaintext();
-    if plaintext.len() != FRONTIER_PLAINTEXT_BYTES {
+    let expected_plaintext_bytes = if format_version == 1 {
+        FRONTIER_V1_PLAINTEXT_BYTES
+    } else {
+        FRONTIER_V2_PLAINTEXT_BYTES
+    };
+    if plaintext.len() != expected_plaintext_bytes {
         return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
     }
     let durable_bytes = read_u64(plaintext, 0)?;
@@ -327,11 +345,39 @@ fn read_frontier(
         return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
     }
     let position = position_from_value(read_u64(plaintext, 16)?)?;
+    let segment_retention = if format_version == 1 {
+        SegmentRetention::Unavailable
+    } else {
+        decode_segment_retention(plaintext)?
+    };
+    if matches!(segment_retention, SegmentRetention::Complete(_)) && next_sequence == 0 {
+        return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
+    }
     Ok(Some(PublishedFrontier {
         durable_bytes,
         next_sequence,
         position,
+        segment_retention,
     }))
+}
+
+fn decode_segment_retention(bytes: &[u8]) -> Result<SegmentRetention, LedgerFailure> {
+    let instant = i64::from_be_bytes(
+        bytes
+            .get(25..33)
+            .and_then(|value| value.try_into().ok())
+            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?,
+    );
+    match bytes.get(24).copied() {
+        Some(0) if instant == 0 => Ok(SegmentRetention::Empty),
+        Some(1) if instant == 0 => Ok(SegmentRetention::Unavailable),
+        Some(2) => Ok(SegmentRetention::Complete(
+            IngestTime::from_authenticated_durable(positron_domain::time::UnixNanoseconds::new(
+                instant,
+            )),
+        )),
+        _ => Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption)),
+    }
 }
 
 pub(super) fn segment_name(id: SegmentId) -> String {

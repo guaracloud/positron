@@ -20,7 +20,7 @@ use super::{
 mod oracle;
 mod persisted_corruption;
 
-use oracle::Oracle;
+use oracle::{Oracle, SnapshotExpectation};
 use persisted_corruption::{PersistedArtifact, run_persisted_corruption_case};
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
@@ -70,8 +70,8 @@ pub(super) fn fuzz_active_segment_stateful(data: &[u8]) {
     let scope = scope();
     let mut ledger = open(&authority, &catalog, scope).expect("fresh ledger opens");
     let mut oracle = Oracle::new();
-    let mut lease: Option<(SnapshotLeaseId, u64)> = None;
-    let mut protected_snapshot: Option<LedgerSnapshot<'_>> = None;
+    let mut lease: Option<(SnapshotLeaseId, u64, SnapshotExpectation)> = None;
+    let mut protected_snapshot: Option<(LedgerSnapshot<'_>, SnapshotExpectation)> = None;
 
     for (index, selector) in data.iter().copied().take(24).enumerate() {
         let operation = selector % 23;
@@ -159,50 +159,57 @@ pub(super) fn fuzz_active_segment_stateful(data: &[u8]) {
                     let now = fuzz_now();
                     let expiry = now.checked_add(30).expect("fuzz lease expiry is bounded");
                     if let Ok(grant) = ledger.create_snapshot_lease(now, expiry) {
-                        lease = Some((grant.identity(), expiry));
+                        lease = Some((grant.identity(), expiry, Oracle::capture(grant.snapshot())));
                     }
                 }
             },
             14 => {
-                if let Some((identity, _)) = lease {
-                    let _ = ledger.resume_snapshot_lease_with_marker(
-                        identity,
+                if let Some((identity, _, expected)) = &lease
+                    && let Ok(resumed) = ledger.resume_snapshot_lease_with_marker(
+                        *identity,
                         fuzz_now(),
                         1,
                         [0x51; 32],
-                    );
+                    )
+                {
+                    expected.assert_snapshot(resumed.snapshot());
                 }
             },
             15 => {
-                if let Some((identity, _)) = lease {
-                    let _ = ledger.resume_snapshot_lease_with_marker(
-                        identity,
-                        fuzz_now(),
-                        1,
-                        [0x51; 32],
-                    );
+                if let Some((identity, _, expected)) = &lease
+                    && let Ok(resumed) = ledger.resume_snapshot_lease(*identity, fuzz_now())
+                {
+                    expected.assert_snapshot(resumed.snapshot());
                 }
             },
             16 => {
-                if let Some((identity, _)) = lease.take() {
+                if let Some((identity, _, _)) = lease.take() {
                     let _ = ledger.release_snapshot_lease(identity);
                 }
             },
             17 => {
-                if let Some((identity, expiry)) = lease.take() {
-                    let _ = ledger.resume_snapshot_lease(identity, expiry);
+                if let Some((identity, expiry, _)) = lease.take() {
+                    assert_eq!(
+                        ledger
+                            .resume_snapshot_lease(identity, expiry)
+                            .expect_err("lease expiry is exclusive")
+                            .code(),
+                        LedgerFailureCode::SnapshotExpired
+                    );
                 }
             },
             18 => {
-                if let Some((identity, _)) = lease {
+                if let Some((identity, _, _)) = &lease {
                     let _ = ledger.record_snapshot_lease_usage(
-                        identity,
+                        *identity,
                         SnapshotLeaseUsage::new(1, 1, 1, 1, 1, 1, 1),
                     );
                 }
             },
             19 => {
-                protected_snapshot = Some(ledger.snapshot().expect("protected fuzz snapshot"));
+                let snapshot = ledger.snapshot().expect("protected fuzz snapshot");
+                let expected = Oracle::capture(&snapshot);
+                protected_snapshot = Some((snapshot, expected));
             },
             20 => {
                 protected_snapshot = None;
@@ -210,12 +217,6 @@ pub(super) fn fuzz_active_segment_stateful(data: &[u8]) {
             21 => {
                 let snapshot = ledger.snapshot().expect("retention evidence snapshot");
                 let active = ledger.active_segment_id().expect("active segment identity");
-                let evidence_clock = crate::LifecycleClock::new(
-                    crate::FixedLifecycleClockSource::new(UnixNanoseconds::new(1_000_000_000)),
-                );
-                let evidence_time = evidence_clock
-                    .assign_ingest_time()
-                    .expect("fixed evidence time");
                 let duration = NonZeroU64::new(1).expect("positive fuzz duration");
                 let mut retired = BTreeSet::new();
                 let evidence = snapshot
@@ -225,24 +226,30 @@ pub(super) fn fuzz_active_segment_stateful(data: &[u8]) {
                     .map(|block| {
                         retired.insert(block.segment_id());
                         snapshot
-                            .retention_evidence(block, evidence_time, duration)
+                            .retention_evidence(block, duration)
                             .expect("snapshot-bound fuzz evidence")
                     })
                     .collect::<Vec<_>>();
                 drop(snapshot);
-                let now_nanos = i64::try_from(fuzz_now())
-                    .ok()
-                    .and_then(|seconds| seconds.checked_mul(1_000_000_000))
-                    .expect("current fuzz time is representable");
-                let cutoff = crate::LifecycleClock::new(crate::FixedLifecycleClockSource::new(
-                    UnixNanoseconds::new(now_nanos),
-                ))
-                .retention_cutoff(duration)
-                .expect("fixed fuzz cutoff");
+                let cutoff = crate::LifecycleClock::new(crate::SystemLifecycleClockSource)
+                    .retention_cutoff(duration)
+                    .expect("system fuzz cutoff");
+                let mut protected = BTreeSet::new();
+                if let Some((_, expected)) = &protected_snapshot {
+                    protected.extend(expected.segments());
+                }
+                if let Some((_, _, expected)) = &lease {
+                    protected.extend(expected.segments());
+                }
                 let outcome = ledger
                     .retire_expired_sealed_segments(cutoff, &evidence)
                     .expect("bounded fuzz retention");
                 assert!(outcome.logically_retired_segments() >= retired.len());
+                oracle.note_retention(
+                    &retired,
+                    &protected,
+                    outcome.physically_reclaimed_segments(),
+                );
                 oracle.retire_segments(&retired);
             },
             22 => {
@@ -251,11 +258,16 @@ pub(super) fn fuzz_active_segment_stateful(data: &[u8]) {
                     return;
                 };
                 ledger = recovered;
+                if let Some((identity, _, expected)) = &lease
+                    && let Ok(resumed) = ledger.resume_snapshot_lease(*identity, fuzz_now())
+                {
+                    expected.assert_snapshot(resumed.snapshot());
+                }
             },
             _ => {},
         }
-        if let Some(snapshot) = &protected_snapshot {
-            assert!(snapshot.frontier() <= oracle.frontier());
+        if let Some((snapshot, expected)) = &protected_snapshot {
+            expected.assert_snapshot(snapshot);
         }
         oracle.assert_ledger(&ledger);
     }
@@ -285,7 +297,16 @@ fn block_parts(index: usize, selector: u8) -> (StoreBlockIdentity, Vec<u8>) {
 }
 
 fn prepared(identity: StoreBlockIdentity, payload: Vec<u8>) -> PreparedStoreBlock<'static> {
-    PreparedStoreBlock::new(scope(), identity, payload).expect("bounded fuzz block")
+    let mut block =
+        PreparedStoreBlock::new(scope(), identity, payload).expect("bounded fuzz block");
+    block.retention_ingest_time = Some(
+        crate::LifecycleClock::new(crate::FixedLifecycleClockSource::new(UnixNanoseconds::new(
+            1,
+        )))
+        .assign_ingest_time()
+        .expect("fixed fuzz ingest time"),
+    );
+    block
 }
 
 fn identity(index: usize) -> StoreBlockIdentity {

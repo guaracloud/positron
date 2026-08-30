@@ -1,10 +1,10 @@
 use positron_domain::identity::TenantId;
 use positron_domain::routing::{SignalKind, VirtualShardId};
 use positron_domain::time::UnixNanoseconds;
-use positron_domain::value::CandidateAttributeValue;
+use positron_domain::value::{AttributeNamespace, CandidateAttributeValue};
 use positron_kernel::{
     ActiveSegmentLedger, Catalog, CatalogSecret, FixedLifecycleClockSource, InstanceId,
-    LifecycleClock, SegmentProtectionKey, SegmentScope, StoreBlockIdentity,
+    LifecycleClock, PreparedStoreBlock, SegmentProtectionKey, SegmentScope, StoreBlockIdentity,
 };
 use positron_policy::IngestPolicy;
 use positron_signals::{LogStore, ScanCancellation, SchemaCatalog, SchemaCheckpointFrontier};
@@ -12,8 +12,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::super::{SchemaSessionFailure, TenantSchemaRegistry};
 use crate::{
-    IngestOutcome, LogIngest, LogMetadata, NativeLogBatch, NativeLogCandidate, OtlpLogsReceiver,
-    PolicyReceiver,
+    IngestOutcome, LogIngest, LogMetadata, NativeLogAttribute, NativeLogBatch, NativeLogCandidate,
+    OtlpLogsReceiver, PolicyReceiver,
 };
 
 #[test]
@@ -171,6 +171,145 @@ fn bootstrap_replay_keeps_mandatory_discovery_when_text_is_not_admitted() {
         bootstrap_catalog != live_catalog,
         "bootstrap omits optional text evidence when only mandatory work is admitted"
     );
+}
+
+#[test]
+fn public_schema_replay_admits_actual_multi_path_reconciliation_work() {
+    let fixture = crate::tests::support::fixture_with_ordinary_memory(40_000_000)
+        .expect("replay-capable fixture");
+    let catalog = Catalog::open(
+        &fixture.authority,
+        InstanceId::new([0xc1; 16]).expect("instance"),
+        CatalogSecret::from_owned(Box::new([0xc2; 32]), Box::new([0xc3; 32])),
+    )
+    .expect("catalog");
+    let shard = VirtualShardId::new(311).expect("shard");
+    let ledger = ledger(&fixture, &catalog, shard, 0xc4);
+    let live_registry = TenantSchemaRegistry::new(1).expect("registry");
+    let live = live_registry
+        .session(fixture.tenant, fixture.authority.governor())
+        .expect("live session");
+    let candidate = NativeLogCandidate::new(
+        None,
+        None,
+        None,
+        (0_i64..8)
+            .map(|index| {
+                NativeLogAttribute::new(
+                    AttributeNamespace::Record,
+                    format!("replay.field.{index}"),
+                    vec![CandidateAttributeValue::signed_integer(index)],
+                )
+            })
+            .collect(),
+        LogMetadata::empty(),
+    );
+    let batch = NativeLogBatch::new(
+        crate::tests::support::attribution(),
+        vec![candidate],
+        LogStore::value_limit_profile(),
+        1_024,
+        None,
+        PolicyReceiver::OtlpGrpc,
+    )
+    .expect("multi-path batch");
+    let policy = IngestPolicy::preserving(1).expect("policy");
+    assert!(matches!(
+        LogIngest::new(
+            &fixture.authority,
+            &ledger,
+            &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(101))),
+            &policy,
+            fixture.tenant,
+            shard,
+            live.clone(),
+        )
+        .accept(
+            batch,
+            StoreBlockIdentity::new([0xc5; 16]).expect("identity"),
+        ),
+        IngestOutcome::Full(_)
+    ));
+    let expected = live
+        .checkpoint()
+        .expect("live checkpoint")
+        .catalog_bytes()
+        .to_vec();
+    let snapshot = ledger.snapshot().expect("snapshot");
+    drop(live);
+    drop(live_registry);
+
+    let replay_registry = TenantSchemaRegistry::new(1).expect("replay registry");
+    let replay = replay_registry
+        .session(fixture.tenant, fixture.authority.governor())
+        .expect("replay session");
+    replay
+        .replay_snapshot(fixture.tenant, &snapshot, fixture.authority.governor())
+        .expect("multi-path replay");
+    assert_eq!(
+        replay
+            .checkpoint()
+            .expect("replayed checkpoint")
+            .catalog_bytes(),
+        expected
+    );
+}
+
+#[test]
+fn authenticated_malformed_log_block_preserves_its_schema_replay_failure_class() {
+    let fixture = crate::tests::support::fixture_with_ordinary_memory(40_000_000)
+        .expect("replay-capable fixture");
+    let catalog = Catalog::open(
+        &fixture.authority,
+        InstanceId::new([0xdd; 16]).expect("instance"),
+        CatalogSecret::from_owned(Box::new([0xde; 32]), Box::new([0xdf; 32])),
+    )
+    .expect("catalog");
+    let shard = VirtualShardId::new(310).expect("shard");
+    let ledger = ledger(&fixture, &catalog, shard, 0xe0);
+    let scope = SegmentScope::new(fixture.tenant, SignalKind::Logs, shard);
+    ledger
+        .append(
+            PreparedStoreBlock::new(
+                scope,
+                StoreBlockIdentity::new([0xe8; 16]).expect("identity"),
+                b"authenticated-but-not-a-log-store-block".to_vec(),
+            )
+            .expect("bounded malformed block"),
+        )
+        .expect("durably authenticated block");
+    let snapshot = ledger.snapshot().expect("snapshot");
+    let registry = TenantSchemaRegistry::new(1).expect("registry");
+    let session = registry
+        .session(fixture.tenant, fixture.authority.governor())
+        .expect("schema session");
+    let before = session.checkpoint().expect("checkpoint");
+    let before_governor = fixture.authority.governor().inspect().expect("governor");
+
+    assert_eq!(
+        session.replay_snapshot(fixture.tenant, &snapshot, fixture.authority.governor()),
+        Err(SchemaSessionFailure::LogStore(
+            positron_signals::LogStoreFailureCode::MalformedBlock,
+        ))
+    );
+    assert_eq!(
+        session
+            .checkpoint()
+            .expect("failed replay checkpoint")
+            .catalog_bytes(),
+        before.catalog_bytes()
+    );
+    let after_governor = fixture.authority.governor().inspect().expect("governor");
+    assert_eq!(
+        after_governor.outstanding_total(),
+        before_governor.outstanding_total()
+    );
+    for dimension in positron_kernel::ResourceDimension::ALL {
+        assert_eq!(
+            after_governor.usage(dimension),
+            before_governor.usage(dimension)
+        );
+    }
 }
 
 #[test]

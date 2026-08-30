@@ -1,15 +1,21 @@
 use std::io::{Seek, SeekFrom, Write};
 
+use crate::active_segment_ledger::SegmentRetention;
 use crate::data_protection::{EncryptedFrame, ObjectDataKey};
 
 use super::*;
+
+pub(in crate::active_segment_ledger) struct NextFrontier {
+    pub(in crate::active_segment_ledger) sequence: u64,
+    pub(in crate::active_segment_ledger) position: positron_domain::routing::CommitPosition,
+    pub(in crate::active_segment_ledger) segment_retention: SegmentRetention,
+}
 
 impl LedgerStorage {
     pub(in crate::active_segment_ledger) fn append_and_commit<R>(
         &self,
         key: &ObjectDataKey,
-        sequence: u64,
-        position: positron_domain::routing::CommitPosition,
+        frontier: NextFrontier,
         frame_bytes: u32,
         protect_frame: impl FnOnce() -> Result<EncryptedFrame, LedgerFailure>,
         admit_durability: impl FnOnce() -> Result<R, LedgerFailure>,
@@ -55,11 +61,13 @@ impl LedgerStorage {
             metadata.id,
             key,
             durable_bytes,
-            sequence
+            frontier
+                .sequence
                 .checked_add(1)
                 .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))
                 .map_err(|failure| mutation.failure(failure))?,
-            position,
+            frontier.position,
+            frontier.segment_retention,
         )
         .map_err(|failure| mutation.failure(failure))
     }

@@ -209,7 +209,7 @@ fn recovery_rejects_truncated_trailing_and_structurally_corrupt_frontiers()
             3 => {
                 let mut file = OpenOptions::new().write(true).open(&path)?;
                 file.seek(SeekFrom::Start(10))?;
-                file.write_all(&2_u16.to_be_bytes())?;
+                file.write_all(&3_u16.to_be_bytes())?;
                 file.sync_all()?;
             },
             _ => {

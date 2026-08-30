@@ -101,7 +101,8 @@ legitimate separate appends.
 
 ## Durability Frontier
 
-Format v2 encrypts frontier metadata as one independent frame:
+Format v3 writes frontier schema version 2 and encrypts the metadata as one
+independent frame:
 
 | Bytes | Field | Value or limit |
 | ---: | --- | --- |
@@ -109,7 +110,15 @@ Format v2 encrypts frontier metadata as one independent frame:
 | 2 | version | `1` |
 | 2 | frame algorithm | `1`, AES-256-GCM |
 | 4 | encrypted-frame length | at most 512 |
-| variable | encrypted frontier frame | plaintext is `durable_bytes:u64 || next_sequence:u64 || commit_position:u64` |
+| variable | encrypted frontier frame | plaintext is `durable_bytes:u64 || next_sequence:u64 || commit_position:u64 || retention_tag:u8 || maximum_ingest_time:i64` |
+
+`retention_tag` is `0` for an empty segment, `1` when complete lifecycle
+metadata is unavailable, and `2` when `maximum_ingest_time` is the authenticated
+aggregate of every Store Block appended to the segment. Non-Log Store and
+legacy frontier-v1 segments recover as unavailable and cannot be selected for
+destructive retention. The Log Store supplies lifecycle metadata while
+preparing canonical records; the Storage Kernel authenticates the aggregate in
+the frontier and derives deletion evidence from it after restart.
 
 The frontier frame purpose is `DurabilityFrontier`; its nonce sequence is
 `u64::MAX - encrypted_next_sequence`, disjoint from metadata and Store Block

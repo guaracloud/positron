@@ -66,6 +66,7 @@ pub enum SchemaSessionFailure {
     InFlight,
     PendingReconciliationRequired,
     ReplayIntegrity,
+    LogStore(positron_signals::LogStoreFailureCode),
 }
 
 impl std::fmt::Display for SchemaSessionFailure {

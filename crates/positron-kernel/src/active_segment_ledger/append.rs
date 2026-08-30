@@ -108,6 +108,16 @@ impl<'kernel> ActiveSegmentLedger<'kernel, '_> {
             .frontier
             .next()
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+        let segment = self.storage.segment_id()?;
+        let prior_retention = state
+            .blocks
+            .iter()
+            .rev()
+            .find(|committed| committed.segment == segment)
+            .map_or(super::SegmentRetention::Empty, |committed| {
+                committed.segment_retention
+            });
+        let segment_retention = prior_retention.append(block.retention_ingest_time);
         let content_digest = block.content_digest()?;
         let context = self
             .key
@@ -135,8 +145,11 @@ impl<'kernel> ActiveSegmentLedger<'kernel, '_> {
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
         let authenticator = match self.storage.append_and_commit(
             &self.key,
-            state.next_sequence,
-            position,
+            storage::NextFrontier {
+                sequence: state.next_sequence,
+                position,
+                segment_retention,
+            },
             frame_bytes,
             || {
                 DataProtection::protect_frame(&self.key, context, &frame_plaintext, limits)
@@ -162,13 +175,21 @@ impl<'kernel> ActiveSegmentLedger<'kernel, '_> {
                 return Err(failure);
             },
         };
+        for committed in state
+            .blocks
+            .iter_mut()
+            .filter(|committed| committed.segment == segment)
+        {
+            committed.segment_retention = segment_retention;
+        }
         state.blocks.push(CommittedBlock {
             identity: block.identity,
             position,
             payload: block.payload,
             content_digest,
-            segment: self.storage.segment_id()?,
+            segment,
             frontier_authenticator: authenticator,
+            segment_retention,
         });
         state.frontier = position;
         state.retained_bytes = retained_bytes;
@@ -177,7 +198,7 @@ impl<'kernel> ActiveSegmentLedger<'kernel, '_> {
             .checked_add(1)
             .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
         Ok(CommitReceipt {
-            segment: self.storage.segment_id()?,
+            segment,
             position,
             frontier_authenticator: authenticator,
         })

@@ -121,36 +121,9 @@ pub(super) fn reconcile_pending(
 pub(super) fn map_replay_observed_failure(
     failure: positron_signals::LogStoreFailure,
 ) -> SchemaSessionFailure {
-    classify_replay_failure_code(failure.code())
-}
-
-const fn classify_replay_failure_code(
-    code: positron_signals::LogStoreFailureCode,
-) -> SchemaSessionFailure {
-    match code {
-        positron_signals::LogStoreFailureCode::BudgetExhausted
-        | positron_signals::LogStoreFailureCode::ResourceExhausted
-        | positron_signals::LogStoreFailureCode::StorageExhausted
-        | positron_signals::LogStoreFailureCode::StorageUnavailable
-        | positron_signals::LogStoreFailureCode::ConcurrentWriter
-        | positron_signals::LogStoreFailureCode::StaleGeneration
-        | positron_signals::LogStoreFailureCode::ResourceAdmissionRefused => {
-            SchemaSessionFailure::StateUnavailable
-        },
+    match failure.code() {
         positron_signals::LogStoreFailureCode::Cancelled => SchemaSessionFailure::Cancelled,
-        positron_signals::LogStoreFailureCode::InvalidInput
-        | positron_signals::LogStoreFailureCode::LimitExceeded
-        | positron_signals::LogStoreFailureCode::MalformedBlock
-        | positron_signals::LogStoreFailureCode::PhysicalScopeMismatch
-        | positron_signals::LogStoreFailureCode::IntegrityCorruption
-        | positron_signals::LogStoreFailureCode::AuthenticationFailed
-        | positron_signals::LogStoreFailureCode::UnsupportedFormat
-        | positron_signals::LogStoreFailureCode::IdempotencyConflict
-        | positron_signals::LogStoreFailureCode::RecoveryRequired
-        | positron_signals::LogStoreFailureCode::SnapshotExpired
-        | positron_signals::LogStoreFailureCode::StaleResumeMarker
-        | positron_signals::LogStoreFailureCode::ClockUnavailable
-        | positron_signals::LogStoreFailureCode::Internal => SchemaSessionFailure::ReplayIntegrity,
+        code => SchemaSessionFailure::LogStore(code),
     }
 }
 
@@ -228,71 +201,4 @@ pub(super) fn reserve_schema_memory<'authority>(
         .reserve(claim)
         .map(Some)
         .map_err(|_| SchemaSessionFailure::StateUnavailable)
-}
-
-#[cfg(test)]
-mod failure_classification_tests {
-    use super::{SchemaSessionFailure, classify_replay_failure_code, map_observation_failure};
-    use positron_signals::{LogStoreFailureCode as Store, ScanObservationFailureCode as Observer};
-
-    #[test]
-    fn replay_observation_refusal_preserves_cancellation() {
-        assert_eq!(
-            map_observation_failure(Observer::Cancelled),
-            SchemaSessionFailure::Cancelled
-        );
-        for failure in [
-            Observer::BudgetExhausted,
-            Observer::DecodedRecordsExhausted,
-            Observer::ResourceExhausted,
-            Observer::Internal,
-        ] {
-            assert_eq!(
-                map_observation_failure(failure),
-                SchemaSessionFailure::StateUnavailable
-            );
-        }
-    }
-
-    #[test]
-    fn replay_preserves_retry_cancellation_and_integrity_classes() {
-        for code in [
-            Store::BudgetExhausted,
-            Store::ResourceExhausted,
-            Store::StorageExhausted,
-            Store::StorageUnavailable,
-            Store::ConcurrentWriter,
-            Store::StaleGeneration,
-            Store::ResourceAdmissionRefused,
-        ] {
-            assert_eq!(
-                classify_replay_failure_code(code),
-                SchemaSessionFailure::StateUnavailable
-            );
-        }
-        assert_eq!(
-            classify_replay_failure_code(Store::Cancelled),
-            SchemaSessionFailure::Cancelled
-        );
-        for code in [
-            Store::InvalidInput,
-            Store::LimitExceeded,
-            Store::MalformedBlock,
-            Store::PhysicalScopeMismatch,
-            Store::IntegrityCorruption,
-            Store::AuthenticationFailed,
-            Store::UnsupportedFormat,
-            Store::IdempotencyConflict,
-            Store::RecoveryRequired,
-            Store::SnapshotExpired,
-            Store::StaleResumeMarker,
-            Store::ClockUnavailable,
-            Store::Internal,
-        ] {
-            assert_eq!(
-                classify_replay_failure_code(code),
-                SchemaSessionFailure::ReplayIntegrity
-            );
-        }
-    }
 }

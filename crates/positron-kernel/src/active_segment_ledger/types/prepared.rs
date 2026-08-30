@@ -2,7 +2,7 @@ use crate::ResourceReservation;
 use crate::data_protection::DataProtection;
 use std::sync::OnceLock;
 
-use super::{LedgerFailure, LedgerFailureCode, SegmentScope, StoreBlockIdentity};
+use super::{IngestTime, LedgerFailure, LedgerFailureCode, SegmentScope, StoreBlockIdentity};
 use crate::active_segment_ledger::MAX_STORE_BLOCK_BYTES;
 
 /// Opaque canonical Store Block bytes and their caller-owned stable identity.
@@ -13,6 +13,7 @@ pub struct PreparedStoreBlock<'capacity> {
     pub(in crate::active_segment_ledger) content_digest: OnceLock<[u8; 32]>,
     pub(in crate::active_segment_ledger) preparation_capacity:
         Option<ResourceReservation<'capacity>>,
+    pub(in crate::active_segment_ledger) retention_ingest_time: Option<IngestTime>,
 }
 
 impl PreparedStoreBlock<'static> {
@@ -21,7 +22,7 @@ impl PreparedStoreBlock<'static> {
         identity: StoreBlockIdentity,
         bytes: Vec<u8>,
     ) -> Result<Self, LedgerFailure> {
-        Self::checked(scope, identity, bytes, None)
+        Self::checked(scope, identity, bytes, None, None)
     }
 }
 
@@ -42,7 +43,25 @@ impl<'capacity> PreparedStoreBlock<'capacity> {
         bytes: Vec<u8>,
         capacity: ResourceReservation<'capacity>,
     ) -> Result<Self, LedgerFailure> {
-        Self::checked(scope, identity, bytes, Some(capacity))
+        Self::checked(scope, identity, bytes, Some(capacity), None)
+    }
+
+    /// Carries Signal Store-derived lifecycle metadata into the authenticated
+    /// durability frontier without exposing it as a deletion selector.
+    pub fn new_with_preparation_capacity_and_ingest_time(
+        scope: SegmentScope,
+        identity: StoreBlockIdentity,
+        bytes: Vec<u8>,
+        capacity: ResourceReservation<'capacity>,
+        latest_ingest_time: IngestTime,
+    ) -> Result<Self, LedgerFailure> {
+        Self::checked(
+            scope,
+            identity,
+            bytes,
+            Some(capacity),
+            Some(latest_ingest_time),
+        )
     }
 
     fn checked(
@@ -50,6 +69,7 @@ impl<'capacity> PreparedStoreBlock<'capacity> {
         identity: StoreBlockIdentity,
         bytes: Vec<u8>,
         preparation_capacity: Option<ResourceReservation<'capacity>>,
+        retention_ingest_time: Option<IngestTime>,
     ) -> Result<Self, LedgerFailure> {
         if bytes.is_empty() || bytes.len() > MAX_STORE_BLOCK_BYTES {
             return Err(LedgerFailure::new(LedgerFailureCode::LimitExceeded));
@@ -60,6 +80,7 @@ impl<'capacity> PreparedStoreBlock<'capacity> {
             payload: bytes,
             content_digest: OnceLock::new(),
             preparation_capacity,
+            retention_ingest_time,
         })
     }
 }

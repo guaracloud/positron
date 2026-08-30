@@ -191,6 +191,7 @@ pub(crate) fn before_lease_marker_basis(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CatalogPublicationFault {
     SynchronizeCommit,
+    SynchronizeGenerationDirectory,
 }
 
 #[cfg(feature = "test-support")]
@@ -198,6 +199,9 @@ impl CatalogPublicationFault {
     const fn storage_event(self) -> CatalogFileEvent {
         match self {
             Self::SynchronizeCommit => CatalogFileEvent::SynchronizeCommit,
+            Self::SynchronizeGenerationDirectory => {
+                CatalogFileEvent::SynchronizeGenerationDirectory
+            },
         }
     }
 }

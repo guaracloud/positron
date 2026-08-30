@@ -114,10 +114,14 @@ impl<S: LifecycleClockSource> LifecycleClock<S> {
         *last = Some(assigned);
         Ok(IngestTime(assigned))
     }
+}
 
-    /// Mints a retention boundary from kernel-assigned time and a bounded
-    /// tenant-and-store duration. The caller cannot provide a wall-clock
-    /// instant or a physical segment selection.
+impl LifecycleClock<SystemLifecycleClockSource> {
+    /// Mints a destructive retention boundary from the production kernel
+    /// clock and a bounded tenant-and-store duration.
+    ///
+    /// Test and replay clocks may assign deterministic ingest time, but cannot
+    /// mint deletion authority.
     pub fn retention_cutoff(
         &self,
         retention_seconds: NonZeroU64,
@@ -199,14 +203,15 @@ mod tests {
 
     #[test]
     fn retention_cutoff_is_minted_from_kernel_time_with_explicit_provenance() {
-        let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(
-            12_000_000_000,
-        )));
+        let clock = LifecycleClock::new(SystemLifecycleClockSource);
         let cutoff = clock
             .retention_cutoff(std::num::NonZeroU64::new(2).expect("positive duration"))
             .expect("representable cutoff");
 
-        assert_eq!(cutoff.instant(), UnixNanoseconds::new(10_000_000_000));
+        assert_eq!(
+            cutoff.evaluated_at().value() - cutoff.instant().value(),
+            2_000_000_000
+        );
         assert_eq!(
             cutoff.provenance(),
             RetentionCutoffProvenance::LifecycleClock
@@ -214,21 +219,13 @@ mod tests {
     }
 
     #[test]
-    fn retention_cutoff_rejects_unrepresentable_duration_and_boundary() {
-        let duration_overflow =
-            LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(0)))
-                .retention_cutoff(NonZeroU64::new(u64::MAX).expect("nonzero duration"))
-                .expect_err("duration multiplication must remain bounded");
+    fn retention_cutoff_rejects_unrepresentable_duration() {
+        let duration_overflow = LifecycleClock::new(SystemLifecycleClockSource)
+            .retention_cutoff(NonZeroU64::new(u64::MAX).expect("nonzero duration"))
+            .expect_err("duration multiplication must remain bounded");
         assert_eq!(duration_overflow, LifecycleClockFailure::OutOfRange);
-
-        let boundary_overflow = LifecycleClock::new(FixedLifecycleClockSource::new(
-            UnixNanoseconds::new(i64::MIN),
-        ))
-        .retention_cutoff(NonZeroU64::new(1).expect("nonzero duration"))
-        .expect_err("cutoff subtraction must remain bounded");
-        assert_eq!(boundary_overflow, LifecycleClockFailure::OutOfRange);
         assert_eq!(
-            boundary_overflow.to_string(),
+            duration_overflow.to_string(),
             "lifecycle clock value is out of range"
         );
     }

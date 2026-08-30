@@ -277,6 +277,25 @@ pub struct CommittedBlock {
     pub(super) content_digest: [u8; 32],
     pub(super) segment: SegmentId,
     pub(super) frontier_authenticator: [u8; 32],
+    pub(super) segment_retention: SegmentRetention,
+}
+
+/// Authenticated aggregate lifecycle metadata for one physical segment.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SegmentRetention {
+    Empty,
+    Unavailable,
+    Complete(IngestTime),
+}
+
+impl SegmentRetention {
+    pub(super) fn append(self, ingest_time: Option<IngestTime>) -> Self {
+        match (self, ingest_time) {
+            (Self::Empty, Some(instant)) => Self::Complete(instant),
+            (Self::Complete(previous), Some(instant)) => Self::Complete(previous.max(instant)),
+            (Self::Empty | Self::Complete(_), None) | (Self::Unavailable, _) => Self::Unavailable,
+        }
+    }
 }
 
 /// Snapshot-bound evidence from a Signal Store's canonical block decoder.
@@ -367,11 +386,10 @@ impl LedgerSnapshot<'_> {
         &self.blocks
     }
 
-    /// Binds signal-decoded lifecycle evidence to one authenticated block.
+    /// Binds authenticated segment lifecycle metadata to one snapshot block.
     pub fn retention_evidence(
         &self,
         block: &CommittedBlock,
-        latest_ingest_time: IngestTime,
         bucket_duration_seconds: NonZeroU64,
     ) -> Result<BlockRetentionEvidence, LedgerFailure> {
         let authenticated = self.blocks.iter().find(|candidate| {
@@ -381,6 +399,12 @@ impl LedgerSnapshot<'_> {
         });
         let authenticated = authenticated
             .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::PhysicalScopeMismatch))?;
+        let latest_ingest_time = match authenticated.segment_retention {
+            SegmentRetention::Complete(instant) => instant,
+            SegmentRetention::Empty | SegmentRetention::Unavailable => {
+                return Err(LedgerFailure::new(LedgerFailureCode::UnsupportedFormat));
+            },
+        };
         Ok(BlockRetentionEvidence {
             scope: self.scope,
             catalog_identity: self.catalog_identity,

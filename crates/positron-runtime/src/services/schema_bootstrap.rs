@@ -38,6 +38,17 @@ pub(super) fn classify_replay_failure(failure: SchemaSessionFailure) -> ServiceF
                 positron_signals::ScanObservationFailureCode::Cancelled,
             ) => ServiceFailure::Cancelled,
         },
+        SchemaSessionFailure::LogStore(code) => match code {
+            positron_signals::LogStoreFailureCode::ResourceExhausted
+            | positron_signals::LogStoreFailureCode::StorageExhausted
+            | positron_signals::LogStoreFailureCode::BudgetExhausted
+            | positron_signals::LogStoreFailureCode::ClockUnavailable
+            | positron_signals::LogStoreFailureCode::ResourceAdmissionRefused => {
+                ServiceFailure::CapacityUnavailable
+            },
+            positron_signals::LogStoreFailureCode::Cancelled => ServiceFailure::Cancelled,
+            _ => ServiceFailure::CorruptState,
+        },
         SchemaSessionFailure::TenantConflict
         | SchemaSessionFailure::InFlight
         | SchemaSessionFailure::PendingReconciliationRequired

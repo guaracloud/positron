@@ -3,8 +3,9 @@ use std::sync::Arc;
 
 use positron_ingest::{SchemaReplayBuilder, load_schema_checkpoint};
 use positron_kernel::{
-    CatalogObject, CatalogProposal, FormatEpoch, RecoveryWorkClaim, RecoveryWorkKind,
-    ResourceAmounts, ResourceDimension, StoreBlockIdentity, TransactionId,
+    ActiveSegmentLedger, CatalogObject, CatalogProposal, FormatEpoch, PreparedStoreBlock,
+    RecoveryWorkClaim, RecoveryWorkKind, ResourceAmounts, ResourceDimension, StoreBlockIdentity,
+    TransactionId,
 };
 use prost::Message;
 
@@ -70,6 +71,54 @@ fn bootstrap_rejects_a_structurally_valid_mismatched_replay_frontier() -> Result
         None,
     )?;
     drop((basis, catalog, services));
+
+    assert!(matches!(
+        ServiceHandle::new(Arc::clone(&initialized)),
+        Err(ServiceFailure::CorruptState)
+    ));
+    Ok(())
+}
+
+#[test]
+fn bootstrap_preserves_authenticated_malformed_log_state_as_corruption()
+-> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let (initialized, ingest, _) = fixture.initialized()?;
+    let services = ServiceHandle::new(Arc::clone(&initialized))?;
+    assert_eq!(
+        services
+            .ingest_otlp_logs(&ingest, request("valid-before-malformed").encode_to_vec())?
+            .accepted_records(),
+        1
+    );
+    drop(services);
+
+    let catalog = open_catalog(&initialized)?;
+    let basis = catalog.pin()?;
+    let scope = basis
+        .reachable_ledger_scopes(
+            initialized.tenant,
+            positron_domain::routing::SignalKind::Logs,
+        )?
+        .into_iter()
+        .next()
+        .ok_or("missing log scope")?;
+    drop(basis);
+    let protection = initialized
+        .key
+        .segment_key(initialized.instance, scope)
+        .map_err(|_| "segment key")?;
+    let ledger = ActiveSegmentLedger::open(&initialized._authority, &catalog, scope, protection)
+        .map_err(|failure| format!("reopen ledger: {failure:?}"))?;
+    ledger
+        .append(PreparedStoreBlock::new(
+            scope,
+            StoreBlockIdentity::new([0xd4; 16])?,
+            b"authenticated-but-not-a-log-store-block".to_vec(),
+        )?)
+        .map_err(|failure| format!("append malformed block: {failure:?}"))?;
+    drop(ledger);
+    drop(catalog);
 
     assert!(matches!(
         ServiceHandle::new(Arc::clone(&initialized)),

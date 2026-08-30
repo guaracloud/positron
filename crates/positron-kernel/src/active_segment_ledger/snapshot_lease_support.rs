@@ -101,6 +101,33 @@ pub(crate) fn snapshot_from_record<'kernel>(
     if record.scope != ledger.scope || record.frontier > state.frontier {
         return Err(LedgerFailure::new(LedgerFailureCode::SnapshotExpired));
     }
+    let maximum_bytes = record.blocks.iter().try_fold(0_usize, |total, expected| {
+        let bytes = state
+            .blocks
+            .iter()
+            .find(|actual| {
+                actual.identity == expected.identity
+                    && actual.position == expected.position
+                    && actual.segment == expected.segment
+            })
+            .map_or(super::super::MAX_STORE_BLOCK_BYTES, |block| {
+                block.payload.len()
+            });
+        total
+            .checked_add(bytes)
+            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))
+    })?;
+    let maximum_claim = crate::WorkClaim::tenant(
+        record.scope.tenant,
+        crate::WorkKind::InteractiveQueryTail,
+        super::super::capacity::snapshot_retained_claim(maximum_bytes, record.blocks.len())?,
+    )
+    .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+    let mut capacity = ledger
+        .authority
+        .governor()
+        .reserve(maximum_claim)
+        .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
     let blocks = blocks_for_record(ledger, state, record)?;
     let bytes = blocks
         .iter()
@@ -108,16 +135,11 @@ pub(crate) fn snapshot_from_record<'kernel>(
             total.checked_add(block.payload.len())
         })
         .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
-    let claim = crate::WorkClaim::tenant(
-        record.scope.tenant,
-        crate::WorkKind::InteractiveQueryTail,
-        super::super::capacity::snapshot_retained_claim(bytes, blocks.len())?,
-    )
-    .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
-    let capacity = ledger
-        .authority
-        .governor()
-        .reserve(claim)
+    capacity
+        .try_resize_preserving_capacity(super::super::capacity::snapshot_retained_claim(
+            bytes,
+            blocks.len(),
+        )?)
         .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
     Ok(LedgerSnapshot {
         _capacity: capacity,

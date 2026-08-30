@@ -180,10 +180,20 @@ impl LogStore {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let bytes = codec::encode_block(tenant, &stored, encoded_bytes)?;
+        let latest_ingest_time = stored
+            .iter()
+            .map(StoredLogRecord::ingest_time)
+            .max()
+            .ok_or_else(LogStoreFailure::invalid_input)?;
         let scope = SegmentScope::new(tenant, SignalKind::Logs, shard);
-        let block =
-            PreparedStoreBlock::new_with_preparation_capacity(scope, identity, bytes, capacity)
-                .map_err(LogStoreFailure::kernel)?;
+        let block = PreparedStoreBlock::new_with_preparation_capacity_and_ingest_time(
+            scope,
+            identity,
+            bytes,
+            capacity,
+            latest_ingest_time,
+        )
+        .map_err(LogStoreFailure::kernel)?;
         Ok(PreparedLogBlock::new(block))
     }
 
@@ -239,10 +249,10 @@ impl LogStore {
     }
 
     /// Enforces retention for one tenant-scoped Log Store ledger.
-    pub fn enforce_retention<'kernel, 'catalog, S: LifecycleClockSource>(
+    pub fn enforce_retention<'kernel, 'catalog>(
         &self,
         ledger: &positron_kernel::ActiveSegmentLedger<'kernel, 'catalog>,
-        clock: &LifecycleClock<S>,
+        clock: &LifecycleClock<positron_kernel::SystemLifecycleClockSource>,
         tenant: TenantId,
         policy: LogRetentionPolicy,
     ) -> Result<LogRetentionOutcome, LogStoreFailure> {
@@ -257,10 +267,10 @@ impl LogStore {
     }
 
     /// Enforces retention with cooperative cancellation and bounded work observation.
-    pub fn enforce_retention_observed<'kernel, 'catalog, S: LifecycleClockSource>(
+    pub fn enforce_retention_observed<'kernel, 'catalog>(
         &self,
         ledger: &positron_kernel::ActiveSegmentLedger<'kernel, 'catalog>,
-        clock: &LifecycleClock<S>,
+        clock: &LifecycleClock<positron_kernel::SystemLifecycleClockSource>,
         tenant: TenantId,
         policy: LogRetentionPolicy,
         cancellation: &dyn ScanCancellation,
