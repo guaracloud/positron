@@ -26,7 +26,7 @@ use positron_kernel::{
 pub use failure::{LogStoreFailure, LogStoreFailureCode};
 pub use metadata::LogMetadata;
 pub use positron_policy::PolicyProvenance;
-pub use retention::{LogRetentionOutcome, LogRetentionPolicy, RetentionClockProvenance};
+pub use retention::{LogRetentionBucket, LogRetentionOutcome, LogRetentionPolicy};
 pub use scan::{
     LogScan, LogScanResult, ScanCancellation, ScanLimit, ScanObservationFailureCode, ScanObserver,
     ScannedLogRecord,
@@ -246,7 +246,27 @@ impl LogStore {
         tenant: TenantId,
         policy: LogRetentionPolicy,
     ) -> Result<LogRetentionOutcome, LogStoreFailure> {
-        retention::enforce_retention(ledger, clock, tenant, policy)
+        self.enforce_retention_observed(
+            ledger,
+            clock,
+            tenant,
+            policy,
+            &scan::NeverCancelled,
+            &scan::Unobserved,
+        )
+    }
+
+    /// Enforces retention with cooperative cancellation and bounded work observation.
+    pub fn enforce_retention_observed<'kernel, 'catalog, S: LifecycleClockSource>(
+        &self,
+        ledger: &positron_kernel::ActiveSegmentLedger<'kernel, 'catalog>,
+        clock: &LifecycleClock<S>,
+        tenant: TenantId,
+        policy: LogRetentionPolicy,
+        cancellation: &dyn ScanCancellation,
+        observer: &dyn ScanObserver,
+    ) -> Result<LogRetentionOutcome, LogStoreFailure> {
+        retention::enforce_retention(ledger, clock, tenant, policy, cancellation, observer)
     }
 }
 

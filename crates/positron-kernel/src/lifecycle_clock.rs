@@ -1,12 +1,12 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
+use std::num::NonZeroU64;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use positron_domain::time::UnixNanoseconds;
 
-/// Maximum wall-clock reconciliation movement accepted for age-derived work.
-const SAFE_RECONCILIATION_BOUND: UnixNanoseconds = UnixNanoseconds::new(300_000_000_000);
+const NANOS_PER_SECOND: u64 = 1_000_000_000;
 
 /// A kernel-assigned timestamp that cannot be constructed from caller values.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -21,6 +21,36 @@ impl IngestTime {
     pub(crate) const fn from_authenticated_durable(instant: UnixNanoseconds) -> Self {
         Self(instant)
     }
+}
+
+/// Kernel-minted age boundary for one retention evaluation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetentionCutoff {
+    instant: UnixNanoseconds,
+    evaluated_at: UnixNanoseconds,
+}
+
+impl RetentionCutoff {
+    #[must_use]
+    pub const fn instant(self) -> UnixNanoseconds {
+        self.instant
+    }
+
+    #[must_use]
+    pub const fn evaluated_at(self) -> UnixNanoseconds {
+        self.evaluated_at
+    }
+
+    #[must_use]
+    pub const fn provenance(self) -> RetentionCutoffProvenance {
+        RetentionCutoffProvenance::LifecycleClock
+    }
+}
+
+/// Stable provenance for destructive age evaluation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RetentionCutoffProvenance {
+    LifecycleClock,
 }
 
 /// Trusted wall-clock adapter used only by the Storage Kernel Lifecycle Clock.
@@ -62,14 +92,7 @@ impl LifecycleClockSource for FixedLifecycleClockSource {
 /// The kernel time authority that assigns non-decreasing Ingest Time.
 pub struct LifecycleClock<S> {
     source: S,
-    state: Mutex<ClockState>,
-    safe_reconciliation_bound: UnixNanoseconds,
-}
-
-#[derive(Clone, Copy)]
-struct ClockState {
-    last: Option<UnixNanoseconds>,
-    uncertain: bool,
+    last: Mutex<Option<UnixNanoseconds>>,
 }
 
 impl<S: LifecycleClockSource> LifecycleClock<S> {
@@ -77,82 +100,57 @@ impl<S: LifecycleClockSource> LifecycleClock<S> {
     pub const fn new(source: S) -> Self {
         Self {
             source,
-            state: Mutex::new(ClockState {
-                last: None,
-                uncertain: false,
-            }),
-            safe_reconciliation_bound: SAFE_RECONCILIATION_BOUND,
+            last: Mutex::new(None),
         }
     }
 
     pub fn assign_ingest_time(&self) -> Result<IngestTime, LifecycleClockFailure> {
         let observed = self.source.read()?;
         let mut last = self
-            .state
+            .last
             .lock()
             .map_err(|_| LifecycleClockFailure::Unavailable)?;
-        if let Some(previous) = last.last {
-            if exceeds_bound(previous, observed, self.safe_reconciliation_bound) {
-                last.uncertain = true;
-                return Ok(IngestTime(previous));
-            }
-            if last.uncertain {
-                last.uncertain = false;
-            }
-        }
-        let assigned = last
-            .last
-            .map_or(observed, |previous| previous.max(observed));
-        last.last = Some(assigned);
+        let assigned = last.map_or(observed, |previous| previous.max(observed));
+        *last = Some(assigned);
         Ok(IngestTime(assigned))
     }
 
-    /// Assigns a lifecycle time only when wall-clock reconciliation is safe.
-    /// Ingestion may continue from the last safe anchor while this operation
-    /// refuses age-derived destructive work.
-    pub fn retention_time(&self) -> Result<IngestTime, LifecycleClockFailure> {
-        let observed = self.source.read()?;
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| LifecycleClockFailure::Unavailable)?;
-        if let Some(previous) = state.last {
-            if exceeds_bound(previous, observed, self.safe_reconciliation_bound) {
-                state.uncertain = true;
-                return Err(LifecycleClockFailure::Uncertain);
-            }
-            if state.uncertain {
-                state.uncertain = false;
-            }
-        }
-        let assigned = state
-            .last
-            .map_or(observed, |previous| previous.max(observed));
-        state.last = Some(assigned);
-        Ok(IngestTime(assigned))
+    /// Mints a retention boundary from kernel-assigned time and a bounded
+    /// tenant-and-store duration. The caller cannot provide a wall-clock
+    /// instant or a physical segment selection.
+    pub fn retention_cutoff(
+        &self,
+        retention_seconds: NonZeroU64,
+    ) -> Result<RetentionCutoff, LifecycleClockFailure> {
+        let now = self.assign_ingest_time()?.instant();
+        let retention_nanos = retention_seconds
+            .get()
+            .checked_mul(NANOS_PER_SECOND)
+            .and_then(|value| i64::try_from(value).ok())
+            .ok_or(LifecycleClockFailure::OutOfRange)?;
+        let instant = now
+            .value()
+            .checked_sub(retention_nanos)
+            .map(UnixNanoseconds::new)
+            .ok_or(LifecycleClockFailure::OutOfRange)?;
+        Ok(RetentionCutoff {
+            instant,
+            evaluated_at: now,
+        })
     }
-}
-
-fn exceeds_bound(
-    previous: UnixNanoseconds,
-    observed: UnixNanoseconds,
-    bound: UnixNanoseconds,
-) -> bool {
-    let distance = i128::from(observed.value()) - i128::from(previous.value());
-    distance.unsigned_abs() > u128::from(bound.value().unsigned_abs())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LifecycleClockFailure {
     Unavailable,
-    Uncertain,
+    OutOfRange,
 }
 
 impl Display for LifecycleClockFailure {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
             Self::Unavailable => "lifecycle clock unavailable",
-            Self::Uncertain => "lifecycle clock uncertain",
+            Self::OutOfRange => "lifecycle clock value is out of range",
         })
     }
 }
@@ -200,29 +198,38 @@ mod tests {
     }
 
     #[test]
-    fn retention_pauses_on_large_wall_clock_movement_until_reconciled() {
-        let clock = LifecycleClock::new(SequenceSource(Mutex::new(vec![
-            UnixNanoseconds::new(10),
-            UnixNanoseconds::new(1_000_000_000_000),
-            UnixNanoseconds::new(10),
-        ])));
+    fn retention_cutoff_is_minted_from_kernel_time_with_explicit_provenance() {
+        let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(
+            12_000_000_000,
+        )));
+        let cutoff = clock
+            .retention_cutoff(std::num::NonZeroU64::new(2).expect("positive duration"))
+            .expect("representable cutoff");
+
+        assert_eq!(cutoff.instant(), UnixNanoseconds::new(10_000_000_000));
         assert_eq!(
-            clock.assign_ingest_time().expect("anchor").instant(),
-            UnixNanoseconds::new(10)
+            cutoff.provenance(),
+            RetentionCutoffProvenance::LifecycleClock
         );
+    }
+
+    #[test]
+    fn retention_cutoff_rejects_unrepresentable_duration_and_boundary() {
+        let duration_overflow =
+            LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(0)))
+                .retention_cutoff(NonZeroU64::new(u64::MAX).expect("nonzero duration"))
+                .expect_err("duration multiplication must remain bounded");
+        assert_eq!(duration_overflow, LifecycleClockFailure::OutOfRange);
+
+        let boundary_overflow = LifecycleClock::new(FixedLifecycleClockSource::new(
+            UnixNanoseconds::new(i64::MIN),
+        ))
+        .retention_cutoff(NonZeroU64::new(1).expect("nonzero duration"))
+        .expect_err("cutoff subtraction must remain bounded");
+        assert_eq!(boundary_overflow, LifecycleClockFailure::OutOfRange);
         assert_eq!(
-            clock
-                .retention_time()
-                .expect_err("large movement is uncertain"),
-            LifecycleClockFailure::Uncertain
-        );
-        assert_eq!(
-            clock.retention_time().expect("return to anchor").instant(),
-            UnixNanoseconds::new(10)
-        );
-        assert_eq!(
-            LifecycleClockFailure::Uncertain.to_string(),
-            "lifecycle clock uncertain"
+            boundary_overflow.to_string(),
+            "lifecycle clock value is out of range"
         );
     }
 }

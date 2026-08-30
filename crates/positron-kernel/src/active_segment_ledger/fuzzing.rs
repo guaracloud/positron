@@ -1,17 +1,20 @@
+use std::collections::BTreeSet;
 use std::fs;
+use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use positron_domain::identity::TenantId;
 use positron_domain::routing::{SignalKind, VirtualShardId};
+use positron_domain::time::UnixNanoseconds;
 
 use crate::catalog::fuzz_authority;
 use crate::{Catalog, CatalogSecret, InstanceId, MountQualification, PrimaryDataVolume};
 
 use super::fault::{LedgerFileEvent, with_ledger_fault};
 use super::{
-    ActiveSegmentLedger, LedgerFailureCode, PreparedStoreBlock, SegmentProtectionKey, SegmentScope,
-    SnapshotLeaseId, SnapshotLeaseUsage, StoreBlockIdentity,
+    ActiveSegmentLedger, LedgerFailureCode, LedgerSnapshot, PreparedStoreBlock,
+    SegmentProtectionKey, SegmentScope, SnapshotLeaseId, SnapshotLeaseUsage, StoreBlockIdentity,
 };
 
 mod oracle;
@@ -68,9 +71,11 @@ pub(super) fn fuzz_active_segment_stateful(data: &[u8]) {
     let mut ledger = open(&authority, &catalog, scope).expect("fresh ledger opens");
     let mut oracle = Oracle::new();
     let mut lease: Option<(SnapshotLeaseId, u64)> = None;
+    let mut protected_snapshot: Option<LedgerSnapshot<'_>> = None;
 
     for (index, selector) in data.iter().copied().take(24).enumerate() {
-        match selector % 19 {
+        let operation = selector % 23;
+        match operation {
             0 => {
                 let (identity, payload) = block_parts(index, selector);
                 let receipt = ledger
@@ -145,7 +150,7 @@ pub(super) fn fuzz_active_segment_stateful(data: &[u8]) {
                 }
             },
             7..=12 => {
-                let artifact = PersistedArtifact::from_operation(selector % 19)
+                let artifact = PersistedArtifact::from_operation(operation)
                     .expect("the corruption operation is in range");
                 assert_eq!(run_persisted_corruption_case(artifact, selector), artifact);
             },
@@ -196,7 +201,61 @@ pub(super) fn fuzz_active_segment_stateful(data: &[u8]) {
                     );
                 }
             },
+            19 => {
+                protected_snapshot = Some(ledger.snapshot().expect("protected fuzz snapshot"));
+            },
+            20 => {
+                protected_snapshot = None;
+            },
+            21 => {
+                let snapshot = ledger.snapshot().expect("retention evidence snapshot");
+                let active = ledger.active_segment_id().expect("active segment identity");
+                let evidence_clock = crate::LifecycleClock::new(
+                    crate::FixedLifecycleClockSource::new(UnixNanoseconds::new(1_000_000_000)),
+                );
+                let evidence_time = evidence_clock
+                    .assign_ingest_time()
+                    .expect("fixed evidence time");
+                let duration = NonZeroU64::new(1).expect("positive fuzz duration");
+                let mut retired = BTreeSet::new();
+                let evidence = snapshot
+                    .blocks()
+                    .iter()
+                    .filter(|block| block.segment_id() != active)
+                    .map(|block| {
+                        retired.insert(block.segment_id());
+                        snapshot
+                            .retention_evidence(block, evidence_time, duration)
+                            .expect("snapshot-bound fuzz evidence")
+                    })
+                    .collect::<Vec<_>>();
+                drop(snapshot);
+                let now_nanos = i64::try_from(fuzz_now())
+                    .ok()
+                    .and_then(|seconds| seconds.checked_mul(1_000_000_000))
+                    .expect("current fuzz time is representable");
+                let cutoff = crate::LifecycleClock::new(crate::FixedLifecycleClockSource::new(
+                    UnixNanoseconds::new(now_nanos),
+                ))
+                .retention_cutoff(duration)
+                .expect("fixed fuzz cutoff");
+                let outcome = ledger
+                    .retire_expired_sealed_segments(cutoff, &evidence)
+                    .expect("bounded fuzz retention");
+                assert!(outcome.logically_retired_segments() >= retired.len());
+                oracle.retire_segments(&retired);
+            },
+            22 => {
+                drop(ledger);
+                let Some(recovered) = recover_or_stop(&authority, &catalog, scope) else {
+                    return;
+                };
+                ledger = recovered;
+            },
             _ => {},
+        }
+        if let Some(snapshot) = &protected_snapshot {
+            assert!(snapshot.frontier() <= oracle.frontier());
         }
         oracle.assert_ledger(&ledger);
     }

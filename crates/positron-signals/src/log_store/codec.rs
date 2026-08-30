@@ -131,20 +131,15 @@ pub(super) fn decode_block(
     )
 }
 
-pub(super) fn block_retention_range(
+pub(super) fn block_retention_range_observed(
     expected_tenant: TenantId,
     snapshot: &LedgerSnapshot<'_>,
     bytes: &[u8],
-) -> Result<Option<i64>, LogStoreFailure> {
-    let decoder = BlockDecode::new(expected_tenant, bytes)?;
-    let count = decoder.record_count();
-    let decoded = decoder.decode(snapshot, count, &super::scan::NeverCancelled)?;
-    let mut latest = None;
-    for record in decoded.records {
-        let instant = record.ingest_time().instant().value();
-        latest = Some(latest.map_or(instant, |current: i64| current.max(instant)));
-    }
-    Ok(latest)
+    cancellation: &dyn super::ScanCancellation,
+    observer: &dyn super::ScanObserver,
+) -> Result<Option<positron_kernel::IngestTime>, LogStoreFailure> {
+    BlockDecode::observed(expected_tenant, bytes, cancellation, observer)?
+        .retention_range(snapshot, cancellation)
 }
 
 pub(super) fn decode_block_cancellable(
@@ -263,6 +258,35 @@ impl<'input> BlockDecode<'input> {
             self.limits,
             self.count,
         )
+    }
+
+    pub(super) fn retention_range(
+        mut self,
+        snapshot: &LedgerSnapshot<'_>,
+        cancellation: &dyn super::ScanCancellation,
+    ) -> Result<Option<positron_kernel::IngestTime>, LogStoreFailure> {
+        let mut latest = None;
+        for _ in 0..self.count {
+            if cancellation.is_cancelled() {
+                return Err(LogStoreFailure::cancelled());
+            }
+            let ingest_time = snapshot.reconstruct_ingest_time(record::retention_ingest_time(
+                &mut self.input,
+                self.limits,
+                self.version,
+            )?);
+            self.input.observe_decoded_record()?;
+            latest = Some(
+                latest.map_or(ingest_time, |current: positron_kernel::IngestTime| {
+                    current.max(ingest_time)
+                }),
+            );
+        }
+        self.input.finish_component_observation()?;
+        if !self.input.is_empty() {
+            return Err(LogStoreFailure::malformed_block());
+        }
+        Ok(latest)
     }
 
     #[cfg(fuzzing)]

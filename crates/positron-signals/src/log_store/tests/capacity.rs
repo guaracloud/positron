@@ -151,7 +151,7 @@ fn preparation_capacity_is_continuous_through_commit_and_every_terminal_path()
             .governor()
             .inspect()?
             .outstanding_for(WorkClass::Ingest),
-        baseline.outstanding_for(WorkClass::Ingest) + 1
+        baseline.outstanding_for(WorkClass::Ingest)
     );
     ledger.seal()?;
     assert_accounting(&authority, empty)?;

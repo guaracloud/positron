@@ -6,8 +6,24 @@ pub(super) fn recovery_claim() -> ResourceAmounts {
     ResourceAmounts::new([2_500_000, 1, 1, 2_500_000, 1_024, 0, 1, 1, 1, 6, 0])
 }
 
-pub(super) fn retention_claim() -> ResourceAmounts {
-    ResourceAmounts::new([1_048_576, 1, 1, 1_048_576, 1_024, 0, 1, 1, 1, 6, 1_048_576])
+pub(super) fn retention_claim(
+    block_bytes: usize,
+    blocks: usize,
+) -> Result<ResourceAmounts, LedgerFailure> {
+    let bytes = u64::try_from(block_bytes)
+        .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+    let items =
+        u64::try_from(blocks).map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+    let memory = bytes
+        .checked_add(
+            items
+                .checked_mul(128)
+                .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?,
+        )
+        .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+    Ok(ResourceAmounts::new([
+        memory, 1, 1, bytes, items, 0, 1, 1, 1, 6, bytes,
+    ]))
 }
 
 pub(super) fn append_claim(block_bytes: usize) -> Result<ResourceAmounts, LedgerFailure> {
@@ -87,6 +103,7 @@ mod tests {
             snapshot_retained_claim(usize::MAX, usize::MAX)
                 .expect_err("snapshot arithmetic overflow"),
             lease_claim(usize::MAX).expect_err("lease arithmetic overflow"),
+            retention_claim(usize::MAX, usize::MAX).expect_err("retention arithmetic overflow"),
         ] {
             assert_eq!(failure.code(), LedgerFailureCode::LimitExceeded);
         }

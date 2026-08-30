@@ -60,10 +60,23 @@ const fn map_store_failure_code(code: positron_signals::LogStoreFailureCode) -> 
         positron_signals::LogStoreFailureCode::PhysicalScopeMismatch => {
             QueryFailureCode::MalformedPersistentData
         },
-        positron_signals::LogStoreFailureCode::Kernel
-        | positron_signals::LogStoreFailureCode::ClockUnavailable
-        | positron_signals::LogStoreFailureCode::ClockUncertain => {
+        positron_signals::LogStoreFailureCode::StorageUnavailable
+        | positron_signals::LogStoreFailureCode::ConcurrentWriter
+        | positron_signals::LogStoreFailureCode::IdempotencyConflict
+        | positron_signals::LogStoreFailureCode::StaleGeneration
+        | positron_signals::LogStoreFailureCode::ClockUnavailable => {
             QueryFailureCode::StoreUnavailable
+        },
+        positron_signals::LogStoreFailureCode::IntegrityCorruption
+        | positron_signals::LogStoreFailureCode::AuthenticationFailed
+        | positron_signals::LogStoreFailureCode::UnsupportedFormat
+        | positron_signals::LogStoreFailureCode::RecoveryRequired => {
+            QueryFailureCode::MalformedPersistentData
+        },
+        positron_signals::LogStoreFailureCode::SnapshotExpired => QueryFailureCode::SnapshotExpired,
+        positron_signals::LogStoreFailureCode::StaleResumeMarker => QueryFailureCode::InvalidCursor,
+        positron_signals::LogStoreFailureCode::StorageExhausted => {
+            QueryFailureCode::ResourceExhausted
         },
         positron_signals::LogStoreFailureCode::ResourceAdmissionRefused => {
             QueryFailureCode::ResourceAdmissionRefused
@@ -194,12 +207,51 @@ mod tests {
             QueryFailureCode::MalformedPersistentData
         );
         assert_eq!(
-            map_store_failure_code(positron_signals::LogStoreFailureCode::Kernel),
+            map_store_failure_code(positron_signals::LogStoreFailureCode::StorageUnavailable),
             QueryFailureCode::StoreUnavailable
+        );
+        assert_eq!(
+            map_store_failure_code(positron_signals::LogStoreFailureCode::IntegrityCorruption),
+            QueryFailureCode::MalformedPersistentData
+        );
+        assert_eq!(
+            map_store_failure_code(positron_signals::LogStoreFailureCode::UnsupportedFormat),
+            QueryFailureCode::MalformedPersistentData
+        );
+        assert_eq!(
+            map_store_failure_code(positron_signals::LogStoreFailureCode::SnapshotExpired),
+            QueryFailureCode::SnapshotExpired
+        );
+        assert_eq!(
+            map_store_failure_code(positron_signals::LogStoreFailureCode::StorageExhausted),
+            QueryFailureCode::ResourceExhausted
         );
         assert_eq!(
             map_store_failure_code(positron_signals::LogStoreFailureCode::ClockUnavailable),
             QueryFailureCode::StoreUnavailable
+        );
+        for code in [
+            positron_signals::LogStoreFailureCode::AuthenticationFailed,
+            positron_signals::LogStoreFailureCode::RecoveryRequired,
+        ] {
+            assert_eq!(
+                map_store_failure_code(code),
+                QueryFailureCode::MalformedPersistentData
+            );
+        }
+        for code in [
+            positron_signals::LogStoreFailureCode::ConcurrentWriter,
+            positron_signals::LogStoreFailureCode::IdempotencyConflict,
+            positron_signals::LogStoreFailureCode::StaleGeneration,
+        ] {
+            assert_eq!(
+                map_store_failure_code(code),
+                QueryFailureCode::StoreUnavailable
+            );
+        }
+        assert_eq!(
+            map_store_failure_code(positron_signals::LogStoreFailureCode::StaleResumeMarker),
+            QueryFailureCode::InvalidCursor
         );
     }
 

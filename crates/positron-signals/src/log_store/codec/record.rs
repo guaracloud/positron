@@ -68,6 +68,24 @@ pub(super) fn validate_structure(
     limits: CodecLimits,
     version: u16,
 ) -> Result<(), LogStoreFailure> {
+    validate_structure_with_ingest_time(input, limits, version).map(|_| ())
+}
+
+/// Validates the complete record without materializing semantic values and
+/// returns only the authenticated Ingest Time needed by retention.
+pub(super) fn retention_ingest_time(
+    input: &mut Input<'_>,
+    limits: CodecLimits,
+    version: u16,
+) -> Result<UnixNanoseconds, LogStoreFailure> {
+    validate_structure_with_ingest_time(input, limits, version)
+}
+
+fn validate_structure_with_ingest_time(
+    input: &mut Input<'_>,
+    limits: CodecLimits,
+    version: u16,
+) -> Result<UnixNanoseconds, LogStoreFailure> {
     input.observe_component()?;
     decode_event_time(input)?;
     match input.u8()? {
@@ -90,7 +108,7 @@ pub(super) fn validate_structure(
             .observe_metadata(0)
             .map_err(|_| LogStoreFailure::malformed_block())?;
     }
-    input.i64()?;
+    let ingest_time = UnixNanoseconds::new(input.i64()?);
     match input.u8()? {
         0 => {},
         1 => {
@@ -129,7 +147,7 @@ pub(super) fn validate_structure(
             .map_err(|_| LogStoreFailure::malformed_block())?;
     }
     validate_policy(input)?;
-    Ok(())
+    Ok(ingest_time)
 }
 
 fn decode_metadata(

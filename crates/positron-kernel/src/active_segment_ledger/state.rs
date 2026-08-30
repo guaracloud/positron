@@ -9,8 +9,7 @@ use super::{
 };
 
 pub(super) struct LedgerState<'kernel> {
-    pub(super) _capacity: ResourceReservation<'kernel>,
-    pub(super) retained_reservations: Vec<(super::SegmentId, ResourceReservation<'kernel>)>,
+    pub(super) retained_capacity: ResourceReservation<'kernel>,
     pub(super) frontier: CommitPosition,
     pub(super) blocks: Vec<CommittedBlock>,
     pub(super) retained_bytes: usize,

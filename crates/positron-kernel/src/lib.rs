@@ -92,11 +92,12 @@ pub use catalog::{GovernanceFixtureObject, GovernanceFixtureTarget};
 #[cfg(feature = "test-support")]
 pub use active_segment_ledger::publish_snapshot_lease_marker_for_test;
 pub use active_segment_ledger::{
-    ActiveSegmentLedger, AppendCancellation, CommitReceipt, CommittedBlock, CommittedLedgerReader,
-    LedgerCompletionState, LedgerFailure, LedgerFailureCode, LedgerSnapshot,
-    MAX_SNAPSHOT_LEASE_TTL_SECONDS, PreparedStoreBlock, RetentionReclamation, SealedSegment,
-    SegmentId, SegmentProtectionKey, SegmentScope, SnapshotLeaseAttempt, SnapshotLeaseGrant,
-    SnapshotLeaseId, SnapshotLeaseReplacement, SnapshotLeaseUsage, StoreBlockIdentity,
+    ActiveSegmentLedger, AppendCancellation, BlockRetentionEvidence, CommitReceipt, CommittedBlock,
+    CommittedLedgerReader, LedgerCompletionState, LedgerFailure, LedgerFailureCode, LedgerSnapshot,
+    MAX_SNAPSHOT_LEASE_TTL_SECONDS, PreparedStoreBlock, RetentionBucket, RetentionReclamation,
+    SealedSegment, SegmentId, SegmentProtectionKey, SegmentScope, SnapshotLeaseAttempt,
+    SnapshotLeaseGrant, SnapshotLeaseId, SnapshotLeaseReplacement, SnapshotLeaseUsage,
+    StoreBlockIdentity,
 };
 
 pub use data_protection::{
@@ -112,7 +113,7 @@ pub use instance_bootstrap_storage::{
 
 pub use lifecycle_clock::{
     FixedLifecycleClockSource, IngestTime, LifecycleClock, LifecycleClockFailure,
-    LifecycleClockSource, SystemLifecycleClockSource,
+    LifecycleClockSource, RetentionCutoff, RetentionCutoffProvenance, SystemLifecycleClockSource,
 };
 
 pub use resource_governor::{

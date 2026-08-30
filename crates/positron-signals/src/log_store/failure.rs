@@ -11,10 +11,19 @@ pub enum LogStoreFailureCode {
     LimitExceeded,
     MalformedBlock,
     PhysicalScopeMismatch,
-    Kernel,
+    StorageUnavailable,
+    IntegrityCorruption,
+    AuthenticationFailed,
+    ConcurrentWriter,
+    UnsupportedFormat,
+    StorageExhausted,
+    IdempotencyConflict,
+    StaleGeneration,
+    RecoveryRequired,
+    SnapshotExpired,
+    StaleResumeMarker,
     ResourceExhausted,
     ClockUnavailable,
-    ClockUncertain,
     ResourceAdmissionRefused,
     Cancelled,
     BudgetExhausted,
@@ -64,12 +73,6 @@ impl LogStoreFailure {
         }
     }
 
-    pub(super) const fn clock_uncertain() -> Self {
-        Self {
-            code: LogStoreFailureCode::ClockUncertain,
-        }
-    }
-
     pub(super) const fn resource_admission_refused() -> Self {
         Self {
             code: LogStoreFailureCode::ResourceAdmissionRefused,
@@ -105,15 +108,60 @@ impl LogStoreFailure {
         }
     }
 
-    pub(super) fn kernel(_failure: LedgerFailure) -> Self {
+    pub(super) fn kernel(failure: LedgerFailure) -> Self {
         Self {
-            code: LogStoreFailureCode::Kernel,
+            code: classify_ledger_failure_code(failure.code()),
         }
     }
 
     #[must_use]
     pub const fn code(&self) -> LogStoreFailureCode {
         self.code
+    }
+}
+
+pub(crate) const fn classify_ledger_failure_code(
+    code: positron_kernel::LedgerFailureCode,
+) -> LogStoreFailureCode {
+    match code {
+        positron_kernel::LedgerFailureCode::InvalidInput => LogStoreFailureCode::InvalidInput,
+        positron_kernel::LedgerFailureCode::PhysicalScopeMismatch => {
+            LogStoreFailureCode::PhysicalScopeMismatch
+        },
+        positron_kernel::LedgerFailureCode::LimitExceeded => LogStoreFailureCode::LimitExceeded,
+        positron_kernel::LedgerFailureCode::ResourceAdmissionRefused => {
+            LogStoreFailureCode::ResourceAdmissionRefused
+        },
+        positron_kernel::LedgerFailureCode::StorageUnavailable => {
+            LogStoreFailureCode::StorageUnavailable
+        },
+        positron_kernel::LedgerFailureCode::IntegrityCorruption => {
+            LogStoreFailureCode::IntegrityCorruption
+        },
+        positron_kernel::LedgerFailureCode::AuthenticationFailed => {
+            LogStoreFailureCode::AuthenticationFailed
+        },
+        positron_kernel::LedgerFailureCode::ConcurrentWriter => {
+            LogStoreFailureCode::ConcurrentWriter
+        },
+        positron_kernel::LedgerFailureCode::UnsupportedFormat => {
+            LogStoreFailureCode::UnsupportedFormat
+        },
+        positron_kernel::LedgerFailureCode::StorageExhausted => {
+            LogStoreFailureCode::StorageExhausted
+        },
+        positron_kernel::LedgerFailureCode::IdempotencyConflict => {
+            LogStoreFailureCode::IdempotencyConflict
+        },
+        positron_kernel::LedgerFailureCode::StaleGeneration => LogStoreFailureCode::StaleGeneration,
+        positron_kernel::LedgerFailureCode::RecoveryRequired => {
+            LogStoreFailureCode::RecoveryRequired
+        },
+        positron_kernel::LedgerFailureCode::Cancelled => LogStoreFailureCode::Cancelled,
+        positron_kernel::LedgerFailureCode::SnapshotExpired => LogStoreFailureCode::SnapshotExpired,
+        positron_kernel::LedgerFailureCode::StaleResumeMarker => {
+            LogStoreFailureCode::StaleResumeMarker
+        },
     }
 }
 
@@ -147,7 +195,7 @@ impl From<positron_policy::PolicyProvenanceFailure> for LogStoreFailure {
 
 #[cfg(test)]
 mod tests {
-    use super::{LogStoreFailure, LogStoreFailureCode};
+    use super::{LogStoreFailure, LogStoreFailureCode, classify_ledger_failure_code};
     use crate::log_store::ScanObservationFailureCode;
 
     #[test]
@@ -172,14 +220,100 @@ mod tests {
         let ledger = positron_kernel::SnapshotLeaseId::new([0; 16])
             .expect_err("zero lease identity must remain invalid");
         let kernel = LogStoreFailure::kernel(ledger);
-        assert_eq!(kernel.code(), LogStoreFailureCode::Kernel);
-        assert_eq!(kernel.to_string(), "log store failure: Kernel");
+        assert_eq!(kernel.code(), LogStoreFailureCode::InvalidInput);
+        assert_eq!(kernel.to_string(), "log store failure: InvalidInput");
     }
 
     #[test]
-    fn decoded_record_budget_observation_maps_to_public_limit_failure() {
-        let failure =
-            LogStoreFailure::observation(ScanObservationFailureCode::DecodedRecordsExhausted);
-        assert_eq!(failure.code(), LogStoreFailureCode::LimitExceeded);
+    fn observation_failures_preserve_their_public_meaning() {
+        for (observation, expected) in [
+            (
+                ScanObservationFailureCode::BudgetExhausted,
+                LogStoreFailureCode::BudgetExhausted,
+            ),
+            (
+                ScanObservationFailureCode::DecodedRecordsExhausted,
+                LogStoreFailureCode::LimitExceeded,
+            ),
+            (
+                ScanObservationFailureCode::Cancelled,
+                LogStoreFailureCode::Cancelled,
+            ),
+            (
+                ScanObservationFailureCode::ResourceExhausted,
+                LogStoreFailureCode::ResourceExhausted,
+            ),
+            (
+                ScanObservationFailureCode::Internal,
+                LogStoreFailureCode::Internal,
+            ),
+        ] {
+            assert_eq!(LogStoreFailure::observation(observation).code(), expected);
+        }
+    }
+
+    #[test]
+    fn every_kernel_failure_keeps_its_exact_log_store_class() {
+        use positron_kernel::LedgerFailureCode as Kernel;
+
+        for (kernel, expected) in [
+            (Kernel::InvalidInput, LogStoreFailureCode::InvalidInput),
+            (
+                Kernel::PhysicalScopeMismatch,
+                LogStoreFailureCode::PhysicalScopeMismatch,
+            ),
+            (Kernel::LimitExceeded, LogStoreFailureCode::LimitExceeded),
+            (
+                Kernel::ResourceAdmissionRefused,
+                LogStoreFailureCode::ResourceAdmissionRefused,
+            ),
+            (
+                Kernel::StorageUnavailable,
+                LogStoreFailureCode::StorageUnavailable,
+            ),
+            (
+                Kernel::IntegrityCorruption,
+                LogStoreFailureCode::IntegrityCorruption,
+            ),
+            (
+                Kernel::AuthenticationFailed,
+                LogStoreFailureCode::AuthenticationFailed,
+            ),
+            (
+                Kernel::ConcurrentWriter,
+                LogStoreFailureCode::ConcurrentWriter,
+            ),
+            (
+                Kernel::UnsupportedFormat,
+                LogStoreFailureCode::UnsupportedFormat,
+            ),
+            (
+                Kernel::StorageExhausted,
+                LogStoreFailureCode::StorageExhausted,
+            ),
+            (
+                Kernel::IdempotencyConflict,
+                LogStoreFailureCode::IdempotencyConflict,
+            ),
+            (
+                Kernel::StaleGeneration,
+                LogStoreFailureCode::StaleGeneration,
+            ),
+            (
+                Kernel::RecoveryRequired,
+                LogStoreFailureCode::RecoveryRequired,
+            ),
+            (Kernel::Cancelled, LogStoreFailureCode::Cancelled),
+            (
+                Kernel::SnapshotExpired,
+                LogStoreFailureCode::SnapshotExpired,
+            ),
+            (
+                Kernel::StaleResumeMarker,
+                LogStoreFailureCode::StaleResumeMarker,
+            ),
+        ] {
+            assert_eq!(classify_ledger_failure_code(kernel), expected);
+        }
     }
 }

@@ -86,17 +86,6 @@ impl<'kernel> ActiveSegmentLedger<'kernel, '_> {
                 .try_resize(amounts)
                 .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
         }
-        let retained = WorkClaim::tenant(
-            self.scope.tenant,
-            WorkKind::Ingest,
-            retained_claim(block.payload.len(), 1)?,
-        )
-        .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
-        let retained_reservation = self
-            .authority
-            .governor()
-            .reserve(retained)
-            .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
         let claim = RecoveryWorkClaim::tenant(
             self.scope.tenant,
             RecoveryWorkKind::DurabilityCompletion,
@@ -139,6 +128,11 @@ impl<'kernel> ActiveSegmentLedger<'kernel, '_> {
         frame_plaintext.extend_from_slice(&block.payload);
         let frame_bytes = DataProtection::protected_frame_length(frame_plaintext.len(), limits)
             .map_err(map_frame_failure)?;
+        let previous_retained = state.retained_capacity.granted();
+        state
+            .retained_capacity
+            .try_resize_preserving_capacity(retained_claim(retained_bytes, block_count)?)
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
         let authenticator = match self.storage.append_and_commit(
             &self.key,
             state.next_sequence,
@@ -156,7 +150,13 @@ impl<'kernel> ActiveSegmentLedger<'kernel, '_> {
             },
         ) {
             Ok(authenticator) => authenticator,
-            Err(storage::AppendFailure::RejectedBeforeMutation(failure)) => return Err(failure),
+            Err(storage::AppendFailure::RejectedBeforeMutation(failure)) => {
+                state
+                    .retained_capacity
+                    .try_resize_preserving_capacity(previous_retained)
+                    .map_err(|_| LedgerFailure::new(LedgerFailureCode::RecoveryRequired))?;
+                return Err(failure);
+            },
             Err(storage::AppendFailure::SegmentMutated(failure)) => {
                 state.poisoned = true;
                 return Err(failure);
@@ -170,9 +170,6 @@ impl<'kernel> ActiveSegmentLedger<'kernel, '_> {
             segment: self.storage.segment_id()?,
             frontier_authenticator: authenticator,
         });
-        state
-            .retained_reservations
-            .push((self.storage.segment_id()?, retained_reservation));
         state.frontier = position;
         state.retained_bytes = retained_bytes;
         state.next_sequence = state

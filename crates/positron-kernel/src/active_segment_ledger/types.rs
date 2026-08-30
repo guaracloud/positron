@@ -1,4 +1,5 @@
 use std::fmt::Formatter;
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -72,6 +73,65 @@ impl SegmentScope {
             *lifecycle = 1;
         }
         key
+    }
+}
+
+/// Fixed ingest-time interval scoped to one tenant and Signal Store.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetentionBucket {
+    tenant: TenantId,
+    signal: SignalKind,
+    start: UnixNanoseconds,
+    end_exclusive: UnixNanoseconds,
+}
+
+impl RetentionBucket {
+    pub fn for_ingest_time(
+        tenant: TenantId,
+        signal: SignalKind,
+        ingest_time: IngestTime,
+        duration_seconds: NonZeroU64,
+    ) -> Result<Self, LedgerFailure> {
+        let width = duration_seconds
+            .get()
+            .checked_mul(1_000_000_000)
+            .and_then(|value| i64::try_from(value).ok())
+            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+        let start = ingest_time
+            .instant()
+            .value()
+            .div_euclid(width)
+            .checked_mul(width)
+            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+        let end_exclusive = start
+            .checked_add(width)
+            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+        Ok(Self {
+            tenant,
+            signal,
+            start: UnixNanoseconds::new(start),
+            end_exclusive: UnixNanoseconds::new(end_exclusive),
+        })
+    }
+
+    #[must_use]
+    pub const fn tenant(self) -> TenantId {
+        self.tenant
+    }
+
+    #[must_use]
+    pub const fn signal_kind(self) -> SignalKind {
+        self.signal
+    }
+
+    #[must_use]
+    pub const fn start(self) -> UnixNanoseconds {
+        self.start
+    }
+
+    #[must_use]
+    pub const fn end_exclusive(self) -> UnixNanoseconds {
+        self.end_exclusive
     }
 }
 
@@ -219,6 +279,22 @@ pub struct CommittedBlock {
     pub(super) frontier_authenticator: [u8; 32],
 }
 
+/// Snapshot-bound evidence from a Signal Store's canonical block decoder.
+///
+/// The Storage Kernel consumes this evidence only after matching every field
+/// back to the authenticated snapshot and deriving complete sealed-segment
+/// candidates itself.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlockRetentionEvidence {
+    pub(super) scope: SegmentScope,
+    pub(super) catalog_identity: crate::CatalogGenerationId,
+    pub(super) block: StoreBlockIdentity,
+    pub(super) content_digest: [u8; 32],
+    pub(super) segment: SegmentId,
+    pub(super) latest_ingest_time: IngestTime,
+    pub(super) bucket: RetentionBucket,
+}
+
 impl CommittedBlock {
     #[must_use]
     pub const fn identity(&self) -> StoreBlockIdentity {
@@ -289,6 +365,36 @@ impl LedgerSnapshot<'_> {
     #[must_use]
     pub fn blocks(&self) -> &[CommittedBlock] {
         &self.blocks
+    }
+
+    /// Binds signal-decoded lifecycle evidence to one authenticated block.
+    pub fn retention_evidence(
+        &self,
+        block: &CommittedBlock,
+        latest_ingest_time: IngestTime,
+        bucket_duration_seconds: NonZeroU64,
+    ) -> Result<BlockRetentionEvidence, LedgerFailure> {
+        let authenticated = self.blocks.iter().find(|candidate| {
+            candidate.identity == block.identity
+                && candidate.segment == block.segment
+                && candidate.content_digest == block.content_digest
+        });
+        let authenticated = authenticated
+            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::PhysicalScopeMismatch))?;
+        Ok(BlockRetentionEvidence {
+            scope: self.scope,
+            catalog_identity: self.catalog_identity,
+            block: authenticated.identity,
+            content_digest: authenticated.content_digest,
+            segment: authenticated.segment,
+            latest_ingest_time,
+            bucket: RetentionBucket::for_ingest_time(
+                self.scope.tenant,
+                self.scope.signal,
+                latest_ingest_time,
+                bucket_duration_seconds,
+            )?,
+        })
     }
 }
 

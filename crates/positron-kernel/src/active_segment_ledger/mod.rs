@@ -34,7 +34,6 @@ mod types;
 #[cfg(test)]
 mod tests;
 
-use std::collections::BTreeMap;
 use std::fmt::Formatter;
 use std::sync::{Arc, Mutex};
 
@@ -210,7 +209,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
         let base_claim = WorkClaim::tenant(scope.tenant, WorkKind::Ingest, retained_claim(0, 0)?)
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
-        let reservation = authority
+        let mut retained_capacity = authority
             .governor()
             .reserve(base_claim)
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
@@ -236,32 +235,9 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         let frontier = reconstruction.frontier;
         let recovered_active = reconstruction.recovered_active;
 
-        let mut recovered_capacity = Vec::new();
-        let mut retained_by_segment = BTreeMap::<SegmentId, (usize, usize)>::new();
-        for block in &blocks {
-            let entry = retained_by_segment.entry(block.segment_id()).or_default();
-            entry.0 = entry
-                .0
-                .checked_add(block.payload.len())
-                .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
-            entry.1 = entry
-                .1
-                .checked_add(1)
-                .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
-        }
-        for (segment, (bytes, count)) in retained_by_segment {
-            let claim = WorkClaim::tenant(
-                scope.tenant,
-                WorkKind::Ingest,
-                retained_claim(bytes, count)?,
-            )
-            .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
-            let reservation = authority
-                .governor()
-                .reserve(claim)
-                .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
-            recovered_capacity.push((segment, reservation));
-        }
+        retained_capacity
+            .try_resize_preserving_capacity(retained_claim(retained_bytes, blocks.len())?)
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
         let successor = fresh_metadata(scope, frontier)?;
         let key = storage.create_active(successor, &protection, catalog.instance())?;
         if let Some((predecessor, _recovered_key)) = recovered_active {
@@ -287,8 +263,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             protection,
             key,
             state: Mutex::new(LedgerState {
-                _capacity: reservation,
-                retained_reservations: recovered_capacity,
+                retained_capacity,
                 frontier,
                 blocks,
                 retained_bytes,
@@ -324,17 +299,17 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         self.storage.segment_id()
     }
 
-    /// Atomically removes complete sealed segments from new snapshots.
+    /// Atomically removes complete expired sealed segments from new snapshots.
     ///
-    /// Physical reclamation is intentionally a later kernel-owned phase. The
-    /// retired metadata remains authenticated and reachable until that phase
-    /// proves that no protected snapshot or lease still references it.
-    pub fn retire_sealed_segments(
+    /// The kernel derives candidates by matching complete block evidence to
+    /// authenticated current metadata. Callers cannot select segment IDs or
+    /// provide a raw wall-clock/reclamation time.
+    pub fn retire_expired_sealed_segments(
         &self,
-        segments: &[SegmentId],
-        now: u64,
+        cutoff: crate::RetentionCutoff,
+        evidence: &[BlockRetentionEvidence],
     ) -> Result<RetentionReclamation, LedgerFailure> {
-        retention::retire_sealed_segments(self, segments, now)
+        retention::retire_expired_sealed_segments(self, cutoff, evidence)
     }
 
     /// Builds an immutable snapshot for an already-admitted task. The caller's
