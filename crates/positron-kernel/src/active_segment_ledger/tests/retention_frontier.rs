@@ -8,10 +8,14 @@ use positron_domain::time::UnixNanoseconds;
 use super::support::{TemporaryRoot, establish_authority};
 use crate::retention_time::RetentionTimeAuthority;
 use crate::{
-    ActiveSegmentLedger, Catalog, CatalogObject, CatalogProposal, CatalogPublicationFault,
-    CatalogSecret, FormatEpoch, InstanceId, LedgerFailureCode, MountQualification,
-    PrimaryDataVolume, RecoveryWorkClaim, RecoveryWorkKind, ResourceAmounts, ResourceDimension,
-    SegmentProtectionKey, SegmentScope, StoreBlockIdentity, TransactionId, WorkClaim, WorkKind,
+    ActiveSegmentLedger, Catalog, CatalogObject, CatalogProposal, CatalogSecret, FormatEpoch,
+    InstanceId, LedgerFailureCode, MountQualification, PrimaryDataVolume, ResourceAmounts,
+    ResourceDimension, SegmentProtectionKey, SegmentScope, StoreBlockIdentity, TransactionId,
+    WorkClaim, WorkKind,
+};
+#[cfg(feature = "test-support")]
+use crate::{
+    CatalogPublicationFault, RecoveryWorkClaim, RecoveryWorkKind,
     with_catalog_publication_fault_after,
 };
 
