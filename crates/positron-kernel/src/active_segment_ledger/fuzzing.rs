@@ -8,8 +8,9 @@ use positron_domain::routing::{SignalKind, VirtualShardId};
 
 use crate::catalog::fuzz_authority;
 use crate::{
-    Catalog, CatalogSecret, InstanceId, MountQualification, PrimaryDataVolume, ResourceAmounts,
-    ResourceDimension, RetentionTimeAuthority, StorageKernelResourceAuthority, WorkClaim, WorkKind,
+    Catalog, CatalogObject, CatalogProposal, CatalogSecret, FormatEpoch, InstanceId,
+    MountQualification, PrimaryDataVolume, ResourceAmounts, ResourceDimension,
+    RetentionTimeAuthority, StorageKernelResourceAuthority, TransactionId, WorkClaim, WorkKind,
 };
 
 use super::fault::{LedgerFileEvent, with_ledger_fault};
@@ -62,13 +63,11 @@ pub(super) fn fuzz_active_segment_stateful(data: &[u8]) {
     let Some(authority) = fuzz_authority(volume) else {
         return;
     };
-    let catalog = Catalog::open(
-        &authority,
-        InstanceId::new([0x81; 16]).expect("fixed instance identity"),
-        catalog_secret(),
-    )
-    .expect("fuzz catalog opens");
+    let instance = InstanceId::new([0x81; 16]).expect("fixed instance identity");
+    let catalog =
+        Catalog::open(&authority, instance, catalog_secret()).expect("fuzz catalog opens");
     let scope = scope();
+    install_retention_policy(&catalog, instance, scope.tenant_id());
     let (retention_time, elapsed) = RetentionTimeAuthority::establish_with_manual_elapsed(
         positron_domain::time::UnixNanoseconds::new(1_000_000_000),
     );
@@ -180,10 +179,15 @@ pub(super) fn fuzz_active_segment_stateful(data: &[u8]) {
             },
             13 => {
                 if lease.is_none() {
-                    let now = fuzz_now();
-                    let expiry = now.checked_add(30).expect("fuzz lease expiry is bounded");
-                    if let Ok(grant) = ledger.create_snapshot_lease(now, expiry) {
-                        lease = Some((grant.identity(), expiry, Oracle::capture(grant.snapshot())));
+                    if let Ok(grant) = ledger.create_snapshot_lease_for(
+                        fuzz_now(),
+                        NonZeroU64::new(30).expect("positive fuzz lease duration"),
+                    ) {
+                        lease = Some((
+                            grant.identity(),
+                            grant.expiry(),
+                            Oracle::capture(grant.snapshot()),
+                        ));
                     }
                 }
             },
@@ -213,6 +217,18 @@ pub(super) fn fuzz_active_segment_stateful(data: &[u8]) {
             },
             17 => {
                 if let Some((identity, expiry, _)) = lease.take() {
+                    let current = 1_u64
+                        .checked_add(elapsed.nanoseconds() / 1_000_000_000)
+                        .expect("bounded fuzz lease observation");
+                    if let Some(delta) = expiry.checked_sub(current) {
+                        elapsed
+                            .advance(
+                                delta
+                                    .checked_mul(1_000_000_000)
+                                    .expect("bounded fuzz lease movement"),
+                            )
+                            .expect("bounded fuzz lease expiry movement");
+                    }
                     assert_eq!(
                         ledger
                             .resume_snapshot_lease(identity, expiry)
@@ -260,7 +276,7 @@ pub(super) fn fuzz_active_segment_stateful(data: &[u8]) {
                     protected.extend(expected.segments());
                 }
                 let outcome = ledger
-                    .begin_retention(duration)
+                    .begin_retention()
                     .expect("bounded fuzz retention evaluation")
                     .commit()
                     .expect("bounded fuzz retention");
@@ -302,6 +318,63 @@ pub(super) fn fuzz_active_segment_stateful(data: &[u8]) {
         recovered.snapshot().expect("final frontier").frontier(),
         oracle.frontier()
     );
+}
+
+pub(super) fn fuzz_retention_prepared_block(
+    data: &[u8],
+    exercise: impl FnOnce(&ActiveSegmentLedger<'_, '_>, TenantId),
+) {
+    if data.is_empty() || data.len() > 1_048_576 {
+        return;
+    }
+    let Some(root) = FuzzRoot::new() else {
+        return;
+    };
+    let Some(volume) = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost).ok()
+    else {
+        return;
+    };
+    let Some(authority) = fuzz_authority(volume) else {
+        return;
+    };
+    let instance = InstanceId::new([0x85; 16]).expect("fixed retention fuzz instance");
+    let catalog = Catalog::open(&authority, instance, catalog_secret())
+        .expect("retention fuzz catalog opens");
+    let scope = scope();
+    install_retention_policy(&catalog, instance, scope.tenant_id());
+    let (retention_time, elapsed) = RetentionTimeAuthority::establish_with_manual_elapsed(
+        positron_domain::time::UnixNanoseconds::new(1_000_000_000),
+    );
+    let sealed =
+        open(&authority, &retention_time, &catalog, scope).expect("retention fuzz ledger opens");
+    let capacity = authority
+        .governor()
+        .reserve(
+            WorkClaim::tenant(
+                scope.tenant_id(),
+                WorkKind::Ingest,
+                ResourceAmounts::only(ResourceDimension::MemoryBytes, 1_048_576)
+                    .expect("bounded retention fuzz capacity"),
+            )
+            .expect("retention fuzz claim"),
+        )
+        .expect("retention fuzz reservation");
+    let block = sealed
+        .begin_store_block(
+            capacity,
+            StoreBlockIdentity::new([0x86; 16]).expect("retention fuzz block identity"),
+        )
+        .expect("retention fuzz preparation")
+        .finish(data.to_vec())
+        .expect("bounded retention fuzz block");
+    sealed.append(block).expect("retention fuzz append");
+    sealed.seal().expect("retention fuzz seal");
+    elapsed
+        .advance(2_000_000_000)
+        .expect("bounded retention fuzz elapsed time");
+    let active = open(&authority, &retention_time, &catalog, scope)
+        .expect("retention fuzz active ledger opens");
+    exercise(&active, scope.tenant_id());
 }
 
 fn fuzz_now() -> u64 {
@@ -381,6 +454,61 @@ fn recover_or_stop<'authority, 'catalog>(
 
 fn catalog_secret() -> CatalogSecret {
     CatalogSecret::from_owned(Box::new([0x82; 32]), Box::new([0x83; 32]))
+}
+
+fn install_retention_policy(catalog: &Catalog<'_>, instance: InstanceId, tenant: TenantId) {
+    let basis = catalog.pin().expect("fuzz policy basis");
+    catalog
+        .commit(
+            basis.identity(),
+            CatalogProposal::new(
+                TransactionId::new([0x84; 16]).expect("fuzz policy transaction"),
+                FormatEpoch::CATALOG_V1,
+                vec![
+                    CatalogObject::new(governance_policy(instance, tenant))
+                        .expect("bounded fuzz policy"),
+                ],
+            )
+            .expect("fuzz policy proposal"),
+            None,
+        )
+        .expect("fuzz policy publication");
+}
+
+fn governance_policy(instance: InstanceId, tenant: TenantId) -> Vec<u8> {
+    let slug = b"fuzz-tenant";
+    let display = b"Fuzz tenant";
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(b"POSGOV03");
+    encoded.extend_from_slice(&instance.to_bytes());
+    encoded.extend_from_slice(&tenant.to_bytes());
+    encoded.push(u8::try_from(slug.len()).expect("bounded fuzz slug"));
+    encoded.extend_from_slice(slug);
+    encoded.push(u8::try_from(display.len()).expect("bounded fuzz display"));
+    encoded.extend_from_slice(display);
+    encoded.extend_from_slice(&[0x11; 16]);
+    encoded.extend_from_slice(&[0x21; 32]);
+    encoded.extend_from_slice(&[0x22; 32]);
+    encoded.extend_from_slice(&[0x12; 16]);
+    encoded.extend_from_slice(&[0x23; 32]);
+    encoded.extend_from_slice(&[0x24; 32]);
+    encoded.extend_from_slice(&[0x13; 16]);
+    encoded.extend_from_slice(&[0x25; 32]);
+    encoded.extend_from_slice(&[0x26; 32]);
+    encoded.extend_from_slice(&[0x27; 32]);
+    encoded.extend_from_slice(&[0x28; 32]);
+    encoded.extend_from_slice(&1_u16.to_be_bytes());
+    encoded.push(0x29);
+    encoded.extend_from_slice(&1_u16.to_be_bytes());
+    encoded.push(0x2a);
+    encoded.extend_from_slice(&1_u64.to_be_bytes());
+    encoded.extend_from_slice(&1_u64.to_be_bytes());
+    encoded.extend_from_slice(&1_u32.to_be_bytes());
+    for _ in 0..11 {
+        encoded.extend_from_slice(&1_u64.to_be_bytes());
+    }
+    encoded.extend_from_slice(&[1, 4, 0, 1, 1]);
+    encoded
 }
 
 fn scope() -> SegmentScope {

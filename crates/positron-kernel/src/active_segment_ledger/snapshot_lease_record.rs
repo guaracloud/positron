@@ -2,6 +2,12 @@ use positron_domain::routing::CommitPosition;
 
 use super::{LedgerFailure, LedgerFailureCode, SegmentId, SegmentScope, StoreBlockIdentity};
 
+#[derive(Clone, Copy)]
+pub(super) struct LeaseWindow {
+    pub(super) observed: u64,
+    pub(super) expiry: u64,
+}
+
 /// Release 1 hard system ceiling for one Snapshot Lease lifetime.
 ///
 /// This is deliberately compiled rather than configurable in Release 1 so

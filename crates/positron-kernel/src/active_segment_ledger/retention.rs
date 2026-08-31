@@ -16,13 +16,16 @@ pub(super) fn commit(
         .state
         .lock()
         .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
+    state.require_healthy()?;
     ledger.catalog.refresh_state()?;
     let basis = ledger.catalog.pin()?;
-    if let Some(identity) = evaluation.policy_object {
-        if basis.object(identity)?.is_none() {
-            return Err(LedgerFailure::new(LedgerFailureCode::StaleGeneration));
-        }
-    } else if basis.identity() != evaluation.catalog_identity {
+    let current_policy = basis.log_retention_policy()?;
+    if current_policy != evaluation.policy {
+        return Err(LedgerFailure::new(LedgerFailureCode::StaleGeneration));
+    }
+    if state.retention_frontier != evaluation.expected_retention_frontier
+        || state.retention_readiness != evaluation.expected_retention_readiness
+    {
         return Err(LedgerFailure::new(LedgerFailureCode::StaleGeneration));
     }
     if state.blocks != evaluation.blocks {

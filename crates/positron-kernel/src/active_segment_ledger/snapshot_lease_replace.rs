@@ -8,7 +8,9 @@ use super::snapshot_lease::snapshot_lease_support::{
 use super::snapshot_lease_codec::decode;
 use super::snapshot_lease_codec::encode;
 use super::snapshot_lease_grant::SnapshotLeaseGrant;
-use super::snapshot_lease_record::{LeaseBlock, LeaseRecord, SnapshotLeaseId, SnapshotLeaseUsage};
+use super::snapshot_lease_record::{
+    LeaseBlock, LeaseRecord, LeaseWindow, SnapshotLeaseId, SnapshotLeaseUsage,
+};
 use super::{ActiveSegmentLedger, LedgerCompletionState, LedgerFailure, LedgerFailureCode};
 
 /// A prepared replacement keeps the old durable lease authoritative until the
@@ -209,7 +211,13 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         if self.retention_time.is_some() {
             return Err(LedgerFailure::new(LedgerFailureCode::InvalidInput));
         }
-        self.prepare_snapshot_lease_replacement_internal(old_identity, now, expiry)
+        self.prepare_snapshot_lease_replacement_internal(
+            old_identity,
+            LeaseWindow {
+                observed: now,
+                expiry,
+            },
+        )
     }
 
     pub fn prepare_snapshot_lease_replacement_for<'lease>(
@@ -228,16 +236,22 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         let expiry = now
             .checked_add(ttl.get())
             .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
-        self.prepare_snapshot_lease_replacement_internal(old_identity, now, expiry)
+        self.prepare_snapshot_lease_replacement_internal(
+            old_identity,
+            LeaseWindow {
+                observed: now,
+                expiry,
+            },
+        )
     }
 
     fn prepare_snapshot_lease_replacement_internal<'lease>(
         &'lease self,
         old_identity: SnapshotLeaseId,
-        now: u64,
-        expiry: u64,
+        window: LeaseWindow,
     ) -> Result<SnapshotLeaseReplacement<'lease, 'kernel, 'catalog>, LedgerFailure> {
-        let now = self.lease_operation_time(now)?;
+        let now = window.observed;
+        let expiry = window.expiry;
         if !super::snapshot_lease_record::valid_lease_interval(now, expiry) {
             return Err(LedgerFailure::new(LedgerFailureCode::InvalidInput));
         }

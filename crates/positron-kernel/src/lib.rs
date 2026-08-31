@@ -78,9 +78,9 @@ mod retention_time;
 
 pub use catalog::{
     AuditIntent, Catalog, CatalogCommit, CatalogFailure, CatalogFailureCode, CatalogGenerationId,
-    CatalogObject, CatalogObjectId, CatalogProposal, CatalogRotation, CatalogSecret,
-    CatalogSnapshot, CatalogWrappingKey, FormatEpoch, GovernanceAuditRecord, InstanceId,
-    TransactionId,
+    CatalogGovernanceObject, CatalogGovernanceVersion, CatalogLogRetentionPolicy, CatalogObject,
+    CatalogObjectId, CatalogProposal, CatalogRotation, CatalogSecret, CatalogSnapshot,
+    CatalogWrappingKey, FormatEpoch, GovernanceAuditRecord, InstanceId, TransactionId,
 };
 #[cfg(feature = "test-support")]
 pub use catalog::{
@@ -157,7 +157,7 @@ pub use catalog::fuzz_catalog_stateful;
 
 #[cfg(fuzzing)]
 #[doc(hidden)]
-pub use active_segment_ledger::fuzz_active_segment_stateful;
+pub use active_segment_ledger::{fuzz_active_segment_stateful, fuzz_retention_prepared_block};
 
 #[cfg(fuzzing)]
 #[doc(hidden)]

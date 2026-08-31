@@ -35,6 +35,11 @@ enum ElapsedSource {
     System(Instant),
     #[cfg(any(test, fuzzing, feature = "test-support"))]
     Manual(Arc<AtomicU64>),
+    #[cfg(test)]
+    Stepping {
+        elapsed: AtomicU64,
+        step: u64,
+    },
 }
 
 impl ElapsedSource {
@@ -44,6 +49,12 @@ impl ElapsedSource {
                 .map_err(|_| LifecycleClockFailure::OutOfRange),
             #[cfg(any(test, fuzzing, feature = "test-support"))]
             Self::Manual(elapsed) => Ok(elapsed.load(Ordering::Acquire)),
+            #[cfg(test)]
+            Self::Stepping { elapsed, step } => elapsed
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    current.checked_add(*step)
+                })
+                .map_err(|_| LifecycleClockFailure::OutOfRange),
         }
     }
 }
@@ -93,6 +104,19 @@ impl RetentionTimeAuthority {
             },
             ManualRetentionTime(elapsed),
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn establish_with_stepping_elapsed(epoch: UnixNanoseconds, step: u64) -> Self {
+        Self {
+            epoch,
+            elapsed: ElapsedSource::Stepping {
+                elapsed: AtomicU64::new(0),
+                step,
+            },
+            destructive_retention: true,
+            scopes: Mutex::new(BTreeMap::new()),
+        }
     }
 
     /// Constructs deterministic Ingest Time authority for cross-crate tests.

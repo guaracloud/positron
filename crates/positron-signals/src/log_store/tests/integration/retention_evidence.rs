@@ -214,11 +214,11 @@ fn reconstructed_caller_time_cannot_retire_fresh_authenticated_data() -> Result<
             .code(),
         positron_kernel::LedgerFailureCode::IntegrityCorruption,
     );
-    let duration = NonZeroU64::new(1).ok_or("positive retention duration")?;
     let legacy_payload = block.payload().to_vec();
     drop(snapshot);
+    let _policy = retention_policy(&catalog, &active, tenant, 1)?;
     let outcome = active
-        .begin_retention(duration)?
+        .begin_retention()?
         .commit()
         .map_err(|failure| format!("retire fresh retention ledger: {failure:?}"))?;
     assert_eq!(outcome.logically_retired_segments(), 0);
@@ -930,11 +930,10 @@ fn partial_physical_reclamation_requires_recovery_and_retries_idempotently()
         scope,
         key(),
     )?;
+    let _policy = retention_policy(&catalog, &active, tenant, 1)?;
     let protected = active.snapshot()?;
     assert_eq!(protected.blocks().len(), 2);
-    let retired = active
-        .begin_retention(NonZeroU64::new(1).ok_or("duration")?)?
-        .commit()?;
+    let retired = active.begin_retention()?.commit()?;
     assert_eq!(retired.logically_retired_segments(), 2);
     assert_eq!(retired.physically_reclaimed_segments(), 0);
     assert!(active.snapshot()?.blocks().is_empty());
@@ -1019,7 +1018,7 @@ fn partial_physical_reclamation_requires_recovery_and_retries_idempotently()
         reader_failure.code(),
         positron_kernel::LedgerFailureCode::RecoveryRequired
     );
-    let retention_failure = match active.begin_retention(NonZeroU64::new(1).ok_or("duration")?) {
+    let retention_failure = match active.begin_retention() {
         Ok(_) => return Err("retention continued on a partially reclaimed live ledger".into()),
         Err(failure) => failure,
     };
@@ -1056,9 +1055,7 @@ fn partial_physical_reclamation_requires_recovery_and_retries_idempotently()
         key(),
     )?;
     assert!(restarted.snapshot()?.blocks().is_empty());
-    restarted
-        .begin_retention(NonZeroU64::new(1).ok_or("duration")?)?
-        .commit()?;
+    restarted.begin_retention()?.commit()?;
     assert!(!second_path.exists());
     assert_same_resource_usage(&baseline, &authority.governor().inspect()?);
     Ok(())
@@ -1106,6 +1103,7 @@ fn retired_lease_resume_reserves_capacity_before_recovery_reads() -> Result<(), 
             )?
             .into_store_block(),
     )?;
+    let leased_payload = ledger.snapshot()?.blocks()[0].payload().to_vec();
     let lifecycle = retention_clock();
     let now = u64::try_from(
         lifecycle
@@ -1171,6 +1169,19 @@ fn retired_lease_resume_reserves_capacity_before_recovery_reads() -> Result<(), 
                 .is_some_and(|extension| extension == "segment")
         })
         .ok_or("retired segment payload is missing")?;
+    let resume_now = active.snapshot_lease_time()?.max(now + 1);
+    let before_resume = authority.governor().inspect()?;
+    let resumed = active.resume_snapshot_lease(lease_identity, resume_now)?;
+    assert_eq!(resumed.snapshot().blocks().len(), 1);
+    assert_eq!(resumed.snapshot().blocks()[0].payload(), leased_payload);
+    assert!(segment_path.exists());
+    let during_resume = authority.governor().inspect()?;
+    assert_eq!(
+        during_resume.outstanding_total(),
+        before_resume.outstanding_total() + 1
+    );
+    drop(resumed);
+    assert_same_resource_usage(&before_resume, &authority.governor().inspect()?);
     let mut segment = std::fs::read(&segment_path)?;
     let last = segment
         .last_mut()
@@ -1181,7 +1192,6 @@ fn retired_lease_resume_reserves_capacity_before_recovery_reads() -> Result<(), 
     let before = authority.governor().inspect()?;
     let blocker = query_capacity_blocker_leaving(&authority, tenant, 1_100_000)?;
     let blocked = authority.governor().inspect()?;
-    let resume_now = active.snapshot_lease_time()?.max(now + 1);
     let refusal = active
         .resume_snapshot_lease(lease_identity, resume_now)
         .expect_err("capacity refusal must precede retired segment recovery");

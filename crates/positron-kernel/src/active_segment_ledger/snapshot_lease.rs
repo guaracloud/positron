@@ -6,7 +6,7 @@ use super::snapshot_lease_pending::{
     cleanup_expired_on_resume_failure, register_all, register_lease_reservation, remove_all,
 };
 use super::snapshot_lease_record::{
-    LeaseBlock, LeaseRecord, SnapshotLeaseId, SnapshotLeaseUsage, resume_marker_for,
+    LeaseBlock, LeaseRecord, LeaseWindow, SnapshotLeaseId, SnapshotLeaseUsage, resume_marker_for,
     valid_lease_interval, validate_active_lease,
 };
 use crate::{WorkClaim, WorkKind};
@@ -47,7 +47,13 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         if self.retention_time.is_some() {
             return Err(LedgerFailure::new(LedgerFailureCode::InvalidInput));
         }
-        self.create_snapshot_lease_internal(now, expiry, None)
+        self.create_snapshot_lease_internal(
+            LeaseWindow {
+                observed: now,
+                expiry,
+            },
+            None,
+        )
     }
 
     /// Creates a durable Log lease whose observation and expiry share the
@@ -75,7 +81,13 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         if self.retention_time.is_some() {
             return Err(LedgerFailure::new(LedgerFailureCode::InvalidInput));
         }
-        self.create_snapshot_lease_internal(now, expiry, Some(expected_catalog))
+        self.create_snapshot_lease_internal(
+            LeaseWindow {
+                observed: now,
+                expiry,
+            },
+            Some(expected_catalog),
+        )
     }
 
     /// Creates a retention-domain lease only if the Catalog generation used
@@ -105,21 +117,27 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         let expiry = now
             .checked_add(ttl.get())
             .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
-        self.create_snapshot_lease_internal(now, expiry, expected_catalog)
+        self.create_snapshot_lease_internal(
+            LeaseWindow {
+                observed: now,
+                expiry,
+            },
+            expected_catalog,
+        )
     }
 
     fn create_snapshot_lease_internal(
         &self,
-        mut now: u64,
-        expiry: u64,
+        window: LeaseWindow,
         expected_catalog: Option<CatalogGenerationId>,
     ) -> Result<SnapshotLeaseGrant<'kernel>, LedgerFailure> {
+        let mut now = window.observed;
+        let expiry = window.expiry;
         let mut state = self
             .state
             .lock()
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
         state.require_healthy()?;
-        now = self.lease_operation_time(now)?;
         if !valid_lease_interval(now, expiry) {
             return Err(LedgerFailure::new(LedgerFailureCode::InvalidInput));
         }

@@ -4,6 +4,7 @@ mod budget;
 mod codec;
 #[cfg(feature = "test-support")]
 mod fixture;
+mod governance_object;
 mod inspection;
 mod recovery;
 mod rotation;
@@ -33,6 +34,9 @@ use crate::{RecoveryWorkClaim, RecoveryWorkKind, StorageKernelResourceAuthority}
 
 #[cfg(feature = "test-support")]
 pub use fixture::GovernanceFixtureTarget;
+pub use governance_object::{
+    CatalogGovernanceObject, CatalogGovernanceVersion, CatalogLogRetentionPolicy,
+};
 #[cfg(feature = "test-support")]
 pub use storage::{
     CatalogPublicationFault, with_catalog_generation_ambiguity_hook_after,

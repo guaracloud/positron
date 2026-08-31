@@ -9,8 +9,6 @@ pub(super) use super::history::HistoricalMarker;
 use crate::result_key::HistoricalTotalKey;
 pub use wire::TailCursor;
 pub(crate) use wire::budget_digest;
-#[cfg(feature = "test-support")]
-pub use wire::fail_next_encode;
 
 use crate::{QueryFailure, QueryFailureCode};
 

@@ -49,8 +49,6 @@ pub use stream::{
     ResultLease, ResultOrdering, ResultSchema, ResultSnapshot, ResultValueType, TailPhase,
 };
 pub use stream_lifecycle::QueryStream;
-#[cfg(feature = "test-support")]
-pub use tail::fail_next_encode as fail_next_tail_cursor_encode;
 pub use tail::{
     TailCursor, TailCursorState, TailEvent, TailPosition, TailSession, TailSourceSet, TailStart,
     TailStats, TailTerminal,

@@ -94,8 +94,9 @@ impl RetentionReclamation {
 pub struct RetentionEvaluation<'ledger, 'kernel, 'catalog> {
     ledger: &'ledger ActiveSegmentLedger<'kernel, 'catalog>,
     _capacity: ResourceReservation<'kernel>,
-    catalog_identity: crate::CatalogGenerationId,
-    policy_object: Option<crate::CatalogObjectId>,
+    policy: crate::CatalogLogRetentionPolicy,
+    expected_retention_frontier: Option<crate::IngestTime>,
+    expected_retention_readiness: RetentionReadiness,
     frontier: crate::IngestTime,
     cutoff: positron_domain::time::UnixNanoseconds,
     blocks: Vec<CommittedBlock>,
@@ -130,6 +131,15 @@ const FORMAT_EPOCH: u32 = 1;
 #[doc(hidden)]
 pub fn fuzz_active_segment_stateful(data: &[u8]) {
     fuzzing::fuzz_active_segment_stateful(data);
+}
+
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub fn fuzz_retention_prepared_block(
+    data: &[u8],
+    exercise: impl FnOnce(&ActiveSegmentLedger<'_, '_>, positron_domain::identity::TenantId),
+) {
+    fuzzing::fuzz_retention_prepared_block(data, exercise);
 }
 
 #[cfg(fuzzing)]
@@ -427,6 +437,9 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         let retention_time = self
             .retention_time
             .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::UnsupportedFormat))?;
+        if !retention_time.authorizes_destructive_retention() {
+            return Err(LedgerFailure::new(LedgerFailureCode::UnsupportedFormat));
+        }
         let ingest_time = retention_time
             .ingest_time(self.scope, state.retention_frontier)
             .map_err(map_retention_time_failure)?;
@@ -487,28 +500,10 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         self.storage.segment_id()
     }
 
-    /// Admits one retention pass without accepting caller-selected time or segments.
+    /// Admits one retention pass from the exact current Catalog policy without
+    /// accepting caller-selected time, duration, policy identity, or segments.
     pub fn begin_retention<'ledger>(
         &'ledger self,
-        duration: std::num::NonZeroU64,
-    ) -> Result<RetentionEvaluation<'ledger, 'kernel, 'catalog>, LedgerFailure> {
-        self.begin_retention_internal(duration, None)
-    }
-
-    /// Admits retention bound to one immutable policy object that must remain
-    /// present in the current Catalog lineage through commit.
-    pub fn begin_retention_with_policy<'ledger>(
-        &'ledger self,
-        duration: std::num::NonZeroU64,
-        policy_object: crate::CatalogObjectId,
-    ) -> Result<RetentionEvaluation<'ledger, 'kernel, 'catalog>, LedgerFailure> {
-        self.begin_retention_internal(duration, Some(policy_object))
-    }
-
-    fn begin_retention_internal<'ledger>(
-        &'ledger self,
-        duration: std::num::NonZeroU64,
-        policy_object: Option<crate::CatalogObjectId>,
     ) -> Result<RetentionEvaluation<'ledger, 'kernel, 'catalog>, LedgerFailure> {
         let retention_time = self
             .retention_time
@@ -518,11 +513,6 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         }
         self.catalog.refresh_state()?;
         let basis = self.catalog.pin()?;
-        if let Some(identity) = policy_object
-            && basis.object(identity)?.is_none()
-        {
-            return Err(LedgerFailure::new(LedgerFailureCode::StaleGeneration));
-        }
         let state = self
             .state
             .lock()
@@ -558,10 +548,18 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             .recovery()
             .reserve(claim)
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
+        let policy = basis.log_retention_policy()?;
+        if policy.instance() != self.catalog.instance()
+            || policy.tenant() != self.scope.tenant
+            || policy.signal_kind() != self.scope.signal
+        {
+            return Err(LedgerFailure::new(LedgerFailureCode::PhysicalScopeMismatch));
+        }
         let frontier = retention_time
             .ingest_time(self.scope, state.retention_frontier)
             .map_err(map_retention_time_failure)?;
-        let duration_nanos = duration
+        let duration_nanos = policy
+            .retention_seconds()
             .get()
             .checked_mul(1_000_000_000)
             .and_then(|value| i64::try_from(value).ok())
@@ -576,8 +574,9 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         Ok(RetentionEvaluation {
             ledger: self,
             _capacity: capacity,
-            catalog_identity: basis.identity(),
-            policy_object,
+            policy,
+            expected_retention_frontier: state.retention_frontier,
+            expected_retention_readiness: state.retention_readiness,
             frontier,
             cutoff,
             blocks,

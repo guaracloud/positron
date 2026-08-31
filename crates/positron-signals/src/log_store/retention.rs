@@ -5,13 +5,10 @@ use positron_kernel::{ActiveSegmentLedger, IngestTime};
 
 use super::{LogStoreFailure, codec};
 
-const NANOS_PER_SECOND: i64 = 1_000_000_000;
-const MAX_RETENTION_SECONDS: u64 = i64::MAX as u64 / NANOS_PER_SECOND as u64;
-
 /// Tenant-and-signal retention duration expressed in whole seconds.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LogRetentionPolicy {
-    configured: positron_governance::RetentionPolicySnapshot,
+    configured: positron_kernel::CatalogLogRetentionPolicy,
 }
 
 impl LogRetentionPolicy {
@@ -20,11 +17,13 @@ impl LogRetentionPolicy {
     pub fn from_catalog(
         snapshot: &positron_kernel::CatalogSnapshot,
     ) -> Result<Self, LogStoreFailure> {
-        let configured = positron_governance::RetentionPolicySnapshot::open(snapshot)
-            .map_err(|_| LogStoreFailure::corrupt_policy())?;
-        if configured.retention_seconds().get() > MAX_RETENTION_SECONDS {
-            return Err(LogStoreFailure::invalid_input());
-        }
+        let configured = snapshot.log_retention_policy().map_err(|failure| {
+            if failure.code() == positron_kernel::CatalogFailureCode::InvalidInput {
+                LogStoreFailure::invalid_input()
+            } else {
+                LogStoreFailure::corrupt_policy()
+            }
+        })?;
         Ok(Self { configured })
     }
 
@@ -122,22 +121,21 @@ pub(super) fn enforce_retention<'kernel, 'catalog>(
         || ledger.scope().signal_kind() != positron_domain::routing::SignalKind::Logs
         || policy.configured.tenant() != tenant
         || policy.configured.signal_kind() != positron_domain::routing::SignalKind::Logs
-        || policy.configured.instance() != ledger.catalog_instance().to_bytes()
+        || policy.configured.instance() != ledger.catalog_instance()
     {
         return Err(LogStoreFailure::physical_scope_mismatch());
     }
     let current = ledger
         .current_catalog_snapshot()
         .map_err(map_kernel_failure)?;
-    policy
-        .configured
-        .validate_current(&current)
+    let current_policy = current
+        .log_retention_policy()
         .map_err(|_| LogStoreFailure::corrupt_policy())?;
-    let retention_seconds = policy.configured.retention_seconds();
+    if current_policy != policy.configured {
+        return Err(LogStoreFailure::corrupt_policy());
+    }
     super::check_scan_cancellation(cancellation)?;
-    let evaluation = ledger
-        .begin_retention_with_policy(retention_seconds, policy.configured.governance_object())
-        .map_err(map_kernel_failure)?;
+    let evaluation = ledger.begin_retention().map_err(map_kernel_failure)?;
     let active_segment = ledger.active_segment_id().map_err(map_kernel_failure)?;
     for block in evaluation.blocks() {
         if block.segment_id() == active_segment {

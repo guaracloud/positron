@@ -384,6 +384,8 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             retained_memory_bytes: memory_budget.retained_bytes,
             runtime_memory_limit: memory_budget.execution_limit,
             cursor_observed: std::cell::Cell::new(false),
+            #[cfg(feature = "test-support")]
+            cursor_encode_fault: std::sync::atomic::AtomicBool::new(false),
         };
         session.record_memory_peak(0)?;
         if matches!(start, TailStart::Historical { .. }) {

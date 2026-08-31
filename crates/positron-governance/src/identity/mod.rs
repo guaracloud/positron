@@ -20,10 +20,7 @@ use positron_kernel::{BootstrapKeyCustody, CatalogObjectId, CatalogSnapshot};
 
 use crate::GovernanceAuditEntry;
 
-use codec::{
-    GOVERNANCE_OBJECT_MAGIC_V1, GOVERNANCE_OBJECT_MAGIC_V2, GOVERNANCE_OBJECT_MAGIC_V3,
-    decode_initial_identity,
-};
+use codec::identity_from_catalog;
 
 #[derive(Clone)]
 struct IngestIdentity {
@@ -52,18 +49,6 @@ pub struct Identity {
     ingest: Option<IngestIdentity>,
     query: Option<QueryIdentity>,
     lifecycle: TenantLifecycleState,
-    retention_seconds: u64,
-}
-
-/// Immutable tenant Log-retention policy authenticated by one governance
-/// object in a pinned Catalog lineage.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RetentionPolicySnapshot {
-    instance: [u8; 16],
-    tenant: TenantId,
-    signal: positron_domain::routing::SignalKind,
-    retention_seconds: std::num::NonZeroU64,
-    governance_object: CatalogObjectId,
 }
 
 impl Identity {
@@ -91,37 +76,21 @@ impl Identity {
     fn open_with_object(
         snapshot: &CatalogSnapshot,
     ) -> Result<(Self, CatalogObjectId), IdentityFailure> {
-        let mut identity = None;
-        for object_id in snapshot.object_identities() {
-            let object = snapshot
-                .object(object_id)
-                .map_err(|_| IdentityFailure)?
-                .ok_or(IdentityFailure)?;
-            if !object.starts_with(&GOVERNANCE_OBJECT_MAGIC_V1)
-                && !object.starts_with(&GOVERNANCE_OBJECT_MAGIC_V2)
-                && !object.starts_with(&GOVERNANCE_OBJECT_MAGIC_V3)
-            {
-                continue;
-            }
-            if identity.is_some() {
-                return Err(IdentityFailure);
-            }
-            let mut decoded = decode_initial_identity(object)?;
-            // Lease, query-marker, and other catalog objects may advance the
-            // catalog generation without changing authorization. Bind query
-            // revalidation to this immutable governance object instead, so a
-            // reconnect after ordinary catalog churn remains authorized while
-            // replacing the identity object still changes the binding.
-            let object_bytes = object_id.to_bytes();
-            decoded.generation = object_bytes
-                .get(..8)
-                .and_then(|bytes| bytes.try_into().ok())
-                .map(u64::from_be_bytes)
-                .unwrap_or(1)
-                .max(1);
-            identity = Some((decoded, object_id));
-        }
-        identity.ok_or(IdentityFailure)
+        let (object_id, governance) = snapshot.governance_object().map_err(|_| IdentityFailure)?;
+        let mut decoded = identity_from_catalog(governance)?;
+        // Lease, query-marker, and other catalog objects may advance the
+        // catalog generation without changing authorization. Bind query
+        // revalidation to this immutable governance object instead, so a
+        // reconnect after ordinary catalog churn remains authorized while
+        // replacing the identity object still changes the binding.
+        let object_bytes = object_id.to_bytes();
+        decoded.generation = object_bytes
+            .get(..8)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(u64::from_be_bytes)
+            .unwrap_or(1)
+            .max(1);
+        Ok((decoded, object_id))
     }
 
     /// Authenticates and authorizes before a decoder or data-plane admission
@@ -285,59 +254,6 @@ impl Identity {
             &self.tenant_slug,
             audit,
         ))
-    }
-}
-
-impl RetentionPolicySnapshot {
-    /// Reconstructs the configured Log retention from the authenticated
-    /// governance object without accepting a caller-selected duration.
-    pub fn open(snapshot: &CatalogSnapshot) -> Result<Self, IdentityFailure> {
-        let (identity, governance_object) = Identity::open_with_object(snapshot)?;
-        let retention_seconds =
-            std::num::NonZeroU64::new(identity.retention_seconds).ok_or(IdentityFailure)?;
-        Ok(Self {
-            instance: identity.instance,
-            tenant: identity.tenant,
-            signal: positron_domain::routing::SignalKind::Logs,
-            retention_seconds,
-            governance_object,
-        })
-    }
-
-    /// Verifies that this exact immutable policy object remains current while
-    /// allowing unrelated Catalog generations to advance.
-    pub fn validate_current(&self, snapshot: &CatalogSnapshot) -> Result<(), IdentityFailure> {
-        let current = Self::open(snapshot)?;
-        if current == *self {
-            Ok(())
-        } else {
-            Err(IdentityFailure)
-        }
-    }
-
-    #[must_use]
-    pub const fn instance(&self) -> [u8; 16] {
-        self.instance
-    }
-
-    #[must_use]
-    pub const fn tenant(&self) -> TenantId {
-        self.tenant
-    }
-
-    #[must_use]
-    pub const fn signal_kind(&self) -> positron_domain::routing::SignalKind {
-        self.signal
-    }
-
-    #[must_use]
-    pub const fn retention_seconds(&self) -> std::num::NonZeroU64 {
-        self.retention_seconds
-    }
-
-    #[must_use]
-    pub const fn governance_object(&self) -> CatalogObjectId {
-        self.governance_object
     }
 }
 

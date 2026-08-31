@@ -1,4 +1,4 @@
-use super::super::cursor::{TailCursor, TailPosition};
+use super::super::cursor::TailPosition;
 use super::{AdvancedBatch, TailSession};
 use crate::result_key::HistoricalTotalKey;
 use crate::{QueryBudgetDimension, QueryFailure};
@@ -37,7 +37,7 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
             state.clear_historical_markers();
         }
         let lease_rotation = self.prepare_lease_rotation(&mut state, historical_complete)?;
-        let cursor = TailCursor::encode(&self.service.ledger.control_tokens(), &state)?;
+        let cursor = self.encode_cursor(&state)?;
         let next_sequence = self
             .next_sequence
             .checked_add(1)
@@ -63,7 +63,7 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
             state.clear_historical_markers();
         }
         let lease_rotation = self.prepare_lease_rotation(&mut state, clear_historical)?;
-        let cursor = TailCursor::encode(&self.service.ledger.control_tokens(), &state)?;
+        let cursor = self.encode_cursor(&state)?;
         self.commit_lease_rotation(lease_rotation)?;
         self.state = state;
         self.cursor = cursor;
@@ -73,7 +73,7 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
     pub(in crate::tail) fn sync_progress(&mut self) -> Result<(), QueryFailure> {
         self.sync_state_progress();
         self.persist_lease_usage()?;
-        self.cursor = TailCursor::encode(&self.service.ledger.control_tokens(), &self.state)?;
+        self.cursor = self.encode_cursor(&self.state)?;
         Ok(())
     }
 

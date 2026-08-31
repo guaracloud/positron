@@ -18,7 +18,7 @@ pub(super) struct RecoveredLeases<'kernel> {
 enum LeaseRecoveryObservation {
     Unavailable,
     Current(u64),
-    ConservativeFloor(u64),
+    ConservativeFloor,
 }
 
 pub(super) enum LeaseRecoveryClock {
@@ -29,10 +29,9 @@ pub(super) enum LeaseRecoveryClock {
 impl LeaseRecoveryObservation {
     fn from_durable(now: Option<u64>, persisted_floor: u64) -> Self {
         match now {
-            Some(now) if now >= persisted_floor => Self::Current(now),
-            Some(_) if persisted_floor != 0 => Self::ConservativeFloor(persisted_floor),
+            Some(now) if now < persisted_floor => Self::ConservativeFloor,
             Some(now) => Self::Current(now),
-            None if persisted_floor != 0 => Self::ConservativeFloor(persisted_floor),
+            None if persisted_floor != 0 => Self::ConservativeFloor,
             None => Self::Unavailable,
         }
     }
@@ -40,14 +39,7 @@ impl LeaseRecoveryObservation {
     const fn expiry_time(self) -> Option<u64> {
         match self {
             Self::Current(now) => Some(now),
-            Self::Unavailable | Self::ConservativeFloor(_) => None,
-        }
-    }
-
-    const fn last_observed(self) -> u64 {
-        match self {
-            Self::Unavailable => 0,
-            Self::Current(now) | Self::ConservativeFloor(now) => now,
+            Self::Unavailable | Self::ConservativeFloor => None,
         }
     }
 }
@@ -141,7 +133,7 @@ pub(super) fn recover_reservations<'kernel>(
         last_observed: if persisted_last_observed == 0 {
             0
         } else {
-            observation.last_observed()
+            expiry_time.unwrap_or(persisted_last_observed)
         },
     })
 }

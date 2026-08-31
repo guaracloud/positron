@@ -1,6 +1,98 @@
 use super::*;
 
 #[test]
+fn generic_lifecycle_clock_cannot_authorize_a_retention_bucket() -> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x91; 16])?,
+        CatalogSecret::from_owned(Box::new([0x92; 32]), Box::new([0x93; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let retention_time = RetentionTimeAuthority::establish()?;
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(18)?),
+        SegmentProtectionKey::from_owned(Box::new([0x94; 32])),
+    )?;
+    let policy = retention_policy(&catalog, &ledger, tenant, 10)?;
+    let unretained = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(
+        12_000_000_000,
+    )))
+    .assign_ingest_time()?;
+
+    assert_eq!(
+        policy
+            .bucket(tenant, unretained)
+            .expect_err("a generic clock cannot authorize destructive retention")
+            .code(),
+        positron_signals::LogStoreFailureCode::UnsupportedFormat,
+    );
+    Ok(())
+}
+
+#[test]
+fn legacy_governance_identity_remains_readable_but_cannot_authorize_retention()
+-> Result<(), Box<dyn Error>> {
+    for (version, transaction, shard) in [(1_u8, 0x95, 30), (2_u8, 0x96, 31)] {
+        let root = TemporaryRoot::new()?;
+        let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+        let authority = establish_kernel_authority(volume)?;
+        let instance = InstanceId::new([0x91; 16])?;
+        let catalog = Catalog::open(
+            &authority,
+            instance,
+            CatalogSecret::from_owned(Box::new([0x97; 32]), Box::new([0x98; 32])),
+        )?;
+        let tenant = TenantId::from_bytes([0x41; 16])?;
+        let basis = catalog.pin()?;
+        let committed = catalog.commit(
+            basis.identity(),
+            CatalogProposal::new(
+                TransactionId::new([transaction; 16])?,
+                FormatEpoch::CATALOG_V1,
+                vec![CatalogObject::new(legacy_governance_fixture(
+                    version,
+                    instance.to_bytes(),
+                    tenant,
+                ))?],
+            )?,
+            None,
+        )?;
+        positron_governance::Identity::open(committed.snapshot())?;
+        assert_eq!(
+            LogRetentionPolicy::from_catalog(committed.snapshot())
+                .expect_err("legacy identity cannot mint retention policy evidence")
+                .code(),
+            positron_signals::LogStoreFailureCode::IntegrityCorruption,
+        );
+        let retention_time = RetentionTimeAuthority::establish()?;
+        let ledger = ActiveSegmentLedger::open_with_retention_time(
+            &authority,
+            &retention_time,
+            &catalog,
+            SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(shard)?),
+            SegmentProtectionKey::from_owned(Box::new([0x99; 32])),
+        )?;
+        let generation = catalog.pin()?.identity();
+        let failure = match ledger.begin_retention() {
+            Ok(_) => return Err("legacy policy admitted destructive retention".into()),
+            Err(failure) => failure,
+        };
+        assert_eq!(
+            failure.code(),
+            positron_kernel::LedgerFailureCode::UnsupportedFormat
+        );
+        assert_eq!(catalog.pin()?.identity(), generation);
+    }
+    Ok(())
+}
+
+#[test]
 fn governance_retention_duration_must_fit_the_ingest_time_domain() -> Result<(), Box<dyn Error>> {
     let root = TemporaryRoot::new()?;
     let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
@@ -54,22 +146,13 @@ fn retention_buckets_are_fixed_by_tenant_store_and_kernel_ingest_time() -> Resul
         SegmentProtectionKey::from_owned(Box::new([0x11; 32])),
     )?;
     let policy = retention_policy(&catalog, &ledger, first_tenant, 10)?;
-    let first_time = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(
-        12_000_000_000,
-    )))
-    .assign_ingest_time()?;
-    let same_bucket_time = LifecycleClock::new(FixedLifecycleClockSource::new(
-        UnixNanoseconds::new(19_999_999_999),
-    ))
-    .assign_ingest_time()?;
-    let next_bucket_time = LifecycleClock::new(FixedLifecycleClockSource::new(
-        UnixNanoseconds::new(20_000_000_000),
-    ))
-    .assign_ingest_time()?;
-
+    let preparation = ledger.begin_store_block(
+        preparation_capacity(&authority, first_tenant)?,
+        StoreBlockIdentity::new([0x12; 16])?,
+    )?;
+    let first_time = preparation.ingest_time();
+    drop(preparation);
     let first = policy.bucket(first_tenant, first_time)?;
-    assert_eq!(first, policy.bucket(first_tenant, same_bucket_time)?);
-    assert_ne!(first, policy.bucket(first_tenant, next_bucket_time)?);
     assert_eq!(
         policy
             .bucket(second_tenant, first_time)
@@ -79,18 +162,9 @@ fn retention_buckets_are_fixed_by_tenant_store_and_kernel_ingest_time() -> Resul
     );
     assert_eq!(first.tenant(), first_tenant);
     assert_eq!(first.signal_kind(), SignalKind::Logs);
-    assert_eq!(first.start(), UnixNanoseconds::new(10_000_000_000));
-    assert_eq!(first.end_exclusive(), UnixNanoseconds::new(20_000_000_000));
-    let maximum_time = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(
-        i64::MAX,
-    )))
-    .assign_ingest_time()?;
     assert_eq!(
-        policy
-            .bucket(first_tenant, maximum_time)
-            .expect_err("a bucket ending beyond the timestamp domain must fail")
-            .code(),
-        positron_signals::LogStoreFailureCode::LimitExceeded
+        first.end_exclusive().value() - first.start().value(),
+        10_000_000_000,
     );
     Ok(())
 }
@@ -286,6 +360,39 @@ fn governance_fixture(
     Ok(InitialGovernanceIntent::create_tenant(intent)?
         .into_parts()
         .0)
+}
+
+fn legacy_governance_fixture(version: u8, instance: [u8; 16], tenant: TenantId) -> Vec<u8> {
+    let mut encoded = b"POSGOV01".to_vec();
+    encoded.extend_from_slice(&instance);
+    encoded.extend_from_slice(&tenant.to_bytes());
+    encoded.push(7);
+    encoded.extend_from_slice(b"default");
+    encoded.push(14);
+    encoded.extend_from_slice(b"Default tenant");
+    encoded.extend_from_slice(&[3; 16]);
+    encoded.extend_from_slice(&[4; 32]);
+    encoded.extend_from_slice(&[5; 32]);
+    if version == 2 {
+        encoded[..8].copy_from_slice(b"POSGOV02");
+        encoded.extend_from_slice(&[12; 16]);
+        encoded.extend_from_slice(&[13; 32]);
+        encoded.extend_from_slice(&[14; 32]);
+    }
+    encoded.extend_from_slice(&[6; 32]);
+    encoded.extend_from_slice(&[7; 32]);
+    encoded.extend_from_slice(&64_u16.to_be_bytes());
+    encoded.extend_from_slice(&[8; 64]);
+    encoded.extend_from_slice(&48_u16.to_be_bytes());
+    encoded.extend_from_slice(&[9; 48]);
+    encoded.extend_from_slice(&2_592_000_u64.to_be_bytes());
+    encoded.extend_from_slice(&1_u64.to_be_bytes());
+    encoded.extend_from_slice(&1_u32.to_be_bytes());
+    for _ in 0..11 {
+        encoded.extend_from_slice(&10_u64.to_be_bytes());
+    }
+    encoded.extend_from_slice(&[1, 4, 0, 1, 1]);
+    encoded
 }
 
 #[test]

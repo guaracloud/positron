@@ -8,6 +8,7 @@ use positron_domain::routing::{CommitPosition, SignalKind, VirtualShardId};
 use positron_domain::time::UnixNanoseconds;
 
 use super::support::{TemporaryRoot, establish_authority};
+use crate::active_segment_ledger::fault::{LedgerFileEvent, with_ledger_fault};
 use crate::active_segment_ledger::format::decode_header;
 use crate::active_segment_ledger::object_context;
 use crate::data_protection::{DataProtection, FrameLimits, FrameSequence, SegmentFramePurpose};
@@ -15,8 +16,9 @@ use crate::retention_time::RetentionTimeAuthority;
 use crate::{
     ActiveSegmentLedger, Catalog, CatalogObject, CatalogProposal, CatalogSecret, FormatEpoch,
     InstanceId, LedgerCompletionState, LedgerFailureCode, MountQualification, PreparedStoreBlock,
-    PrimaryDataVolume, ResourceAmounts, ResourceDimension, SegmentId, SegmentProtectionKey,
-    SegmentScope, StoreBlockIdentity, TransactionId, WorkClaim, WorkKind,
+    PrimaryDataVolume, ResourceAmounts, ResourceDimension, RetentionBucket, SegmentId,
+    SegmentProtectionKey, SegmentScope, SnapshotLeaseUsage, StoreBlockIdentity, TransactionId,
+    WorkClaim, WorkKind,
 };
 #[cfg(feature = "test-support")]
 use crate::{
@@ -90,6 +92,64 @@ fn recovered_frontier_ignores_restart_wall_and_advances_only_by_new_monotonic_el
 }
 
 #[test]
+fn retention_buckets_use_only_authoritative_kernel_preparation_time() -> Result<(), Box<dyn Error>>
+{
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0xa6; 16])?,
+        CatalogSecret::from_owned(Box::new([0xa7; 32]), Box::new([0xa8; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x64; 16])?;
+    let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(29)?);
+    let (retention_time, elapsed) =
+        RetentionTimeAuthority::establish_with_manual_elapsed(UnixNanoseconds::new(12_000_000_000));
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        SegmentProtectionKey::from_owned(Box::new([0xa9; 32])),
+    )?;
+    let duration = NonZeroU64::new(10).ok_or("bucket duration")?;
+    let first = ledger
+        .begin_store_block(
+            preparation_capacity(&authority, tenant)?,
+            StoreBlockIdentity::new([0xaa; 16])?,
+        )?
+        .ingest_time();
+    elapsed.advance(7_999_999_999)?;
+    let same = ledger
+        .begin_store_block(
+            preparation_capacity(&authority, tenant)?,
+            StoreBlockIdentity::new([0xab; 16])?,
+        )?
+        .ingest_time();
+    elapsed.advance(1)?;
+    let next = ledger
+        .begin_store_block(
+            preparation_capacity(&authority, tenant)?,
+            StoreBlockIdentity::new([0xac; 16])?,
+        )?
+        .ingest_time();
+
+    let bucket = RetentionBucket::for_ingest_time(tenant, SignalKind::Logs, first, duration)?;
+    assert_eq!(
+        bucket,
+        RetentionBucket::for_ingest_time(tenant, SignalKind::Logs, same, duration)?
+    );
+    assert_ne!(
+        bucket,
+        RetentionBucket::for_ingest_time(tenant, SignalKind::Logs, next, duration)?
+    );
+    assert_eq!(bucket.start(), UnixNanoseconds::new(10_000_000_000));
+    assert_eq!(bucket.end_exclusive(), UnixNanoseconds::new(20_000_000_000));
+    Ok(())
+}
+
+#[test]
 fn retention_policy_evidence_is_required_at_admission_and_commit() -> Result<(), Box<dyn Error>> {
     let root = TemporaryRoot::new()?;
     let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
@@ -110,7 +170,7 @@ fn retention_policy_evidence_is_required_at_admission_and_commit() -> Result<(),
         scope,
         SegmentProtectionKey::from_owned(Box::new([0xb4; 32])),
     )?;
-    let policy = CatalogObject::new(b"authenticated retention policy".to_vec())?;
+    let policy = CatalogObject::new(governance_policy([0xb1; 16], tenant, 1))?;
     let policy_identity = policy.identity();
     let basis = catalog.pin()?;
     let mut objects = basis
@@ -153,9 +213,7 @@ fn retention_policy_evidence_is_required_at_admission_and_commit() -> Result<(),
     )?;
     let missing_generation = catalog.pin()?.identity();
     let baseline = authority.governor().inspect()?;
-    let missing = match ledger
-        .begin_retention_with_policy(NonZeroU64::new(1).ok_or("duration")?, policy_identity)
-    {
+    let missing = match ledger.begin_retention() {
         Ok(_) => return Err("missing policy evidence admitted retention".into()),
         Err(failure) => failure,
     };
@@ -175,9 +233,9 @@ fn retention_policy_evidence_is_required_at_admission_and_commit() -> Result<(),
         .plaintext_objects()
         .map(|bytes| CatalogObject::new(bytes.to_vec()))
         .collect::<Result<Vec<_>, _>>()?;
-    objects.push(CatalogObject::new(
-        b"authenticated retention policy".to_vec(),
-    )?);
+    objects.push(CatalogObject::new(governance_policy(
+        [0xb1; 16], tenant, 1,
+    ))?);
     catalog.commit(
         basis.identity(),
         CatalogProposal::new(
@@ -187,10 +245,9 @@ fn retention_policy_evidence_is_required_at_admission_and_commit() -> Result<(),
         )?,
         None,
     )?;
-    let evaluation = ledger
-        .begin_retention_with_policy(NonZeroU64::new(1).ok_or("duration")?, policy_identity)?;
+    let evaluation = ledger.begin_retention()?;
     let basis = catalog.pin()?;
-    let objects = basis
+    let mut objects = basis
         .object_identities()
         .filter(|identity| *identity != policy_identity)
         .map(|identity| {
@@ -203,6 +260,9 @@ fn retention_policy_evidence_is_required_at_admission_and_commit() -> Result<(),
             .map_err(Into::into)
         })
         .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    objects.push(CatalogObject::new(governance_policy(
+        [0xb1; 16], tenant, 2,
+    ))?);
     catalog.commit(
         basis.identity(),
         CatalogProposal::new(
@@ -212,12 +272,12 @@ fn retention_policy_evidence_is_required_at_admission_and_commit() -> Result<(),
         )?,
         None,
     )?;
-    let removed_generation = catalog.pin()?.identity();
+    let replaced_generation = catalog.pin()?.identity();
     let stale = evaluation
         .commit()
-        .expect_err("policy removal after admission cannot retire segments");
+        .expect_err("policy replacement after admission cannot retire segments");
     assert_eq!(stale.code(), LedgerFailureCode::StaleGeneration);
-    assert_eq!(catalog.pin()?.identity(), removed_generation);
+    assert_eq!(catalog.pin()?.identity(), replaced_generation);
     assert!(ledger.snapshot()?.blocks().is_empty());
     let after_commit = authority.governor().inspect()?;
     assert_eq!(
@@ -226,6 +286,96 @@ fn retention_policy_evidence_is_required_at_admission_and_commit() -> Result<(),
     );
     for dimension in ResourceDimension::ALL {
         assert_eq!(after_commit.usage(dimension), baseline.usage(dimension));
+    }
+    Ok(())
+}
+
+#[test]
+fn retention_rejects_mismatched_or_duplicate_canonical_policy_without_mutation()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_authority(volume)?;
+    let instance = InstanceId::new([0xe1; 16])?;
+    let catalog = Catalog::open(
+        &authority,
+        instance,
+        CatalogSecret::from_owned(Box::new([0xe2; 32]), Box::new([0xe3; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x64; 16])?;
+    let other_tenant = TenantId::from_bytes([0x65; 16])?;
+    let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(39)?);
+    let (retention_time, _) =
+        RetentionTimeAuthority::establish_with_manual_elapsed(UnixNanoseconds::new(2_000_000_000));
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        SegmentProtectionKey::from_owned(Box::new([0xe4; 32])),
+    )?;
+    install_governance_policy(&catalog, instance, other_tenant, 1, 0xe5)?;
+    let mismatched_generation = catalog.pin()?.identity();
+    let baseline = authority.governor().inspect()?;
+
+    let mismatch = match ledger.begin_retention() {
+        Ok(_) => return Err("another tenant's policy admitted retention".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(mismatch.code(), LedgerFailureCode::PhysicalScopeMismatch);
+    assert_eq!(catalog.pin()?.identity(), mismatched_generation);
+    assert!(ledger.snapshot()?.blocks().is_empty());
+    let after_mismatch = authority.governor().inspect()?;
+    assert_eq!(
+        after_mismatch.outstanding_total(),
+        baseline.outstanding_total()
+    );
+    for dimension in ResourceDimension::ALL {
+        assert_eq!(after_mismatch.usage(dimension), baseline.usage(dimension));
+    }
+
+    let basis = catalog.pin()?;
+    let mut objects = basis
+        .object_identities()
+        .filter_map(|identity| {
+            let bytes = basis.object(identity).ok().flatten()?;
+            (!bytes.starts_with(b"POSGOV")).then(|| CatalogObject::new(bytes.to_vec()).ok())?
+        })
+        .collect::<Vec<_>>();
+    objects.push(CatalogObject::new(governance_policy(
+        instance.to_bytes(),
+        tenant,
+        1,
+    ))?);
+    objects.push(CatalogObject::new(governance_policy(
+        instance.to_bytes(),
+        tenant,
+        2,
+    ))?);
+    catalog.commit(
+        basis.identity(),
+        CatalogProposal::new(
+            TransactionId::new([0xe6; 16])?,
+            FormatEpoch::CATALOG_V1,
+            objects,
+        )?,
+        None,
+    )?;
+    let duplicate_generation = catalog.pin()?.identity();
+    let duplicate = match ledger.begin_retention() {
+        Ok(_) => return Err("duplicate canonical policies admitted retention".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(duplicate.code(), LedgerFailureCode::IntegrityCorruption);
+    assert_eq!(catalog.pin()?.identity(), duplicate_generation);
+    assert!(ledger.snapshot()?.blocks().is_empty());
+    let after_duplicate = authority.governor().inspect()?;
+    assert_eq!(
+        after_duplicate.outstanding_total(),
+        baseline.outstanding_total()
+    );
+    for dimension in ResourceDimension::ALL {
+        assert_eq!(after_duplicate.usage(dimension), baseline.usage(dimension));
     }
     Ok(())
 }
@@ -375,6 +525,7 @@ fn assert_legacy_segment_compatibility(format_version: u16) -> Result<(), Box<dy
         CatalogSecret::from_owned(Box::new([0xc2; 32]), Box::new([0xc3; 32])),
     )?;
     let tenant = TenantId::from_bytes([0x64; 16])?;
+    install_governance_policy(&catalog, instance, tenant, 1, format_version as u8 + 0x50)?;
     let scope = SegmentScope::new(
         tenant,
         SignalKind::Logs,
@@ -438,7 +589,7 @@ fn assert_legacy_segment_compatibility(format_version: u16) -> Result<(), Box<dy
     )?;
     assert_eq!(active.snapshot()?.blocks()[0].payload(), payload);
     let failure = active
-        .begin_retention(NonZeroU64::new(1).ok_or("duration")?)?
+        .begin_retention()?
         .commit()
         .expect_err("legacy retention evidence cannot authorize destruction");
     assert_eq!(failure.code(), LedgerFailureCode::UnsupportedFormat);
@@ -608,7 +759,7 @@ fn nonempty_scope_without_persisted_frontier_stays_readable_but_retention_unavai
         key(),
     )?;
     assert_eq!(restarted.snapshot()?.blocks().len(), 1);
-    let failure = match restarted.begin_retention(NonZeroU64::new(1).ok_or("duration")?) {
+    let failure = match restarted.begin_retention() {
         Ok(_) => return Err("missing durable trust authorized destructive retention".into()),
         Err(failure) => failure,
     };
@@ -626,7 +777,7 @@ fn nonempty_scope_without_persisted_frontier_stays_readable_but_retention_unavai
             .plaintext_objects()
             .all(|bytes| !bytes.starts_with(b"PRETFR01"))
     );
-    let failure = match restarted.begin_retention(NonZeroU64::new(1).ok_or("duration")?) {
+    let failure = match restarted.begin_retention() {
         Ok(_) => return Err("later ingest established trust for preexisting data".into()),
         Err(failure) => failure,
     };
@@ -709,7 +860,7 @@ fn deterministic_test_ingest_time_cannot_authorize_retention() -> Result<(), Box
         SegmentProtectionKey::from_owned(Box::new([0xa5; 32])),
     )?;
 
-    let failure = match ledger.begin_retention(NonZeroU64::new(1).ok_or("duration")?) {
+    let failure = match ledger.begin_retention() {
         Ok(_) => return Err("test-only Ingest Time authorized deletion".into()),
         Err(failure) => failure,
     };
@@ -1005,18 +1156,217 @@ fn preparation_authority_rejects_wrong_capacity_and_production_time_substitution
     Ok(())
 }
 
+#[cfg(feature = "test-support")]
+#[test]
+fn test_ingest_time_authority_cannot_publish_retention_evidence() -> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0xe9; 16])?,
+        CatalogSecret::from_owned(Box::new([0xea; 32]), Box::new([0xeb; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x64; 16])?;
+    let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(24)?);
+    let test_time = RetentionTimeAuthority::for_test_ingest_time(UnixNanoseconds::new(301));
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &test_time,
+        &catalog,
+        scope,
+        SegmentProtectionKey::from_owned(Box::new([0xec; 32])),
+    )?;
+    let generation = catalog.pin()?.identity();
+    let capacity = authority.governor().inspect()?;
+
+    let failure = match ledger.begin_store_block(
+        preparation_capacity(&authority, tenant)?,
+        StoreBlockIdentity::new([0xed; 16])?,
+    ) {
+        Ok(_) => return Err("test-only time minted retained preparation evidence".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(failure.code(), LedgerFailureCode::UnsupportedFormat);
+    assert_eq!(catalog.pin()?.identity(), generation);
+    assert!(
+        catalog
+            .pin()?
+            .plaintext_objects()
+            .all(|bytes| !bytes.starts_with(b"PRETFR01"))
+    );
+    let after = authority.governor().inspect()?;
+    assert_eq!(after.outstanding_total(), capacity.outstanding_total());
+    for dimension in ResourceDimension::ALL {
+        assert_eq!(after.usage(dimension), capacity.usage(dimension));
+    }
+    assert!(ledger.snapshot()?.blocks().is_empty());
+    Ok(())
+}
+
+#[test]
+fn retention_evaluation_cannot_commit_after_concurrent_append_uncertainty()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_authority(volume)?;
+    let instance = InstanceId::new([0xc1; 16])?;
+    let catalog = Catalog::open(
+        &authority,
+        instance,
+        CatalogSecret::from_owned(Box::new([0xc2; 32]), Box::new([0xc3; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x64; 16])?;
+    let basis = catalog.pin()?;
+    catalog.commit(
+        basis.identity(),
+        CatalogProposal::new(
+            TransactionId::new([0xc4; 16])?,
+            FormatEpoch::CATALOG_V1,
+            vec![CatalogObject::new(governance_policy(
+                instance.to_bytes(),
+                tenant,
+                1,
+            ))?],
+        )?,
+        None,
+    )?;
+    let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(25)?);
+    let (retention_time, _) =
+        RetentionTimeAuthority::establish_with_manual_elapsed(UnixNanoseconds::new(2_000_000_000));
+    let key = || SegmentProtectionKey::from_owned(Box::new([0xc5; 32]));
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    let prepared = ledger
+        .begin_store_block(
+            preparation_capacity(&authority, tenant)?,
+            StoreBlockIdentity::new([0xc6; 16])?,
+        )?
+        .finish(b"uncertain append".to_vec())?;
+    let evaluation = ledger.begin_retention()?;
+    let generation = catalog.pin()?.identity();
+
+    let append = with_ledger_fault(LedgerFileEvent::SynchronizeFrame, || {
+        ledger.append(prepared)
+    })
+    .expect_err("frame synchronization uncertainty must fence the ledger");
+    assert_eq!(
+        append.completion_state(),
+        LedgerCompletionState::RecoveryRequired
+    );
+    let retention = evaluation
+        .commit()
+        .expect_err("a stale evaluation cannot bypass the recovery fence");
+    assert_eq!(retention.code(), LedgerFailureCode::RecoveryRequired);
+    assert_eq!(catalog.pin()?.identity(), generation);
+    drop(ledger);
+
+    let reopened = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    assert!(reopened.snapshot()?.blocks().is_empty());
+    Ok(())
+}
+
+#[test]
+fn stale_evaluation_cannot_regress_a_newly_published_scope_frontier() -> Result<(), Box<dyn Error>>
+{
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_authority(volume)?;
+    let instance = InstanceId::new([0xd1; 16])?;
+    let catalog = Catalog::open(
+        &authority,
+        instance,
+        CatalogSecret::from_owned(Box::new([0xd2; 32]), Box::new([0xd3; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x64; 16])?;
+    let basis = catalog.pin()?;
+    catalog.commit(
+        basis.identity(),
+        CatalogProposal::new(
+            TransactionId::new([0xd4; 16])?,
+            FormatEpoch::CATALOG_V1,
+            vec![CatalogObject::new(governance_policy(
+                instance.to_bytes(),
+                tenant,
+                1,
+            ))?],
+        )?,
+        None,
+    )?;
+    let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(26)?);
+    let (retention_time, elapsed) =
+        RetentionTimeAuthority::establish_with_manual_elapsed(UnixNanoseconds::new(1_000_000_000));
+    let key = || SegmentProtectionKey::from_owned(Box::new([0xd5; 32]));
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    let stale = ledger.begin_retention()?;
+    elapsed.advance(1_000_000_000)?;
+    let newer = ledger.begin_store_block(
+        preparation_capacity(&authority, tenant)?,
+        StoreBlockIdentity::new([0xd6; 16])?,
+    )?;
+    assert_eq!(
+        newer.ingest_time().instant(),
+        UnixNanoseconds::new(2_000_000_000)
+    );
+    drop(newer);
+    let generation = catalog.pin()?.identity();
+
+    let failure = stale
+        .commit()
+        .expect_err("retention cannot republish an older per-scope frontier");
+    assert_eq!(failure.code(), LedgerFailureCode::StaleGeneration);
+    assert_eq!(catalog.pin()?.identity(), generation);
+    drop(ledger);
+
+    let reopened = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    let recovered = reopened.begin_store_block(
+        preparation_capacity(&authority, tenant)?,
+        StoreBlockIdentity::new([0xd7; 16])?,
+    )?;
+    assert_eq!(
+        recovered.ingest_time().instant(),
+        UnixNanoseconds::new(2_000_000_000)
+    );
+    Ok(())
+}
+
 #[test]
 fn retention_bounds_and_pinned_evaluations_fail_closed_without_capacity_drift()
 -> Result<(), Box<dyn Error>> {
     let root = TemporaryRoot::new()?;
     let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
     let authority = establish_authority(volume)?;
+    let instance = InstanceId::new([0xf1; 16])?;
     let catalog = Catalog::open(
         &authority,
-        InstanceId::new([0xf1; 16])?,
+        instance,
         CatalogSecret::from_owned(Box::new([0xf2; 32]), Box::new([0xf3; 32])),
     )?;
     let tenant = TenantId::from_bytes([0x64; 16])?;
+    install_governance_policy(&catalog, instance, tenant, u64::MAX, 0xf7)?;
     let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(14)?);
     let (retention_time, _) =
         RetentionTimeAuthority::establish_with_manual_elapsed(UnixNanoseconds::new(20_000_000_000));
@@ -1028,17 +1378,19 @@ fn retention_bounds_and_pinned_evaluations_fail_closed_without_capacity_drift()
         SegmentProtectionKey::from_owned(Box::new([0xf4; 32])),
     )?;
 
-    let failure = match ledger.begin_retention(NonZeroU64::MAX) {
+    let failure = match ledger.begin_retention() {
         Ok(_) => return Err("overflowing retention duration was admitted".into()),
         Err(failure) => failure,
     };
-    assert_eq!(failure.code(), LedgerFailureCode::LimitExceeded);
+    assert_eq!(failure.code(), LedgerFailureCode::InvalidInput);
+
+    install_governance_policy(&catalog, instance, tenant, 1, 0xf8)?;
 
     let prepared = ledger.begin_store_block(
         preparation_capacity(&authority, tenant)?,
         StoreBlockIdentity::new([0xf5; 16])?,
     )?;
-    let stale_blocks = ledger.begin_retention(NonZeroU64::new(1).ok_or("duration")?)?;
+    let stale_blocks = ledger.begin_retention()?;
     ledger.append(prepared.finish(b"later".to_vec())?)?;
     assert_eq!(
         stale_blocks
@@ -1048,7 +1400,7 @@ fn retention_bounds_and_pinned_evaluations_fail_closed_without_capacity_drift()
         LedgerFailureCode::StaleGeneration
     );
 
-    let stale_catalog = ledger.begin_retention(NonZeroU64::new(1).ok_or("duration")?)?;
+    let unrelated_catalog = ledger.begin_retention()?;
     let basis = catalog.pin()?;
     let objects = basis
         .plaintext_objects()
@@ -1063,13 +1415,8 @@ fn retention_bounds_and_pinned_evaluations_fail_closed_without_capacity_drift()
         )?,
         None,
     )?;
-    assert_eq!(
-        stale_catalog
-            .commit()
-            .expect_err("evaluation must pin the catalog generation")
-            .code(),
-        LedgerFailureCode::StaleGeneration
-    );
+    let outcome = unrelated_catalog.commit()?;
+    assert_eq!(outcome.logically_retired_segments(), 0);
     Ok(())
 }
 
@@ -1079,16 +1426,18 @@ fn monotonic_overflow_and_cutoff_underflow_are_typed_public_refusals() -> Result
     let root = TemporaryRoot::new()?;
     let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
     let authority = establish_authority(volume)?;
+    let instance = InstanceId::new([0x71; 16])?;
     let catalog = Catalog::open(
         &authority,
-        InstanceId::new([0x71; 16])?,
+        instance,
         CatalogSecret::from_owned(Box::new([0x72; 32]), Box::new([0x73; 32])),
     )?;
     let tenant = TenantId::from_bytes([0x64; 16])?;
+    install_governance_policy(&catalog, instance, tenant, 1, 0x77)?;
 
     let (overflow_time, overflow_elapsed) =
         RetentionTimeAuthority::establish_with_manual_elapsed(UnixNanoseconds::new(i64::MAX));
-    let overflow_scope = SegmentScope::new(tenant, SignalKind::Traces, VirtualShardId::new(15)?);
+    let overflow_scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(15)?);
     let overflow_ledger = ActiveSegmentLedger::open_with_retention_time(
         &authority,
         &overflow_time,
@@ -1114,7 +1463,7 @@ fn monotonic_overflow_and_cutoff_underflow_are_typed_public_refusals() -> Result
         Err(failure) => failure,
     };
     assert_eq!(failure.code(), LedgerFailureCode::LimitExceeded);
-    let failure = match overflow_ledger.begin_retention(NonZeroU64::new(1).ok_or("duration")?) {
+    let failure = match overflow_ledger.begin_retention() {
         Ok(_) => return Err("monotonic overflow authorized retention".into()),
         Err(failure) => failure,
     };
@@ -1133,7 +1482,7 @@ fn monotonic_overflow_and_cutoff_underflow_are_typed_public_refusals() -> Result
         SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(16)?),
         SegmentProtectionKey::from_owned(Box::new([0x76; 32])),
     )?;
-    let failure = match minimum_ledger.begin_retention(NonZeroU64::new(1).ok_or("duration")?) {
+    let failure = match minimum_ledger.begin_retention() {
         Ok(_) => return Err("underflowing retention cutoff was admitted".into()),
         Err(failure) => failure,
     };
@@ -1147,12 +1496,14 @@ fn sealed_nonempty_segment_expires_only_after_authoritative_elapsed_time()
     let root = TemporaryRoot::new()?;
     let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
     let authority = establish_authority(volume)?;
+    let instance = InstanceId::new([0x21; 16])?;
     let catalog = Catalog::open(
         &authority,
-        InstanceId::new([0x21; 16])?,
+        instance,
         CatalogSecret::from_owned(Box::new([0x22; 32]), Box::new([0x23; 32])),
     )?;
     let tenant = TenantId::from_bytes([0x64; 16])?;
+    install_governance_policy(&catalog, instance, tenant, 1, 0x2f)?;
     let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(17)?);
     let (retention_time, elapsed) =
         RetentionTimeAuthority::establish_with_manual_elapsed(UnixNanoseconds::new(10_000_000_000));
@@ -1178,15 +1529,14 @@ fn sealed_nonempty_segment_expires_only_after_authoritative_elapsed_time()
         scope,
         key(),
     )?;
-    let duration = NonZeroU64::new(1).ok_or("duration")?;
-    let fresh = active.begin_retention(duration)?;
+    let fresh = active.begin_retention()?;
     assert_eq!(fresh.blocks().len(), 1);
     let fresh_outcome = fresh.commit()?;
     assert_eq!(fresh_outcome.logically_retired_segments(), 0);
     assert_eq!(fresh_outcome.physically_reclaimed_segments(), 0);
 
     elapsed.advance(2_000_000_000)?;
-    let expired = active.begin_retention(duration)?;
+    let expired = active.begin_retention()?;
     assert_eq!(
         expired.blocks().first().map(|block| block.payload()),
         Some(b"retained".as_slice()),
@@ -1205,12 +1555,14 @@ fn restart_wall_jump_cannot_expire_a_durable_lease_or_reclaim_its_segment()
     let root = TemporaryRoot::new()?;
     let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
     let authority = establish_authority(volume)?;
+    let instance = InstanceId::new([0x26; 16])?;
     let catalog = Catalog::open(
         &authority,
-        InstanceId::new([0x26; 16])?,
+        instance,
         CatalogSecret::from_owned(Box::new([0x27; 32]), Box::new([0x28; 32])),
     )?;
     let tenant = TenantId::from_bytes([0x64; 16])?;
+    install_governance_policy(&catalog, instance, tenant, 1, 0x2e)?;
     let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(18)?);
     let key = || SegmentProtectionKey::from_owned(Box::new([0x29; 32]));
     let (retention_time, elapsed) = RetentionTimeAuthority::establish_with_manual_elapsed(
@@ -1300,9 +1652,17 @@ fn restart_wall_jump_cannot_expire_a_durable_lease_or_reclaim_its_segment()
         102,
         "a lease observation above the durable retention frontier becomes a conservative floor"
     );
-    let retired = active
-        .begin_retention(NonZeroU64::new(1).ok_or("duration")?)?
-        .commit()?;
+    assert_eq!(
+        active.snapshot_lease_usage(lease_identity, 0)?,
+        SnapshotLeaseUsage::default(),
+        "a caller observation below the durable floor must not make the lease unreadable"
+    );
+    assert_eq!(
+        active.snapshot_lease_time()?,
+        102,
+        "reading lease usage must not regress the conservative observation floor"
+    );
+    let retired = active.begin_retention()?.commit()?;
     assert_eq!(
         retired.evaluated_at(),
         UnixNanoseconds::new(100_000_000_000),
@@ -1336,17 +1696,90 @@ fn restart_wall_jump_cannot_expire_a_durable_lease_or_reclaim_its_segment()
 }
 
 #[test]
-fn empty_sealed_segment_is_logically_retired_and_physically_reclaimed() -> Result<(), Box<dyn Error>>
-{
+fn retention_domain_lease_derives_observation_and_expiry_from_one_sample()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_authority(volume)?;
+    let instance = InstanceId::new([0x31; 16])?;
+    let catalog = Catalog::open(
+        &authority,
+        instance,
+        CatalogSecret::from_owned(Box::new([0x32; 32]), Box::new([0x33; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x64; 16])?;
+    install_governance_policy(&catalog, instance, tenant, 1, 0x39)?;
+    let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(27)?);
+    let retention_time = RetentionTimeAuthority::establish_with_stepping_elapsed(
+        UnixNanoseconds::new(100_000_000_000),
+        1_000_000_000,
+    );
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        SegmentProtectionKey::from_owned(Box::new([0x34; 32])),
+    )?;
+
+    let lease = ledger
+        .create_snapshot_lease_for(u64::MAX, NonZeroU64::new(1).ok_or("one-second lease")?)?;
+    assert_eq!(lease.expiry(), 101);
+    Ok(())
+}
+
+#[test]
+fn retention_domain_lease_replacement_uses_one_authority_sample() -> Result<(), Box<dyn Error>> {
     let root = TemporaryRoot::new()?;
     let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
     let authority = establish_authority(volume)?;
     let catalog = Catalog::open(
         &authority,
-        InstanceId::new([0x31; 16])?,
+        InstanceId::new([0x35; 16])?,
+        CatalogSecret::from_owned(Box::new([0x36; 32]), Box::new([0x37; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x64; 16])?;
+    let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(28)?);
+    let retention_time = RetentionTimeAuthority::establish_with_stepping_elapsed(
+        UnixNanoseconds::new(100_000_000_000),
+        1_000_000_000,
+    );
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        SegmentProtectionKey::from_owned(Box::new([0x38; 32])),
+    )?;
+    let lease = ledger
+        .create_snapshot_lease_for(u64::MAX, NonZeroU64::new(10).ok_or("ten-second lease")?)?;
+    let identity = lease.identity();
+    drop(lease);
+
+    let mut replacement = ledger.prepare_snapshot_lease_replacement_for(
+        identity,
+        u64::MAX,
+        NonZeroU64::new(1).ok_or("one-second replacement")?,
+    )?;
+    let replacement = replacement.commit()?;
+    assert_eq!(replacement.expiry(), 102);
+    Ok(())
+}
+
+#[test]
+fn empty_sealed_segment_is_logically_retired_and_physically_reclaimed() -> Result<(), Box<dyn Error>>
+{
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_authority(volume)?;
+    let instance = InstanceId::new([0x31; 16])?;
+    let catalog = Catalog::open(
+        &authority,
+        instance,
         CatalogSecret::from_owned(Box::new([0x32; 32]), Box::new([0x33; 32])),
     )?;
     let tenant = TenantId::from_bytes([0x64; 16])?;
+    install_governance_policy(&catalog, instance, tenant, 1, 0x3a)?;
     let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(17)?);
     let (retention_time, _) =
         RetentionTimeAuthority::establish_with_manual_elapsed(UnixNanoseconds::new(2_000_000_000));
@@ -1367,9 +1800,7 @@ fn empty_sealed_segment_is_logically_retired_and_physically_reclaimed() -> Resul
         scope,
         key(),
     )?;
-    let outcome = active
-        .begin_retention(NonZeroU64::new(1).ok_or("duration")?)?
-        .commit()?;
+    let outcome = active.begin_retention()?.commit()?;
     assert_eq!(outcome.logically_retired_segments(), 1);
     assert_eq!(outcome.physically_reclaimed_segments(), 1);
     assert_eq!(outcome.evaluated_at(), UnixNanoseconds::new(2_000_000_000));
@@ -1406,6 +1837,76 @@ fn copied_non_frontier_objects(
         .filter(|bytes| !bytes.starts_with(b"PRETFR01"))
         .map(|bytes| CatalogObject::new(bytes.to_vec()).map_err(Into::into))
         .collect()
+}
+
+fn governance_policy(instance: [u8; 16], tenant: TenantId, retention_seconds: u64) -> Vec<u8> {
+    let slug = b"retention-test";
+    let display = b"Retention test tenant";
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(b"POSGOV03");
+    encoded.extend_from_slice(&instance);
+    encoded.extend_from_slice(&tenant.to_bytes());
+    encoded.push(u8::try_from(slug.len()).expect("bounded fixture slug"));
+    encoded.extend_from_slice(slug);
+    encoded.push(u8::try_from(display.len()).expect("bounded fixture display"));
+    encoded.extend_from_slice(display);
+    encoded.extend_from_slice(&[0x11; 16]);
+    encoded.extend_from_slice(&[0x21; 32]);
+    encoded.extend_from_slice(&[0x22; 32]);
+    encoded.extend_from_slice(&[0x12; 16]);
+    encoded.extend_from_slice(&[0x23; 32]);
+    encoded.extend_from_slice(&[0x24; 32]);
+    encoded.extend_from_slice(&[0x13; 16]);
+    encoded.extend_from_slice(&[0x25; 32]);
+    encoded.extend_from_slice(&[0x26; 32]);
+    encoded.extend_from_slice(&[0x27; 32]);
+    encoded.extend_from_slice(&[0x28; 32]);
+    encoded.extend_from_slice(&1_u16.to_be_bytes());
+    encoded.push(0x29);
+    encoded.extend_from_slice(&1_u16.to_be_bytes());
+    encoded.push(0x2a);
+    encoded.extend_from_slice(&retention_seconds.to_be_bytes());
+    encoded.extend_from_slice(&1_u64.to_be_bytes());
+    encoded.extend_from_slice(&1_u32.to_be_bytes());
+    for _ in 0..11 {
+        encoded.extend_from_slice(&1_u64.to_be_bytes());
+    }
+    encoded.extend_from_slice(&[1, 4, 0, 1, 1]);
+    encoded
+}
+
+fn install_governance_policy(
+    catalog: &Catalog<'_>,
+    instance: InstanceId,
+    tenant: TenantId,
+    retention_seconds: u64,
+    transaction: u8,
+) -> Result<(), Box<dyn Error>> {
+    let basis = catalog.pin()?;
+    let mut objects = basis
+        .plaintext_objects()
+        .filter(|bytes| {
+            !bytes.starts_with(b"POSGOV01")
+                && !bytes.starts_with(b"POSGOV02")
+                && !bytes.starts_with(b"POSGOV03")
+        })
+        .map(|bytes| CatalogObject::new(bytes.to_vec()))
+        .collect::<Result<Vec<_>, _>>()?;
+    objects.push(CatalogObject::new(governance_policy(
+        instance.to_bytes(),
+        tenant,
+        retention_seconds,
+    ))?);
+    catalog.commit(
+        basis.identity(),
+        CatalogProposal::new(
+            TransactionId::new([transaction; 16])?,
+            FormatEpoch::CATALOG_V1,
+            objects,
+        )?,
+        None,
+    )?;
+    Ok(())
 }
 
 #[cfg(feature = "test-support")]

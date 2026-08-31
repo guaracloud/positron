@@ -14,7 +14,7 @@ mod text_scan;
 mod types;
 
 #[cfg(fuzzing)]
-pub use fuzzing::fuzz_log_store_block;
+pub use fuzzing::{fuzz_log_retention_block, fuzz_log_store_block};
 
 use positron_domain::identity::TenantId;
 #[cfg(any(test, fuzzing))]

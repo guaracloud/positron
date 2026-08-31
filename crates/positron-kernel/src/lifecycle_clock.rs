@@ -115,7 +115,7 @@ impl LifecycleClockSource for FixedLifecycleClockSource {
     }
 }
 
-/// The kernel time authority that assigns non-decreasing Ingest Time.
+/// Non-destructive observation clock for deterministic query and codec work.
 pub struct LifecycleClock<S> {
     source: S,
     last: Mutex<Option<UnixNanoseconds>>,
@@ -138,7 +138,7 @@ impl<S: LifecycleClockSource> LifecycleClock<S> {
             .map_err(|_| LifecycleClockFailure::Unavailable)?;
         let assigned = last.map_or(observed, |previous| previous.max(observed));
         *last = Some(assigned);
-        Ok(IngestTime::from_authenticated_durable(assigned))
+        Ok(IngestTime::from_unretained_observation(assigned))
     }
 }
 
