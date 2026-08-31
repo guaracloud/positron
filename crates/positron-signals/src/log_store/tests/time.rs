@@ -43,7 +43,7 @@ fn kernel_clock_assigns_ingest_and_retention_time_while_event_time_remains_untru
     let ledger = ActiveSegmentLedger::open(&authority, &catalog, scope, key())?;
     ledger.append(
         LogStore::new()
-            .prepare(
+            .prepare_unretained_for_test(
                 preparation_capacity(&authority, tenant)?,
                 &clock,
                 tenant,

@@ -2,16 +2,14 @@ use std::error::Error;
 
 use positron_domain::identity::TenantId;
 use positron_domain::routing::{SignalKind, VirtualShardId};
-use positron_domain::time::UnixNanoseconds;
 use positron_ingest::{
     AdmissionGroupPlanFailure, AdmissionGroupPlanner, AuthenticatedOtlpLogsRequest,
     IngestFailureCode, IngestOutcome, IngestPolicy, LogIngest, NativeLogCandidate,
     OtlpLogsReceiver,
 };
 use positron_kernel::{
-    ActiveSegmentLedger, Catalog, CatalogSecret, FixedLifecycleClockSource, InstanceId,
-    LifecycleClock, ResourceAmounts, SegmentProtectionKey, SegmentScope, StoreBlockIdentity,
-    WorkClaim, WorkKind,
+    ActiveSegmentLedger, Catalog, CatalogSecret, InstanceId, ResourceAmounts, SegmentProtectionKey,
+    SegmentScope, StoreBlockIdentity, WorkClaim, WorkKind,
 };
 use prost::Message;
 
@@ -56,7 +54,6 @@ fn later_group_capacity_refusal_wins_before_policy_and_never_rolls_back_prior_co
         InstanceId::new([0x91; 16])?,
         CatalogSecret::from_owned(Box::new([0x92; 32]), Box::new([0x93; 32])),
     )?;
-    let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(900)));
     let policy = IngestPolicy::reject_exact_text_body(33, "reject-later", "policy-reject-later")?;
     let first = groups.next().ok_or("missing first group")?;
     let second = groups.next().ok_or("missing second group")?;
@@ -67,7 +64,6 @@ fn later_group_capacity_refusal_wins_before_policy_and_never_rolls_back_prior_co
         LogIngest::new(
             &fixture.authority,
             &first_ledger,
-            &clock,
             &policy,
             fixture.tenant,
             first.shard(),
@@ -91,7 +87,6 @@ fn later_group_capacity_refusal_wins_before_policy_and_never_rolls_back_prior_co
         LogIngest::new(
             &fixture.authority,
             &second_ledger,
-            &clock,
             &policy,
             fixture.tenant,
             second.shard(),
@@ -122,8 +117,9 @@ fn ledger<'authority, 'catalog>(
     shard: VirtualShardId,
     marker: u8,
 ) -> Result<ActiveSegmentLedger<'authority, 'catalog>, Box<dyn Error>> {
-    Ok(ActiveSegmentLedger::open(
+    Ok(ActiveSegmentLedger::open_with_retention_time(
         &fixture.authority,
+        &fixture.retention_time,
         catalog,
         SegmentScope::new(fixture.tenant, SignalKind::Logs, shard),
         SegmentProtectionKey::from_owned(Box::new([marker; 32])),

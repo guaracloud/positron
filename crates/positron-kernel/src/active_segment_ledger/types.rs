@@ -16,7 +16,7 @@ mod failure;
 mod prepared;
 mod protection_clone;
 pub use failure::{LedgerCompletionState, LedgerFailure, LedgerFailureCode};
-pub use prepared::PreparedStoreBlock;
+pub use prepared::{PreparedStoreBlock, StoreBlockPreparation};
 
 /// The immutable tenant, Signal Store, and Virtual Shard boundary of one active segment.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -298,22 +298,6 @@ impl SegmentRetention {
     }
 }
 
-/// Snapshot-bound evidence from a Signal Store's canonical block decoder.
-///
-/// The Storage Kernel consumes this evidence only after matching every field
-/// back to the authenticated snapshot and deriving complete sealed-segment
-/// candidates itself.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct BlockRetentionEvidence {
-    pub(super) scope: SegmentScope,
-    pub(super) catalog_identity: crate::CatalogGenerationId,
-    pub(super) block: StoreBlockIdentity,
-    pub(super) content_digest: [u8; 32],
-    pub(super) segment: SegmentId,
-    pub(super) latest_ingest_time: IngestTime,
-    pub(super) bucket: RetentionBucket,
-}
-
 impl CommittedBlock {
     #[must_use]
     pub const fn identity(&self) -> StoreBlockIdentity {
@@ -384,41 +368,6 @@ impl LedgerSnapshot<'_> {
     #[must_use]
     pub fn blocks(&self) -> &[CommittedBlock] {
         &self.blocks
-    }
-
-    /// Binds authenticated segment lifecycle metadata to one snapshot block.
-    pub fn retention_evidence(
-        &self,
-        block: &CommittedBlock,
-        bucket_duration_seconds: NonZeroU64,
-    ) -> Result<BlockRetentionEvidence, LedgerFailure> {
-        let authenticated = self.blocks.iter().find(|candidate| {
-            candidate.identity == block.identity
-                && candidate.segment == block.segment
-                && candidate.content_digest == block.content_digest
-        });
-        let authenticated = authenticated
-            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::PhysicalScopeMismatch))?;
-        let latest_ingest_time = match authenticated.segment_retention {
-            SegmentRetention::Complete(instant) => instant,
-            SegmentRetention::Empty | SegmentRetention::Unavailable => {
-                return Err(LedgerFailure::new(LedgerFailureCode::UnsupportedFormat));
-            },
-        };
-        Ok(BlockRetentionEvidence {
-            scope: self.scope,
-            catalog_identity: self.catalog_identity,
-            block: authenticated.identity,
-            content_digest: authenticated.content_digest,
-            segment: authenticated.segment,
-            latest_ingest_time,
-            bucket: RetentionBucket::for_ingest_time(
-                self.scope.tenant,
-                self.scope.signal,
-                latest_ingest_time,
-                bucket_duration_seconds,
-            )?,
-        })
     }
 }
 

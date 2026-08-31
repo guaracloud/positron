@@ -14,6 +14,7 @@ fn retention_keeps_an_existing_snapshot_readable_while_new_snapshots_exclude_it(
     let tenant = TenantId::from_bytes([0x41; 16])?;
     let shard = VirtualShardId::new(10)?;
     let scope = SegmentScope::new(tenant, SignalKind::Logs, shard);
+    let retention_time = RetentionTimeAuthority::establish()?;
     let store = LogStore::new();
     let PolicyEvaluation::Accepted(evaluated) = IngestPolicy::preserving(1)?.evaluate(
         NativeLogCandidate::new(
@@ -32,11 +33,9 @@ fn retention_keeps_an_existing_snapshot_readable_while_new_snapshots_exclude_it(
     };
     let record =
         LogRecord::checked_evaluated(ValueLimitProfile::release_1_system_maximum(), *evaluated)?;
-    let ingest_clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(
-        10_000_000_000,
-    )));
-    let ledger = ActiveSegmentLedger::open(
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
         &authority,
+        &retention_time,
         &catalog,
         scope,
         SegmentProtectionKey::from_owned(Box::new([0x5a; 32])),
@@ -44,11 +43,10 @@ fn retention_keeps_an_existing_snapshot_readable_while_new_snapshots_exclude_it(
     ledger.append(
         store
             .prepare(
-                preparation_capacity(&authority, tenant)?,
-                &ingest_clock,
-                tenant,
-                shard,
-                StoreBlockIdentity::new([0x6a; 16])?,
+                ledger.begin_store_block(
+                    preparation_capacity(&authority, tenant)?,
+                    StoreBlockIdentity::new([0x6a; 16])?,
+                )?,
                 vec![record.clone()],
             )?
             .into_store_block(),
@@ -56,24 +54,22 @@ fn retention_keeps_an_existing_snapshot_readable_while_new_snapshots_exclude_it(
     ledger.append(
         store
             .prepare(
-                preparation_capacity(&authority, tenant)?,
-                &ingest_clock,
-                tenant,
-                shard,
-                StoreBlockIdentity::new([0x7a; 16])?,
+                ledger.begin_store_block(
+                    preparation_capacity(&authority, tenant)?,
+                    StoreBlockIdentity::new([0x7a; 16])?,
+                )?,
                 vec![record],
             )?
             .into_store_block(),
     )?;
     ledger.seal()?;
-    let active = ActiveSegmentLedger::open_with_clock(
+    std::thread::sleep(std::time::Duration::from_millis(1_050));
+    let active = ActiveSegmentLedger::open_with_retention_time(
         &authority,
+        &retention_time,
         &catalog,
         scope,
         SegmentProtectionKey::from_owned(Box::new([0x5a; 32])),
-        &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(
-            12_000_000_000,
-        ))),
     )?;
     let previous = active.snapshot()?;
     assert_eq!(previous.blocks().len(), 2);
@@ -84,7 +80,6 @@ fn retention_keeps_an_existing_snapshot_readable_while_new_snapshots_exclude_it(
     let cancelled = store
         .enforce_retention_observed(
             &active,
-            &retention_clock(),
             tenant,
             LogRetentionPolicy::new(1)?,
             &CancelledRetention,
@@ -103,14 +98,17 @@ fn retention_keeps_an_existing_snapshot_readable_while_new_snapshots_exclude_it(
         before
     );
     assert_eq!(active.snapshot()?.blocks().len(), 2);
-    let lease = active.create_snapshot_lease(12, 100)?;
-    let lease_identity = lease.identity();
-    let outcome = store.enforce_retention(
-        &active,
-        &retention_clock(),
-        tenant,
-        LogRetentionPolicy::new(1)?,
+    let lease_now = u64::try_from(
+        retention_clock()
+            .assign_ingest_time()?
+            .instant()
+            .value()
+            .checked_div(1_000_000_000)
+            .ok_or("snapshot lease seconds")?,
     )?;
+    let lease = active.create_snapshot_lease(lease_now, lease_now + 100)?;
+    let lease_identity = lease.identity();
+    let outcome = store.enforce_retention(&active, tenant, LogRetentionPolicy::new(1)?)?;
     assert_eq!(outcome.expired_segments(), 1);
     assert_eq!(outcome.reclaimed_segments(), 0);
     let old_result = store.scan(
@@ -130,15 +128,14 @@ fn retention_keeps_an_existing_snapshot_readable_while_new_snapshots_exclude_it(
     drop(lease);
     drop(previous);
     drop(active);
-    let active = ActiveSegmentLedger::open_with_clock(
+    let active = ActiveSegmentLedger::open_with_retention_time(
         &authority,
+        &retention_time,
         &catalog,
         scope,
         SegmentProtectionKey::from_owned(Box::new([0x5a; 32])),
-        &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(
-            12_000_000_000,
-        ))),
     )?;
+    let resume_now = active.snapshot_lease_time()?.max(lease_now);
     let basis = catalog.pin()?;
     let original_objects = basis
         .object_identities()
@@ -179,7 +176,7 @@ fn retention_keeps_an_existing_snapshot_readable_while_new_snapshots_exclude_it(
     )?;
     drop(basis);
     let substituted = active
-        .resume_snapshot_lease(lease_identity, 12)
+        .resume_snapshot_lease(lease_identity, resume_now)
         .expect_err("authenticated lease block substitution must fail closed");
     assert_eq!(
         substituted.code(),
@@ -243,7 +240,7 @@ fn retention_keeps_an_existing_snapshot_readable_while_new_snapshots_exclude_it(
     )?;
     drop(ordered_basis);
     let reordered = active
-        .resume_snapshot_lease(lease_identity, 12)
+        .resume_snapshot_lease(lease_identity, resume_now)
         .expect_err("authenticated lease block reordering must fail closed");
     assert_eq!(
         reordered.code(),
@@ -279,7 +276,7 @@ fn retention_keeps_an_existing_snapshot_readable_while_new_snapshots_exclude_it(
     )?;
     drop(rewind_basis);
     let rewound = active
-        .resume_snapshot_lease(lease_identity, 12)
+        .resume_snapshot_lease(lease_identity, resume_now)
         .expect_err("authenticated snapshot frontier rewind must fail closed");
     assert_eq!(
         rewound.code(),
@@ -300,7 +297,7 @@ fn retention_keeps_an_existing_snapshot_readable_while_new_snapshots_exclude_it(
         None,
     )?;
     drop(final_basis);
-    let resumed = active.resume_snapshot_lease(lease_identity, 12)?;
+    let resumed = active.resume_snapshot_lease(lease_identity, resume_now)?;
     let resumed_result = store.scan(
         authority.governor(),
         tenant,
@@ -313,12 +310,7 @@ fn retention_keeps_an_existing_snapshot_readable_while_new_snapshots_exclude_it(
         std::fs::read_dir(root.path().join("segments/sealed"))?.collect::<Result<Vec<_>, _>>()?;
     assert!(!sealed_entries.is_empty());
     active.release_snapshot_lease(lease_identity)?;
-    let outcome = store.enforce_retention(
-        &active,
-        &retention_clock(),
-        tenant,
-        LogRetentionPolicy::new(1)?,
-    )?;
+    let outcome = store.enforce_retention(&active, tenant, LogRetentionPolicy::new(1)?)?;
     assert_eq!(outcome.expired_segments(), 1);
     assert_eq!(outcome.reclaimed_segments(), 2);
     let sealed_entries =

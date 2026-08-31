@@ -2,7 +2,8 @@ use positron_domain::routing::{SignalKind, VirtualShardId};
 use positron_governance::{GovernanceAuditEntry, Identity};
 use positron_kernel::{
     ActiveSegmentLedger, BootstrapArtifact, BootstrapArtifactAccess, BootstrapKeyCustody,
-    BootstrapObjectPurpose, Catalog, SegmentScope, StorageKernelResourceAuthority,
+    BootstrapObjectPurpose, Catalog, RetentionTimeAuthority, SegmentScope,
+    StorageKernelResourceAuthority,
 };
 use std::sync::Arc;
 
@@ -100,6 +101,8 @@ pub(super) fn outcome(
         Arc::new(positron_ingest::FixedAdmissionGroupPlanner::new(logs_shard));
     #[cfg(not(any(test, fuzzing)))]
     let _ = (identity, audit);
+    let retention_time = RetentionTimeAuthority::establish()
+        .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
     Ok(InitializedInstance {
         key,
         #[cfg(any(test, fuzzing))]
@@ -107,6 +110,7 @@ pub(super) fn outcome(
         #[cfg(any(test, fuzzing))]
         audit,
         _authority: authority,
+        retention_time,
         instance: record.instance,
         tenant: record.tenant,
         logs_shard,

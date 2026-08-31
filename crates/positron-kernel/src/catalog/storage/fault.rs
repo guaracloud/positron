@@ -59,6 +59,7 @@ pub(super) fn emit_event(_event: CatalogFileEvent) -> Result<(), CatalogFailure>
 thread_local! {
     static CATALOG_FAULT: RefCell<Option<CatalogFault>> = const { RefCell::new(None) };
     static CATALOG_FAULT_SEQUENCE: RefCell<Option<Vec<CatalogScheduledFault>>> = const { RefCell::new(None) };
+    static CATALOG_AMBIGUITY_HOOK: RefCell<Option<Box<CatalogFaultHook>>> = const { RefCell::new(None) };
 }
 
 #[cfg(any(test, fuzzing, feature = "test-support"))]
@@ -256,4 +257,32 @@ pub fn with_catalog_publication_hook_after<T>(
         hook,
         action,
     )
+}
+
+/// Fails one generation-directory synchronization after marker rename, then
+/// invokes a successor-publication hook after Catalog operation locks unwind.
+#[cfg(feature = "test-support")]
+pub fn with_catalog_generation_ambiguity_hook_after<T>(
+    preceding_occurrences: usize,
+    hook: impl for<'a> Fn(&'a crate::catalog::Catalog<'a>) + 'static,
+    action: impl FnOnce() -> T,
+) -> T {
+    CATALOG_AMBIGUITY_HOOK.with(|slot| {
+        let previous_hook = slot.replace(Some(Box::new(hook)));
+        let result = with_catalog_fault_after(
+            CatalogFileEvent::SynchronizeGenerationDirectory,
+            preceding_occurrences,
+            action,
+        );
+        slot.replace(previous_hook);
+        result
+    })
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn after_ambiguous_publication(catalog: &crate::catalog::Catalog<'_>) {
+    let hook = CATALOG_AMBIGUITY_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook(catalog);
+    }
 }

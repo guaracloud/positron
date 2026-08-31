@@ -82,7 +82,7 @@ fn round_trip_record(record: LogRecord, marker: u8) -> Result<StoredLogRecord, B
     )?;
     ledger.append(
         LogStore::new()
-            .prepare(
+            .prepare_unretained_for_test(
                 preparation_capacity(&authority, tenant)?,
                 &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(1))),
                 tenant,

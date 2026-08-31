@@ -73,6 +73,38 @@ pub(super) fn snapshot_retained_claim(
     ]))
 }
 
+pub(super) fn snapshot_resume_claim(
+    working_bytes: usize,
+    encoded_bytes: usize,
+    decoded_items: usize,
+    segment_count: usize,
+) -> Result<ResourceAmounts, LedgerFailure> {
+    let bytes = u64::try_from(working_bytes)
+        .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+    let encoded = u64::try_from(encoded_bytes)
+        .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+    let items = u64::try_from(decoded_items)
+        .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+    let memory = bytes
+        .checked_add(
+            items
+                .checked_mul(128)
+                .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?,
+        )
+        .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+    let work = items
+        .checked_add(255)
+        .and_then(|value| value.checked_div(256))
+        .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+    let files = u64::try_from(segment_count)
+        .ok()
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+    Ok(ResourceAmounts::new([
+        memory, 1, 1, encoded, work, 0, 1, 1, work, files, 0,
+    ]))
+}
+
 pub(super) fn lease_claim(encoded_bytes: usize) -> Result<ResourceAmounts, LedgerFailure> {
     let memory = u64::try_from(encoded_bytes)
         .ok()

@@ -322,6 +322,29 @@ impl LedgerStorage {
         encode_metadata(metadata)
     }
 
+    pub(super) fn retired_recovery_encoded_bytes(
+        &self,
+        metadata: SegmentMetadata,
+    ) -> Result<usize, LedgerFailure> {
+        if metadata.state != SegmentState::Retired {
+            return Err(LedgerFailure::new(LedgerFailureCode::InvalidInput));
+        }
+        [segment_name(metadata.id), frontier_name(metadata.id)]
+            .into_iter()
+            .try_fold(0_usize, |total, name| {
+                let stat = unix_fs::statat(&self.sealed, name, AtFlags::SYMLINK_NOFOLLOW)
+                    .map_err(map_errno)?;
+                if !unix_fs::FileType::from_raw_mode(stat.st_mode).is_file() {
+                    return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
+                }
+                let bytes = usize::try_from(stat.st_size)
+                    .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+                total
+                    .checked_add(bytes)
+                    .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))
+            })
+    }
+
     pub(super) fn is_scope_metadata(&self, bytes: &[u8], scope: SegmentScope) -> bool {
         decode_metadata(bytes)
             .ok()

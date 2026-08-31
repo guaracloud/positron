@@ -44,7 +44,7 @@ pub(in crate::active_segment_ledger) fn publish_frontier(
     let mut encoded = Vec::with_capacity(FRONTIER_PREFIX_BYTES + frame.as_bytes().len());
     encoded.extend_from_slice(FRONTIER_MAGIC);
     encoded.extend_from_slice(&1_u16.to_be_bytes());
-    encoded.extend_from_slice(&2_u16.to_be_bytes());
+    encoded.extend_from_slice(&3_u16.to_be_bytes());
     encoded.extend_from_slice(&frame_length.to_be_bytes());
     encoded.extend_from_slice(frame.as_bytes());
     let authenticator = receipt_authenticator(key, durable_bytes, next_sequence, position)?;

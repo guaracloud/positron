@@ -2,11 +2,10 @@ use crate::schema_session::SchemaBuildObserver;
 use crate::schema_session::{DurableSchemaOutcome, DurableSchemaResolution};
 use crate::{IngestPolicy, NativeLogBatch, PolicyEvaluation, TenantSchemaSession};
 use positron_domain::identity::{Scope, TenantId};
-use positron_domain::routing::VirtualShardId;
+use positron_domain::routing::{SignalKind, VirtualShardId};
 use positron_kernel::{
-    ActiveSegmentLedger, AppendCancellation, LedgerCompletionState, LifecycleClock,
-    LifecycleClockSource, ResourceAmounts, ResourceDimension, StorageKernelResourceAuthority,
-    StoreBlockIdentity, WorkClaim, WorkKind,
+    ActiveSegmentLedger, AppendCancellation, LedgerCompletionState, ResourceAmounts,
+    ResourceDimension, StorageKernelResourceAuthority, StoreBlockIdentity, WorkClaim, WorkKind,
 };
 use positron_signals::LogStore;
 
@@ -29,19 +28,16 @@ use schema_resolution::{
 };
 
 /// Concrete receiver-independent Log ingestion path.
-pub struct LogIngest<'service, 'kernel, 'catalog, S> {
+pub struct LogIngest<'service, 'kernel, 'catalog> {
     authority: &'kernel StorageKernelResourceAuthority,
     ledger: &'service ActiveSegmentLedger<'kernel, 'catalog>,
-    clock: &'service LifecycleClock<S>,
     policy: &'service IngestPolicy,
     tenant: TenantId,
     shard: VirtualShardId,
     schema: TenantSchemaSession,
 }
 
-impl<'service, 'kernel, 'catalog, S: LifecycleClockSource>
-    LogIngest<'service, 'kernel, 'catalog, S>
-{
+impl<'service, 'kernel, 'catalog> LogIngest<'service, 'kernel, 'catalog> {
     fn accept_inner(
         &self,
         batch: NativeLogBatch<'kernel>,
@@ -51,6 +47,11 @@ impl<'service, 'kernel, 'catalog, S: LifecycleClockSource>
         let (attribution, records, value_profile, capacity, receiver) = batch.into_parts();
         if attribution.scope() != Scope::Ingest || attribution.tenant_id() != self.tenant {
             return IngestOutcome::Permanent(IngestFailureCode::TenantConflict);
+        }
+        if self.ledger.scope()
+            != positron_kernel::SegmentScope::new(self.tenant, SignalKind::Logs, self.shard)
+        {
+            return IngestOutcome::Permanent(IngestFailureCode::InvalidRecord);
         }
         if records.is_empty() {
             return IngestOutcome::Permanent(IngestFailureCode::InvalidRecord);
@@ -244,14 +245,11 @@ impl<'service, 'kernel, 'catalog, S: LifecycleClockSource>
             },
         };
         drop(snapshot);
-        let prepared = match LogStore::new().prepare(
-            capacity,
-            self.clock,
-            self.tenant,
-            self.shard,
-            identity,
-            accepted,
-        ) {
+        let preparation = match self.ledger.begin_store_block(capacity, identity) {
+            Ok(preparation) => preparation,
+            Err(failure) => return map_ledger_failure(&failure),
+        };
+        let prepared = match LogStore::new().prepare(preparation, accepted) {
             Ok(prepared) => prepared,
             Err(failure) => {
                 return rollback_schema(

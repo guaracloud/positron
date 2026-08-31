@@ -97,6 +97,60 @@ fn snapshot_lease_pins_exact_visibility_across_append_restart_release_and_expiry
 }
 
 #[test]
+fn authenticated_live_lease_block_identity_and_position_substitution_fail_closed()
+-> Result<(), Box<dyn Error>> {
+    with_fixture(|authority, catalog, scope| {
+        let ledger = ActiveSegmentLedger::open(
+            authority,
+            catalog,
+            scope,
+            SegmentProtectionKey::from_owned(Box::new([0x73; 32])),
+        )?;
+        ledger.append(prepared(scope, b"leased")?)?;
+        let identity = ledger.create_snapshot_lease(100, 200)?.identity();
+        publish_lease_rewrite(catalog, 0xb1, |bytes| {
+            bytes
+                .get_mut(113..129)
+                .expect("one-block lease identity")
+                .copy_from_slice(&[0xab; 16]);
+        })?;
+        assert_eq!(
+            ledger
+                .resume_snapshot_lease(identity, 101)
+                .expect_err("authenticated identity substitution must fail closed")
+                .code(),
+            LedgerFailureCode::IntegrityCorruption
+        );
+        Ok(())
+    })?;
+
+    with_fixture(|authority, catalog, scope| {
+        let ledger = ActiveSegmentLedger::open(
+            authority,
+            catalog,
+            scope,
+            SegmentProtectionKey::from_owned(Box::new([0x74; 32])),
+        )?;
+        ledger.append(prepared(scope, b"leased")?)?;
+        let identity = ledger.create_snapshot_lease(100, 200)?.identity();
+        publish_lease_rewrite(catalog, 0xb2, |bytes| {
+            bytes
+                .get_mut(129..137)
+                .expect("one-block lease position")
+                .copy_from_slice(&2_u64.to_be_bytes());
+        })?;
+        assert_eq!(
+            ledger
+                .resume_snapshot_lease(identity, 101)
+                .expect_err("authenticated position substitution must fail closed")
+                .code(),
+            LedgerFailureCode::IntegrityCorruption
+        );
+        Ok(())
+    })
+}
+
+#[test]
 fn snapshot_lease_public_time_and_signal_boundaries_are_typed_and_restartable()
 -> Result<(), Box<dyn Error>> {
     with_fixture(|authority, catalog, scope| {

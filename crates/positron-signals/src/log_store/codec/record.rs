@@ -71,16 +71,6 @@ pub(super) fn validate_structure(
     validate_structure_with_ingest_time(input, limits, version).map(|_| ())
 }
 
-/// Validates the complete record without materializing semantic values and
-/// returns only the authenticated Ingest Time needed by retention.
-pub(super) fn retention_ingest_time(
-    input: &mut Input<'_>,
-    limits: CodecLimits,
-    version: u16,
-) -> Result<UnixNanoseconds, LogStoreFailure> {
-    validate_structure_with_ingest_time(input, limits, version)
-}
-
 fn validate_structure_with_ingest_time(
     input: &mut Input<'_>,
     limits: CodecLimits,

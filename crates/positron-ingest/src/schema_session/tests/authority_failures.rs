@@ -179,8 +179,9 @@ fn ledger<'authority, 'catalog>(
     shard: VirtualShardId,
     marker: u8,
 ) -> ActiveSegmentLedger<'authority, 'catalog> {
-    ActiveSegmentLedger::open(
+    ActiveSegmentLedger::open_with_retention_time(
         &fixture.authority,
+        &fixture.retention_time,
         catalog,
         SegmentScope::new(fixture.tenant, SignalKind::Logs, shard),
         SegmentProtectionKey::from_owned(Box::new([marker; 32])),

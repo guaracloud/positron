@@ -5,6 +5,47 @@ use std::sync::OnceLock;
 use super::{IngestTime, LedgerFailure, LedgerFailureCode, SegmentScope, StoreBlockIdentity};
 use crate::active_segment_ledger::MAX_STORE_BLOCK_BYTES;
 
+/// Move-only Storage Kernel authority to prepare one retention-authenticated Store Block.
+///
+/// The private ingest timestamp is minted by the ledger and is consumed with
+/// the preparation capacity when the Signal Store finishes its canonical
+/// bytes. Callers can observe the timestamp for encoding, but cannot replace
+/// the authenticated retention upper bound carried by the finished block.
+pub struct StoreBlockPreparation<'capacity> {
+    pub(in crate::active_segment_ledger) scope: SegmentScope,
+    pub(in crate::active_segment_ledger) identity: StoreBlockIdentity,
+    pub(in crate::active_segment_ledger) ingest_time: IngestTime,
+    pub(in crate::active_segment_ledger) retention_ingest_time: Option<IngestTime>,
+    pub(in crate::active_segment_ledger) capacity: ResourceReservation<'capacity>,
+}
+
+impl<'capacity> StoreBlockPreparation<'capacity> {
+    #[must_use]
+    pub const fn scope(&self) -> SegmentScope {
+        self.scope
+    }
+
+    #[must_use]
+    pub const fn identity(&self) -> StoreBlockIdentity {
+        self.identity
+    }
+
+    #[must_use]
+    pub const fn ingest_time(&self) -> IngestTime {
+        self.ingest_time
+    }
+
+    pub fn finish(self, bytes: Vec<u8>) -> Result<PreparedStoreBlock<'capacity>, LedgerFailure> {
+        PreparedStoreBlock::checked(
+            self.scope,
+            self.identity,
+            bytes,
+            Some(self.capacity),
+            self.retention_ingest_time,
+        )
+    }
+}
+
 /// Opaque canonical Store Block bytes and their caller-owned stable identity.
 pub struct PreparedStoreBlock<'capacity> {
     pub(in crate::active_segment_ledger) scope: SegmentScope,
@@ -44,24 +85,6 @@ impl<'capacity> PreparedStoreBlock<'capacity> {
         capacity: ResourceReservation<'capacity>,
     ) -> Result<Self, LedgerFailure> {
         Self::checked(scope, identity, bytes, Some(capacity), None)
-    }
-
-    /// Carries Signal Store-derived lifecycle metadata into the authenticated
-    /// durability frontier without exposing it as a deletion selector.
-    pub fn new_with_preparation_capacity_and_ingest_time(
-        scope: SegmentScope,
-        identity: StoreBlockIdentity,
-        bytes: Vec<u8>,
-        capacity: ResourceReservation<'capacity>,
-        latest_ingest_time: IngestTime,
-    ) -> Result<Self, LedgerFailure> {
-        Self::checked(
-            scope,
-            identity,
-            bytes,
-            Some(capacity),
-            Some(latest_ingest_time),
-        )
     }
 
     fn checked(

@@ -22,6 +22,7 @@ pub(super) struct LedgerState<'kernel> {
         BTreeMap<super::SnapshotLeaseId, super::snapshot_lease_record::LeaseResumeMarker>,
     pub(super) pending_lease_releases: super::snapshot_lease_pending::PendingLeaseReleases,
     pub(super) last_snapshot_lease_time: u64,
+    pub(super) retention_frontier: Option<crate::IngestTime>,
 }
 
 pub(super) fn receipt_for(block: &CommittedBlock) -> CommitReceipt {

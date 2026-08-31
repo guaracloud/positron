@@ -32,6 +32,8 @@ use io::{
 pub(super) use marker::MARKER_BYTES;
 use marker::{MarkerDecode, decode_marker, encode_marker};
 
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use fault::after_ambiguous_publication;
 #[cfg(any(test, fuzzing, feature = "test-support"))]
 pub(crate) use fault::before_lease_marker_basis;
 #[cfg(any(test, fuzzing))]
@@ -40,8 +42,9 @@ pub(crate) use fault::with_catalog_fault;
 pub(crate) use fault::with_catalog_fault_after;
 #[cfg(feature = "test-support")]
 pub use fault::{
-    CatalogPublicationFault, with_catalog_publication_fault_after,
-    with_catalog_publication_fault_sequence_after, with_catalog_publication_hook_after,
+    CatalogPublicationFault, with_catalog_generation_ambiguity_hook_after,
+    with_catalog_publication_fault_after, with_catalog_publication_fault_sequence_after,
+    with_catalog_publication_hook_after,
 };
 
 pub(super) const FRAME_OVERHEAD_BYTES: usize = 315;

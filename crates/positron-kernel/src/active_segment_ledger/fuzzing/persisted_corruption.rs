@@ -11,7 +11,7 @@ use crate::{
     PrimaryDataVolume,
 };
 
-use super::{FuzzRoot, block_parts, catalog_secret, open, prepared, scope};
+use super::{FuzzRoot, block_parts, catalog_secret, prepared, scope};
 use crate::active_segment_ledger::format::{HEADER_PREFIX_BYTES, decode_header};
 
 const AUTHENTICATION_TAG_BYTES: usize = 16;
@@ -101,7 +101,13 @@ fn prepare_fixture(root: &Path, artifact: PersistedArtifact) -> PersistedState {
         catalog_secret(),
     )
     .expect("persisted fixture catalog opens");
-    let ledger = open(&authority, &catalog, scope()).expect("persisted fixture ledger opens");
+    let ledger = crate::ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        scope(),
+        crate::SegmentProtectionKey::from_owned(Box::new([0x91; 32])),
+    )
+    .expect("persisted fixture ledger opens");
     if artifact.requires_block() {
         let (identity, payload) = block_parts(0, 0xa5);
         ledger
@@ -134,8 +140,13 @@ fn reopen_fixture(root: &Path) -> Result<PersistedState, PersistedFailure> {
         catalog_secret(),
     )
     .map_err(|failure| PersistedFailure::Catalog(failure.code()))?;
-    let ledger = open(&authority, &catalog, scope())
-        .map_err(|failure| PersistedFailure::Ledger(failure.code()))?;
+    let ledger = crate::ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        scope(),
+        crate::SegmentProtectionKey::from_owned(Box::new([0x91; 32])),
+    )
+    .map_err(|failure| PersistedFailure::Ledger(failure.code()))?;
     let snapshot = ledger
         .snapshot()
         .map_err(|failure| PersistedFailure::Ledger(failure.code()))?;

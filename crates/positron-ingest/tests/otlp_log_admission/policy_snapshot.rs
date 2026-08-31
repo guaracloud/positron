@@ -2,15 +2,14 @@ use std::error::Error;
 
 use positron_domain::identity::TenantId;
 use positron_domain::routing::{SignalKind, VirtualShardId};
-use positron_domain::time::UnixNanoseconds;
 use positron_ingest::{
     AdmissionGroupPlanFailure, AdmissionGroupPlanner, AuthenticatedOtlpLogsRequest, IngestOutcome,
     IngestPolicy, LogIngest, NativeLogCandidate, OtlpLogsReceiver, PolicyAction, PolicyPredicate,
     PolicyRule, PolicyTarget,
 };
 use positron_kernel::{
-    ActiveSegmentLedger, Catalog, CatalogSecret, FixedLifecycleClockSource, InstanceId,
-    LifecycleClock, SegmentProtectionKey, SegmentScope, StoreBlockIdentity,
+    ActiveSegmentLedger, Catalog, CatalogSecret, InstanceId, SegmentProtectionKey, SegmentScope,
+    StoreBlockIdentity,
 };
 use positron_signals::{LogScan, LogStore, ScanLimit};
 use prost::Message;
@@ -62,13 +61,11 @@ fn admitted_request_keeps_one_immutable_snapshot_across_groups() -> Result<(), B
         ledger(&first_fixture, &catalog, shards[0], 0x77)?,
         ledger(&first_fixture, &catalog, shards[1], 0x78)?,
     ];
-    let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(700)));
     for (ordinal, (group, ledger)) in groups.zip(ledgers.iter()).enumerate() {
         assert!(matches!(
             LogIngest::new(
                 &first_fixture.authority,
                 ledger,
-                &clock,
                 &old,
                 first_fixture.tenant,
                 group.shard(),
@@ -116,8 +113,9 @@ fn ledger<'authority, 'catalog>(
     shard: VirtualShardId,
     marker: u8,
 ) -> Result<ActiveSegmentLedger<'authority, 'catalog>, Box<dyn Error>> {
-    Ok(ActiveSegmentLedger::open(
+    Ok(ActiveSegmentLedger::open_with_retention_time(
         &fixture.authority,
+        &fixture.retention_time,
         catalog,
         SegmentScope::new(fixture.tenant, SignalKind::Logs, shard),
         SegmentProtectionKey::from_owned(Box::new([marker; 32])),

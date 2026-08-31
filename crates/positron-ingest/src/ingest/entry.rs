@@ -1,21 +1,17 @@
 use positron_domain::identity::TenantId;
 use positron_domain::routing::VirtualShardId;
 use positron_kernel::{
-    ActiveSegmentLedger, AppendCancellation, LifecycleClock, LifecycleClockSource,
-    StorageKernelResourceAuthority, StoreBlockIdentity,
+    ActiveSegmentLedger, AppendCancellation, StorageKernelResourceAuthority, StoreBlockIdentity,
 };
 
 use super::{IngestOutcome, LogIngest};
 use crate::{IngestPolicy, NativeLogBatch, TenantSchemaSession};
 
-impl<'service, 'kernel, 'catalog, S: LifecycleClockSource>
-    LogIngest<'service, 'kernel, 'catalog, S>
-{
+impl<'service, 'kernel, 'catalog> LogIngest<'service, 'kernel, 'catalog> {
     #[must_use]
     pub fn new(
         authority: &'kernel StorageKernelResourceAuthority,
         ledger: &'service ActiveSegmentLedger<'kernel, 'catalog>,
-        clock: &'service LifecycleClock<S>,
         policy: &'service IngestPolicy,
         tenant: TenantId,
         shard: VirtualShardId,
@@ -24,7 +20,6 @@ impl<'service, 'kernel, 'catalog, S: LifecycleClockSource>
         Self {
             authority,
             ledger,
-            clock,
             policy,
             tenant,
             shard,

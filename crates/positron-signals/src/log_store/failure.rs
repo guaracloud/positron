@@ -67,6 +67,7 @@ impl LogStoreFailure {
         }
     }
 
+    #[cfg(any(test, fuzzing))]
     pub(super) const fn clock_unavailable() -> Self {
         Self {
             code: LogStoreFailureCode::ClockUnavailable,

@@ -1,4 +1,3 @@
-use std::collections::BTreeSet;
 use std::fs;
 use std::num::NonZeroU64;
 use std::path::PathBuf;
@@ -6,10 +5,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use positron_domain::identity::TenantId;
 use positron_domain::routing::{SignalKind, VirtualShardId};
-use positron_domain::time::UnixNanoseconds;
 
 use crate::catalog::fuzz_authority;
-use crate::{Catalog, CatalogSecret, InstanceId, MountQualification, PrimaryDataVolume};
+use crate::{
+    Catalog, CatalogSecret, InstanceId, MountQualification, PrimaryDataVolume, ResourceAmounts,
+    ResourceDimension, RetentionTimeAuthority, StorageKernelResourceAuthority, WorkClaim, WorkKind,
+};
 
 use super::fault::{LedgerFileEvent, with_ledger_fault};
 use super::{
@@ -68,7 +69,11 @@ pub(super) fn fuzz_active_segment_stateful(data: &[u8]) {
     )
     .expect("fuzz catalog opens");
     let scope = scope();
-    let mut ledger = open(&authority, &catalog, scope).expect("fresh ledger opens");
+    let (retention_time, elapsed) = RetentionTimeAuthority::establish_with_manual_elapsed(
+        positron_domain::time::UnixNanoseconds::new(1_000_000_000),
+    );
+    let mut ledger =
+        open(&authority, &retention_time, &catalog, scope).expect("fresh ledger opens");
     let mut oracle = Oracle::new();
     let mut lease: Option<(SnapshotLeaseId, u64, SnapshotExpectation)> = None;
     let mut protected_snapshot: Option<(LedgerSnapshot<'_>, SnapshotExpectation)> = None;
@@ -79,20 +84,26 @@ pub(super) fn fuzz_active_segment_stateful(data: &[u8]) {
             0 => {
                 let (identity, payload) = block_parts(index, selector);
                 let receipt = ledger
-                    .append(prepared(identity, payload.clone()))
+                    .append(prepared_retained(
+                        &ledger,
+                        &authority,
+                        identity,
+                        payload.clone(),
+                    ))
                     .expect("ordinary bounded fuzz append succeeds");
-                oracle.record(identity, payload, receipt);
+                oracle.record(identity, payload, receipt, elapsed.nanoseconds());
             },
             1 => {
                 let event = fault_event(selector);
                 let (identity, payload) = block_parts(index, selector);
-                let result =
-                    with_ledger_fault(event, || ledger.append(prepared(identity, payload.clone())));
+                let retained = prepared_retained(&ledger, &authority, identity, payload.clone());
+                let result = with_ledger_fault(event, || ledger.append(retained));
                 let failure =
                     result.expect_err("an injected filesystem boundary cannot acknowledge");
                 assert_eq!(failure.completion_state(), fault_completion(event));
                 drop(ledger);
-                let Some(recovered) = recover_or_stop(&authority, &catalog, scope) else {
+                let Some(recovered) = recover_or_stop(&authority, &retention_time, &catalog, scope)
+                else {
                     return;
                 };
                 ledger = recovered;
@@ -100,12 +111,13 @@ pub(super) fn fuzz_active_segment_stateful(data: &[u8]) {
                     let receipt = ledger
                         .append(prepared(identity, payload.clone()))
                         .expect("ambiguous successor replays exactly");
-                    oracle.record(identity, payload, receipt);
+                    oracle.record(identity, payload, receipt, elapsed.nanoseconds());
                 }
             },
             2 => {
                 drop(ledger);
-                let Some(recovered) = recover_or_stop(&authority, &catalog, scope) else {
+                let Some(recovered) = recover_or_stop(&authority, &retention_time, &catalog, scope)
+                else {
                     return;
                 };
                 ledger = recovered;
@@ -113,7 +125,8 @@ pub(super) fn fuzz_active_segment_stateful(data: &[u8]) {
             3 => {
                 ledger.seal().expect("bounded seal succeeds");
                 oracle.record_seal();
-                let Some(recovered) = recover_or_stop(&authority, &catalog, scope) else {
+                let Some(recovered) = recover_or_stop(&authority, &retention_time, &catalog, scope)
+                else {
                     return;
                 };
                 ledger = recovered;
@@ -143,9 +156,14 @@ pub(super) fn fuzz_active_segment_stateful(data: &[u8]) {
                     if !oracle.contains(identity) {
                         let payload = existing_payload.to_vec();
                         let receipt = ledger
-                            .append(prepared(identity, payload.clone()))
+                            .append(prepared_retained(
+                                &ledger,
+                                &authority,
+                                identity,
+                                payload.clone(),
+                            ))
                             .expect("equal bytes under distinct identity append");
-                        oracle.record(identity, payload, receipt);
+                        oracle.record(identity, payload, receipt, elapsed.nanoseconds());
                     }
                 }
             },
@@ -215,26 +233,20 @@ pub(super) fn fuzz_active_segment_stateful(data: &[u8]) {
                 protected_snapshot = None;
             },
             21 => {
-                let snapshot = ledger.snapshot().expect("retention evidence snapshot");
                 let active = ledger.active_segment_id().expect("active segment identity");
                 let duration = NonZeroU64::new(1).expect("positive fuzz duration");
-                let mut retired = BTreeSet::new();
-                let evidence = snapshot
-                    .blocks()
-                    .iter()
-                    .filter(|block| block.segment_id() != active)
-                    .map(|block| {
-                        retired.insert(block.segment_id());
-                        snapshot
-                            .retention_evidence(block, duration)
-                            .expect("snapshot-bound fuzz evidence")
-                    })
-                    .collect::<Vec<_>>();
-                drop(snapshot);
-                let cutoff = crate::LifecycleClock::new(crate::SystemLifecycleClockSource)
-                    .retention_cutoff(duration)
-                    .expect("system fuzz cutoff");
-                let mut protected = BTreeSet::new();
+                let advances = (selector / 23) % 2 == 1;
+                if advances {
+                    elapsed
+                        .advance(2_000_000_000)
+                        .expect("bounded fuzz retention movement");
+                }
+                let retired = oracle.expired_segments(
+                    active,
+                    elapsed.nanoseconds(),
+                    duration.get() * 1_000_000_000,
+                );
+                let mut protected = std::collections::BTreeSet::new();
                 if let Some((_, expected)) = &protected_snapshot {
                     protected.extend(expected.segments());
                 }
@@ -242,7 +254,9 @@ pub(super) fn fuzz_active_segment_stateful(data: &[u8]) {
                     protected.extend(expected.segments());
                 }
                 let outcome = ledger
-                    .retire_expired_sealed_segments(cutoff, &evidence)
+                    .begin_retention(duration)
+                    .expect("bounded fuzz retention evaluation")
+                    .commit()
                     .expect("bounded fuzz retention");
                 assert!(outcome.logically_retired_segments() >= retired.len());
                 oracle.note_retention(
@@ -254,7 +268,8 @@ pub(super) fn fuzz_active_segment_stateful(data: &[u8]) {
             },
             22 => {
                 drop(ledger);
-                let Some(recovered) = recover_or_stop(&authority, &catalog, scope) else {
+                let Some(recovered) = recover_or_stop(&authority, &retention_time, &catalog, scope)
+                else {
                     return;
                 };
                 ledger = recovered;
@@ -273,7 +288,7 @@ pub(super) fn fuzz_active_segment_stateful(data: &[u8]) {
     }
 
     drop(ledger);
-    let Some(recovered) = recover_or_stop(&authority, &catalog, scope) else {
+    let Some(recovered) = recover_or_stop(&authority, &retention_time, &catalog, scope) else {
         return;
     };
     oracle.assert_ledger(&recovered);
@@ -297,16 +312,32 @@ fn block_parts(index: usize, selector: u8) -> (StoreBlockIdentity, Vec<u8>) {
 }
 
 fn prepared(identity: StoreBlockIdentity, payload: Vec<u8>) -> PreparedStoreBlock<'static> {
-    let mut block =
-        PreparedStoreBlock::new(scope(), identity, payload).expect("bounded fuzz block");
-    block.retention_ingest_time = Some(
-        crate::LifecycleClock::new(crate::FixedLifecycleClockSource::new(UnixNanoseconds::new(
-            1,
-        )))
-        .assign_ingest_time()
-        .expect("fixed fuzz ingest time"),
-    );
-    block
+    PreparedStoreBlock::new(scope(), identity, payload).expect("bounded fuzz replay block")
+}
+
+fn prepared_retained<'capacity>(
+    ledger: &ActiveSegmentLedger<'_, '_>,
+    authority: &'capacity StorageKernelResourceAuthority,
+    identity: StoreBlockIdentity,
+    payload: Vec<u8>,
+) -> PreparedStoreBlock<'capacity> {
+    let capacity = authority
+        .governor()
+        .reserve(
+            WorkClaim::tenant(
+                scope().tenant_id(),
+                WorkKind::Ingest,
+                ResourceAmounts::only(ResourceDimension::MemoryBytes, 1_048_576)
+                    .expect("bounded fuzz capacity"),
+            )
+            .expect("bounded fuzz claim"),
+        )
+        .expect("bounded fuzz reservation");
+    ledger
+        .begin_store_block(capacity, identity)
+        .expect("kernel fuzz preparation")
+        .finish(payload)
+        .expect("bounded fuzz block")
 }
 
 fn identity(index: usize) -> StoreBlockIdentity {
@@ -316,11 +347,13 @@ fn identity(index: usize) -> StoreBlockIdentity {
 
 fn open<'authority, 'catalog>(
     authority: &'authority crate::StorageKernelResourceAuthority,
+    retention_time: &'authority RetentionTimeAuthority,
     catalog: &'catalog Catalog<'authority>,
     scope: SegmentScope,
 ) -> Result<ActiveSegmentLedger<'authority, 'catalog>, super::LedgerFailure> {
-    ActiveSegmentLedger::open(
+    ActiveSegmentLedger::open_with_retention_time(
         authority,
+        retention_time,
         catalog,
         scope,
         SegmentProtectionKey::from_owned(Box::new([0x91; 32])),
@@ -329,10 +362,11 @@ fn open<'authority, 'catalog>(
 
 fn recover_or_stop<'authority, 'catalog>(
     authority: &'authority crate::StorageKernelResourceAuthority,
+    retention_time: &'authority RetentionTimeAuthority,
     catalog: &'catalog Catalog<'authority>,
     scope: SegmentScope,
 ) -> Option<ActiveSegmentLedger<'authority, 'catalog>> {
-    match open(authority, catalog, scope) {
+    match open(authority, retention_time, catalog, scope) {
         Ok(ledger) => Some(ledger),
         Err(failure) if failure.code() == LedgerFailureCode::InvalidInput => None,
         Err(failure) => panic!("unexpected fuzz recovery failure: {failure:?}"),

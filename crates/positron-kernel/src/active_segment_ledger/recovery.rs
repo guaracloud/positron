@@ -284,7 +284,7 @@ fn read_frontier(
             .and_then(|bytes| bytes.try_into().ok())
             .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?,
     );
-    if !matches!(format_version, 1 | 2) {
+    if !matches!(format_version, 1..=3) {
         return Err(LedgerFailure::new(LedgerFailureCode::UnsupportedFormat));
     }
     let frame_bytes = usize::try_from(u32::from_be_bytes(
@@ -345,10 +345,12 @@ fn read_frontier(
         return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
     }
     let position = position_from_value(read_u64(plaintext, 16)?)?;
-    let segment_retention = if format_version == 1 {
-        SegmentRetention::Unavailable
-    } else {
+    let segment_retention = if format_version == 3 {
         decode_segment_retention(plaintext)?
+    } else {
+        // v1 carried no bound and v2 could be authored from caller-supplied
+        // metadata. Both remain readable but are ineligible for destruction.
+        SegmentRetention::Unavailable
     };
     if matches!(segment_retention, SegmentRetention::Complete(_)) && next_sequence == 0 {
         return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));

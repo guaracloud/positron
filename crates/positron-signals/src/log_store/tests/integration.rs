@@ -11,8 +11,9 @@ use positron_kernel::{
     ActiveSegmentLedger, Catalog, CatalogObject, CatalogProposal, CatalogPublicationFault,
     CatalogSecret, FixedLifecycleClockSource, FormatEpoch, InstanceId, LifecycleClock,
     MountQualification, OrdinaryPool, PreparedStoreBlock, PrimaryDataVolume, RecoveryWorkClaim,
-    RecoveryWorkKind, ResourceAmounts, ResourceDimension, SegmentProtectionKey, SegmentScope,
-    StoreBlockIdentity, SystemLifecycleClockSource, TransactionId, WorkClaim, WorkClass, WorkKind,
+    RecoveryWorkKind, ResourceAmounts, ResourceDimension, RetentionTimeAuthority,
+    SegmentProtectionKey, SegmentScope, StoreBlockIdentity, SystemLifecycleClockSource,
+    TransactionId, WorkClaim, WorkClass, WorkKind, with_catalog_generation_ambiguity_hook_after,
     with_catalog_publication_fault_after,
 };
 use positron_policy::{
@@ -70,9 +71,10 @@ fn retention_clock() -> LifecycleClock<SystemLifecycleClockSource> {
     LifecycleClock::new(SystemLifecycleClockSource)
 }
 
-fn query_capacity_blocker<'kernel>(
+fn query_capacity_blocker_leaving<'kernel>(
     authority: &'kernel positron_kernel::StorageKernelResourceAuthority,
     tenant: TenantId,
+    headroom: u64,
 ) -> Result<positron_kernel::ResourceReservation<'kernel>, Box<dyn Error>> {
     let snapshot = authority.governor().inspect()?;
     let dimension = ResourceDimension::MemoryBytes;
@@ -85,8 +87,8 @@ fn query_capacity_blocker<'kernel>(
                 .checked_sub(snapshot.pool_usage(OrdinaryPool::InteractiveQueryTail, dimension))
                 .and_then(|query| shared.checked_add(query))
         })
-        .and_then(|available| available.checked_sub(1))
-        .ok_or("query capacity blocker cannot leave one byte")?;
+        .and_then(|available| available.checked_sub(headroom))
+        .ok_or("query capacity blocker cannot leave requested headroom")?;
     Ok(authority.governor().reserve(WorkClaim::tenant(
         tenant,
         WorkKind::InteractiveQueryTail,

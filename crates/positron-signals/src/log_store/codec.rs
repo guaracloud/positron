@@ -131,15 +131,13 @@ pub(super) fn decode_block(
     )
 }
 
-pub(super) fn block_retention_range_observed(
+pub(super) fn validate_retention_block_observed(
     expected_tenant: TenantId,
-    snapshot: &LedgerSnapshot<'_>,
     bytes: &[u8],
     cancellation: &dyn super::ScanCancellation,
     observer: &dyn super::ScanObserver,
-) -> Result<Option<positron_kernel::IngestTime>, LogStoreFailure> {
-    BlockDecode::observed(expected_tenant, bytes, cancellation, observer)?
-        .retention_range(snapshot, cancellation)
+) -> Result<(), LogStoreFailure> {
+    BlockDecode::observed(expected_tenant, bytes, cancellation, observer)?.validate(cancellation)
 }
 
 pub(super) fn decode_block_cancellable(
@@ -260,36 +258,6 @@ impl<'input> BlockDecode<'input> {
         )
     }
 
-    pub(super) fn retention_range(
-        mut self,
-        snapshot: &LedgerSnapshot<'_>,
-        cancellation: &dyn super::ScanCancellation,
-    ) -> Result<Option<positron_kernel::IngestTime>, LogStoreFailure> {
-        let mut latest = None;
-        for _ in 0..self.count {
-            if cancellation.is_cancelled() {
-                return Err(LogStoreFailure::cancelled());
-            }
-            let ingest_time = snapshot.reconstruct_ingest_time(record::retention_ingest_time(
-                &mut self.input,
-                self.limits,
-                self.version,
-            )?);
-            self.input.observe_decoded_record()?;
-            latest = Some(
-                latest.map_or(ingest_time, |current: positron_kernel::IngestTime| {
-                    current.max(ingest_time)
-                }),
-            );
-        }
-        self.input.finish_component_observation()?;
-        if !self.input.is_empty() {
-            return Err(LogStoreFailure::malformed_block());
-        }
-        Ok(latest)
-    }
-
-    #[cfg(fuzzing)]
     pub(super) fn validate(
         mut self,
         cancellation: &dyn super::ScanCancellation,

@@ -1,5 +1,6 @@
 use positron_domain::routing::CommitPosition;
 
+use crate::IngestTime;
 use crate::catalog::{
     Catalog, CatalogFailureCode, CatalogObject, CatalogProposal, FormatEpoch, TransactionId,
 };
@@ -37,13 +38,55 @@ pub(super) fn publish_segments(
     scope: SegmentScope,
     metadata: &[SegmentMetadata],
 ) -> Result<(), LedgerFailure> {
-    let mut objects = basis
-        .plaintext_objects()
-        .filter(|bytes| !storage.is_scope_metadata(bytes, scope))
-        .map(|bytes| CatalogObject::new(bytes.to_vec()))
-        .collect::<Result<Vec<_>, _>>()?;
+    publish_scope(catalog, basis, storage, scope, metadata, None)
+}
+
+pub(super) fn publish_segments_with_frontier(
+    catalog: &Catalog<'_>,
+    basis: &crate::CatalogSnapshot,
+    storage: &LedgerStorage,
+    scope: SegmentScope,
+    metadata: &[SegmentMetadata],
+    frontier: IngestTime,
+) -> Result<(), LedgerFailure> {
+    publish_scope(catalog, basis, storage, scope, metadata, Some(frontier))
+}
+
+fn publish_scope(
+    catalog: &Catalog<'_>,
+    basis: &crate::CatalogSnapshot,
+    storage: &LedgerStorage,
+    scope: SegmentScope,
+    metadata: &[SegmentMetadata],
+    frontier: Option<IngestTime>,
+) -> Result<(), LedgerFailure> {
+    let mut objects = Vec::new();
+    objects
+        .try_reserve_exact(
+            basis
+                .plaintext_object_count()
+                .saturating_add(metadata.len()),
+        )
+        .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+    for bytes in basis.plaintext_objects() {
+        if storage.is_scope_metadata(bytes, scope) {
+            continue;
+        }
+        if frontier.is_some()
+            && super::retention_frontier::decode(bytes)?
+                .is_some_and(|(candidate, _)| candidate == scope)
+        {
+            continue;
+        }
+        objects.push(CatalogObject::new(bytes.to_vec())?);
+    }
     for segment in metadata {
         objects.push(CatalogObject::new(storage.metadata_object(*segment))?);
+    }
+    if let Some(frontier) = frontier {
+        objects.push(CatalogObject::new(super::retention_frontier::encode(
+            scope, frontier,
+        ))?);
     }
     let random = DataProtection::random_identifier().map_err(map_frame_failure)?;
     let mut transaction = [0_u8; 16];
@@ -68,21 +111,22 @@ pub(super) fn publish_segments(
             // before its directory synchronization reported failure. Reconcile
             // the catalog authority before exposing an ordinary rejection to
             // callers whose live ledger still reflects the prior generation.
-            if failure.code() == CatalogFailureCode::StorageUnavailable
-                && catalog.refresh_state().is_ok()
-                && catalog.pin().ok().is_some_and(|snapshot| {
-                    basis.number().checked_add(1) == Some(snapshot.number())
-                        && storage.catalog_segments(&snapshot, scope).ok().is_some_and(
-                            |published| {
-                                published.len() == metadata.len()
-                                    && metadata.iter().all(|expected| published.contains(expected))
-                            },
-                        )
-                })
-            {
+            if failure.code() != CatalogFailureCode::StorageUnavailable {
+                return Err(failure.into());
+            }
+            catalog.refresh_state()?;
+            let snapshot = catalog.pin()?;
+            let segments = storage.catalog_segments(&snapshot, scope)?;
+            let segments_subsume = metadata.iter().all(|expected| segments.contains(expected));
+            let frontier_subsumed = match frontier {
+                Some(expected) => super::retention_frontier::recover(&snapshot, scope)?
+                    .is_some_and(|published| published >= expected),
+                None => true,
+            };
+            if snapshot.number() > basis.number() && segments_subsume && frontier_subsumed {
                 Ok(())
             } else {
-                Err(failure.into())
+                Err(LedgerFailure::new(LedgerFailureCode::StaleGeneration))
             }
         },
     }

@@ -1,9 +1,8 @@
 use positron_domain::routing::{SignalKind, VirtualShardId};
-use positron_domain::time::UnixNanoseconds;
 use positron_kernel::{
-    ActiveSegmentLedger, Catalog, CatalogSecret, FixedLifecycleClockSource, InstanceId,
-    LifecycleClock, ResourceAmounts, ResourceDimension, SegmentProtectionKey, SegmentScope,
-    StoreBlockIdentity, WorkClaim, WorkKind,
+    ActiveSegmentLedger, Catalog, CatalogSecret, InstanceId, ResourceAmounts, ResourceDimension,
+    RetentionTimeAuthority, SegmentProtectionKey, SegmentScope, StoreBlockIdentity, WorkClaim,
+    WorkKind,
 };
 use positron_policy::{IngestPolicy, PolicyEvaluation};
 use positron_signals::{LogRecord, LogStore, SchemaBudget, SchemaCatalog, SchemaEntry};
@@ -147,11 +146,9 @@ fn committed_ambiguity_reconciles_from_v2_and_shrinks_to_exact_retained_charge()
     let pending_capacity = reserve_memory(&fixture, staged_bytes).transfer();
     let block = LogStore::new()
         .prepare(
-            reserve_memory(&fixture, 1_048_576),
-            &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
-            fixture.tenant,
-            shard,
-            identity,
+            ledger
+                .begin_store_block(reserve_memory(&fixture, 1_048_576), identity)
+                .expect("kernel preparation"),
             staged_records,
         )
         .expect("prepared v2 block")
@@ -360,8 +357,12 @@ fn ledger<'authority, 'catalog>(
     shard: VirtualShardId,
     marker: u8,
 ) -> ActiveSegmentLedger<'authority, 'catalog> {
-    ActiveSegmentLedger::open(
+    let retention_time = Box::leak(Box::new(
+        RetentionTimeAuthority::establish().expect("retention time"),
+    ));
+    ActiveSegmentLedger::open_with_retention_time(
         &fixture.authority,
+        retention_time,
         catalog,
         SegmentScope::new(fixture.tenant, SignalKind::Logs, shard),
         SegmentProtectionKey::from_owned(Box::new([marker; 32])),

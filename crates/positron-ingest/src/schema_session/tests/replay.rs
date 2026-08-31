@@ -1,10 +1,9 @@
 use positron_domain::identity::TenantId;
 use positron_domain::routing::{SignalKind, VirtualShardId};
-use positron_domain::time::UnixNanoseconds;
 use positron_domain::value::{AttributeNamespace, CandidateAttributeValue};
 use positron_kernel::{
-    ActiveSegmentLedger, Catalog, CatalogSecret, FixedLifecycleClockSource, InstanceId,
-    LifecycleClock, PreparedStoreBlock, SegmentProtectionKey, SegmentScope, StoreBlockIdentity,
+    ActiveSegmentLedger, Catalog, CatalogSecret, InstanceId, PreparedStoreBlock,
+    SegmentProtectionKey, SegmentScope, StoreBlockIdentity,
 };
 use positron_policy::IngestPolicy;
 use positron_signals::{LogStore, ScanCancellation, SchemaCatalog, SchemaCheckpointFrontier};
@@ -135,7 +134,6 @@ fn bootstrap_replay_keeps_mandatory_discovery_when_text_is_not_admitted() {
         LogIngest::new(
             &fixture.authority,
             &ledger,
-            &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
             &policy,
             fixture.tenant,
             shard,
@@ -218,7 +216,6 @@ fn public_schema_replay_admits_actual_multi_path_reconciliation_work() {
         LogIngest::new(
             &fixture.authority,
             &ledger,
-            &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(101))),
             &policy,
             fixture.tenant,
             shard,
@@ -862,7 +859,6 @@ fn ingest<'authority>(
     schema: super::super::TenantSchemaSession,
     marker: u8,
 ) {
-    let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100)));
     let policy = IngestPolicy::preserving(1).expect("policy");
     let batch = OtlpLogsReceiver::new()
         .decode(crate::tests::support::protobuf_request())
@@ -871,7 +867,6 @@ fn ingest<'authority>(
         LogIngest::new(
             &fixture.authority,
             ledger,
-            &clock,
             &policy,
             fixture.tenant,
             shard,
@@ -891,8 +886,9 @@ fn ledger<'authority, 'catalog>(
     shard: VirtualShardId,
     marker: u8,
 ) -> ActiveSegmentLedger<'authority, 'catalog> {
-    ActiveSegmentLedger::open(
+    ActiveSegmentLedger::open_with_retention_time(
         &fixture.authority,
+        &fixture.retention_time,
         catalog,
         SegmentScope::new(fixture.tenant, SignalKind::Logs, shard),
         SegmentProtectionKey::from_owned(Box::new([marker; 32])),

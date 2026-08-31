@@ -117,7 +117,7 @@ fn scan_is_bounded_and_refuses_another_physical_scope() -> Result<(), Box<dyn Er
     )?;
     ledger.append(
         store
-            .prepare(
+            .prepare_unretained_for_test(
                 preparation_capacity(&authority, tenant)?,
                 &clock(1),
                 tenant,
@@ -195,7 +195,7 @@ fn sealed_and_successor_active_blocks_share_one_logical_scan() -> Result<(), Box
     let ledger = ActiveSegmentLedger::open(&authority, &catalog, scope, key())?;
     ledger.append(
         store
-            .prepare(
+            .prepare_unretained_for_test(
                 preparation_capacity(&authority, tenant)?,
                 &clock(10),
                 tenant,
@@ -209,7 +209,7 @@ fn sealed_and_successor_active_blocks_share_one_logical_scan() -> Result<(), Box
     let successor = ActiveSegmentLedger::open(&authority, &catalog, scope, key())?;
     successor.append(
         store
-            .prepare(
+            .prepare_unretained_for_test(
                 preparation_capacity(&authority, tenant)?,
                 &clock(11),
                 tenant,
@@ -254,7 +254,7 @@ fn exclusive_commit_lower_bound_reads_only_post_handoff_blocks() -> Result<(), B
     )?;
     ledger.append(
         store
-            .prepare(
+            .prepare_unretained_for_test(
                 preparation_capacity(&authority, tenant)?,
                 &clock(1),
                 tenant,
@@ -267,7 +267,7 @@ fn exclusive_commit_lower_bound_reads_only_post_handoff_blocks() -> Result<(), B
     let handoff = ledger.snapshot()?.frontier();
     ledger.append(
         store
-            .prepare(
+            .prepare_unretained_for_test(
                 preparation_capacity(&authority, tenant)?,
                 &clock(2),
                 tenant,
@@ -319,7 +319,7 @@ fn a_store_block_is_atomic_for_the_decoded_record_budget() -> Result<(), Box<dyn
     )?;
     ledger.append(
         LogStore::new()
-            .prepare(
+            .prepare_unretained_for_test(
                 preparation_capacity(&authority, tenant)?,
                 &clock(123),
                 tenant,
@@ -466,7 +466,7 @@ fn oversized_block_preflight_has_an_exact_observed_work_boundary() -> Result<(),
     )?;
     ledger.append(
         LogStore::new()
-            .prepare(
+            .prepare_unretained_for_test(
                 preparation_capacity(&authority, tenant)?,
                 &clock(124),
                 tenant,
@@ -616,7 +616,7 @@ fn fitting_block_decode_has_an_exact_observed_work_boundary() -> Result<(), Box<
     )?;
     ledger.append(
         LogStore::new()
-            .prepare(
+            .prepare_unretained_for_test(
                 preparation_capacity(&authority, tenant)?,
                 &clock(125),
                 tenant,
@@ -707,7 +707,7 @@ fn exact_result_limit_stops_before_decoding_a_later_committed_block() -> Result<
     )?;
     ledger.append(
         LogStore::new()
-            .prepare(
+            .prepare_unretained_for_test(
                 preparation_capacity(&authority, tenant)?,
                 &clock(1),
                 tenant,
@@ -915,7 +915,7 @@ fn cancellable_scan_stops_between_decoded_records_and_releases_capacity()
     for identity in [0x75_u8, 0x76] {
         ledger.append(
             LogStore::new()
-                .prepare(
+                .prepare_unretained_for_test(
                     preparation_capacity(&authority, tenant)?,
                     &clock(i64::from(identity)),
                     tenant,

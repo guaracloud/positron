@@ -1,9 +1,7 @@
 use positron_domain::identity::TenantId;
 use positron_domain::routing::SignalKind;
 use positron_domain::time::UnixNanoseconds;
-use positron_kernel::{
-    ActiveSegmentLedger, IngestTime, LifecycleClock, SystemLifecycleClockSource,
-};
+use positron_kernel::{ActiveSegmentLedger, IngestTime};
 
 use super::{LogStoreFailure, codec};
 
@@ -108,7 +106,6 @@ impl LogRetentionOutcome {
 
 pub(super) fn enforce_retention<'kernel, 'catalog>(
     ledger: &ActiveSegmentLedger<'kernel, 'catalog>,
-    clock: &LifecycleClock<SystemLifecycleClockSource>,
     tenant: TenantId,
     policy: LogRetentionPolicy,
     cancellation: &dyn super::ScanCancellation,
@@ -122,23 +119,11 @@ pub(super) fn enforce_retention<'kernel, 'catalog>(
     let retention_seconds = std::num::NonZeroU64::new(policy.retention_seconds)
         .ok_or_else(LogStoreFailure::invalid_input)?;
     super::check_scan_cancellation(cancellation)?;
-    let cutoff = clock
-        .retention_cutoff(retention_seconds)
-        .map_err(|failure| match failure {
-            positron_kernel::LifecycleClockFailure::Unavailable => {
-                LogStoreFailure::clock_unavailable()
-            },
-            positron_kernel::LifecycleClockFailure::OutOfRange => LogStoreFailure::limit_exceeded(),
-        })?;
-    let evaluated_at = cutoff.evaluated_at();
-    let clock_provenance = cutoff.provenance();
-    let snapshot = ledger.snapshot().map_err(map_kernel_failure)?;
+    let evaluation = ledger
+        .begin_retention(retention_seconds)
+        .map_err(map_kernel_failure)?;
     let active_segment = ledger.active_segment_id().map_err(map_kernel_failure)?;
-    let mut evidence = Vec::new();
-    evidence
-        .try_reserve_exact(snapshot.blocks().len())
-        .map_err(|_| LogStoreFailure::resource_exhausted())?;
-    for block in snapshot.blocks() {
+    for block in evaluation.blocks() {
         if block.segment_id() == active_segment {
             continue;
         }
@@ -149,30 +134,15 @@ pub(super) fn enforce_retention<'kernel, 'catalog>(
                     .map_err(|_| LogStoreFailure::limit_exceeded())?,
             )
             .map_err(LogStoreFailure::observation)?;
-        codec::block_retention_range_observed(
-            tenant,
-            &snapshot,
-            block.payload(),
-            cancellation,
-            observer,
-        )?
-        .ok_or_else(LogStoreFailure::malformed_block)?;
-        evidence.push(
-            snapshot
-                .retention_evidence(block, retention_seconds)
-                .map_err(map_kernel_failure)?,
-        );
+        codec::validate_retention_block_observed(tenant, block.payload(), cancellation, observer)?;
     }
     super::check_scan_cancellation(cancellation)?;
-    drop(snapshot);
-    let reclamation = ledger
-        .retire_expired_sealed_segments(cutoff, &evidence)
-        .map_err(map_kernel_failure)?;
+    let reclamation = evaluation.commit().map_err(map_kernel_failure)?;
     Ok(LogRetentionOutcome {
-        evaluated_at,
+        evaluated_at: reclamation.evaluated_at(),
         expired_segments: reclamation.logically_retired_segments(),
         reclaimed_segments: reclamation.physically_reclaimed_segments(),
-        clock_provenance,
+        clock_provenance: positron_kernel::RetentionCutoffProvenance::PersistedRetentionFrontier,
     })
 }
 

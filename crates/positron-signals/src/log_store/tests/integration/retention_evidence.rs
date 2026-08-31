@@ -13,6 +13,7 @@ fn retention_rejects_a_malformed_signal_block_without_retiring_its_segment()
     )?;
     let tenant = TenantId::from_bytes([0x41; 16])?;
     let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(15)?);
+    let retention_time = RetentionTimeAuthority::establish()?;
     let ledger = ActiveSegmentLedger::open(
         &authority,
         &catalog,
@@ -25,21 +26,16 @@ fn retention_rejects_a_malformed_signal_block_without_retiring_its_segment()
         vec![0xff],
     )?)?;
     ledger.seal()?;
-    let active = ActiveSegmentLedger::open_with_clock(
+    let active = ActiveSegmentLedger::open_with_retention_time(
         &authority,
+        &retention_time,
         &catalog,
         scope,
         SegmentProtectionKey::from_owned(Box::new([0x5f; 32])),
-        &retention_clock(),
     )?;
 
     let failure = LogStore::new()
-        .enforce_retention(
-            &active,
-            &retention_clock(),
-            tenant,
-            LogRetentionPolicy::new(1)?,
-        )
+        .enforce_retention(&active, tenant, LogRetentionPolicy::new(1)?)
         .expect_err("malformed signal bytes cannot become retention evidence");
     assert_eq!(
         failure.code(),
@@ -63,6 +59,7 @@ fn reconstructed_caller_time_cannot_retire_fresh_authenticated_data() -> Result<
     let tenant = TenantId::from_bytes([0x41; 16])?;
     let shard = VirtualShardId::new(12)?;
     let scope = SegmentScope::new(tenant, SignalKind::Logs, shard);
+    let retention_time = RetentionTimeAuthority::establish()?;
     let store = LogStore::new();
     let PolicyEvaluation::Accepted(evaluated) = IngestPolicy::preserving(1)?.evaluate(
         NativeLogCandidate::new(None, None, None, vec![], LogMetadata::empty()),
@@ -73,8 +70,9 @@ fn reconstructed_caller_time_cannot_retire_fresh_authenticated_data() -> Result<
     };
     let record =
         LogRecord::checked_evaluated(ValueLimitProfile::release_1_system_maximum(), *evaluated)?;
-    let ledger = ActiveSegmentLedger::open(
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
         &authority,
+        &retention_time,
         &catalog,
         scope,
         SegmentProtectionKey::from_owned(Box::new([0x5c; 32])),
@@ -84,14 +82,11 @@ fn reconstructed_caller_time_cannot_retire_fresh_authenticated_data() -> Result<
         .append(
             store
                 .prepare(
-                    preparation_capacity(&authority, tenant)
-                        .map_err(|failure| format!("reserve fresh preparation: {failure:?}"))?,
-                    &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(
-                        i64::MAX / 2,
-                    ))),
-                    tenant,
-                    shard,
-                    StoreBlockIdentity::new([0x6c; 16])?,
+                    ledger.begin_store_block(
+                        preparation_capacity(&authority, tenant)
+                            .map_err(|failure| format!("reserve fresh preparation: {failure:?}"))?,
+                        StoreBlockIdentity::new([0x6c; 16])?,
+                    )?,
                     vec![record],
                 )
                 .map_err(|failure| format!("prepare fresh retention block: {failure:?}"))?
@@ -101,12 +96,12 @@ fn reconstructed_caller_time_cannot_retire_fresh_authenticated_data() -> Result<
     ledger
         .seal()
         .map_err(|failure| format!("seal fresh retention segment: {failure:?}"))?;
-    let active = ActiveSegmentLedger::open_with_clock(
+    let active = ActiveSegmentLedger::open_with_retention_time(
         &authority,
+        &retention_time,
         &catalog,
         scope,
         SegmentProtectionKey::from_owned(Box::new([0x5c; 32])),
-        &retention_clock(),
     )
     .map_err(|failure| format!("reopen fresh retention ledger: {failure:?}"))?;
     let snapshot = active
@@ -117,7 +112,6 @@ fn reconstructed_caller_time_cannot_retire_fresh_authenticated_data() -> Result<
         .first()
         .ok_or("fresh retention fixture is missing its committed block")?;
     let duration = NonZeroU64::new(1).ok_or("positive retention duration")?;
-    let evidence = snapshot.retention_evidence(block, duration)?;
     let legacy_payload = block.payload().to_vec();
     let caller_time = snapshot.reconstruct_ingest_time(UnixNanoseconds::new(1_000_000_000));
     assert_ne!(
@@ -133,7 +127,8 @@ fn reconstructed_caller_time_cannot_retire_fresh_authenticated_data() -> Result<
     );
     drop(snapshot);
     let outcome = active
-        .retire_expired_sealed_segments(retention_clock().retention_cutoff(duration)?, &[evidence])
+        .begin_retention(duration)?
+        .commit()
         .map_err(|failure| format!("retire fresh retention ledger: {failure:?}"))?;
     assert_eq!(outcome.logically_retired_segments(), 0);
     assert_eq!(active.snapshot()?.blocks().len(), 1);
@@ -144,47 +139,22 @@ fn reconstructed_caller_time_cannot_retire_fresh_authenticated_data() -> Result<
         other_scope,
         SegmentProtectionKey::from_owned(Box::new([0x7c; 32])),
     )?;
-    let mismatched = other
-        .retire_expired_sealed_segments(retention_clock().retention_cutoff(duration)?, &[evidence])
-        .expect_err("snapshot evidence cannot authorize another ledger scope");
-    assert_eq!(
-        mismatched.code(),
-        positron_kernel::LedgerFailureCode::PhysicalScopeMismatch
-    );
     other.append(PreparedStoreBlock::new(
         other_scope,
         StoreBlockIdentity::new([0x7c; 16])?,
         legacy_payload,
     )?)?;
-    let unavailable_snapshot = other.snapshot()?;
-    let unavailable_block = unavailable_snapshot
-        .blocks()
-        .first()
-        .ok_or("legacy retention fixture is missing its block")?;
-    let unavailable = unavailable_snapshot
-        .retention_evidence(unavailable_block, duration)
-        .expect_err("blocks without authenticated ingest-time metadata cannot authorize expiry");
-    assert_eq!(
-        unavailable.code(),
-        positron_kernel::LedgerFailureCode::UnsupportedFormat
-    );
     assert_eq!(other.snapshot()?.blocks().len(), 1);
-    drop(unavailable_snapshot);
     other.seal()?;
-    let legacy = ActiveSegmentLedger::open_with_clock(
+    let legacy = ActiveSegmentLedger::open_with_retention_time(
         &authority,
+        &retention_time,
         &catalog,
         other_scope,
         SegmentProtectionKey::from_owned(Box::new([0x7c; 32])),
-        &retention_clock(),
     )?;
     let refusal = store
-        .enforce_retention(
-            &legacy,
-            &retention_clock(),
-            tenant,
-            LogRetentionPolicy::new(1)?,
-        )
+        .enforce_retention(&legacy, tenant, LogRetentionPolicy::new(1)?)
         .expect_err("unauthenticated ingest-time metadata cannot drive public retention");
     assert_eq!(
         refusal.code(),
@@ -207,6 +177,7 @@ fn retired_catalog_rename_is_reconciled_before_new_snapshots() -> Result<(), Box
     let tenant = TenantId::from_bytes([0x41; 16])?;
     let shard = VirtualShardId::new(13)?;
     let scope = SegmentScope::new(tenant, SignalKind::Logs, shard);
+    let retention_time = RetentionTimeAuthority::establish()?;
     let store = LogStore::new();
     let PolicyEvaluation::Accepted(evaluated) = IngestPolicy::preserving(1)?.evaluate(
         NativeLogCandidate::new(None, None, None, vec![], LogMetadata::empty()),
@@ -217,8 +188,9 @@ fn retired_catalog_rename_is_reconciled_before_new_snapshots() -> Result<(), Box
     };
     let record =
         LogRecord::checked_evaluated(ValueLimitProfile::release_1_system_maximum(), *evaluated)?;
-    let ledger = ActiveSegmentLedger::open(
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
         &authority,
+        &retention_time,
         &catalog,
         scope,
         SegmentProtectionKey::from_owned(Box::new([0x5d; 32])),
@@ -226,55 +198,173 @@ fn retired_catalog_rename_is_reconciled_before_new_snapshots() -> Result<(), Box
     ledger.append(
         store
             .prepare(
-                preparation_capacity(&authority, tenant)?,
-                &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(1))),
-                tenant,
-                shard,
-                StoreBlockIdentity::new([0x6d; 16])?,
+                ledger.begin_store_block(
+                    preparation_capacity(&authority, tenant)?,
+                    StoreBlockIdentity::new([0x6d; 16])?,
+                )?,
                 vec![record],
             )?
             .into_store_block(),
     )?;
     ledger.seal()?;
-    let active = ActiveSegmentLedger::open_with_clock(
+    std::thread::sleep(std::time::Duration::from_millis(1_050));
+    let active = ActiveSegmentLedger::open_with_retention_time(
         &authority,
+        &retention_time,
         &catalog,
         scope,
         SegmentProtectionKey::from_owned(Box::new([0x5d; 32])),
-        &retention_clock(),
     )?;
     assert_eq!(active.snapshot()?.blocks().len(), 1);
 
     let rejected =
         with_catalog_publication_fault_after(CatalogPublicationFault::SynchronizeCommit, 0, || {
-            store.enforce_retention(
-                &active,
-                &retention_clock(),
-                tenant,
-                LogRetentionPolicy::new(1)?,
-            )
+            store.enforce_retention(&active, tenant, LogRetentionPolicy::new(1)?)
         })
         .expect_err("a pre-publication catalog sync failure must remain typed");
     assert_eq!(
         rejected.code(),
-        positron_signals::LogStoreFailureCode::StorageUnavailable
+        positron_signals::LogStoreFailureCode::StaleGeneration
     );
     assert_eq!(active.snapshot()?.blocks().len(), 1);
 
-    let outcome = with_catalog_publication_fault_after(
-        CatalogPublicationFault::SynchronizeGenerationDirectory,
+    let outcome = with_catalog_generation_ambiguity_hook_after(
         0,
-        || {
-            store.enforce_retention(
-                &active,
-                &retention_clock(),
-                tenant,
-                LogRetentionPolicy::new(1)?,
-            )
+        |catalog| {
+            catalog
+                .refresh_after_ambiguous_publication_for_test()
+                .expect("N+1 must be recoverable before publishing N+2");
+            let basis = catalog.pin().expect("pin N+1");
+            let mut objects = basis
+                .object_identities()
+                .map(|identity| {
+                    CatalogObject::new(
+                        basis
+                            .object(identity)
+                            .expect("read N+1 object")
+                            .expect("N+1 object exists")
+                            .to_vec(),
+                    )
+                    .expect("copy N+1 object")
+                })
+                .collect::<Vec<_>>();
+            objects.push(CatalogObject::new(b"retention N+2".to_vec()).expect("N+2 object"));
+            catalog
+                .commit(
+                    basis.identity(),
+                    CatalogProposal::new(
+                        TransactionId::new([0x7d; 16]).expect("N+2 transaction"),
+                        FormatEpoch::CATALOG_V1,
+                        objects,
+                    )
+                    .expect("N+2 proposal"),
+                    None,
+                )
+                .expect("publish N+2");
         },
+        || store.enforce_retention(&active, tenant, LogRetentionPolicy::new(1)?),
     )?;
     assert_eq!(outcome.expired_segments(), 1);
     assert!(active.snapshot()?.blocks().is_empty());
+    Ok(())
+}
+
+#[test]
+fn later_catalog_conflict_hides_segments_already_published_as_retired() -> Result<(), Box<dyn Error>>
+{
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x21; 16])?,
+        CatalogSecret::from_owned(Box::new([0x22; 32]), Box::new([0x23; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let shard = VirtualShardId::new(16)?;
+    let scope = SegmentScope::new(tenant, SignalKind::Logs, shard);
+    let retention_time = RetentionTimeAuthority::establish()?;
+    let store = LogStore::new();
+    let PolicyEvaluation::Accepted(evaluated) = IngestPolicy::preserving(1)?.evaluate(
+        NativeLogCandidate::new(None, None, None, vec![], LogMetadata::empty()),
+        PolicyReceiver::OtlpGrpc,
+    )?
+    else {
+        return Err("preserving policy rejected the divergent N+2 fixture".into());
+    };
+    let record =
+        LogRecord::checked_evaluated(ValueLimitProfile::release_1_system_maximum(), *evaluated)?;
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        SegmentProtectionKey::from_owned(Box::new([0x24; 32])),
+    )?;
+    ledger.append(
+        store
+            .prepare(
+                ledger.begin_store_block(
+                    preparation_capacity(&authority, tenant)?,
+                    StoreBlockIdentity::new([0x25; 16])?,
+                )?,
+                vec![record],
+            )?
+            .into_store_block(),
+    )?;
+    ledger.seal()?;
+    std::thread::sleep(std::time::Duration::from_millis(1_050));
+    let active = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        SegmentProtectionKey::from_owned(Box::new([0x24; 32])),
+    )?;
+
+    let failure = with_catalog_generation_ambiguity_hook_after(
+        0,
+        |catalog| {
+            catalog
+                .refresh_after_ambiguous_publication_for_test()
+                .expect("recover divergent N+1");
+            let basis = catalog.pin().expect("pin divergent N+1");
+            let objects = basis
+                .object_identities()
+                .filter_map(|identity| {
+                    let bytes = basis
+                        .object(identity)
+                        .expect("read divergent N+1 object")
+                        .expect("divergent N+1 object exists");
+                    (!bytes.starts_with(b"PRETFR01")).then(|| {
+                        CatalogObject::new(bytes.to_vec()).expect("copy divergent N+1 object")
+                    })
+                })
+                .collect::<Vec<_>>();
+            catalog
+                .commit(
+                    basis.identity(),
+                    CatalogProposal::new(
+                        TransactionId::new([0x26; 16]).expect("divergent N+2 transaction"),
+                        FormatEpoch::CATALOG_V1,
+                        objects,
+                    )
+                    .expect("divergent N+2 proposal"),
+                    None,
+                )
+                .expect("publish divergent N+2");
+        },
+        || store.enforce_retention(&active, tenant, LogRetentionPolicy::new(1)?),
+    )
+    .expect_err("a later generation without the intended frontier must fence retention");
+    assert_eq!(
+        failure.code(),
+        positron_signals::LogStoreFailureCode::StaleGeneration
+    );
+    assert!(
+        active.snapshot()?.blocks().is_empty(),
+        "new snapshots cannot expose a segment the latest Catalog keeps Retired"
+    );
     Ok(())
 }
 
@@ -291,6 +381,7 @@ fn retired_lease_resume_reserves_capacity_before_recovery_reads() -> Result<(), 
     let tenant = TenantId::from_bytes([0x41; 16])?;
     let shard = VirtualShardId::new(14)?;
     let scope = SegmentScope::new(tenant, SignalKind::Logs, shard);
+    let retention_time = RetentionTimeAuthority::establish()?;
     let store = LogStore::new();
     let PolicyEvaluation::Accepted(evaluated) = IngestPolicy::preserving(1)?.evaluate(
         NativeLogCandidate::new(None, None, None, vec![], LogMetadata::empty()),
@@ -301,8 +392,9 @@ fn retired_lease_resume_reserves_capacity_before_recovery_reads() -> Result<(), 
     };
     let record =
         LogRecord::checked_evaluated(ValueLimitProfile::release_1_system_maximum(), *evaluated)?;
-    let ledger = ActiveSegmentLedger::open(
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
         &authority,
+        &retention_time,
         &catalog,
         scope,
         SegmentProtectionKey::from_owned(Box::new([0x5e; 32])),
@@ -310,16 +402,14 @@ fn retired_lease_resume_reserves_capacity_before_recovery_reads() -> Result<(), 
     ledger.append(
         store
             .prepare(
-                preparation_capacity(&authority, tenant)?,
-                &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(1))),
-                tenant,
-                shard,
-                StoreBlockIdentity::new([0x6e; 16])?,
+                ledger.begin_store_block(
+                    preparation_capacity(&authority, tenant)?,
+                    StoreBlockIdentity::new([0x6e; 16])?,
+                )?,
                 vec![record],
             )?
             .into_store_block(),
     )?;
-    ledger.seal()?;
     let lifecycle = retention_clock();
     let now = u64::try_from(
         lifecycle
@@ -329,18 +419,47 @@ fn retired_lease_resume_reserves_capacity_before_recovery_reads() -> Result<(), 
             .checked_div(1_000_000_000)
             .ok_or("lifecycle seconds")?,
     )?;
-    let active = ActiveSegmentLedger::open_with_clock(
+    let lease = ledger.create_snapshot_lease(now, now + 100)?;
+    let lease_identity = lease.identity();
+    drop(lease);
+    let PolicyEvaluation::Accepted(large) = IngestPolicy::preserving(1)?.evaluate(
+        NativeLogCandidate::new(
+            None,
+            None,
+            Some(CandidateAttributeValue::string("x".repeat(200_000))),
+            vec![],
+            LogMetadata::empty(),
+        ),
+        PolicyReceiver::OtlpGrpc,
+    )?
+    else {
+        return Err("preserving policy rejected the large resume fixture".into());
+    };
+    let large_record =
+        LogRecord::checked_evaluated(ValueLimitProfile::release_1_system_maximum(), *large)?;
+    for identity in [[0x7e; 16], [0x8e; 16], [0x9e; 16], [0xae; 16]] {
+        ledger.append(
+            store
+                .prepare(
+                    ledger.begin_store_block(
+                        preparation_capacity(&authority, tenant)?,
+                        StoreBlockIdentity::new(identity)?,
+                    )?,
+                    vec![large_record.clone()],
+                )?
+                .into_store_block(),
+        )?;
+    }
+    ledger.seal()?;
+    std::thread::sleep(std::time::Duration::from_millis(1_050));
+    let active = ActiveSegmentLedger::open_with_retention_time(
         &authority,
+        &retention_time,
         &catalog,
         scope,
         SegmentProtectionKey::from_owned(Box::new([0x5e; 32])),
-        &lifecycle,
     )?;
-    let lease = active.create_snapshot_lease(now, now + 100)?;
-    let lease_identity = lease.identity();
-    drop(lease);
-    let outcome =
-        store.enforce_retention(&active, &lifecycle, tenant, LogRetentionPolicy::new(1)?)?;
+    let outcome = store.enforce_retention(&active, tenant, LogRetentionPolicy::new(1)?)?;
     assert_eq!(outcome.expired_segments(), 1);
     assert_eq!(outcome.reclaimed_segments(), 0);
     let segment_path = std::fs::read_dir(root.path().join("segments/sealed"))?
@@ -359,10 +478,11 @@ fn retired_lease_resume_reserves_capacity_before_recovery_reads() -> Result<(), 
     std::fs::write(&segment_path, segment)?;
 
     let before = authority.governor().inspect()?;
-    let blocker = query_capacity_blocker(&authority, tenant)?;
+    let blocker = query_capacity_blocker_leaving(&authority, tenant, 1_100_000)?;
     let blocked = authority.governor().inspect()?;
+    let resume_now = active.snapshot_lease_time()?.max(now + 1);
     let refusal = active
-        .resume_snapshot_lease(lease_identity, now + 1)
+        .resume_snapshot_lease(lease_identity, resume_now)
         .expect_err("capacity refusal must precede retired segment recovery");
     assert_eq!(
         refusal.code(),
@@ -371,7 +491,7 @@ fn retired_lease_resume_reserves_capacity_before_recovery_reads() -> Result<(), 
     assert_same_resource_usage(&blocked, &authority.governor().inspect()?);
     drop(blocker);
     let corrupted = active
-        .resume_snapshot_lease(lease_identity, now + 1)
+        .resume_snapshot_lease(lease_identity, resume_now)
         .expect_err("corrupted retired payload must remain typed after capacity returns");
     assert_eq!(
         corrupted.code(),

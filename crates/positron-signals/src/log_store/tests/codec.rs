@@ -25,7 +25,7 @@ fn committed_native_log_survives_reopen_and_bounded_scan() -> Result<(), Box<dyn
         ],
         PolicyProvenance::new(7, [0x71; 32], vec!["redact-password".to_owned()])?,
     )?;
-    let prepared = store.prepare(
+    let prepared = store.prepare_unretained_for_test(
         preparation_capacity(&authority, tenant)?,
         &clock(1_723_456_789_000_000_000),
         tenant,
@@ -123,7 +123,7 @@ fn native_values_occurrences_namespaces_and_time_provenance_round_trip()
     let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
     let authority = establish_kernel_authority(volume)?;
     let store = LogStore::new();
-    let prepared = store.prepare(
+    let prepared = store.prepare_unretained_for_test(
         preparation_capacity(&authority, tenant)?,
         &clock(1_000),
         tenant,

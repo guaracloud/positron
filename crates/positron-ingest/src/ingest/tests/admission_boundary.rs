@@ -1,9 +1,7 @@
 use positron_domain::routing::{SignalKind, VirtualShardId};
-use positron_domain::time::UnixNanoseconds;
 use positron_kernel::{
-    ActiveSegmentLedger, Catalog, CatalogSecret, FixedLifecycleClockSource, InstanceId,
-    LifecycleClock, ResourceAmounts, ResourceDimension, SegmentProtectionKey, SegmentScope,
-    StoreBlockIdentity, WorkClaim, WorkKind,
+    ActiveSegmentLedger, Catalog, CatalogSecret, InstanceId, ResourceAmounts, ResourceDimension,
+    SegmentProtectionKey, SegmentScope, StoreBlockIdentity, WorkClaim, WorkKind,
 };
 
 use crate::{IngestFailureCode, IngestOutcome, IngestPolicy, LogIngest, OtlpLogsReceiver};
@@ -34,8 +32,9 @@ fn run_at_boundary(shortage: u64) -> IngestOutcome {
     )
     .expect("catalog");
     let shard = VirtualShardId::new(225).expect("shard");
-    let ledger = ActiveSegmentLedger::open(
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
         &fixture.authority,
+        &fixture.retention_time,
         &catalog,
         SegmentScope::new(fixture.tenant, SignalKind::Logs, shard),
         SegmentProtectionKey::from_owned(Box::new([0xe4; 32])),
@@ -111,11 +110,9 @@ fn run_at_boundary(shortage: u64) -> IngestOutcome {
         .governor()
         .reserve(filler)
         .expect("boundary filler");
-    let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(1)));
     LogIngest::new(
         &fixture.authority,
         &ledger,
-        &clock,
         &policy,
         fixture.tenant,
         shard,

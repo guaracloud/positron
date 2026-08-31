@@ -47,12 +47,22 @@ fn run_checked(data: &[u8]) -> Result<(), String> {
         .key
         .segment_key(instance.instance, second_scope)
         .map_err(describe)?;
-    let first_ledger =
-        ActiveSegmentLedger::open(&instance._authority, &catalog, first_scope, first_key)
-            .map_err(describe)?;
-    let second_ledger =
-        ActiveSegmentLedger::open(&instance._authority, &catalog, second_scope, second_key)
-            .map_err(describe)?;
+    let first_ledger = ActiveSegmentLedger::open_with_retention_time(
+        &instance._authority,
+        &instance.retention_time,
+        &catalog,
+        first_scope,
+        first_key,
+    )
+    .map_err(describe)?;
+    let second_ledger = ActiveSegmentLedger::open_with_retention_time(
+        &instance._authority,
+        &instance.retention_time,
+        &catalog,
+        second_scope,
+        second_key,
+    )
+    .map_err(describe)?;
     append_valid(
         &instance._authority,
         &first_ledger,

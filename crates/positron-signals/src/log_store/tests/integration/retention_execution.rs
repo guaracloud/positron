@@ -12,6 +12,7 @@ fn public_log_store_commits_and_scans_through_the_storage_kernel() -> Result<(),
     )?;
     let tenant = TenantId::from_bytes([0x41; 16])?;
     let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(8)?);
+    let retention_time = RetentionTimeAuthority::establish()?;
     let store = LogStore::new();
     let candidate = NativeLogCandidate::new(
         None,
@@ -34,22 +35,21 @@ fn public_log_store_commits_and_scans_through_the_storage_kernel() -> Result<(),
     };
     let record =
         LogRecord::checked_evaluated(ValueLimitProfile::release_1_system_maximum(), *evaluated)?;
-    let ledger = ActiveSegmentLedger::open(
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
         &authority,
+        &retention_time,
         &catalog,
         scope,
         SegmentProtectionKey::from_owned(Box::new([0x58; 32])),
     )?;
+    let preparation = ledger.begin_store_block(
+        preparation_capacity(&authority, tenant)?,
+        StoreBlockIdentity::new([0x68; 16])?,
+    )?;
+    let authoritative_ingest_time = preparation.ingest_time();
     ledger.append(
         store
-            .prepare(
-                preparation_capacity(&authority, tenant)?,
-                &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
-                tenant,
-                VirtualShardId::new(8)?,
-                StoreBlockIdentity::new([0x68; 16])?,
-                vec![record.clone()],
-            )?
+            .prepare(preparation, vec![record.clone()])?
             .into_store_block(),
     )?;
 
@@ -60,6 +60,7 @@ fn public_log_store_commits_and_scans_through_the_storage_kernel() -> Result<(),
         LogScan::all(ScanLimit::new(1)?),
     )?;
     assert_eq!(result.records()[0].record(), &record);
+    assert_eq!(result.records()[0].ingest_time(), authoritative_ingest_time);
     assert!(result.complete());
     Ok(())
 }
@@ -77,6 +78,7 @@ fn expired_sealed_logs_are_removed_by_kernel_ingest_time_only() -> Result<(), Bo
     let tenant = TenantId::from_bytes([0x41; 16])?;
     let shard = VirtualShardId::new(9)?;
     let scope = SegmentScope::new(tenant, SignalKind::Logs, shard);
+    let retention_time = RetentionTimeAuthority::establish()?;
     let store = LogStore::new();
     let PolicyEvaluation::Accepted(evaluated) = IngestPolicy::preserving(1)?.evaluate(
         NativeLogCandidate::new(
@@ -107,11 +109,9 @@ fn expired_sealed_logs_are_removed_by_kernel_ingest_time_only() -> Result<(), Bo
     };
     let record =
         LogRecord::checked_evaluated(ValueLimitProfile::release_1_system_maximum(), *evaluated)?;
-    let ingest_clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(
-        10_000_000_000,
-    )));
-    let ledger = ActiveSegmentLedger::open(
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
         &authority,
+        &retention_time,
         &catalog,
         scope,
         SegmentProtectionKey::from_owned(Box::new([0x59; 32])),
@@ -119,11 +119,10 @@ fn expired_sealed_logs_are_removed_by_kernel_ingest_time_only() -> Result<(), Bo
     ledger.append(
         store
             .prepare(
-                preparation_capacity(&authority, tenant)?,
-                &ingest_clock,
-                tenant,
-                shard,
-                StoreBlockIdentity::new([0x69; 16])?,
+                ledger.begin_store_block(
+                    preparation_capacity(&authority, tenant)?,
+                    StoreBlockIdentity::new([0x69; 16])?,
+                )?,
                 vec![record.clone(), record.clone()],
             )?
             .into_store_block(),
@@ -131,41 +130,35 @@ fn expired_sealed_logs_are_removed_by_kernel_ingest_time_only() -> Result<(), Bo
     ledger.append(
         store
             .prepare(
-                preparation_capacity(&authority, tenant)?,
-                &ingest_clock,
-                tenant,
-                shard,
-                StoreBlockIdentity::new([0x79; 16])?,
+                ledger.begin_store_block(
+                    preparation_capacity(&authority, tenant)?,
+                    StoreBlockIdentity::new([0x79; 16])?,
+                )?,
                 vec![record.clone()],
             )?
             .into_store_block(),
     )?;
     ledger.seal()?;
+    std::thread::sleep(std::time::Duration::from_millis(1_050));
 
-    let active = ActiveSegmentLedger::open_with_clock(
+    let active = ActiveSegmentLedger::open_with_retention_time(
         &authority,
+        &retention_time,
         &catalog,
         scope,
         SegmentProtectionKey::from_owned(Box::new([0x59; 32])),
-        &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(
-            12_000_000_000,
-        ))),
     )?;
     active.append(
         store
             .prepare(
-                preparation_capacity(&authority, tenant)?,
-                &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(
-                    i64::MAX / 2,
-                ))),
-                tenant,
-                shard,
-                StoreBlockIdentity::new([0x89; 16])?,
+                active.begin_store_block(
+                    preparation_capacity(&authority, tenant)?,
+                    StoreBlockIdentity::new([0x89; 16])?,
+                )?,
                 vec![record.clone()],
             )?
             .into_store_block(),
     )?;
-    let duration = NonZeroU64::new(1).ok_or("positive retention duration")?;
     for (observation, expected) in [
         (
             ScanObservationFailureCode::BudgetExhausted,
@@ -187,7 +180,6 @@ fn expired_sealed_logs_are_removed_by_kernel_ingest_time_only() -> Result<(), Bo
         let failure = store
             .enforce_retention_observed(
                 &active,
-                &retention_clock(),
                 tenant,
                 LogRetentionPolicy::new(1)?,
                 &NeverCancelledRetention,
@@ -198,16 +190,6 @@ fn expired_sealed_logs_are_removed_by_kernel_ingest_time_only() -> Result<(), Bo
         assert_eq!(active.snapshot()?.blocks().len(), 3);
     }
 
-    let evidence_snapshot = active.snapshot()?;
-    let evidence_block = evidence_snapshot
-        .blocks()
-        .first()
-        .ok_or("sealed retention fixture is missing its committed block")?;
-    let evidence = evidence_snapshot.retention_evidence(
-        evidence_block,
-        NonZeroU64::new(1).ok_or("positive retention duration")?,
-    )?;
-    let cutoff = retention_clock().retention_cutoff(duration)?;
     let recovery_baseline = authority
         .governor()
         .inspect()?
@@ -223,25 +205,13 @@ fn expired_sealed_logs_are_removed_by_kernel_ingest_time_only() -> Result<(), Bo
     }
     assert!(!held_recovery.is_empty());
     let public_refusal = store
-        .enforce_retention(
-            &active,
-            &retention_clock(),
-            tenant,
-            LogRetentionPolicy::new(1)?,
-        )
+        .enforce_retention(&active, tenant, LogRetentionPolicy::new(1)?)
         .expect_err("public retention must preserve kernel recovery refusal");
     assert_eq!(
         public_refusal.code(),
         positron_signals::LogStoreFailureCode::ResourceAdmissionRefused
     );
-    let refused = active
-        .retire_expired_sealed_segments(cutoff, &[evidence])
-        .expect_err("saturated retention recovery capacity must fail before publication");
-    assert_eq!(
-        refused.code(),
-        positron_kernel::LedgerFailureCode::ResourceAdmissionRefused
-    );
-    assert_eq!(evidence_snapshot.blocks().len(), 3);
+    assert_eq!(active.snapshot()?.blocks().len(), 3);
     drop(held_recovery);
     assert_eq!(
         authority
@@ -250,39 +220,15 @@ fn expired_sealed_logs_are_removed_by_kernel_ingest_time_only() -> Result<(), Bo
             .outstanding_for(WorkClass::DurabilityRecovery),
         recovery_baseline
     );
-    let incomplete = active.retire_expired_sealed_segments(cutoff, &[])?;
-    assert_eq!(incomplete.logically_retired_segments(), 0);
     assert_eq!(active.snapshot()?.blocks().len(), 3);
-    let excessive = vec![evidence; 1_025];
-    let bounded = active
-        .retire_expired_sealed_segments(cutoff, &excessive)
-        .expect_err("retention evidence must remain bounded");
-    assert_eq!(
-        bounded.code(),
-        positron_kernel::LedgerFailureCode::LimitExceeded
-    );
-    let duplicate = active
-        .retire_expired_sealed_segments(cutoff, &[evidence, evidence])
-        .expect_err("duplicate block evidence must fail before publication");
-    assert_eq!(
-        duplicate.code(),
-        positron_kernel::LedgerFailureCode::InvalidInput
-    );
-    assert_eq!(active.snapshot()?.blocks().len(), 3);
-    drop(evidence_snapshot);
 
-    let outcome = store.enforce_retention(
-        &active,
-        &retention_clock(),
-        tenant,
-        LogRetentionPolicy::new(1)?,
-    )?;
-    assert!(outcome.evaluated_at().value() > 12_000_000_000);
+    let outcome = store.enforce_retention(&active, tenant, LogRetentionPolicy::new(1)?)?;
+    assert!(outcome.evaluated_at().value() > 0);
     assert_eq!(outcome.expired_segments(), 1);
     assert_eq!(outcome.reclaimed_segments(), 1);
     assert_eq!(
         outcome.clock_provenance(),
-        positron_kernel::RetentionCutoffProvenance::LifecycleClock
+        positron_kernel::RetentionCutoffProvenance::PersistedRetentionFrontier
     );
     let result = store.scan(
         authority.governor(),

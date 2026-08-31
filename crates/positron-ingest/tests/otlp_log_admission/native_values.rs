@@ -7,15 +7,14 @@ use opentelemetry_proto::tonic::common::v1::{
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs, SeverityNumber};
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use positron_domain::routing::{SignalKind, VirtualShardId};
-use positron_domain::time::UnixNanoseconds;
 use positron_domain::value::{AttributeNamespace, AttributeValueKind};
 use positron_governance::{CompatibilityHints, PresentedCredential, RequestedIntent};
 use positron_ingest::{
     AuthenticatedOtlpLogsRequest, IngestOutcome, IngestPolicy, LogIngest, OtlpLogsReceiver,
 };
 use positron_kernel::{
-    ActiveSegmentLedger, Catalog, CatalogSecret, FixedLifecycleClockSource, InstanceId,
-    LifecycleClock, MountQualification, SegmentProtectionKey, SegmentScope, StoreBlockIdentity,
+    ActiveSegmentLedger, Catalog, CatalogSecret, InstanceId, MountQualification,
+    SegmentProtectionKey, SegmentScope, StoreBlockIdentity,
 };
 use positron_runtime::{BootstrapPaths, InitializationPlan, InstanceBootstrap};
 use positron_signals::{LogScan, LogStore, ScanLimit};
@@ -57,14 +56,17 @@ fn native_values_survive_authenticated_otlp_acknowledgement_and_reopen()
     let scope = SegmentScope::new(fixture.tenant, SignalKind::Logs, shard);
     let protection_key = || SegmentProtectionKey::from_owned(Box::new([0xe4; 32]));
     let policy = IngestPolicy::preserving(17)?;
-    let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(500)));
     {
-        let ledger =
-            ActiveSegmentLedger::open(&fixture.authority, &catalog, scope, protection_key())?;
+        let ledger = ActiveSegmentLedger::open_with_retention_time(
+            &fixture.authority,
+            &fixture.retention_time,
+            &catalog,
+            scope,
+            protection_key(),
+        )?;
         let committed = match LogIngest::new(
             &fixture.authority,
             &ledger,
-            &clock,
             &policy,
             fixture.tenant,
             shard,
@@ -79,8 +81,13 @@ fn native_values_survive_authenticated_otlp_acknowledgement_and_reopen()
         assert_eq!(committed.receipt().position().value(), 1);
     }
 
-    let reopened =
-        ActiveSegmentLedger::open(&fixture.authority, &catalog, scope, protection_key())?;
+    let reopened = ActiveSegmentLedger::open_with_retention_time(
+        &fixture.authority,
+        &fixture.retention_time,
+        &catalog,
+        scope,
+        protection_key(),
+    )?;
     let result = LogStore::new().scan(
         fixture.authority.governor(),
         fixture.tenant,

@@ -31,6 +31,7 @@ struct Record {
     identity: StoreBlockIdentity,
     payload: Vec<u8>,
     receipt: CommitReceipt,
+    ingest_nanos: u64,
 }
 
 impl Oracle {
@@ -55,6 +56,7 @@ impl Oracle {
         identity: StoreBlockIdentity,
         payload: Vec<u8>,
         receipt: CommitReceipt,
+        ingest_nanos: u64,
     ) {
         assert_eq!(receipt.position().value(), self.expected_position());
         assert!(
@@ -66,6 +68,7 @@ impl Oracle {
             identity,
             payload,
             receipt,
+            ingest_nanos,
         });
         self.frontier = receipt.position();
     }
@@ -89,6 +92,34 @@ impl Oracle {
     pub(super) fn retire_segments(&mut self, retired: &BTreeSet<SegmentId>) {
         self.records
             .retain(|record| !retired.contains(&record.receipt.segment_id()));
+    }
+
+    pub(super) fn expired_segments(
+        &self,
+        active: SegmentId,
+        now_nanos: u64,
+        retention_nanos: u64,
+    ) -> BTreeSet<SegmentId> {
+        let Some(cutoff) = now_nanos.checked_sub(retention_nanos) else {
+            return BTreeSet::new();
+        };
+        let segments = self
+            .records
+            .iter()
+            .filter(|record| record.receipt.segment_id() != active)
+            .map(|record| record.receipt.segment_id())
+            .collect::<BTreeSet<_>>();
+        segments
+            .into_iter()
+            .filter(|segment| {
+                self.records
+                    .iter()
+                    .filter(|record| record.receipt.segment_id() == *segment)
+                    .map(|record| record.ingest_nanos)
+                    .max()
+                    .is_some_and(|latest| latest <= cutoff)
+            })
+            .collect()
     }
 
     pub(super) fn capture(snapshot: &super::super::LedgerSnapshot<'_>) -> SnapshotExpectation {

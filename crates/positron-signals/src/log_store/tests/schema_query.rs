@@ -513,7 +513,7 @@ fn stored_projection_compatibility_preserves_nested_occurrences_and_exact_matchi
         )],
         PolicyProvenance::new(1, [0x36; 32], vec![])?,
     )?;
-    let prepared = store.prepare(
+    let prepared = store.prepare_unretained_for_test(
         preparation_capacity(&authority, tenant)?,
         &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(10))),
         tenant,
@@ -1076,7 +1076,7 @@ fn governed_promotion_overflow_releases_sidecar_cost_and_reopens() -> Result<(),
     let path = SchemaPath::root(AttributeNamespace::Record, "scalar".to_owned())?;
     let identity = StoreBlockIdentity::new([0x5d; 16])?;
     let prepared = store
-        .prepare(
+        .prepare_unretained_for_test(
             preparation_capacity(&authority, tenant)?,
             &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(103))),
             tenant,

@@ -14,6 +14,7 @@ mod receipt;
 mod reconstruction;
 mod recovery;
 mod retention;
+mod retention_frontier;
 mod scope_discovery;
 mod snapshot_lease;
 mod snapshot_lease_attempt;
@@ -41,8 +42,8 @@ use crate::catalog::Catalog;
 use crate::data_protection::ObjectDataKey;
 use crate::resource_governor::{ActiveSegmentLeaseFailure, ActiveSegmentLedgerLease};
 use crate::{
-    CatalogSnapshot, RecoveryWorkClaim, RecoveryWorkKind, StorageKernelResourceAuthority,
-    WorkClaim, WorkKind,
+    CatalogSnapshot, RecoveryWorkClaim, RecoveryWorkKind, ResourceReservation,
+    StorageKernelResourceAuthority, WorkClaim, WorkKind,
 };
 
 use capacity::{recovery_claim, retained_claim, snapshot_retained_claim};
@@ -69,6 +70,7 @@ pub use types::*;
 pub struct RetentionReclamation {
     logically_retired_segments: usize,
     physically_reclaimed_segments: usize,
+    evaluated_at: positron_domain::time::UnixNanoseconds,
 }
 
 impl RetentionReclamation {
@@ -81,6 +83,40 @@ impl RetentionReclamation {
     pub const fn physically_reclaimed_segments(self) -> usize {
         self.physically_reclaimed_segments
     }
+
+    #[must_use]
+    pub const fn evaluated_at(self) -> positron_domain::time::UnixNanoseconds {
+        self.evaluated_at
+    }
+}
+
+/// Move-only, pre-admitted retention evaluation over one authenticated ledger state.
+pub struct RetentionEvaluation<'ledger, 'kernel, 'catalog> {
+    ledger: &'ledger ActiveSegmentLedger<'kernel, 'catalog>,
+    _capacity: ResourceReservation<'kernel>,
+    catalog_identity: crate::CatalogGenerationId,
+    frontier: crate::IngestTime,
+    cutoff: positron_domain::time::UnixNanoseconds,
+    blocks: Vec<CommittedBlock>,
+}
+
+impl<'ledger, 'kernel, 'catalog> RetentionEvaluation<'ledger, 'kernel, 'catalog> {
+    #[must_use]
+    pub fn blocks(&self) -> &[CommittedBlock] {
+        &self.blocks
+    }
+
+    pub fn commit(self) -> Result<RetentionReclamation, LedgerFailure> {
+        retention::commit(self)
+    }
+}
+
+fn map_retention_time_failure(failure: crate::LifecycleClockFailure) -> LedgerFailure {
+    let code = match failure {
+        crate::LifecycleClockFailure::Unavailable => LedgerFailureCode::StorageUnavailable,
+        crate::LifecycleClockFailure::OutOfRange => LedgerFailureCode::LimitExceeded,
+    };
+    LedgerFailure::new(code)
 }
 
 const MAX_STORE_BLOCK_BYTES: usize = 1_048_576;
@@ -105,6 +141,7 @@ pub fn fuzz_snapshot_lease_record(data: &[u8]) {
 pub struct ActiveSegmentLedger<'kernel, 'catalog> {
     _writer: ActiveSegmentLedgerLease<'kernel>,
     authority: &'kernel StorageKernelResourceAuthority,
+    retention_time: Option<&'kernel crate::RetentionTimeAuthority>,
     catalog: &'catalog Catalog<'kernel>,
     scope: SegmentScope,
     storage: LedgerStorage,
@@ -165,6 +202,31 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         )
     }
 
+    pub fn open_with_retention_time(
+        authority: &'kernel StorageKernelResourceAuthority,
+        retention_time: &'kernel crate::RetentionTimeAuthority,
+        catalog: &'catalog Catalog<'kernel>,
+        scope: SegmentScope,
+        protection: SegmentProtectionKey,
+    ) -> Result<Self, LedgerFailure> {
+        let now = crate::LifecycleClock::new(crate::SystemLifecycleClockSource)
+            .assign_ingest_time()
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::StorageUnavailable))?
+            .instant()
+            .value()
+            .checked_div(1_000_000_000)
+            .and_then(|value| u64::try_from(value).ok())
+            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::StorageUnavailable))?;
+        Self::open_at(
+            authority,
+            Some(retention_time),
+            catalog,
+            scope,
+            protection,
+            now,
+        )
+    }
+
     pub fn open_with_clock<S: crate::LifecycleClockSource>(
         authority: &'kernel StorageKernelResourceAuthority,
         catalog: &'catalog Catalog<'kernel>,
@@ -180,11 +242,12 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             .checked_div(1_000_000_000)
             .and_then(|value| u64::try_from(value).ok())
             .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::StorageUnavailable))?;
-        Self::open_at(authority, catalog, scope, protection, now)
+        Self::open_at(authority, None, catalog, scope, protection, now)
     }
 
     fn open_at(
         authority: &'kernel StorageKernelResourceAuthority,
+        retention_time: Option<&'kernel crate::RetentionTimeAuthority>,
         catalog: &'catalog Catalog<'kernel>,
         scope: SegmentScope,
         protection: SegmentProtectionKey,
@@ -218,6 +281,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::StorageUnavailable))?;
         let mut storage = LedgerStorage::open(volume)?;
         let snapshot = catalog.pin()?;
+        let retention_frontier = retention_frontier::recover(&snapshot, scope)?;
         let recovered_leases = snapshot_lease_recovery::recover_reservations(
             authority, catalog, scope, &snapshot, now,
         )?;
@@ -257,6 +321,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         Ok(Self {
             _writer: writer,
             authority,
+            retention_time,
             catalog,
             scope,
             storage,
@@ -274,6 +339,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
                 lease_resume_markers: recovered_leases.resume_markers,
                 pending_lease_releases: snapshot_lease_pending::PendingLeaseReleases::new(),
                 last_snapshot_lease_time: recovered_leases.last_observed,
+                retention_frontier,
             }),
             lease_attempts: Arc::new(Mutex::new(
                 snapshot_lease_attempt::LeaseAttemptRegistry::new(),
@@ -294,22 +360,142 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         self.scope
     }
 
+    /// Mints the authoritative Ingest Time for one Signal Store preparation.
+    pub fn begin_store_block<'capacity>(
+        &self,
+        capacity: ResourceReservation<'capacity>,
+        identity: StoreBlockIdentity,
+    ) -> Result<StoreBlockPreparation<'capacity>, LedgerFailure> {
+        if !capacity.authorizes_ingest_preparation(self.scope.tenant, 1_048_576) {
+            return Err(LedgerFailure::new(
+                LedgerFailureCode::ResourceAdmissionRefused,
+            ));
+        }
+        let retention_time = self
+            .retention_time
+            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::UnsupportedFormat))?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
+        let ingest_time = retention_time
+            .ingest_time(self.scope, state.retention_frontier)
+            .map_err(map_retention_time_failure)?;
+        if state.retention_frontier.is_none() {
+            self.catalog.refresh_state()?;
+            let basis = self.catalog.pin()?;
+            retention_frontier::publish(self.catalog, &basis, self.scope, ingest_time)?;
+            state.retention_frontier = Some(ingest_time);
+        }
+        Ok(StoreBlockPreparation {
+            scope: self.scope,
+            identity,
+            ingest_time,
+            retention_ingest_time: Some(ingest_time),
+            capacity,
+        })
+    }
+
+    /// Mints deterministic, retention-ineligible Ingest Time for cross-crate tests.
+    #[cfg(feature = "test-support")]
+    pub fn begin_store_block_for_test<'capacity>(
+        &self,
+        capacity: ResourceReservation<'capacity>,
+        identity: StoreBlockIdentity,
+        retention_time: &crate::RetentionTimeAuthority,
+    ) -> Result<StoreBlockPreparation<'capacity>, LedgerFailure> {
+        if !capacity.authorizes_ingest_preparation(self.scope.tenant, 1_048_576) {
+            return Err(LedgerFailure::new(
+                LedgerFailureCode::ResourceAdmissionRefused,
+            ));
+        }
+        if retention_time.authorizes_destructive_retention() {
+            return Err(LedgerFailure::new(LedgerFailureCode::InvalidInput));
+        }
+        let ingest_time = retention_time
+            .ingest_time(self.scope, None)
+            .map_err(map_retention_time_failure)?;
+        Ok(StoreBlockPreparation {
+            scope: self.scope,
+            identity,
+            ingest_time,
+            retention_ingest_time: None,
+            capacity,
+        })
+    }
+
     /// Returns the active segment identity for this physical scope.
     pub fn active_segment_id(&self) -> Result<SegmentId, LedgerFailure> {
         self.storage.segment_id()
     }
 
-    /// Atomically removes complete expired sealed segments from new snapshots.
-    ///
-    /// The kernel derives candidates by matching complete block evidence to
-    /// authenticated current metadata. Callers cannot select segment IDs or
-    /// provide a raw wall-clock/reclamation time.
-    pub fn retire_expired_sealed_segments(
-        &self,
-        cutoff: crate::RetentionCutoff,
-        evidence: &[BlockRetentionEvidence],
-    ) -> Result<RetentionReclamation, LedgerFailure> {
-        retention::retire_expired_sealed_segments(self, cutoff, evidence)
+    /// Admits one retention pass without accepting caller-selected time or segments.
+    pub fn begin_retention<'ledger>(
+        &'ledger self,
+        duration: std::num::NonZeroU64,
+    ) -> Result<RetentionEvaluation<'ledger, 'kernel, 'catalog>, LedgerFailure> {
+        let retention_time = self
+            .retention_time
+            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::UnsupportedFormat))?;
+        if !retention_time.authorizes_destructive_retention() {
+            return Err(LedgerFailure::new(LedgerFailureCode::UnsupportedFormat));
+        }
+        self.catalog.refresh_state()?;
+        let basis = self.catalog.pin()?;
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
+        let catalog_bytes = basis
+            .plaintext_objects()
+            .try_fold(0_usize, |total, bytes| {
+                total
+                    .checked_add(bytes.len())
+                    .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))
+            })?;
+        let inspected_bytes = state
+            .retained_bytes
+            .checked_add(catalog_bytes)
+            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+        let inspected_items = state
+            .blocks
+            .len()
+            .checked_add(basis.plaintext_object_count())
+            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+        let claim = RecoveryWorkClaim::tenant(
+            self.scope.tenant,
+            RecoveryWorkKind::Retention,
+            capacity::retention_claim(inspected_bytes, inspected_items)?,
+        )
+        .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+        let capacity = self
+            .authority
+            .recovery()
+            .reserve(claim)
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
+        let frontier = retention_time
+            .ingest_time(self.scope, state.retention_frontier)
+            .map_err(map_retention_time_failure)?;
+        let duration_nanos = duration
+            .get()
+            .checked_mul(1_000_000_000)
+            .and_then(|value| i64::try_from(value).ok())
+            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+        let cutoff = frontier
+            .instant()
+            .value()
+            .checked_sub(duration_nanos)
+            .map(positron_domain::time::UnixNanoseconds::new)
+            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+        let blocks = state.blocks.clone();
+        Ok(RetentionEvaluation {
+            ledger: self,
+            _capacity: capacity,
+            catalog_identity: basis.identity(),
+            frontier,
+            cutoff,
+            blocks,
+        })
     }
 
     /// Builds an immutable snapshot for an already-admitted task. The caller's

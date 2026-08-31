@@ -1,12 +1,9 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
-use std::num::NonZeroU64;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use positron_domain::time::UnixNanoseconds;
-
-const NANOS_PER_SECOND: u64 = 1_000_000_000;
 
 /// A kernel-assigned timestamp that cannot be constructed from caller values.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -23,34 +20,10 @@ impl IngestTime {
     }
 }
 
-/// Kernel-minted age boundary for one retention evaluation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RetentionCutoff {
-    instant: UnixNanoseconds,
-    evaluated_at: UnixNanoseconds,
-}
-
-impl RetentionCutoff {
-    #[must_use]
-    pub const fn instant(self) -> UnixNanoseconds {
-        self.instant
-    }
-
-    #[must_use]
-    pub const fn evaluated_at(self) -> UnixNanoseconds {
-        self.evaluated_at
-    }
-
-    #[must_use]
-    pub const fn provenance(self) -> RetentionCutoffProvenance {
-        RetentionCutoffProvenance::LifecycleClock
-    }
-}
-
 /// Stable provenance for destructive age evaluation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RetentionCutoffProvenance {
-    LifecycleClock,
+    PersistedRetentionFrontier,
 }
 
 /// Trusted wall-clock adapter used only by the Storage Kernel Lifecycle Clock.
@@ -116,34 +89,6 @@ impl<S: LifecycleClockSource> LifecycleClock<S> {
     }
 }
 
-impl LifecycleClock<SystemLifecycleClockSource> {
-    /// Mints a destructive retention boundary from the production kernel
-    /// clock and a bounded tenant-and-store duration.
-    ///
-    /// Test and replay clocks may assign deterministic ingest time, but cannot
-    /// mint deletion authority.
-    pub fn retention_cutoff(
-        &self,
-        retention_seconds: NonZeroU64,
-    ) -> Result<RetentionCutoff, LifecycleClockFailure> {
-        let now = self.assign_ingest_time()?.instant();
-        let retention_nanos = retention_seconds
-            .get()
-            .checked_mul(NANOS_PER_SECOND)
-            .and_then(|value| i64::try_from(value).ok())
-            .ok_or(LifecycleClockFailure::OutOfRange)?;
-        let instant = now
-            .value()
-            .checked_sub(retention_nanos)
-            .map(UnixNanoseconds::new)
-            .ok_or(LifecycleClockFailure::OutOfRange)?;
-        Ok(RetentionCutoff {
-            instant,
-            evaluated_at: now,
-        })
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LifecycleClockFailure {
     Unavailable,
@@ -198,35 +143,6 @@ mod tests {
         assert_eq!(
             LifecycleClockFailure::Unavailable.to_string(),
             "lifecycle clock unavailable"
-        );
-    }
-
-    #[test]
-    fn retention_cutoff_is_minted_from_kernel_time_with_explicit_provenance() {
-        let clock = LifecycleClock::new(SystemLifecycleClockSource);
-        let cutoff = clock
-            .retention_cutoff(std::num::NonZeroU64::new(2).expect("positive duration"))
-            .expect("representable cutoff");
-
-        assert_eq!(
-            cutoff.evaluated_at().value() - cutoff.instant().value(),
-            2_000_000_000
-        );
-        assert_eq!(
-            cutoff.provenance(),
-            RetentionCutoffProvenance::LifecycleClock
-        );
-    }
-
-    #[test]
-    fn retention_cutoff_rejects_unrepresentable_duration() {
-        let duration_overflow = LifecycleClock::new(SystemLifecycleClockSource)
-            .retention_cutoff(NonZeroU64::new(u64::MAX).expect("nonzero duration"))
-            .expect_err("duration multiplication must remain bounded");
-        assert_eq!(duration_overflow, LifecycleClockFailure::OutOfRange);
-        assert_eq!(
-            duration_overflow.to_string(),
-            "lifecycle clock value is out of range"
         );
     }
 }

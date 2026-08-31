@@ -1,80 +1,34 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use super::capacity::retained_claim;
 use super::format::SegmentState;
-use super::publication::publish_segments;
+use super::publication::{publish_segments, publish_segments_with_frontier};
 use super::{
-    ActiveSegmentLedger, BlockRetentionEvidence, LedgerFailure, LedgerFailureCode,
-    RecoveryWorkClaim, RecoveryWorkKind, RetentionReclamation,
+    ActiveSegmentLedger, LedgerFailure, LedgerFailureCode, RetentionEvaluation,
+    RetentionReclamation, SegmentRetention,
 };
 
-/// Derives fully expired sealed segments from snapshot-bound block evidence,
-/// then publishes only those complete segments as retired.
-pub(super) fn retire_expired_sealed_segments(
-    ledger: &ActiveSegmentLedger<'_, '_>,
-    cutoff: crate::RetentionCutoff,
-    evidence: &[BlockRetentionEvidence],
+pub(super) fn commit(
+    evaluation: RetentionEvaluation<'_, '_, '_>,
 ) -> Result<RetentionReclamation, LedgerFailure> {
-    if evidence.len() > super::MAX_RETAINED_BLOCKS {
-        return Err(LedgerFailure::new(LedgerFailureCode::LimitExceeded));
-    }
+    let ledger = evaluation.ledger;
     let mut state = ledger
         .state
         .lock()
         .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
     ledger.catalog.refresh_state()?;
     let basis = ledger.catalog.pin()?;
-    let mut inspected_bytes = 0_usize;
-    for item in evidence {
-        if item.scope != ledger.scope
-            || item.catalog_identity != basis.identity()
-            || item.bucket.tenant() != ledger.scope.tenant
-            || item.bucket.signal_kind() != ledger.scope.signal
-        {
-            return Err(LedgerFailure::new(LedgerFailureCode::PhysicalScopeMismatch));
-        }
-        let Some(block) = state.blocks.iter().find(|block| {
-            block.identity == item.block
-                && block.segment == item.segment
-                && block.content_digest == item.content_digest
-        }) else {
-            return Err(LedgerFailure::new(LedgerFailureCode::StaleGeneration));
-        };
-        inspected_bytes = inspected_bytes
-            .checked_add(block.payload.len())
-            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+    if basis.identity() != evaluation.catalog_identity {
+        return Err(LedgerFailure::new(LedgerFailureCode::StaleGeneration));
     }
-    let catalog_items = basis.plaintext_object_count();
-    let inspected_bytes = super::format::METADATA_BYTES
-        .checked_mul(catalog_items)
-        .and_then(|metadata_bytes| inspected_bytes.checked_add(metadata_bytes))
-        .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
-    let inspected_items = evidence
-        .len()
-        .checked_add(catalog_items)
-        .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
-    let claim = RecoveryWorkClaim::tenant(
-        ledger.scope.tenant,
-        RecoveryWorkKind::Retention,
-        super::capacity::retention_claim(inspected_bytes, inspected_items)?,
-    )
-    .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
-    let _retention = ledger
-        .authority
-        .recovery()
-        .reserve(claim)
-        .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
-    let mut by_block = BTreeMap::new();
-    for item in evidence {
-        if by_block.insert(item.block, *item).is_some() {
-            return Err(LedgerFailure::new(LedgerFailureCode::InvalidInput));
-        }
+    if state.blocks != evaluation.blocks {
+        return Err(LedgerFailure::new(LedgerFailureCode::StaleGeneration));
     }
     let mut metadata = ledger
         .storage
         .catalog_segments(&basis, ledger.scope)
         .map_err(|failure| LedgerFailure::new(failure.code()))?;
-    let mut retired = BTreeSet::new();
+    let mut newly_retired = BTreeSet::new();
     for candidate in metadata
         .iter_mut()
         .filter(|candidate| candidate.state == SegmentState::Sealed)
@@ -86,23 +40,23 @@ pub(super) fn retire_expired_sealed_segments(
             .peekable();
         if segment_blocks.peek().is_none() {
             candidate.state = SegmentState::Retired;
-            retired.insert(candidate.id);
+            newly_retired.insert(candidate.id);
             continue;
         }
-        let mut latest: Option<crate::IngestTime> = None;
-        let mut complete = true;
+        let mut latest = None;
         for block in segment_blocks {
-            let Some(item) = by_block.get(&block.identity) else {
-                complete = false;
-                break;
-            };
-            latest = Some(latest.map_or(item.latest_ingest_time, |current| {
-                current.max(item.latest_ingest_time)
-            }));
+            match block.segment_retention {
+                SegmentRetention::Complete(instant) => {
+                    latest = Some(
+                        latest.map_or(instant, |current: crate::IngestTime| current.max(instant)),
+                    );
+                },
+                SegmentRetention::Empty | SegmentRetention::Unavailable => {
+                    return Err(LedgerFailure::new(LedgerFailureCode::UnsupportedFormat));
+                },
+            }
         }
-        if !complete
-            || latest.is_none_or(|latest| latest.instant().value() > cutoff.instant().value())
-        {
+        if latest.is_none_or(|latest| latest.instant().value() > evaluation.cutoff.value()) {
             continue;
         }
         // A retired segment no longer participates in reconstruction, so its
@@ -116,20 +70,24 @@ pub(super) fn retire_expired_sealed_segments(
             .max()
             .map_or(candidate.base_position, |position| position);
         candidate.state = SegmentState::Retired;
-        retired.insert(candidate.id);
+        newly_retired.insert(candidate.id);
     }
-
-    if !retired.is_empty() {
-        publish_segments(
-            ledger.catalog,
-            &basis,
-            &ledger.storage,
-            ledger.scope,
-            &metadata,
-        )
-        .map_err(|failure| LedgerFailure::new(failure.code()))?;
-    }
-
+    let publication = publish_segments_with_frontier(
+        ledger.catalog,
+        &basis,
+        &ledger.storage,
+        ledger.scope,
+        &metadata,
+        evaluation.frontier,
+    );
+    ledger.catalog.refresh_state()?;
+    let latest = ledger.catalog.pin()?;
+    let latest_metadata = ledger.storage.catalog_segments(&latest, ledger.scope)?;
+    let retired = latest_metadata
+        .iter()
+        .filter(|candidate| candidate.state == SegmentState::Retired)
+        .map(|candidate| candidate.id)
+        .collect::<BTreeSet<_>>();
     if !retired.is_empty() {
         state
             .blocks
@@ -147,16 +105,24 @@ pub(super) fn retire_expired_sealed_segments(
             .try_resize_preserving_capacity(remaining_capacity)
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::RecoveryRequired))?;
     }
-    let now = cutoff
-        .evaluated_at()
+    if super::retention_frontier::recover(&latest, ledger.scope)?
+        .is_some_and(|durable| durable >= evaluation.frontier)
+    {
+        state.retention_frontier = Some(evaluation.frontier);
+    }
+    publication?;
+    let now = evaluation
+        .frontier
+        .instant()
         .value()
         .checked_div(1_000_000_000)
         .and_then(|value| u64::try_from(value).ok())
         .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
     let physically_reclaimed_segments = reclaim_retired_segments(ledger, now)?;
     Ok(RetentionReclamation {
-        logically_retired_segments: retired.len(),
+        logically_retired_segments: newly_retired.len(),
         physically_reclaimed_segments,
+        evaluated_at: evaluation.frontier.instant(),
     })
 }
 

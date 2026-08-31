@@ -4,6 +4,7 @@ mod format;
 mod io;
 mod reader;
 mod recovery;
+mod retention_frontier;
 mod scopes;
 mod storage;
 mod support;

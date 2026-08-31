@@ -5,8 +5,7 @@ use positron_ingest::{
     IngestRequestOutcome, LogIngest, NativeLogBatch, OtlpLogsReceiver,
 };
 use positron_kernel::{
-    ActiveSegmentLedger, Catalog, LedgerFailureCode, LifecycleClock, SegmentScope,
-    StoreBlockIdentity, SystemLifecycleClockSource,
+    ActiveSegmentLedger, Catalog, LedgerFailureCode, SegmentScope, StoreBlockIdentity,
 };
 
 use super::{
@@ -70,7 +69,6 @@ pub(super) fn ingest_native_batch(
     identity
         .validate_ingest_context(context)
         .map_err(|_| ServiceFailure::Unauthorized)?;
-    let clock = LifecycleClock::new(SystemLifecycleClockSource);
     let mut outcomes = Vec::new();
     outcomes
         .try_reserve_exact(groups.len())
@@ -78,7 +76,7 @@ pub(super) fn ingest_native_batch(
     for group in groups {
         let shard = group.shard();
         let records = group.records();
-        let outcome = ingest_group(instance, &catalog, &clock, &policy, schema.clone(), group);
+        let outcome = ingest_group(instance, &catalog, &policy, schema.clone(), group);
         outcomes.push(AdmissionGroupOutcome::new(shard, records, outcome));
     }
     drop(catalog);
@@ -106,10 +104,9 @@ pub(super) const fn map_ledger_failure_code(code: LedgerFailureCode) -> IngestFa
     }
 }
 
-fn ingest_group<S: positron_kernel::LifecycleClockSource>(
+fn ingest_group(
     instance: &crate::InitializedInstance,
     catalog: &Catalog<'_>,
-    clock: &LifecycleClock<S>,
     policy: &positron_ingest::IngestPolicy,
     schema: positron_ingest::TenantSchemaSession,
     group: positron_ingest::NativeLogAdmissionGroup<'_>,
@@ -119,7 +116,13 @@ fn ingest_group<S: positron_kernel::LifecycleClockSource>(
     let Ok(protection) = instance.key.segment_key(instance.instance, scope) else {
         return IngestOutcome::Retryable(IngestFailureCode::StorageUnavailable);
     };
-    let ledger = match ActiveSegmentLedger::open(&instance._authority, catalog, scope, protection) {
+    let ledger = match ActiveSegmentLedger::open_with_retention_time(
+        &instance._authority,
+        &instance.retention_time,
+        catalog,
+        scope,
+        protection,
+    ) {
         Ok(ledger) => ledger,
         Err(failure) => return IngestOutcome::Retryable(map_ledger_failure_code(failure.code())),
     };
@@ -135,7 +138,6 @@ fn ingest_group<S: positron_kernel::LifecycleClockSource>(
     LogIngest::new(
         &instance._authority,
         &ledger,
-        clock,
         policy,
         instance.tenant,
         shard,

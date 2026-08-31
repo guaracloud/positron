@@ -4,7 +4,6 @@ use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, ArrayValue, KeyValue, any_value};
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use positron_domain::routing::{SignalKind, VirtualShardId};
-use positron_domain::time::UnixNanoseconds;
 use positron_domain::value::{
     ByteLimit, DynamicValueLimits, NestingLimit, RecordLimits, ValueLimitProfile,
     ValueLimitProfileCandidate, ValueLimitSet,
@@ -15,8 +14,8 @@ use positron_ingest::{
     OtlpLogsReceiver,
 };
 use positron_kernel::{
-    ActiveSegmentLedger, Catalog, CatalogSecret, FixedLifecycleClockSource, InstanceId,
-    LifecycleClock, MountQualification, SegmentProtectionKey, SegmentScope, StoreBlockIdentity,
+    ActiveSegmentLedger, Catalog, CatalogSecret, InstanceId, MountQualification,
+    SegmentProtectionKey, SegmentScope, StoreBlockIdentity,
 };
 use positron_runtime::{BootstrapPaths, InitializationPlan, InstanceBootstrap};
 use positron_signals::{LogScan, LogStore, ScanLimit};
@@ -67,14 +66,17 @@ fn effective_nesting_boundary_survives_authenticated_admission_and_reopen()
     let scope = SegmentScope::new(fixture.tenant, SignalKind::Logs, shard);
     let protection_key = || SegmentProtectionKey::from_owned(Box::new([0xf4; 32]));
     let policy = IngestPolicy::preserving(18)?;
-    let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(600)));
     {
-        let ledger =
-            ActiveSegmentLedger::open(&fixture.authority, &catalog, scope, protection_key())?;
+        let ledger = ActiveSegmentLedger::open_with_retention_time(
+            &fixture.authority,
+            &fixture.retention_time,
+            &catalog,
+            scope,
+            protection_key(),
+        )?;
         let ingest = LogIngest::new(
             &fixture.authority,
             &ledger,
-            &clock,
             &policy,
             fixture.tenant,
             shard,
@@ -90,8 +92,13 @@ fn effective_nesting_boundary_survives_authenticated_admission_and_reopen()
         );
     }
 
-    let reopened =
-        ActiveSegmentLedger::open(&fixture.authority, &catalog, scope, protection_key())?;
+    let reopened = ActiveSegmentLedger::open_with_retention_time(
+        &fixture.authority,
+        &fixture.retention_time,
+        &catalog,
+        scope,
+        protection_key(),
+    )?;
     let result = LogStore::new().scan(
         fixture.authority.governor(),
         fixture.tenant,
@@ -154,14 +161,17 @@ fn decoded_record_boundary_survives_authenticated_admission_and_reopen()
     let scope = SegmentScope::new(fixture.tenant, SignalKind::Logs, shard);
     let protection_key = || SegmentProtectionKey::from_owned(Box::new([0xd4; 32]));
     let policy = IngestPolicy::preserving(19)?;
-    let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(700)));
     {
-        let ledger =
-            ActiveSegmentLedger::open(&fixture.authority, &catalog, scope, protection_key())?;
+        let ledger = ActiveSegmentLedger::open_with_retention_time(
+            &fixture.authority,
+            &fixture.retention_time,
+            &catalog,
+            scope,
+            protection_key(),
+        )?;
         let ingest = LogIngest::new(
             &fixture.authority,
             &ledger,
-            &clock,
             &policy,
             fixture.tenant,
             shard,
@@ -177,8 +187,13 @@ fn decoded_record_boundary_survives_authenticated_admission_and_reopen()
         );
     }
 
-    let reopened =
-        ActiveSegmentLedger::open(&fixture.authority, &catalog, scope, protection_key())?;
+    let reopened = ActiveSegmentLedger::open_with_retention_time(
+        &fixture.authority,
+        &fixture.retention_time,
+        &catalog,
+        scope,
+        protection_key(),
+    )?;
     let result = LogStore::new().scan(
         fixture.authority.governor(),
         fixture.tenant,

@@ -1,12 +1,11 @@
 use std::error::Error;
 
 use positron_domain::routing::{SignalKind, VirtualShardId};
-use positron_domain::time::UnixNanoseconds;
 use positron_governance::{CompatibilityHints, PresentedCredential, RequestedIntent};
 use positron_ingest::{IngestOutcome, IngestPolicy, LogIngest};
 use positron_kernel::{
-    ActiveSegmentLedger, Catalog, CatalogSecret, FixedLifecycleClockSource, InstanceId,
-    LifecycleClock, MountQualification, SegmentProtectionKey, SegmentScope, StoreBlockIdentity,
+    ActiveSegmentLedger, Catalog, CatalogSecret, InstanceId, MountQualification,
+    SegmentProtectionKey, SegmentScope, StoreBlockIdentity,
 };
 use positron_runtime::{BootstrapPaths, InitializationPlan, InstanceBootstrap};
 use positron_signals::{LogScan, LogStore, ScanLimit};
@@ -51,17 +50,16 @@ pub(crate) fn ingest_and_scan<'fixture>(
         CatalogSecret::from_owned(Box::new([marker + 1; 32]), Box::new([marker + 2; 32])),
     )?;
     let shard = VirtualShardId::new(u32::from(marker))?;
-    let ledger = ActiveSegmentLedger::open(
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
         &fixture.authority,
+        &fixture.retention_time,
         &catalog,
         SegmentScope::new(fixture.tenant, SignalKind::Logs, shard),
         SegmentProtectionKey::from_owned(Box::new([marker + 3; 32])),
     )?;
-    let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(500)));
     let outcome = LogIngest::new(
         &fixture.authority,
         &ledger,
-        &clock,
         policy,
         fixture.tenant,
         shard,

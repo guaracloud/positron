@@ -6,7 +6,6 @@ use opentelemetry_proto::tonic::common::v1::{
 };
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use positron_domain::routing::{SignalKind, VirtualShardId};
-use positron_domain::time::UnixNanoseconds;
 use positron_domain::value::AttributeNamespace;
 use positron_governance::{CompatibilityHints, PresentedCredential, RequestedIntent};
 use positron_ingest::{
@@ -14,8 +13,8 @@ use positron_ingest::{
     PolicyAction, PolicyAttributePath, PolicyPredicate, PolicyReceiver, PolicyRule, PolicyTarget,
 };
 use positron_kernel::{
-    ActiveSegmentLedger, Catalog, CatalogSecret, FixedLifecycleClockSource, InstanceId,
-    LifecycleClock, MountQualification, SegmentProtectionKey, SegmentScope, StoreBlockIdentity,
+    ActiveSegmentLedger, Catalog, CatalogSecret, InstanceId, MountQualification,
+    SegmentProtectionKey, SegmentScope, StoreBlockIdentity,
 };
 use positron_runtime::{BootstrapPaths, InitializationPlan, InstanceBootstrap};
 use positron_signals::{LogScan, LogStore, ScanLimit, SchemaCatalog, SchemaPath};
@@ -67,19 +66,18 @@ fn remove_erases_source_content_and_persists_typed_provenance() -> Result<(), Bo
     )?;
     let shard = VirtualShardId::new(31)?;
     let scope = SegmentScope::new(fixture.tenant, SignalKind::Logs, shard);
-    let ledger = ActiveSegmentLedger::open(
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
         &fixture.authority,
+        &fixture.retention_time,
         &catalog,
         scope,
         SegmentProtectionKey::from_owned(Box::new([0x34; 32])),
     )?;
-    let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(500)));
     let schema = super::schema_support::session(&fixture)?;
     assert!(matches!(
         LogIngest::new(
             &fixture.authority,
             &ledger,
-            &clock,
             &policy,
             fixture.tenant,
             shard,

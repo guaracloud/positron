@@ -1,9 +1,7 @@
 use positron_domain::routing::{SignalKind, VirtualShardId};
-use positron_domain::time::UnixNanoseconds;
 use positron_kernel::{
-    ActiveSegmentLedger, Catalog, CatalogSecret, FixedLifecycleClockSource, InstanceId,
-    LifecycleClock, ResourceAmounts, SegmentProtectionKey, SegmentScope, StoreBlockIdentity,
-    WorkClaim, WorkKind,
+    ActiveSegmentLedger, Catalog, CatalogSecret, InstanceId, ResourceAmounts, SegmentProtectionKey,
+    SegmentScope, StoreBlockIdentity, WorkClaim, WorkKind,
 };
 
 use super::super::NativeLogCandidate;
@@ -38,8 +36,9 @@ fn second_group_capacity_is_reserved_before_its_configured_policy_result() {
     )
     .expect("catalog");
     let second_shard = VirtualShardId::new(2).expect("second shard");
-    let ledger = ActiveSegmentLedger::open(
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
         &fixture.authority,
+        &fixture.retention_time,
         &catalog,
         SegmentScope::new(fixture.tenant, SignalKind::Logs, second_shard),
         SegmentProtectionKey::from_owned(Box::new([0x34; 32])),
@@ -89,11 +88,9 @@ fn second_group_capacity_is_reserved_before_its_configured_policy_result() {
 
     let policy = IngestPolicy::reject_exact_text_body(1, "second-group-policy", "reject-second")
         .expect("policy");
-    let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(1)));
     let outcome = LogIngest::new(
         &fixture.authority,
         &ledger,
-        &clock,
         &policy,
         fixture.tenant,
         second_shard,

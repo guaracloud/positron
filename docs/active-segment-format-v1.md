@@ -42,6 +42,35 @@ The encoding is exactly 56 bytes. Objects without this magic belong to another
 Catalog authority and are ignored. Matching magic with invalid length,
 version, or fields fails closed.
 
+## Catalog retention frontier
+
+Each retention-enabled physical scope has at most one authenticated frontier
+object in the same Catalog Generation as its segment metadata:
+
+| Bytes | Field | Value or limit |
+| ---: | --- | --- |
+| 8 | magic | ASCII `PRETFR01` |
+| 2 | version | `1` |
+| 16 | tenant ID | nonzero domain identity |
+| 1 | signal | `1` logs, `2` traces |
+| 4 | virtual shard ID | valid nonzero shard |
+| 8 | frontier Ingest Time | signed Unix nanoseconds |
+
+The encoding is exactly 39 bytes. A matching magic with an unknown version,
+invalid length, invalid scope, or duplicate scope fails closed. The initial
+value comes from the kernel retention-time authority before the scope contains
+retention-enabled data. Thereafter it advances only by process-monotonic
+elapsed time. Recovery resumes at the authenticated durable value and adds no
+downtime; subsequent wall-clock movement cannot advance or regress it.
+
+Block preparation publishes this frontier before issuing the move-only
+preparation capability. Retirement publishes its advanced frontier and all
+Retired segment metadata in one Catalog Writer transaction. An ambiguous
+publication is reconciled against the latest authenticated generation; live
+snapshot visibility follows that latest generation before an ordinary failure
+is returned. Legacy segments without both a v3 durability bound and this
+frontier remain retention-ineligible.
+
 ## Segment header
 
 Format v3 replaces the rejected route-unbound draft v2 bootstrap. The segment
@@ -110,13 +139,18 @@ independent frame:
 | 2 | version | `1` |
 | 2 | frame algorithm | `1`, AES-256-GCM |
 | 4 | encrypted-frame length | at most 512 |
-| variable | encrypted frontier frame | plaintext is `durable_bytes:u64 || next_sequence:u64 || commit_position:u64 || retention_tag:u8 || maximum_ingest_time:i64` |
+| variable | encrypted frontier frame | v3 plaintext is `durable_bytes:u64 || next_sequence:u64 || commit_position:u64 || retention_tag:u8 || maximum_ingest_time:i64` |
 
 `retention_tag` is `0` for an empty segment, `1` when complete lifecycle
 metadata is unavailable, and `2` when `maximum_ingest_time` is the authenticated
 aggregate of every Store Block appended to the segment. Non-Log Store and
 legacy frontier-v1 segments recover as unavailable and cannot be selected for
-destructive retention. The Log Store supplies lifecycle metadata while
+destructive retention. Frontier format v1 has no retention bound. Frontier
+format v2 remains readable, but its legacy caller-supplied bound is treated as
+unavailable for destructive retention. Frontier format v3 is emitted only from
+the Storage Kernel's move-only block preparation and is therefore the first
+format whose maximum Ingest Time can authorize retention. The Log Store encodes
+the kernel-issued Ingest Time while
 preparing canonical records; the Storage Kernel authenticates the aggregate in
 the frontier and derives deletion evidence from it after restart.
 

@@ -1,11 +1,10 @@
 use positron_domain::routing::{SignalKind, VirtualShardId};
-use positron_domain::time::UnixNanoseconds;
 use positron_domain::value::{
     CollectionLimit, RequestLimits, ValueLimitProfile, ValueLimitProfileCandidate, ValueLimitSet,
 };
 use positron_kernel::{
-    ActiveSegmentLedger, Catalog, CatalogSecret, FixedLifecycleClockSource, InstanceId,
-    LifecycleClock, SegmentProtectionKey, SegmentScope, StoreBlockIdentity,
+    ActiveSegmentLedger, Catalog, CatalogSecret, InstanceId, SegmentProtectionKey, SegmentScope,
+    StoreBlockIdentity,
 };
 
 use crate::{IngestFailureCode, IngestOutcome, IngestPolicy, LogIngest, OtlpLogsReceiver};
@@ -23,8 +22,9 @@ fn lowered_request_record_limit_is_checked_after_policy_before_commit() {
     .expect("catalog");
     let shard = VirtualShardId::new(121).expect("shard");
     let scope = SegmentScope::new(fixture.tenant, SignalKind::Logs, shard);
-    let ledger = ActiveSegmentLedger::open(
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
         &fixture.authority,
+        &fixture.retention_time,
         &catalog,
         scope,
         SegmentProtectionKey::from_owned(Box::new([0xc4; 32])),
@@ -45,12 +45,10 @@ fn lowered_request_record_limit_is_checked_after_policy_before_commit() {
         .decode(protobuf_with_bodies(&["first", "second"]))
         .expect("structural decode stays within hard safe maxima");
     let policy = IngestPolicy::preserving(1).expect("policy");
-    let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(13)));
 
     let outcome = LogIngest::new(
         &fixture.authority,
         &ledger,
-        &clock,
         &policy,
         fixture.tenant,
         shard,
@@ -78,8 +76,9 @@ fn lowered_request_attribute_limit_counts_namespaced_source_occurrences() {
     .expect("catalog");
     let shard = VirtualShardId::new(131).expect("shard");
     let scope = SegmentScope::new(fixture.tenant, SignalKind::Logs, shard);
-    let ledger = ActiveSegmentLedger::open(
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
         &fixture.authority,
+        &fixture.retention_time,
         &catalog,
         scope,
         SegmentProtectionKey::from_owned(Box::new([0xd4; 32])),
@@ -100,12 +99,10 @@ fn lowered_request_attribute_limit_counts_namespaced_source_occurrences() {
         .decode(protobuf_with_bodies(&["one-record-two-attributes"]))
         .expect("resource and record attributes are structurally valid");
     let policy = IngestPolicy::preserving(1).expect("policy");
-    let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(14)));
 
     let outcome = LogIngest::new(
         &fixture.authority,
         &ledger,
-        &clock,
         &policy,
         fixture.tenant,
         shard,

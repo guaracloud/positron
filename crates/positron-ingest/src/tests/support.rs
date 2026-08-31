@@ -8,7 +8,7 @@ use positron_kernel::{
     ObservedResourceEnvironment, OperatorLimits, OrdinaryPoolPolicy, OwnedPrimaryDataVolume,
     PrimaryDataVolume, RecoveryPoolCapacities, RecoveryReserve, RegisteredResourceBounds,
     ResourceAmounts, ResourceDimension, ResourceGovernorConfiguration, ResourceInventory,
-    StorageKernelResourceAuthority, TenantQuota,
+    RetentionTimeAuthority, StorageKernelResourceAuthority, TenantQuota,
 };
 use prost::Message;
 
@@ -19,6 +19,7 @@ const DEFAULT_ORDINARY_MEMORY_BYTES: u64 = 8_000_000;
 
 pub struct Fixture {
     pub authority: StorageKernelResourceAuthority,
+    pub retention_time: RetentionTimeAuthority,
     pub tenant: TenantId,
     _root: TemporaryRoot,
 }
@@ -96,8 +97,10 @@ fn fixture_for_volume(
     let configuration = ResourceGovernorConfiguration::new(inventory, policy, recovery)?;
     let authority = StorageKernelResourceAuthority::establish(volume, configuration)
         .map_err(|_| "kernel authority establishment failed")?;
+    let retention_time = RetentionTimeAuthority::establish()?;
     Ok(Fixture {
         authority,
+        retention_time,
         tenant,
         _root: root,
     })

@@ -17,10 +17,12 @@ mod types;
 pub use fuzzing::fuzz_log_store_block;
 
 use positron_domain::identity::TenantId;
+#[cfg(any(test, fuzzing))]
 use positron_domain::routing::{SignalKind, VirtualShardId};
+use positron_kernel::{LedgerSnapshot, ResourceGovernor, StoreBlockIdentity};
+#[cfg(any(test, fuzzing))]
 use positron_kernel::{
-    LedgerSnapshot, LifecycleClock, LifecycleClockSource, PreparedStoreBlock, ResourceGovernor,
-    ResourceReservation, SegmentScope, StoreBlockIdentity,
+    LifecycleClock, LifecycleClockSource, PreparedStoreBlock, ResourceReservation, SegmentScope,
 };
 
 pub use failure::{LogStoreFailure, LogStoreFailureCode};
@@ -88,8 +90,30 @@ impl LogStore {
         types::value_profile()
     }
 
-    /// Prepares one canonical, checked Log Store Block for kernel durability.
-    pub fn prepare<'capacity, S: LifecycleClockSource>(
+    /// Prepares canonical Log Store bytes under a kernel-issued Ingest Time.
+    pub fn prepare<'capacity>(
+        &self,
+        preparation: positron_kernel::StoreBlockPreparation<'capacity>,
+        records: Vec<LogRecord>,
+    ) -> Result<PreparedLogBlock<'capacity>, LogStoreFailure> {
+        if records.is_empty() {
+            return Err(LogStoreFailure::invalid_input());
+        }
+        let tenant = preparation.scope().tenant_id();
+        let ingest_time = preparation.ingest_time();
+        let encoded_bytes = codec::encoded_block_length(&records)?;
+        let stored = records
+            .into_iter()
+            .map(|record| StoredLogRecord::new(record, ingest_time))
+            .collect::<Vec<_>>();
+        let bytes = codec::encode_block(tenant, &stored, encoded_bytes)?;
+        let block = preparation.finish(bytes).map_err(LogStoreFailure::kernel)?;
+        Ok(PreparedLogBlock::new(block))
+    }
+
+    #[cfg(any(test, fuzzing))]
+    #[doc(hidden)]
+    pub fn prepare_unretained_for_test<'capacity, S: LifecycleClockSource>(
         &self,
         capacity: ResourceReservation<'capacity>,
         clock: &LifecycleClock<S>,
@@ -98,7 +122,7 @@ impl LogStore {
         identity: StoreBlockIdentity,
         records: Vec<LogRecord>,
     ) -> Result<PreparedLogBlock<'capacity>, LogStoreFailure> {
-        self.prepare_internal(capacity, clock, tenant, shard, identity, records)
+        self.prepare_unretained_internal(capacity, clock, tenant, shard, identity, records)
     }
 
     /// Prepares a block and its bounded schema delta without mutating live schema state.
@@ -116,7 +140,7 @@ impl LogStore {
         schema: &SchemaCatalog,
     ) -> Result<(PreparedLogBlock<'capacity>, SchemaDelta), LogStoreFailure> {
         let delta = self.stage_schema_group(&mut records, schema)?;
-        self.prepare_internal(capacity, clock, tenant, shard, identity, records)
+        self.prepare_unretained_internal(capacity, clock, tenant, shard, identity, records)
             .map(|prepared| (prepared, delta))
     }
 
@@ -157,7 +181,8 @@ impl LogStore {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn prepare_internal<'capacity, S: LifecycleClockSource>(
+    #[cfg(any(test, fuzzing))]
+    fn prepare_unretained_internal<'capacity, S: LifecycleClockSource>(
         &self,
         capacity: ResourceReservation<'capacity>,
         clock: &LifecycleClock<S>,
@@ -180,20 +205,10 @@ impl LogStore {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let bytes = codec::encode_block(tenant, &stored, encoded_bytes)?;
-        let latest_ingest_time = stored
-            .iter()
-            .map(StoredLogRecord::ingest_time)
-            .max()
-            .ok_or_else(LogStoreFailure::invalid_input)?;
         let scope = SegmentScope::new(tenant, SignalKind::Logs, shard);
-        let block = PreparedStoreBlock::new_with_preparation_capacity_and_ingest_time(
-            scope,
-            identity,
-            bytes,
-            capacity,
-            latest_ingest_time,
-        )
-        .map_err(LogStoreFailure::kernel)?;
+        let block =
+            PreparedStoreBlock::new_with_preparation_capacity(scope, identity, bytes, capacity)
+                .map_err(LogStoreFailure::kernel)?;
         Ok(PreparedLogBlock::new(block))
     }
 
@@ -252,13 +267,11 @@ impl LogStore {
     pub fn enforce_retention<'kernel, 'catalog>(
         &self,
         ledger: &positron_kernel::ActiveSegmentLedger<'kernel, 'catalog>,
-        clock: &LifecycleClock<positron_kernel::SystemLifecycleClockSource>,
         tenant: TenantId,
         policy: LogRetentionPolicy,
     ) -> Result<LogRetentionOutcome, LogStoreFailure> {
         self.enforce_retention_observed(
             ledger,
-            clock,
             tenant,
             policy,
             &scan::NeverCancelled,
@@ -270,13 +283,12 @@ impl LogStore {
     pub fn enforce_retention_observed<'kernel, 'catalog>(
         &self,
         ledger: &positron_kernel::ActiveSegmentLedger<'kernel, 'catalog>,
-        clock: &LifecycleClock<positron_kernel::SystemLifecycleClockSource>,
         tenant: TenantId,
         policy: LogRetentionPolicy,
         cancellation: &dyn ScanCancellation,
         observer: &dyn ScanObserver,
     ) -> Result<LogRetentionOutcome, LogStoreFailure> {
-        retention::enforce_retention(ledger, clock, tenant, policy, cancellation, observer)
+        retention::enforce_retention(ledger, tenant, policy, cancellation, observer)
     }
 }
 

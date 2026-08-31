@@ -35,8 +35,9 @@ use crate::{RecoveryWorkClaim, RecoveryWorkKind, StorageKernelResourceAuthority}
 pub use fixture::GovernanceFixtureTarget;
 #[cfg(feature = "test-support")]
 pub use storage::{
-    CatalogPublicationFault, with_catalog_publication_fault_after,
-    with_catalog_publication_fault_sequence_after, with_catalog_publication_hook_after,
+    CatalogPublicationFault, with_catalog_generation_ambiguity_hook_after,
+    with_catalog_publication_fault_after, with_catalog_publication_fault_sequence_after,
+    with_catalog_publication_hook_after,
 };
 use types::AuditFrontier;
 #[cfg(feature = "test-support")]
@@ -190,11 +191,22 @@ impl<'authority> Catalog<'authority> {
             .recovery()
             .reserve(durability_claim)
             .map_err(CatalogFailure::admission)?;
-        let _operation = self
-            .operation
-            .lock()
-            .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
-        self.commit_unreserved(expected, proposal, audit)
+        let result = {
+            let _operation = self
+                .operation
+                .lock()
+                .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
+            self.commit_unreserved(expected, proposal, audit)
+        };
+        drop(_reservation);
+        #[cfg(any(test, feature = "test-support"))]
+        if result
+            .as_ref()
+            .is_err_and(|failure| failure.code() == CatalogFailureCode::StorageUnavailable)
+        {
+            storage::after_ambiguous_publication(self);
+        }
+        result
     }
 
     fn commit_unreserved(
@@ -373,6 +385,12 @@ impl<'authority> Catalog<'authority> {
             *state = recovered;
         }
         Ok(())
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn refresh_after_ambiguous_publication_for_test(&self) -> Result<(), CatalogFailure> {
+        self.refresh_state()
     }
 }
 

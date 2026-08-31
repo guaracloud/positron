@@ -74,8 +74,10 @@ fn retention_refuses_wrong_scope_before_mutation() -> Result<(), Box<dyn Error>>
     )?;
     let tenant = TenantId::from_bytes([0x41; 16])?;
     let other_tenant = TenantId::from_bytes([0x42; 16])?;
-    let ledger = ActiveSegmentLedger::open(
+    let retention_time = RetentionTimeAuthority::establish()?;
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
         &authority,
+        &retention_time,
         &catalog,
         SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(11)?),
         SegmentProtectionKey::from_owned(Box::new([0x5b; 32])),
@@ -85,7 +87,7 @@ fn retention_refuses_wrong_scope_before_mutation() -> Result<(), Box<dyn Error>>
     let policy = LogRetentionPolicy::new(1)?;
 
     let wrong_scope = store
-        .enforce_retention(&ledger, &retention_clock(), other_tenant, policy)
+        .enforce_retention(&ledger, other_tenant, policy)
         .expect_err("a tenant cannot execute retention for another tenant's ledger");
     assert_eq!(
         wrong_scope.code(),
@@ -94,14 +96,14 @@ fn retention_refuses_wrong_scope_before_mutation() -> Result<(), Box<dyn Error>>
 
     assert!(ledger.snapshot()?.blocks().is_empty());
     ledger.seal()?;
-    let reopened = ActiveSegmentLedger::open_with_clock(
+    let reopened = ActiveSegmentLedger::open_with_retention_time(
         &authority,
+        &retention_time,
         &catalog,
         SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(11)?),
         SegmentProtectionKey::from_owned(Box::new([0x5b; 32])),
-        &retention_clock(),
     )?;
-    let empty_segment = store.enforce_retention(&reopened, &retention_clock(), tenant, policy)?;
+    let empty_segment = store.enforce_retention(&reopened, tenant, policy)?;
     assert_eq!(empty_segment.expired_segments(), 1);
     assert_eq!(empty_segment.reclaimed_segments(), 1);
     Ok(())

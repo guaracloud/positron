@@ -8,8 +8,8 @@ use positron_ingest::{
     OtlpLogsReceiver, PolicyAction, PolicyPredicate, PolicyRule, PolicyTarget,
 };
 use positron_kernel::{
-    ActiveSegmentLedger, Catalog, CatalogSecret, FixedLifecycleClockSource, InstanceId,
-    LifecycleClock, SegmentProtectionKey, SegmentScope, StoreBlockIdentity,
+    ActiveSegmentLedger, Catalog, CatalogSecret, InstanceId, SegmentProtectionKey, SegmentScope,
+    StoreBlockIdentity,
 };
 use prost::Message;
 
@@ -131,8 +131,9 @@ fn unchanged_body_that_exceeds_the_post_policy_limit_is_rejected() -> Result<(),
         CatalogSecret::from_owned(Box::new([0x69; 32]), Box::new([0x6a; 32])),
     )?;
     let shard = positron_domain::routing::VirtualShardId::new(103)?;
-    let ledger = ActiveSegmentLedger::open(
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
         &fixture.authority,
+        &fixture.retention_time,
         &catalog,
         SegmentScope::new(
             fixture.tenant,
@@ -141,14 +142,10 @@ fn unchanged_body_that_exceeds_the_post_policy_limit_is_rejected() -> Result<(),
         ),
         SegmentProtectionKey::from_owned(Box::new([0x6b; 32])),
     )?;
-    let clock = LifecycleClock::new(FixedLifecycleClockSource::new(
-        positron_domain::time::UnixNanoseconds::new(600),
-    ));
     assert_eq!(
         LogIngest::new(
             &fixture.authority,
             &ledger,
-            &clock,
             &policy,
             fixture.tenant,
             shard,
