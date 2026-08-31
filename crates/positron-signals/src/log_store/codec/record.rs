@@ -1,6 +1,8 @@
 use positron_domain::time::{EventTime, ObservedTime, SourceTimeQuality, UnixNanoseconds};
 use positron_domain::value::{AttributeNamespace, AttributeOccurrenceSetCandidate};
-use positron_kernel::LedgerSnapshot;
+#[cfg(any(test, feature = "test-support"))]
+use positron_kernel::LedgerFailureCode;
+use positron_kernel::{CommittedBlock, IngestTime};
 
 use super::{CodecLimits, Input, LEGACY_VERSION, METADATA_VERSION, bounded_vec, metadata, value};
 use crate::log_store::types::{
@@ -15,11 +17,26 @@ pub(super) struct DecodedRecord {
 }
 
 impl DecodedRecord {
-    pub(super) fn into_stored(self, snapshot: &LedgerSnapshot<'_>) -> StoredLogRecord {
-        StoredLogRecord::new(
-            self.record,
-            snapshot.reconstruct_ingest_time(self.ingest_time),
-        )
+    pub(super) fn into_stored(
+        self,
+        block: &CommittedBlock,
+    ) -> Result<StoredLogRecord, LogStoreFailure> {
+        authenticated_ingest_time(block, self.ingest_time)
+            .map(|ingest_time| StoredLogRecord::new(self.record, ingest_time))
+    }
+}
+
+fn authenticated_ingest_time(
+    block: &CommittedBlock,
+    encoded: UnixNanoseconds,
+) -> Result<IngestTime, LogStoreFailure> {
+    match block.authenticate_ingest_time(encoded) {
+        Ok(ingest_time) => Ok(ingest_time),
+        #[cfg(any(test, feature = "test-support"))]
+        Err(failure) if failure.code() == LedgerFailureCode::UnsupportedFormat => block
+            .reconstruct_unretained_ingest_time_for_test(encoded)
+            .map_err(LogStoreFailure::kernel),
+        Err(failure) => Err(LogStoreFailure::kernel(failure)),
     }
 }
 
@@ -69,6 +86,16 @@ pub(super) fn validate_structure(
     version: u16,
 ) -> Result<(), LogStoreFailure> {
     validate_structure_with_ingest_time(input, limits, version).map(|_| ())
+}
+
+pub(super) fn validate_structure_for_block(
+    input: &mut Input<'_>,
+    limits: CodecLimits,
+    version: u16,
+    block: &CommittedBlock,
+) -> Result<(), LogStoreFailure> {
+    let ingest_time = validate_structure_with_ingest_time(input, limits, version)?;
+    authenticated_ingest_time(block, ingest_time).map(|_| ())
 }
 
 fn validate_structure_with_ingest_time(

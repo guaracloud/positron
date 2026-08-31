@@ -338,6 +338,36 @@ fn preparation_authority_rejects_wrong_capacity_and_production_time_substitution
         };
     assert_eq!(failure.code(), LedgerFailureCode::ResourceAdmissionRefused);
 
+    let foreign_root = TemporaryRoot::new()?;
+    let foreign_volume =
+        PrimaryDataVolume::acquire(foreign_root.path(), MountQualification::LocalHost)?;
+    let foreign_authority = establish_authority(foreign_volume)?;
+    let local_baseline = authority.governor().inspect()?.outstanding_total();
+    let foreign_baseline = foreign_authority.governor().inspect()?.outstanding_total();
+    let generation_before_foreign = catalog.pin()?.number();
+    let foreign_capacity = preparation_capacity(&foreign_authority, tenant)?;
+    let failure =
+        match ledger.begin_store_block(foreign_capacity, StoreBlockIdentity::new([0xe8; 16])?) {
+            Ok(_) => return Err("foreign governor authorized frontier publication".into()),
+            Err(failure) => failure,
+        };
+    assert_eq!(failure.code(), LedgerFailureCode::ResourceAdmissionRefused);
+    assert_eq!(catalog.pin()?.number(), generation_before_foreign);
+    assert!(
+        catalog
+            .pin()?
+            .plaintext_objects()
+            .all(|bytes| !bytes.starts_with(b"PRETFR01"))
+    );
+    assert_eq!(
+        authority.governor().inspect()?.outstanding_total(),
+        local_baseline
+    );
+    assert_eq!(
+        foreign_authority.governor().inspect()?.outstanding_total(),
+        foreign_baseline
+    );
+
     let failure = match ledger.begin_store_block_for_test(
         preparation_capacity(&authority, tenant)?,
         StoreBlockIdentity::new([0xe6; 16])?,
@@ -557,6 +587,74 @@ fn sealed_nonempty_segment_expires_only_after_authoritative_elapsed_time()
     assert_eq!(outcome.logically_retired_segments(), 1);
     assert_eq!(outcome.physically_reclaimed_segments(), 1);
     assert!(active.snapshot()?.blocks().is_empty());
+    Ok(())
+}
+
+#[test]
+fn restart_wall_jump_cannot_expire_a_durable_lease_or_reclaim_its_segment()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x26; 16])?,
+        CatalogSecret::from_owned(Box::new([0x27; 32]), Box::new([0x28; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x64; 16])?;
+    let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(18)?);
+    let key = || SegmentProtectionKey::from_owned(Box::new([0x29; 32]));
+    let (retention_time, elapsed) = RetentionTimeAuthority::establish_with_manual_elapsed(
+        UnixNanoseconds::new(100_000_000_000),
+    );
+    let sealed = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    let prepared = sealed.begin_store_block(
+        preparation_capacity(&authority, tenant)?,
+        StoreBlockIdentity::new([0x2a; 16])?,
+    )?;
+    sealed.append(prepared.finish(b"leased-retention".to_vec())?)?;
+    sealed.seal()?;
+
+    let active = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    let lease = active.create_snapshot_lease(100, 200)?;
+    let lease_identity = lease.identity();
+    drop(lease);
+    elapsed.advance(2_000_000_000)?;
+    let retired = active
+        .begin_retention(NonZeroU64::new(1).ok_or("duration")?)?
+        .commit()?;
+    assert_eq!(retired.logically_retired_segments(), 1);
+    assert_eq!(retired.physically_reclaimed_segments(), 0);
+    drop(active);
+
+    let (restarted_time, _) =
+        RetentionTimeAuthority::establish_with_manual_elapsed(UnixNanoseconds::new(i64::MAX / 2));
+    let restarted = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &restarted_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    let resumed = restarted.resume_snapshot_lease(lease_identity, 102)?;
+    assert_eq!(resumed.snapshot().blocks().len(), 1);
+    assert_eq!(
+        resumed.snapshot().blocks()[0].payload(),
+        b"leased-retention"
+    );
+    drop(resumed);
     Ok(())
 }
 

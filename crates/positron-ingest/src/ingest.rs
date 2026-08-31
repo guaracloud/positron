@@ -247,7 +247,16 @@ impl<'service, 'kernel, 'catalog> LogIngest<'service, 'kernel, 'catalog> {
         drop(snapshot);
         let preparation = match self.ledger.begin_store_block(capacity, identity) {
             Ok(preparation) => preparation,
-            Err(failure) => return map_ledger_failure(&failure),
+            Err(failure) => {
+                return rollback_schema(
+                    &self.schema,
+                    identity,
+                    self.shard,
+                    staged_schema,
+                    map_ledger_failure(&failure),
+                    self.authority.governor(),
+                );
+            },
         };
         let prepared = match LogStore::new().prepare(preparation, accepted) {
             Ok(prepared) => prepared,

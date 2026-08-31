@@ -180,7 +180,7 @@ impl LogStore {
             let skipped = skipped_records(scan, block.position());
             let available = decode.record_count().saturating_sub(skipped);
             let oversized = available > remaining;
-            let decoded = decode.decode_after(snapshot, skipped, remaining, cancellation)?;
+            let decoded = decode.decode_after(block, skipped, remaining, cancellation)?;
             decoded_records = decoded_records
                 .checked_add(decoded.records.len())
                 .ok_or_else(LogStoreFailure::limit_exceeded)?;

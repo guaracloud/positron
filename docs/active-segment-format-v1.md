@@ -114,7 +114,7 @@ Immediately after the header, each canonical Store Block is encoded as:
 | Bytes | Field | Value or limit |
 | ---: | --- | --- |
 | 4 | encrypted-frame length | at most 1,048,960 |
-| variable | encrypted frame | existing encrypted-frame format; plaintext is the 16-byte stable Store Block identity followed by canonical block bytes |
+| variable | encrypted frame | existing encrypted-frame format; plaintext is the 16-byte stable Store Block identity, one-byte retention tag, signed 64-bit exact kernel preparation Ingest Time, then canonical block bytes |
 
 Plaintext blocks are nonempty and at most 1,048,576 bytes. Frame context binds
 the segment object, `StoreBlock` purpose, format and key epochs, and the
@@ -127,6 +127,12 @@ Retrying the same stable Store Block identity with the same canonical bytes is
 idempotent within the retained ledger. Reusing an identity with different
 bytes fails closed. Equal canonical bytes under distinct identities are
 legitimate separate appends.
+
+The per-block retention tag is `1` with a zero time when authenticated
+lifecycle metadata is unavailable, or `2` with the exact kernel-issued
+preparation Ingest Time. Empty (`0`) is invalid for a Store Block. Recovery
+authenticates every block value and folds them to the segment maximum; the
+result must exactly match the authenticated Durability Frontier aggregate.
 
 ## Durability Frontier
 
@@ -150,9 +156,10 @@ format v2 remains readable, but its legacy caller-supplied bound is treated as
 unavailable for destructive retention. Frontier format v3 is emitted only from
 the Storage Kernel's move-only block preparation and is therefore the first
 format whose maximum Ingest Time can authorize retention. The Log Store encodes
-the kernel-issued Ingest Time while
-preparing canonical records; the Storage Kernel authenticates the aggregate in
-the frontier and derives deletion evidence from it after restart.
+the kernel-issued Ingest Time while preparing canonical records; the Storage
+Kernel preserves that exact value in the Store Block frame, authenticates the
+aggregate in the frontier, and derives deletion evidence by folding those
+values after restart.
 
 The frontier frame purpose is `DurabilityFrontier`; its nonce sequence is
 `u64::MAX - encrypted_next_sequence`, disjoint from metadata and Store Block

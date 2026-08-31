@@ -40,10 +40,17 @@ pub(super) enum RecoveryMode {
     Observe,
 }
 struct PublishedFrontier {
+    format_version: u16,
     durable_bytes: u64,
     next_sequence: u64,
     position: CommitPosition,
     segment_retention: SegmentRetention,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct BlockRecoveryFormat {
+    pub(super) version: u16,
+    pub(super) segment_retention: SegmentRetention,
 }
 
 #[cfg(test)]
@@ -82,6 +89,7 @@ pub(super) fn recover_with_mode(
     let header_length = u64::try_from(header_bytes)
         .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
     let Some(PublishedFrontier {
+        format_version,
         durable_bytes,
         next_sequence,
         position,
@@ -134,7 +142,10 @@ pub(super) fn recover_with_mode(
         metadata.id,
         header_length,
         key,
-        segment_retention,
+        BlockRecoveryFormat {
+            version: format_version,
+            segment_retention,
+        },
     )?;
     let expected_blocks = usize::try_from(next_sequence)
         .map_err(|_| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?;
@@ -161,7 +172,7 @@ pub(super) fn read_blocks(
     segment: SegmentId,
     header_bytes: u64,
     key: &ObjectDataKey,
-    segment_retention: SegmentRetention,
+    format: BlockRecoveryFormat,
 ) -> Result<Vec<CommittedBlock>, LedgerFailure> {
     let mut blocks = Vec::new();
     let mut consumed = 0_u64;
@@ -207,8 +218,14 @@ pub(super) fn read_blocks(
                 .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?,
         )
         .map_err(|_| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?;
+        let block_retention = if format.version == 3 {
+            decode_block_retention(plaintext)?
+        } else {
+            SegmentRetention::Unavailable
+        };
+        let payload_offset = if format.version == 3 { 25 } else { 16 };
         let payload = plaintext
-            .get(16..)
+            .get(payload_offset..)
             .filter(|bytes| !bytes.is_empty())
             .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?;
         let content_digest = DataProtection::hash(payload)
@@ -249,8 +266,16 @@ pub(super) fn read_blocks(
             content_digest,
             segment,
             frontier_authenticator,
-            segment_retention,
+            block_retention,
         });
+    }
+    let recovered_retention = blocks
+        .iter()
+        .fold(SegmentRetention::Empty, |aggregate, block| {
+            aggregate.append_block(block.block_retention)
+        });
+    if format.version == 3 && recovered_retention != format.segment_retention {
+        return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
     }
     Ok(blocks)
 }
@@ -356,6 +381,7 @@ fn read_frontier(
         return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
     }
     Ok(Some(PublishedFrontier {
+        format_version,
         durable_bytes,
         next_sequence,
         position,
@@ -363,14 +389,30 @@ fn read_frontier(
     }))
 }
 
+fn decode_block_retention(bytes: &[u8]) -> Result<SegmentRetention, LedgerFailure> {
+    let retention = decode_retention(bytes, 16, 17)?;
+    match retention {
+        SegmentRetention::Complete(_) | SegmentRetention::Unavailable => Ok(retention),
+        SegmentRetention::Empty => Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption)),
+    }
+}
+
 fn decode_segment_retention(bytes: &[u8]) -> Result<SegmentRetention, LedgerFailure> {
+    decode_retention(bytes, 24, 25)
+}
+
+fn decode_retention(
+    bytes: &[u8],
+    tag_offset: usize,
+    instant_offset: usize,
+) -> Result<SegmentRetention, LedgerFailure> {
     let instant = i64::from_be_bytes(
         bytes
-            .get(25..33)
+            .get(instant_offset..instant_offset.saturating_add(8))
             .and_then(|value| value.try_into().ok())
             .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?,
     );
-    match bytes.get(24).copied() {
+    match bytes.get(tag_offset).copied() {
         Some(0) if instant == 0 => Ok(SegmentRetention::Empty),
         Some(1) if instant == 0 => Ok(SegmentRetention::Unavailable),
         Some(2) => Ok(SegmentRetention::Complete(

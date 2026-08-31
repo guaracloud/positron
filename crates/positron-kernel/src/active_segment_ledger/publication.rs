@@ -38,7 +38,17 @@ pub(super) fn publish_segments(
     scope: SegmentScope,
     metadata: &[SegmentMetadata],
 ) -> Result<(), LedgerFailure> {
-    publish_scope(catalog, basis, storage, scope, metadata, None)
+    publish_scope(catalog, basis, storage, scope, metadata, None, false)
+}
+
+pub(super) fn publish_exact_scope_segments(
+    catalog: &Catalog<'_>,
+    basis: &crate::CatalogSnapshot,
+    storage: &LedgerStorage,
+    scope: SegmentScope,
+    metadata: &[SegmentMetadata],
+) -> Result<(), LedgerFailure> {
+    publish_scope(catalog, basis, storage, scope, metadata, None, true)
 }
 
 pub(super) fn publish_segments_with_frontier(
@@ -49,7 +59,15 @@ pub(super) fn publish_segments_with_frontier(
     metadata: &[SegmentMetadata],
     frontier: IngestTime,
 ) -> Result<(), LedgerFailure> {
-    publish_scope(catalog, basis, storage, scope, metadata, Some(frontier))
+    publish_scope(
+        catalog,
+        basis,
+        storage,
+        scope,
+        metadata,
+        Some(frontier),
+        false,
+    )
 }
 
 fn publish_scope(
@@ -59,6 +77,7 @@ fn publish_scope(
     scope: SegmentScope,
     metadata: &[SegmentMetadata],
     frontier: Option<IngestTime>,
+    exact_scope: bool,
 ) -> Result<(), LedgerFailure> {
     let mut objects = Vec::new();
     objects
@@ -117,7 +136,8 @@ fn publish_scope(
             catalog.refresh_state()?;
             let snapshot = catalog.pin()?;
             let segments = storage.catalog_segments(&snapshot, scope)?;
-            let segments_subsume = metadata.iter().all(|expected| segments.contains(expected));
+            let segments_subsume = metadata.iter().all(|expected| segments.contains(expected))
+                && (!exact_scope || segments.len() == metadata.len());
             let frontier_subsumed = match frontier {
                 Some(expected) => super::retention_frontier::recover(&snapshot, scope)?
                     .is_some_and(|published| published >= expected),

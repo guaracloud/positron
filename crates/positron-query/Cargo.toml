@@ -11,7 +11,7 @@ homepage.workspace = true
 publish = false
 
 [features]
-test-support = []
+test-support = ["positron-kernel/test-support", "positron-signals/test-support"]
 
 [lints]
 workspace = true

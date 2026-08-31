@@ -8,6 +8,7 @@ use positron_kernel::{
     ResourceAmounts, ResourceDimension, SegmentProtectionKey, SegmentScope, StoreBlockIdentity,
     WorkClaim, WorkKind,
 };
+use positron_kernel::{CatalogPublicationFault, with_catalog_publication_fault_after};
 use positron_signals::{LogScan, LogStore, ScanLimit};
 
 use crate::{
@@ -69,6 +70,76 @@ fn schema_authority_mismatch_is_storage_unavailable_not_capacity() {
         ),
         IngestOutcome::Retryable(IngestFailureCode::StorageUnavailable)
     );
+}
+
+#[test]
+fn preparation_failure_rolls_back_schema_so_the_next_ingest_can_commit() {
+    let fixture = fixture().expect("kernel fixture");
+    let catalog = Catalog::open(
+        &fixture.authority,
+        InstanceId::new([0x56; 16]).expect("instance"),
+        CatalogSecret::from_owned(Box::new([0x57; 32]), Box::new([0x58; 32])),
+    )
+    .expect("catalog");
+    let shard = VirtualShardId::new(52).expect("shard");
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
+        &fixture.authority,
+        &fixture.retention_time,
+        &catalog,
+        SegmentScope::new(fixture.tenant, SignalKind::Logs, shard),
+        SegmentProtectionKey::from_owned(Box::new([0x59; 32])),
+    )
+    .expect("ledger");
+    let schema = super::support::schema_session(&fixture).expect("schema session");
+    let policy = IngestPolicy::preserving(1).expect("policy");
+    let ingest = LogIngest::new(
+        &fixture.authority,
+        &ledger,
+        &policy,
+        fixture.tenant,
+        shard,
+        schema.clone(),
+    );
+    let baseline = fixture
+        .authority
+        .governor()
+        .inspect()
+        .expect("baseline")
+        .outstanding_total();
+
+    let first =
+        with_catalog_publication_fault_after(CatalogPublicationFault::SynchronizeCommit, 0, || {
+            ingest.accept(
+                OtlpLogsReceiver::new()
+                    .decode(protobuf_with_bodies(&["first"]))
+                    .expect("first batch"),
+                StoreBlockIdentity::new([0x5a; 16]).expect("first identity"),
+            )
+        });
+    assert_eq!(
+        first,
+        IngestOutcome::Retryable(IngestFailureCode::StorageUnavailable)
+    );
+    assert_eq!(
+        fixture
+            .authority
+            .governor()
+            .inspect()
+            .expect("after rejection")
+            .outstanding_total(),
+        baseline
+    );
+
+    let second = ingest.accept(
+        OtlpLogsReceiver::new()
+            .decode(protobuf_with_bodies(&["second"]))
+            .expect("second batch"),
+        StoreBlockIdentity::new([0x5b; 16]).expect("second identity"),
+    );
+    assert!(matches!(second, IngestOutcome::Full(_)));
+    let checkpoint = schema.checkpoint().expect("checkpoint after retry");
+    assert_eq!(checkpoint.entry_count(), 2);
+    assert_eq!(checkpoint.pending_bytes(), 0);
 }
 
 #[test]

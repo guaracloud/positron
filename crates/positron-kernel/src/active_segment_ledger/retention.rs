@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use super::capacity::retained_claim;
 use super::format::SegmentState;
-use super::publication::{publish_segments, publish_segments_with_frontier};
+use super::publication::{publish_exact_scope_segments, publish_segments_with_frontier};
 use super::{
     ActiveSegmentLedger, LedgerFailure, LedgerFailureCode, RetentionEvaluation,
     RetentionReclamation, SegmentRetention,
@@ -45,7 +45,7 @@ pub(super) fn commit(
         }
         let mut latest = None;
         for block in segment_blocks {
-            match block.segment_retention {
+            match block.block_retention {
                 SegmentRetention::Complete(instant) => {
                     latest = Some(
                         latest.map_or(instant, |current: crate::IngestTime| current.max(instant)),
@@ -154,14 +154,25 @@ fn reclaim_retired_segments(
     if reclaimable.is_empty() {
         return Ok(0);
     }
+    let mut physically_mutated = false;
     for candidate in &reclaimable {
-        ledger.storage.reclaim_retired(*candidate)?;
+        match ledger.storage.reclaim_retired(*candidate) {
+            Ok(changed) => physically_mutated |= changed,
+            Err(failure) if physically_mutated => {
+                return Err(LedgerFailure::post_mutation(failure.code()));
+            },
+            Err(failure) => return Err(failure),
+        }
     }
-    let basis = ledger.catalog.pin()?;
+    let basis = ledger
+        .catalog
+        .pin()
+        .map_err(LedgerFailure::from)
+        .map_err(|failure| after_physical_reclamation(failure, physically_mutated))?;
     let mut remaining = ledger
         .storage
         .catalog_segments(&basis, ledger.scope)
-        .map_err(|failure| LedgerFailure::new(failure.code()))?;
+        .map_err(|failure| after_physical_reclamation(failure, physically_mutated))?;
     let continuity_marker = reclaimable
         .iter()
         .copied()
@@ -170,13 +181,21 @@ fn reclaim_retired_segments(
     if let Some(marker) = continuity_marker {
         remaining.push(marker);
     }
-    publish_segments(
+    publish_exact_scope_segments(
         ledger.catalog,
         &basis,
         &ledger.storage,
         ledger.scope,
         &remaining,
     )
-    .map_err(|failure| LedgerFailure::new(failure.code()))?;
+    .map_err(|failure| after_physical_reclamation(failure, physically_mutated))?;
     Ok(reclaimable.len())
+}
+
+fn after_physical_reclamation(failure: LedgerFailure, physically_mutated: bool) -> LedgerFailure {
+    if physically_mutated {
+        LedgerFailure::post_mutation(failure.code())
+    } else {
+        failure
+    }
 }

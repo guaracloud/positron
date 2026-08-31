@@ -111,20 +111,15 @@ fn reconstructed_caller_time_cannot_retire_fresh_authenticated_data() -> Result<
         .blocks()
         .first()
         .ok_or("fresh retention fixture is missing its committed block")?;
+    assert_eq!(
+        block
+            .authenticate_ingest_time(UnixNanoseconds::new(1_000_000_000))
+            .expect_err("encoded time must match private v3 block evidence")
+            .code(),
+        positron_kernel::LedgerFailureCode::IntegrityCorruption,
+    );
     let duration = NonZeroU64::new(1).ok_or("positive retention duration")?;
     let legacy_payload = block.payload().to_vec();
-    let caller_time = snapshot.reconstruct_ingest_time(UnixNanoseconds::new(1_000_000_000));
-    assert_ne!(
-        LogRetentionPolicy::new(1)?
-            .bucket(tenant, caller_time)?
-            .start(),
-        LogRetentionPolicy::new(1)?
-            .bucket(
-                tenant,
-                snapshot.reconstruct_ingest_time(UnixNanoseconds::new(i64::MAX / 2)),
-            )?
-            .start(),
-    );
     drop(snapshot);
     let outcome = active
         .begin_retention(duration)?
@@ -144,7 +139,21 @@ fn reconstructed_caller_time_cannot_retire_fresh_authenticated_data() -> Result<
         StoreBlockIdentity::new([0x7c; 16])?,
         legacy_payload,
     )?)?;
-    assert_eq!(other.snapshot()?.blocks().len(), 1);
+    let legacy_snapshot = other.snapshot()?;
+    let legacy_block = legacy_snapshot
+        .blocks()
+        .first()
+        .ok_or("legacy fixture block")?;
+    let caller_time = legacy_block
+        .reconstruct_unretained_ingest_time_for_test(UnixNanoseconds::new(1_000_000_000))?;
+    assert_eq!(
+        LogRetentionPolicy::new(1)?
+            .bucket(tenant, caller_time)
+            .expect_err("unretained test time cannot select a retention bucket")
+            .code(),
+        positron_signals::LogStoreFailureCode::UnsupportedFormat,
+    );
+    drop(legacy_snapshot);
     other.seal()?;
     let legacy = ActiveSegmentLedger::open_with_retention_time(
         &authority,
@@ -369,6 +378,268 @@ fn later_catalog_conflict_hides_segments_already_published_as_retired() -> Resul
 }
 
 #[test]
+fn reclaim_cleanup_rejects_a_later_catalog_that_keeps_the_removed_scope_superset()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x31; 16])?,
+        CatalogSecret::from_owned(Box::new([0x32; 32]), Box::new([0x33; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(17)?);
+    let retention_time = RetentionTimeAuthority::establish()?;
+    let store = LogStore::new();
+    let PolicyEvaluation::Accepted(evaluated) = IngestPolicy::preserving(1)?.evaluate(
+        NativeLogCandidate::new(None, None, None, vec![], LogMetadata::empty()),
+        PolicyReceiver::OtlpGrpc,
+    )?
+    else {
+        return Err("preserving policy rejected the reclaim fixture".into());
+    };
+    let record =
+        LogRecord::checked_evaluated(ValueLimitProfile::release_1_system_maximum(), *evaluated)?;
+    let key = || SegmentProtectionKey::from_owned(Box::new([0x34; 32]));
+    let sealed = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    sealed.append(
+        store
+            .prepare(
+                sealed.begin_store_block(
+                    preparation_capacity(&authority, tenant)?,
+                    StoreBlockIdentity::new([0x35; 16])?,
+                )?,
+                vec![record.clone()],
+            )?
+            .into_store_block(),
+    )?;
+    sealed.seal()?;
+    let second_sealed = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    second_sealed.append(
+        store
+            .prepare(
+                second_sealed.begin_store_block(
+                    preparation_capacity(&authority, tenant)?,
+                    StoreBlockIdentity::new([0x37; 16])?,
+                )?,
+                vec![record],
+            )?
+            .into_store_block(),
+    )?;
+    second_sealed.seal()?;
+    std::thread::sleep(std::time::Duration::from_millis(1_050));
+    let active = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+
+    let failure = with_catalog_publication_ambiguity_hook_after(
+        CatalogPublicationFault::SynchronizeCommit,
+        1,
+        |catalog| {
+            catalog
+                .refresh_after_ambiguous_publication_for_test()
+                .expect("refresh pre-durable cleanup failure");
+            let basis = catalog.pin().expect("pin stale-superset basis");
+            let mut objects = basis
+                .object_identities()
+                .map(|identity| {
+                    CatalogObject::new(
+                        basis
+                            .object(identity)
+                            .expect("read basis object")
+                            .expect("basis object exists")
+                            .to_vec(),
+                    )
+                    .expect("copy basis object")
+                })
+                .collect::<Vec<_>>();
+            objects.push(CatalogObject::new(b"unrelated N+2 control".to_vec()).expect("control"));
+            catalog
+                .commit(
+                    basis.identity(),
+                    CatalogProposal::new(
+                        TransactionId::new([0x36; 16]).expect("N+2 transaction"),
+                        FormatEpoch::CATALOG_V1,
+                        objects,
+                    )
+                    .expect("N+2 proposal"),
+                    None,
+                )
+                .expect("publish stale-superset N+2");
+        },
+        || store.enforce_retention(&active, tenant, LogRetentionPolicy::new(1)?),
+    )
+    .expect_err("stale scoped metadata cannot acknowledge reclaim cleanup");
+    assert_eq!(
+        failure.code(),
+        positron_signals::LogStoreFailureCode::StaleGeneration
+    );
+    assert!(active.snapshot()?.blocks().is_empty());
+    drop(active);
+
+    let restarted = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    assert!(restarted.snapshot()?.blocks().is_empty());
+    store.enforce_retention(&restarted, tenant, LogRetentionPolicy::new(1)?)?;
+    Ok(())
+}
+
+#[test]
+fn partial_physical_reclamation_requires_recovery_and_retries_idempotently()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x71; 16])?,
+        CatalogSecret::from_owned(Box::new([0x72; 32]), Box::new([0x73; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(18)?);
+    let retention_time = RetentionTimeAuthority::establish()?;
+    let store = LogStore::new();
+    let PolicyEvaluation::Accepted(evaluated) = IngestPolicy::preserving(1)?.evaluate(
+        NativeLogCandidate::new(None, None, None, vec![], LogMetadata::empty()),
+        PolicyReceiver::OtlpGrpc,
+    )?
+    else {
+        return Err("preserving policy rejected the partial reclaim fixture".into());
+    };
+    let record =
+        LogRecord::checked_evaluated(ValueLimitProfile::release_1_system_maximum(), *evaluated)?;
+    let key = || SegmentProtectionKey::from_owned(Box::new([0x74; 32]));
+    let first = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    let first_id = first.active_segment_id()?;
+    first.append(
+        store
+            .prepare(
+                first.begin_store_block(
+                    preparation_capacity(&authority, tenant)?,
+                    StoreBlockIdentity::new([0x75; 16])?,
+                )?,
+                vec![record.clone()],
+            )?
+            .into_store_block(),
+    )?;
+    first.seal()?;
+    let second = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    let second_id = second.active_segment_id()?;
+    second.append(
+        store
+            .prepare(
+                second.begin_store_block(
+                    preparation_capacity(&authority, tenant)?,
+                    StoreBlockIdentity::new([0x76; 16])?,
+                )?,
+                vec![record],
+            )?
+            .into_store_block(),
+    )?;
+    second.seal()?;
+    std::thread::sleep(std::time::Duration::from_millis(1_050));
+    let active = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    let protected = active.snapshot()?;
+    assert_eq!(protected.blocks().len(), 2);
+    let retired = active
+        .begin_retention(NonZeroU64::new(1).ok_or("duration")?)?
+        .commit()?;
+    assert_eq!(retired.logically_retired_segments(), 2);
+    assert_eq!(retired.physically_reclaimed_segments(), 0);
+    assert!(active.snapshot()?.blocks().is_empty());
+    drop(protected);
+
+    let sealed = root.path().join("segments/sealed");
+    let segment_path = |id: positron_kernel::SegmentId| {
+        let name = id
+            .to_bytes()
+            .iter()
+            .fold(String::with_capacity(32), |mut name, byte| {
+                use std::fmt::Write as _;
+                write!(&mut name, "{byte:02x}").expect("writing to String cannot fail");
+                name
+            });
+        sealed.join(format!("{name}.segment"))
+    };
+    let first_path = segment_path(first_id);
+    let second_path = segment_path(second_id);
+    let second_bytes = std::fs::read(&second_path)?;
+    std::fs::remove_file(&second_path)?;
+    std::fs::create_dir(&second_path)?;
+    let baseline = authority.governor().inspect()?;
+    let failure = active
+        .begin_retention(NonZeroU64::new(1).ok_or("duration")?)?
+        .commit()
+        .expect_err("partial physical reclamation cannot be reported as a clean refusal");
+    assert_ne!(
+        failure.completion_state(),
+        LedgerCompletionState::RejectedBeforeMutation
+    );
+    assert!(active.snapshot()?.blocks().is_empty());
+    assert!(!first_path.exists());
+    assert!(second_path.is_dir());
+    assert_same_resource_usage(&baseline, &authority.governor().inspect()?);
+
+    std::fs::remove_dir(&second_path)?;
+    std::fs::write(&second_path, second_bytes)?;
+    drop(active);
+    let restarted = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    assert!(restarted.snapshot()?.blocks().is_empty());
+    restarted
+        .begin_retention(NonZeroU64::new(1).ok_or("duration")?)?
+        .commit()?;
+    assert!(!second_path.exists());
+    assert_same_resource_usage(&baseline, &authority.governor().inspect()?);
+    Ok(())
+}
+
+#[test]
 fn retired_lease_resume_reserves_capacity_before_recovery_reads() -> Result<(), Box<dyn Error>> {
     let root = TemporaryRoot::new()?;
     let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
@@ -495,6 +766,16 @@ fn retired_lease_resume_reserves_capacity_before_recovery_reads() -> Result<(), 
         .expect_err("corrupted retired payload must remain typed after capacity returns");
     assert_eq!(
         corrupted.code(),
+        positron_kernel::LedgerFailureCode::IntegrityCorruption
+    );
+    assert_same_resource_usage(&before, &authority.governor().inspect()?);
+    std::fs::remove_file(&segment_path)?;
+    std::fs::create_dir(&segment_path)?;
+    let substituted = active
+        .resume_snapshot_lease(lease_identity, resume_now)
+        .expect_err("a retired segment directory substitution must fail before decode");
+    assert_eq!(
+        substituted.code(),
         positron_kernel::LedgerFailureCode::IntegrityCorruption
     );
     assert_same_resource_usage(&before, &authority.governor().inspect()?);

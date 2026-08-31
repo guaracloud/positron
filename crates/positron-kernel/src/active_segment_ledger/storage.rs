@@ -370,7 +370,7 @@ impl LedgerStorage {
     /// Removes a retired sealed segment only after its catalog state has made
     /// it invisible to new snapshots. Missing entries are already reclaimed
     /// work and are therefore idempotent across crash recovery.
-    pub(super) fn reclaim_retired(&self, metadata: SegmentMetadata) -> Result<(), LedgerFailure> {
+    pub(super) fn reclaim_retired(&self, metadata: SegmentMetadata) -> Result<bool, LedgerFailure> {
         if metadata.state != SegmentState::Retired {
             return Err(LedgerFailure::new(LedgerFailureCode::InvalidInput));
         }
@@ -384,13 +384,21 @@ impl LedgerStorage {
             match unix_fs::unlinkat(&self.sealed, name, AtFlags::empty()) {
                 Ok(()) => changed = true,
                 Err(rustix::io::Errno::NOENT) => {},
-                Err(error) => return Err(map_errno(error)),
+                Err(error) => {
+                    let failure = map_errno(error);
+                    return Err(if changed {
+                        LedgerFailure::post_mutation(failure.code())
+                    } else {
+                        failure
+                    });
+                },
             }
         }
         if changed {
-            synchronize(&self.sealed)?;
+            synchronize(&self.sealed)
+                .map_err(|failure| LedgerFailure::post_mutation(failure.code()))?;
         }
-        Ok(())
+        Ok(changed)
     }
 }
 

@@ -136,7 +136,28 @@ impl RetentionTimeAuthority {
             .and_then(|delta| baseline.instant.value().checked_add(delta))
             .map(UnixNanoseconds::new)
             .ok_or(LifecycleClockFailure::OutOfRange)?;
+        #[cfg(feature = "test-support")]
+        if !self.destructive_retention {
+            return Ok(IngestTime::from_unretained_test(advanced));
+        }
         Ok(IngestTime::from_authenticated_durable(advanced))
+    }
+
+    pub(crate) fn lease_recovery_time(
+        &self,
+        scope: SegmentScope,
+        durable: Option<IngestTime>,
+    ) -> Result<Option<u64>, LifecycleClockFailure> {
+        let Some(durable) = durable else {
+            return Ok(None);
+        };
+        self.ingest_time(scope, Some(durable))?
+            .instant()
+            .value()
+            .checked_div(1_000_000_000)
+            .and_then(|value| u64::try_from(value).ok())
+            .map(Some)
+            .ok_or(LifecycleClockFailure::OutOfRange)
     }
 }
 

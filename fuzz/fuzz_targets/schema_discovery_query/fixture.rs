@@ -9,7 +9,6 @@ use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
 use opentelemetry_proto::tonic::logs::v1::{LogRecord as OtlpLogRecord, ResourceLogs, ScopeLogs};
 use positron_domain::identity::TenantId;
 use positron_domain::routing::{SignalKind, VirtualShardId};
-use positron_domain::time::UnixNanoseconds;
 use positron_domain::value::{AttributeNamespace, ValidatedAttributeValue};
 use positron_governance::{
     AuthorizedContext, CompatibilityHints, PresentedCredential, RequestedIntent,
@@ -19,9 +18,8 @@ use positron_ingest::{
     LogIngest, OtlpLogsReceiver, SchemaDiscoveryRequest, TenantSchemaRegistry, TenantSchemaSession,
 };
 use positron_kernel::{
-    ActiveSegmentLedger, Catalog, CatalogSecret, FixedLifecycleClockSource, InstanceId,
-    LifecycleClock, MountQualification, SegmentProtectionKey, SegmentScope,
-    StorageKernelResourceAuthority, StoreBlockIdentity,
+    ActiveSegmentLedger, Catalog, CatalogSecret, InstanceId, MountQualification,
+    SegmentProtectionKey, SegmentScope, StorageKernelResourceAuthority, StoreBlockIdentity,
 };
 use positron_runtime::{BootstrapPaths, InitializationPlan, InstanceBootstrap};
 use positron_signals::{
@@ -250,11 +248,9 @@ impl FuzzFixture {
         let Ok(policy) = IngestPolicy::preserving(1) else {
             return;
         };
-        let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(1)));
         let outcome = LogIngest::new(
             self.authority,
             self.ledger,
-            &clock,
             &policy,
             self.tenant,
             shard,

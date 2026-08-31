@@ -85,8 +85,8 @@ pub use catalog::{
 #[cfg(feature = "test-support")]
 pub use catalog::{
     CatalogPublicationFault, with_catalog_generation_ambiguity_hook_after,
-    with_catalog_publication_fault_after, with_catalog_publication_fault_sequence_after,
-    with_catalog_publication_hook_after,
+    with_catalog_publication_ambiguity_hook_after, with_catalog_publication_fault_after,
+    with_catalog_publication_fault_sequence_after, with_catalog_publication_hook_after,
 };
 #[cfg(feature = "test-support")]
 pub use catalog::{GovernanceFixtureObject, GovernanceFixtureTarget};

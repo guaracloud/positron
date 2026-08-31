@@ -112,12 +112,12 @@ impl<'kernel> ActiveSegmentLedger<'kernel, '_> {
         let prior_retention = state
             .blocks
             .iter()
-            .rev()
-            .find(|committed| committed.segment == segment)
-            .map_or(super::SegmentRetention::Empty, |committed| {
-                committed.segment_retention
+            .filter(|committed| committed.segment == segment)
+            .fold(super::SegmentRetention::Empty, |aggregate, committed| {
+                aggregate.append_block(committed.block_retention)
             });
-        let segment_retention = prior_retention.append(block.retention_ingest_time);
+        let block_retention = super::SegmentRetention::for_block(block.retention_ingest_time);
+        let segment_retention = prior_retention.append_block(block_retention);
         let content_digest = block.content_digest()?;
         let context = self
             .key
@@ -133,8 +133,17 @@ impl<'kernel> ActiveSegmentLedger<'kernel, '_> {
             )
             .map_err(map_frame_failure)?;
         let limits = FrameLimits::new(MAX_ENCODED_FRAME_BYTES).map_err(map_frame_failure)?;
-        let mut frame_plaintext = Vec::with_capacity(16 + block.payload.len());
+        let mut frame_plaintext = Vec::with_capacity(25 + block.payload.len());
         frame_plaintext.extend_from_slice(&block.identity.to_bytes());
+        let (retention_tag, retention_instant) = match block_retention {
+            super::SegmentRetention::Complete(instant) => (2_u8, instant.instant().value()),
+            super::SegmentRetention::Unavailable => (1_u8, 0_i64),
+            super::SegmentRetention::Empty => {
+                return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
+            },
+        };
+        frame_plaintext.push(retention_tag);
+        frame_plaintext.extend_from_slice(&retention_instant.to_be_bytes());
         frame_plaintext.extend_from_slice(&block.payload);
         let frame_bytes = DataProtection::protected_frame_length(frame_plaintext.len(), limits)
             .map_err(map_frame_failure)?;
@@ -175,13 +184,6 @@ impl<'kernel> ActiveSegmentLedger<'kernel, '_> {
                 return Err(failure);
             },
         };
-        for committed in state
-            .blocks
-            .iter_mut()
-            .filter(|committed| committed.segment == segment)
-        {
-            committed.segment_retention = segment_retention;
-        }
         state.blocks.push(CommittedBlock {
             identity: block.identity,
             position,
@@ -189,7 +191,7 @@ impl<'kernel> ActiveSegmentLedger<'kernel, '_> {
             content_digest,
             segment,
             frontier_authenticator: authenticator,
-            segment_retention,
+            block_retention,
         });
         state.frontier = position;
         state.retained_bytes = retained_bytes;

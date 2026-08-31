@@ -209,21 +209,13 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         scope: SegmentScope,
         protection: SegmentProtectionKey,
     ) -> Result<Self, LedgerFailure> {
-        let now = crate::LifecycleClock::new(crate::SystemLifecycleClockSource)
-            .assign_ingest_time()
-            .map_err(|_| LedgerFailure::new(LedgerFailureCode::StorageUnavailable))?
-            .instant()
-            .value()
-            .checked_div(1_000_000_000)
-            .and_then(|value| u64::try_from(value).ok())
-            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::StorageUnavailable))?;
         Self::open_at(
             authority,
             Some(retention_time),
             catalog,
             scope,
             protection,
-            now,
+            None,
         )
     }
 
@@ -242,7 +234,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             .checked_div(1_000_000_000)
             .and_then(|value| u64::try_from(value).ok())
             .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::StorageUnavailable))?;
-        Self::open_at(authority, None, catalog, scope, protection, now)
+        Self::open_at(authority, None, catalog, scope, protection, Some(now))
     }
 
     fn open_at(
@@ -251,7 +243,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         catalog: &'catalog Catalog<'kernel>,
         scope: SegmentScope,
         protection: SegmentProtectionKey,
-        now: u64,
+        lifecycle_now: Option<u64>,
     ) -> Result<Self, LedgerFailure> {
         let writer = authority
             .acquire_active_segment_ledger(scope.lease_key())
@@ -282,8 +274,18 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         let mut storage = LedgerStorage::open(volume)?;
         let snapshot = catalog.pin()?;
         let retention_frontier = retention_frontier::recover(&snapshot, scope)?;
+        let lease_recovery_time = match retention_time {
+            Some(authority) => authority
+                .lease_recovery_time(scope, retention_frontier)
+                .map_err(map_retention_time_failure)?,
+            None => lifecycle_now,
+        };
         let recovered_leases = snapshot_lease_recovery::recover_reservations(
-            authority, catalog, scope, &snapshot, now,
+            authority,
+            catalog,
+            scope,
+            &snapshot,
+            lease_recovery_time,
         )?;
         let snapshot = catalog.pin()?;
         let mut metadata = storage.catalog_segments(&snapshot, scope)?;
@@ -366,7 +368,9 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         capacity: ResourceReservation<'capacity>,
         identity: StoreBlockIdentity,
     ) -> Result<StoreBlockPreparation<'capacity>, LedgerFailure> {
-        if !capacity.authorizes_ingest_preparation(self.scope.tenant, 1_048_576) {
+        if !capacity.belongs_to(self.authority.governor())
+            || !capacity.authorizes_ingest_preparation(self.scope.tenant, 1_048_576)
+        {
             return Err(LedgerFailure::new(
                 LedgerFailureCode::ResourceAdmissionRefused,
             ));
@@ -404,7 +408,9 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         identity: StoreBlockIdentity,
         retention_time: &crate::RetentionTimeAuthority,
     ) -> Result<StoreBlockPreparation<'capacity>, LedgerFailure> {
-        if !capacity.authorizes_ingest_preparation(self.scope.tenant, 1_048_576) {
+        if !capacity.belongs_to(self.authority.governor())
+            || !capacity.authorizes_ingest_preparation(self.scope.tenant, 1_048_576)
+        {
             return Err(LedgerFailure::new(
                 LedgerFailureCode::ResourceAdmissionRefused,
             ));

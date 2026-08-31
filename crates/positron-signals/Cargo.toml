@@ -10,6 +10,10 @@ repository.workspace = true
 homepage.workspace = true
 publish = false
 
+[features]
+default = []
+test-support = ["positron-kernel/test-support"]
+
 [lints]
 workspace = true
 

@@ -92,6 +92,9 @@ impl RetentionBucket {
         ingest_time: IngestTime,
         duration_seconds: NonZeroU64,
     ) -> Result<Self, LedgerFailure> {
+        if !ingest_time.retention_authenticated() {
+            return Err(LedgerFailure::new(LedgerFailureCode::UnsupportedFormat));
+        }
         let width = duration_seconds
             .get()
             .checked_mul(1_000_000_000)
@@ -277,10 +280,10 @@ pub struct CommittedBlock {
     pub(super) content_digest: [u8; 32],
     pub(super) segment: SegmentId,
     pub(super) frontier_authenticator: [u8; 32],
-    pub(super) segment_retention: SegmentRetention,
+    pub(super) block_retention: SegmentRetention,
 }
 
-/// Authenticated aggregate lifecycle metadata for one physical segment.
+/// Authenticated lifecycle metadata for a Store Block or its segment aggregate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SegmentRetention {
     Empty,
@@ -289,11 +292,22 @@ pub(super) enum SegmentRetention {
 }
 
 impl SegmentRetention {
-    pub(super) fn append(self, ingest_time: Option<IngestTime>) -> Self {
-        match (self, ingest_time) {
-            (Self::Empty, Some(instant)) => Self::Complete(instant),
-            (Self::Complete(previous), Some(instant)) => Self::Complete(previous.max(instant)),
-            (Self::Empty | Self::Complete(_), None) | (Self::Unavailable, _) => Self::Unavailable,
+    pub(super) const fn for_block(ingest_time: Option<IngestTime>) -> Self {
+        match ingest_time {
+            Some(instant) => Self::Complete(instant),
+            None => Self::Unavailable,
+        }
+    }
+
+    pub(super) fn append_block(self, block: Self) -> Self {
+        match (self, block) {
+            (Self::Empty, Self::Complete(instant)) => Self::Complete(instant),
+            (Self::Complete(previous), Self::Complete(instant)) => {
+                Self::Complete(previous.max(instant))
+            },
+            (Self::Empty | Self::Complete(_), Self::Unavailable)
+            | (Self::Unavailable, Self::Complete(_) | Self::Unavailable) => Self::Unavailable,
+            (_, Self::Empty) => Self::Unavailable,
         }
     }
 }
@@ -320,6 +334,37 @@ impl CommittedBlock {
         &self.payload
     }
 
+    /// Verifies one encoded record timestamp against this authenticated v3 block.
+    pub fn authenticate_ingest_time(
+        &self,
+        encoded: UnixNanoseconds,
+    ) -> Result<IngestTime, LedgerFailure> {
+        match self.block_retention {
+            SegmentRetention::Complete(expected) if expected.instant() == encoded => Ok(expected),
+            SegmentRetention::Complete(_) => {
+                Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))
+            },
+            SegmentRetention::Empty | SegmentRetention::Unavailable => {
+                Err(LedgerFailure::new(LedgerFailureCode::UnsupportedFormat))
+            },
+        }
+    }
+
+    /// Reconstructs time only for explicitly retention-unavailable test blocks.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn reconstruct_unretained_ingest_time_for_test(
+        &self,
+        encoded: UnixNanoseconds,
+    ) -> Result<IngestTime, LedgerFailure> {
+        match self.block_retention {
+            SegmentRetention::Unavailable => Ok(IngestTime::from_unretained_test(encoded)),
+            SegmentRetention::Empty | SegmentRetention::Complete(_) => {
+                Err(LedgerFailure::new(LedgerFailureCode::InvalidInput))
+            },
+        }
+    }
+
     /// Returns the stable digest computed while the payload was admitted.
     pub fn content_digest(&self) -> Result<[u8; 32], LedgerFailure> {
         Ok(self.content_digest)
@@ -342,12 +387,6 @@ impl LedgerSnapshot<'_> {
     #[must_use]
     pub const fn scope(&self) -> SegmentScope {
         self.scope
-    }
-
-    /// Reconstructs Ingest Time only inside an authenticated durable snapshot.
-    #[must_use]
-    pub const fn reconstruct_ingest_time(&self, instant: UnixNanoseconds) -> IngestTime {
-        IngestTime::from_authenticated_durable(instant)
     }
 
     #[must_use]

@@ -5,6 +5,90 @@ use crate::{
     SnapshotLeaseUsage, WorkClaim, WorkKind,
 };
 
+#[test]
+fn missing_leased_block_in_a_valid_empty_retired_artifact_is_snapshot_expired()
+-> Result<(), Box<dyn Error>> {
+    use crate::active_segment_ledger::format::{SegmentState, decode_header};
+    use crate::active_segment_ledger::recovery::{frontier_name, publish_frontier, segment_name};
+    use crate::active_segment_ledger::storage::LedgerStorage;
+    use crate::active_segment_ledger::{SegmentRetention, publish_segments};
+
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x41; 16])?,
+        CatalogSecret::from_owned(Box::new([0x42; 32]), Box::new([0x43; 32])),
+    )?;
+    let scope = SegmentScope::new(
+        TenantId::from_bytes([0x64; 16])?,
+        SignalKind::Logs,
+        VirtualShardId::new(7)?,
+    );
+    let protection = || SegmentProtectionKey::from_owned(Box::new([0x44; 32]));
+    let ledger = ActiveSegmentLedger::open(&authority, &catalog, scope, protection())?;
+    let receipt = ledger.append(prepared(scope, b"leased-block")?)?;
+    let lease = ledger.create_snapshot_lease(100, 200)?;
+    let lease_identity = lease.identity();
+    drop(lease);
+    ledger.seal()?;
+
+    let storage = LedgerStorage::open(
+        authority
+            .primary_data_volume()
+            .ok_or("fixture retains its primary volume")?,
+    )?;
+    let basis = catalog.pin()?;
+    let sealed = storage.catalog_segments(&basis, scope)?[0];
+    let (segment_key, _) = storage.recover_segment(sealed, &protection(), catalog.instance())?;
+    let sealed_directory = root.path().join("segments/sealed");
+    let segment_path = sealed_directory.join(segment_name(sealed.id));
+    let segment_bytes = std::fs::read(&segment_path)?;
+    let header_bytes = decode_header(&segment_bytes)?.encoded_bytes;
+    let segment_file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&segment_path)?;
+    segment_file.set_len(u64::try_from(header_bytes)?)?;
+    segment_file.sync_all()?;
+    let sealed_handle = std::fs::File::open(&sealed_directory)?;
+    publish_frontier(
+        &sealed_handle,
+        sealed.id,
+        &segment_key,
+        u64::try_from(header_bytes)?,
+        0,
+        sealed.base_position,
+        SegmentRetention::Empty,
+    )?;
+    assert!(sealed_directory.join(frontier_name(sealed.id)).is_file());
+    publish_segments(
+        &catalog,
+        &basis,
+        &storage,
+        scope,
+        &[crate::active_segment_ledger::format::SegmentMetadata {
+            state: SegmentState::Retired,
+            base_position: receipt.position(),
+            ..sealed
+        }],
+    )?;
+    drop(basis);
+
+    let active = ActiveSegmentLedger::open_with_clock(
+        &authority,
+        &catalog,
+        scope,
+        protection(),
+        &lease_clock(101),
+    )?;
+    let failure = active
+        .resume_snapshot_lease(lease_identity, 101)
+        .expect_err("a valid retired artifact without the leased block is expired");
+    assert_eq!(failure.code(), LedgerFailureCode::SnapshotExpired);
+    Ok(())
+}
+
 fn resize_blocker(
     authority: &crate::StorageKernelResourceAuthority,
     tenant: positron_domain::identity::TenantId,

@@ -66,6 +66,92 @@ fn public_log_store_commits_and_scans_through_the_storage_kernel() -> Result<(),
 }
 
 #[test]
+fn restart_preserves_each_block_ingest_time_and_uses_the_segment_max_for_retention()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x1c; 16])?,
+        CatalogSecret::from_owned(Box::new([0x2c; 32]), Box::new([0x3c; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(12)?);
+    let retention_time = RetentionTimeAuthority::establish()?;
+    let store = LogStore::new();
+    let PolicyEvaluation::Accepted(evaluated) = IngestPolicy::preserving(1)?.evaluate(
+        NativeLogCandidate::new(
+            None,
+            None,
+            Some(CandidateAttributeValue::string(
+                "distinct durable ingest times".to_owned(),
+            )),
+            vec![],
+            LogMetadata::empty(),
+        ),
+        PolicyReceiver::OtlpGrpc,
+    )?
+    else {
+        return Err("preserving policy rejected the restart fixture".into());
+    };
+    let record =
+        LogRecord::checked_evaluated(ValueLimitProfile::release_1_system_maximum(), *evaluated)?;
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        SegmentProtectionKey::from_owned(Box::new([0x5c; 32])),
+    )?;
+    let first = ledger.begin_store_block(
+        preparation_capacity(&authority, tenant)?,
+        StoreBlockIdentity::new([0x6c; 16])?,
+    )?;
+    let first_ingest_time = first.ingest_time();
+    ledger.append(
+        store
+            .prepare(first, vec![record.clone()])?
+            .into_store_block(),
+    )?;
+    std::thread::sleep(std::time::Duration::from_millis(1_050));
+    let second = ledger.begin_store_block(
+        preparation_capacity(&authority, tenant)?,
+        StoreBlockIdentity::new([0x7c; 16])?,
+    )?;
+    let second_ingest_time = second.ingest_time();
+    assert!(second_ingest_time > first_ingest_time);
+    ledger.append(store.prepare(second, vec![record])?.into_store_block())?;
+    ledger.seal()?;
+
+    let reopened = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        SegmentProtectionKey::from_owned(Box::new([0x5c; 32])),
+    )?;
+    let scanned = store.scan(
+        authority.governor(),
+        tenant,
+        &reopened.snapshot()?,
+        LogScan::all(ScanLimit::new(2)?),
+    )?;
+    assert_eq!(scanned.records().len(), 2);
+    assert_eq!(scanned.records()[0].ingest_time(), first_ingest_time);
+    assert_eq!(scanned.records()[1].ingest_time(), second_ingest_time);
+    let still_fresh = store.enforce_retention(&reopened, tenant, LogRetentionPolicy::new(1)?)?;
+    assert_eq!(still_fresh.expired_segments(), 0);
+    assert_eq!(reopened.snapshot()?.blocks().len(), 2);
+
+    std::thread::sleep(std::time::Duration::from_millis(1_050));
+    let expired = store.enforce_retention(&reopened, tenant, LogRetentionPolicy::new(1)?)?;
+    assert_eq!(expired.expired_segments(), 1);
+    assert!(reopened.snapshot()?.blocks().is_empty());
+    Ok(())
+}
+
+#[test]
 fn expired_sealed_logs_are_removed_by_kernel_ingest_time_only() -> Result<(), Box<dyn Error>> {
     let root = TemporaryRoot::new()?;
     let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;

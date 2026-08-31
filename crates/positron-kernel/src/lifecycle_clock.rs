@@ -1,22 +1,76 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
+use std::hash::{Hash, Hasher};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use positron_domain::time::UnixNanoseconds;
 
 /// A kernel-assigned timestamp that cannot be constructed from caller values.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct IngestTime(UnixNanoseconds);
+#[derive(Clone, Copy)]
+pub struct IngestTime {
+    instant: UnixNanoseconds,
+    retention_authenticated: bool,
+}
 
 impl IngestTime {
     #[must_use]
     pub const fn instant(self) -> UnixNanoseconds {
-        self.0
+        self.instant
     }
 
     pub(crate) const fn from_authenticated_durable(instant: UnixNanoseconds) -> Self {
-        Self(instant)
+        Self {
+            instant,
+            retention_authenticated: true,
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) const fn from_unretained_test(instant: UnixNanoseconds) -> Self {
+        Self {
+            instant,
+            retention_authenticated: false,
+        }
+    }
+
+    pub(crate) const fn retention_authenticated(self) -> bool {
+        self.retention_authenticated
+    }
+}
+
+impl std::fmt::Debug for IngestTime {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("IngestTime")
+            .field(&self.instant)
+            .finish()
+    }
+}
+
+impl PartialEq for IngestTime {
+    fn eq(&self, other: &Self) -> bool {
+        self.instant == other.instant
+    }
+}
+
+impl Eq for IngestTime {}
+
+impl PartialOrd for IngestTime {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for IngestTime {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.instant.cmp(&other.instant)
+    }
+}
+
+impl Hash for IngestTime {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.instant.hash(state);
     }
 }
 
@@ -85,7 +139,7 @@ impl<S: LifecycleClockSource> LifecycleClock<S> {
             .map_err(|_| LifecycleClockFailure::Unavailable)?;
         let assigned = last.map_or(observed, |previous| previous.max(observed));
         *last = Some(assigned);
-        Ok(IngestTime(assigned))
+        Ok(IngestTime::from_authenticated_durable(assigned))
     }
 }
 

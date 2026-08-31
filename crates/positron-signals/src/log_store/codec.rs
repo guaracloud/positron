@@ -4,7 +4,7 @@ use positron_domain::value::AttributeNamespace;
 
 use super::LogStoreFailure;
 use super::types::{AttributeRepresentation, StoredLogRecord};
-use positron_kernel::LedgerSnapshot;
+use positron_kernel::CommittedBlock;
 
 const MAGIC: &[u8; 8] = b"PLOGBL01";
 const LEGACY_VERSION: u16 = 1;
@@ -118,17 +118,10 @@ fn encode_observed_time(output: &mut Vec<u8>, time: ObservedTime) {
 
 pub(super) fn decode_block(
     expected_tenant: TenantId,
-    snapshot: &LedgerSnapshot<'_>,
-    bytes: &[u8],
+    block: &CommittedBlock,
     limit: usize,
 ) -> Result<DecodedBlock, LogStoreFailure> {
-    decode_block_cancellable(
-        expected_tenant,
-        snapshot,
-        bytes,
-        limit,
-        &super::scan::NeverCancelled,
-    )
+    decode_block_cancellable(expected_tenant, block, limit, &super::scan::NeverCancelled)
 }
 
 pub(super) fn validate_retention_block_observed(
@@ -142,12 +135,11 @@ pub(super) fn validate_retention_block_observed(
 
 pub(super) fn decode_block_cancellable(
     expected_tenant: TenantId,
-    snapshot: &LedgerSnapshot<'_>,
-    bytes: &[u8],
+    block: &CommittedBlock,
     limit: usize,
     cancellation: &dyn super::ScanCancellation,
 ) -> Result<DecodedBlock, LogStoreFailure> {
-    BlockDecode::new(expected_tenant, bytes)?.decode(snapshot, limit, cancellation)
+    BlockDecode::new(expected_tenant, block.payload())?.decode(block, limit, cancellation)
 }
 
 fn decode_block_header_with<'input>(
@@ -232,22 +224,22 @@ impl<'input> BlockDecode<'input> {
 
     pub(super) fn decode(
         self,
-        snapshot: &LedgerSnapshot<'_>,
+        block: &CommittedBlock,
         limit: usize,
         cancellation: &dyn super::ScanCancellation,
     ) -> Result<DecodedBlock, LogStoreFailure> {
-        self.decode_after(snapshot, 0, limit, cancellation)
+        self.decode_after(block, 0, limit, cancellation)
     }
 
     pub(super) fn decode_after(
         mut self,
-        snapshot: &LedgerSnapshot<'_>,
+        block: &CommittedBlock,
         skip: usize,
         limit: usize,
         cancellation: &dyn super::ScanCancellation,
     ) -> Result<DecodedBlock, LogStoreFailure> {
         decode_block_records(
-            snapshot,
+            block,
             skip,
             limit,
             cancellation,
@@ -281,7 +273,7 @@ impl<'input> BlockDecode<'input> {
     reason = "the bounded decoder passes one immutable snapshot and its authenticated block context"
 )]
 fn decode_block_records(
-    snapshot: &LedgerSnapshot<'_>,
+    block: &CommittedBlock,
     skip: usize,
     limit: usize,
     cancellation: &dyn super::ScanCancellation,
@@ -295,7 +287,7 @@ fn decode_block_records(
         if cancellation.is_cancelled() {
             return Err(LogStoreFailure::cancelled());
         }
-        record::validate_structure(input, limits, version)?;
+        record::validate_structure_for_block(input, limits, version, block)?;
     }
     let retained_count = count.saturating_sub(skipped_count).min(limit);
     let mut records = bounded_vec(retained_count)?;
@@ -304,7 +296,7 @@ fn decode_block_records(
             return Err(LogStoreFailure::cancelled());
         }
         let decoded = record::decode(input, limits, version)?;
-        let record = decoded.into_stored(snapshot);
+        let record = decoded.into_stored(block)?;
         input.observe_decoded_record()?;
         records.push(record);
     }
@@ -318,7 +310,7 @@ fn decode_block_records(
         if cancellation.is_cancelled() {
             return Err(LogStoreFailure::cancelled());
         }
-        record::validate_structure(&mut tail, limits, version)?;
+        record::validate_structure_for_block(&mut tail, limits, version, block)?;
     }
     tail.finish_component_observation()?;
     if !tail.is_empty() {

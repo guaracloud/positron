@@ -9,11 +9,12 @@ use positron_domain::value::{
 };
 use positron_kernel::{
     ActiveSegmentLedger, Catalog, CatalogObject, CatalogProposal, CatalogPublicationFault,
-    CatalogSecret, FixedLifecycleClockSource, FormatEpoch, InstanceId, LifecycleClock,
-    MountQualification, OrdinaryPool, PreparedStoreBlock, PrimaryDataVolume, RecoveryWorkClaim,
-    RecoveryWorkKind, ResourceAmounts, ResourceDimension, RetentionTimeAuthority,
-    SegmentProtectionKey, SegmentScope, StoreBlockIdentity, SystemLifecycleClockSource,
-    TransactionId, WorkClaim, WorkClass, WorkKind, with_catalog_generation_ambiguity_hook_after,
+    CatalogSecret, FixedLifecycleClockSource, FormatEpoch, InstanceId, LedgerCompletionState,
+    LifecycleClock, MountQualification, OrdinaryPool, PreparedStoreBlock, PrimaryDataVolume,
+    RecoveryWorkClaim, RecoveryWorkKind, ResourceAmounts, ResourceDimension,
+    RetentionTimeAuthority, SegmentProtectionKey, SegmentScope, StoreBlockIdentity,
+    SystemLifecycleClockSource, TransactionId, WorkClaim, WorkClass, WorkKind,
+    with_catalog_generation_ambiguity_hook_after, with_catalog_publication_ambiguity_hook_after,
     with_catalog_publication_fault_after,
 };
 use positron_policy::{
