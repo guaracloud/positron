@@ -2,7 +2,7 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 
 use positron_domain::outcome::{DomainFailure, DomainFailureCode};
-use positron_kernel::{LedgerFailure, LedgerFailureCode as Kernel};
+use positron_kernel::{LedgerCompletionState, LedgerFailure, LedgerFailureCode as Kernel};
 
 /// Stable failure class returned at the Log Store interface.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -34,56 +34,48 @@ pub enum LogStoreFailureCode {
 #[derive(Debug)]
 pub struct LogStoreFailure {
     code: LogStoreFailureCode,
+    completion: LedgerCompletionState,
 }
 
 impl LogStoreFailure {
-    pub(super) const fn invalid_input() -> Self {
+    const fn rejected(code: LogStoreFailureCode) -> Self {
         Self {
-            code: LogStoreFailureCode::InvalidInput,
+            code,
+            completion: LedgerCompletionState::RejectedBeforeMutation,
         }
+    }
+
+    pub(super) const fn invalid_input() -> Self {
+        Self::rejected(LogStoreFailureCode::InvalidInput)
     }
 
     pub(super) const fn limit_exceeded() -> Self {
-        Self {
-            code: LogStoreFailureCode::LimitExceeded,
-        }
+        Self::rejected(LogStoreFailureCode::LimitExceeded)
     }
 
     pub(super) const fn malformed_block() -> Self {
-        Self {
-            code: LogStoreFailureCode::MalformedBlock,
-        }
+        Self::rejected(LogStoreFailureCode::MalformedBlock)
     }
 
     pub(super) const fn physical_scope_mismatch() -> Self {
-        Self {
-            code: LogStoreFailureCode::PhysicalScopeMismatch,
-        }
+        Self::rejected(LogStoreFailureCode::PhysicalScopeMismatch)
     }
 
     pub(super) const fn resource_exhausted() -> Self {
-        Self {
-            code: LogStoreFailureCode::ResourceExhausted,
-        }
+        Self::rejected(LogStoreFailureCode::ResourceExhausted)
     }
 
     #[cfg(any(test, fuzzing))]
     pub(super) const fn clock_unavailable() -> Self {
-        Self {
-            code: LogStoreFailureCode::ClockUnavailable,
-        }
+        Self::rejected(LogStoreFailureCode::ClockUnavailable)
     }
 
     pub(super) const fn resource_admission_refused() -> Self {
-        Self {
-            code: LogStoreFailureCode::ResourceAdmissionRefused,
-        }
+        Self::rejected(LogStoreFailureCode::ResourceAdmissionRefused)
     }
 
     pub(super) const fn cancelled() -> Self {
-        Self {
-            code: LogStoreFailureCode::Cancelled,
-        }
+        Self::rejected(LogStoreFailureCode::Cancelled)
     }
 
     pub(super) const fn observation(code: super::ScanObservationFailureCode) -> Self {
@@ -100,24 +92,28 @@ impl LogStoreFailure {
             },
             super::ScanObservationFailureCode::Internal => LogStoreFailureCode::Internal,
         };
-        Self { code }
+        Self::rejected(code)
     }
 
     pub(super) const fn domain(failure: DomainFailure) -> Self {
-        Self {
-            code: classify_domain_failure_code(failure.code()),
-        }
+        Self::rejected(classify_domain_failure_code(failure.code()))
     }
 
     pub(super) fn kernel(failure: LedgerFailure) -> Self {
         Self {
             code: failure.code().into(),
+            completion: failure.completion_state(),
         }
     }
 
     #[must_use]
     pub const fn code(&self) -> LogStoreFailureCode {
         self.code
+    }
+
+    #[must_use]
+    pub const fn completion_state(&self) -> LedgerCompletionState {
+        self.completion
     }
 }
 

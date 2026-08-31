@@ -59,7 +59,7 @@ pub use snapshot_lease_record::{
 };
 pub use snapshot_lease_replace::SnapshotLeaseReplacement;
 use snapshot_protection::SnapshotProtection;
-use state::LedgerState;
+use state::{LedgerState, RetentionReadiness};
 use storage::LedgerStorage;
 #[cfg(feature = "test-support")]
 pub use test_support::publish_snapshot_lease_marker_for_test;
@@ -158,6 +158,14 @@ impl std::fmt::Debug for ActiveSegmentLedger<'_, '_> {
 }
 
 impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
+    fn lease_operation_time(&self, fallback: u64) -> Result<u64, LedgerFailure> {
+        self.retention_time.map_or(Ok(fallback), |authority| {
+            authority
+                .lease_time(self.scope)
+                .map_err(map_retention_time_failure)
+        })
+    }
+
     /// Returns the Data Protection-owned bounded control-token operation.
     #[must_use]
     pub fn control_tokens(&self) -> crate::ControlTokenProtector<'_> {
@@ -285,7 +293,11 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             catalog,
             scope,
             &snapshot,
-            lease_recovery_time,
+            if retention_time.is_some() {
+                snapshot_lease_recovery::LeaseRecoveryClock::Conservative(lease_recovery_time)
+            } else {
+                snapshot_lease_recovery::LeaseRecoveryClock::Strict(lease_recovery_time)
+            },
         )?;
         let snapshot = catalog.pin()?;
         let mut metadata = storage.catalog_segments(&snapshot, scope)?;
@@ -300,6 +312,28 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         let retained_bytes = reconstruction.retained_bytes;
         let frontier = reconstruction.frontier;
         let recovered_active = reconstruction.recovered_active;
+        let retention_readiness = if retention_frontier.is_some() {
+            RetentionReadiness::TrustedPersisted
+        } else if blocks.is_empty() {
+            RetentionReadiness::EmptyUninitialized
+        } else {
+            RetentionReadiness::Unavailable
+        };
+        if let Some(retention_time) = retention_time {
+            let durable = blocks
+                .iter()
+                .filter_map(|block| match block.block_retention {
+                    SegmentRetention::Complete(instant) => Some(instant),
+                    SegmentRetention::Empty | SegmentRetention::Unavailable => None,
+                })
+                .chain(retention_frontier)
+                .max();
+            if let Some(durable) = durable {
+                retention_time
+                    .recover_scope(scope, durable)
+                    .map_err(map_retention_time_failure)?;
+            }
+        }
 
         retained_capacity
             .try_resize_preserving_capacity(retained_claim(retained_bytes, blocks.len())?)
@@ -342,6 +376,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
                 pending_lease_releases: snapshot_lease_pending::PendingLeaseReleases::new(),
                 last_snapshot_lease_time: recovered_leases.last_observed,
                 retention_frontier,
+                retention_readiness,
             }),
             lease_attempts: Arc::new(Mutex::new(
                 snapshot_lease_attempt::LeaseAttemptRegistry::new(),
@@ -385,11 +420,12 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         let ingest_time = retention_time
             .ingest_time(self.scope, state.retention_frontier)
             .map_err(map_retention_time_failure)?;
-        if state.retention_frontier.is_none() {
+        if state.retention_readiness == RetentionReadiness::EmptyUninitialized {
             self.catalog.refresh_state()?;
             let basis = self.catalog.pin()?;
             retention_frontier::publish(self.catalog, &basis, self.scope, ingest_time)?;
             state.retention_frontier = Some(ingest_time);
+            state.retention_readiness = RetentionReadiness::TrustedPersisted;
         }
         Ok(StoreBlockPreparation {
             scope: self.scope,
@@ -452,6 +488,9 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             .state
             .lock()
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
+        if state.retention_readiness == RetentionReadiness::Unavailable {
+            return Err(LedgerFailure::new(LedgerFailureCode::UnsupportedFormat));
+        }
         let catalog_bytes = basis
             .plaintext_objects()
             .try_fold(0_usize, |total, bytes| {

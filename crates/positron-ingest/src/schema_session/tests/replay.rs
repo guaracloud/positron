@@ -2,8 +2,8 @@ use positron_domain::identity::TenantId;
 use positron_domain::routing::{SignalKind, VirtualShardId};
 use positron_domain::value::{AttributeNamespace, CandidateAttributeValue};
 use positron_kernel::{
-    ActiveSegmentLedger, Catalog, CatalogSecret, InstanceId, PreparedStoreBlock,
-    SegmentProtectionKey, SegmentScope, StoreBlockIdentity,
+    ActiveSegmentLedger, Catalog, CatalogSecret, InstanceId, ResourceAmounts, ResourceDimension,
+    SegmentProtectionKey, SegmentScope, StoreBlockIdentity, WorkClaim, WorkKind,
 };
 use positron_policy::IngestPolicy;
 use positron_signals::{LogStore, ScanCancellation, SchemaCatalog, SchemaCheckpointFrontier};
@@ -264,15 +264,30 @@ fn authenticated_malformed_log_block_preserves_its_schema_replay_failure_class()
     .expect("catalog");
     let shard = VirtualShardId::new(310).expect("shard");
     let ledger = ledger(&fixture, &catalog, shard, 0xe0);
-    let scope = SegmentScope::new(fixture.tenant, SignalKind::Logs, shard);
+    let capacity = fixture
+        .authority
+        .governor()
+        .reserve(
+            WorkClaim::tenant(
+                fixture.tenant,
+                WorkKind::Ingest,
+                ResourceAmounts::only(ResourceDimension::MemoryBytes, 1_048_576)
+                    .expect("bounded capacity"),
+            )
+            .expect("ingest claim"),
+        )
+        .expect("ingest capacity");
+    let preparation = ledger
+        .begin_store_block(
+            capacity,
+            StoreBlockIdentity::new([0xe8; 16]).expect("identity"),
+        )
+        .expect("kernel preparation");
     ledger
         .append(
-            PreparedStoreBlock::new(
-                scope,
-                StoreBlockIdentity::new([0xe8; 16]).expect("identity"),
-                b"authenticated-but-not-a-log-store-block".to_vec(),
-            )
-            .expect("bounded malformed block"),
+            preparation
+                .finish(b"authenticated-but-not-a-log-store-block".to_vec())
+                .expect("bounded malformed block"),
         )
         .expect("durably authenticated block");
     let snapshot = ledger.snapshot().expect("snapshot");

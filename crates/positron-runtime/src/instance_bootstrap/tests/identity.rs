@@ -186,8 +186,14 @@ fn query_authorization_generation_ignores_non_security_catalog_churn()
         VirtualShardId::new(1)?,
     );
     let protection = initialized.key.segment_key(initialized.instance, scope)?;
-    let ledger = ActiveSegmentLedger::open(&initialized._authority, &catalog, scope, protection)
-        .map_err(|error| format!("ledger open: {error:?}"))?;
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
+        &initialized._authority,
+        &initialized.retention_time,
+        &catalog,
+        scope,
+        protection,
+    )
+    .map_err(|error| format!("ledger open: {error:?}"))?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let expiry = now.checked_add(100).ok_or("lease expiry overflow")?;
     drop(

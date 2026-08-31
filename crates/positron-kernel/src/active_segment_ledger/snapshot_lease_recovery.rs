@@ -14,12 +14,50 @@ pub(super) struct RecoveredLeases<'kernel> {
     pub(super) last_observed: u64,
 }
 
+#[derive(Clone, Copy)]
+enum LeaseRecoveryObservation {
+    Unavailable,
+    Current(u64),
+    ConservativeFloor(u64),
+}
+
+pub(super) enum LeaseRecoveryClock {
+    Conservative(Option<u64>),
+    Strict(Option<u64>),
+}
+
+impl LeaseRecoveryObservation {
+    fn from_durable(now: Option<u64>, persisted_floor: u64) -> Self {
+        match now {
+            Some(now) if now >= persisted_floor => Self::Current(now),
+            Some(_) if persisted_floor != 0 => Self::ConservativeFloor(persisted_floor),
+            Some(now) => Self::Current(now),
+            None if persisted_floor != 0 => Self::ConservativeFloor(persisted_floor),
+            None => Self::Unavailable,
+        }
+    }
+
+    const fn expiry_time(self) -> Option<u64> {
+        match self {
+            Self::Current(now) => Some(now),
+            Self::Unavailable | Self::ConservativeFloor(_) => None,
+        }
+    }
+
+    const fn last_observed(self) -> u64 {
+        match self {
+            Self::Unavailable => 0,
+            Self::Current(now) | Self::ConservativeFloor(now) => now,
+        }
+    }
+}
+
 pub(super) fn recover_reservations<'kernel>(
     ledger_authority: &'kernel crate::StorageKernelResourceAuthority,
     catalog: &crate::Catalog<'_>,
     scope: SegmentScope,
     snapshot: &crate::CatalogSnapshot,
-    now: Option<u64>,
+    clock: LeaseRecoveryClock,
 ) -> Result<RecoveredLeases<'kernel>, LedgerFailure> {
     let scoped = records(snapshot)?
         .into_iter()
@@ -30,21 +68,30 @@ pub(super) fn recover_reservations<'kernel>(
         .map(|record| record.observed_at)
         .max()
         .unwrap_or(0);
-    if now.is_some_and(|now| now < persisted_last_observed) {
-        return Err(LedgerFailure::new(LedgerFailureCode::InvalidInput));
-    }
-    let expired = now.map_or_else(BTreeSet::new, |now| expired_in_scope(&scoped, scope, now));
+    let now = match clock {
+        LeaseRecoveryClock::Conservative(now) => now,
+        LeaseRecoveryClock::Strict(now) => {
+            if now.is_some_and(|now| now < persisted_last_observed) {
+                return Err(LedgerFailure::new(LedgerFailureCode::InvalidInput));
+            }
+            now
+        },
+    };
+    let observation = LeaseRecoveryObservation::from_durable(now, persisted_last_observed);
+    let expiry_time = observation.expiry_time();
+    let expired =
+        expiry_time.map_or_else(BTreeSet::new, |now| expired_in_scope(&scoped, scope, now));
     let mut active = scoped
         .into_iter()
         .filter(|record| !expired.contains(&record.identity))
         .collect::<Vec<_>>();
     for record in &active {
-        validate_active_lease(record, now.unwrap_or(record.observed_at))?;
+        validate_active_lease(record, expiry_time.unwrap_or(record.observed_at))?;
     }
     if active.len() > MAX_SNAPSHOT_LEASES {
         return Err(LedgerFailure::new(LedgerFailureCode::LimitExceeded));
     }
-    if let Some(now) = now
+    if let Some(now) = expiry_time
         .filter(|now| !expired.is_empty() || active.iter().any(|record| record.observed_at != *now))
     {
         let remove = active
@@ -91,8 +138,10 @@ pub(super) fn recover_reservations<'kernel>(
     Ok(RecoveredLeases {
         reservations: retained,
         resume_markers,
-        last_observed: now
-            .filter(|_| persisted_last_observed != 0)
-            .unwrap_or(persisted_last_observed),
+        last_observed: if persisted_last_observed == 0 {
+            0
+        } else {
+            observation.last_observed()
+        },
     })
 }

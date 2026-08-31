@@ -8,6 +8,13 @@ use super::{
     CommitReceipt, CommittedBlock, LedgerFailure, LedgerFailureCode, MAX_RETAINED_BLOCK_BYTES,
 };
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(super) enum RetentionReadiness {
+    EmptyUninitialized,
+    TrustedPersisted,
+    Unavailable,
+}
+
 pub(super) struct LedgerState<'kernel> {
     pub(super) retained_capacity: ResourceReservation<'kernel>,
     pub(super) frontier: CommitPosition,
@@ -23,6 +30,7 @@ pub(super) struct LedgerState<'kernel> {
     pub(super) pending_lease_releases: super::snapshot_lease_pending::PendingLeaseReleases,
     pub(super) last_snapshot_lease_time: u64,
     pub(super) retention_frontier: Option<crate::IngestTime>,
+    pub(super) retention_readiness: RetentionReadiness,
 }
 
 pub(super) fn receipt_for(block: &CommittedBlock) -> CommitReceipt {

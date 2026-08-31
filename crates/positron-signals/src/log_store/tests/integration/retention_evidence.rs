@@ -14,17 +14,21 @@ fn retention_rejects_a_malformed_signal_block_without_retiring_its_segment()
     let tenant = TenantId::from_bytes([0x41; 16])?;
     let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(15)?);
     let retention_time = RetentionTimeAuthority::establish()?;
-    let ledger = ActiveSegmentLedger::open(
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
         &authority,
+        &retention_time,
         &catalog,
         scope,
         SegmentProtectionKey::from_owned(Box::new([0x5f; 32])),
     )?;
-    ledger.append(PreparedStoreBlock::new(
-        scope,
-        StoreBlockIdentity::new([0x6f; 16])?,
-        vec![0xff],
-    )?)?;
+    ledger.append(
+        ledger
+            .begin_store_block(
+                preparation_capacity(&authority, tenant)?,
+                StoreBlockIdentity::new([0x6f; 16])?,
+            )?
+            .finish(vec![0xff])?,
+    )?;
     ledger.seal()?;
     let active = ActiveSegmentLedger::open_with_retention_time(
         &authority,
@@ -607,13 +611,12 @@ fn partial_physical_reclamation_requires_recovery_and_retries_idempotently()
     std::fs::remove_file(&second_path)?;
     std::fs::create_dir(&second_path)?;
     let baseline = authority.governor().inspect()?;
-    let failure = active
-        .begin_retention(NonZeroU64::new(1).ok_or("duration")?)?
-        .commit()
+    let failure = store
+        .enforce_retention(&active, tenant, LogRetentionPolicy::new(1)?)
         .expect_err("partial physical reclamation cannot be reported as a clean refusal");
-    assert_ne!(
+    assert_eq!(
         failure.completion_state(),
-        LedgerCompletionState::RejectedBeforeMutation
+        LedgerCompletionState::RecoveryRequired
     );
     assert!(active.snapshot()?.blocks().is_empty());
     assert!(!first_path.exists());

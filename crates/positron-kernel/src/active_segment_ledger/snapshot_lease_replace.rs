@@ -204,6 +204,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         now: u64,
         expiry: u64,
     ) -> Result<SnapshotLeaseReplacement<'lease, 'kernel, 'catalog>, LedgerFailure> {
+        let now = self.lease_operation_time(now)?;
         if !super::snapshot_lease_record::valid_lease_interval(now, expiry) {
             return Err(LedgerFailure::new(LedgerFailureCode::InvalidInput));
         }
@@ -212,7 +213,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             .lock()
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
         self.retry_pending_releases(&mut state)?;
-        if now < state.last_snapshot_lease_time {
+        if self.retention_time.is_none() && now < state.last_snapshot_lease_time {
             return Err(LedgerFailure::new(LedgerFailureCode::InvalidInput));
         }
         let now = state.last_snapshot_lease_time.max(now);

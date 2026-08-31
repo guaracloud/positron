@@ -109,6 +109,7 @@ pub(super) fn commit(
         .is_some_and(|durable| durable >= evaluation.frontier)
     {
         state.retention_frontier = Some(evaluation.frontier);
+        state.retention_readiness = super::state::RetentionReadiness::TrustedPersisted;
     }
     publication?;
     let now = evaluation

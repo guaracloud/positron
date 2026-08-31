@@ -113,6 +113,38 @@ impl RetentionTimeAuthority {
         self.destructive_retention
     }
 
+    pub(crate) fn recover_scope(
+        &self,
+        scope: SegmentScope,
+        durable: IngestTime,
+    ) -> Result<(), LifecycleClockFailure> {
+        let elapsed = self.elapsed.nanoseconds()?;
+        let mut scopes = self
+            .scopes
+            .lock()
+            .map_err(|_| LifecycleClockFailure::Unavailable)?;
+        if !scopes.contains_key(&scope) && scopes.len() >= crate::MAX_TENANT_QUOTAS {
+            return Err(LifecycleClockFailure::OutOfRange);
+        }
+        match scopes.get_mut(&scope) {
+            Some(baseline) => {
+                let current = advance(*baseline, elapsed)?;
+                baseline.instant = current.max(durable.instant());
+                baseline.elapsed_at_start = elapsed;
+            },
+            None => {
+                scopes.insert(
+                    scope,
+                    ScopeBaseline {
+                        instant: durable.instant(),
+                        elapsed_at_start: 0,
+                    },
+                );
+            },
+        }
+        Ok(())
+    }
+
     pub(crate) fn ingest_time(
         &self,
         scope: SegmentScope,
@@ -130,12 +162,7 @@ impl RetentionTimeAuthority {
             instant: durable.map_or(self.epoch, IngestTime::instant),
             elapsed_at_start: 0,
         });
-        let advanced = elapsed
-            .checked_sub(baseline.elapsed_at_start)
-            .and_then(|delta| i64::try_from(delta).ok())
-            .and_then(|delta| baseline.instant.value().checked_add(delta))
-            .map(UnixNanoseconds::new)
-            .ok_or(LifecycleClockFailure::OutOfRange)?;
+        let advanced = advance(*baseline, elapsed)?;
         #[cfg(feature = "test-support")]
         if !self.destructive_retention {
             return Ok(IngestTime::from_unretained_test(advanced));
@@ -159,6 +186,27 @@ impl RetentionTimeAuthority {
             .map(Some)
             .ok_or(LifecycleClockFailure::OutOfRange)
     }
+
+    pub(crate) fn lease_time(&self, scope: SegmentScope) -> Result<u64, LifecycleClockFailure> {
+        self.ingest_time(scope, None)?
+            .instant()
+            .value()
+            .checked_div(1_000_000_000)
+            .and_then(|value| u64::try_from(value).ok())
+            .ok_or(LifecycleClockFailure::OutOfRange)
+    }
+}
+
+fn advance(
+    baseline: ScopeBaseline,
+    elapsed: u64,
+) -> Result<UnixNanoseconds, LifecycleClockFailure> {
+    elapsed
+        .checked_sub(baseline.elapsed_at_start)
+        .and_then(|delta| i64::try_from(delta).ok())
+        .and_then(|delta| baseline.instant.value().checked_add(delta))
+        .map(UnixNanoseconds::new)
+        .ok_or(LifecycleClockFailure::OutOfRange)
 }
 
 impl std::fmt::Debug for RetentionTimeAuthority {

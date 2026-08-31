@@ -60,6 +60,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         expiry: u64,
         expected_catalog: Option<CatalogGenerationId>,
     ) -> Result<SnapshotLeaseGrant<'kernel>, LedgerFailure> {
+        now = self.lease_operation_time(now)?;
         if !valid_lease_interval(now, expiry) {
             return Err(LedgerFailure::new(LedgerFailureCode::InvalidInput));
         }
@@ -215,11 +216,17 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         marker: Option<(u64, [u8; 32])>,
         expected_catalog: Option<(CatalogGenerationId, u64)>,
     ) -> Result<SnapshotLeaseGrant<'kernel>, LedgerFailure> {
+        let now = self.lease_operation_time(now)?;
         let mut state = self
             .state
             .lock()
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
         self.retry_pending_releases(&mut state)?;
+        let now = if self.retention_time.is_some() {
+            state.last_snapshot_lease_time.max(now)
+        } else {
+            now
+        };
         reject_time_regression(&state, now)?;
         let mut active_attempt = marker
             .map(|_| SnapshotLeaseAttempt::acquire(&self.lease_attempts, identity, 0))

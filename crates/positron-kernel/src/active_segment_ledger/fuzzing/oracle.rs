@@ -2,9 +2,8 @@ use positron_domain::routing::CommitPosition;
 
 use std::collections::BTreeSet;
 
-use super::super::{
-    ActiveSegmentLedger, CommitReceipt, PreparedStoreBlock, SegmentId, StoreBlockIdentity,
-};
+use super::super::{ActiveSegmentLedger, CommitReceipt, SegmentId, StoreBlockIdentity};
+use crate::StorageKernelResourceAuthority;
 
 pub(super) struct Oracle {
     records: Vec<Record>,
@@ -152,7 +151,11 @@ impl Oracle {
             .extend(retired.intersection(protected).copied());
     }
 
-    pub(super) fn assert_ledger(&self, ledger: &ActiveSegmentLedger<'_, '_>) {
+    pub(super) fn assert_ledger<'authority>(
+        &self,
+        ledger: &ActiveSegmentLedger<'authority, '_>,
+        authority: &'authority StorageKernelResourceAuthority,
+    ) {
         let snapshot = ledger.snapshot().expect("oracle snapshot is available");
         assert_eq!(snapshot.frontier(), self.frontier);
         assert_eq!(snapshot.blocks().len(), self.records.len());
@@ -163,9 +166,12 @@ impl Oracle {
         }
         drop(snapshot);
         for expected in &self.records {
-            let retry =
-                PreparedStoreBlock::new(ledger.scope, expected.identity, expected.payload.clone())
-                    .expect("oracle record remains bounded");
+            let retry = super::prepared_retained(
+                ledger,
+                authority,
+                expected.identity,
+                expected.payload.clone(),
+            );
             assert_eq!(
                 ledger.append(retry).expect("oracle replay succeeds"),
                 expected.receipt

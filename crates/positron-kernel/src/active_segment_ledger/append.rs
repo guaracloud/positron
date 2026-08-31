@@ -39,6 +39,9 @@ impl<'kernel> ActiveSegmentLedger<'kernel, '_> {
         if block.scope != self.scope {
             return Err(LedgerFailure::new(LedgerFailureCode::PhysicalScopeMismatch));
         }
+        if self.retention_time.is_some() && block.retention_ingest_time.is_none() {
+            return Err(LedgerFailure::new(LedgerFailureCode::UnsupportedFormat));
+        }
         if block.preparation_capacity.as_ref().is_some_and(|capacity| {
             !capacity.belongs_to(self.authority.governor())
                 || !capacity.authorizes_ingest_preparation(

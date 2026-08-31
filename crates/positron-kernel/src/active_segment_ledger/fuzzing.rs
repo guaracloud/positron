@@ -109,7 +109,12 @@ pub(super) fn fuzz_active_segment_stateful(data: &[u8]) {
                 ledger = recovered;
                 if fault_commits(event) {
                     let receipt = ledger
-                        .append(prepared(identity, payload.clone()))
+                        .append(prepared_retained(
+                            &ledger,
+                            &authority,
+                            identity,
+                            payload.clone(),
+                        ))
                         .expect("ambiguous successor replays exactly");
                     oracle.record(identity, payload, receipt, elapsed.nanoseconds());
                 }
@@ -133,14 +138,15 @@ pub(super) fn fuzz_active_segment_stateful(data: &[u8]) {
             },
             4 => {
                 if let Some((identity, payload, receipt)) = oracle.first() {
-                    let retry = prepared(identity, payload.to_vec());
+                    let retry = prepared_retained(&ledger, &authority, identity, payload.to_vec());
                     let actual = ledger.append(retry).expect("same identity and bytes retry");
                     assert_eq!(actual, receipt);
                 }
             },
             5 => {
                 if let Some((identity, _, _)) = oracle.first() {
-                    let conflict = prepared(identity, vec![selector, 0xff]);
+                    let conflict =
+                        prepared_retained(&ledger, &authority, identity, vec![selector, 0xff]);
                     assert_eq!(
                         ledger
                             .append(conflict)
@@ -284,14 +290,14 @@ pub(super) fn fuzz_active_segment_stateful(data: &[u8]) {
         if let Some((snapshot, expected)) = &protected_snapshot {
             expected.assert_snapshot(snapshot);
         }
-        oracle.assert_ledger(&ledger);
+        oracle.assert_ledger(&ledger, &authority);
     }
 
     drop(ledger);
     let Some(recovered) = recover_or_stop(&authority, &retention_time, &catalog, scope) else {
         return;
     };
-    oracle.assert_ledger(&recovered);
+    oracle.assert_ledger(&recovered, &authority);
     assert_eq!(
         recovered.snapshot().expect("final frontier").frontier(),
         oracle.frontier()
@@ -312,7 +318,7 @@ fn block_parts(index: usize, selector: u8) -> (StoreBlockIdentity, Vec<u8>) {
 }
 
 fn prepared(identity: StoreBlockIdentity, payload: Vec<u8>) -> PreparedStoreBlock<'static> {
-    PreparedStoreBlock::new(scope(), identity, payload).expect("bounded fuzz replay block")
+    PreparedStoreBlock::new(scope(), identity, payload).expect("bounded non-retention fuzz block")
 }
 
 fn prepared_retained<'capacity>(
