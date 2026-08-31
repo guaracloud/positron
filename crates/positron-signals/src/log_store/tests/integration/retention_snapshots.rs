@@ -1,6 +1,74 @@
 use super::*;
 
 #[test]
+fn snapshot_protects_only_segments_that_are_visible_in_its_reconstruction()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0xc1; 16])?,
+        CatalogSecret::from_owned(Box::new([0xc2; 32]), Box::new([0xc3; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(28)?);
+    let retention_time = RetentionTimeAuthority::establish()?;
+    let key = || SegmentProtectionKey::from_owned(Box::new([0xc4; 32]));
+    let store = LogStore::new();
+    let PolicyEvaluation::Accepted(evaluated) = IngestPolicy::preserving(1)?.evaluate(
+        NativeLogCandidate::new(None, None, None, vec![], LogMetadata::empty()),
+        PolicyReceiver::OtlpGrpc,
+    )?
+    else {
+        return Err("preserving policy rejected the visibility fixture".into());
+    };
+    let sealed = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    sealed.append(
+        store
+            .prepare(
+                sealed.begin_store_block(
+                    preparation_capacity(&authority, tenant)?,
+                    StoreBlockIdentity::new([0xc5; 16])?,
+                )?,
+                vec![LogRecord::checked_evaluated(
+                    ValueLimitProfile::release_1_system_maximum(),
+                    *evaluated,
+                )?],
+            )?
+            .into_store_block(),
+    )?;
+    sealed.seal()?;
+    std::thread::sleep(std::time::Duration::from_millis(1_050));
+    let active = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    let visible = active.snapshot()?;
+    let policy = retention_policy(&catalog, &active, tenant, 1)?;
+    let retired = store.enforce_retention(&active, tenant, policy)?;
+    assert_eq!(retired.expired_segments(), 1);
+    assert_eq!(retired.reclaimed_segments(), 0);
+    let invisible = active.reader()?.snapshot()?;
+    assert!(invisible.blocks().is_empty());
+    drop(visible);
+
+    let reclaimed = store.enforce_retention(&active, tenant, policy)?;
+    assert_eq!(reclaimed.reclaimed_segments(), 1);
+    assert!(invisible.blocks().is_empty());
+    Ok(())
+}
+
+#[test]
 fn retention_keeps_an_existing_snapshot_readable_while_new_snapshots_exclude_it()
 -> Result<(), Box<dyn Error>> {
     let root = TemporaryRoot::new()?;
@@ -81,7 +149,7 @@ fn retention_keeps_an_existing_snapshot_readable_while_new_snapshots_exclude_it(
         .enforce_retention_observed(
             &active,
             tenant,
-            LogRetentionPolicy::new(1)?,
+            retention_policy(&catalog, &active, tenant, 1)?,
             &CancelledRetention,
             &RetentionObserver,
         )
@@ -106,9 +174,14 @@ fn retention_keeps_an_existing_snapshot_readable_while_new_snapshots_exclude_it(
             .checked_div(1_000_000_000)
             .ok_or("snapshot lease seconds")?,
     )?;
-    let lease = active.create_snapshot_lease(lease_now, lease_now + 100)?;
+    let lease = active
+        .create_snapshot_lease_for(lease_now, NonZeroU64::new(100).ok_or("lease duration")?)?;
     let lease_identity = lease.identity();
-    let outcome = store.enforce_retention(&active, tenant, LogRetentionPolicy::new(1)?)?;
+    let outcome = store.enforce_retention(
+        &active,
+        tenant,
+        retention_policy(&catalog, &active, tenant, 1)?,
+    )?;
     assert_eq!(outcome.expired_segments(), 1);
     assert_eq!(outcome.reclaimed_segments(), 0);
     let old_result = store.scan(
@@ -310,7 +383,11 @@ fn retention_keeps_an_existing_snapshot_readable_while_new_snapshots_exclude_it(
         std::fs::read_dir(root.path().join("segments/sealed"))?.collect::<Result<Vec<_>, _>>()?;
     assert!(!sealed_entries.is_empty());
     active.release_snapshot_lease(lease_identity)?;
-    let outcome = store.enforce_retention(&active, tenant, LogRetentionPolicy::new(1)?)?;
+    let outcome = store.enforce_retention(
+        &active,
+        tenant,
+        retention_policy(&catalog, &active, tenant, 1)?,
+    )?;
     assert_eq!(outcome.expired_segments(), 1);
     assert_eq!(outcome.reclaimed_segments(), 2);
     let sealed_entries =

@@ -96,6 +96,9 @@ impl LogStore {
         preparation: positron_kernel::StoreBlockPreparation<'capacity>,
         records: Vec<LogRecord>,
     ) -> Result<PreparedLogBlock<'capacity>, LogStoreFailure> {
+        if preparation.scope().signal_kind() != positron_domain::routing::SignalKind::Logs {
+            return Err(LogStoreFailure::physical_scope_mismatch());
+        }
         if records.is_empty() {
             return Err(LogStoreFailure::invalid_input());
         }

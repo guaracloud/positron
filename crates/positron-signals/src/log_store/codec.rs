@@ -126,11 +126,12 @@ pub(super) fn decode_block(
 
 pub(super) fn validate_retention_block_observed(
     expected_tenant: TenantId,
-    bytes: &[u8],
+    block: &CommittedBlock,
     cancellation: &dyn super::ScanCancellation,
     observer: &dyn super::ScanObserver,
 ) -> Result<(), LogStoreFailure> {
-    BlockDecode::observed(expected_tenant, bytes, cancellation, observer)?.validate(cancellation)
+    BlockDecode::observed(expected_tenant, block.payload(), cancellation, observer)?
+        .validate_for_block(block, cancellation)
 }
 
 pub(super) fn decode_block_cancellable(
@@ -250,15 +251,21 @@ impl<'input> BlockDecode<'input> {
         )
     }
 
-    pub(super) fn validate(
+    fn validate_for_block(
         mut self,
+        block: &CommittedBlock,
         cancellation: &dyn super::ScanCancellation,
     ) -> Result<(), LogStoreFailure> {
         for _ in 0..self.count {
             if cancellation.is_cancelled() {
                 return Err(LogStoreFailure::cancelled());
             }
-            record::validate_structure(&mut self.input, self.limits, self.version)?;
+            record::validate_structure_for_block(
+                &mut self.input,
+                self.limits,
+                self.version,
+                block,
+            )?;
         }
         self.input.finish_component_observation()?;
         if !self.input.is_empty() {
@@ -287,7 +294,7 @@ fn decode_block_records(
         if cancellation.is_cancelled() {
             return Err(LogStoreFailure::cancelled());
         }
-        record::validate_structure_for_block(input, limits, version, block)?;
+        record::validate_structure_for_observation(input, limits, version, block)?;
     }
     let retained_count = count.saturating_sub(skipped_count).min(limit);
     let mut records = bounded_vec(retained_count)?;
@@ -310,7 +317,7 @@ fn decode_block_records(
         if cancellation.is_cancelled() {
             return Err(LogStoreFailure::cancelled());
         }
-        record::validate_structure_for_block(&mut tail, limits, version, block)?;
+        record::validate_structure_for_observation(&mut tail, limits, version, block)?;
     }
     tail.finish_component_observation()?;
     if !tail.is_empty() {

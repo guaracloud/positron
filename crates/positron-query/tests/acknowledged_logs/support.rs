@@ -1005,6 +1005,19 @@ impl KernelFixture {
         Ok(())
     }
 
+    pub fn reopen_ledger_with_retention_time(&mut self) -> Result<(), Box<dyn Error>> {
+        let ledger = self.ledger.take().ok_or("ledger unavailable")?;
+        drop(ledger);
+        self.ledger = Some(ActiveSegmentLedger::open_with_retention_time(
+            self.authority,
+            self.retention_time,
+            self.catalog,
+            SegmentScope::new(self.tenant, SignalKind::Logs, self.shard),
+            SegmentProtectionKey::from_owned(Box::new([0x34; 32])),
+        )?);
+        Ok(())
+    }
+
     pub fn append_log(
         &self,
         body: &str,

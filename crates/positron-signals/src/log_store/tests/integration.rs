@@ -1,17 +1,18 @@
 use std::error::Error;
 use std::num::NonZeroU64;
 
-use positron_domain::identity::TenantId;
+use positron_domain::identity::{PrincipalId, TenantId, TenantSlug};
 use positron_domain::routing::{SignalKind, VirtualShardId};
 use positron_domain::time::UnixNanoseconds;
 use positron_domain::value::{
     AttributeNamespace, CandidateAttributeValue, CandidateKeyValue, ValueLimitProfile,
 };
+use positron_governance::{InitialAuditContext, InitialGovernanceIntent, InitialTenantIntent};
 use positron_kernel::{
-    ActiveSegmentLedger, Catalog, CatalogObject, CatalogProposal, CatalogPublicationFault,
-    CatalogSecret, FixedLifecycleClockSource, FormatEpoch, InstanceId, LedgerCompletionState,
-    LifecycleClock, MountQualification, OrdinaryPool, PreparedStoreBlock, PrimaryDataVolume,
-    RecoveryWorkClaim, RecoveryWorkKind, ResourceAmounts, ResourceDimension,
+    ActiveSegmentLedger, AuditIntent, Catalog, CatalogObject, CatalogProposal,
+    CatalogPublicationFault, CatalogSecret, FixedLifecycleClockSource, FormatEpoch, InstanceId,
+    LedgerCompletionState, LifecycleClock, MountQualification, OrdinaryPool, PreparedStoreBlock,
+    PrimaryDataVolume, RecoveryWorkClaim, RecoveryWorkKind, ResourceAmounts, ResourceDimension,
     RetentionTimeAuthority, SegmentProtectionKey, SegmentScope, StoreBlockIdentity,
     SystemLifecycleClockSource, TransactionId, WorkClaim, WorkClass, WorkKind,
     with_catalog_generation_ambiguity_hook_after, with_catalog_publication_ambiguity_hook_after,
@@ -70,6 +71,69 @@ impl ScanObserver for RejectScannedBytes {
 
 fn retention_clock() -> LifecycleClock<SystemLifecycleClockSource> {
     LifecycleClock::new(SystemLifecycleClockSource)
+}
+
+fn retention_policy(
+    catalog: &Catalog<'_>,
+    ledger: &ActiveSegmentLedger<'_, '_>,
+    tenant: TenantId,
+    seconds: u64,
+) -> Result<LogRetentionPolicy, Box<dyn Error>> {
+    let snapshot = catalog.pin()?;
+    if let Ok(policy) = LogRetentionPolicy::from_catalog(&snapshot) {
+        if policy.retention_seconds() != seconds {
+            return Err("retention fixture policy mismatch".into());
+        }
+        return Ok(policy);
+    }
+    let intent = InitialTenantIntent::new(
+        ledger.catalog_instance().to_bytes(),
+        tenant,
+        TenantSlug::parse_canonical("retention-test")?,
+        "Retention test tenant",
+        PrincipalId::from_bytes([0x11; 16])?,
+        [0x21; 32],
+        [0x22; 32],
+        PrincipalId::from_bytes([0x12; 16])?,
+        [0x23; 32],
+        [0x24; 32],
+        PrincipalId::from_bytes([0x13; 16])?,
+        [0x25; 32],
+        [0x26; 32],
+        [0x27; 32],
+        [0x28; 32],
+        vec![0x29],
+        vec![0x2a],
+        seconds,
+        1,
+        1,
+        [1; 11],
+        InitialAuditContext::new(1, [0x2b; 16], true)?,
+    )?;
+    let (governance, audit) = InitialGovernanceIntent::create_tenant(intent)?.into_parts();
+    let mut objects = snapshot
+        .object_identities()
+        .map(|identity| {
+            CatalogObject::new(
+                snapshot
+                    .object(identity)?
+                    .ok_or("Catalog fixture object disappeared")?
+                    .to_vec(),
+            )
+            .map_err(Into::into)
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    objects.push(CatalogObject::new(governance)?);
+    let committed = catalog.commit(
+        snapshot.identity(),
+        CatalogProposal::new(
+            TransactionId::new([0x2c; 16])?,
+            FormatEpoch::CATALOG_V1,
+            objects,
+        )?,
+        Some(AuditIntent::new(audit)?),
+    )?;
+    LogRetentionPolicy::from_catalog(committed.snapshot()).map_err(Into::into)
 }
 
 fn query_capacity_blocker_leaving<'kernel>(

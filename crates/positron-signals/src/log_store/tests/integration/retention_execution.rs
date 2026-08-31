@@ -140,12 +140,13 @@ fn restart_preserves_each_block_ingest_time_and_uses_the_segment_max_for_retenti
     assert_eq!(scanned.records().len(), 2);
     assert_eq!(scanned.records()[0].ingest_time(), first_ingest_time);
     assert_eq!(scanned.records()[1].ingest_time(), second_ingest_time);
-    let still_fresh = store.enforce_retention(&reopened, tenant, LogRetentionPolicy::new(1)?)?;
+    let policy = retention_policy(&catalog, &reopened, tenant, 1)?;
+    let still_fresh = store.enforce_retention(&reopened, tenant, policy)?;
     assert_eq!(still_fresh.expired_segments(), 0);
     assert_eq!(reopened.snapshot()?.blocks().len(), 2);
 
     std::thread::sleep(std::time::Duration::from_millis(1_050));
-    let expired = store.enforce_retention(&reopened, tenant, LogRetentionPolicy::new(1)?)?;
+    let expired = store.enforce_retention(&reopened, tenant, policy)?;
     assert_eq!(expired.expired_segments(), 1);
     assert!(reopened.snapshot()?.blocks().is_empty());
     Ok(())
@@ -267,7 +268,7 @@ fn expired_sealed_logs_are_removed_by_kernel_ingest_time_only() -> Result<(), Bo
             .enforce_retention_observed(
                 &active,
                 tenant,
-                LogRetentionPolicy::new(1)?,
+                retention_policy(&catalog, &active, tenant, 1)?,
                 &NeverCancelledRetention,
                 &RejectScannedBytes(observation),
             )
@@ -291,7 +292,11 @@ fn expired_sealed_logs_are_removed_by_kernel_ingest_time_only() -> Result<(), Bo
     }
     assert!(!held_recovery.is_empty());
     let public_refusal = store
-        .enforce_retention(&active, tenant, LogRetentionPolicy::new(1)?)
+        .enforce_retention(
+            &active,
+            tenant,
+            retention_policy(&catalog, &active, tenant, 1)?,
+        )
         .expect_err("public retention must preserve kernel recovery refusal");
     assert_eq!(
         public_refusal.code(),
@@ -308,7 +313,11 @@ fn expired_sealed_logs_are_removed_by_kernel_ingest_time_only() -> Result<(), Bo
     );
     assert_eq!(active.snapshot()?.blocks().len(), 3);
 
-    let outcome = store.enforce_retention(&active, tenant, LogRetentionPolicy::new(1)?)?;
+    let outcome = store.enforce_retention(
+        &active,
+        tenant,
+        retention_policy(&catalog, &active, tenant, 1)?,
+    )?;
     assert!(outcome.evaluated_at().value() > 0);
     assert_eq!(outcome.expired_segments(), 1);
     assert_eq!(outcome.reclaimed_segments(), 1);

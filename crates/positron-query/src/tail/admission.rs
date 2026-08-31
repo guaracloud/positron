@@ -63,6 +63,10 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         if now >= expiry {
             return Err(QueryFailure::new(QueryFailureCode::SnapshotExpired));
         }
+        let lease_ttl = expiry
+            .checked_sub(now)
+            .and_then(std::num::NonZeroU64::new)
+            .ok_or_else(|| QueryFailure::new(QueryFailureCode::SnapshotExpired))?;
         if let TailStart::Historical { max_rows } = start
             && (max_rows == 0 || max_rows > super::MAX_TAIL_BATCH_ROWS)
         {
@@ -101,7 +105,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         } else {
             let lease = self
                 .ledger
-                .create_snapshot_lease_at_catalog(now, expiry, catalog_identity)
+                .create_snapshot_lease_for_at_catalog(now, lease_ttl, catalog_identity)
                 .map_err(crate::execution_support::map_ledger_failure)?;
             let owner = TailLeaseOwner::new(self.ledger, lease.identity());
             (lease, owner)
@@ -126,7 +130,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                     .lease_authority()
                     .ok_or_else(|| QueryFailure::new(QueryFailureCode::StoreUnavailable))?;
                 let source_lease = authority
-                    .create_snapshot_lease(now, expiry)
+                    .create_snapshot_lease_for(now, lease_ttl)
                     .map_err(crate::execution_support::map_ledger_failure)?;
                 (authority, Some(source_lease))
             };

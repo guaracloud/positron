@@ -4,8 +4,8 @@ use super::capacity::retained_claim;
 use super::format::SegmentState;
 use super::publication::{publish_exact_scope_segments, publish_segments_with_frontier};
 use super::{
-    ActiveSegmentLedger, LedgerFailure, LedgerFailureCode, RetentionEvaluation,
-    RetentionReclamation, SegmentRetention,
+    ActiveSegmentLedger, LedgerCompletionState, LedgerFailure, LedgerFailureCode,
+    RetentionEvaluation, RetentionReclamation, SegmentRetention,
 };
 
 pub(super) fn commit(
@@ -18,7 +18,11 @@ pub(super) fn commit(
         .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
     ledger.catalog.refresh_state()?;
     let basis = ledger.catalog.pin()?;
-    if basis.identity() != evaluation.catalog_identity {
+    if let Some(identity) = evaluation.policy_object {
+        if basis.object(identity)?.is_none() {
+            return Err(LedgerFailure::new(LedgerFailureCode::StaleGeneration));
+        }
+    } else if basis.identity() != evaluation.catalog_identity {
         return Err(LedgerFailure::new(LedgerFailureCode::StaleGeneration));
     }
     if state.blocks != evaluation.blocks {
@@ -72,17 +76,33 @@ pub(super) fn commit(
         candidate.state = SegmentState::Retired;
         newly_retired.insert(candidate.id);
     }
-    let publication = publish_segments_with_frontier(
+    let now = evaluation
+        .frontier
+        .instant()
+        .value()
+        .checked_div(1_000_000_000)
+        .and_then(|value| u64::try_from(value).ok())
+        .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+    let latest = match publish_segments_with_frontier(
         ledger.catalog,
         &basis,
         &ledger.storage,
         ledger.scope,
         &metadata,
         evaluation.frontier,
-    );
-    ledger.catalog.refresh_state()?;
-    let latest = ledger.catalog.pin()?;
-    let latest_metadata = ledger.storage.catalog_segments(&latest, ledger.scope)?;
+    ) {
+        Ok(latest) => latest,
+        Err(failure) => {
+            if failure.completion_state() != super::LedgerCompletionState::RejectedBeforeMutation {
+                state.poisoned = true;
+            }
+            return Err(failure);
+        },
+    };
+    let latest_metadata = ledger
+        .storage
+        .catalog_segments(&latest, ledger.scope)
+        .map_err(|failure| poison_after_commit(&mut state, failure))?;
     let retired = latest_metadata
         .iter()
         .filter(|candidate| candidate.state == SegmentState::Retired)
@@ -98,33 +118,50 @@ pub(super) fn commit(
             .try_fold(0_usize, |total, block| {
                 total.checked_add(block.payload.len())
             })
-            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
-        let remaining_capacity = retained_claim(state.retained_bytes, state.blocks.len())?;
-        state
+            .ok_or_else(|| {
+                poison_after_commit(
+                    &mut state,
+                    LedgerFailure::new(LedgerFailureCode::LimitExceeded),
+                )
+            })?;
+        let remaining_capacity = retained_claim(state.retained_bytes, state.blocks.len())
+            .map_err(|failure| poison_after_commit(&mut state, failure))?;
+        if state
             .retained_capacity
             .try_resize_preserving_capacity(remaining_capacity)
-            .map_err(|_| LedgerFailure::new(LedgerFailureCode::RecoveryRequired))?;
+            .is_err()
+        {
+            state.poisoned = true;
+            return Err(LedgerFailure::post_mutation(
+                LedgerFailureCode::RecoveryRequired,
+            ));
+        }
     }
-    if super::retention_frontier::recover(&latest, ledger.scope)?
-        .is_some_and(|durable| durable >= evaluation.frontier)
-    {
-        state.retention_frontier = Some(evaluation.frontier);
-        state.retention_readiness = super::state::RetentionReadiness::TrustedPersisted;
-    }
-    publication?;
-    let now = evaluation
-        .frontier
-        .instant()
-        .value()
-        .checked_div(1_000_000_000)
-        .and_then(|value| u64::try_from(value).ok())
-        .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
-    let physically_reclaimed_segments = reclaim_retired_segments(ledger, now)?;
+    state.retention_frontier = Some(evaluation.frontier);
+    state.retention_readiness = super::state::RetentionReadiness::TrustedPersisted;
+    let physically_reclaimed_segments = match reclaim_retired_segments(ledger, now) {
+        Ok(reclaimed) => reclaimed,
+        Err(failure) => {
+            return Err(poison_after_commit(&mut state, failure));
+        },
+    };
     Ok(RetentionReclamation {
         logically_retired_segments: newly_retired.len(),
         physically_reclaimed_segments,
         evaluated_at: evaluation.frontier.instant(),
     })
+}
+
+fn poison_after_commit(
+    state: &mut super::state::LedgerState,
+    failure: LedgerFailure,
+) -> LedgerFailure {
+    state.poisoned = true;
+    if failure.completion_state() == LedgerCompletionState::RejectedBeforeMutation {
+        LedgerFailure::post_mutation(failure.code())
+    } else {
+        failure
+    }
 }
 
 fn reclaim_retired_segments(

@@ -56,7 +56,11 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         // immutable lease snapshot is constructed.
         let lease = self
             .ledger
-            .create_snapshot_lease_at_catalog(now, expiry, catalog_identity)
+            .create_snapshot_lease_for_at_catalog(
+                now,
+                remaining_ttl(now, expiry)?,
+                catalog_identity,
+            )
             .map_err(map_ledger_failure)?;
         let (state, reservation) =
             initial_state(query, lease.snapshot(), tenant, expiry, lease.identity());
@@ -93,7 +97,11 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         // immutable lease snapshot is constructed.
         let lease = self
             .ledger
-            .create_snapshot_lease_at_catalog(now_seconds, expiry, catalog_identity)
+            .create_snapshot_lease_for_at_catalog(
+                now_seconds,
+                remaining_ttl(now_seconds, expiry)?,
+                catalog_identity,
+            )
             .map_err(map_ledger_failure)?;
         let (state, reservation) =
             initial_state(query, lease.snapshot(), tenant, expiry, lease.identity());
@@ -216,7 +224,6 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         if lease.snapshot().catalog_identity().to_bytes() != state.catalog_identity
             || lease.snapshot().catalog_generation() != state.catalog_generation
             || lease.snapshot().frontier().value() != state.frontier
-            || lease.expiry() != state.expiry
         {
             return Err(resources.fail_before_stream(
                 self.ledger,
@@ -279,4 +286,11 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         }
         Ok(now)
     }
+}
+
+fn remaining_ttl(now: u64, expiry: u64) -> Result<std::num::NonZeroU64, QueryFailure> {
+    expiry
+        .checked_sub(now)
+        .and_then(std::num::NonZeroU64::new)
+        .ok_or_else(|| QueryFailure::new(QueryFailureCode::SnapshotExpired))
 }

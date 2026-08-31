@@ -987,6 +987,7 @@ name = "positron-signals"
 version = "0.0.0"
 dependencies = [
  "positron-domain",
+ "positron-governance",
  "positron-kernel",
  "positron-policy",
  "sha2",

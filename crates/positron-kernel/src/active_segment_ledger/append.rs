@@ -70,9 +70,7 @@ impl<'kernel> ActiveSegmentLedger<'kernel, '_> {
         if cancellation.is_some_and(AppendCancellation::is_cancelled) {
             return Err(LedgerFailure::new(LedgerFailureCode::Cancelled));
         }
-        if state.poisoned {
-            return Err(LedgerFailure::new(LedgerFailureCode::RecoveryRequired));
-        }
+        state.require_healthy()?;
         let amounts = append_claim(block.payload.len())?;
         let ordinary_claim = WorkClaim::tenant(self.scope.tenant, WorkKind::Ingest, amounts)
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;

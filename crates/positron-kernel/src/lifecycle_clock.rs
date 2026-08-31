@@ -26,8 +26,7 @@ impl IngestTime {
         }
     }
 
-    #[cfg(feature = "test-support")]
-    pub(crate) const fn from_unretained_test(instant: UnixNanoseconds) -> Self {
+    pub(crate) const fn from_unretained_observation(instant: UnixNanoseconds) -> Self {
         Self {
             instant,
             retention_authenticated: false,

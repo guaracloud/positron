@@ -37,7 +37,7 @@ pub(super) fn publish_segments(
     storage: &LedgerStorage,
     scope: SegmentScope,
     metadata: &[SegmentMetadata],
-) -> Result<(), LedgerFailure> {
+) -> Result<crate::CatalogSnapshot, LedgerFailure> {
     publish_scope(catalog, basis, storage, scope, metadata, None, false)
 }
 
@@ -47,7 +47,7 @@ pub(super) fn publish_exact_scope_segments(
     storage: &LedgerStorage,
     scope: SegmentScope,
     metadata: &[SegmentMetadata],
-) -> Result<(), LedgerFailure> {
+) -> Result<crate::CatalogSnapshot, LedgerFailure> {
     publish_scope(catalog, basis, storage, scope, metadata, None, true)
 }
 
@@ -58,7 +58,7 @@ pub(super) fn publish_segments_with_frontier(
     scope: SegmentScope,
     metadata: &[SegmentMetadata],
     frontier: IngestTime,
-) -> Result<(), LedgerFailure> {
+) -> Result<crate::CatalogSnapshot, LedgerFailure> {
     publish_scope(
         catalog,
         basis,
@@ -78,7 +78,7 @@ fn publish_scope(
     metadata: &[SegmentMetadata],
     frontier: Option<IngestTime>,
     exact_scope: bool,
-) -> Result<(), LedgerFailure> {
+) -> Result<crate::CatalogSnapshot, LedgerFailure> {
     let mut objects = Vec::new();
     objects
         .try_reserve_exact(
@@ -124,7 +124,7 @@ fn publish_scope(
         None,
     );
     match publication {
-        Ok(_) => Ok(()),
+        Ok(commit) => Ok(commit.snapshot().clone()),
         Err(failure) => {
             // A generation marker rename may have made the proposal durable
             // before its directory synchronization reported failure. Reconcile
@@ -133,8 +133,15 @@ fn publish_scope(
             if failure.code() != CatalogFailureCode::StorageUnavailable {
                 return Err(failure.into());
             }
-            catalog.refresh_state()?;
-            let snapshot = catalog.pin()?;
+            catalog
+                .refresh_state()
+                .map_err(|failure| LedgerFailure::ambiguous(LedgerFailure::from(failure).code()))?;
+            let snapshot = catalog
+                .pin()
+                .map_err(|failure| LedgerFailure::ambiguous(LedgerFailure::from(failure).code()))?;
+            if snapshot.identity() == basis.identity() {
+                return Err(failure.into());
+            }
             let segments = storage.catalog_segments(&snapshot, scope)?;
             let segments_subsume = metadata.iter().all(|expected| segments.contains(expected))
                 && (!exact_scope || segments.len() == metadata.len());
@@ -144,9 +151,9 @@ fn publish_scope(
                 None => true,
             };
             if snapshot.number() > basis.number() && segments_subsume && frontier_subsumed {
-                Ok(())
+                Ok(snapshot)
             } else {
-                Err(LedgerFailure::new(LedgerFailureCode::StaleGeneration))
+                Err(LedgerFailure::ambiguous(LedgerFailureCode::StaleGeneration))
             }
         },
     }

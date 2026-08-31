@@ -165,7 +165,7 @@ impl RetentionTimeAuthority {
         let advanced = advance(*baseline, elapsed)?;
         #[cfg(feature = "test-support")]
         if !self.destructive_retention {
-            return Ok(IngestTime::from_unretained_test(advanced));
+            return Ok(IngestTime::from_unretained_observation(advanced));
         }
         Ok(IngestTime::from_authenticated_durable(advanced))
     }

@@ -75,7 +75,8 @@ pub(crate) fn decode_initial_identity(encoded: &[u8]) -> Result<Identity, Identi
     require_nonzero(cursor.take_array::<32>()?)?;
     cursor.skip_u16_bytes()?;
     cursor.skip_u16_bytes()?;
-    if cursor.take_u64()? == 0 || cursor.take_u64()? == 0 || cursor.take_u32()? == 0 {
+    let retention_seconds = cursor.take_u64()?;
+    if retention_seconds == 0 || cursor.take_u64()? == 0 || cursor.take_u32()? == 0 {
         return Err(IdentityFailure);
     }
     for _ in 0..11 {
@@ -105,6 +106,7 @@ pub(crate) fn decode_initial_identity(encoded: &[u8]) -> Result<Identity, Identi
         ingest,
         query,
         lifecycle,
+        retention_seconds,
     })
 }
 

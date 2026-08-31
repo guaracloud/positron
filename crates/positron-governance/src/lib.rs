@@ -22,7 +22,7 @@ pub use audit::{
 };
 pub use identity::{
     AttributionFailure, AuthorizedContext, CompatibilityHints, GovernanceInspection, Identity,
-    IdentityFailure, PresentedCredential, RequestedIntent,
+    IdentityFailure, PresentedCredential, RequestedIntent, RetentionPolicySnapshot,
 };
 pub use policy_administration::{
     AdministrativeIdempotencyKey, IngestPolicyActivation, IngestPolicyAdministration,

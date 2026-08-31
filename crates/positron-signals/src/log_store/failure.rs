@@ -61,6 +61,10 @@ impl LogStoreFailure {
         Self::rejected(LogStoreFailureCode::PhysicalScopeMismatch)
     }
 
+    pub(super) const fn corrupt_policy() -> Self {
+        Self::rejected(LogStoreFailureCode::IntegrityCorruption)
+    }
+
     pub(super) const fn resource_exhausted() -> Self {
         Self::rejected(LogStoreFailureCode::ResourceExhausted)
     }

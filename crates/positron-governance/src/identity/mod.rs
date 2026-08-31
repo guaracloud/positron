@@ -16,7 +16,7 @@ use std::fmt::Formatter;
 
 use positron_domain::identity::{PrincipalId, Scope, TenantAttribution, TenantId, TenantSlug};
 use positron_domain::lifecycle::TenantLifecycleState;
-use positron_kernel::{BootstrapKeyCustody, CatalogSnapshot};
+use positron_kernel::{BootstrapKeyCustody, CatalogObjectId, CatalogSnapshot};
 
 use crate::GovernanceAuditEntry;
 
@@ -52,6 +52,18 @@ pub struct Identity {
     ingest: Option<IngestIdentity>,
     query: Option<QueryIdentity>,
     lifecycle: TenantLifecycleState,
+    retention_seconds: u64,
+}
+
+/// Immutable tenant Log-retention policy authenticated by one governance
+/// object in a pinned Catalog lineage.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetentionPolicySnapshot {
+    instance: [u8; 16],
+    tenant: TenantId,
+    signal: positron_domain::routing::SignalKind,
+    retention_seconds: std::num::NonZeroU64,
+    governance_object: CatalogObjectId,
 }
 
 impl Identity {
@@ -73,6 +85,12 @@ impl Identity {
 
     /// Reconstructs the unique initialization identity from a pinned Catalog.
     pub fn open(snapshot: &CatalogSnapshot) -> Result<Self, IdentityFailure> {
+        Self::open_with_object(snapshot).map(|(identity, _)| identity)
+    }
+
+    fn open_with_object(
+        snapshot: &CatalogSnapshot,
+    ) -> Result<(Self, CatalogObjectId), IdentityFailure> {
         let mut identity = None;
         for object_id in snapshot.object_identities() {
             let object = snapshot
@@ -101,7 +119,7 @@ impl Identity {
                 .map(u64::from_be_bytes)
                 .unwrap_or(1)
                 .max(1);
-            identity = Some(decoded);
+            identity = Some((decoded, object_id));
         }
         identity.ok_or(IdentityFailure)
     }
@@ -267,6 +285,59 @@ impl Identity {
             &self.tenant_slug,
             audit,
         ))
+    }
+}
+
+impl RetentionPolicySnapshot {
+    /// Reconstructs the configured Log retention from the authenticated
+    /// governance object without accepting a caller-selected duration.
+    pub fn open(snapshot: &CatalogSnapshot) -> Result<Self, IdentityFailure> {
+        let (identity, governance_object) = Identity::open_with_object(snapshot)?;
+        let retention_seconds =
+            std::num::NonZeroU64::new(identity.retention_seconds).ok_or(IdentityFailure)?;
+        Ok(Self {
+            instance: identity.instance,
+            tenant: identity.tenant,
+            signal: positron_domain::routing::SignalKind::Logs,
+            retention_seconds,
+            governance_object,
+        })
+    }
+
+    /// Verifies that this exact immutable policy object remains current while
+    /// allowing unrelated Catalog generations to advance.
+    pub fn validate_current(&self, snapshot: &CatalogSnapshot) -> Result<(), IdentityFailure> {
+        let current = Self::open(snapshot)?;
+        if current == *self {
+            Ok(())
+        } else {
+            Err(IdentityFailure)
+        }
+    }
+
+    #[must_use]
+    pub const fn instance(&self) -> [u8; 16] {
+        self.instance
+    }
+
+    #[must_use]
+    pub const fn tenant(&self) -> TenantId {
+        self.tenant
+    }
+
+    #[must_use]
+    pub const fn signal_kind(&self) -> positron_domain::routing::SignalKind {
+        self.signal
+    }
+
+    #[must_use]
+    pub const fn retention_seconds(&self) -> std::num::NonZeroU64 {
+        self.retention_seconds
+    }
+
+    #[must_use]
+    pub const fn governance_object(&self) -> CatalogObjectId {
+        self.governance_object
     }
 }
 

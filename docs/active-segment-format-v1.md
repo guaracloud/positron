@@ -136,14 +136,14 @@ result must exactly match the authenticated Durability Frontier aggregate.
 
 ## Durability Frontier
 
-Format v3 writes frontier schema version 2 and encrypts the metadata as one
-independent frame:
+Format v3 writes frontier envelope version 1, carries the active-segment format
+version explicitly, and encrypts the metadata as one independent frame:
 
 | Bytes | Field | Value or limit |
 | ---: | --- | --- |
 | 8 | magic | ASCII `PFRONT02` |
-| 2 | version | `1` |
-| 2 | frame algorithm | `1`, AES-256-GCM |
+| 2 | frontier envelope version | `1` |
+| 2 | active-segment format version | `3` |
 | 4 | encrypted-frame length | at most 512 |
 | variable | encrypted frontier frame | v3 plaintext is `durable_bytes:u64 || next_sequence:u64 || commit_position:u64 || retention_tag:u8 || maximum_ingest_time:i64` |
 

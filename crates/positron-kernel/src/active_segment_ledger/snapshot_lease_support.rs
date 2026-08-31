@@ -261,13 +261,6 @@ fn blocks_for_record<'kernel>(
         if exact {
             continue;
         }
-        if state
-            .blocks
-            .iter()
-            .any(|actual| actual.segment == expected.segment)
-        {
-            return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
-        }
         missing_segments.insert(expected.segment);
     }
 

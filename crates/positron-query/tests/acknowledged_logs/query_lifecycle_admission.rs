@@ -50,6 +50,31 @@ fn snapshot_lease_admission_rejects_a_catalog_generation_changed_after_validatio
 }
 
 #[test]
+fn restarted_log_lease_uses_retention_time_while_query_budget_uses_query_clock()
+-> Result<(), Box<dyn Error>> {
+    let mut fixture = QueryFixture::new("query-retention-lease-domain")?;
+    fixture.kernel.reopen_ledger_with_retention_time()?;
+    let service = QueryService::with_clock(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+        TestClock::shared(2_000_000_000),
+    );
+    let query = service.plan_pipeline(
+        fixture.context,
+        "logs | range query_time -100 100 | limit 1",
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?,
+    )?;
+
+    let events = service.execute_page(query)?.collect::<Vec<_>>();
+    assert!(matches!(
+        events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Complete(_)))
+    ));
+    Ok(())
+}
+
+#[test]
 fn resume_rejects_a_lifecycle_transition_at_marker_admission() -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("resume-lifecycle-admission")?;
     fixture.kernel.append_log("first", 20, 1)?;

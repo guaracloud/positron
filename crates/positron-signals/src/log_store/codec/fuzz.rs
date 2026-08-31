@@ -8,6 +8,17 @@ pub(in crate::log_store) fn fuzz_decode_block(
 ) -> Result<(), LogStoreFailure> {
     let cancellation = super::super::scan::NeverCancelled;
     let observer = super::super::scan::Unobserved;
-    super::BlockDecode::observed(expected_tenant, bytes, &cancellation, &observer)?
-        .validate(&cancellation)
+    let mut decoder =
+        super::BlockDecode::observed(expected_tenant, bytes, &cancellation, &observer)?;
+    let version = decoder.version;
+    let limits = decoder.limits;
+    for _ in 0..decoder.record_count() {
+        super::record::validate_structure(&mut decoder.input, limits, version)?;
+    }
+    decoder.input.finish_component_observation()?;
+    if decoder.input.is_empty() {
+        Ok(())
+    } else {
+        Err(LogStoreFailure::malformed_block())
+    }
 }

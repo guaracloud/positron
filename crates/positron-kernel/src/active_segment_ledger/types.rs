@@ -350,17 +350,20 @@ impl CommittedBlock {
         }
     }
 
-    /// Reconstructs time only for explicitly retention-unavailable test blocks.
-    #[cfg(feature = "test-support")]
-    #[doc(hidden)]
-    pub fn reconstruct_unretained_ingest_time_for_test(
+    /// Observes a record time through this block's format evidence without
+    /// granting legacy data retention authority.
+    pub fn observe_ingest_time(
         &self,
         encoded: UnixNanoseconds,
     ) -> Result<IngestTime, LedgerFailure> {
         match self.block_retention {
-            SegmentRetention::Unavailable => Ok(IngestTime::from_unretained_test(encoded)),
-            SegmentRetention::Empty | SegmentRetention::Complete(_) => {
-                Err(LedgerFailure::new(LedgerFailureCode::InvalidInput))
+            SegmentRetention::Complete(expected) if expected.instant() == encoded => Ok(expected),
+            SegmentRetention::Complete(_) => {
+                Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))
+            },
+            SegmentRetention::Unavailable => Ok(IngestTime::from_unretained_observation(encoded)),
+            SegmentRetention::Empty => {
+                Err(LedgerFailure::new(LedgerFailureCode::UnsupportedFormat))
             },
         }
     }

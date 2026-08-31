@@ -1,17 +1,22 @@
 use std::error::Error;
+use std::fs;
 use std::num::NonZeroU64;
+use std::path::Path;
 
 use positron_domain::identity::TenantId;
-use positron_domain::routing::{SignalKind, VirtualShardId};
+use positron_domain::routing::{CommitPosition, SignalKind, VirtualShardId};
 use positron_domain::time::UnixNanoseconds;
 
 use super::support::{TemporaryRoot, establish_authority};
+use crate::active_segment_ledger::format::decode_header;
+use crate::active_segment_ledger::object_context;
+use crate::data_protection::{DataProtection, FrameLimits, FrameSequence, SegmentFramePurpose};
 use crate::retention_time::RetentionTimeAuthority;
 use crate::{
     ActiveSegmentLedger, Catalog, CatalogObject, CatalogProposal, CatalogSecret, FormatEpoch,
     InstanceId, LedgerCompletionState, LedgerFailureCode, MountQualification, PreparedStoreBlock,
-    PrimaryDataVolume, ResourceAmounts, ResourceDimension, SegmentProtectionKey, SegmentScope,
-    StoreBlockIdentity, TransactionId, WorkClaim, WorkKind,
+    PrimaryDataVolume, ResourceAmounts, ResourceDimension, SegmentId, SegmentProtectionKey,
+    SegmentScope, StoreBlockIdentity, TransactionId, WorkClaim, WorkKind,
 };
 #[cfg(feature = "test-support")]
 use crate::{
@@ -81,6 +86,474 @@ fn recovered_frontier_ignores_restart_wall_and_advances_only_by_new_monotonic_el
         second_ingest.instant().value() + 1_000_000_000
     );
     assert_eq!(catalog.pin()?.number(), persisted_frontier_generation);
+    Ok(())
+}
+
+#[test]
+fn retention_policy_evidence_is_required_at_admission_and_commit() -> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0xb1; 16])?,
+        CatalogSecret::from_owned(Box::new([0xb2; 32]), Box::new([0xb3; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x64; 16])?;
+    let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(19)?);
+    let (retention_time, _) =
+        RetentionTimeAuthority::establish_with_manual_elapsed(UnixNanoseconds::new(2_000_000_000));
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        SegmentProtectionKey::from_owned(Box::new([0xb4; 32])),
+    )?;
+    let policy = CatalogObject::new(b"authenticated retention policy".to_vec())?;
+    let policy_identity = policy.identity();
+    let basis = catalog.pin()?;
+    let mut objects = basis
+        .plaintext_objects()
+        .map(|bytes| CatalogObject::new(bytes.to_vec()))
+        .collect::<Result<Vec<_>, _>>()?;
+    objects.push(policy);
+    catalog.commit(
+        basis.identity(),
+        CatalogProposal::new(
+            TransactionId::new([0xb5; 16])?,
+            FormatEpoch::CATALOG_V1,
+            objects,
+        )?,
+        None,
+    )?;
+
+    let basis = catalog.pin()?;
+    let objects = basis
+        .object_identities()
+        .filter(|identity| *identity != policy_identity)
+        .map(|identity| {
+            CatalogObject::new(
+                basis
+                    .object(identity)?
+                    .ok_or_else(|| "Catalog policy fixture disappeared".to_owned())?
+                    .to_vec(),
+            )
+            .map_err(Into::into)
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    catalog.commit(
+        basis.identity(),
+        CatalogProposal::new(
+            TransactionId::new([0xb6; 16])?,
+            FormatEpoch::CATALOG_V1,
+            objects,
+        )?,
+        None,
+    )?;
+    let missing_generation = catalog.pin()?.identity();
+    let baseline = authority.governor().inspect()?;
+    let missing = match ledger
+        .begin_retention_with_policy(NonZeroU64::new(1).ok_or("duration")?, policy_identity)
+    {
+        Ok(_) => return Err("missing policy evidence admitted retention".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(missing.code(), LedgerFailureCode::StaleGeneration);
+    assert_eq!(catalog.pin()?.identity(), missing_generation);
+    let after_missing = authority.governor().inspect()?;
+    assert_eq!(
+        after_missing.outstanding_total(),
+        baseline.outstanding_total()
+    );
+    for dimension in ResourceDimension::ALL {
+        assert_eq!(after_missing.usage(dimension), baseline.usage(dimension));
+    }
+
+    let basis = catalog.pin()?;
+    let mut objects = basis
+        .plaintext_objects()
+        .map(|bytes| CatalogObject::new(bytes.to_vec()))
+        .collect::<Result<Vec<_>, _>>()?;
+    objects.push(CatalogObject::new(
+        b"authenticated retention policy".to_vec(),
+    )?);
+    catalog.commit(
+        basis.identity(),
+        CatalogProposal::new(
+            TransactionId::new([0xb7; 16])?,
+            FormatEpoch::CATALOG_V1,
+            objects,
+        )?,
+        None,
+    )?;
+    let evaluation = ledger
+        .begin_retention_with_policy(NonZeroU64::new(1).ok_or("duration")?, policy_identity)?;
+    let basis = catalog.pin()?;
+    let objects = basis
+        .object_identities()
+        .filter(|identity| *identity != policy_identity)
+        .map(|identity| {
+            CatalogObject::new(
+                basis
+                    .object(identity)?
+                    .ok_or_else(|| "Catalog policy fixture disappeared".to_owned())?
+                    .to_vec(),
+            )
+            .map_err(Into::into)
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    catalog.commit(
+        basis.identity(),
+        CatalogProposal::new(
+            TransactionId::new([0xb8; 16])?,
+            FormatEpoch::CATALOG_V1,
+            objects,
+        )?,
+        None,
+    )?;
+    let removed_generation = catalog.pin()?.identity();
+    let stale = evaluation
+        .commit()
+        .expect_err("policy removal after admission cannot retire segments");
+    assert_eq!(stale.code(), LedgerFailureCode::StaleGeneration);
+    assert_eq!(catalog.pin()?.identity(), removed_generation);
+    assert!(ledger.snapshot()?.blocks().is_empty());
+    let after_commit = authority.governor().inspect()?;
+    assert_eq!(
+        after_commit.outstanding_total(),
+        baseline.outstanding_total()
+    );
+    for dimension in ResourceDimension::ALL {
+        assert_eq!(after_commit.usage(dimension), baseline.usage(dimension));
+    }
+    Ok(())
+}
+
+#[test]
+fn authenticated_v1_and_v2_segments_remain_readable_but_retention_ineligible()
+-> Result<(), Box<dyn Error>> {
+    for format_version in [1_u16, 2_u16] {
+        assert_legacy_segment_compatibility(format_version)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn authenticated_v3_segment_rejects_a_false_frontier_aggregate() -> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_authority(volume)?;
+    let instance = InstanceId::new([0x31; 16])?;
+    let catalog = Catalog::open(
+        &authority,
+        instance,
+        CatalogSecret::from_owned(Box::new([0x32; 32]), Box::new([0x33; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x64; 16])?;
+    let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(35)?);
+    let (retention_time, _) =
+        RetentionTimeAuthority::establish_with_manual_elapsed(UnixNanoseconds::new(5_000_000_000));
+    let protection = || SegmentProtectionKey::from_owned(Box::new([0x35; 32]));
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        protection(),
+    )?;
+    let segment = ledger.active_segment_id()?;
+    drop(ledger.begin_store_block(
+        preparation_capacity(&authority, tenant)?,
+        StoreBlockIdentity::new([0x36; 16])?,
+    )?);
+    drop(ledger);
+
+    write_authenticated_segment_fixture(AuthenticatedSegmentFixture {
+        root: root.path(),
+        instance,
+        scope,
+        segment,
+        wrapping: protection(),
+        identity: StoreBlockIdentity::new([0x37; 16])?,
+        payload: b"authenticated-v3",
+        format_version: 3,
+        block_tag: Some(2),
+        block_time: Some(4_000_000_000),
+        frontier_time: Some(3_000_000_000),
+    })?;
+
+    let failure = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        protection(),
+    )
+    .expect_err("the authenticated frontier must equal the folded exact block times");
+    assert_eq!(failure.code(), LedgerFailureCode::IntegrityCorruption);
+    Ok(())
+}
+
+#[test]
+fn authenticated_v3_blocks_reject_empty_and_unknown_retention_tags() -> Result<(), Box<dyn Error>> {
+    for (tag, instant, discriminator, shard) in [(0, 0, 0x38, 36), (3, 4_000_000_000, 0x39, 37)] {
+        assert_invalid_v3_block_tag(tag, instant, discriminator, shard)?;
+    }
+    Ok(())
+}
+
+fn assert_invalid_v3_block_tag(
+    tag: u8,
+    instant: i64,
+    discriminator: u8,
+    shard: u32,
+) -> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_authority(volume)?;
+    let instance = InstanceId::new([discriminator; 16])?;
+    let catalog = Catalog::open(
+        &authority,
+        instance,
+        CatalogSecret::from_owned(
+            Box::new([discriminator.wrapping_add(1); 32]),
+            Box::new([discriminator.wrapping_add(2); 32]),
+        ),
+    )?;
+    let tenant = TenantId::from_bytes([0x64; 16])?;
+    let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(shard)?);
+    let (retention_time, _) =
+        RetentionTimeAuthority::establish_with_manual_elapsed(UnixNanoseconds::new(5_000_000_000));
+    let protection = || SegmentProtectionKey::from_owned(Box::new([discriminator; 32]));
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        protection(),
+    )?;
+    let segment = ledger.active_segment_id()?;
+    drop(ledger.begin_store_block(
+        preparation_capacity(&authority, tenant)?,
+        StoreBlockIdentity::new([discriminator.wrapping_add(3); 16])?,
+    )?);
+    drop(ledger);
+    write_authenticated_segment_fixture(AuthenticatedSegmentFixture {
+        root: root.path(),
+        instance,
+        scope,
+        segment,
+        wrapping: protection(),
+        identity: StoreBlockIdentity::new([discriminator.wrapping_add(4); 16])?,
+        payload: b"invalid-v3-retention-tag",
+        format_version: 3,
+        block_tag: Some(tag),
+        block_time: Some(instant),
+        frontier_time: Some(4_000_000_000),
+    })?;
+    let failure = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        protection(),
+    )
+    .expect_err("v3 block retention tags must be complete and recognized");
+    assert_eq!(failure.code(), LedgerFailureCode::IntegrityCorruption);
+    Ok(())
+}
+
+fn assert_legacy_segment_compatibility(format_version: u16) -> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_authority(volume)?;
+    let instance = InstanceId::new([format_version as u8; 16])?;
+    let catalog = Catalog::open(
+        &authority,
+        instance,
+        CatalogSecret::from_owned(Box::new([0xc2; 32]), Box::new([0xc3; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x64; 16])?;
+    let scope = SegmentScope::new(
+        tenant,
+        SignalKind::Logs,
+        VirtualShardId::new(u32::from(format_version) + 20)?,
+    );
+    let (retention_time, _) =
+        RetentionTimeAuthority::establish_with_manual_elapsed(UnixNanoseconds::new(3_000_000_000));
+    let protection = || SegmentProtectionKey::from_owned(Box::new([0xc4; 32]));
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        protection(),
+    )?;
+    let segment = ledger.active_segment_id()?;
+    let identity = StoreBlockIdentity::new([format_version as u8 + 0x40; 16])?;
+    let payload = format!("legacy-v{format_version}").into_bytes();
+    drop(ledger.begin_store_block(preparation_capacity(&authority, tenant)?, identity)?);
+    drop(ledger);
+
+    write_authenticated_segment_fixture(AuthenticatedSegmentFixture {
+        root: root.path(),
+        instance,
+        scope,
+        segment,
+        wrapping: protection(),
+        identity,
+        payload: &payload,
+        format_version,
+        block_tag: None,
+        block_time: None,
+        frontier_time: (format_version == 2).then_some(1),
+    })?;
+
+    let reopened = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        protection(),
+    )?;
+    let snapshot = reopened.snapshot()?;
+    assert_eq!(snapshot.blocks().len(), 1);
+    assert_eq!(snapshot.blocks()[0].payload(), payload);
+    assert_eq!(
+        snapshot.blocks()[0]
+            .authenticate_ingest_time(UnixNanoseconds::new(1))
+            .expect_err("legacy observations cannot authenticate retention time")
+            .code(),
+        LedgerFailureCode::UnsupportedFormat
+    );
+    drop(snapshot);
+    reopened.seal()?;
+    let active = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        protection(),
+    )?;
+    assert_eq!(active.snapshot()?.blocks()[0].payload(), payload);
+    let failure = active
+        .begin_retention(NonZeroU64::new(1).ok_or("duration")?)?
+        .commit()
+        .expect_err("legacy retention evidence cannot authorize destruction");
+    assert_eq!(failure.code(), LedgerFailureCode::UnsupportedFormat);
+    assert_eq!(active.snapshot()?.blocks().len(), 1);
+    Ok(())
+}
+
+struct AuthenticatedSegmentFixture<'fixture> {
+    root: &'fixture Path,
+    instance: InstanceId,
+    scope: SegmentScope,
+    segment: SegmentId,
+    wrapping: SegmentProtectionKey,
+    identity: StoreBlockIdentity,
+    payload: &'fixture [u8],
+    format_version: u16,
+    block_tag: Option<u8>,
+    block_time: Option<i64>,
+    frontier_time: Option<i64>,
+}
+
+fn write_authenticated_segment_fixture(
+    fixture: AuthenticatedSegmentFixture<'_>,
+) -> Result<(), Box<dyn Error>> {
+    let AuthenticatedSegmentFixture {
+        root,
+        instance,
+        scope,
+        segment,
+        wrapping,
+        identity,
+        payload,
+        format_version,
+        block_tag,
+        block_time,
+        frontier_time,
+    } = fixture;
+    let segment_name = format!(
+        "{}.segment",
+        segment
+            .to_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+    let frontier_name = segment_name.replace(".segment", ".frontier");
+    let active = root.join("segments/active");
+    let segment_path = active.join(segment_name);
+    let frontier_path = active.join(frontier_name);
+    let original_segment = fs::read(&segment_path)?;
+    let header = decode_header(&original_segment)?;
+    let object = object_context(scope, segment)?;
+    let key = DataProtection::unwrap_segment_key_with_route(
+        &wrapping.key,
+        header.wrapped_key,
+        instance.to_bytes(),
+        object,
+        header.route,
+    )?;
+    let mut plaintext = Vec::with_capacity(25 + payload.len());
+    plaintext.extend_from_slice(&identity.to_bytes());
+    if format_version == 3 {
+        plaintext.push(block_tag.ok_or("v3 block fixture requires retention tag")?);
+        plaintext.extend_from_slice(
+            &block_time
+                .ok_or("v3 block fixture requires exact time")?
+                .to_be_bytes(),
+        );
+    }
+    plaintext.extend_from_slice(payload);
+    let frame = DataProtection::protect_frame(
+        &key,
+        object.frame(SegmentFramePurpose::StoreBlock, FrameSequence::new(1))?,
+        &plaintext,
+        FrameLimits::new(1_048_576)?,
+    )?;
+    let frame_length = u32::try_from(frame.as_bytes().len())?;
+    let mut encoded_segment = original_segment
+        .get(..header.encoded_bytes)
+        .ok_or("segment header length exceeds fixture")?
+        .to_vec();
+    encoded_segment.extend_from_slice(&frame_length.to_be_bytes());
+    encoded_segment.extend_from_slice(frame.as_bytes());
+    fs::write(&segment_path, &encoded_segment)?;
+
+    let durable_bytes = u64::try_from(encoded_segment.len())?;
+    let mut frontier_plaintext = Vec::with_capacity(if format_version == 1 { 24 } else { 33 });
+    frontier_plaintext.extend_from_slice(&durable_bytes.to_be_bytes());
+    frontier_plaintext.extend_from_slice(&1_u64.to_be_bytes());
+    frontier_plaintext.extend_from_slice(&CommitPosition::origin().next()?.value().to_be_bytes());
+    if format_version >= 2 {
+        frontier_plaintext.push(2);
+        frontier_plaintext.extend_from_slice(
+            &frontier_time
+                .ok_or("frontier fixture requires retention time")?
+                .to_be_bytes(),
+        );
+    }
+    let frontier_frame = DataProtection::protect_frame(
+        &key,
+        object.frame(
+            SegmentFramePurpose::DurabilityFrontier,
+            FrameSequence::new(u64::MAX - 1),
+        )?,
+        &frontier_plaintext,
+        FrameLimits::new(512)?,
+    )?;
+    let frontier_length = u32::try_from(frontier_frame.as_bytes().len())?;
+    let mut encoded_frontier = Vec::with_capacity(16 + frontier_frame.as_bytes().len());
+    encoded_frontier.extend_from_slice(b"PFRONT02");
+    encoded_frontier.extend_from_slice(&1_u16.to_be_bytes());
+    encoded_frontier.extend_from_slice(&format_version.to_be_bytes());
+    encoded_frontier.extend_from_slice(&frontier_length.to_be_bytes());
+    encoded_frontier.extend_from_slice(frontier_frame.as_bytes());
+    fs::write(frontier_path, encoded_frontier)?;
     Ok(())
 }
 
@@ -764,20 +1237,83 @@ fn restart_wall_jump_cannot_expire_a_durable_lease_or_reclaim_its_segment()
         scope,
         key(),
     )?;
-    let lease = active.create_snapshot_lease(150, 200)?;
+    assert_eq!(
+        active
+            .create_snapshot_lease(150, 250)
+            .expect_err("raw lease time cannot enter a retention ledger")
+            .code(),
+        LedgerFailureCode::InvalidInput
+    );
+    assert_eq!(
+        active
+            .create_snapshot_lease_at_catalog(150, 250, catalog.pin()?.identity())
+            .expect_err("raw Catalog-bound lease time cannot enter a retention ledger")
+            .code(),
+        LedgerFailureCode::InvalidInput
+    );
+    let lease =
+        active.create_snapshot_lease_for(150, NonZeroU64::new(100).ok_or("lease duration")?)?;
+    assert_eq!(lease.expiry(), 200);
     assert_eq!(
         active.snapshot_lease_time()?,
         100,
         "caller wall time must not become the durable Log lease observation"
     );
-    let lease_identity = lease.identity();
+    let mut lease_identity = lease.identity();
     drop(lease);
+    assert_eq!(
+        active
+            .prepare_snapshot_lease_replacement(lease_identity, 150, 250)
+            .err()
+            .ok_or("raw lease replacement unexpectedly entered a retention ledger")?
+            .code(),
+        LedgerFailureCode::InvalidInput
+    );
     elapsed.advance(2_000_000_000)?;
+    let mut replacement = active.prepare_snapshot_lease_replacement_for(
+        lease_identity,
+        u64::MAX - 100,
+        NonZeroU64::new(100).ok_or("replacement duration")?,
+    )?;
+    let replacement = replacement.commit()?;
+    assert_eq!(
+        active.snapshot_lease_time()?,
+        102,
+        "replacement observation must ignore the fallback QueryClock"
+    );
+    assert_eq!(replacement.expiry(), 202);
+    lease_identity = replacement.identity();
+    drop(replacement);
+    drop(active);
+
+    let (conservative_time, _) =
+        RetentionTimeAuthority::establish_with_manual_elapsed(UnixNanoseconds::new(i64::MAX / 3));
+    let active = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &conservative_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    assert_eq!(
+        active.snapshot_lease_time()?,
+        102,
+        "a lease observation above the durable retention frontier becomes a conservative floor"
+    );
     let retired = active
         .begin_retention(NonZeroU64::new(1).ok_or("duration")?)?
         .commit()?;
+    assert_eq!(
+        retired.evaluated_at(),
+        UnixNanoseconds::new(100_000_000_000),
+        "restart must rebase destructive time from authenticated data, not the lease floor"
+    );
     assert_eq!(retired.logically_retired_segments(), 1);
-    assert_eq!(retired.physically_reclaimed_segments(), 0);
+    assert_eq!(
+        retired.physically_reclaimed_segments(),
+        1,
+        "only the empty predecessor created by restart is reclaimable"
+    );
     drop(active);
 
     let (restarted_time, _) =

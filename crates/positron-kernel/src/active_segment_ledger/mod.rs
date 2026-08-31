@@ -95,6 +95,7 @@ pub struct RetentionEvaluation<'ledger, 'kernel, 'catalog> {
     ledger: &'ledger ActiveSegmentLedger<'kernel, 'catalog>,
     _capacity: ResourceReservation<'kernel>,
     catalog_identity: crate::CatalogGenerationId,
+    policy_object: Option<crate::CatalogObjectId>,
     frontier: crate::IngestTime,
     cutoff: positron_domain::time::UnixNanoseconds,
     blocks: Vec<CommittedBlock>,
@@ -282,9 +283,43 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         let mut storage = LedgerStorage::open(volume)?;
         let snapshot = catalog.pin()?;
         let retention_frontier = retention_frontier::recover(&snapshot, scope)?;
+        let recovery_metadata = storage.catalog_segments(&snapshot, scope)?;
+        let reconstruction = reconstruct(
+            &storage,
+            &recovery_metadata,
+            &protection,
+            catalog.instance(),
+            recovery::RecoveryMode::Repair,
+        )?;
+        let blocks = reconstruction.blocks;
+        let retained_bytes = reconstruction.retained_bytes;
+        let frontier = reconstruction.frontier;
+        let recovered_active = reconstruction.recovered_active;
+        let retention_readiness = if retention_frontier.is_some() {
+            RetentionReadiness::TrustedPersisted
+        } else if blocks.is_empty() {
+            RetentionReadiness::EmptyUninitialized
+        } else {
+            RetentionReadiness::Unavailable
+        };
+        let durable = blocks
+            .iter()
+            .filter_map(|block| match block.block_retention {
+                SegmentRetention::Complete(instant) => Some(instant),
+                SegmentRetention::Empty | SegmentRetention::Unavailable => None,
+            })
+            .chain(retention_frontier)
+            .max();
+        if let Some(retention_time) = retention_time
+            && let Some(durable) = durable
+        {
+            retention_time
+                .recover_scope(scope, durable)
+                .map_err(map_retention_time_failure)?;
+        }
         let lease_recovery_time = match retention_time {
             Some(authority) => authority
-                .lease_recovery_time(scope, retention_frontier)
+                .lease_recovery_time(scope, durable)
                 .map_err(map_retention_time_failure)?,
             None => lifecycle_now,
         };
@@ -301,39 +336,6 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         )?;
         let snapshot = catalog.pin()?;
         let mut metadata = storage.catalog_segments(&snapshot, scope)?;
-        let reconstruction = reconstruct(
-            &storage,
-            &metadata,
-            &protection,
-            catalog.instance(),
-            recovery::RecoveryMode::Repair,
-        )?;
-        let blocks = reconstruction.blocks;
-        let retained_bytes = reconstruction.retained_bytes;
-        let frontier = reconstruction.frontier;
-        let recovered_active = reconstruction.recovered_active;
-        let retention_readiness = if retention_frontier.is_some() {
-            RetentionReadiness::TrustedPersisted
-        } else if blocks.is_empty() {
-            RetentionReadiness::EmptyUninitialized
-        } else {
-            RetentionReadiness::Unavailable
-        };
-        if let Some(retention_time) = retention_time {
-            let durable = blocks
-                .iter()
-                .filter_map(|block| match block.block_retention {
-                    SegmentRetention::Complete(instant) => Some(instant),
-                    SegmentRetention::Empty | SegmentRetention::Unavailable => None,
-                })
-                .chain(retention_frontier)
-                .max();
-            if let Some(durable) = durable {
-                retention_time
-                    .recover_scope(scope, durable)
-                    .map_err(map_retention_time_failure)?;
-            }
-        }
 
         retained_capacity
             .try_resize_preserving_capacity(retained_claim(retained_bytes, blocks.len())?)
@@ -397,6 +399,13 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         self.scope
     }
 
+    /// Returns the Catalog lineage that authenticates this ledger's control
+    /// objects.
+    #[must_use]
+    pub const fn catalog_instance(&self) -> crate::InstanceId {
+        self.catalog.instance()
+    }
+
     /// Mints the authoritative Ingest Time for one Signal Store preparation.
     pub fn begin_store_block<'capacity>(
         &self,
@@ -410,13 +419,14 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
                 LedgerFailureCode::ResourceAdmissionRefused,
             ));
         }
-        let retention_time = self
-            .retention_time
-            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::UnsupportedFormat))?;
         let mut state = self
             .state
             .lock()
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
+        state.require_healthy()?;
+        let retention_time = self
+            .retention_time
+            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::UnsupportedFormat))?;
         let ingest_time = retention_time
             .ingest_time(self.scope, state.retention_frontier)
             .map_err(map_retention_time_failure)?;
@@ -451,6 +461,12 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
                 LedgerFailureCode::ResourceAdmissionRefused,
             ));
         }
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
+        state.require_healthy()?;
+        drop(state);
         if retention_time.authorizes_destructive_retention() {
             return Err(LedgerFailure::new(LedgerFailureCode::InvalidInput));
         }
@@ -476,6 +492,24 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         &'ledger self,
         duration: std::num::NonZeroU64,
     ) -> Result<RetentionEvaluation<'ledger, 'kernel, 'catalog>, LedgerFailure> {
+        self.begin_retention_internal(duration, None)
+    }
+
+    /// Admits retention bound to one immutable policy object that must remain
+    /// present in the current Catalog lineage through commit.
+    pub fn begin_retention_with_policy<'ledger>(
+        &'ledger self,
+        duration: std::num::NonZeroU64,
+        policy_object: crate::CatalogObjectId,
+    ) -> Result<RetentionEvaluation<'ledger, 'kernel, 'catalog>, LedgerFailure> {
+        self.begin_retention_internal(duration, Some(policy_object))
+    }
+
+    fn begin_retention_internal<'ledger>(
+        &'ledger self,
+        duration: std::num::NonZeroU64,
+        policy_object: Option<crate::CatalogObjectId>,
+    ) -> Result<RetentionEvaluation<'ledger, 'kernel, 'catalog>, LedgerFailure> {
         let retention_time = self
             .retention_time
             .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::UnsupportedFormat))?;
@@ -484,10 +518,16 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         }
         self.catalog.refresh_state()?;
         let basis = self.catalog.pin()?;
+        if let Some(identity) = policy_object
+            && basis.object(identity)?.is_none()
+        {
+            return Err(LedgerFailure::new(LedgerFailureCode::StaleGeneration));
+        }
         let state = self
             .state
             .lock()
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
+        state.require_healthy()?;
         if state.retention_readiness == RetentionReadiness::Unavailable {
             return Err(LedgerFailure::new(LedgerFailureCode::UnsupportedFormat));
         }
@@ -537,6 +577,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             ledger: self,
             _capacity: capacity,
             catalog_identity: basis.identity(),
+            policy_object,
             frontier,
             cutoff,
             blocks,
@@ -551,6 +592,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             .state
             .lock()
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
+        state.require_healthy()?;
         let barrier = SnapshotProtection::read_barrier(self.authority.snapshot_barrier())?;
         let claim = WorkClaim::tenant(
             self.scope.tenant,
@@ -585,9 +627,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             .state
             .lock()
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
-        if state.poisoned {
-            return Err(LedgerFailure::new(LedgerFailureCode::RecoveryRequired));
-        }
+        state.require_healthy()?;
         let current = self.storage.current_metadata()?;
         let basis = self.catalog.pin()?;
         let mut metadata = self.storage.catalog_segments(&basis, current.scope)?;

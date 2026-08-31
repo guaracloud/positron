@@ -82,6 +82,13 @@ impl<'kernel, 'catalog, 'ledger> CommittedLedgerReader<'kernel, 'catalog, 'ledge
     /// blocks. A concurrent publication causes a bounded retry, never a mixed
     /// generation result.
     pub fn snapshot(&self) -> Result<LedgerSnapshot<'kernel>, LedgerFailure> {
+        if let Some(ledger) = self.lease_authority {
+            ledger
+                .state
+                .lock()
+                .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?
+                .require_healthy()?;
+        }
         for attempt in 0..MAX_SNAPSHOT_RETRIES {
             let barrier = SnapshotProtection::read_barrier(self.authority.snapshot_barrier())?;
             self.catalog.refresh_state()?;
@@ -98,17 +105,17 @@ impl<'kernel, 'catalog, 'ledger> CommittedLedgerReader<'kernel, 'catalog, 'ledge
                 .reserve(reconstruction_claim)
                 .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
             let metadata = self.storage.catalog_segments_observed(&basis, self.scope)?;
-            let protection_claim = SnapshotProtection::with_barrier(
-                self.authority.snapshot_protection(),
-                barrier,
-                metadata.iter().map(|segment| segment.id),
-            )?;
             let reconstruction = reconstruct(
                 &self.storage,
                 &metadata,
                 &self.protection,
                 self.catalog.instance(),
                 RecoveryMode::Observe,
+            )?;
+            let protection_claim = SnapshotProtection::with_barrier(
+                self.authority.snapshot_protection(),
+                barrier,
+                reconstruction.blocks.iter().map(|block| block.segment_id()),
             )?;
             self.catalog.refresh_state()?;
             let current = self.catalog.pin()?;

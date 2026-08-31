@@ -33,6 +33,16 @@ pub(super) struct LedgerState<'kernel> {
     pub(super) retention_readiness: RetentionReadiness,
 }
 
+impl LedgerState<'_> {
+    pub(super) fn require_healthy(&self) -> Result<(), LedgerFailure> {
+        if self.poisoned {
+            Err(LedgerFailure::new(LedgerFailureCode::RecoveryRequired))
+        } else {
+            Ok(())
+        }
+    }
+}
+
 pub(super) fn receipt_for(block: &CommittedBlock) -> CommitReceipt {
     CommitReceipt {
         segment: block.segment,
