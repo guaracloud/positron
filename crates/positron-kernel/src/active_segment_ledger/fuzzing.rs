@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::fs;
 use std::num::NonZeroU64;
 use std::path::PathBuf;
@@ -78,7 +79,7 @@ pub(super) fn fuzz_active_segment_stateful(data: &[u8]) {
     let mut protected_snapshot: Option<(LedgerSnapshot<'_>, SnapshotExpectation)> = None;
 
     for (index, selector) in data.iter().copied().take(24).enumerate() {
-        let operation = selector % 25;
+        let operation = selector % 26;
         match operation {
             0 => {
                 let (identity, payload) = block_parts(index, selector);
@@ -299,6 +300,68 @@ pub(super) fn fuzz_active_segment_stateful(data: &[u8]) {
                     && let Ok(resumed) = ledger.resume_snapshot_lease(*identity, fuzz_now())
                 {
                     expected.assert_snapshot(resumed.snapshot());
+                }
+            },
+            25 => {
+                let active = ledger.active_segment_id().expect("active segment identity");
+                let snapshot = ledger.snapshot().expect("compaction fuzz snapshot");
+                if let Some(blocks) = oracle.compaction_inputs(&snapshot, scope, active) {
+                    let preparation = ledger
+                        .prepare_compaction(&snapshot)
+                        .expect("compaction fuzz admission is bounded");
+                    let event = fault_event(selector);
+                    let polls = Cell::new(0_u8);
+                    let cancel_after = selector % 5;
+                    let cancellation_enabled = selector % 3 != 0;
+                    let result = if cancellation_enabled {
+                        with_ledger_fault(event, || {
+                            ledger.compact_sealed_with_cancellation(blocks, preparation, || {
+                                let current = polls.get();
+                                polls.set(current.saturating_add(1));
+                                current >= cancel_after
+                            })
+                        })
+                    } else {
+                        ledger.compact_sealed_with_cancellation(blocks, preparation, || {
+                            polls.set(polls.get().saturating_add(1));
+                            false
+                        })
+                    };
+                    drop(snapshot);
+                    if result.is_ok() {
+                        let current = ledger
+                            .snapshot()
+                            .expect("compaction fuzz successor snapshot");
+                        oracle.note_compaction(&current);
+                    } else {
+                        let completion = result
+                            .as_ref()
+                            .err()
+                            .map(|failure| failure.completion_state());
+                        drop(ledger);
+                        let Some(recovered) =
+                            recover_or_stop(&authority, &retention_time, &catalog, scope)
+                        else {
+                            return;
+                        };
+                        ledger = recovered;
+                        let current = ledger
+                            .snapshot()
+                            .expect("compaction fuzz recovery snapshot");
+                        if matches!(
+                            completion,
+                            Some(
+                                super::LedgerCompletionState::RecoveryRequired
+                                    | super::LedgerCompletionState::CommitAmbiguous
+                            )
+                        ) {
+                            oracle.note_compaction(&current);
+                        } else {
+                            oracle.assert_snapshot(&current);
+                        }
+                    }
+                } else {
+                    drop(snapshot);
                 }
             },
             _ => {},

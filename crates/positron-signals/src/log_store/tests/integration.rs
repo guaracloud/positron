@@ -19,12 +19,13 @@ use positron_kernel::{
     with_catalog_publication_fault_after,
 };
 use positron_policy::{
-    IngestPolicy, LogMetadata, NativeLogAttribute, NativeLogCandidate, PolicyEvaluation,
-    PolicyReceiver,
+    IngestPolicy, LogMetadata, NativeLogAttribute, NativeLogCandidate, PolicyAction,
+    PolicyEvaluation, PolicyPredicate, PolicyReceiver, PolicyRule,
 };
 use positron_signals::{
-    LogRecord, LogRetentionPolicy, LogScan, LogStore, ScanCancellation, ScanLimit,
-    ScanObservationFailureCode, ScanObserver,
+    AttributeRepresentation, LogRecord, LogRetentionPolicy, LogScan, LogStore, ScanCancellation,
+    ScanLimit, ScanObservationFailureCode, ScanObserver, SchemaBudget, SchemaSessionStore,
+    StoredLogAttribute,
 };
 
 #[path = "support.rs"]

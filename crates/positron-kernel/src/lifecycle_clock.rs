@@ -161,6 +161,9 @@ impl Error for LifecycleClockFailure {}
 
 #[cfg(test)]
 mod tests {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
     use super::*;
 
     struct SequenceSource(Mutex<Vec<UnixNanoseconds>>);
@@ -196,6 +199,23 @@ mod tests {
         assert_eq!(
             LifecycleClockFailure::Unavailable.to_string(),
             "lifecycle clock unavailable"
+        );
+    }
+
+    #[test]
+    fn authenticated_ingest_time_and_clock_failures_have_public_diagnostics() {
+        let ingest = IngestTime::from_authenticated_durable(UnixNanoseconds::new(7));
+        assert_eq!(format!("{ingest:?}"), "IngestTime(UnixNanoseconds(7))");
+
+        let mut first = DefaultHasher::new();
+        ingest.hash(&mut first);
+        let mut second = DefaultHasher::new();
+        ingest.hash(&mut second);
+        assert_eq!(first.finish(), second.finish());
+
+        assert_eq!(
+            LifecycleClockFailure::OutOfRange.to_string(),
+            "lifecycle clock value is out of range"
         );
     }
 }

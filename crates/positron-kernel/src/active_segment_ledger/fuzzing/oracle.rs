@@ -2,14 +2,19 @@ use positron_domain::routing::CommitPosition;
 
 use std::collections::BTreeSet;
 
-use super::super::{ActiveSegmentLedger, CommitReceipt, SegmentId, StoreBlockIdentity};
+use super::super::{
+    ActiveSegmentLedger, CommitReceipt, CompactionBlock, LedgerSnapshot, SegmentId,
+    StoreBlockIdentity,
+};
 use crate::StorageKernelResourceAuthority;
+use positron_domain::time::UnixNanoseconds;
 
 pub(super) struct Oracle {
     records: Vec<Record>,
     frontier: CommitPosition,
     seals: usize,
     pending_protected_reclamation: BTreeSet<SegmentId>,
+    compactions: usize,
 }
 
 #[derive(Clone)]
@@ -40,6 +45,7 @@ impl Oracle {
             frontier: CommitPosition::origin(),
             seals: 0,
             pending_protected_reclamation: BTreeSet::new(),
+            compactions: 0,
         }
     }
 
@@ -157,6 +163,25 @@ impl Oracle {
         authority: &'authority StorageKernelResourceAuthority,
     ) {
         let snapshot = ledger.snapshot().expect("oracle snapshot is available");
+        self.assert_snapshot(&snapshot);
+        drop(snapshot);
+        if self.compactions == 0 {
+            for expected in &self.records {
+                let retry = super::prepared_retained(
+                    ledger,
+                    authority,
+                    expected.identity,
+                    expected.payload.clone(),
+                );
+                assert_eq!(
+                    ledger.append(retry).expect("oracle replay succeeds"),
+                    expected.receipt
+                );
+            }
+        }
+    }
+
+    pub(super) fn assert_snapshot(&self, snapshot: &LedgerSnapshot<'_>) {
         assert_eq!(snapshot.frontier(), self.frontier);
         assert_eq!(snapshot.blocks().len(), self.records.len());
         for (actual, expected) in snapshot.blocks().iter().zip(&self.records) {
@@ -164,18 +189,64 @@ impl Oracle {
             assert_eq!(actual.payload(), expected.payload);
             assert_eq!(actual.position(), expected.receipt.position());
         }
-        drop(snapshot);
-        for expected in &self.records {
-            let retry = super::prepared_retained(
-                ledger,
-                authority,
-                expected.identity,
-                expected.payload.clone(),
+    }
+
+    pub(super) fn compaction_inputs(
+        &self,
+        snapshot: &LedgerSnapshot<'_>,
+        scope: super::super::SegmentScope,
+        active: SegmentId,
+    ) -> Option<Vec<CompactionBlock>> {
+        let sealed = snapshot
+            .blocks()
+            .iter()
+            .filter(|block| block.segment_id() != active)
+            .map(|block| block.segment_id())
+            .collect::<BTreeSet<_>>();
+        if sealed.len() < 2 {
+            return None;
+        }
+        let mut blocks = Vec::new();
+        blocks.reserve(snapshot.blocks().len());
+        for block in snapshot
+            .blocks()
+            .iter()
+            .filter(|block| block.segment_id() != active)
+        {
+            let record = self.records.iter().find(|record| {
+                record.receipt.position() == block.position() && record.identity == block.identity()
+            })?;
+            let instant = i64::try_from(record.ingest_nanos).ok()?;
+            let ingest =
+                crate::IngestTime::from_authenticated_durable(UnixNanoseconds::new(instant));
+            blocks.push(
+                CompactionBlock::new(
+                    scope,
+                    block.segment_id(),
+                    block.identity(),
+                    block.position(),
+                    block.payload().to_vec(),
+                    block.content_digest().ok()?,
+                    ingest,
+                )
+                .ok()?,
             );
-            assert_eq!(
-                ledger.append(retry).expect("oracle replay succeeds"),
-                expected.receipt
-            );
+        }
+        Some(blocks)
+    }
+
+    pub(super) fn note_compaction(&mut self, snapshot: &LedgerSnapshot<'_>) {
+        let mut changed = false;
+        for record in &mut self.records {
+            if let Some(block) = snapshot.blocks().iter().find(|block| {
+                block.identity() == record.identity && block.position() == record.receipt.position()
+            }) {
+                changed |= block.segment_id() != record.receipt.segment;
+                record.receipt.segment = block.segment_id();
+            }
+        }
+        if changed {
+            self.compactions = self.compactions.saturating_add(1);
         }
     }
 

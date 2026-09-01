@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::error::Error;
 use std::fs;
 
@@ -16,7 +17,7 @@ use crate::catalog::{CatalogFileEvent, with_catalog_fault};
 use crate::{
     ActiveSegmentLedger, Catalog, CatalogObject, CatalogProposal, CatalogSecret, CommittedBlock,
     CompactionBlock, FormatEpoch, IngestTime, InstanceId, LedgerCompletionState, LedgerFailureCode,
-    MountQualification, PrimaryDataVolume, ResourceAmounts, ResourceDimension,
+    MountQualification, PrimaryDataVolume, RecoveryWorkKind, ResourceAmounts, ResourceDimension,
     RetentionTimeAuthority, SegmentId, SegmentProtectionKey, SegmentScope, StoreBlockIdentity,
     TransactionId, WorkClaim, WorkKind,
 };
@@ -95,6 +96,25 @@ fn compaction_rejects_invalid_inputs_and_repairs_after_output_seal_ambiguity()
             .finish(b"second-source".to_vec())?,
     )?;
     let active_snapshot = ledger.snapshot()?;
+    let foreign_scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(5)?);
+    let foreign_ledger = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        foreign_scope,
+        key(),
+    )?;
+    let foreign_snapshot = foreign_ledger.snapshot()?;
+    let foreign_preparation_failure = match ledger.prepare_compaction(&foreign_snapshot) {
+        Ok(_) => return Err("a preparation crossed physical scopes".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(
+        foreign_preparation_failure.code(),
+        LedgerFailureCode::PhysicalScopeMismatch
+    );
+    drop(foreign_snapshot);
+    drop(foreign_ledger);
     let active_blocks = active_snapshot.blocks();
     let active_first = active_blocks
         .first()
@@ -133,6 +153,14 @@ fn compaction_rejects_invalid_inputs_and_repairs_after_output_seal_ambiguity()
         ledger
             .compact_sealed(Vec::new())
             .expect_err("empty compaction must be bounded")
+            .code(),
+        LedgerFailureCode::LimitExceeded
+    );
+    let empty_preparation = ledger.prepare_compaction(&active_snapshot)?;
+    assert_eq!(
+        ledger
+            .compact_sealed_with_cancellation(Vec::new(), empty_preparation, || false)
+            .expect_err("an empty prepared compaction must be bounded")
             .code(),
         LedgerFailureCode::LimitExceeded
     );
@@ -227,6 +255,36 @@ fn compaction_rejects_invalid_inputs_and_repairs_after_output_seal_ambiguity()
         .map(|block| compaction_block(scope, block))
         .collect::<Result<Vec<_>, _>>()?;
     assert_eq!(source_blocks.len(), 2);
+    let mut too_many_blocks = source_blocks.clone();
+    let mut extra = source_blocks
+        .get(1)
+        .ok_or("second source block missing")?
+        .clone();
+    extra.identity = StoreBlockIdentity::new([0xc0; 16])?;
+    extra.position = extra.position.next()?;
+    too_many_blocks.push(extra);
+    let prepared_capacity = reopened.prepare_compaction(&source_snapshot)?;
+    assert_eq!(
+        reopened
+            .compact_sealed_with_cancellation(too_many_blocks, prepared_capacity, || false)
+            .expect_err("prepared compaction must reject blocks beyond its admitted bound")
+            .code(),
+        LedgerFailureCode::LimitExceeded
+    );
+    let mut too_large_payload = source_blocks.clone();
+    too_large_payload
+        .first_mut()
+        .ok_or("prepared compaction payload fixture missing")?
+        .payload
+        .extend_from_slice(&[0; 256]);
+    let prepared_capacity = reopened.prepare_compaction(&source_snapshot)?;
+    assert_eq!(
+        reopened
+            .compact_sealed_with_cancellation(too_large_payload, prepared_capacity, || false)
+            .expect_err("prepared compaction must reject payload beyond its admitted bound")
+            .code(),
+        LedgerFailureCode::LimitExceeded
+    );
     assert_eq!(
         reopened
             .compact_sealed(vec![source_blocks[0].clone()])
@@ -517,6 +575,34 @@ fn compaction_cleanup_failures_fence_each_prepublication_mutation() -> Result<()
         .map(|block| compaction_block(scope, block))
         .collect::<Result<Vec<_>, _>>()?;
     assert_eq!(first_blocks.len(), 3);
+    let before_cancellation = catalog.pin()?.identity();
+    let preparation = first_attempt.prepare_compaction(&first_snapshot)?;
+    let cancelled = first_attempt
+        .compact_sealed_with_cancellation(first_blocks.clone(), preparation, || true)
+        .expect_err("cancellation before output creation must not mutate");
+    assert_eq!(cancelled.code(), LedgerFailureCode::Cancelled);
+    assert_eq!(
+        cancelled.completion_state(),
+        LedgerCompletionState::RejectedBeforeMutation
+    );
+    assert_eq!(catalog.pin()?.identity(), before_cancellation);
+    let polls = Cell::new(0_u8);
+    let preparation = first_attempt.prepare_compaction(&first_snapshot)?;
+    let cancelled_at_output_boundary = first_attempt
+        .compact_sealed_with_cancellation(first_blocks.clone(), preparation, || {
+            let current = polls.get();
+            polls.set(current.saturating_add(1));
+            current >= 1
+        })
+        .expect_err("cancellation at the first output boundary must not mutate");
+    assert_eq!(
+        cancelled_at_output_boundary.code(),
+        LedgerFailureCode::Cancelled
+    );
+    assert_eq!(
+        cancelled_at_output_boundary.completion_state(),
+        LedgerCompletionState::RejectedBeforeMutation
+    );
     let first_failure = with_ledger_faults_after(
         &[
             (LedgerFileEvent::CreateSegment, 1),
@@ -546,6 +632,104 @@ fn compaction_cleanup_failures_fence_each_prepublication_mutation() -> Result<()
         .iter()
         .map(|block| compaction_block(scope, block))
         .collect::<Result<Vec<_>, _>>()?;
+    let polls = Cell::new(0_u8);
+    let preparation = second_attempt.prepare_compaction(&second_snapshot)?;
+    let cancelled_before_later_output = second_attempt
+        .compact_sealed_with_cancellation(
+            vec![second_blocks[0].clone(), second_blocks[2].clone()],
+            preparation,
+            || {
+                let current = polls.get();
+                polls.set(current.saturating_add(1));
+                current >= 4
+            },
+        )
+        .expect_err("cancellation before a later output must require recovery");
+    assert_eq!(
+        cancelled_before_later_output.code(),
+        LedgerFailureCode::Cancelled
+    );
+    assert_eq!(
+        cancelled_before_later_output.completion_state(),
+        LedgerCompletionState::RecoveryRequired
+    );
+    drop(second_attempt);
+    let second_attempt = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    let second_snapshot = second_attempt.snapshot()?;
+    let second_blocks = second_snapshot
+        .blocks()
+        .iter()
+        .map(|block| compaction_block(scope, block))
+        .collect::<Result<Vec<_>, _>>()?;
+    let polls = Cell::new(0_u8);
+    let preparation = second_attempt.prepare_compaction(&second_snapshot)?;
+    let cancelled_after_append = second_attempt
+        .compact_sealed_with_cancellation(second_blocks.clone(), preparation, || {
+            let current = polls.get();
+            polls.set(current.saturating_add(1));
+            current >= 3
+        })
+        .expect_err("cancellation after a committed output frame must require recovery");
+    assert_eq!(cancelled_after_append.code(), LedgerFailureCode::Cancelled);
+    assert_eq!(
+        cancelled_after_append.completion_state(),
+        LedgerCompletionState::RecoveryRequired
+    );
+    drop(second_snapshot);
+    drop(second_attempt);
+
+    let second_attempt = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    let second_snapshot = second_attempt.snapshot()?;
+    let second_blocks = second_snapshot
+        .blocks()
+        .iter()
+        .map(|block| compaction_block(scope, block))
+        .collect::<Result<Vec<_>, _>>()?;
+    let polls = Cell::new(0_u8);
+    let preparation = second_attempt.prepare_compaction(&second_snapshot)?;
+    let cancelled_after_first_output = second_attempt
+        .compact_sealed_with_cancellation(second_blocks.clone(), preparation, || {
+            let current = polls.get();
+            polls.set(current.saturating_add(1));
+            current >= 4
+        })
+        .expect_err("cancellation before a later output must require recovery");
+    assert_eq!(
+        cancelled_after_first_output.code(),
+        LedgerFailureCode::Cancelled
+    );
+    assert_eq!(
+        cancelled_after_first_output.completion_state(),
+        LedgerCompletionState::RecoveryRequired
+    );
+    drop(second_snapshot);
+    drop(second_attempt);
+
+    let second_attempt = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    let second_snapshot = second_attempt.snapshot()?;
+    let second_blocks = second_snapshot
+        .blocks()
+        .iter()
+        .map(|block| compaction_block(scope, block))
+        .collect::<Result<Vec<_>, _>>()?;
     let second_failure = with_ledger_faults_after(
         &[
             (LedgerFileEvent::WriteFrame, 1),
@@ -561,6 +745,112 @@ fn compaction_cleanup_failures_fence_each_prepublication_mutation() -> Result<()
     );
     drop(second_snapshot);
     drop(second_attempt);
+
+    let third_attempt = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    let third_snapshot = third_attempt.snapshot()?;
+    let third_blocks = third_snapshot
+        .blocks()
+        .iter()
+        .map(|block| compaction_block(scope, block))
+        .collect::<Result<Vec<_>, _>>()?;
+    let polls = Cell::new(0_u8);
+    let preparation = third_attempt.prepare_compaction(&third_snapshot)?;
+    let cancelled_before_publish =
+        with_ledger_fault(LedgerFileEvent::DiscardUnpublishedOutput, || {
+            third_attempt.compact_sealed_with_cancellation(
+                vec![third_blocks[0].clone(), third_blocks[2].clone()],
+                preparation,
+                || {
+                    let current = polls.get();
+                    polls.set(current.saturating_add(1));
+                    current >= 7
+                },
+            )
+        })
+        .expect_err("failed cleanup after cancellation before publication must fence recovery");
+    assert_eq!(
+        cancelled_before_publish.code(),
+        LedgerFailureCode::StorageUnavailable
+    );
+    assert_eq!(
+        cancelled_before_publish.completion_state(),
+        LedgerCompletionState::RecoveryRequired
+    );
+    drop(third_snapshot);
+    drop(third_attempt);
+
+    let fifth_attempt = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    let fifth_snapshot = fifth_attempt.snapshot()?;
+    let fifth_blocks = fifth_snapshot
+        .blocks()
+        .iter()
+        .map(|block| compaction_block(scope, block))
+        .collect::<Result<Vec<_>, _>>()?;
+    let polls = Cell::new(0_u8);
+    let preparation = fifth_attempt.prepare_compaction(&fifth_snapshot)?;
+    let cancelled_before_publish = fifth_attempt
+        .compact_sealed_with_cancellation(
+            vec![fifth_blocks[0].clone(), fifth_blocks[2].clone()],
+            preparation,
+            || {
+                let current = polls.get();
+                polls.set(current.saturating_add(1));
+                current >= 7
+            },
+        )
+        .expect_err("cancellation before publication must clean outputs and remain retryable");
+    assert_eq!(
+        cancelled_before_publish.code(),
+        LedgerFailureCode::Cancelled
+    );
+    assert_eq!(
+        cancelled_before_publish.completion_state(),
+        LedgerCompletionState::RecoveryRequired
+    );
+    drop(fifth_snapshot);
+    drop(fifth_attempt);
+
+    let fourth_attempt = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    let fourth_snapshot = fourth_attempt.snapshot()?;
+    let fourth_blocks = fourth_snapshot
+        .blocks()
+        .iter()
+        .map(|block| compaction_block(scope, block))
+        .collect::<Result<Vec<_>, _>>()?;
+    let polls = Cell::new(0_u8);
+    let preparation = fourth_attempt.prepare_compaction(&fourth_snapshot)?;
+    let cancelled_after_seal = fourth_attempt
+        .compact_sealed_with_cancellation(fourth_blocks, preparation, || {
+            let current = polls.get();
+            polls.set(current.saturating_add(1));
+            current >= 10
+        })
+        .expect_err("cancellation after output sealing must remain ambiguous");
+    assert_eq!(cancelled_after_seal.code(), LedgerFailureCode::Cancelled);
+    assert_eq!(
+        cancelled_after_seal.completion_state(),
+        LedgerCompletionState::CommitAmbiguous
+    );
+    drop(fourth_snapshot);
+    drop(fourth_attempt);
 
     let third_attempt = ActiveSegmentLedger::open_with_retention_time(
         &authority,
@@ -652,6 +942,194 @@ fn compaction_cleanup_failures_fence_each_prepublication_mutation() -> Result<()
         drop(ambiguous_snapshot);
         drop(ambiguous_attempt);
     }
+    Ok(())
+}
+
+#[test]
+fn cancellation_after_publication_before_output_seal_is_ambiguous() -> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0xd1; 16])?,
+        CatalogSecret::from_owned(Box::new([0xd2; 32]), Box::new([0xd3; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x64; 16])?;
+    let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(6)?);
+    let retention_time = RetentionTimeAuthority::establish()?;
+    let key = SegmentProtectionKey::from_owned(Box::new([0xd5; 32]));
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key,
+    )?;
+    ledger.append(
+        ledger
+            .begin_store_block(
+                preparation_capacity(&authority, tenant)?,
+                StoreBlockIdentity::new([0xd6; 16])?,
+            )?
+            .finish(b"publication-boundary-first".to_vec())?,
+    )?;
+    ledger.seal()?;
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        SegmentProtectionKey::from_owned(Box::new([0xd5; 32])),
+    )?;
+    let snapshot = ledger.snapshot()?;
+    let blocks = snapshot
+        .blocks()
+        .iter()
+        .map(|block| compaction_block(scope, block))
+        .collect::<Result<Vec<_>, _>>()?;
+    let preparation = ledger.prepare_compaction(&snapshot)?;
+    let polls = Cell::new(0_u8);
+    let failure = ledger
+        .compact_sealed_with_cancellation(blocks, preparation, || {
+            let current = polls.get();
+            polls.set(current.saturating_add(1));
+            current >= 5
+        })
+        .expect_err("publication before output sealing must remain ambiguous");
+    assert_eq!(failure.code(), LedgerFailureCode::Cancelled);
+    assert_eq!(
+        failure.completion_state(),
+        LedgerCompletionState::CommitAmbiguous
+    );
+    Ok(())
+}
+
+#[test]
+fn successful_compaction_replaces_sealed_sources_and_survives_reopen() -> Result<(), Box<dyn Error>>
+{
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0xd6; 16])?,
+        CatalogSecret::from_owned(Box::new([0xd7; 32]), Box::new([0xd8; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x64; 16])?;
+    let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(6)?);
+    let retention_time = RetentionTimeAuthority::establish()?;
+    let key = || SegmentProtectionKey::from_owned(Box::new([0xd9; 32]));
+
+    for (identity, payload) in [
+        ([0xda; 16], b"successful-first".as_slice()),
+        ([0xdb; 16], b"successful-second".as_slice()),
+    ] {
+        let source = ActiveSegmentLedger::open_with_retention_time(
+            &authority,
+            &retention_time,
+            &catalog,
+            scope,
+            key(),
+        )?;
+        source.append(
+            source
+                .begin_store_block(
+                    preparation_capacity(&authority, tenant)?,
+                    StoreBlockIdentity::new(identity)?,
+                )?
+                .finish(payload.to_vec())?,
+        )?;
+        source.seal()?;
+    }
+
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    let before = ledger.snapshot()?;
+    let blocks = before
+        .blocks()
+        .iter()
+        .map(|block| compaction_block(scope, block))
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(blocks.len(), 2);
+    let payload_bytes = blocks.iter().try_fold(0_u64, |total, block| {
+        total
+            .checked_add(
+                u64::try_from(block.payload.len())
+                    .map_err(|_| "compaction payload does not fit in u64")?,
+            )
+            .ok_or("compaction payload accounting overflow")
+    })?;
+    let governor_before = authority.governor().inspect()?;
+    let preparation = ledger.prepare_compaction(&before)?;
+    let governor_during = authority.governor().inspect()?;
+    let expected = |dimension| match dimension {
+        ResourceDimension::MemoryBytes => payload_bytes * 5 + 2 * 256,
+        ResourceDimension::QueueSlots | ResourceDimension::TaskSlots => 1,
+        ResourceDimension::BufferCacheBytes => payload_bytes * 2 + 2 * (384 + 1_024),
+        ResourceDimension::BatchItems => 9,
+        ResourceDimension::LeaseSlots => 0,
+        ResourceDimension::RetrySlots | ResourceDimension::IoPermits => 1,
+        ResourceDimension::CpuWorkUnits => 9,
+        ResourceDimension::FileDescriptors => 6,
+        ResourceDimension::DiskHeadroomBytes => payload_bytes * 2 + 2 * (384 + 1_024),
+    };
+    for dimension in ResourceDimension::ALL {
+        let before_usage = governor_before
+            .recovery_shared_usage(dimension)
+            .checked_add(
+                governor_before
+                    .recovery_pool_usage(RecoveryWorkKind::EmergencyCompaction, dimension),
+            )
+            .ok_or("compaction baseline accounting overflow")?;
+        let during_usage = governor_during
+            .recovery_shared_usage(dimension)
+            .checked_add(
+                governor_during
+                    .recovery_pool_usage(RecoveryWorkKind::EmergencyCompaction, dimension),
+            )
+            .ok_or("compaction peak accounting overflow")?;
+        assert_eq!(during_usage - before_usage, expected(dimension));
+    }
+    drop(preparation);
+    let governor_after = authority.governor().inspect()?;
+    for dimension in ResourceDimension::ALL {
+        assert_eq!(
+            governor_after.recovery_shared_usage(dimension),
+            governor_before.recovery_shared_usage(dimension)
+        );
+        assert_eq!(
+            governor_after.recovery_pool_usage(RecoveryWorkKind::EmergencyCompaction, dimension),
+            governor_before.recovery_pool_usage(RecoveryWorkKind::EmergencyCompaction, dimension)
+        );
+    }
+    let publication = ledger.compact_sealed(blocks)?;
+    assert_eq!(publication.input_segments(), 2);
+    assert_eq!(publication.output_segments(), 1);
+    let after = ledger.snapshot()?;
+    assert_eq!(after.blocks().len(), 2);
+    assert_eq!(after.blocks()[0].payload(), b"successful-first");
+    assert_eq!(after.blocks()[1].payload(), b"successful-second");
+    drop(before);
+    drop(after);
+    drop(ledger);
+
+    let reopened = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    let recovered = reopened.snapshot()?;
+    assert_eq!(recovered.blocks().len(), 2);
+    assert_eq!(recovered.blocks()[0].payload(), b"successful-first");
+    assert_eq!(recovered.blocks()[1].payload(), b"successful-second");
     Ok(())
 }
 

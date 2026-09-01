@@ -74,7 +74,15 @@ pub(super) fn compact<'kernel, 'catalog>(
         .active_segment_id()
         .map_err(LogStoreFailure::kernel)?;
     let snapshot = ledger.snapshot().map_err(LogStoreFailure::kernel)?;
+    // Admit the kernel's complete copy-on-write peak while only the immutable
+    // snapshot exists. This is intentionally before any payload is cloned.
+    let preparation = ledger
+        .prepare_compaction(&snapshot)
+        .map_err(LogStoreFailure::kernel)?;
     let mut inputs = Vec::new();
+    inputs
+        .try_reserve_exact(snapshot.blocks().len())
+        .map_err(|_| LogStoreFailure::resource_exhausted())?;
     for block in snapshot.blocks() {
         check_scan_cancellation(cancellation)?;
         if block.segment_id() == active {
@@ -93,28 +101,30 @@ pub(super) fn compact<'kernel, 'catalog>(
             .map(|record| record.ingest_time())
             .max()
             .ok_or_else(LogStoreFailure::malformed_block)?;
-        let mut in_bucket = true;
-        for record in &decoded.records {
-            if policy.bucket(tenant, record.ingest_time())? != bucket {
-                in_bucket = false;
-                break;
-            }
-        }
-        if !in_bucket {
-            continue;
-        }
-        inputs.push(
-            CompactionBlock::new(
-                snapshot.scope(),
-                block.segment_id(),
-                block.identity(),
-                block.position(),
-                block.payload().to_vec(),
-                block.content_digest().map_err(LogStoreFailure::kernel)?,
-                ingest_time,
-            )
-            .map_err(LogStoreFailure::kernel)?,
-        );
+        let in_bucket = decoded
+            .records
+            .iter()
+            .map(|record| {
+                policy
+                    .bucket(tenant, record.ingest_time())
+                    .map(|candidate| candidate == bucket)
+            })
+            .try_fold(true, |all, current| current.map(|current| all && current))?;
+        let input = in_bucket
+            .then(|| {
+                CompactionBlock::new(
+                    snapshot.scope(),
+                    block.segment_id(),
+                    block.identity(),
+                    block.position(),
+                    clone_payload(block.payload())?,
+                    block.content_digest().map_err(LogStoreFailure::kernel)?,
+                    ingest_time,
+                )
+                .map_err(LogStoreFailure::kernel)
+            })
+            .transpose()?;
+        inputs.extend(input);
     }
     check_scan_cancellation(cancellation)?;
     if inputs.is_empty() {
@@ -125,10 +135,15 @@ pub(super) fn compact<'kernel, 'catalog>(
             input_blocks: 0,
         });
     }
-    let input_segments = inputs
-        .iter()
-        .map(|block| block.source_segment())
-        .collect::<BTreeSet<_>>();
+    let mut input_segments = Vec::new();
+    input_segments
+        .try_reserve_exact(inputs.len())
+        .map_err(|_| LogStoreFailure::resource_exhausted())?;
+    for segment in inputs.iter().map(CompactionBlock::source_segment) {
+        if !input_segments.contains(&segment) {
+            input_segments.push(segment);
+        }
+    }
     if input_segments.len() < 2 {
         return Ok(LogCompactionOutcome {
             bucket,
@@ -139,7 +154,7 @@ pub(super) fn compact<'kernel, 'catalog>(
     }
     let input_blocks = inputs.len();
     let publication = ledger
-        .compact_sealed(inputs)
+        .compact_sealed_with_cancellation(inputs, preparation, || cancellation.is_cancelled())
         .map_err(LogStoreFailure::kernel)?;
     Ok(LogCompactionOutcome {
         bucket,
@@ -148,4 +163,12 @@ pub(super) fn compact<'kernel, 'catalog>(
         input_blocks,
     })
 }
-use std::collections::BTreeSet;
+
+fn clone_payload(payload: &[u8]) -> Result<Vec<u8>, LogStoreFailure> {
+    let mut clone = Vec::new();
+    clone
+        .try_reserve_exact(payload.len())
+        .map_err(|_| LogStoreFailure::resource_exhausted())?;
+    clone.extend_from_slice(payload);
+    Ok(clone)
+}

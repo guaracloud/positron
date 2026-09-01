@@ -30,15 +30,43 @@ pub(super) fn compaction_claim(
     block_bytes: usize,
     blocks: usize,
 ) -> Result<ResourceAmounts, LedgerFailure> {
-    // Account for the source snapshot plus the copy-on-write staging and
-    // output buffers. The doubled bounds remain finite at the ledger limits.
+    // Compaction is copy-on-write. At the write peak, additional Log Store
+    // inputs, contiguous-run copies, current plaintext/frame, and committed
+    // output copies can coexist with the separately retained source snapshot.
+    // Reserve every bounded copy plus fixed segment/frontier metadata before
+    // the first caller allocation.
+    const COPY_MULTIPLIER: usize = 5;
+    const BLOCK_OVERHEAD: usize = 256;
+    const FRAME_OVERHEAD: usize = 384;
+    const SEGMENT_OVERHEAD: usize = 1_024;
     let staged_bytes = block_bytes
-        .checked_mul(2)
+        .checked_mul(COPY_MULTIPLIER)
+        .and_then(|bytes| bytes.checked_add(blocks.checked_mul(BLOCK_OVERHEAD)?))
         .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
     let staged_blocks = blocks
-        .checked_mul(2)
+        .checked_mul(4)
+        .and_then(|count| count.checked_add(1))
         .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
-    retention_claim(staged_bytes, staged_blocks)
+    let persistent_bytes = block_bytes
+        .checked_mul(2)
+        .and_then(|bytes| bytes.checked_add(blocks.checked_mul(FRAME_OVERHEAD)?))
+        .and_then(|bytes| bytes.checked_add(blocks.checked_mul(SEGMENT_OVERHEAD)?))
+        .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+    let files = blocks
+        .checked_mul(2)
+        .and_then(|count| count.checked_add(2))
+        .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+    let memory = u64::try_from(staged_bytes)
+        .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+    let persistent = u64::try_from(persistent_bytes)
+        .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+    let items = u64::try_from(staged_blocks)
+        .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+    let files =
+        u64::try_from(files).map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+    Ok(ResourceAmounts::new([
+        memory, 1, 1, persistent, items, 0, 1, 1, items, files, persistent,
+    ]))
 }
 
 pub(super) fn append_claim(block_bytes: usize) -> Result<ResourceAmounts, LedgerFailure> {

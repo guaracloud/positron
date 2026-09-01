@@ -56,7 +56,7 @@ impl SegmentScope {
         for (destination, source) in key.iter_mut().zip(self.tenant.to_bytes()) {
             *destination = source;
         }
-        if let Some(signal) = key.get_mut(16) {
+        for signal in key.iter_mut().skip(16).take(1) {
             *signal = match self.signal {
                 SignalKind::Logs => 1,
                 SignalKind::Traces => 2,
@@ -295,6 +295,16 @@ pub struct CompactionBlock {
     pub(super) payload: Vec<u8>,
     pub(super) content_digest: [u8; 32],
     pub(super) ingest_time: IngestTime,
+}
+
+/// Capacity admitted before a caller materializes compaction inputs.
+///
+/// The reservation is move-only so every successful preparation is either
+/// consumed by the kernel publication or released before the caller returns.
+pub struct CompactionPreparation<'kernel> {
+    pub(super) capacity: ResourceReservation<'kernel>,
+    pub(super) maximum_blocks: usize,
+    pub(super) maximum_payload_bytes: usize,
 }
 
 impl CompactionBlock {
