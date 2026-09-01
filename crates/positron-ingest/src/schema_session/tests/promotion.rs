@@ -1,11 +1,10 @@
 use positron_domain::identity::TenantId;
 use positron_domain::routing::{SignalKind, VirtualShardId};
-use positron_domain::time::UnixNanoseconds;
 use positron_domain::value::AttributeNamespace;
 use positron_kernel::{
-    ActiveSegmentLedger, Catalog, CatalogSecret, FixedLifecycleClockSource, InstanceId,
-    LifecycleClock, ResourceAmounts, ResourceDimension, SegmentProtectionKey, SegmentScope,
-    StoreBlockIdentity, WorkClaim, WorkKind,
+    ActiveSegmentLedger, Catalog, CatalogSecret, InstanceId, ResourceAmounts, ResourceDimension,
+    RetentionTimeAuthority, SegmentProtectionKey, SegmentScope, StoreBlockIdentity, WorkClaim,
+    WorkKind,
 };
 use positron_policy::{IngestPolicy, NativeLogCandidate, PolicyEvaluation};
 use positron_signals::{
@@ -26,8 +25,10 @@ fn governed_query_evidence_promotes_demotes_and_reopens_equivalently() {
     )
     .expect("catalog");
     let shard = VirtualShardId::new(211).expect("shard");
-    let ledger = ActiveSegmentLedger::open(
+    let retention_time = RetentionTimeAuthority::establish().expect("retention time");
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
         &fixture.authority,
+        &retention_time,
         &catalog,
         SegmentScope::new(fixture.tenant, SignalKind::Logs, shard),
         SegmentProtectionKey::from_owned(Box::new([0xa4; 32])),
@@ -62,11 +63,9 @@ fn governed_query_evidence_promotes_demotes_and_reopens_equivalently() {
     );
     let prepared = LogStore::new()
         .prepare(
-            preparation_capacity(&fixture),
-            &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(1))),
-            fixture.tenant,
-            shard,
-            identity,
+            ledger
+                .begin_store_block(preparation_capacity(&fixture), identity)
+                .expect("kernel preparation"),
             records,
         )
         .expect("prepare")

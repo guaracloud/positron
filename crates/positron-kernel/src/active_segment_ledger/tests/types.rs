@@ -96,6 +96,7 @@ fn public_values_enforce_bounds_and_expose_only_bounded_outcomes() {
         content_digest: [4; 32],
         segment,
         frontier_authenticator: [3; 32],
+        block_retention: super::super::SegmentRetention::Unavailable,
     };
     assert_eq!(block.position(), receipt.position());
     assert_eq!(block.payload(), b"block");

@@ -2,7 +2,8 @@ use positron_domain::routing::{SignalKind, VirtualShardId};
 use positron_governance::{GovernanceAuditEntry, Identity};
 use positron_kernel::{
     ActiveSegmentLedger, BootstrapArtifact, BootstrapArtifactAccess, BootstrapKeyCustody,
-    BootstrapObjectPurpose, Catalog, SegmentScope, StorageKernelResourceAuthority,
+    BootstrapObjectPurpose, Catalog, RetentionTimeAuthority, SegmentScope,
+    StorageKernelResourceAuthority,
 };
 use std::sync::Arc;
 
@@ -13,6 +14,7 @@ use super::support::{catalog_failure, key_failure};
 
 pub(super) fn open_initial_ledgers(
     authority: &StorageKernelResourceAuthority,
+    retention_time: &RetentionTimeAuthority,
     catalog: &Catalog<'_>,
     key: &BootstrapKeyCustody,
     record: &BootstrapRecord,
@@ -24,8 +26,17 @@ pub(super) fn open_initial_ledgers(
         let protection = key
             .segment_key(record.instance, scope)
             .map_err(key_failure)?;
-        let ledger = ActiveSegmentLedger::open(authority, catalog, scope, protection)
-            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::LedgerUnavailable))?;
+        let ledger = match signal {
+            SignalKind::Logs => ActiveSegmentLedger::open_with_retention_time(
+                authority,
+                retention_time,
+                catalog,
+                scope,
+                protection,
+            ),
+            SignalKind::Traces => ActiveSegmentLedger::open(authority, catalog, scope, protection),
+        }
+        .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::LedgerUnavailable))?;
         drop(ledger);
     }
     Ok(())
@@ -89,6 +100,7 @@ pub(super) fn outcome(
     identity: Identity,
     audit: Vec<GovernanceAuditEntry>,
     authority: StorageKernelResourceAuthority,
+    retention_time: RetentionTimeAuthority,
     generation: u64,
     audit_frontier: u64,
     claim_available: bool,
@@ -107,6 +119,7 @@ pub(super) fn outcome(
         #[cfg(any(test, fuzzing))]
         audit,
         _authority: authority,
+        retention_time,
         instance: record.instance,
         tenant: record.tenant,
         logs_shard,

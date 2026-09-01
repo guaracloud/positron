@@ -16,11 +16,14 @@ use super::io::{map_errno, map_integrity_read, map_io_error, open_regular, synch
 use super::receipt::receipt_authenticator;
 use super::{
     CommittedBlock, LedgerFailure, LedgerFailureCode, MAX_ENCODED_FRAME_BYTES,
-    MAX_RETAINED_BLOCK_BYTES, SegmentId, StoreBlockIdentity, map_frame_failure,
+    MAX_RETAINED_BLOCK_BYTES, SegmentId, SegmentRetention, StoreBlockIdentity, map_frame_failure,
 };
+use crate::IngestTime;
 const FRONTIER_MAGIC: &[u8; 8] = b"PFRONT02";
 const FRONTIER_PREFIX_BYTES: usize = 8 + 2 + 2 + 4;
-const FRONTIER_PLAINTEXT_BYTES: usize = 8 + 8 + 8;
+const FRONTIER_V1_PLAINTEXT_BYTES: usize = 8 + 8 + 8;
+const FRONTIER_V2_PLAINTEXT_BYTES: usize = FRONTIER_V1_PLAINTEXT_BYTES + 1 + 8;
+const FRONTIER_V3_PLAINTEXT_BYTES: usize = 2 + FRONTIER_V2_PLAINTEXT_BYTES;
 const MAX_FRONTIER_FRAME_BYTES: u32 = 512;
 const MAX_RECOVERED_BLOCKS: usize = 1_024;
 
@@ -38,9 +41,17 @@ pub(super) enum RecoveryMode {
     Observe,
 }
 struct PublishedFrontier {
+    format_version: u16,
     durable_bytes: u64,
     next_sequence: u64,
     position: CommitPosition,
+    segment_retention: SegmentRetention,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct BlockRecoveryFormat {
+    pub(super) version: u16,
+    pub(super) segment_retention: SegmentRetention,
 }
 
 #[cfg(test)]
@@ -79,9 +90,11 @@ pub(super) fn recover_with_mode(
     let header_length = u64::try_from(header_bytes)
         .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
     let Some(PublishedFrontier {
+        format_version,
         durable_bytes,
         next_sequence,
         position,
+        segment_retention,
     }) = frontier
     else {
         if file_length < header_length {
@@ -130,6 +143,10 @@ pub(super) fn recover_with_mode(
         metadata.id,
         header_length,
         key,
+        BlockRecoveryFormat {
+            version: format_version,
+            segment_retention,
+        },
     )?;
     let expected_blocks = usize::try_from(next_sequence)
         .map_err(|_| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?;
@@ -156,6 +173,7 @@ pub(super) fn read_blocks(
     segment: SegmentId,
     header_bytes: u64,
     key: &ObjectDataKey,
+    format: BlockRecoveryFormat,
 ) -> Result<Vec<CommittedBlock>, LedgerFailure> {
     let mut blocks = Vec::new();
     let mut consumed = 0_u64;
@@ -201,8 +219,14 @@ pub(super) fn read_blocks(
                 .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?,
         )
         .map_err(|_| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?;
+        let block_retention = if format.version == 3 {
+            decode_block_retention(plaintext)?
+        } else {
+            SegmentRetention::Unavailable
+        };
+        let payload_offset = if format.version == 3 { 25 } else { 16 };
         let payload = plaintext
-            .get(16..)
+            .get(payload_offset..)
             .filter(|bytes| !bytes.is_empty())
             .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?;
         let content_digest = DataProtection::hash(payload)
@@ -243,7 +267,16 @@ pub(super) fn read_blocks(
             content_digest,
             segment,
             frontier_authenticator,
+            block_retention,
         });
+    }
+    let recovered_retention = blocks
+        .iter()
+        .fold(SegmentRetention::Empty, |aggregate, block| {
+            aggregate.append_block(block.block_retention)
+        });
+    if format.version == 3 && recovered_retention != format.segment_retention {
+        return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
     }
     Ok(blocks)
 }
@@ -271,7 +304,13 @@ fn read_frontier(
     {
         return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
     }
-    if prefix.get(10..12) != Some(1_u16.to_be_bytes().as_slice()) {
+    let format_version = u16::from_be_bytes(
+        prefix
+            .get(10..12)
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?,
+    );
+    if !matches!(format_version, 1..=3) {
         return Err(LedgerFailure::new(LedgerFailureCode::UnsupportedFormat));
     }
     let frame_bytes = usize::try_from(u32::from_be_bytes(
@@ -318,20 +357,90 @@ fn read_frontier(
     let (frame_sequence, verified) =
         opened.ok_or_else(|| LedgerFailure::new(LedgerFailureCode::AuthenticationFailed))?;
     let plaintext = verified.as_plaintext();
-    if plaintext.len() != FRONTIER_PLAINTEXT_BYTES {
+    let expected_plaintext_bytes = if format_version == 1 {
+        FRONTIER_V1_PLAINTEXT_BYTES
+    } else if format_version == 2 {
+        FRONTIER_V2_PLAINTEXT_BYTES
+    } else {
+        FRONTIER_V3_PLAINTEXT_BYTES
+    };
+    if plaintext.len() != expected_plaintext_bytes {
         return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
     }
-    let durable_bytes = read_u64(plaintext, 0)?;
-    let next_sequence = read_u64(plaintext, 8)?;
+    let authenticated = if format_version == 3 {
+        let authenticated_version = u16::from_be_bytes(
+            plaintext
+                .get(..2)
+                .and_then(|bytes| bytes.try_into().ok())
+                .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?,
+        );
+        if authenticated_version != format_version {
+            return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
+        }
+        plaintext
+            .get(2..)
+            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?
+    } else {
+        plaintext
+    };
+    let durable_bytes = read_u64(authenticated, 0)?;
+    let next_sequence = read_u64(authenticated, 8)?;
     if next_sequence != frame_sequence {
         return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
     }
-    let position = position_from_value(read_u64(plaintext, 16)?)?;
+    let position = position_from_value(read_u64(authenticated, 16)?)?;
+    let segment_retention = if format_version == 3 {
+        decode_segment_retention(authenticated)?
+    } else {
+        // v1 carried no bound and v2 could be authored from caller-supplied
+        // metadata. Both remain readable but are ineligible for destruction.
+        SegmentRetention::Unavailable
+    };
+    if matches!(segment_retention, SegmentRetention::Complete(_)) && next_sequence == 0 {
+        return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
+    }
     Ok(Some(PublishedFrontier {
+        format_version,
         durable_bytes,
         next_sequence,
         position,
+        segment_retention,
     }))
+}
+
+fn decode_block_retention(bytes: &[u8]) -> Result<SegmentRetention, LedgerFailure> {
+    let retention = decode_retention(bytes, 16, 17)?;
+    match retention {
+        SegmentRetention::Complete(_) | SegmentRetention::Unavailable => Ok(retention),
+        SegmentRetention::Empty => Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption)),
+    }
+}
+
+fn decode_segment_retention(bytes: &[u8]) -> Result<SegmentRetention, LedgerFailure> {
+    decode_retention(bytes, 24, 25)
+}
+
+fn decode_retention(
+    bytes: &[u8],
+    tag_offset: usize,
+    instant_offset: usize,
+) -> Result<SegmentRetention, LedgerFailure> {
+    let instant = i64::from_be_bytes(
+        bytes
+            .get(instant_offset..instant_offset.saturating_add(8))
+            .and_then(|value| value.try_into().ok())
+            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?,
+    );
+    match bytes.get(tag_offset).copied() {
+        Some(0) if instant == 0 => Ok(SegmentRetention::Empty),
+        Some(1) if instant == 0 => Ok(SegmentRetention::Unavailable),
+        Some(2) => Ok(SegmentRetention::Complete(
+            IngestTime::from_authenticated_durable(positron_domain::time::UnixNanoseconds::new(
+                instant,
+            )),
+        )),
+        _ => Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption)),
+    }
 }
 
 pub(super) fn segment_name(id: SegmentId) -> String {

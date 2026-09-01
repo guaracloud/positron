@@ -84,16 +84,13 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
             let authority = reader
                 .lease_authority()
                 .ok_or_else(|| QueryFailure::new(QueryFailureCode::StoreUnavailable))?;
-            let lease_now = now.max(
-                authority
-                    .snapshot_lease_time()
-                    .map_err(crate::execution_support::map_ledger_failure)?,
-            );
-            if lease_now >= state.expiry() {
-                return Err(QueryFailure::new(QueryFailureCode::SnapshotExpired));
-            }
+            let lease_ttl = state
+                .expiry()
+                .checked_sub(now)
+                .and_then(std::num::NonZeroU64::new)
+                .ok_or_else(|| QueryFailure::new(QueryFailureCode::SnapshotExpired))?;
             let replacement = authority
-                .prepare_snapshot_lease_replacement(binding.lease(), lease_now, state.expiry())
+                .prepare_snapshot_lease_replacement_for(binding.lease(), now, lease_ttl)
                 .map_err(crate::execution_support::map_ledger_failure)?;
             if replacement
                 .snapshot()

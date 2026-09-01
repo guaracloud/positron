@@ -28,11 +28,18 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         identity: SnapshotLeaseId,
         now: u64,
     ) -> Result<SnapshotLeaseUsage, LedgerFailure> {
+        let now = self.lease_operation_time(now)?;
         let mut state = self
             .state
             .lock()
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
+        state.require_healthy()?;
         self.retry_pending_releases(&mut state)?;
+        let now = if self.retention_time.is_some() {
+            state.last_snapshot_lease_time.max(now)
+        } else {
+            now
+        };
         if now < state.last_snapshot_lease_time {
             return Err(LedgerFailure::new(LedgerFailureCode::InvalidInput));
         }
@@ -100,6 +107,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             .state
             .lock()
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
+        state.require_healthy()?;
         if attempt.is_none() {
             let active = {
                 let registry = self

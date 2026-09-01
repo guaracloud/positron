@@ -8,7 +8,7 @@ use positron_kernel::{
     DiskPressureThresholds, GovernorPolicy, InventoryCardinalityLimits, MountQualification,
     ObservedResourceEnvironment, OperatorLimits, OrdinaryPoolPolicy, PrimaryDataVolume,
     RecoveryPoolCapacities, RecoveryReserve, RegisteredResourceBounds, ResourceAmounts,
-    ResourceDimension, ResourceGovernorConfiguration, ResourceInventory,
+    ResourceDimension, ResourceGovernorConfiguration, ResourceInventory, RetentionTimeAuthority,
     StorageKernelResourceAuthority, TenantQuota,
 };
 
@@ -58,6 +58,10 @@ impl Drop for TemporaryRoots {
 
 pub struct Fixture {
     pub authority: StorageKernelResourceAuthority,
+    // The Loki-only integration target shares this fixture module but never
+    // opens a Log ledger; OTLP integration targets consume the authority.
+    #[allow(dead_code)]
+    pub retention_time: RetentionTimeAuthority,
     pub tenant: TenantId,
     _root: TemporaryKernelRoot,
 }
@@ -103,8 +107,10 @@ pub fn fixture(tenant: TenantId) -> Result<Fixture, Box<dyn Error>> {
     let configuration = ResourceGovernorConfiguration::new(inventory, policy, recovery)?;
     let authority = StorageKernelResourceAuthority::establish(volume, configuration)
         .map_err(|_| "kernel authority establishment failed")?;
+    let retention_time = RetentionTimeAuthority::establish()?;
     Ok(Fixture {
         authority,
+        retention_time,
         tenant,
         _root: root,
     })

@@ -6,7 +6,8 @@ use std::sync::Arc;
 use positron_domain::identity::{PrincipalId, TenantId, TenantSlug};
 use positron_kernel::{
     BootstrapKeyCustody, Catalog, CatalogFailureCode, InstanceBootstrapStorage, InstanceId,
-    MountQualification, OwnedPrimaryDataVolume, StorageKernelResourceAuthority,
+    MountQualification, OwnedPrimaryDataVolume, RetentionTimeAuthority,
+    StorageKernelResourceAuthority,
 };
 use zeroize::Zeroizing;
 
@@ -152,6 +153,7 @@ pub struct InitializedInstance {
     #[cfg(any(test, fuzzing))]
     pub(super) audit: Vec<positron_governance::GovernanceAuditEntry>,
     pub(crate) _authority: StorageKernelResourceAuthority,
+    pub(crate) retention_time: RetentionTimeAuthority,
     pub(crate) instance: InstanceId,
     pub(crate) tenant: TenantId,
     pub(crate) logs_shard: positron_domain::routing::VirtualShardId,

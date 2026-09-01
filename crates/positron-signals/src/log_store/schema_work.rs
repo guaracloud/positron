@@ -187,6 +187,9 @@ impl super::LogStore {
         observer: Option<&dyn ScanObserver>,
         text_observer: Option<&dyn ScanObserver>,
     ) -> Result<SchemaDelta, LogStoreFailure> {
+        if !snapshot.blocks().contains(block) {
+            return Err(LogStoreFailure::malformed_block());
+        }
         let decoded = match (cancellation, observer) {
             (Some(cancellation), Some(observer)) => codec::BlockDecode::observed_quantized(
                 tenant,
@@ -194,8 +197,8 @@ impl super::LogStore {
                 cancellation,
                 observer,
             )?
-            .decode(snapshot, usize::MAX, cancellation)?,
-            _ => codec::decode_block(tenant, snapshot, block.payload(), usize::MAX)?,
+            .decode(block, usize::MAX, cancellation)?,
+            _ => codec::decode_block(tenant, block, usize::MAX)?,
         };
         if schema.tenant() != tenant {
             return Err(LogStoreFailure::physical_scope_mismatch());

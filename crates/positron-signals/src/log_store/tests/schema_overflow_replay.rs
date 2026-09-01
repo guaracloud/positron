@@ -75,7 +75,7 @@ fn exhausted_overflow_traversal_never_leaves_a_nested_replay_sidecar() -> Result
             .map(|attribute| attribute.representation()),
         Some(AttributeRepresentation::SchemaOverflow)
     );
-    let prepared = store.prepare(
+    let prepared = store.prepare_unretained_for_test(
         preparation_capacity(&authority, tenant)?,
         &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(101))),
         tenant,
@@ -99,7 +99,7 @@ fn exhausted_overflow_traversal_never_leaves_a_nested_replay_sidecar() -> Result
         Some(AttributeRepresentation::SchemaOverflow)
     );
     let isolated_block = store
-        .prepare(
+        .prepare_unretained_for_test(
             preparation_capacity(&authority, tenant)?,
             &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(102))),
             tenant,

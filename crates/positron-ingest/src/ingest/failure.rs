@@ -4,52 +4,59 @@ use positron_signals::LogStoreFailureCode;
 use super::{IngestFailureCode, IngestOutcome};
 
 pub(crate) const fn classify_log_store_failure_code(code: LogStoreFailureCode) -> IngestOutcome {
+    let failure_code = ingest_code_for_log_store(code);
     match code {
         LogStoreFailureCode::InvalidInput
         | LogStoreFailureCode::MalformedBlock
-        | LogStoreFailureCode::PhysicalScopeMismatch => {
-            IngestOutcome::Permanent(IngestFailureCode::InvalidRecord)
-        },
-        LogStoreFailureCode::LimitExceeded => {
-            IngestOutcome::Permanent(IngestFailureCode::ValueLimitExceeded)
-        },
+        | LogStoreFailureCode::PhysicalScopeMismatch
+        | LogStoreFailureCode::LimitExceeded
+        | LogStoreFailureCode::IdempotencyConflict => IngestOutcome::Permanent(failure_code),
+        _ => IngestOutcome::Retryable(failure_code),
+    }
+}
+
+const fn ingest_code_for_log_store(code: LogStoreFailureCode) -> IngestFailureCode {
+    match code {
+        LogStoreFailureCode::InvalidInput
+        | LogStoreFailureCode::MalformedBlock
+        | LogStoreFailureCode::PhysicalScopeMismatch => IngestFailureCode::InvalidRecord,
+        LogStoreFailureCode::LimitExceeded => IngestFailureCode::ValueLimitExceeded,
         LogStoreFailureCode::ResourceExhausted
+        | LogStoreFailureCode::StorageExhausted
         | LogStoreFailureCode::BudgetExhausted
         | LogStoreFailureCode::ClockUnavailable
-        | LogStoreFailureCode::ResourceAdmissionRefused => {
-            IngestOutcome::Retryable(IngestFailureCode::CapacityUnavailable)
-        },
-        LogStoreFailureCode::Kernel | LogStoreFailureCode::Internal => {
-            IngestOutcome::Retryable(IngestFailureCode::StorageUnavailable)
-        },
-        LogStoreFailureCode::Cancelled => IngestOutcome::Retryable(IngestFailureCode::Cancelled),
+        | LogStoreFailureCode::ResourceAdmissionRefused => IngestFailureCode::CapacityUnavailable,
+        LogStoreFailureCode::IdempotencyConflict => IngestFailureCode::IdempotencyConflict,
+        LogStoreFailureCode::StorageUnavailable
+        | LogStoreFailureCode::IntegrityCorruption
+        | LogStoreFailureCode::AuthenticationFailed
+        | LogStoreFailureCode::ConcurrentWriter
+        | LogStoreFailureCode::UnsupportedFormat
+        | LogStoreFailureCode::StaleGeneration
+        | LogStoreFailureCode::RecoveryRequired
+        | LogStoreFailureCode::SnapshotExpired
+        | LogStoreFailureCode::StaleResumeMarker
+        | LogStoreFailureCode::Internal => IngestFailureCode::StorageUnavailable,
+        LogStoreFailureCode::Cancelled => IngestFailureCode::Cancelled,
     }
 }
 
 pub(super) fn map_ledger_failure(failure: &LedgerFailure) -> IngestOutcome {
-    let code = match failure.code() {
-        LedgerFailureCode::Cancelled => IngestFailureCode::Cancelled,
-        LedgerFailureCode::IdempotencyConflict => IngestFailureCode::IdempotencyConflict,
-        LedgerFailureCode::LimitExceeded => IngestFailureCode::ValueLimitExceeded,
-        LedgerFailureCode::InvalidInput | LedgerFailureCode::PhysicalScopeMismatch => {
-            IngestFailureCode::InvalidRecord
-        },
-        LedgerFailureCode::ResourceAdmissionRefused => IngestFailureCode::CapacityUnavailable,
-        LedgerFailureCode::StorageUnavailable
-        | LedgerFailureCode::StorageExhausted
-        | LedgerFailureCode::IntegrityCorruption
-        | LedgerFailureCode::AuthenticationFailed
-        | LedgerFailureCode::ConcurrentWriter
-        | LedgerFailureCode::UnsupportedFormat
-        | LedgerFailureCode::StaleGeneration
-        | LedgerFailureCode::SnapshotExpired
-        | LedgerFailureCode::StaleResumeMarker
-        | LedgerFailureCode::RecoveryRequired => IngestFailureCode::StorageUnavailable,
+    classify_ledger_failure(failure.code(), failure.completion_state())
+}
+
+fn classify_ledger_failure(
+    failure_code: LedgerFailureCode,
+    completion: LedgerCompletionState,
+) -> IngestOutcome {
+    let code = match failure_code {
+        LedgerFailureCode::StorageExhausted => IngestFailureCode::StorageUnavailable,
+        other => ingest_code_for_log_store(LogStoreFailureCode::from(other)),
     };
-    match failure.completion_state() {
+    match completion {
         LedgerCompletionState::CommitAmbiguous => IngestOutcome::Ambiguous(code),
         LedgerCompletionState::RecoveryRequired => IngestOutcome::Retryable(code),
-        LedgerCompletionState::RejectedBeforeMutation => match failure.code() {
+        LedgerCompletionState::RejectedBeforeMutation => match failure_code {
             LedgerFailureCode::InvalidInput
             | LedgerFailureCode::PhysicalScopeMismatch
             | LedgerFailureCode::LimitExceeded

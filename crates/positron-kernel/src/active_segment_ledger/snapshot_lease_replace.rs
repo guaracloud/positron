@@ -8,8 +8,10 @@ use super::snapshot_lease::snapshot_lease_support::{
 use super::snapshot_lease_codec::decode;
 use super::snapshot_lease_codec::encode;
 use super::snapshot_lease_grant::SnapshotLeaseGrant;
-use super::snapshot_lease_record::{LeaseBlock, LeaseRecord, SnapshotLeaseId, SnapshotLeaseUsage};
-use super::{ActiveSegmentLedger, LedgerCompletionState, LedgerFailure, LedgerFailureCode};
+use super::snapshot_lease_record::{
+    LeaseBlock, LeaseRecord, LeaseWindow, SnapshotLeaseId, SnapshotLeaseUsage,
+};
+use super::{ActiveSegmentLedger, LedgerFailure, LedgerFailureCode};
 
 /// A prepared replacement keeps the old durable lease authoritative until the
 /// caller has authenticated the candidate cursor. Dropping it releases only
@@ -22,6 +24,7 @@ pub struct SnapshotLeaseReplacement<'lease, 'kernel, 'catalog> {
     encoded: Vec<u8>,
     grant: Option<SnapshotLeaseGrant<'kernel>>,
     observed_at: u64,
+    expiry: u64,
     committed: bool,
 }
 
@@ -53,6 +56,13 @@ impl<'lease, 'kernel, 'catalog> SnapshotLeaseReplacement<'lease, 'kernel, 'catal
             .state
             .lock()
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
+        state.require_healthy()?;
+        if self.expiry <= state.last_snapshot_lease_time {
+            return Err(LedgerFailure::new(LedgerFailureCode::SnapshotExpired));
+        }
+        if self.observed_at < state.last_snapshot_lease_time {
+            return Err(LedgerFailure::new(LedgerFailureCode::StaleGeneration));
+        }
         self.ledger.retry_pending_releases(&mut state)?;
         if state.lease_reservations.contains_key(&self.new_identity) {
             return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
@@ -74,7 +84,10 @@ impl<'lease, 'kernel, 'catalog> SnapshotLeaseReplacement<'lease, 'kernel, 'catal
         if !state.lease_reservations.contains_key(&self.old_identity) {
             return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
         }
-        super::snapshot_lease_record::validate_active_lease(&old_record, self.observed_at)?;
+        super::snapshot_lease_record::validate_active_lease(
+            &old_record,
+            state.last_snapshot_lease_time,
+        )?;
         let amounts = lease_claim(self.encoded.len())?;
         let transaction = LeaseReservationTransaction::begin(&mut state, self.old_identity)?;
         if let Err(failure) = transaction.resize(&mut state, amounts) {
@@ -104,7 +117,7 @@ impl<'lease, 'kernel, 'catalog> SnapshotLeaseReplacement<'lease, 'kernel, 'catal
             .lease_reservations
             .insert(self.new_identity, reservation);
         state.lease_resume_markers.remove(&self.old_identity);
-        state.last_snapshot_lease_time = self.observed_at;
+        state.last_snapshot_lease_time = state.last_snapshot_lease_time.max(self.observed_at);
         self.committed = true;
         self.grant
             .take()
@@ -122,6 +135,7 @@ impl<'lease, 'kernel, 'catalog> SnapshotLeaseReplacement<'lease, 'kernel, 'catal
             .state
             .lock()
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
+        state.require_healthy()?;
         self.ledger.retry_pending_releases(&mut state)?;
         self.ledger.catalog.refresh_state()?;
         let basis = self.ledger.catalog.pin()?;
@@ -184,13 +198,7 @@ fn rollback_after_replacement_failure(
 ) -> LedgerFailure {
     match transaction.rollback(state) {
         Ok(()) => failure,
-        Err(rollback) => {
-            if rollback.completion_state() == LedgerCompletionState::CommitAmbiguous {
-                rollback
-            } else {
-                LedgerFailure::new(LedgerFailureCode::RecoveryRequired)
-            }
-        },
+        Err(_) => LedgerFailure::new(LedgerFailureCode::RecoveryRequired),
     }
 }
 
@@ -204,6 +212,50 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         now: u64,
         expiry: u64,
     ) -> Result<SnapshotLeaseReplacement<'lease, 'kernel, 'catalog>, LedgerFailure> {
+        if self.retention_time.is_some() {
+            return Err(LedgerFailure::new(LedgerFailureCode::InvalidInput));
+        }
+        self.prepare_snapshot_lease_replacement_internal(
+            old_identity,
+            LeaseWindow {
+                observed: now,
+                expiry,
+            },
+        )
+    }
+
+    pub fn prepare_snapshot_lease_replacement_for<'lease>(
+        &'lease self,
+        old_identity: SnapshotLeaseId,
+        fallback_now: u64,
+        ttl: std::num::NonZeroU64,
+    ) -> Result<SnapshotLeaseReplacement<'lease, 'kernel, 'catalog>, LedgerFailure> {
+        let now = self
+            .retention_time
+            .map_or(Ok(fallback_now), |retention_time| {
+                retention_time
+                    .lease_time(self.scope)
+                    .map_err(super::map_retention_time_failure)
+            })?;
+        let expiry = now
+            .checked_add(ttl.get())
+            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+        self.prepare_snapshot_lease_replacement_internal(
+            old_identity,
+            LeaseWindow {
+                observed: now,
+                expiry,
+            },
+        )
+    }
+
+    fn prepare_snapshot_lease_replacement_internal<'lease>(
+        &'lease self,
+        old_identity: SnapshotLeaseId,
+        window: LeaseWindow,
+    ) -> Result<SnapshotLeaseReplacement<'lease, 'kernel, 'catalog>, LedgerFailure> {
+        let now = window.observed;
+        let expiry = window.expiry;
         if !super::snapshot_lease_record::valid_lease_interval(now, expiry) {
             return Err(LedgerFailure::new(LedgerFailureCode::InvalidInput));
         }
@@ -211,8 +263,9 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             .state
             .lock()
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
+        state.require_healthy()?;
         self.retry_pending_releases(&mut state)?;
-        if now < state.last_snapshot_lease_time {
+        if self.retention_time.is_none() && now < state.last_snapshot_lease_time {
             return Err(LedgerFailure::new(LedgerFailureCode::InvalidInput));
         }
         let now = state.last_snapshot_lease_time.max(now);
@@ -275,6 +328,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             encoded,
             grant: Some(grant),
             observed_at: now,
+            expiry,
             committed: false,
         })
     }

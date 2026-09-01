@@ -4,7 +4,7 @@ use positron_governance::{InitialAuditContext, InitialGovernanceIntent, InitialT
 use positron_kernel::{
     AuditIntent, BootstrapArtifact, BootstrapArtifactAccess, BootstrapKeyCustody,
     BootstrapObjectPurpose, Catalog, CatalogObject, CatalogProposal, FormatEpoch, InstanceId,
-    OwnedPrimaryDataVolume, TransactionId,
+    OwnedPrimaryDataVolume, RetentionTimeAuthority, TransactionId,
 };
 use zeroize::Zeroizing;
 
@@ -94,6 +94,8 @@ fn resume(
         key.catalog_secret(record.instance).map_err(key_failure)?,
     )
     .map_err(catalog_failure)?;
+    let retention_time = RetentionTimeAuthority::establish()
+        .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
     compatibility::migrate_pending_v1(&access, &key, &catalog, &mut record)?;
     let api_secret = record
         .api_key_secret
@@ -171,7 +173,7 @@ fn resume(
     } else {
         None
     };
-    open_initial_ledgers(&authority, &catalog, &key, &record)?;
+    open_initial_ledgers(&authority, &retention_time, &catalog, &key, &record)?;
     let current = catalog.pin().map_err(catalog_failure)?;
     if plan.creates_claim() {
         ensure_claim(&access, &key, &record, api_secret)?;
@@ -209,6 +211,7 @@ fn resume(
         identity,
         audit_records,
         authority,
+        retention_time,
         generation,
         audit,
         claim_available,
@@ -232,10 +235,12 @@ pub(super) fn reopen(paths: &BootstrapPaths) -> Result<InitializedInstance, Boot
         key.catalog_secret(record.instance).map_err(key_failure)?,
     )
     .map_err(catalog_failure)?;
+    let retention_time = RetentionTimeAuthority::establish()
+        .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
     if catalog.pin().map_err(catalog_failure)?.number() == 0 {
         return Err(BootstrapFailure::new(BootstrapFailureCode::CorruptState));
     }
-    open_initial_ledgers(&authority, &catalog, &key, &record)?;
+    open_initial_ledgers(&authority, &retention_time, &catalog, &key, &record)?;
     let current = catalog.pin().map_err(catalog_failure)?;
     let generation = current.number();
     let audit = current.governance_audit_frontier();
@@ -252,6 +257,7 @@ pub(super) fn reopen(paths: &BootstrapPaths) -> Result<InitializedInstance, Boot
         identity,
         audit_records,
         authority,
+        retention_time,
         generation,
         audit,
         claim_available,

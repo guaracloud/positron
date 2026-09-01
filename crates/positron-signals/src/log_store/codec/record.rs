@@ -1,6 +1,6 @@
 use positron_domain::time::{EventTime, ObservedTime, SourceTimeQuality, UnixNanoseconds};
 use positron_domain::value::{AttributeNamespace, AttributeOccurrenceSetCandidate};
-use positron_kernel::LedgerSnapshot;
+use positron_kernel::{CommittedBlock, IngestTime};
 
 use super::{CodecLimits, Input, LEGACY_VERSION, METADATA_VERSION, bounded_vec, metadata, value};
 use crate::log_store::types::{
@@ -15,12 +15,24 @@ pub(super) struct DecodedRecord {
 }
 
 impl DecodedRecord {
-    pub(super) fn into_stored(self, snapshot: &LedgerSnapshot<'_>) -> StoredLogRecord {
-        StoredLogRecord::new(
-            self.record,
-            snapshot.reconstruct_ingest_time(self.ingest_time),
-        )
+    pub(super) fn into_stored(
+        self,
+        block: &CommittedBlock,
+    ) -> Result<StoredLogRecord, LogStoreFailure> {
+        block
+            .observe_ingest_time(self.ingest_time)
+            .map(|ingest_time| StoredLogRecord::new_observed(self.record, ingest_time))
+            .map_err(LogStoreFailure::kernel)
     }
+}
+
+fn authenticated_ingest_time(
+    block: &CommittedBlock,
+    encoded: UnixNanoseconds,
+) -> Result<IngestTime, LogStoreFailure> {
+    block
+        .authenticate_ingest_time(encoded)
+        .map_err(LogStoreFailure::kernel)
 }
 
 pub(super) fn decode(
@@ -59,15 +71,43 @@ pub(super) fn decode(
     })
 }
 
-/// Validates only the authenticated record framing and bounded value
-/// structure. This is used for records beyond a hard decode limit: they must
-/// still be consumed and rejected when malformed, but must not be built into
-/// semantic record values or charged as decoded records.
+pub(super) fn validate_structure_for_block(
+    input: &mut Input<'_>,
+    limits: CodecLimits,
+    version: u16,
+    block: &CommittedBlock,
+) -> Result<(), LogStoreFailure> {
+    let ingest_time = validate_structure_with_ingest_time(input, limits, version)?;
+    authenticated_ingest_time(block, ingest_time).map(|_| ())
+}
+
+pub(super) fn validate_structure_for_observation(
+    input: &mut Input<'_>,
+    limits: CodecLimits,
+    version: u16,
+    block: &CommittedBlock,
+) -> Result<(), LogStoreFailure> {
+    let ingest_time = validate_structure_with_ingest_time(input, limits, version)?;
+    block
+        .observe_ingest_time(ingest_time)
+        .map(|_| ())
+        .map_err(LogStoreFailure::kernel)
+}
+
+#[cfg(any(test, fuzzing))]
 pub(super) fn validate_structure(
     input: &mut Input<'_>,
     limits: CodecLimits,
     version: u16,
 ) -> Result<(), LogStoreFailure> {
+    validate_structure_with_ingest_time(input, limits, version).map(|_| ())
+}
+
+fn validate_structure_with_ingest_time(
+    input: &mut Input<'_>,
+    limits: CodecLimits,
+    version: u16,
+) -> Result<UnixNanoseconds, LogStoreFailure> {
     input.observe_component()?;
     decode_event_time(input)?;
     match input.u8()? {
@@ -90,7 +130,7 @@ pub(super) fn validate_structure(
             .observe_metadata(0)
             .map_err(|_| LogStoreFailure::malformed_block())?;
     }
-    input.i64()?;
+    let ingest_time = UnixNanoseconds::new(input.i64()?);
     match input.u8()? {
         0 => {},
         1 => {
@@ -129,7 +169,7 @@ pub(super) fn validate_structure(
             .map_err(|_| LogStoreFailure::malformed_block())?;
     }
     validate_policy(input)?;
-    Ok(())
+    Ok(ingest_time)
 }
 
 fn decode_metadata(

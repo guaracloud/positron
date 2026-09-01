@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use positron_domain::identity::{PrincipalId, Scope};
 use positron_domain::routing::{SignalKind, VirtualShardId};
@@ -186,13 +186,17 @@ fn query_authorization_generation_ignores_non_security_catalog_churn()
         VirtualShardId::new(1)?,
     );
     let protection = initialized.key.segment_key(initialized.instance, scope)?;
-    let ledger = ActiveSegmentLedger::open(&initialized._authority, &catalog, scope, protection)
-        .map_err(|error| format!("ledger open: {error:?}"))?;
-    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-    let expiry = now.checked_add(100).ok_or("lease expiry overflow")?;
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
+        &initialized._authority,
+        &initialized.retention_time,
+        &catalog,
+        scope,
+        protection,
+    )
+    .map_err(|error| format!("ledger open: {error:?}"))?;
     drop(
         ledger
-            .create_snapshot_lease(now, expiry)
+            .create_snapshot_lease_for(0, NonZeroU64::new(100).ok_or("lease duration")?)
             .map_err(|error| format!("lease create: {error:?}"))?,
     );
     drop(ledger);

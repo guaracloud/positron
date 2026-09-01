@@ -2,12 +2,11 @@ use std::error::Error;
 
 use positron_domain::identity::TenantId;
 use positron_domain::routing::{SignalKind, VirtualShardId};
-use positron_domain::time::UnixNanoseconds;
 use positron_domain::value::{AttributeNamespace, CandidateAttributeValue, ValueLimitProfile};
 use positron_kernel::{
-    ActiveSegmentLedger, Catalog, CatalogSecret, FixedLifecycleClockSource, InstanceId,
-    LifecycleClock, MountQualification, ResourceAmounts, ResourceDimension, SegmentProtectionKey,
-    SegmentScope, StoreBlockIdentity, WorkClaim, WorkKind,
+    ActiveSegmentLedger, Catalog, CatalogSecret, InstanceId, MountQualification, ResourceAmounts,
+    ResourceDimension, RetentionTimeAuthority, SegmentProtectionKey, SegmentScope,
+    StoreBlockIdentity, WorkClaim, WorkKind,
 };
 use positron_policy::{
     IngestPolicy, LogMetadata, NativeLogAttribute, NativeLogCandidate, PolicyEvaluation,
@@ -38,8 +37,10 @@ fn public_scalar_query_checkpoint_and_missing_or_stale_fallbacks_preserve_result
     let tenant = TenantId::from_bytes([0x41; 16])?;
     let shard = VirtualShardId::new(8)?;
     let scope = SegmentScope::new(tenant, SignalKind::Logs, shard);
-    let ledger = ActiveSegmentLedger::open(
+    let retention_time = RetentionTimeAuthority::establish()?;
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
         &authority,
+        &retention_time,
         &catalog,
         scope,
         SegmentProtectionKey::from_owned(Box::new([0x58; 32])),
@@ -96,11 +97,7 @@ fn public_scalar_query_checkpoint_and_missing_or_stale_fallbacks_preserve_result
     let delta = session.stage_group(&mut durable)?;
     let prepared = store
         .prepare(
-            preparation_capacity(&authority, tenant)?,
-            &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(800))),
-            tenant,
-            shard,
-            identity,
+            ledger.begin_store_block(preparation_capacity(&authority, tenant)?, identity)?,
             durable,
         )
         .map_err(|failure| format!("prepare durable block: {failure:?}"))?;

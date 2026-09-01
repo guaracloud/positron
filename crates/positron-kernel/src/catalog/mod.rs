@@ -4,6 +4,7 @@ mod budget;
 mod codec;
 #[cfg(feature = "test-support")]
 mod fixture;
+mod governance_object;
 mod inspection;
 mod recovery;
 mod rotation;
@@ -33,9 +34,13 @@ use crate::{RecoveryWorkClaim, RecoveryWorkKind, StorageKernelResourceAuthority}
 
 #[cfg(feature = "test-support")]
 pub use fixture::GovernanceFixtureTarget;
+pub use governance_object::{
+    CatalogGovernanceObject, CatalogGovernanceVersion, CatalogLogRetentionPolicy,
+};
 #[cfg(feature = "test-support")]
 pub use storage::{
-    CatalogPublicationFault, with_catalog_publication_fault_after,
+    CatalogPublicationFault, with_catalog_generation_ambiguity_hook_after,
+    with_catalog_publication_ambiguity_hook_after, with_catalog_publication_fault_after,
     with_catalog_publication_fault_sequence_after, with_catalog_publication_hook_after,
 };
 use types::AuditFrontier;
@@ -190,11 +195,22 @@ impl<'authority> Catalog<'authority> {
             .recovery()
             .reserve(durability_claim)
             .map_err(CatalogFailure::admission)?;
-        let _operation = self
-            .operation
-            .lock()
-            .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
-        self.commit_unreserved(expected, proposal, audit)
+        let result = {
+            let _operation = self
+                .operation
+                .lock()
+                .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
+            self.commit_unreserved(expected, proposal, audit)
+        };
+        drop(_reservation);
+        #[cfg(any(test, feature = "test-support"))]
+        if result
+            .as_ref()
+            .is_err_and(|failure| failure.code() == CatalogFailureCode::StorageUnavailable)
+        {
+            storage::after_ambiguous_publication(self);
+        }
+        result
     }
 
     fn commit_unreserved(
@@ -373,6 +389,12 @@ impl<'authority> Catalog<'authority> {
             *state = recovered;
         }
         Ok(())
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn refresh_after_ambiguous_publication_for_test(&self) -> Result<(), CatalogFailure> {
+        self.refresh_state()
     }
 }
 

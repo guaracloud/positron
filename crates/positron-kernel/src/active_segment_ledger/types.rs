@@ -1,4 +1,5 @@
 use std::fmt::Formatter;
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -15,7 +16,7 @@ mod failure;
 mod prepared;
 mod protection_clone;
 pub use failure::{LedgerCompletionState, LedgerFailure, LedgerFailureCode};
-pub use prepared::PreparedStoreBlock;
+pub use prepared::{PreparedStoreBlock, StoreBlockPreparation};
 
 /// The immutable tenant, Signal Store, and Virtual Shard boundary of one active segment.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -72,6 +73,68 @@ impl SegmentScope {
             *lifecycle = 1;
         }
         key
+    }
+}
+
+/// Fixed ingest-time interval scoped to one tenant and Signal Store.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetentionBucket {
+    tenant: TenantId,
+    signal: SignalKind,
+    start: UnixNanoseconds,
+    end_exclusive: UnixNanoseconds,
+}
+
+impl RetentionBucket {
+    pub fn for_ingest_time(
+        tenant: TenantId,
+        signal: SignalKind,
+        ingest_time: IngestTime,
+        duration_seconds: NonZeroU64,
+    ) -> Result<Self, LedgerFailure> {
+        if !ingest_time.retention_authenticated() {
+            return Err(LedgerFailure::new(LedgerFailureCode::UnsupportedFormat));
+        }
+        let width = duration_seconds
+            .get()
+            .checked_mul(1_000_000_000)
+            .and_then(|value| i64::try_from(value).ok())
+            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+        let start = ingest_time
+            .instant()
+            .value()
+            .div_euclid(width)
+            .checked_mul(width)
+            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+        let end_exclusive = start
+            .checked_add(width)
+            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+        Ok(Self {
+            tenant,
+            signal,
+            start: UnixNanoseconds::new(start),
+            end_exclusive: UnixNanoseconds::new(end_exclusive),
+        })
+    }
+
+    #[must_use]
+    pub const fn tenant(self) -> TenantId {
+        self.tenant
+    }
+
+    #[must_use]
+    pub const fn signal_kind(self) -> SignalKind {
+        self.signal
+    }
+
+    #[must_use]
+    pub const fn start(self) -> UnixNanoseconds {
+        self.start
+    }
+
+    #[must_use]
+    pub const fn end_exclusive(self) -> UnixNanoseconds {
+        self.end_exclusive
     }
 }
 
@@ -217,6 +280,36 @@ pub struct CommittedBlock {
     pub(super) content_digest: [u8; 32],
     pub(super) segment: SegmentId,
     pub(super) frontier_authenticator: [u8; 32],
+    pub(super) block_retention: SegmentRetention,
+}
+
+/// Authenticated lifecycle metadata for a Store Block or its segment aggregate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SegmentRetention {
+    Empty,
+    Unavailable,
+    Complete(IngestTime),
+}
+
+impl SegmentRetention {
+    pub(super) const fn for_block(ingest_time: Option<IngestTime>) -> Self {
+        match ingest_time {
+            Some(instant) => Self::Complete(instant),
+            None => Self::Unavailable,
+        }
+    }
+
+    pub(super) fn append_block(self, block: Self) -> Self {
+        match (self, block) {
+            (Self::Empty, Self::Complete(instant)) => Self::Complete(instant),
+            (Self::Complete(previous), Self::Complete(instant)) => {
+                Self::Complete(previous.max(instant))
+            },
+            (Self::Empty | Self::Complete(_), Self::Unavailable)
+            | (Self::Unavailable, Self::Complete(_) | Self::Unavailable) => Self::Unavailable,
+            (_, Self::Empty) => Self::Unavailable,
+        }
+    }
 }
 
 impl CommittedBlock {
@@ -230,9 +323,49 @@ impl CommittedBlock {
         self.position
     }
 
+    /// Returns the immutable segment that durably contains this block.
+    #[must_use]
+    pub const fn segment_id(&self) -> SegmentId {
+        self.segment
+    }
+
     #[must_use]
     pub fn payload(&self) -> &[u8] {
         &self.payload
+    }
+
+    /// Verifies one encoded record timestamp against this authenticated v3 block.
+    pub fn authenticate_ingest_time(
+        &self,
+        encoded: UnixNanoseconds,
+    ) -> Result<IngestTime, LedgerFailure> {
+        match self.block_retention {
+            SegmentRetention::Complete(expected) if expected.instant() == encoded => Ok(expected),
+            SegmentRetention::Complete(_) => {
+                Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))
+            },
+            SegmentRetention::Empty | SegmentRetention::Unavailable => {
+                Err(LedgerFailure::new(LedgerFailureCode::UnsupportedFormat))
+            },
+        }
+    }
+
+    /// Observes a record time through this block's format evidence without
+    /// granting legacy data retention authority.
+    pub fn observe_ingest_time(
+        &self,
+        encoded: UnixNanoseconds,
+    ) -> Result<IngestTime, LedgerFailure> {
+        match self.block_retention {
+            SegmentRetention::Complete(expected) if expected.instant() == encoded => Ok(expected),
+            SegmentRetention::Complete(_) => {
+                Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))
+            },
+            SegmentRetention::Unavailable => Ok(IngestTime::from_unretained_observation(encoded)),
+            SegmentRetention::Empty => {
+                Err(LedgerFailure::new(LedgerFailureCode::UnsupportedFormat))
+            },
+        }
     }
 
     /// Returns the stable digest computed while the payload was admitted.
@@ -244,6 +377,7 @@ impl CommittedBlock {
 /// A verified immutable view bounded by the published Durability Frontier.
 pub struct LedgerSnapshot<'kernel> {
     pub(super) _capacity: ResourceReservation<'kernel>,
+    pub(super) _protection: super::snapshot_protection::SnapshotProtection,
     pub(super) scope: SegmentScope,
     pub(super) frontier: CommitPosition,
     pub(super) catalog_generation: u64,
@@ -256,12 +390,6 @@ impl LedgerSnapshot<'_> {
     #[must_use]
     pub const fn scope(&self) -> SegmentScope {
         self.scope
-    }
-
-    /// Reconstructs Ingest Time only inside an authenticated durable snapshot.
-    #[must_use]
-    pub const fn reconstruct_ingest_time(&self, instant: UnixNanoseconds) -> IngestTime {
-        IngestTime::from_authenticated_durable(instant)
     }
 
     #[must_use]

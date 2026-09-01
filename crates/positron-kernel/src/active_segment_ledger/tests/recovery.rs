@@ -8,10 +8,12 @@ use positron_domain::routing::{CommitPosition, SignalKind, VirtualShardId};
 use super::support::TemporaryRoot;
 use crate::active_segment_ledger::format::{SegmentMetadata, SegmentState};
 use crate::active_segment_ledger::recovery::{
-    RecoveryMode, publish_frontier, read_blocks, recover, recover_with_mode, segment_name,
+    BlockRecoveryFormat, RecoveryMode, publish_frontier, read_blocks, recover, recover_with_mode,
+    segment_name,
 };
 use crate::active_segment_ledger::{
-    LedgerFailureCode, MAX_ENCODED_FRAME_BYTES, SegmentId, SegmentScope, object_context,
+    LedgerFailureCode, MAX_ENCODED_FRAME_BYTES, SegmentId, SegmentRetention, SegmentScope,
+    object_context,
 };
 use crate::data_protection::{DataProtection, FrameLimits, FrameSequence, SegmentFramePurpose};
 
@@ -75,6 +77,7 @@ fn authenticated_but_semantically_inconsistent_frontier_is_rejected() -> Result<
         0,
         0,
         CommitPosition::origin().next()?,
+        SegmentRetention::Empty,
     )?;
     let failure = recover(&directory, &directory, metadata, &key, 0, true)
         .err()
@@ -98,6 +101,10 @@ fn block_reader_rejects_oversized_lengths_overflow_and_record_overrun() -> Resul
         metadata.id,
         0,
         &key,
+        BlockRecoveryFormat {
+            version: 2,
+            segment_retention: SegmentRetention::Unavailable,
+        },
     )
     .expect_err("oversized record");
     assert_eq!(failure.code(), LedgerFailureCode::LimitExceeded);
@@ -122,6 +129,10 @@ fn block_reader_rejects_oversized_lengths_overflow_and_record_overrun() -> Resul
         metadata.id,
         0,
         &key,
+        BlockRecoveryFormat {
+            version: 2,
+            segment_retention: SegmentRetention::Unavailable,
+        },
     )
     .expect_err("record cannot overrun frontier bytes");
     assert_eq!(failure.code(), LedgerFailureCode::IntegrityCorruption);
@@ -135,6 +146,10 @@ fn block_reader_rejects_oversized_lengths_overflow_and_record_overrun() -> Resul
         metadata.id,
         0,
         &key,
+        BlockRecoveryFormat {
+            version: 2,
+            segment_retention: SegmentRetention::Unavailable,
+        },
     )
     .expect_err("commit position cannot wrap");
     assert_eq!(failure.code(), LedgerFailureCode::LimitExceeded);
@@ -158,6 +173,7 @@ fn frontier_publication_rejects_an_unremovable_temporary_path() -> Result<(), Bo
         0,
         0,
         CommitPosition::origin(),
+        SegmentRetention::Empty,
     )
     .expect_err("temporary directory cannot be unlinked as a file");
     assert_eq!(failure.code(), LedgerFailureCode::StorageUnavailable);
@@ -221,6 +237,10 @@ fn block_reader_enforces_the_bounded_recovery_cardinality() -> Result<(), Box<dy
         metadata.id,
         0,
         &key,
+        BlockRecoveryFormat {
+            version: 2,
+            segment_retention: SegmentRetention::Unavailable,
+        },
     )
     .expect_err("recovery cannot retain an unbounded block set");
     assert_eq!(failure.code(), LedgerFailureCode::LimitExceeded);

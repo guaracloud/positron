@@ -30,6 +30,16 @@ pub(super) fn reconstruct(
     let mut frontier = CommitPosition::origin();
     let mut recovered_active = None;
     while let Some(first) = segments.peek().copied() {
+        if first.state == SegmentState::Retired {
+            let retired = segments
+                .next()
+                .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?;
+            if retired.base_position < frontier {
+                return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
+            }
+            frontier = retired.base_position;
+            continue;
+        }
         let base = first.base_position;
         if base != frontier {
             return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));

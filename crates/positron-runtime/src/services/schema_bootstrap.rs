@@ -38,6 +38,17 @@ pub(super) fn classify_replay_failure(failure: SchemaSessionFailure) -> ServiceF
                 positron_signals::ScanObservationFailureCode::Cancelled,
             ) => ServiceFailure::Cancelled,
         },
+        SchemaSessionFailure::LogStore(code) => match code {
+            positron_signals::LogStoreFailureCode::ResourceExhausted
+            | positron_signals::LogStoreFailureCode::StorageExhausted
+            | positron_signals::LogStoreFailureCode::BudgetExhausted
+            | positron_signals::LogStoreFailureCode::ClockUnavailable
+            | positron_signals::LogStoreFailureCode::ResourceAdmissionRefused => {
+                ServiceFailure::CapacityUnavailable
+            },
+            positron_signals::LogStoreFailureCode::Cancelled => ServiceFailure::Cancelled,
+            _ => ServiceFailure::CorruptState,
+        },
         SchemaSessionFailure::TenantConflict
         | SchemaSessionFailure::InFlight
         | SchemaSessionFailure::PendingReconciliationRequired
@@ -84,8 +95,14 @@ pub(super) fn recover(
             .key
             .segment_key(instance.instance, scope)
             .map_err(|_| ServiceFailure::KeyUnavailable)?;
-        let ledger = ActiveSegmentLedger::open(&instance._authority, &catalog, scope, protection)
-            .map_err(|failure| classify_ledger_failure_code(failure.code()))?;
+        let ledger = ActiveSegmentLedger::open_with_retention_time(
+            &instance._authority,
+            &instance.retention_time,
+            &catalog,
+            scope,
+            protection,
+        )
+        .map_err(|failure| classify_ledger_failure_code(failure.code()))?;
         // `replay` retains the admitted repair CPU/task reservation while the
         // immutable snapshot is constructed and replayed.
         let snapshot = ledger

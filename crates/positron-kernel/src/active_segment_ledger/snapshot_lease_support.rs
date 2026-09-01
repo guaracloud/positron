@@ -7,11 +7,13 @@ use crate::catalog::{
 };
 use crate::data_protection::DataProtection;
 
+use super::super::format::SegmentState;
+use super::super::recovery::RecoveryMode;
 use super::super::snapshot_lease_codec::decode;
 use super::super::snapshot_lease_record::{LeaseRecord, SnapshotLeaseId};
 use super::super::{
-    ActiveSegmentLedger, FORMAT_EPOCH, LedgerFailure, LedgerFailureCode, LedgerSnapshot,
-    SegmentScope, map_frame_failure,
+    ActiveSegmentLedger, CommittedBlock, FORMAT_EPOCH, LedgerFailure, LedgerFailureCode,
+    LedgerSnapshot, SegmentScope, map_frame_failure,
 };
 
 fn rollback_lease_reservation(
@@ -96,49 +98,251 @@ pub(crate) fn snapshot_from_record<'kernel>(
     state: &super::super::state::LedgerState<'kernel>,
     record: &LeaseRecord,
 ) -> Result<LedgerSnapshot<'kernel>, LedgerFailure> {
-    if record.blocks.len() > state.blocks.len() || record.frontier > state.frontier {
+    if record.scope != ledger.scope || record.frontier > state.frontier {
         return Err(LedgerFailure::new(LedgerFailureCode::SnapshotExpired));
     }
-    let blocks = state
-        .blocks
-        .get(..record.blocks.len())
-        .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?;
-    if !blocks.iter().zip(&record.blocks).all(|(actual, expected)| {
-        actual.identity == expected.identity
-            && actual.position == expected.position
-            && actual.segment == expected.segment
-    }) || blocks
-        .last()
-        .map_or(CommitPosition::origin(), |block| block.position)
-        != record.frontier
-    {
-        return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
-    }
+    let maximum_bytes = record.blocks.iter().try_fold(0_usize, |total, expected| {
+        let bytes = state
+            .blocks
+            .iter()
+            .find(|actual| {
+                actual.identity == expected.identity
+                    && actual.position == expected.position
+                    && actual.segment == expected.segment
+            })
+            .map_or(super::super::MAX_STORE_BLOCK_BYTES, |block| {
+                block.payload.len()
+            });
+        total
+            .checked_add(bytes)
+            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))
+    })?;
+    let recovery = resume_recovery_plan(ledger, state, record)?;
+    let admitted = if recovery.segments.is_empty() {
+        // Creating a lease clones only already-retained blocks. The caller's
+        // admitted query task covers construction work, while this claim must
+        // precede and cover the retained clone allocation itself.
+        super::super::capacity::snapshot_retained_claim(maximum_bytes, record.blocks.len())?
+    } else {
+        let recovery_working_bytes = recovery
+            .encoded_bytes
+            .checked_mul(3)
+            .and_then(|bytes| bytes.checked_add(maximum_bytes))
+            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+        let recovery_items = recovery
+            .segments
+            .len()
+            .checked_mul(super::super::MAX_RETAINED_BLOCKS)
+            .and_then(|items| items.checked_add(record.blocks.len()))
+            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+        super::super::capacity::snapshot_resume_claim(
+            recovery_working_bytes,
+            recovery.encoded_bytes,
+            recovery_items,
+            recovery.segments.len(),
+        )?
+    };
+    let maximum_claim = crate::WorkClaim::tenant(
+        record.scope.tenant,
+        crate::WorkKind::InteractiveQueryTail,
+        admitted,
+    )
+    .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+    let mut capacity = ledger
+        .authority
+        .governor()
+        .reserve(maximum_claim)
+        .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
+    let blocks = blocks_for_record(ledger, state, record, &recovery.segments)?;
     let bytes = blocks
         .iter()
         .try_fold(0_usize, |total, block| {
             total.checked_add(block.payload.len())
         })
         .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
-    let claim = crate::WorkClaim::tenant(
-        record.scope.tenant,
-        crate::WorkKind::InteractiveQueryTail,
-        super::super::capacity::snapshot_retained_claim(bytes, blocks.len())?,
-    )
-    .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
-    let capacity = ledger
-        .authority
-        .governor()
-        .reserve(claim)
+    capacity
+        .try_resize_preserving_capacity(super::super::capacity::snapshot_retained_claim(
+            bytes,
+            blocks.len(),
+        )?)
         .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
     Ok(LedgerSnapshot {
         _capacity: capacity,
+        _protection: super::super::snapshot_protection::SnapshotProtection::for_blocks(
+            ledger.authority.snapshot_protection(),
+            ledger.authority.snapshot_barrier(),
+            &blocks,
+        )?,
         scope: record.scope,
         frontier: record.frontier,
         catalog_generation: record.catalog_generation,
         catalog_identity: record.catalog_identity,
-        blocks: blocks.to_vec(),
+        blocks,
     })
+}
+
+struct ResumeRecoveryPlan {
+    segments: Vec<super::super::format::SegmentMetadata>,
+    encoded_bytes: usize,
+}
+
+fn resume_recovery_plan(
+    ledger: &ActiveSegmentLedger<'_, '_>,
+    state: &super::super::state::LedgerState<'_>,
+    record: &LeaseRecord,
+) -> Result<ResumeRecoveryPlan, LedgerFailure> {
+    let mut missing = BTreeSet::new();
+    for expected in &record.blocks {
+        let exact = state.blocks.iter().any(|actual| {
+            actual.identity == expected.identity
+                && actual.position == expected.position
+                && actual.segment == expected.segment
+        });
+        if exact {
+            continue;
+        }
+        if state.blocks.iter().any(|actual| {
+            actual.position == expected.position && actual.segment == expected.segment
+        }) || state
+            .blocks
+            .iter()
+            .any(|actual| actual.segment == expected.segment)
+        {
+            return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
+        }
+        missing.insert(expected.segment);
+    }
+    if missing.is_empty() {
+        return Ok(ResumeRecoveryPlan {
+            segments: Vec::new(),
+            encoded_bytes: 0,
+        });
+    }
+    ledger.catalog.refresh_state()?;
+    let basis = ledger.catalog.pin()?;
+    let metadata = ledger
+        .storage
+        .catalog_segments_observed(&basis, record.scope)?;
+    let mut segments = Vec::new();
+    segments
+        .try_reserve_exact(missing.len())
+        .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+    let mut encoded_bytes = 0_usize;
+    for identity in missing {
+        let segment = metadata
+            .iter()
+            .find(|candidate| candidate.id == identity && candidate.state == SegmentState::Retired)
+            .copied()
+            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::SnapshotExpired))?;
+        encoded_bytes = encoded_bytes
+            .checked_add(ledger.storage.retired_recovery_encoded_bytes(segment)?)
+            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+        segments.push(segment);
+    }
+    Ok(ResumeRecoveryPlan {
+        segments,
+        encoded_bytes,
+    })
+}
+
+fn blocks_for_record<'kernel>(
+    ledger: &ActiveSegmentLedger<'kernel, '_>,
+    state: &super::super::state::LedgerState<'kernel>,
+    record: &LeaseRecord,
+    missing_metadata: &[super::super::format::SegmentMetadata],
+) -> Result<Vec<CommittedBlock>, LedgerFailure> {
+    let mut missing_segments = BTreeSet::new();
+    for expected in &record.blocks {
+        let exact = state.blocks.iter().any(|actual| {
+            actual.identity == expected.identity
+                && actual.position == expected.position
+                && actual.segment == expected.segment
+        });
+        if exact {
+            continue;
+        }
+        missing_segments.insert(expected.segment);
+    }
+
+    let mut recovered = Vec::new();
+    recovered
+        .try_reserve_exact(record.blocks.len())
+        .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+    if !missing_segments.is_empty() {
+        for metadata in missing_metadata.iter().copied() {
+            let (_key, recovered_segment) = ledger.storage.recover_segment_with_mode(
+                metadata,
+                &ledger.protection,
+                ledger.catalog.instance(),
+                RecoveryMode::Observe,
+            )?;
+            recovered.extend(recovered_segment.blocks);
+        }
+    }
+
+    let mut blocks = Vec::new();
+    blocks
+        .try_reserve_exact(record.blocks.len())
+        .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+    for expected in &record.blocks {
+        let block = state
+            .blocks
+            .iter()
+            .find(|actual| {
+                actual.identity == expected.identity
+                    && actual.position == expected.position
+                    && actual.segment == expected.segment
+            })
+            .or_else(|| {
+                recovered.iter().find(|actual| {
+                    actual.identity == expected.identity
+                        && actual.position == expected.position
+                        && actual.segment == expected.segment
+                })
+            })
+            .ok_or_else(|| {
+                if recovered
+                    .iter()
+                    .any(|actual| actual.segment == expected.segment)
+                {
+                    LedgerFailure::new(LedgerFailureCode::IntegrityCorruption)
+                } else {
+                    LedgerFailure::new(LedgerFailureCode::SnapshotExpired)
+                }
+            })?;
+        blocks.push(block.clone());
+    }
+    let mut previous_position = None;
+    for block in &blocks {
+        if previous_position.is_some_and(|previous| block.position <= previous) {
+            return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
+        }
+        previous_position = Some(block.position);
+    }
+    if blocks
+        .last()
+        .map_or(CommitPosition::origin(), |block| block.position)
+        != record.frontier
+    {
+        return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
+    }
+    Ok(blocks)
+}
+
+pub(crate) fn active_segments(
+    snapshot: &crate::CatalogSnapshot,
+    scope: SegmentScope,
+    now: u64,
+) -> Result<BTreeSet<super::super::SegmentId>, LedgerFailure> {
+    let mut segments = BTreeSet::new();
+    for record in records(snapshot)? {
+        if record.scope == scope && now < record.expiry {
+            for block in record.blocks {
+                segments.insert(block.segment);
+            }
+        }
+    }
+    Ok(segments)
 }
 
 pub(super) fn publish(

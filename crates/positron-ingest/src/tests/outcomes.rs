@@ -1,30 +1,145 @@
 use positron_domain::identity::TenantId;
 use positron_domain::routing::{SignalKind, VirtualShardId};
-use positron_domain::time::UnixNanoseconds;
 use positron_domain::value::{
     ByteLimit, RecordLimits, ValueLimitProfile, ValueLimitProfileCandidate, ValueLimitSet,
 };
 use positron_kernel::{
-    ActiveSegmentLedger, AppendCancellation, Catalog, CatalogSecret, FixedLifecycleClockSource,
-    InstanceId, LifecycleClock, ResourceAmounts, SegmentProtectionKey, SegmentScope,
-    StoreBlockIdentity, WorkClaim, WorkKind,
+    ActiveSegmentLedger, AppendCancellation, Catalog, CatalogSecret, InstanceId, OrdinaryPool,
+    ResourceAmounts, ResourceDimension, SegmentProtectionKey, SegmentScope, StoreBlockIdentity,
+    WorkClaim, WorkKind,
 };
-use positron_signals::{LogScan, LogStore, LogStoreFailureCode, ScanLimit};
+use positron_kernel::{CatalogPublicationFault, with_catalog_publication_fault_after};
+use positron_signals::{LogScan, LogStore, ScanLimit};
 
-use crate::{IngestFailureCode, IngestOutcome, IngestPolicy, LogIngest, OtlpLogsReceiver};
+use crate::{
+    AdmissionGroupPlanFailure, IngestFailureCode, IngestOutcome, IngestPolicy, LogIngest,
+    LokiPushReceiver, OtlpLogsReceiver,
+};
 
 use super::support::{fixture, protobuf_request, protobuf_with_bodies};
 
 #[test]
-fn log_store_allocation_failure_remains_retryable_at_ingest_boundary() {
+fn public_planning_failure_and_loki_defaults_are_stable_and_redacted() {
     assert_eq!(
-        crate::ingest::classify_log_store_failure_code(LogStoreFailureCode::ResourceExhausted),
-        IngestOutcome::Retryable(IngestFailureCode::CapacityUnavailable)
+        AdmissionGroupPlanFailure::AssignmentUnavailable.to_string(),
+        "admission group assignment failed"
     );
     assert_eq!(
-        crate::ingest::classify_log_store_failure_code(LogStoreFailureCode::LimitExceeded),
-        IngestOutcome::Permanent(IngestFailureCode::ValueLimitExceeded)
+        format!("{:?}", LokiPushReceiver::default()),
+        format!("{:?}", LokiPushReceiver::new())
     );
+}
+
+#[test]
+fn schema_authority_mismatch_is_storage_unavailable_not_capacity() {
+    let schema_fixture = fixture().expect("schema authority fixture");
+    let ingest_fixture = fixture().expect("ingest authority fixture");
+    let catalog = Catalog::open(
+        &ingest_fixture.authority,
+        InstanceId::new([0x51; 16]).expect("instance"),
+        CatalogSecret::from_owned(Box::new([0x52; 32]), Box::new([0x53; 32])),
+    )
+    .expect("catalog");
+    let shard = VirtualShardId::new(51).expect("shard");
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
+        &ingest_fixture.authority,
+        &ingest_fixture.retention_time,
+        &catalog,
+        SegmentScope::new(ingest_fixture.tenant, SignalKind::Logs, shard),
+        SegmentProtectionKey::from_owned(Box::new([0x54; 32])),
+    )
+    .expect("ledger");
+    let schema = super::support::schema_session(&schema_fixture).expect("schema session");
+    let batch = OtlpLogsReceiver::new()
+        .decode(protobuf_with_bodies(&["authority mismatch"]))
+        .expect("batch");
+    let policy = IngestPolicy::preserving(1).expect("policy");
+
+    assert_eq!(
+        LogIngest::new(
+            &ingest_fixture.authority,
+            &ledger,
+            &policy,
+            ingest_fixture.tenant,
+            shard,
+            schema,
+        )
+        .accept(
+            batch,
+            StoreBlockIdentity::new([0x55; 16]).expect("identity"),
+        ),
+        IngestOutcome::Retryable(IngestFailureCode::StorageUnavailable)
+    );
+}
+
+#[test]
+fn preparation_failure_rolls_back_schema_so_the_next_ingest_can_commit() {
+    let fixture = fixture().expect("kernel fixture");
+    let catalog = Catalog::open(
+        &fixture.authority,
+        InstanceId::new([0x56; 16]).expect("instance"),
+        CatalogSecret::from_owned(Box::new([0x57; 32]), Box::new([0x58; 32])),
+    )
+    .expect("catalog");
+    let shard = VirtualShardId::new(52).expect("shard");
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
+        &fixture.authority,
+        &fixture.retention_time,
+        &catalog,
+        SegmentScope::new(fixture.tenant, SignalKind::Logs, shard),
+        SegmentProtectionKey::from_owned(Box::new([0x59; 32])),
+    )
+    .expect("ledger");
+    let schema = super::support::schema_session(&fixture).expect("schema session");
+    let policy = IngestPolicy::preserving(1).expect("policy");
+    let ingest = LogIngest::new(
+        &fixture.authority,
+        &ledger,
+        &policy,
+        fixture.tenant,
+        shard,
+        schema.clone(),
+    );
+    let baseline = fixture
+        .authority
+        .governor()
+        .inspect()
+        .expect("baseline")
+        .outstanding_total();
+
+    let first =
+        with_catalog_publication_fault_after(CatalogPublicationFault::SynchronizeCommit, 0, || {
+            ingest.accept(
+                OtlpLogsReceiver::new()
+                    .decode(protobuf_with_bodies(&["first"]))
+                    .expect("first batch"),
+                StoreBlockIdentity::new([0x5a; 16]).expect("first identity"),
+            )
+        });
+    assert_eq!(
+        first,
+        IngestOutcome::Retryable(IngestFailureCode::StorageUnavailable)
+    );
+    assert_eq!(
+        fixture
+            .authority
+            .governor()
+            .inspect()
+            .expect("after rejection")
+            .outstanding_total(),
+        baseline
+    );
+
+    let second = ingest.accept(
+        OtlpLogsReceiver::new()
+            .decode(protobuf_with_bodies(&["second"]))
+            .expect("second batch"),
+        StoreBlockIdentity::new([0x5b; 16]).expect("second identity"),
+    );
+    assert!(matches!(second, IngestOutcome::Full(_)));
+    let checkpoint = schema.checkpoint().expect("checkpoint after retry");
+    assert_eq!(checkpoint.entry_count(), 2);
+    assert_eq!(checkpoint.pending_bytes(), 0);
 }
 
 #[test]
@@ -38,8 +153,9 @@ fn attributed_batch_cannot_cross_the_admission_group_tenant() {
     .expect("catalog");
     let other_tenant = TenantId::from_bytes([3; 16]).expect("tenant");
     let shard = VirtualShardId::new(61).expect("shard");
-    let ledger = ActiveSegmentLedger::open(
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
         &fixture.authority,
+        &fixture.retention_time,
         &catalog,
         SegmentScope::new(fixture.tenant, SignalKind::Logs, shard),
         SegmentProtectionKey::from_owned(Box::new([0x64; 32])),
@@ -49,11 +165,9 @@ fn attributed_batch_cannot_cross_the_admission_group_tenant() {
         .decode(protobuf_request())
         .expect("batch");
     let policy = IngestPolicy::preserving(1).expect("policy");
-    let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(1)));
     let outcome = LogIngest::new(
         &fixture.authority,
         &ledger,
-        &clock,
         &policy,
         other_tenant,
         shard,
@@ -72,7 +186,6 @@ fn attributed_batch_cannot_cross_the_admission_group_tenant() {
     let correct_ingest = LogIngest::new(
         &fixture.authority,
         &ledger,
-        &clock,
         &policy,
         fixture.tenant,
         shard,
@@ -101,20 +214,19 @@ fn cancellation_and_capacity_refusal_are_retryable_and_release_reservations() {
     )
     .expect("catalog");
     let shard = VirtualShardId::new(81).expect("shard");
-    let ledger = ActiveSegmentLedger::open(
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
         &fixture.authority,
+        &fixture.retention_time,
         &catalog,
         SegmentScope::new(fixture.tenant, SignalKind::Logs, shard),
         SegmentProtectionKey::from_owned(Box::new([0x84; 32])),
     )
     .expect("ledger");
     let policy = IngestPolicy::preserving(1).expect("policy");
-    let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(1)));
     let schema = super::support::schema_session(&fixture).expect("schema");
     let ingest = LogIngest::new(
         &fixture.authority,
         &ledger,
-        &clock,
         &policy,
         fixture.tenant,
         shard,
@@ -183,7 +295,146 @@ fn cancellation_and_capacity_refusal_are_retryable_and_release_reservations() {
 }
 
 #[test]
-fn post_commit_disconnect_is_ambiguous_while_retry_replays_one_durable_block() {
+fn snapshot_capacity_refusal_preserves_ingest_schema_and_governor_truth() {
+    let fixture = fixture().expect("kernel fixture");
+    let catalog = Catalog::open(
+        &fixture.authority,
+        InstanceId::new([0x88; 16]).expect("instance"),
+        CatalogSecret::from_owned(Box::new([0x89; 32]), Box::new([0x8a; 32])),
+    )
+    .expect("catalog");
+    let shard = VirtualShardId::new(82).expect("shard");
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
+        &fixture.authority,
+        &fixture.retention_time,
+        &catalog,
+        SegmentScope::new(fixture.tenant, SignalKind::Logs, shard),
+        SegmentProtectionKey::from_owned(Box::new([0x8b; 32])),
+    )
+    .expect("ledger");
+    let schema = super::support::schema_session(&fixture).expect("schema");
+    let baseline = fixture.authority.governor().inspect().expect("baseline");
+    let dimension = ResourceDimension::MemoryBytes;
+    let query_bytes = baseline
+        .pool_capacity(OrdinaryPool::Shared, dimension)
+        .checked_sub(baseline.pool_usage(OrdinaryPool::Shared, dimension))
+        .and_then(|shared| {
+            baseline
+                .pool_capacity(OrdinaryPool::InteractiveQueryTail, dimension)
+                .checked_sub(baseline.pool_usage(OrdinaryPool::InteractiveQueryTail, dimension))
+                .and_then(|query| shared.checked_add(query))
+        })
+        .and_then(|available| available.checked_sub(1))
+        .expect("query capacity blocker");
+    let blocker = fixture
+        .authority
+        .governor()
+        .reserve(
+            WorkClaim::tenant(
+                fixture.tenant,
+                WorkKind::InteractiveQueryTail,
+                ResourceAmounts::only(dimension, query_bytes).expect("bounded query claim"),
+            )
+            .expect("query claim"),
+        )
+        .expect("query blocker");
+    let blocked = fixture.authority.governor().inspect().expect("blocked");
+    let policy = IngestPolicy::preserving(1).expect("policy");
+
+    assert_eq!(
+        LogIngest::new(
+            &fixture.authority,
+            &ledger,
+            &policy,
+            fixture.tenant,
+            shard,
+            schema.clone(),
+        )
+        .accept(
+            OtlpLogsReceiver::new()
+                .decode(protobuf_request())
+                .expect("batch"),
+            StoreBlockIdentity::new([0x8c; 16]).expect("identity"),
+        ),
+        IngestOutcome::Retryable(IngestFailureCode::CapacityUnavailable)
+    );
+    let released = fixture.authority.governor().inspect().expect("released");
+    assert_eq!(released.outstanding_total(), blocked.outstanding_total());
+    for dimension in ResourceDimension::ALL {
+        assert_eq!(released.usage(dimension), blocked.usage(dimension));
+    }
+    assert_eq!(released.rejection_count(), blocked.rejection_count() + 1);
+    let checkpoint = schema.checkpoint().expect("unchanged checkpoint");
+    assert_eq!(checkpoint.entry_count(), 0);
+    assert_eq!(checkpoint.pending_bytes(), 0);
+    drop(blocker);
+    assert!(
+        ledger
+            .snapshot()
+            .expect("snapshot after release")
+            .blocks()
+            .is_empty()
+    );
+    let after = fixture.authority.governor().inspect().expect("baseline");
+    assert_eq!(after.outstanding_total(), baseline.outstanding_total());
+    for dimension in ResourceDimension::ALL {
+        assert_eq!(after.usage(dimension), baseline.usage(dimension));
+    }
+}
+
+#[test]
+fn physical_shard_mismatch_is_permanent_and_rolls_back_staged_schema() {
+    let fixture = fixture().expect("kernel fixture");
+    let catalog = Catalog::open(
+        &fixture.authority,
+        InstanceId::new([0x8d; 16]).expect("instance"),
+        CatalogSecret::from_owned(Box::new([0x8e; 32]), Box::new([0x8f; 32])),
+    )
+    .expect("catalog");
+    let ledger_shard = VirtualShardId::new(83).expect("ledger shard");
+    let ingest_shard = VirtualShardId::new(84).expect("ingest shard");
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
+        &fixture.authority,
+        &fixture.retention_time,
+        &catalog,
+        SegmentScope::new(fixture.tenant, SignalKind::Logs, ledger_shard),
+        SegmentProtectionKey::from_owned(Box::new([0x90; 32])),
+    )
+    .expect("ledger");
+    let schema = super::support::schema_session(&fixture).expect("schema");
+    let baseline = fixture.authority.governor().inspect().expect("baseline");
+    let policy = IngestPolicy::preserving(1).expect("policy");
+
+    assert_eq!(
+        LogIngest::new(
+            &fixture.authority,
+            &ledger,
+            &policy,
+            fixture.tenant,
+            ingest_shard,
+            schema.clone(),
+        )
+        .accept(
+            OtlpLogsReceiver::new()
+                .decode(protobuf_request())
+                .expect("batch"),
+            StoreBlockIdentity::new([0x91; 16]).expect("identity"),
+        ),
+        IngestOutcome::Permanent(IngestFailureCode::InvalidRecord)
+    );
+    assert!(ledger.snapshot().expect("snapshot").blocks().is_empty());
+    let checkpoint = schema.checkpoint().expect("rolled back checkpoint");
+    assert_eq!(checkpoint.entry_count(), 0);
+    assert_eq!(checkpoint.pending_bytes(), 0);
+    let after = fixture.authority.governor().inspect().expect("after");
+    assert_eq!(after.outstanding_total(), baseline.outstanding_total());
+    for dimension in ResourceDimension::ALL {
+        assert_eq!(after.usage(dimension), baseline.usage(dimension));
+    }
+}
+
+#[test]
+fn post_commit_disconnect_is_ambiguous_and_duplicate_identity_cannot_rewrite_ingest_time() {
     let fixture = fixture().expect("kernel fixture");
     let catalog = Catalog::open(
         &fixture.authority,
@@ -192,19 +443,18 @@ fn post_commit_disconnect_is_ambiguous_while_retry_replays_one_durable_block() {
     )
     .expect("catalog");
     let shard = VirtualShardId::new(91).expect("shard");
-    let ledger = ActiveSegmentLedger::open(
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
         &fixture.authority,
+        &fixture.retention_time,
         &catalog,
         SegmentScope::new(fixture.tenant, SignalKind::Logs, shard),
         SegmentProtectionKey::from_owned(Box::new([0x94; 32])),
     )
     .expect("ledger");
     let policy = IngestPolicy::preserving(1).expect("policy");
-    let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(10)));
     let ingest = LogIngest::new(
         &fixture.authority,
         &ledger,
-        &clock,
         &policy,
         fixture.tenant,
         shard,
@@ -217,7 +467,7 @@ fn post_commit_disconnect_is_ambiguous_while_retry_replays_one_durable_block() {
             .expect("batch"),
         identity,
     );
-    let first_receipt = match first {
+    let _first_receipt = match first {
         IngestOutcome::Full(committed) => committed.receipt(),
         other => panic!("expected commit, got {other:?}"),
     };
@@ -232,11 +482,10 @@ fn post_commit_disconnect_is_ambiguous_while_retry_replays_one_durable_block() {
             .expect("retry batch"),
         identity,
     );
-    let retry_receipt = match retry {
-        IngestOutcome::Full(committed) => committed.receipt(),
-        other => panic!("expected idempotent replay, got {other:?}"),
-    };
-    assert_eq!(retry_receipt, first_receipt);
+    assert_eq!(
+        retry,
+        IngestOutcome::Permanent(IngestFailureCode::IdempotencyConflict)
+    );
     assert_eq!(ledger.snapshot().expect("snapshot").blocks().len(), 1);
 
     assert_eq!(
@@ -272,10 +521,10 @@ fn committed_logs_survive_reopen_and_remain_publicly_readable() {
     let shard = VirtualShardId::new(101).expect("shard");
     let scope = SegmentScope::new(fixture.tenant, SignalKind::Logs, shard);
     let policy = IngestPolicy::preserving(1).expect("policy");
-    let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(11)));
     {
-        let ledger = ActiveSegmentLedger::open(
+        let ledger = ActiveSegmentLedger::open_with_retention_time(
             &fixture.authority,
+            &fixture.retention_time,
             &catalog,
             scope,
             SegmentProtectionKey::from_owned(Box::new([0xa5; 32])),
@@ -285,7 +534,6 @@ fn committed_logs_survive_reopen_and_remain_publicly_readable() {
             LogIngest::new(
                 &fixture.authority,
                 &ledger,
-                &clock,
                 &policy,
                 fixture.tenant,
                 shard,
@@ -301,8 +549,9 @@ fn committed_logs_survive_reopen_and_remain_publicly_readable() {
         ));
     }
 
-    let reopened = ActiveSegmentLedger::open(
+    let reopened = ActiveSegmentLedger::open_with_retention_time(
         &fixture.authority,
+        &fixture.retention_time,
         &catalog,
         scope,
         SegmentProtectionKey::from_owned(Box::new([0xa5; 32])),
@@ -334,8 +583,9 @@ fn receiver_profile_snapshot_governs_post_policy_log_validation() {
     .expect("catalog");
     let shard = VirtualShardId::new(111).expect("shard");
     let scope = SegmentScope::new(fixture.tenant, SignalKind::Logs, shard);
-    let ledger = ActiveSegmentLedger::open(
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
         &fixture.authority,
+        &fixture.retention_time,
         &catalog,
         scope,
         SegmentProtectionKey::from_owned(Box::new([0xb4; 32])),
@@ -355,12 +605,10 @@ fn receiver_profile_snapshot_governs_post_policy_log_validation() {
         .decode(protobuf_with_bodies(&["12345"]))
         .expect("structural decode uses the safe system maximum before policy");
     let policy = IngestPolicy::preserving(1).expect("policy");
-    let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(12)));
 
     let outcome = LogIngest::new(
         &fixture.authority,
         &ledger,
-        &clock,
         &policy,
         fixture.tenant,
         shard,

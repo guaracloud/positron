@@ -12,7 +12,6 @@ use opentelemetry_proto::tonic::common::v1::{AnyValue, ArrayValue, KeyValue, any
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use positron_domain::identity::TenantId;
 use positron_domain::routing::{SignalKind, VirtualShardId};
-use positron_domain::time::UnixNanoseconds;
 use positron_domain::value::{AttributeNamespace, AttributeValueKind};
 use positron_governance::{
     AuthorizedContext, CompatibilityHints, PresentedCredential, RequestedIntent,
@@ -23,12 +22,12 @@ use positron_ingest::{
     PolicyRule, PolicyTarget, TenantSchemaRegistry, TenantSchemaSession,
 };
 use positron_kernel::{
-    ActiveSegmentLedger, Catalog, CatalogSecret, DiskPressureThresholds, FixedLifecycleClockSource,
-    GovernorPolicy, InstanceId, InventoryCardinalityLimits, LifecycleClock, MountQualification,
-    ObservedResourceEnvironment, OperatorLimits, OrdinaryPoolPolicy, PrimaryDataVolume,
-    RecoveryPoolCapacities, RecoveryReserve, RegisteredResourceBounds, ResourceAmounts,
-    ResourceDimension, ResourceGovernorConfiguration, ResourceInventory, SegmentProtectionKey,
-    SegmentScope, StorageKernelResourceAuthority, StoreBlockIdentity, TenantQuota,
+    ActiveSegmentLedger, Catalog, CatalogSecret, DiskPressureThresholds, GovernorPolicy,
+    InstanceId, InventoryCardinalityLimits, MountQualification, ObservedResourceEnvironment,
+    OperatorLimits, OrdinaryPoolPolicy, PrimaryDataVolume, RecoveryPoolCapacities, RecoveryReserve,
+    RegisteredResourceBounds, ResourceAmounts, ResourceDimension, ResourceGovernorConfiguration,
+    ResourceInventory, SegmentProtectionKey, SegmentScope, StorageKernelResourceAuthority,
+    StoreBlockIdentity, TenantQuota,
 };
 use positron_runtime::{BootstrapPaths, InitializationPlan, InstanceBootstrap};
 use prost::Message;
@@ -134,11 +133,9 @@ impl FuzzFixture {
         let Some(group) = groups.next() else {
             return;
         };
-        let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(1)));
         let _ = LogIngest::new(
             self.authority,
             self.ledger,
-            &clock,
             &policy,
             self.tenant,
             shard,

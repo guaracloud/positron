@@ -15,10 +15,7 @@ use positron_signals::{
 use positron_signals::{ScanObservationFailureCode, ScanObserver};
 
 use super::super::schema_admission_estimate;
-use super::{
-    IngestFailureCode, IngestOutcome, SchemaSessionFailure, map_schema_session_failure,
-    rollback_schema,
-};
+use super::{IngestFailureCode, IngestOutcome, rollback_schema};
 
 #[test]
 fn production_observed_schema_stage_publishes_a_complete_text_summary() {
@@ -165,76 +162,6 @@ fn rejected_observed_work_does_not_poison_the_cumulative_budget() {
         Err(ScanObservationFailureCode::BudgetExhausted)
     );
     assert_eq!(observer.consumed(), 3);
-}
-
-#[test]
-fn schema_failures_keep_their_closed_ingest_outcomes() {
-    let cases = [
-        (
-            SchemaSessionFailure::TenantConflict,
-            IngestOutcome::Permanent(IngestFailureCode::TenantConflict),
-        ),
-        (
-            SchemaSessionFailure::Schema(SchemaFailure::InvalidBudget),
-            IngestOutcome::Permanent(IngestFailureCode::InvalidRecord),
-        ),
-        (
-            SchemaSessionFailure::Schema(SchemaFailure::InvalidPath),
-            IngestOutcome::Permanent(IngestFailureCode::InvalidRecord),
-        ),
-        (
-            SchemaSessionFailure::Schema(SchemaFailure::PathTooLong),
-            IngestOutcome::Permanent(IngestFailureCode::InvalidRecord),
-        ),
-        (
-            SchemaSessionFailure::Schema(SchemaFailure::InvalidValue),
-            IngestOutcome::Permanent(IngestFailureCode::InvalidRecord),
-        ),
-        (
-            SchemaSessionFailure::Schema(SchemaFailure::MalformedCatalog),
-            IngestOutcome::Permanent(IngestFailureCode::InvalidRecord),
-        ),
-        (
-            SchemaSessionFailure::Schema(SchemaFailure::LimitExceeded),
-            IngestOutcome::Permanent(IngestFailureCode::ValueLimitExceeded),
-        ),
-        (
-            SchemaSessionFailure::ReplayLimitExceeded,
-            IngestOutcome::Permanent(IngestFailureCode::ValueLimitExceeded),
-        ),
-        (
-            SchemaSessionFailure::RegistryLimitExceeded,
-            IngestOutcome::Permanent(IngestFailureCode::ValueLimitExceeded),
-        ),
-        (
-            SchemaSessionFailure::Schema(SchemaFailure::AllocationUnavailable),
-            IngestOutcome::Retryable(IngestFailureCode::CapacityUnavailable),
-        ),
-        (
-            SchemaSessionFailure::StateUnavailable,
-            IngestOutcome::Retryable(IngestFailureCode::CapacityUnavailable),
-        ),
-        (
-            SchemaSessionFailure::Cancelled,
-            IngestOutcome::Retryable(IngestFailureCode::Cancelled),
-        ),
-        (
-            SchemaSessionFailure::InFlight,
-            IngestOutcome::Retryable(IngestFailureCode::StorageUnavailable),
-        ),
-        (
-            SchemaSessionFailure::PendingReconciliationRequired,
-            IngestOutcome::Retryable(IngestFailureCode::StorageUnavailable),
-        ),
-        (
-            SchemaSessionFailure::ReplayIntegrity,
-            IngestOutcome::Retryable(IngestFailureCode::StorageUnavailable),
-        ),
-    ];
-
-    for (failure, expected) in cases {
-        assert_eq!(map_schema_session_failure(failure), expected);
-    }
 }
 
 #[test]

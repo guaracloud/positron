@@ -1,5 +1,5 @@
 use std::error::Error;
-use std::sync::Mutex;
+use std::sync::{Arc, Barrier};
 
 use positron_domain::routing::{SignalKind, VirtualShardId};
 use positron_domain::value::AttributeValueKind;
@@ -22,8 +22,6 @@ use super::support::{
 use super::terminal_and_bounds::QueryFixture;
 
 struct OperatorOverflowWorkMeter;
-
-static TAIL_CURSOR_FAULT_LOCK: Mutex<()> = Mutex::new(());
 
 impl positron_query::QueryWorkMeter for OperatorOverflowWorkMeter {
     fn units(
@@ -200,9 +198,6 @@ fn tail_resume_frames_cumulative_elapsed_overflow_before_delivery() -> Result<()
 
 #[test]
 fn tail_terminal_stats_accumulate_resume_and_repeat_counts() -> Result<(), Box<dyn Error>> {
-    let _fault_lock = TAIL_CURSOR_FAULT_LOCK
-        .lock()
-        .map_err(|_| "fault lock poisoned")?;
     let fixture = QueryFixture::new("tail-terminal-resume-stats")?;
     fixture.kernel.append_log("repeat", 1, 1)?;
     let service = fixture.service(16)?;
@@ -397,10 +392,7 @@ fn tail_ack_cursor_encode_failure_keeps_safe_progress_and_terminalizes_once()
     let Some(TailEvent::Batch(batch)) = tail.poll() else {
         return Err("acknowledgement failure batch missing".into());
     };
-    let _fault_lock = TAIL_CURSOR_FAULT_LOCK
-        .lock()
-        .map_err(|_| "fault lock poisoned")?;
-    positron_query::fail_next_tail_cursor_encode();
+    tail.fail_next_cursor_encode();
     assert_eq!(
         tail.acknowledge(batch.sequence(), batch.digest())
             .expect_err("injected cursor encoding failure must be returned")
@@ -416,6 +408,69 @@ fn tail_ack_cursor_encode_failure_keeps_safe_progress_and_terminalizes_once()
         })) if cursor == safe_cursor && stats.emitted_records() == 0
     ));
     assert!(tail.poll().is_none());
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn tail_cursor_encode_failure_is_owned_by_one_session() -> Result<(), Box<dyn Error>> {
+    let faulted_fixture = QueryFixture::new("tail-session-owned-encode-fault")?;
+    faulted_fixture.kernel.append_log("faulted", 1, 1)?;
+    let faulted_service = faulted_fixture.service(16)?;
+    let budget = QueryBudget::new(1_048_576, 16, 1, 1_048_576, 1_048_576, 60)?;
+    let faulted_query = faulted_service.plan_pipeline(
+        faulted_fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
+        budget,
+    )?;
+    let mut faulted = faulted_service.tail(faulted_query, TailStart::Historical { max_rows: 1 })?;
+    assert!(matches!(faulted.poll(), Some(TailEvent::Header(_))));
+    let Some(TailEvent::Batch(faulted_batch)) = faulted.poll() else {
+        return Err("faulted session batch missing".into());
+    };
+
+    let ordinary_fixture = QueryFixture::new("tail-session-ordinary-encode")?;
+    let ordinary_service = ordinary_fixture.service(16)?;
+    let ordinary_query = ordinary_service.plan_pipeline(
+        ordinary_fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit all",
+        budget,
+    )?;
+    let mut ordinary = ordinary_service.tail(ordinary_query, TailStart::Now)?;
+    assert!(matches!(ordinary.poll(), Some(TailEvent::Header(_))));
+    let ordinary_kernel = &ordinary_fixture.kernel;
+
+    let armed = Arc::new(Barrier::new(2));
+    let ordinary_encoded = Arc::new(Barrier::new(2));
+    let (faulted_result, ordinary_event) = std::thread::scope(|scope| {
+        let armed_for_faulted = Arc::clone(&armed);
+        let encoded_for_faulted = Arc::clone(&ordinary_encoded);
+        let faulted_thread = scope.spawn(move || {
+            faulted.fail_next_cursor_encode();
+            armed_for_faulted.wait();
+            encoded_for_faulted.wait();
+            faulted.acknowledge(faulted_batch.sequence(), faulted_batch.digest())
+        });
+        let ordinary_thread = scope.spawn(move || {
+            armed.wait();
+            let append_succeeded = ordinary_kernel.append_log("ordinary", 1, 1).is_ok();
+            let event = append_succeeded.then(|| ordinary.poll()).flatten();
+            ordinary_encoded.wait();
+            (append_succeeded, event)
+        });
+        (faulted_thread.join(), ordinary_thread.join())
+    });
+    let faulted_result = faulted_result.map_err(|_| "faulted session thread panicked")?;
+    let (append_succeeded, ordinary_event) =
+        ordinary_event.map_err(|_| "ordinary session thread panicked")?;
+    assert!(append_succeeded, "ordinary session append failed");
+    assert!(matches!(ordinary_event, Some(TailEvent::Batch(_))));
+    assert_eq!(
+        faulted_result
+            .expect_err("the owning session must consume its cursor fault")
+            .code(),
+        QueryFailureCode::InvalidCursor
+    );
     Ok(())
 }
 
@@ -630,9 +685,6 @@ fn tail_historical_admission_failure_releases_the_lease_before_returning()
 
 #[test]
 fn tail_terminal_and_drop_paths_reclaim_lease_capacity_repeatedly() -> Result<(), Box<dyn Error>> {
-    let _fault_lock = TAIL_CURSOR_FAULT_LOCK
-        .lock()
-        .map_err(|_| "fault lock poisoned")?;
     let fixture = QueryFixture::new("tail-terminal-release-loop")?;
     let clock = TestClock::shared(100);
     let service = zero_work_clock_service(
@@ -1648,10 +1700,7 @@ fn tail_terminal_cursor_sync_failure_is_framed_once() -> Result<(), Box<dyn Erro
     )?;
     let mut tail = service.tail(query, TailStart::Now)?;
     assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
-    let _fault_lock = TAIL_CURSOR_FAULT_LOCK
-        .lock()
-        .map_err(|_| "fault lock poisoned")?;
-    positron_query::fail_next_tail_cursor_encode();
+    tail.fail_next_cursor_encode();
     tail.disconnect();
     assert!(matches!(
         tail.poll(),
@@ -2860,10 +2909,7 @@ fn tail_lease_roll_encode_failure_keeps_the_old_safe_binding() -> Result<(), Box
     let Some(TailEvent::Batch(batch)) = tail.poll() else {
         return Err("post-admission batch missing".into());
     };
-    let _fault_lock = TAIL_CURSOR_FAULT_LOCK
-        .lock()
-        .map_err(|_| "fault lock poisoned")?;
-    positron_query::fail_next_tail_cursor_encode();
+    tail.fail_next_cursor_encode();
     assert_eq!(
         tail.acknowledge(batch.sequence(), batch.digest())
             .expect_err("cursor encoding failure must be returned")
@@ -2889,9 +2935,6 @@ fn tail_lease_roll_encode_failure_keeps_the_old_safe_binding() -> Result<(), Box
 #[test]
 fn tail_lease_roll_rejects_an_expired_replacement_before_publication() -> Result<(), Box<dyn Error>>
 {
-    let _fault_lock = TAIL_CURSOR_FAULT_LOCK
-        .lock()
-        .map_err(|_| "fault lock poisoned")?;
     let fixture = QueryFixture::new("tail-live-lease-roll-expiry")?;
     let clock = StepClock::shared(0);
     let service = QueryService::with_clock(

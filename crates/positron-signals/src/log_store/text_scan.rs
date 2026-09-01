@@ -148,7 +148,7 @@ impl LogStore {
             let skipped = skipped_records(scan, block.position());
             let available = block_records.saturating_sub(skipped);
             if available > remaining {
-                let decoded = decode.decode_after(snapshot, skipped, remaining, cancellation)?;
+                let decoded = decode.decode_after(block, skipped, remaining, cancellation)?;
                 for (offset, record) in decoded.records.into_iter().enumerate() {
                     let ordinal = skipped
                         .checked_add(offset)
@@ -162,7 +162,7 @@ impl LogStore {
                 complete = false;
                 break;
             }
-            let decoded = decode.decode_after(snapshot, skipped, remaining, cancellation)?;
+            let decoded = decode.decode_after(block, skipped, remaining, cancellation)?;
             for (offset, record) in decoded.records.into_iter().enumerate() {
                 let ordinal = skipped
                     .checked_add(offset)

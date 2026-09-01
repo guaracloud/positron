@@ -66,8 +66,11 @@ fn failed_frame_synchronization_never_acknowledges_and_recovery_discards_its_tai
             .code(),
         LedgerFailureCode::RecoveryRequired
     );
-    assert_eq!(ledger.snapshot()?.frontier(), acknowledged.position());
-    assert_eq!(ledger.snapshot()?.blocks().len(), 1);
+    let snapshot_failure = match ledger.snapshot() {
+        Ok(_) => return Err("post-mutation append uncertainty did not fence snapshots".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(snapshot_failure.code(), LedgerFailureCode::RecoveryRequired);
     drop(ledger);
 
     let reopened = ActiveSegmentLedger::open(&authority, &catalog, scope, wrapping_key())?;

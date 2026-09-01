@@ -22,8 +22,8 @@ the owned Primary Data Volume and opened relative to retained directories:
 The immutable physical scope is `(tenant_id, signal_kind, virtual_shard_id)`.
 One Catalog object records the scope, segment identity, lifecycle state, and
 base Commit Position. At most one object per scope may be active. Catalog
-Generations are the lifecycle authority; the header state records creation and
-is not rewritten while sealing.
+Generations are the lifecycle authority; the encrypted physical header records
+segment creation and is not rewritten while sealing or reclaiming.
 
 ## Catalog segment metadata
 
@@ -31,16 +31,45 @@ is not rewritten while sealing.
 | ---: | --- | --- |
 | 8 | magic | ASCII `PSEGMET1` |
 | 2 | version | `1` |
-| 1 | state | `1` active, `2` sealed |
+| 1 | state | `1` active, `2` sealed, `3` retired |
 | 16 | tenant ID | nonzero domain identity |
 | 1 | signal | `1` logs, `2` traces |
 | 4 | virtual shard ID | valid nonzero shard |
 | 16 | segment ID | random, nonzero |
-| 8 | base Commit Position | predecessor frontier |
+| 8 | base Commit Position | predecessor frontier; for `retired`, the segment's final frontier |
 
 The encoding is exactly 56 bytes. Objects without this magic belong to another
 Catalog authority and are ignored. Matching magic with invalid length,
 version, or fields fails closed.
+
+## Catalog retention frontier
+
+Each retention-enabled physical scope has at most one authenticated frontier
+object in the same Catalog Generation as its segment metadata:
+
+| Bytes | Field | Value or limit |
+| ---: | --- | --- |
+| 8 | magic | ASCII `PRETFR01` |
+| 2 | version | `1` |
+| 16 | tenant ID | nonzero domain identity |
+| 1 | signal | `1` logs, `2` traces |
+| 4 | virtual shard ID | valid nonzero shard |
+| 8 | frontier Ingest Time | signed Unix nanoseconds |
+
+The encoding is exactly 39 bytes. A matching magic with an unknown version,
+invalid length, invalid scope, or duplicate scope fails closed. The initial
+value comes from the kernel retention-time authority before the scope contains
+retention-enabled data. Thereafter it advances only by process-monotonic
+elapsed time. Recovery resumes at the authenticated durable value and adds no
+downtime; subsequent wall-clock movement cannot advance or regress it.
+
+Block preparation publishes this frontier before issuing the move-only
+preparation capability. Retirement publishes its advanced frontier and all
+Retired segment metadata in one Catalog Writer transaction. An ambiguous
+publication is reconciled against the latest authenticated generation; live
+snapshot visibility follows that latest generation before an ordinary failure
+is returned. Legacy segments without both a v3 durability bound and this
+frontier remain retention-ineligible.
 
 ## Segment header
 
@@ -69,7 +98,10 @@ also embedded in the canonical wrapped payload and its context digest. The
 wrapped-key context binds the Positron instance, key kind, segment object and
 key epoch, segment scope, tenant, signal, shard, format epoch, and exact provider
 route. The encrypted metadata independently binds scope, segment identity,
-creation lifecycle, and base Commit Position. A wrong protection key,
+creation lifecycle, and the segment's creation base Commit Position. Retention
+does not rewrite this physical metadata; a retired Catalog continuity marker
+is the logical retirement record after the file leaves the active snapshot set.
+A wrong protection key,
 substituted route, or substituted context fails authentication.
 
 The header is written once, synchronized, then made reachable by synchronizing
@@ -82,7 +114,7 @@ Immediately after the header, each canonical Store Block is encoded as:
 | Bytes | Field | Value or limit |
 | ---: | --- | --- |
 | 4 | encrypted-frame length | at most 1,048,960 |
-| variable | encrypted frame | existing encrypted-frame format; plaintext is the 16-byte stable Store Block identity followed by canonical block bytes |
+| variable | encrypted frame | existing encrypted-frame format; plaintext is the 16-byte stable Store Block identity, one-byte retention tag, signed 64-bit exact kernel preparation Ingest Time, then canonical block bytes |
 
 Plaintext blocks are nonempty and at most 1,048,576 bytes. Frame context binds
 the segment object, `StoreBlock` purpose, format and key epochs, and the
@@ -96,17 +128,41 @@ idempotent within the retained ledger. Reusing an identity with different
 bytes fails closed. Equal canonical bytes under distinct identities are
 legitimate separate appends.
 
+The per-block retention tag is `1` with a zero time when authenticated
+lifecycle metadata is unavailable, or `2` with the exact kernel-issued
+preparation Ingest Time. Empty (`0`) is invalid for a Store Block. Recovery
+authenticates every block value and folds them to the segment maximum; the
+result must exactly match the authenticated Durability Frontier aggregate.
+
 ## Durability Frontier
 
-Format v2 encrypts frontier metadata as one independent frame:
+Format v3 writes frontier envelope version 1, carries the active-segment format
+version explicitly, and encrypts the metadata as one independent frame:
 
 | Bytes | Field | Value or limit |
 | ---: | --- | --- |
 | 8 | magic | ASCII `PFRONT02` |
-| 2 | version | `1` |
-| 2 | frame algorithm | `1`, AES-256-GCM |
+| 2 | frontier envelope version | `1` |
+| 2 | active-segment format version | `3` |
 | 4 | encrypted-frame length | at most 512 |
-| variable | encrypted frontier frame | plaintext is `durable_bytes:u64 || next_sequence:u64 || commit_position:u64` |
+| variable | encrypted frontier frame | v3 plaintext is `active_segment_format_version:u16 || durable_bytes:u64 || next_sequence:u64 || commit_position:u64 || retention_tag:u8 || maximum_ingest_time:i64` |
+
+The authenticated inner `active_segment_format_version` must equal the outer
+selector before recovery interprets any v3 block or retention field. Changing
+only the outer selector between v3 and a legacy layout is integrity corruption.
+`retention_tag` is `0` for an empty segment, `1` when complete lifecycle
+metadata is unavailable, and `2` when `maximum_ingest_time` is the authenticated
+aggregate of every Store Block appended to the segment. Non-Log Store and
+legacy frontier-v1 segments recover as unavailable and cannot be selected for
+destructive retention. Frontier format v1 has no retention bound. Frontier
+format v2 remains readable, but its legacy caller-supplied bound is treated as
+unavailable for destructive retention. Frontier format v3 is emitted only from
+the Storage Kernel's move-only block preparation and is therefore the first
+format whose maximum Ingest Time can authorize retention. The Log Store encodes
+the kernel-issued Ingest Time while preparing canonical records; the Storage
+Kernel preserves that exact value in the Store Block frame, authenticates the
+aggregate in the frontier, and derives deletion evidence by folding those
+values after restart.
 
 The frontier frame purpose is `DurabilityFrontier`; its nonce sequence is
 `u64::MAX - encrypted_next_sequence`, disjoint from metadata and Store Block
@@ -170,8 +226,14 @@ migration path.
 
 Sealing moves the unchanged segment and frontier from `active` to `sealed`,
 synchronizes both directories, and publishes sealed Catalog metadata. It does
-not copy, decrypt, re-encrypt, or rewrite acknowledged bytes. Every rename and
-publication edge is idempotently recoverable.
+not copy, decrypt, re-encrypt, or rewrite acknowledged bytes. Retention changes
+sealed metadata to `retired` in one Catalog publication, recording its final
+frontier in the retired metadata and making the segment
+invisible to new snapshots. The retired files remain in `sealed` until no
+existing snapshot or live Snapshot Lease references them; reclamation then
+unlinks the files and retains a bounded retired Catalog continuity marker so
+the next active segment can be reopened without reintroducing expired data.
+Every rename and publication edge is idempotently recoverable.
 
 ## Bounds
 

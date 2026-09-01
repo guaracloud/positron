@@ -10,6 +10,10 @@ repository.workspace = true
 homepage.workspace = true
 publish = false
 
+[features]
+default = []
+test-support = ["positron-kernel/test-support"]
+
 [lints]
 workspace = true
 
@@ -18,3 +22,7 @@ positron-domain = { path = "../positron-domain" }
 positron-kernel = { path = "../positron-kernel" }
 positron-policy = { path = "../positron-policy" }
 sha2 = { version = "=0.11.0", default-features = false }
+
+[dev-dependencies]
+positron-governance = { path = "../positron-governance" }
+positron-kernel = { path = "../positron-kernel", features = ["test-support"] }

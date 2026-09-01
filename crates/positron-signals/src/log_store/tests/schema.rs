@@ -229,7 +229,7 @@ fn observed_text_replay_has_an_exact_work_boundary_and_falls_back_atomically()
     let store = LogStore::new();
     let identity = StoreBlockIdentity::new([0x94; 16])?;
     let block = store
-        .prepare(
+        .prepare_unretained_for_test(
             preparation_capacity(&authority, tenant)?,
             &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(120))),
             tenant,
@@ -520,7 +520,7 @@ fn same_block_overflow_keeps_integer_query_unpruned() -> Result<(), Box<dyn Erro
         records[2].attributes()[0].representation(),
         AttributeRepresentation::Generic
     );
-    let prepared = store.prepare(
+    let prepared = store.prepare_unretained_for_test(
         preparation_capacity(&authority, tenant)?,
         &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
         tenant,

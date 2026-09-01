@@ -17,9 +17,9 @@ use positron_kernel::{
     InstanceId, InventoryCardinalityLimits, LifecycleClock, MountQualification,
     ObservedResourceEnvironment, OperatorLimits, OrdinaryPoolPolicy, PreparedStoreBlock,
     PrimaryDataVolume, RecoveryPoolCapacities, RecoveryReserve, ResourceAmounts, ResourceDimension,
-    ResourceGovernorConfiguration, ResourceInventory, SegmentProtectionKey, SegmentScope,
-    StorageKernelResourceAuthority, StoreBlockIdentity, TenantQuota, TransactionId, WorkClaim,
-    WorkKind,
+    ResourceGovernorConfiguration, ResourceInventory, RetentionTimeAuthority, SegmentProtectionKey,
+    SegmentScope, StorageKernelResourceAuthority, StoreBlockIdentity, TenantQuota, TransactionId,
+    WorkClaim, WorkKind,
 };
 use positron_policy::{
     IngestPolicy, LogMetadata, NativeLogAttribute, NativeLogCandidate, PolicyEvaluation,
@@ -873,6 +873,7 @@ impl Drop for TemporaryRoots {
 
 pub struct KernelFixture {
     pub authority: &'static StorageKernelResourceAuthority,
+    retention_time: &'static RetentionTimeAuthority,
     catalog: &'static Catalog<'static>,
     ledger: Option<ActiveSegmentLedger<'static, 'static>>,
     tenant: TenantId,
@@ -923,6 +924,9 @@ impl KernelFixture {
             InstanceId::new([0x31; 16])?,
             CatalogSecret::from_owned(Box::new([0x32; 32]), Box::new([0x33; 32])),
         )?));
+        let retention_time = Box::leak(Box::new(RetentionTimeAuthority::for_test_ingest_time(
+            UnixNanoseconds::new(50),
+        )));
         let shard = VirtualShardId::new(1)?;
         let ledger = ActiveSegmentLedger::open(
             authority,
@@ -932,6 +936,7 @@ impl KernelFixture {
         )?;
         Ok(Self {
             authority,
+            retention_time,
             catalog,
             ledger: Some(ledger),
             tenant,
@@ -1000,6 +1005,19 @@ impl KernelFixture {
         Ok(())
     }
 
+    pub fn reopen_ledger_with_retention_time(&mut self) -> Result<(), Box<dyn Error>> {
+        let ledger = self.ledger.take().ok_or("ledger unavailable")?;
+        drop(ledger);
+        self.ledger = Some(ActiveSegmentLedger::open_with_retention_time(
+            self.authority,
+            self.retention_time,
+            self.catalog,
+            SegmentScope::new(self.tenant, SignalKind::Logs, self.shard),
+            SegmentProtectionKey::from_owned(Box::new([0x34; 32])),
+        )?);
+        Ok(())
+    }
+
     pub fn append_log(
         &self,
         body: &str,
@@ -1044,6 +1062,9 @@ impl KernelFixture {
         candidates: Vec<(Option<i64>, Option<CandidateAttributeValue>)>,
         identity: u8,
     ) -> Result<(), Box<dyn Error>> {
+        if ledger.scope().tenant_id() != self.tenant || ledger.scope().shard_id() != shard {
+            return Err("query fixture ledger scope mismatch".into());
+        }
         let mut records = Vec::new();
         records.try_reserve_exact(candidates.len())?;
         for (event_time, body) in candidates {
@@ -1065,11 +1086,11 @@ impl KernelFixture {
             ResourceAmounts::only(ResourceDimension::MemoryBytes, 1_048_576)?,
         )?)?;
         let block = LogStore::new().prepare(
-            capacity,
-            &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(50))),
-            self.tenant,
-            shard,
-            StoreBlockIdentity::new([identity; 16])?,
+            ledger.begin_store_block_for_test(
+                capacity,
+                StoreBlockIdentity::new([identity; 16])?,
+                self.retention_time,
+            )?,
             records,
         )?;
         ledger.append(block.into_store_block())?;
@@ -1102,11 +1123,11 @@ impl KernelFixture {
             ResourceAmounts::only(ResourceDimension::MemoryBytes, 1_048_576)?,
         )?)?;
         let block = LogStore::new().prepare(
-            capacity,
-            &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(50))),
-            self.tenant,
-            self.shard,
-            StoreBlockIdentity::new([identity; 16])?,
+            self.ledger()?.begin_store_block_for_test(
+                capacity,
+                StoreBlockIdentity::new([identity; 16])?,
+                self.retention_time,
+            )?,
             records,
         )?;
         self.ledger()?.append(block.into_store_block())?;
@@ -1150,11 +1171,11 @@ impl KernelFixture {
         )?)?;
         let block = LogStore::new()
             .prepare(
-                capacity,
-                &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(50))),
-                self.tenant,
-                self.shard,
-                StoreBlockIdentity::new([identity; 16])?,
+                self.ledger()?.begin_store_block_for_test(
+                    capacity,
+                    StoreBlockIdentity::new([identity; 16])?,
+                    self.retention_time,
+                )?,
                 records,
             )?
             .into_store_block();
@@ -1222,11 +1243,11 @@ impl KernelFixture {
         )?)?;
         let block = LogStore::new()
             .prepare(
-                capacity,
-                &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(50))),
-                self.tenant,
-                self.shard,
-                StoreBlockIdentity::new([identity; 16])?,
+                self.ledger()?.begin_store_block_for_test(
+                    capacity,
+                    StoreBlockIdentity::new([identity; 16])?,
+                    self.retention_time,
+                )?,
                 records,
             )?
             .into_store_block();

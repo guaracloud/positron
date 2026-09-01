@@ -14,3 +14,18 @@ pub fn fuzz_log_store_block(data: &[u8]) {
         let _ = codec::fuzz_decode_block(tenant, bounded);
     }
 }
+
+/// Exercises block-aware Log retention over real kernel-authenticated evidence.
+#[doc(hidden)]
+pub fn fuzz_log_retention_block(
+    ledger: &positron_kernel::ActiveSegmentLedger<'_, '_>,
+    tenant: TenantId,
+) {
+    let Ok(snapshot) = ledger.current_catalog_snapshot() else {
+        return;
+    };
+    let Ok(policy) = super::LogRetentionPolicy::from_catalog(&snapshot) else {
+        return;
+    };
+    let _ = super::LogStore::new().enforce_retention(ledger, tenant, policy);
+}

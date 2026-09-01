@@ -59,8 +59,14 @@ pub(super) fn query_events_for_test(
         .key
         .segment_key(instance.instance, scope)
         .map_err(|_| ServiceFailure::KeyUnavailable)?;
-    let ledger = ActiveSegmentLedger::open(&instance._authority, &catalog, scope, protection)
-        .map_err(|failure| classify_ledger_failure_code(failure.code()))?;
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
+        &instance._authority,
+        &instance.retention_time,
+        &catalog,
+        scope,
+        protection,
+    )
+    .map_err(|failure| classify_ledger_failure_code(failure.code()))?;
     let service = QueryService::with_clock(
         instance.resource_governor(),
         &ledger,
@@ -111,8 +117,14 @@ pub(super) fn resume_query_events_for_test(
         .key
         .segment_key(instance.instance, scope)
         .map_err(|_| ServiceFailure::KeyUnavailable)?;
-    let ledger = ActiveSegmentLedger::open(&instance._authority, &catalog, scope, protection)
-        .map_err(|failure| classify_ledger_failure_code(failure.code()))?;
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
+        &instance._authority,
+        &instance.retention_time,
+        &catalog,
+        scope,
+        protection,
+    )
+    .map_err(|failure| classify_ledger_failure_code(failure.code()))?;
     let service = QueryService::with_clock(
         instance.resource_governor(),
         &ledger,
@@ -170,8 +182,14 @@ pub(super) fn query_log_bodies(
         .key
         .segment_key(instance.instance, scope)
         .map_err(|_| ServiceFailure::KeyUnavailable)?;
-    let ledger = ActiveSegmentLedger::open(&instance._authority, &catalog, scope, protection)
-        .map_err(|failure| classify_ledger_failure_code(failure.code()))?;
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
+        &instance._authority,
+        &instance.retention_time,
+        &catalog,
+        scope,
+        protection,
+    )
+    .map_err(|failure| classify_ledger_failure_code(failure.code()))?;
     let service = QueryService::new(instance._authority.governor(), &ledger, 100);
     let query = service
         .plan_pipeline(context, source, budget)

@@ -60,6 +60,43 @@ fn catalog_continuity_gaps_and_multiple_active_segments_fail_closed() -> Result<
 }
 
 #[test]
+fn public_open_rejects_a_retired_continuity_marker_below_the_reconstructed_frontier()
+-> Result<(), Box<dyn Error>> {
+    with_fixture(0xa7, |authority, catalog, scope| {
+        let ledger = open(authority, catalog, scope)?;
+        ledger.append(PreparedStoreBlock::new(
+            scope,
+            StoreBlockIdentity::new([0xc7; 16])?,
+            b"first".to_vec(),
+        )?)?;
+        ledger.append(PreparedStoreBlock::new(
+            scope,
+            StoreBlockIdentity::new([0xd7; 16])?,
+            b"second".to_vec(),
+        )?)?;
+        ledger.seal()?;
+        let storage = LedgerStorage::open(
+            authority
+                .primary_data_volume()
+                .expect("fixture retains the volume"),
+        )?;
+        let sealed = storage.catalog_segments(&catalog.pin()?, scope)?[0];
+        let retired = SegmentMetadata {
+            id: SegmentId::new([0xe7; 16])?,
+            state: SegmentState::Retired,
+            base_position: CommitPosition::origin().next()?,
+            scope,
+        };
+        publish_metadata(catalog, authority, scope, &[sealed, retired], 0xb7)?;
+
+        let failure = open(authority, catalog, scope)
+            .expect_err("a retired marker cannot rewind reconstructed continuity");
+        assert_eq!(failure.code(), LedgerFailureCode::IntegrityCorruption);
+        Ok(())
+    })
+}
+
+#[test]
 fn catalog_rejects_an_active_segment_that_overlaps_committed_sealed_bytes()
 -> Result<(), Box<dyn Error>> {
     with_fixture(0xa6, |authority, catalog, scope| {

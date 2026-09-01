@@ -74,8 +74,39 @@ fn public_limits_and_failures_are_typed_and_redacted() -> Result<(), Box<dyn Err
 
     let tenant = TenantId::from_bytes([0x41; 16])?;
     let store = LogStore::new();
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x61; 16])?,
+        CatalogSecret::from_owned(Box::new([0x62; 32]), Box::new([0x63; 32])),
+    )?;
+    let retention_time = positron_kernel::RetentionTimeAuthority::establish()?;
+    let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(8)?);
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        SegmentProtectionKey::from_owned(Box::new([0x64; 32])),
+    )?;
+    let baseline = authority.governor().inspect()?.outstanding_total();
+    let empty_failure = match store.prepare(
+        ledger.begin_store_block(
+            preparation_capacity(&authority, tenant)?,
+            StoreBlockIdentity::new([0x65; 16])?,
+        )?,
+        vec![],
+    ) {
+        Ok(_) => return Err("kernel-authorized empty Log block was accepted".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(empty_failure.code(), LogStoreFailureCode::InvalidInput);
+    assert_eq!(
+        authority.governor().inspect()?.outstanding_total(),
+        baseline
+    );
+
     let empty_failure = store
-        .prepare(
+        .prepare_unretained_for_test(
             preparation_capacity(&authority, tenant)?,
             &clock(1),
             tenant,
@@ -88,7 +119,7 @@ fn public_limits_and_failures_are_typed_and_redacted() -> Result<(), Box<dyn Err
     assert_eq!(empty_failure.code(), LogStoreFailureCode::LimitExceeded);
     let large_record = LogRecord::checked_minimal(None, Some("x".repeat(262_144)), vec![], policy)?;
     let block_bound = store
-        .prepare(
+        .prepare_unretained_for_test(
             preparation_capacity(&authority, tenant)?,
             &clock(1),
             tenant,

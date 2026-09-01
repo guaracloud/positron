@@ -6,13 +6,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use positron_domain::identity::TenantId;
 use positron_domain::routing::VirtualShardId;
-use positron_domain::time::UnixNanoseconds;
 use positron_domain::value::{CandidateAttributeValue, ValueLimitProfile};
 use positron_governance::{CompatibilityHints, PresentedCredential, RequestedIntent};
 use positron_ingest::{IngestPolicy, PolicyEvaluation, PolicyReceiver};
 use positron_kernel::{
-    ActiveSegmentLedger, FixedLifecycleClockSource, LifecycleClock, ResourceAmounts,
-    ResourceDimension, StorageKernelResourceAuthority, StoreBlockIdentity, WorkClaim, WorkKind,
+    ActiveSegmentLedger, ResourceAmounts, ResourceDimension, StorageKernelResourceAuthority,
+    StoreBlockIdentity, WorkClaim, WorkKind,
 };
 use positron_query::{
     QueryBudget, QueryClock, QueryClockFailure, QueryService, QueryWorkFailure, QueryWorkMeter,
@@ -115,6 +114,9 @@ pub(super) fn append_valid<'kernel, 'catalog>(
     event_time: i64,
     body: &str,
 ) -> Result<(), String> {
+    if ledger.scope().tenant_id() != tenant || ledger.scope().shard_id() != shard {
+        return Err("tail fuzz ledger scope mismatch".to_owned());
+    }
     let candidate = positron_ingest::NativeLogCandidate::new(
         Some(event_time),
         None,
@@ -136,10 +138,14 @@ pub(super) fn append_valid<'kernel, 'catalog>(
         ResourceAmounts::only(ResourceDimension::MemoryBytes, 1_048_576).map_err(describe)?;
     let claim = WorkClaim::tenant(tenant, WorkKind::Ingest, amounts).map_err(describe)?;
     let capacity = authority.governor().reserve(claim).map_err(describe)?;
-    let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(50)));
     let identity = StoreBlockIdentity::new([identity; 16]).map_err(describe)?;
     let block = LogStore::new()
-        .prepare(capacity, &clock, tenant, shard, identity, vec![record])
+        .prepare(
+            ledger
+                .begin_store_block(capacity, identity)
+                .map_err(describe)?,
+            vec![record],
+        )
         .map_err(describe)?
         .into_store_block();
     ledger.append(block).map(|_| ()).map_err(describe)

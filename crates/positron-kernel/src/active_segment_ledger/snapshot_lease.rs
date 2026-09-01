@@ -6,7 +6,7 @@ use super::snapshot_lease_pending::{
     cleanup_expired_on_resume_failure, register_all, register_lease_reservation, remove_all,
 };
 use super::snapshot_lease_record::{
-    LeaseBlock, LeaseRecord, SnapshotLeaseId, SnapshotLeaseUsage, resume_marker_for,
+    LeaseBlock, LeaseRecord, LeaseWindow, SnapshotLeaseId, SnapshotLeaseUsage, resume_marker_for,
     valid_lease_interval, validate_active_lease,
 };
 use crate::{WorkClaim, WorkKind};
@@ -19,7 +19,7 @@ use super::{ActiveSegmentLedger, LedgerCompletionState, LedgerFailure, LedgerFai
 use crate::CatalogGenerationId;
 pub(super) use snapshot_lease_support::map_catalog_failure;
 pub(super) use snapshot_lease_support::{
-    LeaseReservationTransaction, expired_in_scope, publish_many, records,
+    LeaseReservationTransaction, active_segments, expired_in_scope, publish_many, records,
 };
 use snapshot_lease_support::{
     fresh_identity, publish, reject_time_regression, remove_reservations, snapshot_from_record,
@@ -40,7 +40,30 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         now: u64,
         expiry: u64,
     ) -> Result<SnapshotLeaseGrant<'kernel>, LedgerFailure> {
-        self.create_snapshot_lease_internal(now, expiry, None)
+        self.state
+            .lock()
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?
+            .require_healthy()?;
+        if self.retention_time.is_some() {
+            return Err(LedgerFailure::new(LedgerFailureCode::InvalidInput));
+        }
+        self.create_snapshot_lease_internal(
+            LeaseWindow {
+                observed: now,
+                expiry,
+            },
+            None,
+        )
+    }
+
+    /// Creates a durable Log lease whose observation and expiry share the
+    /// ledger's conservative retention-time domain.
+    pub fn create_snapshot_lease_for(
+        &self,
+        fallback_now: u64,
+        ttl: std::num::NonZeroU64,
+    ) -> Result<SnapshotLeaseGrant<'kernel>, LedgerFailure> {
+        self.create_snapshot_lease_for_internal(fallback_now, ttl, None)
     }
 
     /// Creates a lease only if the durable Catalog is still the generation
@@ -51,22 +74,73 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         expiry: u64,
         expected_catalog: CatalogGenerationId,
     ) -> Result<SnapshotLeaseGrant<'kernel>, LedgerFailure> {
-        self.create_snapshot_lease_internal(now, expiry, Some(expected_catalog))
+        self.state
+            .lock()
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?
+            .require_healthy()?;
+        if self.retention_time.is_some() {
+            return Err(LedgerFailure::new(LedgerFailureCode::InvalidInput));
+        }
+        self.create_snapshot_lease_internal(
+            LeaseWindow {
+                observed: now,
+                expiry,
+            },
+            Some(expected_catalog),
+        )
+    }
+
+    /// Creates a retention-domain lease only if the Catalog generation used
+    /// for query admission is still current.
+    pub fn create_snapshot_lease_for_at_catalog(
+        &self,
+        fallback_now: u64,
+        ttl: std::num::NonZeroU64,
+        expected_catalog: CatalogGenerationId,
+    ) -> Result<SnapshotLeaseGrant<'kernel>, LedgerFailure> {
+        self.create_snapshot_lease_for_internal(fallback_now, ttl, Some(expected_catalog))
+    }
+
+    fn create_snapshot_lease_for_internal(
+        &self,
+        fallback_now: u64,
+        ttl: std::num::NonZeroU64,
+        expected_catalog: Option<CatalogGenerationId>,
+    ) -> Result<SnapshotLeaseGrant<'kernel>, LedgerFailure> {
+        let now = self
+            .retention_time
+            .map_or(Ok(fallback_now), |retention_time| {
+                retention_time
+                    .lease_time(self.scope)
+                    .map_err(super::map_retention_time_failure)
+            })?;
+        let expiry = now
+            .checked_add(ttl.get())
+            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+        self.create_snapshot_lease_internal(
+            LeaseWindow {
+                observed: now,
+                expiry,
+            },
+            expected_catalog,
+        )
     }
 
     fn create_snapshot_lease_internal(
         &self,
-        mut now: u64,
-        expiry: u64,
+        window: LeaseWindow,
         expected_catalog: Option<CatalogGenerationId>,
     ) -> Result<SnapshotLeaseGrant<'kernel>, LedgerFailure> {
-        if !valid_lease_interval(now, expiry) {
-            return Err(LedgerFailure::new(LedgerFailureCode::InvalidInput));
-        }
+        let mut now = window.observed;
+        let expiry = window.expiry;
         let mut state = self
             .state
             .lock()
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
+        state.require_healthy()?;
+        if !valid_lease_interval(now, expiry) {
+            return Err(LedgerFailure::new(LedgerFailureCode::InvalidInput));
+        }
         self.retry_pending_releases(&mut state)?;
         now = state.last_snapshot_lease_time.max(now);
         if !valid_lease_interval(now, expiry) {
@@ -215,11 +289,18 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         marker: Option<(u64, [u8; 32])>,
         expected_catalog: Option<(CatalogGenerationId, u64)>,
     ) -> Result<SnapshotLeaseGrant<'kernel>, LedgerFailure> {
+        let now = self.lease_operation_time(now)?;
         let mut state = self
             .state
             .lock()
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
+        state.require_healthy()?;
         self.retry_pending_releases(&mut state)?;
+        let now = if self.retention_time.is_some() {
+            state.last_snapshot_lease_time.max(now)
+        } else {
+            now
+        };
         reject_time_regression(&state, now)?;
         let mut active_attempt = marker
             .map(|_| SnapshotLeaseAttempt::acquire(&self.lease_attempts, identity, 0))
@@ -389,6 +470,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             .state
             .lock()
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
+        state.require_healthy()?;
         state.pending_lease_releases.register(identity)?;
         self.retry_pending_releases(&mut state)
     }

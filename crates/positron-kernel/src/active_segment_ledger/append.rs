@@ -39,6 +39,9 @@ impl<'kernel> ActiveSegmentLedger<'kernel, '_> {
         if block.scope != self.scope {
             return Err(LedgerFailure::new(LedgerFailureCode::PhysicalScopeMismatch));
         }
+        if self.retention_time.is_some() && block.retention_ingest_time.is_none() {
+            return Err(LedgerFailure::new(LedgerFailureCode::UnsupportedFormat));
+        }
         if block.preparation_capacity.as_ref().is_some_and(|capacity| {
             !capacity.belongs_to(self.authority.governor())
                 || !capacity.authorizes_ingest_preparation(
@@ -67,9 +70,7 @@ impl<'kernel> ActiveSegmentLedger<'kernel, '_> {
         if cancellation.is_some_and(AppendCancellation::is_cancelled) {
             return Err(LedgerFailure::new(LedgerFailureCode::Cancelled));
         }
-        if state.poisoned {
-            return Err(LedgerFailure::new(LedgerFailureCode::RecoveryRequired));
-        }
+        state.require_healthy()?;
         let amounts = append_claim(block.payload.len())?;
         let ordinary_claim = WorkClaim::tenant(self.scope.tenant, WorkKind::Ingest, amounts)
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
@@ -86,17 +87,6 @@ impl<'kernel> ActiveSegmentLedger<'kernel, '_> {
                 .try_resize(amounts)
                 .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
         }
-        let retained = WorkClaim::tenant(
-            self.scope.tenant,
-            WorkKind::Ingest,
-            retained_claim(block.payload.len(), 1)?,
-        )
-        .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
-        let retained_reservation = self
-            .authority
-            .governor()
-            .reserve(retained)
-            .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
         let claim = RecoveryWorkClaim::tenant(
             self.scope.tenant,
             RecoveryWorkKind::DurabilityCompletion,
@@ -119,6 +109,16 @@ impl<'kernel> ActiveSegmentLedger<'kernel, '_> {
             .frontier
             .next()
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+        let segment = self.storage.segment_id()?;
+        let prior_retention = state
+            .blocks
+            .iter()
+            .filter(|committed| committed.segment == segment)
+            .fold(super::SegmentRetention::Empty, |aggregate, committed| {
+                aggregate.append_block(committed.block_retention)
+            });
+        let block_retention = super::SegmentRetention::for_block(block.retention_ingest_time);
+        let segment_retention = prior_retention.append_block(block_retention);
         let content_digest = block.content_digest()?;
         let context = self
             .key
@@ -134,15 +134,32 @@ impl<'kernel> ActiveSegmentLedger<'kernel, '_> {
             )
             .map_err(map_frame_failure)?;
         let limits = FrameLimits::new(MAX_ENCODED_FRAME_BYTES).map_err(map_frame_failure)?;
-        let mut frame_plaintext = Vec::with_capacity(16 + block.payload.len());
+        let mut frame_plaintext = Vec::with_capacity(25 + block.payload.len());
         frame_plaintext.extend_from_slice(&block.identity.to_bytes());
+        let (retention_tag, retention_instant) = match block_retention {
+            super::SegmentRetention::Complete(instant) => (2_u8, instant.instant().value()),
+            super::SegmentRetention::Unavailable => (1_u8, 0_i64),
+            super::SegmentRetention::Empty => {
+                return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
+            },
+        };
+        frame_plaintext.push(retention_tag);
+        frame_plaintext.extend_from_slice(&retention_instant.to_be_bytes());
         frame_plaintext.extend_from_slice(&block.payload);
         let frame_bytes = DataProtection::protected_frame_length(frame_plaintext.len(), limits)
             .map_err(map_frame_failure)?;
+        let previous_retained = state.retained_capacity.granted();
+        state
+            .retained_capacity
+            .try_resize_preserving_capacity(retained_claim(retained_bytes, block_count)?)
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
         let authenticator = match self.storage.append_and_commit(
             &self.key,
-            state.next_sequence,
-            position,
+            storage::NextFrontier {
+                sequence: state.next_sequence,
+                position,
+                segment_retention,
+            },
             frame_bytes,
             || {
                 DataProtection::protect_frame(&self.key, context, &frame_plaintext, limits)
@@ -156,7 +173,13 @@ impl<'kernel> ActiveSegmentLedger<'kernel, '_> {
             },
         ) {
             Ok(authenticator) => authenticator,
-            Err(storage::AppendFailure::RejectedBeforeMutation(failure)) => return Err(failure),
+            Err(storage::AppendFailure::RejectedBeforeMutation(failure)) => {
+                state
+                    .retained_capacity
+                    .try_resize_preserving_capacity(previous_retained)
+                    .map_err(|_| LedgerFailure::new(LedgerFailureCode::RecoveryRequired))?;
+                return Err(failure);
+            },
             Err(storage::AppendFailure::SegmentMutated(failure)) => {
                 state.poisoned = true;
                 return Err(failure);
@@ -167,10 +190,10 @@ impl<'kernel> ActiveSegmentLedger<'kernel, '_> {
             position,
             payload: block.payload,
             content_digest,
-            segment: self.storage.segment_id()?,
+            segment,
             frontier_authenticator: authenticator,
+            block_retention,
         });
-        state.retained_reservations.push(retained_reservation);
         state.frontier = position;
         state.retained_bytes = retained_bytes;
         state.next_sequence = state
@@ -178,7 +201,7 @@ impl<'kernel> ActiveSegmentLedger<'kernel, '_> {
             .checked_add(1)
             .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
         Ok(CommitReceipt {
-            segment: self.storage.segment_id()?,
+            segment,
             position,
             frontier_authenticator: authenticator,
         })

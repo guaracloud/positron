@@ -1,4 +1,6 @@
 use std::cell::Cell;
+#[cfg(feature = "test-support")]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::result_key::HistoricalTotalKey;
 use crate::stream::QueryBatch;
@@ -89,6 +91,8 @@ pub struct TailSession<'service, 'kernel, 'catalog, 'ledger> {
     pub(super) resume_count: u64,
     pub(super) repeated_batch_count: u64,
     pub(super) cursor_observed: Cell<bool>,
+    #[cfg(feature = "test-support")]
+    pub(super) cursor_encode_fault: AtomicBool,
 }
 
 impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catalog, 'ledger> {
@@ -100,6 +104,22 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
     pub fn safe_cursor(&self) -> &TailCursor {
         self.cursor_observed.set(true);
         &self.cursor
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn fail_next_cursor_encode(&self) {
+        self.cursor_encode_fault.store(true, Ordering::Release);
+    }
+
+    pub(super) fn encode_cursor(
+        &self,
+        state: &TailCursorState,
+    ) -> Result<TailCursor, QueryFailure> {
+        #[cfg(feature = "test-support")]
+        if self.cursor_encode_fault.swap(false, Ordering::AcqRel) {
+            return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
+        }
+        TailCursor::encode(&self.service.ledger.control_tokens(), state)
     }
 
     fn retain_resumable_leases(&mut self) {
@@ -124,10 +144,7 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
         self.persist_lease_usage()?;
         let mut delivery_state = self.state.clone();
         delivery_state.set_unacknowledged_delivery((self.next_sequence, digest));
-        self.delivery_cursor = Some(TailCursor::encode(
-            &self.service.ledger.control_tokens(),
-            &delivery_state,
-        )?);
+        self.delivery_cursor = Some(self.encode_cursor(&delivery_state)?);
         Ok(())
     }
 

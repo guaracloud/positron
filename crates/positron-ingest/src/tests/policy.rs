@@ -1,8 +1,7 @@
 use positron_domain::routing::{SignalKind, VirtualShardId};
-use positron_domain::time::UnixNanoseconds;
 use positron_kernel::{
-    ActiveSegmentLedger, Catalog, CatalogSecret, FixedLifecycleClockSource, InstanceId,
-    LifecycleClock, SegmentProtectionKey, SegmentScope, StoreBlockIdentity,
+    ActiveSegmentLedger, Catalog, CatalogSecret, InstanceId, SegmentProtectionKey, SegmentScope,
+    StoreBlockIdentity,
 };
 use positron_signals::{LogScan, LogStore, ScanLimit};
 
@@ -31,8 +30,9 @@ fn policy_rejection_precedes_value_limits_and_partial_requires_a_receipt() {
     )
     .expect("catalog");
     let shard = VirtualShardId::new(71).expect("shard");
-    let ledger = ActiveSegmentLedger::open(
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
         &fixture.authority,
+        &fixture.retention_time,
         &catalog,
         SegmentScope::new(fixture.tenant, SignalKind::Logs, shard),
         SegmentProtectionKey::from_owned(Box::new([0x74; 32])),
@@ -45,12 +45,10 @@ fn policy_rejection_precedes_value_limits_and_partial_requires_a_receipt() {
         .expect("structural decode");
     let policy = IngestPolicy::reject_exact_text_body(7, "reject-oversized", &oversized_rejected)
         .expect("policy");
-    let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(200)));
 
     let partial = match LogIngest::new(
         &fixture.authority,
         &ledger,
-        &clock,
         &policy,
         fixture.tenant,
         shard,
@@ -127,8 +125,9 @@ fn partial_admission_preserves_each_permanent_rejection_class() {
     )
     .expect("catalog");
     let shard = VirtualShardId::new(41).expect("shard");
-    let ledger = ActiveSegmentLedger::open(
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
         &fixture.authority,
+        &fixture.retention_time,
         &catalog,
         SegmentScope::new(fixture.tenant, SignalKind::Logs, shard),
         SegmentProtectionKey::from_owned(Box::new([0x44; 32])),
@@ -143,11 +142,9 @@ fn partial_admission_preserves_each_permanent_rejection_class() {
         ]))
         .expect("structural decode");
     let policy = IngestPolicy::reject_exact_text_body(3, "reject", "reject-me").expect("policy");
-    let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(3)));
     let outcome = LogIngest::new(
         &fixture.authority,
         &ledger,
-        &clock,
         &policy,
         fixture.tenant,
         shard,
@@ -185,8 +182,9 @@ fn value_limit_rejection_never_claims_durability() {
     )
     .expect("catalog");
     let shard = VirtualShardId::new(72).expect("shard");
-    let ledger = ActiveSegmentLedger::open(
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
         &fixture.authority,
+        &fixture.retention_time,
         &catalog,
         SegmentScope::new(fixture.tenant, SignalKind::Logs, shard),
         SegmentProtectionKey::from_owned(Box::new([0x7a; 32])),
@@ -197,12 +195,10 @@ fn value_limit_rejection_never_claims_durability() {
         .decode(protobuf_with_bodies(&[oversized.as_str()]))
         .expect("structural decode");
     let policy = IngestPolicy::preserving(1).expect("policy");
-    let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(200)));
     assert!(matches!(
         LogIngest::new(
             &fixture.authority,
             &ledger,
-            &clock,
             &policy,
             fixture.tenant,
             shard,
@@ -227,8 +223,9 @@ fn complete_policy_rejection_is_permanent_and_has_no_receipt() {
     )
     .expect("catalog");
     let shard = VirtualShardId::new(73).expect("shard");
-    let ledger = ActiveSegmentLedger::open(
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
         &fixture.authority,
+        &fixture.retention_time,
         &catalog,
         SegmentScope::new(fixture.tenant, SignalKind::Logs, shard),
         SegmentProtectionKey::from_owned(Box::new([0x80; 32])),
@@ -238,12 +235,10 @@ fn complete_policy_rejection_is_permanent_and_has_no_receipt() {
         .decode(protobuf_with_bodies(&["reject-me"]))
         .expect("decode");
     let policy = IngestPolicy::reject_exact_text_body(2, "reject", "reject-me").expect("policy");
-    let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(200)));
     assert_eq!(
         LogIngest::new(
             &fixture.authority,
             &ledger,
-            &clock,
             &policy,
             fixture.tenant,
             shard,

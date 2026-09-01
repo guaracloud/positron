@@ -19,7 +19,7 @@ fn preparation_accepts_exact_block_maximum_and_rejects_the_next_byte_without_clo
     let clock = LifecycleClock::new(CountingClock { reads: &reads });
     let baseline = authority.governor().inspect()?;
 
-    let prepared = LogStore::new().prepare(
+    let prepared = LogStore::new().prepare_unretained_for_test(
         preparation_capacity(&authority, tenant)?,
         &clock,
         tenant,
@@ -40,7 +40,7 @@ fn preparation_accepts_exact_block_maximum_and_rejects_the_next_byte_without_clo
 
     reads.store(0, Ordering::Relaxed);
     let failure = LogStore::new()
-        .prepare(
+        .prepare_unretained_for_test(
             preparation_capacity(&authority, tenant)?,
             &clock,
             tenant,
@@ -88,7 +88,7 @@ fn cancelled_preparation_capacity_is_refused_before_clock_or_allocation()
         let mut capacity = preparation_capacity(&authority, tenant)?;
         assert_eq!(capacity.cancel()?, ReleaseOutcome::Released);
         let failure = LogStore::new()
-            .prepare(
+            .prepare_unretained_for_test(
                 capacity,
                 &clock,
                 tenant,
@@ -130,7 +130,7 @@ fn preparation_capacity_is_continuous_through_commit_and_every_terminal_path()
     )?;
     let baseline = authority.governor().inspect()?;
     let record = minimal_record("accounted", 1)?;
-    let prepared = LogStore::new().prepare(
+    let prepared = LogStore::new().prepare_unretained_for_test(
         preparation_capacity(&authority, tenant)?,
         &clock(1),
         tenant,
@@ -151,7 +151,7 @@ fn preparation_capacity_is_continuous_through_commit_and_every_terminal_path()
             .governor()
             .inspect()?
             .outstanding_for(WorkClass::Ingest),
-        baseline.outstanding_for(WorkClass::Ingest) + 1
+        baseline.outstanding_for(WorkClass::Ingest)
     );
     ledger.seal()?;
     assert_accounting(&authority, empty)?;
@@ -165,7 +165,7 @@ fn preparation_capacity_is_continuous_through_commit_and_every_terminal_path()
     )?;
     let other_baseline = authority.governor().inspect()?;
     let wrong_scope = LogStore::new()
-        .prepare(
+        .prepare_unretained_for_test(
             preparation_capacity(&authority, tenant)?,
             &clock(2),
             tenant,

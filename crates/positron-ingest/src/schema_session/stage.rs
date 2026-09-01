@@ -1,6 +1,6 @@
 use positron_domain::routing::VirtualShardId;
 use positron_kernel::{LedgerSnapshot, ResourceGovernor, StoreBlockIdentity};
-use positron_signals::{LogRecord, ScanObserver, SchemaDelta, SchemaFailure};
+use positron_signals::{LogRecord, ScanObserver, SchemaDelta};
 
 use super::{SchemaSessionFailure, TenantSchemaSession, ensure_frontier_slot, reconcile_pending};
 
@@ -80,22 +80,7 @@ impl TenantSchemaSession {
 
 fn map_stage_failure(failure: positron_signals::LogStoreFailure) -> SchemaSessionFailure {
     match failure.code() {
-        positron_signals::LogStoreFailureCode::InvalidInput
-        | positron_signals::LogStoreFailureCode::MalformedBlock
-        | positron_signals::LogStoreFailureCode::PhysicalScopeMismatch => {
-            SchemaSessionFailure::Schema(SchemaFailure::InvalidValue)
-        },
-        positron_signals::LogStoreFailureCode::LimitExceeded => {
-            SchemaSessionFailure::Schema(SchemaFailure::LimitExceeded)
-        },
-        positron_signals::LogStoreFailureCode::ResourceExhausted
-        | positron_signals::LogStoreFailureCode::BudgetExhausted
-        | positron_signals::LogStoreFailureCode::ResourceAdmissionRefused
-        | positron_signals::LogStoreFailureCode::ClockUnavailable
-        | positron_signals::LogStoreFailureCode::Kernel
-        | positron_signals::LogStoreFailureCode::Internal => {
-            SchemaSessionFailure::Schema(SchemaFailure::AllocationUnavailable)
-        },
         positron_signals::LogStoreFailureCode::Cancelled => SchemaSessionFailure::Cancelled,
+        code => SchemaSessionFailure::LogStore(code),
     }
 }

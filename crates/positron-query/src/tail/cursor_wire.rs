@@ -1,8 +1,6 @@
 use positron_domain::identity::{PrincipalId, TenantId};
 use positron_domain::routing::{CommitPosition, RecordOrdinal, VirtualShardId};
 use positron_kernel::{ControlTokenAuthentication, ControlTokenProtector};
-#[cfg(feature = "test-support")]
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::{
     HistoricalMarker, TailCursorState, TailPosition, TailSourceBinding, invalid, resource,
@@ -27,14 +25,6 @@ const BIND_MAGIC: [u8; 4] = *b"TB01";
 const DELIVERY_MAGIC: [u8; 4] = *b"DLV1";
 const PREFIX_BYTES: usize = 8 + 2 + 8 + 16 + 16 + 8 + 32 + 32 + 8 + 8 + 32 + 40 + 16 + 32 + 2;
 
-#[cfg(feature = "test-support")]
-static FAIL_NEXT_ENCODE: AtomicBool = AtomicBool::new(false);
-
-#[cfg(feature = "test-support")]
-pub fn fail_next_encode() {
-    FAIL_NEXT_ENCODE.store(true, Ordering::Release);
-}
-
 #[derive(Clone, Eq, PartialEq)]
 pub struct TailCursor(Vec<u8>);
 
@@ -43,10 +33,6 @@ impl TailCursor {
         protector: &ControlTokenProtector<'_>,
         state: &TailCursorState,
     ) -> Result<Self, QueryFailure> {
-        #[cfg(feature = "test-support")]
-        if FAIL_NEXT_ENCODE.swap(false, Ordering::AcqRel) {
-            return Err(invalid());
-        }
         let extension = extension_bytes(state)?;
         let payload = PREFIX_BYTES
             .checked_add(state.positions.len().checked_mul(16).ok_or_else(resource)?)

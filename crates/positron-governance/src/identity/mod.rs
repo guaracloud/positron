@@ -16,14 +16,11 @@ use std::fmt::Formatter;
 
 use positron_domain::identity::{PrincipalId, Scope, TenantAttribution, TenantId, TenantSlug};
 use positron_domain::lifecycle::TenantLifecycleState;
-use positron_kernel::{BootstrapKeyCustody, CatalogSnapshot};
+use positron_kernel::{BootstrapKeyCustody, CatalogObjectId, CatalogSnapshot};
 
 use crate::GovernanceAuditEntry;
 
-use codec::{
-    GOVERNANCE_OBJECT_MAGIC_V1, GOVERNANCE_OBJECT_MAGIC_V2, GOVERNANCE_OBJECT_MAGIC_V3,
-    decode_initial_identity,
-};
+use codec::identity_from_catalog;
 
 #[derive(Clone)]
 struct IngestIdentity {
@@ -73,37 +70,27 @@ impl Identity {
 
     /// Reconstructs the unique initialization identity from a pinned Catalog.
     pub fn open(snapshot: &CatalogSnapshot) -> Result<Self, IdentityFailure> {
-        let mut identity = None;
-        for object_id in snapshot.object_identities() {
-            let object = snapshot
-                .object(object_id)
-                .map_err(|_| IdentityFailure)?
-                .ok_or(IdentityFailure)?;
-            if !object.starts_with(&GOVERNANCE_OBJECT_MAGIC_V1)
-                && !object.starts_with(&GOVERNANCE_OBJECT_MAGIC_V2)
-                && !object.starts_with(&GOVERNANCE_OBJECT_MAGIC_V3)
-            {
-                continue;
-            }
-            if identity.is_some() {
-                return Err(IdentityFailure);
-            }
-            let mut decoded = decode_initial_identity(object)?;
-            // Lease, query-marker, and other catalog objects may advance the
-            // catalog generation without changing authorization. Bind query
-            // revalidation to this immutable governance object instead, so a
-            // reconnect after ordinary catalog churn remains authorized while
-            // replacing the identity object still changes the binding.
-            let object_bytes = object_id.to_bytes();
-            decoded.generation = object_bytes
-                .get(..8)
-                .and_then(|bytes| bytes.try_into().ok())
-                .map(u64::from_be_bytes)
-                .unwrap_or(1)
-                .max(1);
-            identity = Some(decoded);
-        }
-        identity.ok_or(IdentityFailure)
+        Self::open_with_object(snapshot).map(|(identity, _)| identity)
+    }
+
+    fn open_with_object(
+        snapshot: &CatalogSnapshot,
+    ) -> Result<(Self, CatalogObjectId), IdentityFailure> {
+        let (object_id, governance) = snapshot.governance_object().map_err(|_| IdentityFailure)?;
+        let mut decoded = identity_from_catalog(governance)?;
+        // Lease, query-marker, and other catalog objects may advance the
+        // catalog generation without changing authorization. Bind query
+        // revalidation to this immutable governance object instead, so a
+        // reconnect after ordinary catalog churn remains authorized while
+        // replacing the identity object still changes the binding.
+        let object_bytes = object_id.to_bytes();
+        decoded.generation = object_bytes
+            .get(..8)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(u64::from_be_bytes)
+            .unwrap_or(1)
+            .max(1);
+        Ok((decoded, object_id))
     }
 
     /// Authenticates and authorizes before a decoder or data-plane admission

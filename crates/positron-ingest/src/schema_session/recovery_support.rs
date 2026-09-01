@@ -122,19 +122,8 @@ pub(super) fn map_replay_observed_failure(
     failure: positron_signals::LogStoreFailure,
 ) -> SchemaSessionFailure {
     match failure.code() {
-        positron_signals::LogStoreFailureCode::BudgetExhausted
-        | positron_signals::LogStoreFailureCode::ResourceExhausted
-        | positron_signals::LogStoreFailureCode::ResourceAdmissionRefused => {
-            SchemaSessionFailure::StateUnavailable
-        },
         positron_signals::LogStoreFailureCode::Cancelled => SchemaSessionFailure::Cancelled,
-        positron_signals::LogStoreFailureCode::InvalidInput
-        | positron_signals::LogStoreFailureCode::LimitExceeded
-        | positron_signals::LogStoreFailureCode::MalformedBlock
-        | positron_signals::LogStoreFailureCode::PhysicalScopeMismatch
-        | positron_signals::LogStoreFailureCode::Kernel
-        | positron_signals::LogStoreFailureCode::ClockUnavailable
-        | positron_signals::LogStoreFailureCode::Internal => SchemaSessionFailure::ReplayIntegrity,
+        code => SchemaSessionFailure::LogStore(code),
     }
 }
 

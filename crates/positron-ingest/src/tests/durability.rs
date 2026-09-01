@@ -1,8 +1,7 @@
 use positron_domain::routing::{SignalKind, VirtualShardId};
-use positron_domain::time::UnixNanoseconds;
 use positron_kernel::{
-    ActiveSegmentLedger, Catalog, CatalogSecret, FixedLifecycleClockSource, InstanceId,
-    LifecycleClock, SegmentProtectionKey, SegmentScope, StoreBlockIdentity,
+    ActiveSegmentLedger, Catalog, CatalogSecret, InstanceId, SegmentProtectionKey, SegmentScope,
+    StoreBlockIdentity,
 };
 use positron_signals::{LogScan, LogStore, ScanLimit, SchemaBudget, SchemaCatalog};
 
@@ -21,15 +20,15 @@ fn durable_outcome_carries_the_kernel_receipt_and_is_readable_through_the_log_st
     .expect("catalog");
     let tenant = fixture.tenant;
     let shard = VirtualShardId::new(8).expect("shard");
-    let ledger = ActiveSegmentLedger::open(
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
         &fixture.authority,
+        &fixture.retention_time,
         &catalog,
         SegmentScope::new(tenant, SignalKind::Logs, shard),
         SegmentProtectionKey::from_owned(Box::new([0x58; 32])),
     )
     .expect("ledger");
     let store = LogStore::new();
-    let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100)));
     let batch = OtlpLogsReceiver::new()
         .decode(protobuf_request())
         .expect("valid OTLP");
@@ -39,7 +38,6 @@ fn durable_outcome_carries_the_kernel_receipt_and_is_readable_through_the_log_st
     let outcome = LogIngest::new(
         &fixture.authority,
         &ledger,
-        &clock,
         &policy,
         tenant,
         shard,

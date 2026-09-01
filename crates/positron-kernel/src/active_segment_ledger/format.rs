@@ -18,6 +18,7 @@ const MAX_ENCRYPTED_METADATA_BYTES: usize = 256;
 pub(super) enum SegmentState {
     Active,
     Sealed,
+    Retired,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -42,6 +43,7 @@ pub(super) fn encode_metadata(metadata: SegmentMetadata) -> Vec<u8> {
     bytes.push(match metadata.state {
         SegmentState::Active => 1,
         SegmentState::Sealed => 2,
+        SegmentState::Retired => 3,
     });
     bytes.extend_from_slice(&metadata.scope.tenant.to_bytes());
     bytes.push(match metadata.scope.signal {
@@ -66,6 +68,7 @@ pub(super) fn decode_metadata(bytes: &[u8]) -> Result<Option<SegmentMetadata>, L
     let state = match bytes.get(10).copied() {
         Some(1) => SegmentState::Active,
         Some(2) => SegmentState::Sealed,
+        Some(3) => SegmentState::Retired,
         _ => return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption)),
     };
     let tenant: [u8; 16] = exact(bytes, 11, 16)?;

@@ -1,4 +1,5 @@
 use super::*;
+use crate::active_segment_ledger::SegmentRetention;
 
 pub(in crate::active_segment_ledger) fn publish_frontier(
     directory: &File,
@@ -7,11 +8,20 @@ pub(in crate::active_segment_ledger) fn publish_frontier(
     durable_bytes: u64,
     next_sequence: u64,
     position: CommitPosition,
+    segment_retention: SegmentRetention,
 ) -> Result<[u8; 32], LedgerFailure> {
-    let mut plaintext = Vec::with_capacity(FRONTIER_PLAINTEXT_BYTES);
+    let mut plaintext = Vec::with_capacity(FRONTIER_V3_PLAINTEXT_BYTES);
+    plaintext.extend_from_slice(&3_u16.to_be_bytes());
     plaintext.extend_from_slice(&durable_bytes.to_be_bytes());
     plaintext.extend_from_slice(&next_sequence.to_be_bytes());
     plaintext.extend_from_slice(&position.value().to_be_bytes());
+    let (retention_tag, retention_instant) = match segment_retention {
+        SegmentRetention::Empty => (0_u8, 0_i64),
+        SegmentRetention::Unavailable => (1_u8, 0_i64),
+        SegmentRetention::Complete(instant) => (2_u8, instant.instant().value()),
+    };
+    plaintext.push(retention_tag);
+    plaintext.extend_from_slice(&retention_instant.to_be_bytes());
     let context = key
         .object
         .frame(
@@ -35,7 +45,7 @@ pub(in crate::active_segment_ledger) fn publish_frontier(
     let mut encoded = Vec::with_capacity(FRONTIER_PREFIX_BYTES + frame.as_bytes().len());
     encoded.extend_from_slice(FRONTIER_MAGIC);
     encoded.extend_from_slice(&1_u16.to_be_bytes());
-    encoded.extend_from_slice(&1_u16.to_be_bytes());
+    encoded.extend_from_slice(&3_u16.to_be_bytes());
     encoded.extend_from_slice(&frame_length.to_be_bytes());
     encoded.extend_from_slice(frame.as_bytes());
     let authenticator = receipt_authenticator(key, durable_bytes, next_sequence, position)?;

@@ -74,16 +74,18 @@ mod data_protection;
 mod instance_bootstrap_storage;
 mod lifecycle_clock;
 mod resource_governor;
+mod retention_time;
 
 pub use catalog::{
     AuditIntent, Catalog, CatalogCommit, CatalogFailure, CatalogFailureCode, CatalogGenerationId,
-    CatalogObject, CatalogObjectId, CatalogProposal, CatalogRotation, CatalogSecret,
-    CatalogSnapshot, CatalogWrappingKey, FormatEpoch, GovernanceAuditRecord, InstanceId,
-    TransactionId,
+    CatalogGovernanceObject, CatalogGovernanceVersion, CatalogLogRetentionPolicy, CatalogObject,
+    CatalogObjectId, CatalogProposal, CatalogRotation, CatalogSecret, CatalogSnapshot,
+    CatalogWrappingKey, FormatEpoch, GovernanceAuditRecord, InstanceId, TransactionId,
 };
 #[cfg(feature = "test-support")]
 pub use catalog::{
-    CatalogPublicationFault, with_catalog_publication_fault_after,
+    CatalogPublicationFault, with_catalog_generation_ambiguity_hook_after,
+    with_catalog_publication_ambiguity_hook_after, with_catalog_publication_fault_after,
     with_catalog_publication_fault_sequence_after, with_catalog_publication_hook_after,
 };
 #[cfg(feature = "test-support")]
@@ -94,9 +96,10 @@ pub use active_segment_ledger::publish_snapshot_lease_marker_for_test;
 pub use active_segment_ledger::{
     ActiveSegmentLedger, AppendCancellation, CommitReceipt, CommittedBlock, CommittedLedgerReader,
     LedgerCompletionState, LedgerFailure, LedgerFailureCode, LedgerSnapshot,
-    MAX_SNAPSHOT_LEASE_TTL_SECONDS, PreparedStoreBlock, SealedSegment, SegmentId,
-    SegmentProtectionKey, SegmentScope, SnapshotLeaseAttempt, SnapshotLeaseGrant, SnapshotLeaseId,
-    SnapshotLeaseReplacement, SnapshotLeaseUsage, StoreBlockIdentity,
+    MAX_SNAPSHOT_LEASE_TTL_SECONDS, PreparedStoreBlock, RetentionBucket, RetentionEvaluation,
+    RetentionReclamation, SealedSegment, SegmentId, SegmentProtectionKey, SegmentScope,
+    SnapshotLeaseAttempt, SnapshotLeaseGrant, SnapshotLeaseId, SnapshotLeaseReplacement,
+    SnapshotLeaseUsage, StoreBlockIdentity, StoreBlockPreparation,
 };
 
 pub use data_protection::{
@@ -112,8 +115,9 @@ pub use instance_bootstrap_storage::{
 
 pub use lifecycle_clock::{
     FixedLifecycleClockSource, IngestTime, LifecycleClock, LifecycleClockFailure,
-    LifecycleClockSource, SystemLifecycleClockSource,
+    LifecycleClockSource, RetentionCutoffProvenance, SystemLifecycleClockSource,
 };
+pub use retention_time::RetentionTimeAuthority;
 
 pub use resource_governor::{
     AdmissionCompletionState, AdmissionFailure, AdmissionFailureCode, AdmissionRetry,
@@ -153,7 +157,7 @@ pub use catalog::fuzz_catalog_stateful;
 
 #[cfg(fuzzing)]
 #[doc(hidden)]
-pub use active_segment_ledger::fuzz_active_segment_stateful;
+pub use active_segment_ledger::{fuzz_active_segment_stateful, fuzz_retention_prepared_block};
 
 #[cfg(fuzzing)]
 #[doc(hidden)]

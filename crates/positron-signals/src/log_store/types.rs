@@ -328,6 +328,13 @@ impl StoredLogRecord {
         }
     }
 
+    pub(super) const fn new_observed(record: LogRecord, ingest_time: IngestTime) -> Self {
+        Self {
+            record,
+            ingest_time,
+        }
+    }
+
     #[must_use]
     pub const fn record(&self) -> &LogRecord {
         &self.record
