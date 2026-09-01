@@ -13,6 +13,7 @@ opentelemetry-proto = { version = "=0.32.0", default-features = false, features 
 positron-kernel = { path = "../crates/positron-kernel" }
 positron-domain = { path = "../crates/positron-domain" }
 positron-governance = { path = "../crates/positron-governance" }
+positron-policy = { path = "../crates/positron-policy" }
 positron-ingest = { path = "../crates/positron-ingest" }
 positron-runtime = { path = "../crates/positron-runtime" }
 positron-signals = { path = "../crates/positron-signals" }
@@ -85,6 +86,13 @@ bench = false
 [[bin]]
 name = "log_store_block_decode"
 path = "fuzz_targets/log_store_block_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "log_store_compaction_stateful"
+path = "fuzz_targets/log_store_compaction_stateful.rs"
 test = false
 doc = false
 bench = false

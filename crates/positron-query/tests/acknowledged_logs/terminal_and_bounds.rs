@@ -880,6 +880,40 @@ impl QueryFixture {
         })
     }
 
+    pub(crate) fn new_compaction(label: &str) -> Result<Self, Box<dyn Error>> {
+        let roots = TemporaryRoots::new(label)?;
+        let paths = BootstrapPaths::new(
+            &roots.data(),
+            &roots.secrets(),
+            positron_kernel::MountQualification::LocalHost,
+        )?;
+        InstanceBootstrap::initialize(&paths, InitializationPlan::non_interactive())?;
+        let claim = InstanceBootstrap::claim(&paths)?;
+        let instance = InstanceBootstrap::reopen(&paths)?;
+        let context = instance.attribute(
+            PresentedCredential::parse(claim.query_secret().ok_or("query secret missing")?)?,
+            RequestedIntent::Query,
+            CompatibilityHints::none(),
+        )?;
+        let administrator = instance.attribute(
+            PresentedCredential::parse(claim.secret())?,
+            RequestedIntent::SystemAdministration,
+            CompatibilityHints::none(),
+        )?;
+        let governance = instance.governance_fixture_for_test()?;
+        let kernel = KernelFixture::new_compaction_with_identity(
+            instance.default_tenant_id(),
+            label,
+            &governance,
+        )?;
+        Ok(Self {
+            _roots: roots,
+            kernel,
+            context,
+            administrator,
+        })
+    }
+
     pub(crate) fn service(
         &self,
         batch_limit: u16,

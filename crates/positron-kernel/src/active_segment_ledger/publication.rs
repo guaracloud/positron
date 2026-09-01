@@ -80,13 +80,15 @@ fn publish_scope(
     exact_scope: bool,
 ) -> Result<crate::CatalogSnapshot, LedgerFailure> {
     let mut objects = Vec::new();
+    let frontier_objects = usize::from(frontier.is_some());
+    let object_capacity = basis
+        .plaintext_object_count()
+        .checked_add(metadata.len())
+        .and_then(|count| count.checked_add(frontier_objects))
+        .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
     objects
-        .try_reserve_exact(
-            basis
-                .plaintext_object_count()
-                .saturating_add(metadata.len()),
-        )
-        .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+        .try_reserve_exact(object_capacity)
+        .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
     for bytes in basis.plaintext_objects() {
         if storage.is_scope_metadata(bytes, scope) {
             continue;
@@ -97,7 +99,12 @@ fn publish_scope(
         {
             continue;
         }
-        objects.push(CatalogObject::new(bytes.to_vec())?);
+        let mut retained = Vec::new();
+        retained
+            .try_reserve_exact(bytes.len())
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
+        retained.extend_from_slice(bytes);
+        objects.push(CatalogObject::new(retained)?);
     }
     for segment in metadata {
         objects.push(CatalogObject::new(storage.metadata_object(*segment))?);

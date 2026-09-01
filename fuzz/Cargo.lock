@@ -889,6 +889,7 @@ dependencies = [
  "positron-governance",
  "positron-ingest",
  "positron-kernel",
+ "positron-policy",
  "positron-query",
  "positron-runtime",
  "positron-signals",

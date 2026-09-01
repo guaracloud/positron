@@ -164,6 +164,12 @@ pub fn fuzz_retention_prepared_block(
 
 #[cfg(fuzzing)]
 #[doc(hidden)]
+pub fn fuzz_compaction_storage_fault<T>(enabled: bool, action: impl FnOnce() -> T) -> T {
+    fault::fuzz_compaction_storage_fault(enabled, action)
+}
+
+#[cfg(fuzzing)]
+#[doc(hidden)]
 pub fn fuzz_snapshot_lease_record(data: &[u8]) {
     snapshot_lease_codec::fuzz_snapshot_lease_record(data);
 }

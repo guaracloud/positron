@@ -17,9 +17,9 @@ use crate::catalog::{CatalogFileEvent, with_catalog_fault};
 use crate::{
     ActiveSegmentLedger, Catalog, CatalogObject, CatalogProposal, CatalogSecret, CommittedBlock,
     CompactionBlock, FormatEpoch, IngestTime, InstanceId, LedgerCompletionState, LedgerFailureCode,
-    MountQualification, PrimaryDataVolume, RecoveryWorkKind, ResourceAmounts, ResourceDimension,
-    RetentionTimeAuthority, SegmentId, SegmentProtectionKey, SegmentScope, StoreBlockIdentity,
-    TransactionId, WorkClaim, WorkKind,
+    MountQualification, PrimaryDataVolume, RecoveryWorkClaim, RecoveryWorkKind, ResourceAmounts,
+    ResourceDimension, RetentionTimeAuthority, SegmentId, SegmentProtectionKey, SegmentScope,
+    StoreBlockIdentity, TransactionId, WorkClaim, WorkKind,
 };
 
 #[cfg(feature = "test-support")]
@@ -69,9 +69,19 @@ fn compaction_rejects_invalid_inputs_and_repairs_after_output_seal_ambiguity()
         CatalogSecret::from_owned(Box::new([0xb2; 32]), Box::new([0xb3; 32])),
     )?;
     let tenant = TenantId::from_bytes([0x64; 16])?;
+    let foreign_tenant = TenantId::from_bytes([0x65; 16])?;
     let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(4)?);
     let retention_time = RetentionTimeAuthority::establish()?;
     let key = || SegmentProtectionKey::from_owned(Box::new([0xb5; 32]));
+    let governor_before_binding = authority.governor().inspect()?;
+    let tenant_compaction = authority.recovery().reserve(RecoveryWorkClaim::tenant(
+        tenant,
+        RecoveryWorkKind::EmergencyCompaction,
+        ResourceAmounts::only(ResourceDimension::MemoryBytes, 1)?,
+    )?)?;
+    assert!(!tenant_compaction.authorizes_compaction(foreign_tenant));
+    drop(tenant_compaction);
+    assert_eq!(authority.governor().inspect()?, governor_before_binding);
     let ledger = ActiveSegmentLedger::open_with_retention_time(
         &authority,
         &retention_time,
@@ -104,7 +114,33 @@ fn compaction_rejects_invalid_inputs_and_repairs_after_output_seal_ambiguity()
         foreign_scope,
         key(),
     )?;
+    foreign_ledger.append(
+        foreign_ledger
+            .begin_store_block(
+                preparation_capacity(&authority, tenant)?,
+                StoreBlockIdentity::new([0xc2; 16])?,
+            )?
+            .finish(b"first-source".to_vec())?,
+    )?;
+    foreign_ledger.append(
+        foreign_ledger
+            .begin_store_block(
+                preparation_capacity(&authority, tenant)?,
+                StoreBlockIdentity::new([0xc3; 16])?,
+            )?
+            .finish(b"second-source".to_vec())?,
+    )?;
+    foreign_ledger.seal()?;
+    let foreign_ledger = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        foreign_scope,
+        key(),
+    )?;
     let foreign_snapshot = foreign_ledger.snapshot()?;
+    drop(active_snapshot);
+    let active_snapshot = ledger.snapshot()?;
     let foreign_preparation_failure = match ledger.prepare_compaction(&foreign_snapshot) {
         Ok(_) => return Err("a preparation crossed physical scopes".into()),
         Err(failure) => failure,
@@ -113,8 +149,43 @@ fn compaction_rejects_invalid_inputs_and_repairs_after_output_seal_ambiguity()
         foreign_preparation_failure.code(),
         LedgerFailureCode::PhysicalScopeMismatch
     );
+    let foreign_blocks = foreign_snapshot
+        .blocks()
+        .iter()
+        .map(|block| compaction_block(foreign_scope, block))
+        .collect::<Result<Vec<_>, _>>()?;
+    let preparation = ledger.prepare_compaction(&active_snapshot)?;
+    let foreign_execution_failure = foreign_ledger
+        .compact_sealed_with_cancellation(foreign_blocks.clone(), preparation, || false)
+        .expect_err("a preparation cannot execute against another ledger scope");
+    assert_eq!(
+        foreign_execution_failure.code(),
+        LedgerFailureCode::PhysicalScopeMismatch
+    );
+    drop(active_snapshot);
     drop(foreign_snapshot);
+    let stale_snapshot = foreign_ledger.snapshot()?;
+    let stale_preparation = foreign_ledger.prepare_compaction(&stale_snapshot)?;
+    foreign_ledger.append(
+        foreign_ledger
+            .begin_store_block(
+                preparation_capacity(&authority, tenant)?,
+                StoreBlockIdentity::new([0xc4; 16])?,
+            )?
+            .finish(b"foreign-third".to_vec())?,
+    )?;
+    let catalog_before_stale = catalog.pin()?.identity();
+    let stale_execution_failure = foreign_ledger
+        .compact_sealed_with_cancellation(foreign_blocks, stale_preparation, || false)
+        .expect_err("a prepared snapshot cannot execute after the ledger advances");
+    assert_eq!(
+        stale_execution_failure.code(),
+        LedgerFailureCode::StaleGeneration
+    );
+    assert_eq!(catalog.pin()?.identity(), catalog_before_stale);
+    drop(stale_snapshot);
     drop(foreign_ledger);
+    let active_snapshot = ledger.snapshot()?;
     let active_blocks = active_snapshot.blocks();
     let active_first = active_blocks
         .first()
@@ -651,9 +722,47 @@ fn compaction_cleanup_failures_fence_each_prepublication_mutation() -> Result<()
     );
     assert_eq!(
         cancelled_before_later_output.completion_state(),
+        LedgerCompletionState::RejectedBeforeMutation
+    );
+    drop(second_snapshot);
+    drop(second_attempt);
+    let cleanup_attempt = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    let cleanup_snapshot = cleanup_attempt.snapshot()?;
+    let cleanup_blocks = cleanup_snapshot
+        .blocks()
+        .iter()
+        .map(|block| compaction_block(scope, block))
+        .collect::<Result<Vec<_>, _>>()?;
+    let cleanup_polls = Cell::new(0_u8);
+    let cleanup_preparation = cleanup_attempt.prepare_compaction(&cleanup_snapshot)?;
+    let cleanup_failure = with_ledger_fault(LedgerFileEvent::DiscardUnpublishedOutput, || {
+        cleanup_attempt.compact_sealed_with_cancellation(
+            vec![cleanup_blocks[0].clone(), cleanup_blocks[2].clone()],
+            cleanup_preparation,
+            || {
+                let current = cleanup_polls.get();
+                cleanup_polls.set(current.saturating_add(1));
+                current >= 4
+            },
+        )
+    })
+    .expect_err("failed cleanup at a later output boundary must fence recovery");
+    assert_eq!(
+        cleanup_failure.code(),
+        LedgerFailureCode::StorageUnavailable
+    );
+    assert_eq!(
+        cleanup_failure.completion_state(),
         LedgerCompletionState::RecoveryRequired
     );
-    drop(second_attempt);
+    drop(cleanup_snapshot);
+    drop(cleanup_attempt);
     let second_attempt = ActiveSegmentLedger::open_with_retention_time(
         &authority,
         &retention_time,
@@ -679,7 +788,7 @@ fn compaction_cleanup_failures_fence_each_prepublication_mutation() -> Result<()
     assert_eq!(cancelled_after_append.code(), LedgerFailureCode::Cancelled);
     assert_eq!(
         cancelled_after_append.completion_state(),
-        LedgerCompletionState::RecoveryRequired
+        LedgerCompletionState::RejectedBeforeMutation
     );
     drop(second_snapshot);
     drop(second_attempt);
@@ -712,7 +821,7 @@ fn compaction_cleanup_failures_fence_each_prepublication_mutation() -> Result<()
     );
     assert_eq!(
         cancelled_after_first_output.completion_state(),
-        LedgerCompletionState::RecoveryRequired
+        LedgerCompletionState::RejectedBeforeMutation
     );
     drop(second_snapshot);
     drop(second_attempt);
@@ -817,7 +926,7 @@ fn compaction_cleanup_failures_fence_each_prepublication_mutation() -> Result<()
     );
     assert_eq!(
         cancelled_before_publish.completion_state(),
-        LedgerCompletionState::RecoveryRequired
+        LedgerCompletionState::RejectedBeforeMutation
     );
     drop(fifth_snapshot);
     drop(fifth_attempt);
@@ -1006,6 +1115,315 @@ fn cancellation_after_publication_before_output_seal_is_ambiguous() -> Result<()
 }
 
 #[test]
+fn ambiguous_output_append_is_reported_without_catalog_mutation() -> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0xd7; 16])?,
+        CatalogSecret::from_owned(Box::new([0xd8; 32]), Box::new([0xd9; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x64; 16])?;
+    let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(8)?);
+    let retention_time = RetentionTimeAuthority::establish()?;
+    let key = || SegmentProtectionKey::from_owned(Box::new([0xda; 32]));
+    for (identity, payload) in [
+        ([0xdb; 16], b"ambiguous-first".as_slice()),
+        ([0xdc; 16], b"ambiguous-second".as_slice()),
+    ] {
+        let source = ActiveSegmentLedger::open_with_retention_time(
+            &authority,
+            &retention_time,
+            &catalog,
+            scope,
+            key(),
+        )?;
+        source.append(
+            source
+                .begin_store_block(
+                    preparation_capacity(&authority, tenant)?,
+                    StoreBlockIdentity::new(identity)?,
+                )?
+                .finish(payload.to_vec())?,
+        )?;
+        source.seal()?;
+    }
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    let generation_before = catalog.pin()?.identity();
+    let governor_before = authority.governor().inspect()?;
+    let snapshot = ledger.snapshot()?;
+    let blocks = snapshot
+        .blocks()
+        .iter()
+        .map(|block| compaction_block(scope, block))
+        .collect::<Result<Vec<_>, _>>()?;
+    let preparation = ledger.prepare_compaction(&snapshot)?;
+    let failure = with_ledger_fault(LedgerFileEvent::SynchronizeFrontierDirectory, || {
+        ledger.compact_sealed_with_cancellation(blocks, preparation, || false)
+    })
+    .expect_err("ambiguous output append must be surfaced");
+    assert_eq!(failure.code(), LedgerFailureCode::StorageUnavailable);
+    assert_eq!(
+        failure.completion_state(),
+        LedgerCompletionState::CommitAmbiguous
+    );
+    assert_eq!(catalog.pin()?.identity(), generation_before);
+    drop(snapshot);
+    assert_eq!(authority.governor().inspect()?, governor_before);
+    drop(ledger);
+    let reopened = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    assert_eq!(reopened.snapshot()?.blocks().len(), 2);
+    Ok(())
+}
+
+#[test]
+fn large_catalog_compaction_admits_before_copy_and_recovers_without_drift()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_authority(volume)?;
+    let instance = InstanceId::new([0xdb; 16])?;
+    let catalog = Catalog::open(
+        &authority,
+        instance,
+        CatalogSecret::from_owned(Box::new([0xdc; 32]), Box::new([0xdd; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x64; 16])?;
+    let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(9)?);
+    let retention_time = RetentionTimeAuthority::establish()?;
+    let key = || SegmentProtectionKey::from_owned(Box::new([0xde; 32]));
+    let basis = catalog.pin()?;
+    let objects = (0_u8..1)
+        .map(|marker| {
+            let mut bytes = vec![marker; 524_288];
+            if let Some(first) = bytes.first_mut() {
+                *first = marker.saturating_add(1);
+            }
+            CatalogObject::new(bytes).map_err(Into::into)
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    catalog.commit(
+        basis.identity(),
+        CatalogProposal::new(
+            TransactionId::new([0xdf; 16])?,
+            FormatEpoch::CATALOG_V1,
+            objects,
+        )?,
+        None,
+    )?;
+    for (identity, payload) in [
+        ([0xe0; 16], b"large-catalog-first".as_slice()),
+        ([0xe1; 16], b"large-catalog-second".as_slice()),
+    ] {
+        let source = ActiveSegmentLedger::open_with_retention_time(
+            &authority,
+            &retention_time,
+            &catalog,
+            scope,
+            key(),
+        )?;
+        source.append(
+            source
+                .begin_store_block(
+                    preparation_capacity(&authority, tenant)?,
+                    StoreBlockIdentity::new(identity)?,
+                )?
+                .finish(payload.to_vec())?,
+        )?;
+        source.seal()?;
+    }
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    let ledger_baseline = authority.governor().inspect()?;
+    let snapshot = ledger.snapshot()?;
+    let baseline = authority.governor().inspect()?;
+    let probe = ledger.prepare_compaction(&snapshot)?;
+    let admitted = authority.governor().inspect()?;
+    let required_memory = admitted
+        .recovery_shared_usage(ResourceDimension::MemoryBytes)
+        .checked_sub(baseline.recovery_shared_usage(ResourceDimension::MemoryBytes))
+        .ok_or("compaction probe did not report a memory charge")?;
+    drop(probe);
+    assert_eq!(authority.governor().inspect()?, baseline);
+    let available_memory = baseline
+        .recovery_shared_capacity(ResourceDimension::MemoryBytes)
+        .checked_sub(baseline.recovery_shared_usage(ResourceDimension::MemoryBytes))
+        .ok_or("compaction fixture has no shared recovery memory")?;
+    let blocker_memory = available_memory
+        .checked_sub(required_memory)
+        .and_then(|available| available.checked_add(1))
+        .ok_or("large Catalog compaction unexpectedly exceeds shared capacity")?;
+    let blocker = authority.recovery().reserve(RecoveryWorkClaim::system(
+        RecoveryWorkKind::EmergencyCompaction,
+        ResourceAmounts::only(ResourceDimension::MemoryBytes, blocker_memory)?,
+    )?)?;
+    assert!(!blocker.authorizes_tenant_schema_session(tenant, 1));
+    let generation_before_refusal = catalog.pin()?.identity();
+    let refusal = match ledger.prepare_compaction(&snapshot) {
+        Ok(_) => return Err("large Catalog compaction copied before admission".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(refusal.code(), LedgerFailureCode::ResourceAdmissionRefused);
+    assert_eq!(catalog.pin()?.identity(), generation_before_refusal);
+    drop(blocker);
+    let after_refusal = authority.governor().inspect()?;
+    assert_eq!(
+        after_refusal.outstanding_total(),
+        baseline.outstanding_total()
+    );
+    for dimension in ResourceDimension::ALL {
+        assert_eq!(after_refusal.usage(dimension), baseline.usage(dimension));
+        assert_eq!(
+            after_refusal.recovery_shared_usage(dimension),
+            baseline.recovery_shared_usage(dimension)
+        );
+        assert_eq!(
+            after_refusal.recovery_pool_usage(RecoveryWorkKind::EmergencyCompaction, dimension),
+            baseline.recovery_pool_usage(RecoveryWorkKind::EmergencyCompaction, dimension)
+        );
+    }
+
+    let blocks = snapshot
+        .blocks()
+        .iter()
+        .map(|block| compaction_block(scope, block))
+        .collect::<Result<Vec<_>, _>>()?;
+    let generation_before_fault = catalog.pin()?.identity();
+    let fault = with_catalog_fault(CatalogFileEvent::SynchronizeCommit, || {
+        ledger.compact_sealed(blocks)
+    })
+    .expect_err("Catalog publication fault must not publish large-catalog compaction");
+    assert_eq!(fault.code(), LedgerFailureCode::StorageUnavailable);
+    assert_eq!(
+        fault.completion_state(),
+        LedgerCompletionState::RejectedBeforeMutation
+    );
+    assert_eq!(catalog.pin()?.identity(), generation_before_fault);
+    drop(snapshot);
+    let after_fault = authority.governor().inspect()?;
+    assert_eq!(
+        after_fault.outstanding_total(),
+        ledger_baseline.outstanding_total()
+    );
+    for dimension in ResourceDimension::ALL {
+        assert_eq!(
+            after_fault.usage(dimension),
+            ledger_baseline.usage(dimension)
+        );
+        assert_eq!(
+            after_fault.recovery_shared_usage(dimension),
+            ledger_baseline.recovery_shared_usage(dimension)
+        );
+        assert_eq!(
+            after_fault.recovery_pool_usage(RecoveryWorkKind::EmergencyCompaction, dimension),
+            ledger_baseline.recovery_pool_usage(RecoveryWorkKind::EmergencyCompaction, dimension)
+        );
+    }
+    drop(ledger);
+
+    let retry = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    let retry_snapshot = retry.snapshot()?;
+    let retry_blocks = retry_snapshot
+        .blocks()
+        .iter()
+        .map(|block| compaction_block(scope, block))
+        .collect::<Result<Vec<_>, _>>()?;
+    let publication = retry.compact_sealed(retry_blocks)?;
+    assert_eq!(publication.input_segments(), 2);
+    assert_eq!(publication.output_segments(), 1);
+    drop(retry_snapshot);
+    drop(retry);
+    let reopened = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    assert_eq!(reopened.snapshot()?.blocks().len(), 2);
+    Ok(())
+}
+
+#[test]
+fn trace_compaction_uses_the_same_checked_source_binding() -> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0xe2; 16])?,
+        CatalogSecret::from_owned(Box::new([0xe3; 32]), Box::new([0xe4; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x64; 16])?;
+    let scope = SegmentScope::new(tenant, SignalKind::Traces, VirtualShardId::new(10)?);
+    let retention_time = RetentionTimeAuthority::establish()?;
+    let key = || SegmentProtectionKey::from_owned(Box::new([0xe5; 32]));
+    for (identity, payload) in [
+        ([0xe6; 16], b"trace-first".as_slice()),
+        ([0xe7; 16], b"trace-second".as_slice()),
+    ] {
+        let source = ActiveSegmentLedger::open_with_retention_time(
+            &authority,
+            &retention_time,
+            &catalog,
+            scope,
+            key(),
+        )?;
+        source.append(
+            source
+                .begin_store_block(
+                    preparation_capacity(&authority, tenant)?,
+                    StoreBlockIdentity::new(identity)?,
+                )?
+                .finish(payload.to_vec())?,
+        )?;
+        source.seal()?;
+    }
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    let publication = ledger.compact_sealed(
+        ledger
+            .snapshot()?
+            .blocks()
+            .iter()
+            .map(|block| compaction_block(scope, block))
+            .collect::<Result<Vec<_>, _>>()?,
+    )?;
+    assert_eq!(publication.input_segments(), 2);
+    assert_eq!(publication.output_segments(), 1);
+    Ok(())
+}
+
+#[test]
 fn successful_compaction_replaces_sealed_sources_and_survives_reopen() -> Result<(), Box<dyn Error>>
 {
     let root = TemporaryRoot::new()?;
@@ -1068,16 +1486,31 @@ fn successful_compaction_replaces_sealed_sources_and_survives_reopen() -> Result
     let governor_before = authority.governor().inspect()?;
     let preparation = ledger.prepare_compaction(&before)?;
     let governor_during = authority.governor().inspect()?;
+    let catalog_snapshot = catalog.pin()?;
+    let catalog_bytes = catalog_snapshot
+        .plaintext_objects()
+        .try_fold(0_u64, |total, bytes| {
+            total
+                .checked_add(u64::try_from(bytes.len()).map_err(|_| "Catalog bytes overflow")?)
+                .ok_or("Catalog capacity accounting overflow")
+        })?;
+    let catalog_objects = u64::try_from(catalog_snapshot.plaintext_object_count())?;
     let expected = |dimension| match dimension {
-        ResourceDimension::MemoryBytes => payload_bytes * 5 + 2 * 256,
+        ResourceDimension::MemoryBytes => {
+            payload_bytes * 5 + 2 * 256 + catalog_bytes * 2 + catalog_objects * 256
+        },
         ResourceDimension::QueueSlots | ResourceDimension::TaskSlots => 1,
-        ResourceDimension::BufferCacheBytes => payload_bytes * 2 + 2 * (384 + 1_024),
-        ResourceDimension::BatchItems => 9,
+        ResourceDimension::BufferCacheBytes => {
+            payload_bytes * 2 + 2 * (384 + 1_024) + catalog_bytes * 2 + catalog_objects * 512
+        },
+        ResourceDimension::BatchItems => 9 + catalog_objects,
         ResourceDimension::LeaseSlots => 0,
         ResourceDimension::RetrySlots | ResourceDimension::IoPermits => 1,
-        ResourceDimension::CpuWorkUnits => 9,
+        ResourceDimension::CpuWorkUnits => 9 + catalog_objects,
         ResourceDimension::FileDescriptors => 6,
-        ResourceDimension::DiskHeadroomBytes => payload_bytes * 2 + 2 * (384 + 1_024),
+        ResourceDimension::DiskHeadroomBytes => {
+            payload_bytes * 2 + 2 * (384 + 1_024) + catalog_bytes * 2 + catalog_objects * 512
+        },
     };
     for dimension in ResourceDimension::ALL {
         let before_usage = governor_before
@@ -1130,6 +1563,65 @@ fn successful_compaction_replaces_sealed_sources_and_survives_reopen() -> Result
     assert_eq!(recovered.blocks().len(), 2);
     assert_eq!(recovered.blocks()[0].payload(), b"successful-first");
     assert_eq!(recovered.blocks()[1].payload(), b"successful-second");
+    Ok(())
+}
+
+#[test]
+fn compaction_preparation_rejects_a_stale_catalog_snapshot_without_reservation_drift()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0xee; 16])?,
+        CatalogSecret::from_owned(Box::new([0xef; 32]), Box::new([0xf0; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x64; 16])?;
+    let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(7)?);
+    let retention_time = RetentionTimeAuthority::establish()?;
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        SegmentProtectionKey::from_owned(Box::new([0xf1; 32])),
+    )?;
+    ledger.append(
+        ledger
+            .begin_store_block(
+                preparation_capacity(&authority, tenant)?,
+                StoreBlockIdentity::new([0xf2; 16])?,
+            )?
+            .finish(b"stale-preparation".to_vec())?,
+    )?;
+    let snapshot = ledger.snapshot()?;
+    let basis = catalog.pin()?;
+    catalog.commit(
+        basis.identity(),
+        CatalogProposal::new(
+            TransactionId::new([0xf3; 16])?,
+            FormatEpoch::CATALOG_V1,
+            vec![CatalogObject::new(
+                b"unrelated-catalog-generation".to_vec(),
+            )?],
+        )?,
+        None,
+    )?;
+    let before = authority.governor().inspect()?;
+    let failure = match ledger.prepare_compaction(&snapshot) {
+        Ok(_) => return Err("a stale Catalog snapshot was admitted".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(failure.code(), LedgerFailureCode::StaleGeneration);
+    let after = authority.governor().inspect()?;
+    assert_eq!(after.outstanding_total(), before.outstanding_total());
+    for dimension in ResourceDimension::ALL {
+        assert_eq!(
+            after.recovery_pool_usage(RecoveryWorkKind::EmergencyCompaction, dimension),
+            before.recovery_pool_usage(RecoveryWorkKind::EmergencyCompaction, dimension)
+        );
+    }
     Ok(())
 }
 

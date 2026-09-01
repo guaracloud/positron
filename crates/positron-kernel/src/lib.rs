@@ -164,6 +164,14 @@ pub use active_segment_ledger::{fuzz_active_segment_stateful, fuzz_retention_pre
 
 #[cfg(fuzzing)]
 #[doc(hidden)]
+pub use active_segment_ledger::fuzz_compaction_storage_fault;
+
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub use catalog::fuzz_compaction_publication_fault;
+
+#[cfg(fuzzing)]
+#[doc(hidden)]
 pub use active_segment_ledger::fuzz_snapshot_lease_record;
 
 use std::error::Error;

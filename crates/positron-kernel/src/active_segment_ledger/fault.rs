@@ -131,6 +131,16 @@ pub(crate) fn with_ledger_fault<T>(event: LedgerFileEvent, action: impl FnOnce()
     with_ledger_errno(event, rustix::io::Errno::IO, action)
 }
 
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub fn fuzz_compaction_storage_fault<T>(enabled: bool, action: impl FnOnce() -> T) -> T {
+    if enabled {
+        with_ledger_fault(LedgerFileEvent::SynchronizeFrontierDirectory, action)
+    } else {
+        action()
+    }
+}
+
 #[cfg(any(test, fuzzing))]
 pub(crate) fn with_ledger_errno<T>(
     event: LedgerFileEvent,

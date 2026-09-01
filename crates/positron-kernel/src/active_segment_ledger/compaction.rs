@@ -1,5 +1,7 @@
 use std::num::NonZeroU64;
 
+use sha2::{Digest, Sha256};
+
 use crate::RecoveryWorkKind;
 use crate::data_protection::{DataProtection, FrameLimits, FrameSequence, SegmentFramePurpose};
 
@@ -30,11 +32,30 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
                 .checked_add(block.payload().len())
                 .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))
         })?;
+        self.catalog.refresh_state()?;
+        let basis = self.catalog.pin()?;
+        if basis.identity() != snapshot.catalog_identity()
+            || basis.number() != snapshot.catalog_generation()
+        {
+            return Err(LedgerFailure::new(LedgerFailureCode::StaleGeneration));
+        }
+        let catalog_bytes = basis
+            .plaintext_objects()
+            .try_fold(0_usize, |total, bytes| {
+                total
+                    .checked_add(bytes.len())
+                    .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))
+            })?;
         let maximum_blocks = snapshot.blocks().len();
         let claim = RecoveryWorkClaim::tenant(
             self.scope.tenant_id(),
             RecoveryWorkKind::EmergencyCompaction,
-            super::capacity::compaction_claim(payload_bytes, maximum_blocks)?,
+            super::capacity::compaction_claim(
+                payload_bytes,
+                maximum_blocks,
+                catalog_bytes,
+                basis.plaintext_object_count(),
+            )?,
         )
         .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
         let capacity = self
@@ -44,6 +65,12 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
         Ok(CompactionPreparation {
             capacity,
+            scope: snapshot.scope(),
+            catalog_instance: self.catalog.instance(),
+            catalog_identity: snapshot.catalog_identity(),
+            catalog_generation: snapshot.catalog_generation(),
+            frontier: snapshot.frontier(),
+            source_digest: snapshot_source_digest(snapshot)?,
             maximum_blocks,
             maximum_payload_bytes: payload_bytes,
         })
@@ -79,6 +106,15 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         if blocks.is_empty() || blocks.len() > MAX_COMPACTION_BLOCKS {
             return Err(LedgerFailure::new(LedgerFailureCode::LimitExceeded));
         }
+        if preparation.scope != self.scope
+            || !preparation.capacity.belongs_to(self.authority.governor())
+            || !preparation
+                .capacity
+                .authorizes_compaction(self.scope.tenant_id())
+            || preparation.catalog_instance != self.catalog.instance()
+        {
+            return Err(LedgerFailure::new(LedgerFailureCode::PhysicalScopeMismatch));
+        }
         if blocks.iter().any(|block| block.scope != self.scope) {
             return Err(LedgerFailure::new(LedgerFailureCode::PhysicalScopeMismatch));
         }
@@ -113,6 +149,14 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         state.require_healthy()?;
         self.catalog.refresh_state()?;
         let basis = self.catalog.pin()?;
+        if basis.identity() != preparation.catalog_identity
+            || basis.number() != preparation.catalog_generation
+            || state.frontier != preparation.frontier
+            || snapshot_source_digest_from_blocks(self.scope, state.frontier, &state.blocks)?
+                != preparation.source_digest
+        {
+            return Err(LedgerFailure::new(LedgerFailureCode::StaleGeneration));
+        }
         let current_metadata = self
             .storage
             .catalog_segments(&basis, self.scope)
@@ -188,9 +232,11 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         let mut durable_output_mutated = false;
         for run in runs {
             if is_cancelled() {
-                if durable_output_mutated {
+                if durable_output_mutated
+                    && let Err(cleanup_failure) = discard_outputs(&output_storage, &outputs)
+                {
                     state.poisoned = true;
-                    return Err(LedgerFailure::post_mutation(LedgerFailureCode::Cancelled));
+                    return Err(LedgerFailure::post_mutation(cleanup_failure.code()));
                 }
                 return Err(LedgerFailure::new(LedgerFailureCode::Cancelled));
             }
@@ -258,7 +304,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
                 state.poisoned = true;
                 return Err(LedgerFailure::post_mutation(cleanup_failure.code()));
             }
-            return Err(LedgerFailure::post_mutation(LedgerFailureCode::Cancelled));
+            return Err(LedgerFailure::new(LedgerFailureCode::Cancelled));
         }
         let published =
             match publish_segments(self.catalog, &basis, &output_storage, self.scope, &proposal) {
@@ -337,6 +383,51 @@ fn contiguous_runs(blocks: &[CompactionBlock]) -> Result<Vec<Vec<CompactionBlock
         }
     }
     Ok(runs)
+}
+
+fn snapshot_source_digest(snapshot: &super::LedgerSnapshot<'_>) -> Result<[u8; 32], LedgerFailure> {
+    source_digest(snapshot.scope(), snapshot.frontier(), snapshot.blocks())
+}
+
+fn snapshot_source_digest_from_blocks(
+    scope: super::SegmentScope,
+    frontier: positron_domain::routing::CommitPosition,
+    blocks: &[CommittedBlock],
+) -> Result<[u8; 32], LedgerFailure> {
+    source_digest(scope, frontier, blocks)
+}
+
+fn source_digest(
+    scope: super::SegmentScope,
+    frontier: positron_domain::routing::CommitPosition,
+    blocks: &[CommittedBlock],
+) -> Result<[u8; 32], LedgerFailure> {
+    let mut digest = Sha256::new();
+    digest.update(b"positron-compaction-inputs-v1");
+    digest.update(scope.tenant_id().to_bytes());
+    digest.update([match scope.signal_kind() {
+        positron_domain::routing::SignalKind::Logs => 1,
+        positron_domain::routing::SignalKind::Traces => 2,
+    }]);
+    digest.update(scope.shard_id().value().to_be_bytes());
+    digest.update(frontier.value().to_be_bytes());
+    digest.update(
+        u64::try_from(blocks.len())
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?
+            .to_be_bytes(),
+    );
+    for block in blocks {
+        digest.update(block.segment_id().to_bytes());
+        digest.update(block.identity().to_bytes());
+        digest.update(block.position().value().to_be_bytes());
+        digest.update(block.content_digest()?);
+        digest.update(
+            u64::try_from(block.payload().len())
+                .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?
+                .to_be_bytes(),
+        );
+    }
+    Ok(digest.finalize().into())
 }
 
 fn position_before(
@@ -469,6 +560,9 @@ fn map_append_failure(failure: AppendFailure) -> LedgerFailure {
 }
 
 fn after_output_creation(failure: LedgerFailure) -> LedgerFailure {
+    if failure.code() == LedgerFailureCode::Cancelled {
+        return LedgerFailure::new(LedgerFailureCode::Cancelled);
+    }
     match failure.completion_state() {
         super::LedgerCompletionState::RejectedBeforeMutation => {
             LedgerFailure::post_mutation(failure.code())

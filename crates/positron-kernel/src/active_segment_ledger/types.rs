@@ -303,6 +303,12 @@ pub struct CompactionBlock {
 /// consumed by the kernel publication or released before the caller returns.
 pub struct CompactionPreparation<'kernel> {
     pub(super) capacity: ResourceReservation<'kernel>,
+    pub(super) scope: SegmentScope,
+    pub(super) catalog_instance: crate::InstanceId,
+    pub(super) catalog_identity: crate::CatalogGenerationId,
+    pub(super) catalog_generation: u64,
+    pub(super) frontier: CommitPosition,
+    pub(super) source_digest: [u8; 32],
     pub(super) maximum_blocks: usize,
     pub(super) maximum_payload_bytes: usize,
 }

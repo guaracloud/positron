@@ -874,6 +874,7 @@ impl Drop for TemporaryRoots {
 pub struct KernelFixture {
     pub authority: &'static StorageKernelResourceAuthority,
     retention_time: &'static RetentionTimeAuthority,
+    retention_enabled: bool,
     catalog: &'static Catalog<'static>,
     ledger: Option<ActiveSegmentLedger<'static, 'static>>,
     tenant: TenantId,
@@ -937,6 +938,7 @@ impl KernelFixture {
         Ok(Self {
             authority,
             retention_time,
+            retention_enabled: false,
             catalog,
             ledger: Some(ledger),
             tenant,
@@ -951,6 +953,42 @@ impl KernelFixture {
         identity: &GovernanceTestFixture,
     ) -> Result<Self, Box<dyn Error>> {
         let fixture = Self::new(tenant, label)?;
+        identity.install_into(&fixture)?;
+        Ok(fixture)
+    }
+
+    pub fn new_compaction_with_identity(
+        tenant: TenantId,
+        label: &str,
+        identity: &GovernanceTestFixture,
+    ) -> Result<Self, Box<dyn Error>> {
+        let roots = TemporaryRoots::new(label)?;
+        let volume = PrimaryDataVolume::acquire(&roots.0, MountQualification::LocalHost)?;
+        let authority = Box::leak(Box::new(establish_authority(volume, tenant)?));
+        let catalog = Box::leak(Box::new(Catalog::open(
+            authority,
+            InstanceId::new([0x31; 16])?,
+            CatalogSecret::from_owned(Box::new([0x32; 32]), Box::new([0x33; 32])),
+        )?));
+        let retention_time = Box::leak(Box::new(RetentionTimeAuthority::establish()?));
+        let shard = VirtualShardId::new(1)?;
+        let ledger = ActiveSegmentLedger::open_with_retention_time(
+            authority,
+            retention_time,
+            catalog,
+            SegmentScope::new(tenant, SignalKind::Logs, shard),
+            SegmentProtectionKey::from_owned(Box::new([0x34; 32])),
+        )?;
+        let fixture = Self {
+            authority,
+            retention_time,
+            retention_enabled: true,
+            catalog,
+            ledger: Some(ledger),
+            tenant,
+            shard,
+            _root: roots,
+        };
         identity.install_into(&fixture)?;
         Ok(fixture)
     }
@@ -980,12 +1018,22 @@ impl KernelFixture {
     pub fn seal_and_reopen(&mut self) -> Result<(), Box<dyn Error>> {
         let ledger = self.ledger.take().ok_or("ledger unavailable")?;
         ledger.seal()?;
-        self.ledger = Some(ActiveSegmentLedger::open(
-            self.authority,
-            self.catalog,
-            SegmentScope::new(self.tenant, SignalKind::Logs, self.shard),
-            SegmentProtectionKey::from_owned(Box::new([0x34; 32])),
-        )?);
+        self.ledger = Some(if self.retention_enabled {
+            ActiveSegmentLedger::open_with_retention_time(
+                self.authority,
+                self.retention_time,
+                self.catalog,
+                SegmentScope::new(self.tenant, SignalKind::Logs, self.shard),
+                SegmentProtectionKey::from_owned(Box::new([0x34; 32])),
+            )?
+        } else {
+            ActiveSegmentLedger::open(
+                self.authority,
+                self.catalog,
+                SegmentScope::new(self.tenant, SignalKind::Logs, self.shard),
+                SegmentProtectionKey::from_owned(Box::new([0x34; 32])),
+            )?
+        });
         Ok(())
     }
 
@@ -995,13 +1043,23 @@ impl KernelFixture {
         let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(
             101_000_000_000,
         )));
-        self.ledger = Some(ActiveSegmentLedger::open_with_clock(
-            self.authority,
-            self.catalog,
-            SegmentScope::new(self.tenant, SignalKind::Logs, self.shard),
-            SegmentProtectionKey::from_owned(Box::new([0x34; 32])),
-            &clock,
-        )?);
+        self.ledger = Some(if self.retention_enabled {
+            ActiveSegmentLedger::open_with_retention_time(
+                self.authority,
+                self.retention_time,
+                self.catalog,
+                SegmentScope::new(self.tenant, SignalKind::Logs, self.shard),
+                SegmentProtectionKey::from_owned(Box::new([0x34; 32])),
+            )?
+        } else {
+            ActiveSegmentLedger::open_with_clock(
+                self.authority,
+                self.catalog,
+                SegmentScope::new(self.tenant, SignalKind::Logs, self.shard),
+                SegmentProtectionKey::from_owned(Box::new([0x34; 32])),
+                &clock,
+            )?
+        });
         Ok(())
     }
 
@@ -1085,14 +1143,13 @@ impl KernelFixture {
             WorkKind::Ingest,
             ResourceAmounts::only(ResourceDimension::MemoryBytes, 1_048_576)?,
         )?)?;
-        let block = LogStore::new().prepare(
-            ledger.begin_store_block_for_test(
-                capacity,
-                StoreBlockIdentity::new([identity; 16])?,
-                self.retention_time,
-            )?,
-            records,
-        )?;
+        let identity = StoreBlockIdentity::new([identity; 16])?;
+        let preparation = if self.retention_enabled {
+            ledger.begin_store_block(capacity, identity)?
+        } else {
+            ledger.begin_store_block_for_test(capacity, identity, self.retention_time)?
+        };
+        let block = LogStore::new().prepare(preparation, records)?;
         ledger.append(block.into_store_block())?;
         Ok(())
     }
@@ -1122,15 +1179,15 @@ impl KernelFixture {
             WorkKind::Ingest,
             ResourceAmounts::only(ResourceDimension::MemoryBytes, 1_048_576)?,
         )?)?;
-        let block = LogStore::new().prepare(
-            self.ledger()?.begin_store_block_for_test(
-                capacity,
-                StoreBlockIdentity::new([identity; 16])?,
-                self.retention_time,
-            )?,
-            records,
-        )?;
-        self.ledger()?.append(block.into_store_block())?;
+        let ledger = self.ledger()?;
+        let identity = StoreBlockIdentity::new([identity; 16])?;
+        let preparation = if self.retention_enabled {
+            ledger.begin_store_block(capacity, identity)?
+        } else {
+            ledger.begin_store_block_for_test(capacity, identity, self.retention_time)?
+        };
+        let block = LogStore::new().prepare(preparation, records)?;
+        ledger.append(block.into_store_block())?;
         Ok(())
     }
 
