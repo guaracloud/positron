@@ -59,12 +59,13 @@ impl ElapsedSource {
     }
 }
 
-#[cfg(any(test, fuzzing))]
-pub(crate) struct ManualRetentionTime(Arc<AtomicU64>);
+#[cfg(any(test, fuzzing, feature = "test-support"))]
+#[doc(hidden)]
+pub struct ManualRetentionTime(Arc<AtomicU64>);
 
-#[cfg(any(test, fuzzing))]
+#[cfg(any(test, fuzzing, feature = "test-support"))]
 impl ManualRetentionTime {
-    pub(crate) fn advance(&self, nanoseconds: u64) -> Result<(), LifecycleClockFailure> {
+    pub fn advance(&self, nanoseconds: u64) -> Result<(), LifecycleClockFailure> {
         self.0
             .try_update(Ordering::AcqRel, Ordering::Acquire, |elapsed| {
                 elapsed.checked_add(nanoseconds)
@@ -94,6 +95,20 @@ impl RetentionTimeAuthority {
     pub(crate) fn establish_with_manual_elapsed(
         epoch: UnixNanoseconds,
     ) -> (Self, ManualRetentionTime) {
+        Self::manual(epoch)
+    }
+
+    /// Constructs a deterministic destructive-retention authority for cross-crate tests.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn establish_with_manual_elapsed_for_test(
+        epoch: UnixNanoseconds,
+    ) -> (Self, ManualRetentionTime) {
+        Self::manual(epoch)
+    }
+
+    #[cfg(any(test, fuzzing, feature = "test-support"))]
+    fn manual(epoch: UnixNanoseconds) -> (Self, ManualRetentionTime) {
         let elapsed = Arc::new(AtomicU64::new(0));
         (
             Self {

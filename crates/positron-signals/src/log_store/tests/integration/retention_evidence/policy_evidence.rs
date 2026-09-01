@@ -148,7 +148,9 @@ fn reconstructed_caller_time_cannot_retire_fresh_authenticated_data() -> Result<
     let tenant = TenantId::from_bytes([0x41; 16])?;
     let shard = VirtualShardId::new(12)?;
     let scope = SegmentScope::new(tenant, SignalKind::Logs, shard);
-    let retention_time = RetentionTimeAuthority::establish()?;
+    let (retention_time, elapsed) = RetentionTimeAuthority::establish_with_manual_elapsed_for_test(
+        UnixNanoseconds::new(10_000_000_000),
+    );
     let store = LogStore::new();
     let PolicyEvaluation::Accepted(evaluated) = IngestPolicy::preserving(1)?.evaluate(
         NativeLogCandidate::new(None, None, None, vec![], LogMetadata::empty()),
@@ -223,6 +225,13 @@ fn reconstructed_caller_time_cannot_retire_fresh_authenticated_data() -> Result<
         .map_err(|failure| format!("retire fresh retention ledger: {failure:?}"))?;
     assert_eq!(outcome.logically_retired_segments(), 0);
     assert_eq!(active.snapshot()?.blocks().len(), 1);
+    elapsed.advance(1_000_000_000)?;
+    let outcome = active
+        .begin_retention()?
+        .commit()
+        .map_err(|failure| format!("retire elapsed retention ledger: {failure:?}"))?;
+    assert_eq!(outcome.logically_retired_segments(), 1);
+    assert_eq!(active.snapshot()?.blocks().len(), 0);
     let other_scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(112)?);
     let other = ActiveSegmentLedger::open(
         &authority,
