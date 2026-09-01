@@ -61,16 +61,30 @@ pub(super) fn publish(
     match result {
         Ok(_) => Ok(()),
         Err(failure) if failure.code() == CatalogFailureCode::StorageUnavailable => {
-            catalog.refresh_state()?;
-            let latest = catalog.pin()?;
-            if recover(&latest, scope)?.is_some_and(|durable| durable >= frontier) {
+            #[cfg(any(test, fuzzing, feature = "test-support"))]
+            super::fault::emit_event(
+                super::fault::LedgerFileEvent::BeforeRetentionFrontierReconciliation,
+            )?;
+            catalog.refresh_state().map_err(ambiguous_catalog)?;
+            let latest = catalog.pin().map_err(ambiguous_catalog)?;
+            let recovered = recover(&latest, scope)
+                .map_err(|recovery| LedgerFailure::ambiguous(recovery.code()))?;
+            if recovered.is_some_and(|durable| durable >= frontier) {
                 Ok(())
-            } else {
+            } else if latest.identity() == basis.identity() {
                 Err(failure.into())
+            } else {
+                let failure = LedgerFailure::from(failure);
+                Err(LedgerFailure::ambiguous(failure.code()))
             }
         },
         Err(failure) => Err(failure.into()),
     }
+}
+
+fn ambiguous_catalog(failure: crate::CatalogFailure) -> LedgerFailure {
+    let failure = LedgerFailure::from(failure);
+    LedgerFailure::ambiguous(failure.code())
 }
 
 pub(super) fn encode(scope: SegmentScope, frontier: IngestTime) -> Vec<u8> {

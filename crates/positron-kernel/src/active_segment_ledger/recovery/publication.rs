@@ -10,7 +10,8 @@ pub(in crate::active_segment_ledger) fn publish_frontier(
     position: CommitPosition,
     segment_retention: SegmentRetention,
 ) -> Result<[u8; 32], LedgerFailure> {
-    let mut plaintext = Vec::with_capacity(FRONTIER_V2_PLAINTEXT_BYTES);
+    let mut plaintext = Vec::with_capacity(FRONTIER_V3_PLAINTEXT_BYTES);
+    plaintext.extend_from_slice(&3_u16.to_be_bytes());
     plaintext.extend_from_slice(&durable_bytes.to_be_bytes());
     plaintext.extend_from_slice(&next_sequence.to_be_bytes());
     plaintext.extend_from_slice(&position.value().to_be_bytes());

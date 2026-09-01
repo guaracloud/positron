@@ -145,8 +145,11 @@ version explicitly, and encrypts the metadata as one independent frame:
 | 2 | frontier envelope version | `1` |
 | 2 | active-segment format version | `3` |
 | 4 | encrypted-frame length | at most 512 |
-| variable | encrypted frontier frame | v3 plaintext is `durable_bytes:u64 || next_sequence:u64 || commit_position:u64 || retention_tag:u8 || maximum_ingest_time:i64` |
+| variable | encrypted frontier frame | v3 plaintext is `active_segment_format_version:u16 || durable_bytes:u64 || next_sequence:u64 || commit_position:u64 || retention_tag:u8 || maximum_ingest_time:i64` |
 
+The authenticated inner `active_segment_format_version` must equal the outer
+selector before recovery interprets any v3 block or retention field. Changing
+only the outer selector between v3 and a legacy layout is integrity corruption.
 `retention_tag` is `0` for an empty segment, `1` when complete lifecycle
 metadata is unavailable, and `2` when `maximum_ingest_time` is the authenticated
 aggregate of every Store Block appended to the segment. Non-Log Store and

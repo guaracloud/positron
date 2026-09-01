@@ -11,7 +11,7 @@ use super::snapshot_lease_grant::SnapshotLeaseGrant;
 use super::snapshot_lease_record::{
     LeaseBlock, LeaseRecord, LeaseWindow, SnapshotLeaseId, SnapshotLeaseUsage,
 };
-use super::{ActiveSegmentLedger, LedgerCompletionState, LedgerFailure, LedgerFailureCode};
+use super::{ActiveSegmentLedger, LedgerFailure, LedgerFailureCode};
 
 /// A prepared replacement keeps the old durable lease authoritative until the
 /// caller has authenticated the candidate cursor. Dropping it releases only
@@ -24,6 +24,7 @@ pub struct SnapshotLeaseReplacement<'lease, 'kernel, 'catalog> {
     encoded: Vec<u8>,
     grant: Option<SnapshotLeaseGrant<'kernel>>,
     observed_at: u64,
+    expiry: u64,
     committed: bool,
 }
 
@@ -56,6 +57,12 @@ impl<'lease, 'kernel, 'catalog> SnapshotLeaseReplacement<'lease, 'kernel, 'catal
             .lock()
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
         state.require_healthy()?;
+        if self.expiry <= state.last_snapshot_lease_time {
+            return Err(LedgerFailure::new(LedgerFailureCode::SnapshotExpired));
+        }
+        if self.observed_at < state.last_snapshot_lease_time {
+            return Err(LedgerFailure::new(LedgerFailureCode::StaleGeneration));
+        }
         self.ledger.retry_pending_releases(&mut state)?;
         if state.lease_reservations.contains_key(&self.new_identity) {
             return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
@@ -77,7 +84,10 @@ impl<'lease, 'kernel, 'catalog> SnapshotLeaseReplacement<'lease, 'kernel, 'catal
         if !state.lease_reservations.contains_key(&self.old_identity) {
             return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
         }
-        super::snapshot_lease_record::validate_active_lease(&old_record, self.observed_at)?;
+        super::snapshot_lease_record::validate_active_lease(
+            &old_record,
+            state.last_snapshot_lease_time,
+        )?;
         let amounts = lease_claim(self.encoded.len())?;
         let transaction = LeaseReservationTransaction::begin(&mut state, self.old_identity)?;
         if let Err(failure) = transaction.resize(&mut state, amounts) {
@@ -107,7 +117,7 @@ impl<'lease, 'kernel, 'catalog> SnapshotLeaseReplacement<'lease, 'kernel, 'catal
             .lease_reservations
             .insert(self.new_identity, reservation);
         state.lease_resume_markers.remove(&self.old_identity);
-        state.last_snapshot_lease_time = self.observed_at;
+        state.last_snapshot_lease_time = state.last_snapshot_lease_time.max(self.observed_at);
         self.committed = true;
         self.grant
             .take()
@@ -188,13 +198,7 @@ fn rollback_after_replacement_failure(
 ) -> LedgerFailure {
     match transaction.rollback(state) {
         Ok(()) => failure,
-        Err(rollback) => {
-            if rollback.completion_state() == LedgerCompletionState::CommitAmbiguous {
-                rollback
-            } else {
-                LedgerFailure::new(LedgerFailureCode::RecoveryRequired)
-            }
-        },
+        Err(_) => LedgerFailure::new(LedgerFailureCode::RecoveryRequired),
     }
 }
 
@@ -324,6 +328,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             encoded,
             grant: Some(grant),
             observed_at: now,
+            expiry,
             committed: false,
         })
     }

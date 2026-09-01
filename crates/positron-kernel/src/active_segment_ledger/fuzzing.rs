@@ -78,7 +78,7 @@ pub(super) fn fuzz_active_segment_stateful(data: &[u8]) {
     let mut protected_snapshot: Option<(LedgerSnapshot<'_>, SnapshotExpectation)> = None;
 
     for (index, selector) in data.iter().copied().take(24).enumerate() {
-        let operation = selector % 23;
+        let operation = selector % 25;
         match operation {
             0 => {
                 let (identity, payload) = block_parts(index, selector);
@@ -172,7 +172,7 @@ pub(super) fn fuzz_active_segment_stateful(data: &[u8]) {
                     }
                 }
             },
-            7..=12 => {
+            7..=12 | 23..=24 => {
                 let artifact = PersistedArtifact::from_operation(operation)
                     .expect("the corruption operation is in range");
                 assert_eq!(run_persisted_corruption_case(artifact, selector), artifact);

@@ -23,6 +23,7 @@ const FRONTIER_MAGIC: &[u8; 8] = b"PFRONT02";
 const FRONTIER_PREFIX_BYTES: usize = 8 + 2 + 2 + 4;
 const FRONTIER_V1_PLAINTEXT_BYTES: usize = 8 + 8 + 8;
 const FRONTIER_V2_PLAINTEXT_BYTES: usize = FRONTIER_V1_PLAINTEXT_BYTES + 1 + 8;
+const FRONTIER_V3_PLAINTEXT_BYTES: usize = 2 + FRONTIER_V2_PLAINTEXT_BYTES;
 const MAX_FRONTIER_FRAME_BYTES: u32 = 512;
 const MAX_RECOVERED_BLOCKS: usize = 1_024;
 
@@ -358,20 +359,38 @@ fn read_frontier(
     let plaintext = verified.as_plaintext();
     let expected_plaintext_bytes = if format_version == 1 {
         FRONTIER_V1_PLAINTEXT_BYTES
-    } else {
+    } else if format_version == 2 {
         FRONTIER_V2_PLAINTEXT_BYTES
+    } else {
+        FRONTIER_V3_PLAINTEXT_BYTES
     };
     if plaintext.len() != expected_plaintext_bytes {
         return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
     }
-    let durable_bytes = read_u64(plaintext, 0)?;
-    let next_sequence = read_u64(plaintext, 8)?;
+    let authenticated = if format_version == 3 {
+        let authenticated_version = u16::from_be_bytes(
+            plaintext
+                .get(..2)
+                .and_then(|bytes| bytes.try_into().ok())
+                .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?,
+        );
+        if authenticated_version != format_version {
+            return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
+        }
+        plaintext
+            .get(2..)
+            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?
+    } else {
+        plaintext
+    };
+    let durable_bytes = read_u64(authenticated, 0)?;
+    let next_sequence = read_u64(authenticated, 8)?;
     if next_sequence != frame_sequence {
         return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
     }
-    let position = position_from_value(read_u64(plaintext, 16)?)?;
+    let position = position_from_value(read_u64(authenticated, 16)?)?;
     let segment_retention = if format_version == 3 {
-        decode_segment_retention(plaintext)?
+        decode_segment_retention(authenticated)?
     } else {
         // v1 carried no bound and v2 could be authored from caller-supplied
         // metadata. Both remain readable but are ineligible for destruction.

@@ -446,7 +446,14 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         if state.retention_readiness == RetentionReadiness::EmptyUninitialized {
             self.catalog.refresh_state()?;
             let basis = self.catalog.pin()?;
-            retention_frontier::publish(self.catalog, &basis, self.scope, ingest_time)?;
+            if let Err(failure) =
+                retention_frontier::publish(self.catalog, &basis, self.scope, ingest_time)
+            {
+                if failure.completion_state() != LedgerCompletionState::RejectedBeforeMutation {
+                    state.poisoned = true;
+                }
+                return Err(failure);
+            }
             state.retention_frontier = Some(ingest_time);
             state.retention_readiness = RetentionReadiness::TrustedPersisted;
         }

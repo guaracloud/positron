@@ -44,6 +44,10 @@ recovery alongside append and persisted-corruption transitions:
 cargo +nightly fuzz run active_segment_ledger_stateful --sanitizer none -- -runs=1000
 ```
 
+The named `frontier_selector_flips` seed drives authenticated v3-to-v2 and
+legacy v2-to-v3 outer-selector changes through persisted reopen; its trailing
+newline retains the target's existing generic frontier-corruption transition.
+
 The bounded query matcher target exercises substring matching, the static
 regex automaton, and conservative text-pruning candidate extraction:
 
