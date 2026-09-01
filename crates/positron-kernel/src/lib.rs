@@ -117,9 +117,6 @@ pub use lifecycle_clock::{
     FixedLifecycleClockSource, IngestTime, LifecycleClock, LifecycleClockFailure,
     LifecycleClockSource, RetentionCutoffProvenance, SystemLifecycleClockSource,
 };
-#[cfg(feature = "test-support")]
-#[doc(hidden)]
-pub use retention_time::ManualRetentionTime;
 pub use retention_time::RetentionTimeAuthority;
 
 pub use resource_governor::{

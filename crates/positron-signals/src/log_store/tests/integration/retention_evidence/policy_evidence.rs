@@ -148,9 +148,10 @@ fn reconstructed_caller_time_cannot_retire_fresh_authenticated_data() -> Result<
     let tenant = TenantId::from_bytes([0x41; 16])?;
     let shard = VirtualShardId::new(12)?;
     let scope = SegmentScope::new(tenant, SignalKind::Logs, shard);
-    let (retention_time, elapsed) = RetentionTimeAuthority::establish_with_manual_elapsed_for_test(
-        UnixNanoseconds::new(10_000_000_000),
-    );
+    let retention_time = RetentionTimeAuthority::establish()?;
+    // A day leaves deterministic setup margin, while epoch + 1 second would be
+    // expired by decades if caller-reconstructed time could drive retention.
+    const RETENTION_SECONDS: u64 = 86_400;
     let store = LogStore::new();
     let PolicyEvaluation::Accepted(evaluated) = IngestPolicy::preserving(1)?.evaluate(
         NativeLogCandidate::new(None, None, None, vec![], LogMetadata::empty()),
@@ -218,20 +219,22 @@ fn reconstructed_caller_time_cannot_retire_fresh_authenticated_data() -> Result<
     );
     let legacy_payload = block.payload().to_vec();
     drop(snapshot);
-    let _policy = retention_policy(&catalog, &active, tenant, 1)?;
+    let _policy = retention_policy(&catalog, &active, tenant, RETENTION_SECONDS)?;
     let outcome = active
         .begin_retention()?
         .commit()
         .map_err(|failure| format!("retire fresh retention ledger: {failure:?}"))?;
     assert_eq!(outcome.logically_retired_segments(), 0);
     assert_eq!(active.snapshot()?.blocks().len(), 1);
-    elapsed.advance(1_000_000_000)?;
-    let outcome = active
-        .begin_retention()?
-        .commit()
-        .map_err(|failure| format!("retire elapsed retention ledger: {failure:?}"))?;
-    assert_eq!(outcome.logically_retired_segments(), 1);
-    assert_eq!(active.snapshot()?.blocks().len(), 0);
+    let fresh_snapshot = active.snapshot()?;
+    let fresh = store.scan(
+        authority.governor(),
+        tenant,
+        &fresh_snapshot,
+        LogScan::all(ScanLimit::new(1)?),
+    )?;
+    assert_eq!(fresh.records().len(), 1);
+    drop(fresh_snapshot);
     let other_scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(112)?);
     let other = ActiveSegmentLedger::open(
         &authority,
@@ -252,7 +255,7 @@ fn reconstructed_caller_time_cannot_retire_fresh_authenticated_data() -> Result<
     let observed = legacy_block.observe_ingest_time(UnixNanoseconds::new(1_000_000_000))?;
     assert_eq!(observed.instant(), UnixNanoseconds::new(1_000_000_000));
     assert_eq!(
-        retention_policy(&catalog, &other, tenant, 1)?
+        retention_policy(&catalog, &other, tenant, RETENTION_SECONDS)?
             .bucket(tenant, observed)
             .expect_err("legacy observation cannot select a retention bucket")
             .code(),
@@ -266,7 +269,7 @@ fn reconstructed_caller_time_cannot_retire_fresh_authenticated_data() -> Result<
     )?;
     assert_eq!(scanned.records().len(), 1);
     assert_eq!(
-        retention_policy(&catalog, &other, tenant, 1)?
+        retention_policy(&catalog, &other, tenant, RETENTION_SECONDS)?
             .bucket(tenant, scanned.records()[0].ingest_time())
             .expect_err("production legacy scan time remains retention-unavailable")
             .code(),
@@ -285,7 +288,7 @@ fn reconstructed_caller_time_cannot_retire_fresh_authenticated_data() -> Result<
         .enforce_retention(
             &legacy,
             tenant,
-            retention_policy(&catalog, &legacy, tenant, 1)?,
+            retention_policy(&catalog, &legacy, tenant, RETENTION_SECONDS)?,
         )
         .expect_err("unauthenticated ingest-time metadata cannot drive public retention");
     assert_eq!(
