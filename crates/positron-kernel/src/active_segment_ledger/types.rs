@@ -283,6 +283,51 @@ pub struct CommittedBlock {
     pub(super) block_retention: SegmentRetention,
 }
 
+/// A verified Log Store block prepared for kernel-owned copy-on-write
+/// compaction. The source identity and position are retained so a replacement
+/// segment cannot silently change query resume identities.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompactionBlock {
+    pub(super) scope: SegmentScope,
+    pub(super) source_segment: SegmentId,
+    pub(super) identity: StoreBlockIdentity,
+    pub(super) position: CommitPosition,
+    pub(super) payload: Vec<u8>,
+    pub(super) content_digest: [u8; 32],
+    pub(super) ingest_time: IngestTime,
+}
+
+impl CompactionBlock {
+    /// Creates one immutable block for a kernel compaction publication.
+    pub fn new(
+        scope: SegmentScope,
+        source_segment: SegmentId,
+        identity: StoreBlockIdentity,
+        position: CommitPosition,
+        payload: Vec<u8>,
+        content_digest: [u8; 32],
+        ingest_time: IngestTime,
+    ) -> Result<Self, LedgerFailure> {
+        if payload.is_empty() || !ingest_time.retention_authenticated() {
+            return Err(LedgerFailure::new(LedgerFailureCode::InvalidInput));
+        }
+        Ok(Self {
+            scope,
+            source_segment,
+            identity,
+            position,
+            payload,
+            content_digest,
+            ingest_time,
+        })
+    }
+
+    #[must_use]
+    pub const fn source_segment(&self) -> SegmentId {
+        self.source_segment
+    }
+}
+
 /// Authenticated lifecycle metadata for a Store Block or its segment aggregate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SegmentRetention {

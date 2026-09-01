@@ -1,0 +1,709 @@
+use std::error::Error;
+use std::fs;
+
+use positron_domain::identity::TenantId;
+use positron_domain::routing::{SignalKind, VirtualShardId};
+
+use super::support::{TemporaryRoot, establish_authority};
+use crate::active_segment_ledger::SegmentRetention;
+use crate::active_segment_ledger::fault::{
+    LedgerFileEvent, with_ledger_fault, with_ledger_faults_after,
+};
+use crate::active_segment_ledger::format::{SegmentMetadata, SegmentState};
+use crate::active_segment_ledger::publication::publish_segments;
+use crate::active_segment_ledger::recovery::{frontier_name, segment_name};
+use crate::catalog::{CatalogFileEvent, with_catalog_fault};
+use crate::{
+    ActiveSegmentLedger, Catalog, CatalogObject, CatalogProposal, CatalogSecret, CommittedBlock,
+    CompactionBlock, FormatEpoch, IngestTime, InstanceId, LedgerCompletionState, LedgerFailureCode,
+    MountQualification, PrimaryDataVolume, ResourceAmounts, ResourceDimension,
+    RetentionTimeAuthority, SegmentId, SegmentProtectionKey, SegmentScope, StoreBlockIdentity,
+    TransactionId, WorkClaim, WorkKind,
+};
+
+#[cfg(feature = "test-support")]
+use crate::{CatalogPublicationFault, with_catalog_publication_ambiguity_hook_after};
+
+fn preparation_capacity<'authority>(
+    authority: &'authority crate::StorageKernelResourceAuthority,
+    tenant: TenantId,
+) -> Result<crate::ResourceReservation<'authority>, Box<dyn Error>> {
+    Ok(authority.governor().reserve(WorkClaim::tenant(
+        tenant,
+        WorkKind::Ingest,
+        ResourceAmounts::only(ResourceDimension::MemoryBytes, 1_048_576)?,
+    )?)?)
+}
+
+fn compaction_block(
+    scope: SegmentScope,
+    block: &CommittedBlock,
+) -> Result<CompactionBlock, Box<dyn Error>> {
+    let ingest_time = match block.block_retention {
+        SegmentRetention::Complete(ingest_time) => ingest_time,
+        SegmentRetention::Empty | SegmentRetention::Unavailable => {
+            return Err("compaction fixture block lacks authenticated ingest time".into());
+        },
+    };
+    Ok(CompactionBlock::new(
+        scope,
+        block.segment_id(),
+        block.identity(),
+        block.position(),
+        block.payload().to_vec(),
+        block.content_digest()?,
+        ingest_time,
+    )?)
+}
+
+#[test]
+fn compaction_rejects_invalid_inputs_and_repairs_after_output_seal_ambiguity()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0xb1; 16])?,
+        CatalogSecret::from_owned(Box::new([0xb2; 32]), Box::new([0xb3; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x64; 16])?;
+    let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(4)?);
+    let retention_time = RetentionTimeAuthority::establish()?;
+    let key = || SegmentProtectionKey::from_owned(Box::new([0xb5; 32]));
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    ledger.append(
+        ledger
+            .begin_store_block(
+                preparation_capacity(&authority, tenant)?,
+                StoreBlockIdentity::new([0xb6; 16])?,
+            )?
+            .finish(b"first-source".to_vec())?,
+    )?;
+    ledger.append(
+        ledger
+            .begin_store_block(
+                preparation_capacity(&authority, tenant)?,
+                StoreBlockIdentity::new([0xb7; 16])?,
+            )?
+            .finish(b"second-source".to_vec())?,
+    )?;
+    let active_snapshot = ledger.snapshot()?;
+    let active_blocks = active_snapshot.blocks();
+    let active_first = active_blocks
+        .first()
+        .ok_or_else(|| -> Box<dyn Error> { "active compaction fixture block missing".into() })?;
+    let valid_first = compaction_block(scope, active_first)?;
+    assert_eq!(
+        CompactionBlock::new(
+            scope,
+            valid_first.source_segment,
+            valid_first.identity,
+            valid_first.position,
+            Vec::new(),
+            valid_first.content_digest,
+            valid_first.ingest_time,
+        )
+        .expect_err("empty compaction payload must be refused")
+        .code(),
+        LedgerFailureCode::InvalidInput
+    );
+    assert_eq!(
+        CompactionBlock::new(
+            scope,
+            valid_first.source_segment,
+            valid_first.identity,
+            valid_first.position,
+            b"not authenticated".to_vec(),
+            valid_first.content_digest,
+            IngestTime::from_unretained_observation(valid_first.ingest_time.instant()),
+        )
+        .expect_err("unauthenticated compaction time must be refused")
+        .code(),
+        LedgerFailureCode::InvalidInput
+    );
+
+    assert_eq!(
+        ledger
+            .compact_sealed(Vec::new())
+            .expect_err("empty compaction must be bounded")
+            .code(),
+        LedgerFailureCode::LimitExceeded
+    );
+    let mut foreign = valid_first.clone();
+    foreign.scope = SegmentScope::new(
+        TenantId::from_bytes([0x65; 16])?,
+        SignalKind::Logs,
+        VirtualShardId::new(4)?,
+    );
+    assert_eq!(
+        ledger
+            .compact_sealed(vec![foreign])
+            .expect_err("cross-scope compaction must be refused")
+            .code(),
+        LedgerFailureCode::PhysicalScopeMismatch
+    );
+    assert_eq!(
+        ledger
+            .compact_sealed(vec![valid_first.clone(), valid_first.clone()])
+            .expect_err("duplicate positions must be refused")
+            .code(),
+        LedgerFailureCode::InvalidInput
+    );
+    let mut wrong_payload = valid_first.clone();
+    if let Some(byte) = wrong_payload.payload.first_mut() {
+        *byte ^= 1;
+    }
+    assert_eq!(
+        ledger
+            .compact_sealed(vec![wrong_payload])
+            .expect_err("changed source bytes must be refused")
+            .code(),
+        LedgerFailureCode::StaleGeneration
+    );
+    let mut wrong_digest = valid_first.clone();
+    if let Some(byte) = wrong_digest.content_digest.first_mut() {
+        *byte ^= 1;
+    }
+    assert_eq!(
+        ledger
+            .compact_sealed(vec![wrong_digest])
+            .expect_err("changed source digest must be refused")
+            .code(),
+        LedgerFailureCode::StaleGeneration
+    );
+    let mut missing_source = valid_first.clone();
+    missing_source.source_segment = SegmentId::new([0xc1; 16])?;
+    assert_eq!(
+        ledger
+            .compact_sealed(vec![missing_source])
+            .expect_err("unknown source identity must be refused")
+            .code(),
+        LedgerFailureCode::StaleGeneration
+    );
+    let mut unretained = valid_first.clone();
+    unretained.ingest_time = IngestTime::from_unretained_observation(
+        valid_first
+            .ingest_time
+            .instant()
+            .value()
+            .checked_add(1)
+            .map(positron_domain::time::UnixNanoseconds::new)
+            .ok_or("compaction test ingest time overflow")?,
+    );
+    assert_eq!(
+        ledger
+            .compact_sealed(vec![unretained])
+            .expect_err("unauthenticated source time must be refused")
+            .code(),
+        LedgerFailureCode::IntegrityCorruption
+    );
+    assert_eq!(
+        ledger
+            .compact_sealed(vec![valid_first.clone()])
+            .expect_err("active segments are not compaction inputs")
+            .code(),
+        LedgerFailureCode::InvalidInput
+    );
+
+    ledger.seal()?;
+    let reopened = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    let source_snapshot = reopened.snapshot()?;
+    let source_blocks = source_snapshot
+        .blocks()
+        .iter()
+        .map(|block| compaction_block(scope, block))
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(source_blocks.len(), 2);
+    assert_eq!(
+        reopened
+            .compact_sealed(vec![source_blocks[0].clone()])
+            .expect_err("partial source segment must be refused")
+            .code(),
+        LedgerFailureCode::StaleGeneration
+    );
+    assert_eq!(
+        with_ledger_fault(LedgerFileEvent::CreateSegment, || {
+            reopened.compact_sealed(source_blocks.clone())
+        })
+        .expect_err("output creation failure must not publish")
+        .code(),
+        LedgerFailureCode::StorageUnavailable
+    );
+    assert_eq!(
+        with_ledger_fault(LedgerFileEvent::WriteFrame, || {
+            reopened.compact_sealed(source_blocks.clone())
+        })
+        .expect_err("output write failure must not publish")
+        .code(),
+        LedgerFailureCode::StorageUnavailable
+    );
+    let header_cleanup_failure = with_ledger_faults_after(
+        &[
+            (LedgerFileEvent::WriteSegmentHeader, 0),
+            (LedgerFileEvent::DiscardUnpublishedOutput, 0),
+        ],
+        || reopened.compact_sealed(source_blocks.clone()),
+    )
+    .expect_err("header failure cleanup must fence a partial output");
+    assert_eq!(
+        header_cleanup_failure.completion_state(),
+        LedgerCompletionState::RecoveryRequired
+    );
+    assert_eq!(
+        reopened
+            .compact_sealed(source_blocks.clone())
+            .expect_err("a cleanup-fenced ledger must reject follow-up work")
+            .code(),
+        LedgerFailureCode::RecoveryRequired
+    );
+    drop(source_snapshot);
+    drop(reopened);
+
+    let sealed_fault = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    let sealed_fault_snapshot = sealed_fault.snapshot()?;
+    let sealed_fault_blocks = sealed_fault_snapshot
+        .blocks()
+        .iter()
+        .map(|block| compaction_block(scope, block))
+        .collect::<Result<Vec<_>, _>>()?;
+    let failure = with_ledger_fault(LedgerFileEvent::RenameSealSegment, || {
+        sealed_fault.compact_sealed(sealed_fault_blocks)
+    })
+    .expect_err("post-publication sealing failure must be ambiguous");
+    assert_eq!(failure.code(), LedgerFailureCode::StorageUnavailable);
+    assert_eq!(
+        failure.completion_state(),
+        LedgerCompletionState::CommitAmbiguous
+    );
+    drop(sealed_fault_snapshot);
+    drop(sealed_fault);
+
+    let retry = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    let retry_snapshot = retry.snapshot()?;
+    let retry_blocks = retry_snapshot
+        .blocks()
+        .iter()
+        .map(|block| compaction_block(scope, block))
+        .collect::<Result<Vec<_>, _>>()?;
+    let partial_failure = with_ledger_fault(LedgerFileEvent::RenameSealFrontier, || {
+        retry.compact_sealed(retry_blocks)
+    })
+    .expect_err("frontier sealing failure must be ambiguous after segment rename");
+    assert_eq!(
+        partial_failure.code(),
+        LedgerFailureCode::StorageUnavailable
+    );
+    assert_eq!(
+        partial_failure.completion_state(),
+        LedgerCompletionState::CommitAmbiguous
+    );
+    drop(retry_snapshot);
+    drop(retry);
+
+    let repaired = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    let repaired_snapshot = repaired.snapshot()?;
+    assert_eq!(repaired_snapshot.blocks().len(), 2);
+    assert_eq!(repaired_snapshot.blocks()[0].payload(), b"first-source");
+    assert_eq!(repaired_snapshot.blocks()[1].payload(), b"second-source");
+
+    let missing_metadata_block = compaction_block(
+        scope,
+        repaired_snapshot
+            .blocks()
+            .first()
+            .ok_or("repaired compaction block missing")?,
+    )?;
+    let basis = catalog.pin()?;
+    let metadata = repaired.storage.catalog_segments(&basis, scope)?;
+    let source_metadata = metadata
+        .iter()
+        .find(|candidate| candidate.id == missing_metadata_block.source_segment)
+        .copied()
+        .ok_or("repaired source metadata missing")?;
+    assert_eq!(
+        repaired
+            .storage
+            .retired_recovery_encoded_bytes(source_metadata)
+            .expect_err("sealed metadata cannot request retired recovery bytes")
+            .code(),
+        LedgerFailureCode::InvalidInput
+    );
+    assert_eq!(
+        repaired
+            .storage
+            .reclaim_retired(source_metadata)
+            .expect_err("sealed metadata cannot request retired reclamation")
+            .code(),
+        LedgerFailureCode::InvalidInput
+    );
+
+    let active_directory = root.path().join("segments/active");
+    let first_cleanup_probe = SegmentMetadata {
+        id: SegmentId::new([0xc4; 16])?,
+        state: SegmentState::Active,
+        ..source_metadata
+    };
+    fs::create_dir(active_directory.join(segment_name(first_cleanup_probe.id)))?;
+    assert_eq!(
+        repaired
+            .storage
+            .discard_unpublished(first_cleanup_probe)
+            .expect_err("an output directory cannot be unlinked as a file")
+            .code(),
+        LedgerFailureCode::StorageUnavailable
+    );
+    let second_cleanup_probe = SegmentMetadata {
+        id: SegmentId::new([0xc5; 16])?,
+        state: SegmentState::Active,
+        ..source_metadata
+    };
+    fs::write(
+        active_directory.join(segment_name(second_cleanup_probe.id)),
+        b"output",
+    )?;
+    fs::create_dir(active_directory.join(frontier_name(second_cleanup_probe.id)))?;
+    let cleanup_failure = repaired
+        .storage
+        .discard_unpublished(second_cleanup_probe)
+        .expect_err("a partially removed output must be reported as post-mutation");
+    assert_eq!(
+        cleanup_failure.code(),
+        LedgerFailureCode::StorageUnavailable
+    );
+    assert_eq!(
+        cleanup_failure.completion_state(),
+        LedgerCompletionState::RecoveryRequired
+    );
+    fs::remove_dir(active_directory.join(segment_name(first_cleanup_probe.id)))?;
+    fs::remove_dir(active_directory.join(frontier_name(second_cleanup_probe.id)))?;
+    repaired.storage.discard_unpublished(SegmentMetadata {
+        id: SegmentId::new([0xc6; 16])?,
+        state: SegmentState::Active,
+        ..source_metadata
+    })?;
+    let source_bytes = repaired.storage.metadata_object(source_metadata);
+    let retired_metadata = SegmentMetadata {
+        state: SegmentState::Retired,
+        ..source_metadata
+    };
+    let retired_bytes = repaired.storage.metadata_object(retired_metadata);
+    let objects = basis
+        .object_identities()
+        .filter_map(|identity| {
+            let bytes = basis.object(identity).ok().flatten()?.to_vec();
+            if bytes == source_bytes {
+                return CatalogObject::new(retired_bytes.clone()).ok();
+            }
+            CatalogObject::new(bytes).ok()
+        })
+        .collect::<Vec<_>>();
+    catalog.commit(
+        basis.identity(),
+        CatalogProposal::new(
+            TransactionId::new([0xc2; 16])?,
+            FormatEpoch::CATALOG_V1,
+            objects,
+        )?,
+        None,
+    )?;
+    repaired.storage.reclaim_retired(retired_metadata)?;
+    let basis = catalog.pin()?;
+    let objects = basis
+        .object_identities()
+        .filter_map(|identity| {
+            let bytes = basis.object(identity).ok().flatten()?.to_vec();
+            (bytes != retired_bytes).then(|| CatalogObject::new(bytes).ok())?
+        })
+        .collect::<Vec<_>>();
+    catalog.commit(
+        basis.identity(),
+        CatalogProposal::new(
+            TransactionId::new([0xc3; 16])?,
+            FormatEpoch::CATALOG_V1,
+            objects,
+        )?,
+        None,
+    )?;
+    assert_eq!(
+        repaired
+            .compact_sealed(vec![missing_metadata_block])
+            .expect_err("a source omitted from the current Catalog is stale")
+            .code(),
+        LedgerFailureCode::StaleGeneration
+    );
+    Ok(())
+}
+
+#[test]
+fn compaction_cleanup_failures_fence_each_prepublication_mutation() -> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0xc6; 16])?,
+        CatalogSecret::from_owned(Box::new([0xc7; 32]), Box::new([0xc8; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x64; 16])?;
+    let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(5)?);
+    let retention_time = RetentionTimeAuthority::establish()?;
+    let key = || SegmentProtectionKey::from_owned(Box::new([0xc9; 32]));
+
+    for (identity, payload) in [
+        ([0xca; 16], b"cleanup-first".as_slice()),
+        ([0xcb; 16], b"cleanup-middle".as_slice()),
+        ([0xcc; 16], b"cleanup-last".as_slice()),
+    ] {
+        let ledger = ActiveSegmentLedger::open_with_retention_time(
+            &authority,
+            &retention_time,
+            &catalog,
+            scope,
+            key(),
+        )?;
+        ledger.append(
+            ledger
+                .begin_store_block(
+                    preparation_capacity(&authority, tenant)?,
+                    StoreBlockIdentity::new(identity)?,
+                )?
+                .finish(payload.to_vec())?,
+        )?;
+        ledger.seal()?;
+    }
+
+    let first_attempt = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    let first_snapshot = first_attempt.snapshot()?;
+    let first_blocks = first_snapshot
+        .blocks()
+        .iter()
+        .map(|block| compaction_block(scope, block))
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(first_blocks.len(), 3);
+    let first_failure = with_ledger_faults_after(
+        &[
+            (LedgerFileEvent::CreateSegment, 1),
+            (LedgerFileEvent::DiscardUnpublishedOutput, 0),
+        ],
+        || first_attempt.compact_sealed(vec![first_blocks[0].clone(), first_blocks[2].clone()]),
+    )
+    .expect_err("failed cleanup after output creation must fence the ledger");
+    assert_eq!(first_failure.code(), LedgerFailureCode::StorageUnavailable);
+    assert_eq!(
+        first_failure.completion_state(),
+        LedgerCompletionState::RecoveryRequired
+    );
+    drop(first_snapshot);
+    drop(first_attempt);
+
+    let second_attempt = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    let second_snapshot = second_attempt.snapshot()?;
+    let second_blocks = second_snapshot
+        .blocks()
+        .iter()
+        .map(|block| compaction_block(scope, block))
+        .collect::<Result<Vec<_>, _>>()?;
+    let second_failure = with_ledger_faults_after(
+        &[
+            (LedgerFileEvent::WriteFrame, 1),
+            (LedgerFileEvent::DiscardUnpublishedOutput, 0),
+        ],
+        || second_attempt.compact_sealed(vec![second_blocks[0].clone(), second_blocks[2].clone()]),
+    )
+    .expect_err("failed cleanup after output writing must fence the ledger");
+    assert_eq!(second_failure.code(), LedgerFailureCode::StorageUnavailable);
+    assert_eq!(
+        second_failure.completion_state(),
+        LedgerCompletionState::RecoveryRequired
+    );
+    drop(second_snapshot);
+    drop(second_attempt);
+
+    let third_attempt = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    let third_snapshot = third_attempt.snapshot()?;
+    let third_blocks = third_snapshot
+        .blocks()
+        .iter()
+        .map(|block| compaction_block(scope, block))
+        .collect::<Result<Vec<_>, _>>()?;
+    let third_failure = with_ledger_fault(LedgerFileEvent::DiscardUnpublishedOutput, || {
+        with_catalog_fault(CatalogFileEvent::SynchronizeCommit, || {
+            third_attempt.compact_sealed(third_blocks)
+        })
+    })
+    .expect_err("failed cleanup after Catalog refusal must fence the ledger");
+    assert_eq!(third_failure.code(), LedgerFailureCode::StorageUnavailable);
+    assert_eq!(
+        third_failure.completion_state(),
+        LedgerCompletionState::RecoveryRequired
+    );
+    drop(third_snapshot);
+    drop(third_attempt);
+
+    #[cfg(feature = "test-support")]
+    {
+        let ambiguous_attempt = ActiveSegmentLedger::open_with_retention_time(
+            &authority,
+            &retention_time,
+            &catalog,
+            scope,
+            key(),
+        )?;
+        let ambiguous_snapshot = ambiguous_attempt.snapshot()?;
+        let ambiguous_blocks = ambiguous_snapshot
+            .blocks()
+            .iter()
+            .map(|block| compaction_block(scope, block))
+            .collect::<Result<Vec<_>, _>>()?;
+        let ambiguous_failure = with_catalog_publication_ambiguity_hook_after(
+            CatalogPublicationFault::SynchronizeCommit,
+            0,
+            |catalog| {
+                catalog
+                    .refresh_after_ambiguous_publication_for_test()
+                    .expect("pre-rename failure leaves the previous basis recoverable");
+                let basis = catalog.pin().expect("pin the previous Catalog basis");
+                let mut objects = basis
+                    .object_identities()
+                    .map(|identity| {
+                        CatalogObject::new(
+                            basis
+                                .object(identity)
+                                .expect("read the previous Catalog object")
+                                .expect("previous Catalog object exists")
+                                .to_vec(),
+                        )
+                        .expect("copy the previous Catalog object")
+                    })
+                    .collect::<Vec<_>>();
+                objects.push(
+                    CatalogObject::new(b"compaction unrelated successor".to_vec())
+                        .expect("unrelated successor object"),
+                );
+                catalog
+                    .commit(
+                        basis.identity(),
+                        CatalogProposal::new(
+                            TransactionId::new([0xcd; 16]).expect("successor transaction"),
+                            FormatEpoch::CATALOG_V1,
+                            objects,
+                        )
+                        .expect("successor proposal"),
+                        None,
+                    )
+                    .expect("publish unrelated successor");
+            },
+            || ambiguous_attempt.compact_sealed(ambiguous_blocks),
+        )
+        .expect_err("an unresolved Catalog successor must remain ambiguous");
+        assert_eq!(
+            ambiguous_failure.completion_state(),
+            LedgerCompletionState::CommitAmbiguous
+        );
+        drop(ambiguous_snapshot);
+        drop(ambiguous_attempt);
+    }
+    Ok(())
+}
+
+#[test]
+fn repair_moves_a_catalog_published_active_compaction_output_to_sealed_namespace()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0xa1; 16])?,
+        CatalogSecret::from_owned(Box::new([0xa2; 32]), Box::new([0xa3; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x64; 16])?;
+    let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(1)?);
+    let retention_time = RetentionTimeAuthority::establish()?;
+    let protection = SegmentProtectionKey::from_owned(Box::new([0xa5; 32]));
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        protection.clone(),
+    )?;
+    let capacity = authority.governor().reserve(WorkClaim::tenant(
+        tenant,
+        WorkKind::Ingest,
+        ResourceAmounts::only(ResourceDimension::MemoryBytes, 1_048_576)?,
+    )?)?;
+    let preparation = ledger.begin_store_block(capacity, StoreBlockIdentity::new([0xa6; 16])?)?;
+    ledger.append(preparation.finish(b"crash-output".to_vec())?)?;
+    let current = ledger.storage.current_metadata()?;
+    let basis = catalog.pin()?;
+    let mut metadata = ledger.storage.catalog_segments(&basis, scope)?;
+    let published = metadata
+        .iter_mut()
+        .find(|candidate| candidate.id == current.id)
+        .ok_or("active segment missing from Catalog")?;
+    published.state = SegmentState::Sealed;
+    publish_segments(&catalog, &basis, &ledger.storage, scope, &metadata)?;
+    drop(ledger);
+
+    let reopened = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        protection,
+    )?;
+    let snapshot = reopened.snapshot()?;
+    assert_eq!(snapshot.blocks().len(), 1);
+    assert_eq!(snapshot.blocks()[0].payload(), b"crash-output");
+    Ok(())
+}

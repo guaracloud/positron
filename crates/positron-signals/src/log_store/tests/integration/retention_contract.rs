@@ -328,7 +328,7 @@ fn retention_refuses_a_stale_policy_after_valid_governance_replacement()
     Ok(())
 }
 
-fn governance_fixture(
+pub(super) fn governance_fixture(
     instance: [u8; 16],
     tenant: TenantId,
     retention_seconds: u64,

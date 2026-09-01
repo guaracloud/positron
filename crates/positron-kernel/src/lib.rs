@@ -95,11 +95,11 @@ pub use catalog::{GovernanceFixtureObject, GovernanceFixtureTarget};
 pub use active_segment_ledger::publish_snapshot_lease_marker_for_test;
 pub use active_segment_ledger::{
     ActiveSegmentLedger, AppendCancellation, CommitReceipt, CommittedBlock, CommittedLedgerReader,
-    LedgerCompletionState, LedgerFailure, LedgerFailureCode, LedgerSnapshot,
-    MAX_SNAPSHOT_LEASE_TTL_SECONDS, PreparedStoreBlock, RetentionBucket, RetentionEvaluation,
-    RetentionReclamation, SealedSegment, SegmentId, SegmentProtectionKey, SegmentScope,
-    SnapshotLeaseAttempt, SnapshotLeaseGrant, SnapshotLeaseId, SnapshotLeaseReplacement,
-    SnapshotLeaseUsage, StoreBlockIdentity, StoreBlockPreparation,
+    CompactionBlock, CompactionPublication, LedgerCompletionState, LedgerFailure,
+    LedgerFailureCode, LedgerSnapshot, MAX_SNAPSHOT_LEASE_TTL_SECONDS, PreparedStoreBlock,
+    RetentionBucket, RetentionEvaluation, RetentionReclamation, SealedSegment, SegmentId,
+    SegmentProtectionKey, SegmentScope, SnapshotLeaseAttempt, SnapshotLeaseGrant, SnapshotLeaseId,
+    SnapshotLeaseReplacement, SnapshotLeaseUsage, StoreBlockIdentity, StoreBlockPreparation,
 };
 
 pub use data_protection::{

@@ -26,6 +26,21 @@ pub(super) fn retention_claim(
     ]))
 }
 
+pub(super) fn compaction_claim(
+    block_bytes: usize,
+    blocks: usize,
+) -> Result<ResourceAmounts, LedgerFailure> {
+    // Account for the source snapshot plus the copy-on-write staging and
+    // output buffers. The doubled bounds remain finite at the ledger limits.
+    let staged_bytes = block_bytes
+        .checked_mul(2)
+        .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+    let staged_blocks = blocks
+        .checked_mul(2)
+        .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+    retention_claim(staged_bytes, staged_blocks)
+}
+
 pub(super) fn append_claim(block_bytes: usize) -> Result<ResourceAmounts, LedgerFailure> {
     let bytes = u64::try_from(block_bytes)
         .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
@@ -136,6 +151,8 @@ mod tests {
                 .expect_err("snapshot arithmetic overflow"),
             lease_claim(usize::MAX).expect_err("lease arithmetic overflow"),
             retention_claim(usize::MAX, usize::MAX).expect_err("retention arithmetic overflow"),
+            compaction_claim(usize::MAX, 1).expect_err("compaction byte arithmetic overflow"),
+            compaction_claim(1, usize::MAX).expect_err("compaction block arithmetic overflow"),
         ] {
             assert_eq!(failure.code(), LedgerFailureCode::LimitExceeded);
         }

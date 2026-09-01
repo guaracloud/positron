@@ -32,6 +32,8 @@ mod support;
 
 use support::{TemporaryRoot, establish_kernel_authority, preparation_capacity};
 
+#[path = "integration/compaction.rs"]
+mod compaction;
 #[path = "integration/retention_contract.rs"]
 mod retention_contract;
 #[path = "integration/retention_evidence.rs"]
@@ -54,6 +56,12 @@ struct NeverCancelledRetention;
 impl ScanCancellation for NeverCancelledRetention {
     fn is_cancelled(&self) -> bool {
         false
+    }
+}
+
+impl ScanObserver for NeverCancelledRetention {
+    fn observe_work(&self, _units: u64) -> Result<(), ScanObservationFailureCode> {
+        Ok(())
     }
 }
 

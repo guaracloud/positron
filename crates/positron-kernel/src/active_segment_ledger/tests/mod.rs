@@ -1,4 +1,5 @@
 mod catalog;
+mod compaction;
 mod faults;
 mod format;
 mod io;

@@ -2,6 +2,7 @@
 
 mod append;
 mod capacity;
+mod compaction;
 mod fault;
 mod format;
 #[cfg(fuzzing)]
@@ -71,6 +72,25 @@ pub struct RetentionReclamation {
     logically_retired_segments: usize,
     physically_reclaimed_segments: usize,
     evaluated_at: positron_domain::time::UnixNanoseconds,
+}
+
+/// Result of one atomic copy-on-write replacement of sealed segments.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompactionPublication {
+    input_segments: usize,
+    output_segments: usize,
+}
+
+impl CompactionPublication {
+    #[must_use]
+    pub const fn input_segments(self) -> usize {
+        self.input_segments
+    }
+
+    #[must_use]
+    pub const fn output_segments(self) -> usize {
+        self.output_segments
+    }
 }
 
 impl RetentionReclamation {

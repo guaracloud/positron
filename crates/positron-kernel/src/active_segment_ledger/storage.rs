@@ -141,9 +141,7 @@ impl LedgerStorage {
         if let Some(length) =
             injected_partial_write_length(LedgerFileEvent::PartialSegmentHeaderWrite, header.len())
         {
-            let partial_header = header.get(..length).ok_or_else(|| {
-                LedgerFailure::post_mutation(LedgerFailureCode::IntegrityCorruption)
-            })?;
+            let partial_header = header.get(..length).map_or(&[][..], |bytes| bytes);
             file.write_all(partial_header)
                 .map_err(|error| LedgerFailure::post_mutation(map_io_error(error).code()))?;
             return Err(LedgerFailure::post_mutation(
@@ -194,10 +192,18 @@ impl LedgerStorage {
         }
         let active_exists = entry_exists(&self.active, &segment_name(metadata.id))?;
         let sealed_exists = entry_exists(&self.sealed, &segment_name(metadata.id))?;
+        let published_sealed_active =
+            metadata.state == SegmentState::Sealed && active_exists && !sealed_exists;
+        let published_sealed_partial = metadata.state == SegmentState::Sealed
+            && !active_exists
+            && sealed_exists
+            && entry_exists(&self.active, &frontier_name(metadata.id))?
+            && !entry_exists(&self.sealed, &frontier_name(metadata.id))?;
         let (directory, recoverable_tail) = match (active_exists, sealed_exists, catalog_active) {
             (true, false, true) => (&self.active, true),
             (false, true, true) => (&self.sealed, true),
             (false, true, false) => (&self.sealed, false),
+            (true, false, false) if published_sealed_active => (&self.active, false),
             _ => return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption)),
         };
         let active_frontier = entry_exists(&self.active, &frontier_name(metadata.id))?;
@@ -206,6 +212,9 @@ impl LedgerStorage {
             (true, false, true) => &self.active,
             (false, true, _) => &self.sealed,
             (false, false, _) => directory,
+            (true, false, false) if published_sealed_active || published_sealed_partial => {
+                &self.active
+            },
             _ => return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption)),
         };
         let mut file = open_regular(
@@ -270,6 +279,11 @@ impl LedgerStorage {
             mode,
             recoverable_tail,
         )?;
+        if (published_sealed_active || published_sealed_partial)
+            && matches!(mode, RecoveryMode::Repair)
+        {
+            self.seal(metadata)?;
+        }
         Ok((key, state))
     }
 
@@ -399,6 +413,40 @@ impl LedgerStorage {
                 .map_err(|failure| LedgerFailure::post_mutation(failure.code()))?;
         }
         Ok(changed)
+    }
+
+    /// Removes a copy-on-write output that has not yet reached the Catalog.
+    /// The caller must invoke this only while the output is unreachable from
+    /// every published generation.
+    pub(super) fn discard_unpublished(
+        &self,
+        metadata: SegmentMetadata,
+    ) -> Result<(), LedgerFailure> {
+        let mut changed = false;
+        emit_event(LedgerFileEvent::DiscardUnpublishedOutput)?;
+        for directory in [&self.active, &self.sealed] {
+            for name in [segment_name(metadata.id), frontier_name(metadata.id)] {
+                match unix_fs::unlinkat(directory, name, AtFlags::empty()) {
+                    Ok(()) => changed = true,
+                    Err(rustix::io::Errno::NOENT) => {},
+                    Err(error) => {
+                        let failure = map_errno(error);
+                        return Err(if changed {
+                            LedgerFailure::post_mutation(failure.code())
+                        } else {
+                            failure
+                        });
+                    },
+                }
+            }
+        }
+        if changed {
+            synchronize(&self.active)
+                .map_err(|failure| LedgerFailure::post_mutation(failure.code()))?;
+            synchronize(&self.sealed)
+                .map_err(|failure| LedgerFailure::post_mutation(failure.code()))?;
+        }
+        Ok(())
     }
 }
 
