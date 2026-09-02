@@ -36,6 +36,14 @@ Current storage target:
 cargo +nightly fuzz run primary_data_volume_stateful
 ```
 
+The bounded Trace Store Block target feeds untrusted bytes through the native
+tenant-bound codec, including typed values, policy provenance, truncation, and
+trailing-byte validation:
+
+```console
+cargo +nightly fuzz run trace_store_block_decode --sanitizer none -- -runs=1000
+```
+
 The active-segment state-machine target also exercises bounded snapshot-lease
 creation, marked resume/repeat, usage recording, release, expiry, and reopen
 recovery alongside append and persisted-corruption transitions:

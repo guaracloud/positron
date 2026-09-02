@@ -1,0 +1,276 @@
+use positron_domain::time::{EventTime, SourceTimeQuality, UnixNanoseconds};
+use positron_domain::value::{AttributeOccurrenceSet, ValueLimitProfile};
+use positron_kernel::{IngestTime, PreparedStoreBlock};
+
+use super::failure::TraceStoreFailure;
+
+/// The protocol-neutral OTLP span kind retained by the Trace Store.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SpanKind {
+    /// The producer did not provide a span kind.
+    Unspecified,
+    /// An internal operation.
+    Internal,
+    /// A server-side operation.
+    Server,
+    /// A client-side operation.
+    Client,
+    /// A producer operation.
+    Producer,
+    /// A consumer operation.
+    Consumer,
+}
+
+/// The producer's sampling decision, retained without inferring a decision.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SamplingDecision {
+    /// Sampling was not specified by the producer.
+    Unknown,
+    /// The producer explicitly marked this span as not sampled.
+    NotSampled,
+    /// The producer explicitly marked this span as sampled.
+    Sampled,
+}
+
+/// One immutable native Span Observation before logical-span consolidation.
+///
+/// The Trace Store deliberately stores observations rather than logical spans.
+/// Duplicate and conflicting observations therefore remain available to the
+/// later consolidation ticket and can never be overwritten at this seam.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SpanObservation {
+    trace_id: [u8; 16],
+    span_id: [u8; 8],
+    parent_span_id: Option<[u8; 8]>,
+    name: String,
+    start_time: EventTime,
+    end_time: EventTime,
+    attributes: Vec<AttributeOccurrenceSet>,
+    kind: SpanKind,
+    sampling: SamplingDecision,
+    policy: positron_policy::PolicyProvenance,
+}
+
+impl SpanObservation {
+    /// The maximum native span name size for Release 1.
+    pub const MAX_NAME_BYTES: usize = 65_536;
+
+    /// Builds a bounded native observation from source timestamps.
+    ///
+    /// Missing timestamps remain missing. No duration, parent, completion, or
+    /// sampling state is inferred by this constructor.
+    #[allow(clippy::too_many_arguments)]
+    pub fn checked_minimal(
+        trace_id: [u8; 16],
+        span_id: [u8; 8],
+        parent_span_id: Option<[u8; 8]>,
+        name: String,
+        start_time_unix_nanos: Option<i64>,
+        end_time_unix_nanos: Option<i64>,
+        attributes: Vec<AttributeOccurrenceSet>,
+        kind: SpanKind,
+        sampling: SamplingDecision,
+    ) -> Result<Self, TraceStoreFailure> {
+        let policy = positron_policy::PolicyProvenance::new(1, [1; 32], Vec::new())
+            .map_err(|_| TraceStoreFailure::invalid_input())?;
+        Self::checked_native(
+            trace_id,
+            span_id,
+            parent_span_id,
+            name,
+            event_time(start_time_unix_nanos)?,
+            event_time(end_time_unix_nanos)?,
+            attributes,
+            kind,
+            sampling,
+            policy,
+        )
+    }
+
+    /// Builds a native observation with an explicit policy provenance.
+    #[allow(clippy::too_many_arguments)]
+    pub fn checked_native(
+        trace_id: [u8; 16],
+        span_id: [u8; 8],
+        parent_span_id: Option<[u8; 8]>,
+        name: String,
+        start_time: EventTime,
+        end_time: EventTime,
+        attributes: Vec<AttributeOccurrenceSet>,
+        kind: SpanKind,
+        sampling: SamplingDecision,
+        policy: positron_policy::PolicyProvenance,
+    ) -> Result<Self, TraceStoreFailure> {
+        if trace_id.iter().all(|byte| *byte == 0)
+            || span_id.iter().all(|byte| *byte == 0)
+            || parent_span_id.is_some_and(|id| id.iter().all(|byte| *byte == 0))
+            || name.is_empty()
+            || name.len() > Self::MAX_NAME_BYTES
+        {
+            return Err(TraceStoreFailure::invalid_input());
+        }
+        let profile = ValueLimitProfile::release_1_system_maximum();
+        let maximum_attributes = profile
+            .effective_limits()
+            .dynamic_value()
+            .attributes_per_namespace()
+            .value()
+            .checked_mul(3)
+            .ok_or_else(TraceStoreFailure::limit_exceeded)?
+            as usize;
+        if attributes.is_empty() {
+            // Empty attribute collections are valid native spans.
+        } else if attributes.len() > maximum_attributes {
+            return Err(TraceStoreFailure::limit_exceeded());
+        }
+        let mut decoded_bytes = name.len();
+        for attribute in &attributes {
+            if attribute.is_empty() {
+                return Err(TraceStoreFailure::invalid_input());
+            }
+            decoded_bytes = decoded_bytes
+                .checked_add(attribute.key().len())
+                .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+            for index in 0..attribute.len() {
+                let value = attribute
+                    .occurrence(index)
+                    .ok_or_else(TraceStoreFailure::invalid_input)?;
+                decoded_bytes = decoded_bytes
+                    .checked_add(
+                        value
+                            .decoded_size_bytes()
+                            .map_err(TraceStoreFailure::domain)?,
+                    )
+                    .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+            }
+        }
+        if decoded_bytes > 1_048_576 {
+            return Err(TraceStoreFailure::limit_exceeded());
+        }
+        Ok(Self {
+            trace_id,
+            span_id,
+            parent_span_id,
+            name,
+            start_time,
+            end_time,
+            attributes,
+            kind,
+            sampling,
+            policy,
+        })
+    }
+
+    #[must_use]
+    pub const fn trace_id(&self) -> [u8; 16] {
+        self.trace_id
+    }
+
+    #[must_use]
+    pub const fn span_id(&self) -> [u8; 8] {
+        self.span_id
+    }
+
+    #[must_use]
+    pub const fn parent_span_id(&self) -> Option<[u8; 8]> {
+        self.parent_span_id
+    }
+
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    #[must_use]
+    pub const fn start_time(&self) -> EventTime {
+        self.start_time
+    }
+
+    #[must_use]
+    pub const fn end_time(&self) -> EventTime {
+        self.end_time
+    }
+
+    #[must_use]
+    pub fn attributes(&self) -> &[AttributeOccurrenceSet] {
+        &self.attributes
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> SpanKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub const fn sampling(&self) -> SamplingDecision {
+        self.sampling
+    }
+
+    #[must_use]
+    pub const fn policy_provenance(&self) -> &positron_policy::PolicyProvenance {
+        &self.policy
+    }
+}
+
+fn event_time(value: Option<i64>) -> Result<EventTime, TraceStoreFailure> {
+    match value {
+        None => Ok(EventTime::missing()),
+        Some(0) => EventTime::received(UnixNanoseconds::new(0), SourceTimeQuality::Zero)
+            .map_err(TraceStoreFailure::domain),
+        Some(value) => EventTime::received(UnixNanoseconds::new(value), SourceTimeQuality::Usable)
+            .map_err(TraceStoreFailure::domain),
+    }
+}
+
+/// One immutable observation after the kernel assigned Ingest Time.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredSpanObservation {
+    observation: SpanObservation,
+    ingest_time: IngestTime,
+}
+
+impl StoredSpanObservation {
+    pub(super) const fn new(observation: SpanObservation, ingest_time: IngestTime) -> Self {
+        Self {
+            observation,
+            ingest_time,
+        }
+    }
+
+    #[must_use]
+    pub const fn observation(&self) -> &SpanObservation {
+        &self.observation
+    }
+
+    #[must_use]
+    pub const fn trace_id(&self) -> [u8; 16] {
+        self.observation.trace_id()
+    }
+
+    #[must_use]
+    pub const fn span_id(&self) -> [u8; 8] {
+        self.observation.span_id()
+    }
+
+    #[must_use]
+    pub const fn ingest_time(&self) -> IngestTime {
+        self.ingest_time
+    }
+}
+
+/// Opaque checked Trace Store output accepted by the Storage Kernel ledger.
+pub struct PreparedTraceBlock<'capacity> {
+    pub(super) block: PreparedStoreBlock<'capacity>,
+}
+
+impl<'capacity> PreparedTraceBlock<'capacity> {
+    pub(super) const fn new(block: PreparedStoreBlock<'capacity>) -> Self {
+        Self { block }
+    }
+
+    /// Transfers the prepared block to the Storage Kernel for commit.
+    #[must_use]
+    pub fn into_store_block(self) -> PreparedStoreBlock<'capacity> {
+        self.block
+    }
+}
