@@ -19,12 +19,13 @@ use positron_kernel::{
     with_catalog_publication_fault_after,
 };
 use positron_policy::{
-    IngestPolicy, LogMetadata, NativeLogAttribute, NativeLogCandidate, PolicyEvaluation,
-    PolicyReceiver,
+    IngestPolicy, LogMetadata, NativeLogAttribute, NativeLogCandidate, PolicyAction,
+    PolicyEvaluation, PolicyPredicate, PolicyReceiver, PolicyRule,
 };
 use positron_signals::{
-    LogRecord, LogRetentionPolicy, LogScan, LogStore, ScanCancellation, ScanLimit,
-    ScanObservationFailureCode, ScanObserver,
+    AttributeRepresentation, LogRecord, LogRetentionPolicy, LogScan, LogStore, ScanCancellation,
+    ScanLimit, ScanObservationFailureCode, ScanObserver, SchemaBudget, SchemaSessionStore,
+    StoredLogAttribute,
 };
 
 #[path = "support.rs"]
@@ -32,6 +33,8 @@ mod support;
 
 use support::{TemporaryRoot, establish_kernel_authority, preparation_capacity};
 
+#[path = "integration/compaction.rs"]
+mod compaction;
 #[path = "integration/retention_contract.rs"]
 mod retention_contract;
 #[path = "integration/retention_evidence.rs"]
@@ -54,6 +57,12 @@ struct NeverCancelledRetention;
 impl ScanCancellation for NeverCancelledRetention {
     fn is_cancelled(&self) -> bool {
         false
+    }
+}
+
+impl ScanObserver for NeverCancelledRetention {
+    fn observe_work(&self, _units: u64) -> Result<(), ScanObservationFailureCode> {
+        Ok(())
     }
 }
 

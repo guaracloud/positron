@@ -1,10 +1,12 @@
 use positron_domain::identity::TenantId;
 use positron_domain::routing::{CommitPosition, SignalKind, VirtualShardId};
+use positron_domain::time::UnixNanoseconds;
 
+use crate::IngestTime;
 use crate::active_segment_ledger::{
     AppendCancellation, CommitReceipt, CommittedBlock, LedgerFailure, LedgerFailureCode,
-    PreparedStoreBlock, SealedSegment, SegmentId, SegmentProtectionKey, SegmentScope,
-    StoreBlockIdentity,
+    PreparedStoreBlock, RetentionBucket, SealedSegment, SegmentId, SegmentProtectionKey,
+    SegmentScope, StoreBlockIdentity,
 };
 use crate::catalog::{CatalogFailure, CatalogFailureCode};
 use crate::data_protection::{FrameFailure, FrameFailureCode};
@@ -101,6 +103,30 @@ fn public_values_enforce_bounds_and_expose_only_bounded_outcomes() {
     assert_eq!(block.position(), receipt.position());
     assert_eq!(block.payload(), b"block");
     assert_eq!(block.content_digest().expect("committed digest"), [4; 32]);
+    let empty_block = CommittedBlock {
+        block_retention: super::super::SegmentRetention::Empty,
+        ..block.clone()
+    };
+    assert_eq!(
+        empty_block
+            .observe_ingest_time(UnixNanoseconds::new(0))
+            .expect_err("an empty retention marker cannot authorize observation")
+            .code(),
+        LedgerFailureCode::UnsupportedFormat
+    );
+    assert_eq!(
+        super::super::SegmentRetention::Unavailable
+            .append_block(super::super::SegmentRetention::Empty,),
+        super::super::SegmentRetention::Unavailable
+    );
+    let bucket = RetentionBucket::for_ingest_time(
+        prepared_scope.tenant_id(),
+        SignalKind::Logs,
+        IngestTime::from_authenticated_durable(UnixNanoseconds::new(1_000_000_000)),
+        std::num::NonZeroU64::new(1).expect("positive bucket width"),
+    )
+    .expect("authenticated retention bucket");
+    assert_eq!(bucket.signal_kind(), SignalKind::Logs);
     let sealed = SealedSegment {
         segment,
         frontier: receipt.position(),

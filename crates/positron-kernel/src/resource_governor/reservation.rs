@@ -161,6 +161,23 @@ impl<'authority> ResourceReservation<'authority> {
         std::ptr::eq(self.governor, governor.inner)
     }
 
+    /// Confirms that this live grant is the tenant-scoped emergency
+    /// compaction capability. The caller still has to bind it to the exact
+    /// physical ledger before any storage work begins.
+    pub(crate) fn authorizes_compaction(
+        &self,
+        tenant: positron_domain::identity::TenantId,
+    ) -> bool {
+        self.active
+            && matches!(
+                self.identity,
+                ReservationIdentity::Recovery {
+                    scope: super::RecoveryScope::Tenant(reserved_tenant),
+                    kind: super::RecoveryWorkKind::EmergencyCompaction,
+                } if reserved_tenant == tenant
+            )
+    }
+
     fn release(&mut self) {
         if self.active {
             self.governor.mark_drop_pending(self.slot);

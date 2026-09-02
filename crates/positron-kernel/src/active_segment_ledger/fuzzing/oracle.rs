@@ -2,14 +2,18 @@ use positron_domain::routing::CommitPosition;
 
 use std::collections::BTreeSet;
 
-use super::super::{ActiveSegmentLedger, CommitReceipt, SegmentId, StoreBlockIdentity};
-use crate::StorageKernelResourceAuthority;
+use super::super::{
+    ActiveSegmentLedger, CommitReceipt, CompactionBlock, LedgerSnapshot, SegmentId,
+    StoreBlockIdentity,
+};
+use crate::{IngestTime, StorageKernelResourceAuthority};
 
 pub(super) struct Oracle {
     records: Vec<Record>,
     frontier: CommitPosition,
     seals: usize,
     pending_protected_reclamation: BTreeSet<SegmentId>,
+    compactions: usize,
 }
 
 #[derive(Clone)]
@@ -30,7 +34,7 @@ struct Record {
     identity: StoreBlockIdentity,
     payload: Vec<u8>,
     receipt: CommitReceipt,
-    ingest_nanos: u64,
+    ingest_time: IngestTime,
 }
 
 impl Oracle {
@@ -40,6 +44,7 @@ impl Oracle {
             frontier: CommitPosition::origin(),
             seals: 0,
             pending_protected_reclamation: BTreeSet::new(),
+            compactions: 0,
         }
     }
 
@@ -55,7 +60,7 @@ impl Oracle {
         identity: StoreBlockIdentity,
         payload: Vec<u8>,
         receipt: CommitReceipt,
-        ingest_nanos: u64,
+        ingest_time: IngestTime,
     ) {
         assert_eq!(receipt.position().value(), self.expected_position());
         assert!(
@@ -67,7 +72,7 @@ impl Oracle {
             identity,
             payload,
             receipt,
-            ingest_nanos,
+            ingest_time,
         });
         self.frontier = receipt.position();
     }
@@ -96,10 +101,13 @@ impl Oracle {
     pub(super) fn expired_segments(
         &self,
         active: SegmentId,
-        now_nanos: u64,
+        now: IngestTime,
         retention_nanos: u64,
     ) -> BTreeSet<SegmentId> {
-        let Some(cutoff) = now_nanos.checked_sub(retention_nanos) else {
+        let Ok(retention_nanos) = i64::try_from(retention_nanos) else {
+            return BTreeSet::new();
+        };
+        let Some(cutoff) = now.instant().value().checked_sub(retention_nanos) else {
             return BTreeSet::new();
         };
         let segments = self
@@ -114,7 +122,7 @@ impl Oracle {
                 self.records
                     .iter()
                     .filter(|record| record.receipt.segment_id() == *segment)
-                    .map(|record| record.ingest_nanos)
+                    .map(|record| record.ingest_time.instant().value())
                     .max()
                     .is_some_and(|latest| latest <= cutoff)
             })
@@ -157,6 +165,25 @@ impl Oracle {
         authority: &'authority StorageKernelResourceAuthority,
     ) {
         let snapshot = ledger.snapshot().expect("oracle snapshot is available");
+        self.assert_snapshot(&snapshot);
+        drop(snapshot);
+        if self.compactions == 0 {
+            for expected in &self.records {
+                let retry = super::prepared_retained(
+                    ledger,
+                    authority,
+                    expected.identity,
+                    expected.payload.clone(),
+                );
+                assert_eq!(
+                    ledger.append(retry).expect("oracle replay succeeds"),
+                    expected.receipt
+                );
+            }
+        }
+    }
+
+    pub(super) fn assert_snapshot(&self, snapshot: &LedgerSnapshot<'_>) {
         assert_eq!(snapshot.frontier(), self.frontier);
         assert_eq!(snapshot.blocks().len(), self.records.len());
         for (actual, expected) in snapshot.blocks().iter().zip(&self.records) {
@@ -164,19 +191,86 @@ impl Oracle {
             assert_eq!(actual.payload(), expected.payload);
             assert_eq!(actual.position(), expected.receipt.position());
         }
-        drop(snapshot);
-        for expected in &self.records {
-            let retry = super::prepared_retained(
-                ledger,
-                authority,
-                expected.identity,
-                expected.payload.clone(),
-            );
-            assert_eq!(
-                ledger.append(retry).expect("oracle replay succeeds"),
-                expected.receipt
+    }
+
+    pub(super) fn compaction_inputs(
+        &self,
+        snapshot: &LedgerSnapshot<'_>,
+        scope: super::super::SegmentScope,
+        active: SegmentId,
+    ) -> Option<Vec<CompactionBlock>> {
+        let sealed = snapshot
+            .blocks()
+            .iter()
+            .filter(|block| block.segment_id() != active)
+            .map(|block| block.segment_id())
+            .collect::<BTreeSet<_>>();
+        if sealed.len() < 2 {
+            return None;
+        }
+        let mut blocks = Vec::new();
+        blocks.reserve(snapshot.blocks().len());
+        for block in snapshot
+            .blocks()
+            .iter()
+            .filter(|block| block.segment_id() != active)
+        {
+            let record = self.records.iter().find(|record| {
+                record.receipt.position() == block.position() && record.identity == block.identity()
+            })?;
+            blocks.push(
+                CompactionBlock::new(
+                    scope,
+                    block.segment_id(),
+                    block.identity(),
+                    block.position(),
+                    block.payload().to_vec(),
+                    block.content_digest().ok()?,
+                    record.ingest_time,
+                )
+                .ok()?,
             );
         }
+        Some(blocks)
+    }
+
+    pub(super) fn note_compaction(&mut self, snapshot: &LedgerSnapshot<'_>) {
+        let mut changed = false;
+        for record in &mut self.records {
+            if let Some(block) = snapshot.blocks().iter().find(|block| {
+                block.identity() == record.identity && block.position() == record.receipt.position()
+            }) {
+                changed |= block.segment_id() != record.receipt.segment;
+                record.receipt.segment = block.segment_id();
+            }
+        }
+        if changed {
+            self.compactions = self.compactions.saturating_add(1);
+        }
+    }
+
+    pub(super) fn assert_compaction_replaced(
+        &self,
+        snapshot: &LedgerSnapshot<'_>,
+        source_segments: &BTreeSet<SegmentId>,
+    ) {
+        self.assert_snapshot(snapshot);
+        assert!(
+            snapshot
+                .blocks()
+                .iter()
+                .all(|block| !source_segments.contains(&block.segment_id())),
+            "successful compaction must retire every source segment"
+        );
+    }
+
+    pub(super) fn assert_source_segments_retired(&self, source_segments: &BTreeSet<SegmentId>) {
+        assert!(
+            self.records
+                .iter()
+                .all(|record| !source_segments.contains(&record.receipt.segment_id())),
+            "oracle must track every compacted source as retired"
+        );
     }
 
     pub(super) fn frontier(&self) -> CommitPosition {

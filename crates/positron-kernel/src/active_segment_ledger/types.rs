@@ -56,7 +56,7 @@ impl SegmentScope {
         for (destination, source) in key.iter_mut().zip(self.tenant.to_bytes()) {
             *destination = source;
         }
-        if let Some(signal) = key.get_mut(16) {
+        for signal in key.iter_mut().skip(16).take(1) {
             *signal = match self.signal {
                 SignalKind::Logs => 1,
                 SignalKind::Traces => 2,
@@ -281,6 +281,68 @@ pub struct CommittedBlock {
     pub(super) segment: SegmentId,
     pub(super) frontier_authenticator: [u8; 32],
     pub(super) block_retention: SegmentRetention,
+}
+
+/// A verified Log Store block prepared for kernel-owned copy-on-write
+/// compaction. The source identity and position are retained so a replacement
+/// segment cannot silently change query resume identities.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompactionBlock {
+    pub(super) scope: SegmentScope,
+    pub(super) source_segment: SegmentId,
+    pub(super) identity: StoreBlockIdentity,
+    pub(super) position: CommitPosition,
+    pub(super) payload: Vec<u8>,
+    pub(super) content_digest: [u8; 32],
+    pub(super) ingest_time: IngestTime,
+}
+
+/// Capacity admitted before a caller materializes compaction inputs.
+///
+/// The reservation is move-only so every successful preparation is either
+/// consumed by the kernel publication or released before the caller returns.
+pub struct CompactionPreparation<'kernel> {
+    pub(super) capacity: ResourceReservation<'kernel>,
+    pub(super) scope: SegmentScope,
+    pub(super) catalog_instance: crate::InstanceId,
+    pub(super) catalog_identity: crate::CatalogGenerationId,
+    pub(super) catalog_generation: u64,
+    pub(super) retention_policy: Option<crate::CatalogLogRetentionPolicy>,
+    pub(super) frontier: CommitPosition,
+    pub(super) source_digest: [u8; 32],
+    pub(super) maximum_blocks: usize,
+    pub(super) maximum_payload_bytes: usize,
+}
+
+impl CompactionBlock {
+    /// Creates one immutable block for a kernel compaction publication.
+    pub fn new(
+        scope: SegmentScope,
+        source_segment: SegmentId,
+        identity: StoreBlockIdentity,
+        position: CommitPosition,
+        payload: Vec<u8>,
+        content_digest: [u8; 32],
+        ingest_time: IngestTime,
+    ) -> Result<Self, LedgerFailure> {
+        if payload.is_empty() || !ingest_time.retention_authenticated() {
+            return Err(LedgerFailure::new(LedgerFailureCode::InvalidInput));
+        }
+        Ok(Self {
+            scope,
+            source_segment,
+            identity,
+            position,
+            payload,
+            content_digest,
+            ingest_time,
+        })
+    }
+
+    #[must_use]
+    pub const fn source_segment(&self) -> SegmentId {
+        self.source_segment
+    }
 }
 
 /// Authenticated lifecycle metadata for a Store Block or its segment aggregate.

@@ -95,11 +95,12 @@ pub use catalog::{GovernanceFixtureObject, GovernanceFixtureTarget};
 pub use active_segment_ledger::publish_snapshot_lease_marker_for_test;
 pub use active_segment_ledger::{
     ActiveSegmentLedger, AppendCancellation, CommitReceipt, CommittedBlock, CommittedLedgerReader,
-    LedgerCompletionState, LedgerFailure, LedgerFailureCode, LedgerSnapshot,
-    MAX_SNAPSHOT_LEASE_TTL_SECONDS, PreparedStoreBlock, RetentionBucket, RetentionEvaluation,
-    RetentionReclamation, SealedSegment, SegmentId, SegmentProtectionKey, SegmentScope,
-    SnapshotLeaseAttempt, SnapshotLeaseGrant, SnapshotLeaseId, SnapshotLeaseReplacement,
-    SnapshotLeaseUsage, StoreBlockIdentity, StoreBlockPreparation,
+    CompactionBlock, CompactionPreparation, CompactionPublication, LedgerCompletionState,
+    LedgerFailure, LedgerFailureCode, LedgerSnapshot, MAX_SNAPSHOT_LEASE_TTL_SECONDS,
+    PreparedStoreBlock, RetentionBucket, RetentionEvaluation, RetentionReclamation, SealedSegment,
+    SegmentId, SegmentProtectionKey, SegmentScope, SnapshotLeaseAttempt, SnapshotLeaseGrant,
+    SnapshotLeaseId, SnapshotLeaseReplacement, SnapshotLeaseUsage, StoreBlockIdentity,
+    StoreBlockPreparation,
 };
 
 pub use data_protection::{
@@ -117,6 +118,8 @@ pub use lifecycle_clock::{
     FixedLifecycleClockSource, IngestTime, LifecycleClock, LifecycleClockFailure,
     LifecycleClockSource, RetentionCutoffProvenance, SystemLifecycleClockSource,
 };
+#[cfg(feature = "test-support")]
+pub use retention_time::ManualRetentionTime;
 pub use retention_time::RetentionTimeAuthority;
 
 pub use resource_governor::{
@@ -158,6 +161,14 @@ pub use catalog::fuzz_catalog_stateful;
 #[cfg(fuzzing)]
 #[doc(hidden)]
 pub use active_segment_ledger::{fuzz_active_segment_stateful, fuzz_retention_prepared_block};
+
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub use active_segment_ledger::fuzz_compaction_storage_fault;
+
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub use catalog::fuzz_compaction_publication_fault;
 
 #[cfg(fuzzing)]
 #[doc(hidden)]

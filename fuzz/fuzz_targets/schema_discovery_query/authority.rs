@@ -10,9 +10,26 @@ use positron_kernel::{
     StorageKernelResourceAuthority, TenantQuota,
 };
 
+#[allow(dead_code)]
 pub fn establish(
     path: &Path,
     tenant: TenantId,
+) -> Result<StorageKernelResourceAuthority, Box<dyn Error>> {
+    establish_with_compaction_pool(path, tenant, false)
+}
+
+#[allow(dead_code)]
+pub fn establish_for_compaction(
+    path: &Path,
+    tenant: TenantId,
+) -> Result<StorageKernelResourceAuthority, Box<dyn Error>> {
+    establish_with_compaction_pool(path, tenant, true)
+}
+
+fn establish_with_compaction_pool(
+    path: &Path,
+    tenant: TenantId,
+    large_compaction_pool: bool,
 ) -> Result<StorageKernelResourceAuthority, Box<dyn Error>> {
     let volume = PrimaryDataVolume::acquire(path, MountQualification::LocalHost)?;
     let cardinality = InventoryCardinalityLimits::new(1, 16)?;
@@ -26,9 +43,15 @@ pub fn establish(
     let small = uniform(2);
     let durability = add(add(large, large)?, large)?;
     let recovery = add(add(add(durability, large)?, large)?, uniform(12))?;
-    let ordinary = ResourceAmounts::new([
-        5_000_000, 32, 32, 5_000_000, 2_048, 32, 32, 32, 32, 32, 2_000_000,
-    ]);
+    let ordinary = if large_compaction_pool {
+        ResourceAmounts::new([
+            5_000_000, 32, 32, 5_000_000, 2_048, 32, 32, 32, 64, 32, 2_000_000,
+        ])
+    } else {
+        ResourceAmounts::new([
+            5_000_000, 32, 32, 5_000_000, 2_048, 32, 32, 32, 32, 32, 2_000_000,
+        ])
+    };
     let raw = add(
         add(recovery, ordinary)?,
         cardinality.governor_bootstrap_overhead(1)?,
@@ -50,7 +73,22 @@ pub fn establish(
         [TenantQuota::new(tenant, 1, ordinary)?],
         OrdinaryPoolPolicy::new(uniform(8), uniform(6), uniform(4), uniform(2))?,
     )?;
-    let pools = RecoveryPoolCapacities::new(durability, small, small, small, large, small, small)?;
+    let compaction = if large_compaction_pool {
+        ResourceAmounts::new([
+            20_000_000, 8, 8, 20_000_000, 1_000, 8, 8, 8, 8, 20, 20_000_000,
+        ])
+    } else {
+        small
+    };
+    let pools = RecoveryPoolCapacities::new(
+        durability,
+        small,
+        compaction,
+        small,
+        large,
+        small,
+        small,
+    )?;
     Ok(StorageKernelResourceAuthority::establish(
         volume,
         ResourceGovernorConfiguration::new(inventory, policy, pools)?,

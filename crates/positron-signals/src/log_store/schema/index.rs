@@ -216,7 +216,13 @@ impl SchemaBlockIndex {
                 .or_else(|| entry_for_path(entries, &indexed.path))
                 .filter(|entry| entry.promoted)
                 .is_some_and(|entry| {
-                    indexed.kind_mask == scalar_kind_mask(&entry.variants)
+                    // A previously indexed immutable block can legitimately
+                    // cover a strict subset of kinds after a later block
+                    // promotes the same path with another scalar variant.
+                    // The subset remains safe for pruning: values of a kind
+                    // absent from that block cannot match its index.
+                    let entry_kinds = scalar_kind_mask(&entry.variants);
+                    indexed.kind_mask & !entry_kinds == 0
                         && indexed.values.iter().all(|value| {
                             value
                                 .kind_value()

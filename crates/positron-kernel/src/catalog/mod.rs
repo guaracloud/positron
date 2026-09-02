@@ -56,6 +56,16 @@ pub use types::{
 #[cfg(any(test, fuzzing))]
 pub(crate) use storage::with_catalog_fault;
 
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub fn fuzz_compaction_publication_fault<T>(enabled: bool, action: impl FnOnce() -> T) -> T {
+    if enabled {
+        storage::with_catalog_fault(storage::fault::CatalogFileEvent::SynchronizeCommit, action)
+    } else {
+        action()
+    }
+}
+
 #[cfg(any(test, fuzzing, feature = "test-support"))]
 pub(crate) use storage::before_lease_marker_basis;
 #[cfg(test)]
@@ -227,11 +237,13 @@ impl<'authority> Catalog<'authority> {
             .secret
             .lock()
             .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
-        let object_ids: Vec<_> = proposal
-            .objects
-            .iter()
-            .map(CatalogObject::identity)
-            .collect();
+        let mut object_ids = Vec::new();
+        object_ids
+            .try_reserve_exact(proposal.objects.len())
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::ResourceAdmissionRefused))?;
+        for object in &proposal.objects {
+            object_ids.push(object.identity());
+        }
         let audit_intent = audit.as_ref().map(|intent| intent.0.as_slice());
         let digest = transaction_digest(proposal.format_epoch, &object_ids, audit_intent)?;
         // Resolve an earlier acknowledgement-ambiguous marker publication before

@@ -59,12 +59,17 @@ impl ElapsedSource {
     }
 }
 
-#[cfg(any(test, fuzzing))]
-pub(crate) struct ManualRetentionTime(Arc<AtomicU64>);
+#[cfg(any(test, fuzzing, feature = "test-support"))]
+/// Deterministic elapsed-time control for kernel integration and fuzz tests.
+///
+/// This adapter is only available to test-support builds and retains the same
+/// destructive-retention authority used by production ledgers.
+pub struct ManualRetentionTime(Arc<AtomicU64>);
 
-#[cfg(any(test, fuzzing))]
+#[cfg(any(test, fuzzing, feature = "test-support"))]
 impl ManualRetentionTime {
-    pub(crate) fn advance(&self, nanoseconds: u64) -> Result<(), LifecycleClockFailure> {
+    /// Advances the authority's monotonic elapsed time by nanoseconds.
+    pub fn advance(&self, nanoseconds: u64) -> Result<(), LifecycleClockFailure> {
         self.0
             .try_update(Ordering::AcqRel, Ordering::Acquire, |elapsed| {
                 elapsed.checked_add(nanoseconds)
@@ -90,10 +95,9 @@ impl RetentionTimeAuthority {
         })
     }
 
-    #[cfg(any(test, fuzzing))]
-    pub(crate) fn establish_with_manual_elapsed(
-        epoch: UnixNanoseconds,
-    ) -> (Self, ManualRetentionTime) {
+    #[cfg(any(test, fuzzing, feature = "test-support"))]
+    /// Establishes a destructive-retention authority with a deterministic epoch.
+    pub fn establish_with_manual_elapsed(epoch: UnixNanoseconds) -> (Self, ManualRetentionTime) {
         let elapsed = Arc::new(AtomicU64::new(0));
         (
             Self {

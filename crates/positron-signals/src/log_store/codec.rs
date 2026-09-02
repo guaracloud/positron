@@ -143,6 +143,20 @@ pub(super) fn decode_block_cancellable(
     BlockDecode::new(expected_tenant, block.payload())?.decode(block, limit, cancellation)
 }
 
+pub(super) fn decode_block_observed(
+    expected_tenant: TenantId,
+    block: &CommittedBlock,
+    limit: usize,
+    cancellation: &dyn super::ScanCancellation,
+    observer: &dyn super::ScanObserver,
+) -> Result<DecodedBlock, LogStoreFailure> {
+    BlockDecode::observed(expected_tenant, block.payload(), cancellation, observer)?.decode(
+        block,
+        limit,
+        cancellation,
+    )
+}
+
 fn decode_block_header_with<'input>(
     expected_tenant: TenantId,
     mut input: Input<'input>,

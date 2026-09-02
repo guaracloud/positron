@@ -1,5 +1,7 @@
 #[path = "acknowledged_logs/budget_and_sealed.rs"]
 mod budget_and_sealed;
+#[path = "acknowledged_logs/compaction_semantics.rs"]
+mod compaction_semantics;
 #[path = "acknowledged_logs/cursor.rs"]
 mod cursor;
 #[path = "acknowledged_logs/lifecycle.rs"]

@@ -1,6 +1,7 @@
 //! Minimal native Log Signal Store.
 
 mod codec;
+mod compaction;
 mod failure;
 #[cfg(fuzzing)]
 mod fuzzing;
@@ -25,6 +26,7 @@ use positron_kernel::{
     LifecycleClock, LifecycleClockSource, PreparedStoreBlock, ResourceReservation, SegmentScope,
 };
 
+pub use compaction::LogCompactionOutcome;
 pub use failure::{LogStoreFailure, LogStoreFailureCode};
 pub use metadata::LogMetadata;
 pub use positron_policy::PolicyProvenance;
@@ -292,6 +294,39 @@ impl LogStore {
         observer: &dyn ScanObserver,
     ) -> Result<LogRetentionOutcome, LogStoreFailure> {
         retention::enforce_retention(ledger, tenant, policy, cancellation, observer)
+    }
+
+    /// Compacts verified sealed Log blocks from one fixed ingest-time bucket.
+    /// The Storage Kernel owns copy-on-write durability and Catalog publication.
+    pub fn compact<'kernel, 'catalog>(
+        &self,
+        ledger: &positron_kernel::ActiveSegmentLedger<'kernel, 'catalog>,
+        tenant: TenantId,
+        policy: LogRetentionPolicy,
+        bucket: LogRetentionBucket,
+    ) -> Result<LogCompactionOutcome, LogStoreFailure> {
+        self.compact_observed(
+            ledger,
+            tenant,
+            policy,
+            bucket,
+            &scan::NeverCancelled,
+            &scan::Unobserved,
+        )
+    }
+
+    /// Compacts one fixed bucket with cooperative cancellation and bounded
+    /// caller-owned work observation.
+    pub fn compact_observed<'kernel, 'catalog>(
+        &self,
+        ledger: &positron_kernel::ActiveSegmentLedger<'kernel, 'catalog>,
+        tenant: TenantId,
+        policy: LogRetentionPolicy,
+        bucket: LogRetentionBucket,
+        cancellation: &dyn ScanCancellation,
+        observer: &dyn ScanObserver,
+    ) -> Result<LogCompactionOutcome, LogStoreFailure> {
+        compaction::compact(ledger, tenant, policy, bucket, cancellation, observer)
     }
 }
 

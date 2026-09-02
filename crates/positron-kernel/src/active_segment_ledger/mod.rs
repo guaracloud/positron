@@ -2,6 +2,7 @@
 
 mod append;
 mod capacity;
+mod compaction;
 mod fault;
 mod format;
 #[cfg(fuzzing)]
@@ -73,6 +74,25 @@ pub struct RetentionReclamation {
     evaluated_at: positron_domain::time::UnixNanoseconds,
 }
 
+/// Result of one atomic copy-on-write replacement of sealed segments.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompactionPublication {
+    input_segments: usize,
+    output_segments: usize,
+}
+
+impl CompactionPublication {
+    #[must_use]
+    pub const fn input_segments(self) -> usize {
+        self.input_segments
+    }
+
+    #[must_use]
+    pub const fn output_segments(self) -> usize {
+        self.output_segments
+    }
+}
+
 impl RetentionReclamation {
     #[must_use]
     pub const fn logically_retired_segments(self) -> usize {
@@ -140,6 +160,12 @@ pub fn fuzz_retention_prepared_block(
     exercise: impl FnOnce(&ActiveSegmentLedger<'_, '_>, positron_domain::identity::TenantId),
 ) {
     fuzzing::fuzz_retention_prepared_block(data, exercise);
+}
+
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub fn fuzz_compaction_storage_fault<T>(enabled: bool, action: impl FnOnce() -> T) -> T {
+    fault::fuzz_compaction_storage_fault(enabled, action)
 }
 
 #[cfg(fuzzing)]
