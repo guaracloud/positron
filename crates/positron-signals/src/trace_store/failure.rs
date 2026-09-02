@@ -99,6 +99,27 @@ impl TraceStoreFailure {
         Self::rejected(classify_domain_failure_code(failure.code()))
     }
 
+    /// Maps a native validation failure at the authenticated block boundary.
+    /// Value and structural failures are malformed durable data, while a
+    /// bounded validation allocation refusal remains retryable capacity.
+    pub(super) const fn validation(failure: DomainFailure) -> Self {
+        Self::rejected(Self::validation_code(failure.code()))
+    }
+
+    #[cfg(test)]
+    pub(super) const fn validation_for_test(code: DomainFailureCode) -> Self {
+        Self::rejected(Self::validation_code(code))
+    }
+
+    const fn validation_code(code: DomainFailureCode) -> TraceStoreFailureCode {
+        let mapped = classify_domain_failure_code(code);
+        if matches!(mapped, TraceStoreFailureCode::ResourceExhausted) {
+            TraceStoreFailureCode::ResourceExhausted
+        } else {
+            TraceStoreFailureCode::MalformedBlock
+        }
+    }
+
     pub(super) fn kernel(failure: LedgerFailure) -> Self {
         Self {
             code: failure.code().into(),
@@ -283,6 +304,20 @@ mod tests {
         for (code, expected) in domain_cases {
             assert_eq!(classify_domain_failure_code(code), expected);
         }
+        let allocation =
+            TraceStoreFailure::validation_for_test(DomainFailureCode::AllocationUnavailable);
+        assert_eq!(allocation.code(), TraceStoreFailureCode::ResourceExhausted);
+        assert_eq!(
+            allocation.completion_state(),
+            LedgerCompletionState::RejectedBeforeMutation
+        );
+        let value_limit =
+            TraceStoreFailure::validation_for_test(DomainFailureCode::ValueLimitExceeded);
+        assert_eq!(value_limit.code(), TraceStoreFailureCode::MalformedBlock);
+        assert_eq!(
+            value_limit.completion_state(),
+            LedgerCompletionState::RejectedBeforeMutation
+        );
 
         let kernel_cases = [
             (Kernel::InvalidInput, TraceStoreFailureCode::InvalidInput),

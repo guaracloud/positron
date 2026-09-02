@@ -50,13 +50,14 @@ fn codec_tags_round_trip_known_native_values() {
         AttributeNamespace::Resource,
         AttributeNamespace::InstrumentationScope,
         AttributeNamespace::Record,
-        AttributeNamespace::Stream,
     ] {
         assert_eq!(
-            decode_namespace(namespace_tag(namespace)).expect("namespace"),
+            decode_namespace(namespace_tag(namespace).expect("namespace")).expect("namespace"),
             namespace
         );
     }
+    assert!(namespace_tag(AttributeNamespace::Stream).is_err());
+    assert!(decode_namespace(4).is_err());
 }
 
 #[test]
@@ -229,10 +230,19 @@ fn decoder_defensive_paths_remain_typed_after_admission_preflight() {
     Input::observed(&[], &NeverCancelled, &DecodedRecordsExhausted)
         .observe_component()
         .expect("work observer accepts the component");
-    assert_eq!(namespace_index(AttributeNamespace::Stream), 0);
-    assert_eq!(namespace_index(AttributeNamespace::Resource), 1);
-    assert_eq!(namespace_index(AttributeNamespace::InstrumentationScope), 2);
-    assert_eq!(namespace_index(AttributeNamespace::Record), 3);
+    assert_eq!(
+        namespace_index(AttributeNamespace::Resource).expect("namespace"),
+        0
+    );
+    assert_eq!(
+        namespace_index(AttributeNamespace::InstrumentationScope).expect("namespace"),
+        1
+    );
+    assert_eq!(
+        namespace_index(AttributeNamespace::Record).expect("namespace"),
+        2
+    );
+    assert!(namespace_index(AttributeNamespace::Stream).is_err());
     let mut empty_rule = Vec::new();
     empty_rule.extend_from_slice(&1_u64.to_be_bytes());
     empty_rule.extend_from_slice(&[1; 32]);

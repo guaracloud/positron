@@ -120,7 +120,7 @@ pub(crate) fn decode_observation(
     attributes
         .try_reserve_exact(attributes_count)
         .map_err(|_| TraceStoreFailure::resource_exhausted())?;
-    let mut occurrences_by_namespace = [0_usize; 4];
+    let mut occurrences_by_namespace = [0_usize; 3];
     for _ in 0..attributes_count {
         input.observe_component()?;
         let namespace = decode_namespace(input.u8()?)?;
@@ -129,7 +129,7 @@ pub(crate) fn decode_observation(
         if count == 0 {
             return Err(TraceStoreFailure::malformed_block());
         }
-        let namespace_index = super::format::namespace_index(namespace);
+        let namespace_index = super::format::namespace_index(namespace)?;
         occurrences_by_namespace[namespace_index] = occurrences_by_namespace[namespace_index]
             .checked_add(count)
             .filter(|total| *total <= limits.occurrences_per_namespace)
@@ -145,7 +145,7 @@ pub(crate) fn decode_observation(
         attributes.push(
             candidate
                 .validate(ValueLimitProfile::release_1_system_maximum())
-                .map_err(|_| TraceStoreFailure::malformed_block())?,
+                .map_err(TraceStoreFailure::validation)?,
         );
     }
     let policy = decode_policy(input)?;

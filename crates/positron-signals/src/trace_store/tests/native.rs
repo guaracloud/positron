@@ -136,21 +136,20 @@ fn native_span_counts_occurrences_across_attribute_sets_by_namespace() {
         .expect_err("namespace occurrence bound is aggregate across sets");
         assert_eq!(over.code(), TraceStoreFailureCode::LimitExceeded);
     }
-    assert!(
-        SpanObservation::checked_native(
-            [0x4b; 16],
-            [0x4c; 8],
-            None,
-            "stream".to_owned(),
-            EventTime::missing(),
-            EventTime::missing(),
-            make_sets(AttributeNamespace::Stream, 1),
-            SpanKind::Internal,
-            SamplingDecision::Unknown,
-            positron_policy::PolicyProvenance::new(1, [0x72; 32], Vec::new()).unwrap(),
-        )
-        .is_ok()
-    );
+    let stream = SpanObservation::checked_native(
+        [0x4b; 16],
+        [0x4c; 8],
+        None,
+        "stream".to_owned(),
+        EventTime::missing(),
+        EventTime::missing(),
+        make_sets(AttributeNamespace::Stream, 1),
+        SpanKind::Internal,
+        SamplingDecision::Unknown,
+        positron_policy::PolicyProvenance::new(1, [0x72; 32], Vec::new()).unwrap(),
+    )
+    .expect_err("Stream attributes belong only to the Log Store");
+    assert_eq!(stream.code(), TraceStoreFailureCode::InvalidInput);
     let mut mixed = make_sets(AttributeNamespace::Resource, 1_024);
     mixed.extend(make_sets(AttributeNamespace::InstrumentationScope, 1));
     mixed.extend(make_sets(AttributeNamespace::Resource, 1));

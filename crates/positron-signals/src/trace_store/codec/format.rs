@@ -40,12 +40,12 @@ pub(crate) fn decode_quality(
     }
 }
 
-pub(crate) fn namespace_tag(namespace: AttributeNamespace) -> u8 {
+pub(crate) fn namespace_tag(namespace: AttributeNamespace) -> Result<u8, TraceStoreFailure> {
     match namespace {
-        AttributeNamespace::Resource => 1,
-        AttributeNamespace::InstrumentationScope => 2,
-        AttributeNamespace::Record => 3,
-        AttributeNamespace::Stream => 4,
+        AttributeNamespace::Resource => Ok(1),
+        AttributeNamespace::InstrumentationScope => Ok(2),
+        AttributeNamespace::Record => Ok(3),
+        AttributeNamespace::Stream => Err(TraceStoreFailure::invalid_input()),
     }
 }
 
@@ -54,17 +54,16 @@ pub(crate) fn decode_namespace(tag: u8) -> Result<AttributeNamespace, TraceStore
         1 => Ok(AttributeNamespace::Resource),
         2 => Ok(AttributeNamespace::InstrumentationScope),
         3 => Ok(AttributeNamespace::Record),
-        4 => Ok(AttributeNamespace::Stream),
         _ => Err(TraceStoreFailure::malformed_block()),
     }
 }
 
-pub(crate) fn namespace_index(namespace: AttributeNamespace) -> usize {
+pub(crate) fn namespace_index(namespace: AttributeNamespace) -> Result<usize, TraceStoreFailure> {
     match namespace {
-        AttributeNamespace::Stream => 0,
-        AttributeNamespace::Resource => 1,
-        AttributeNamespace::InstrumentationScope => 2,
-        AttributeNamespace::Record => 3,
+        AttributeNamespace::Resource => Ok(0),
+        AttributeNamespace::InstrumentationScope => Ok(1),
+        AttributeNamespace::Record => Ok(2),
+        AttributeNamespace::Stream => Err(TraceStoreFailure::malformed_block()),
     }
 }
 

@@ -30,6 +30,10 @@ Each observation contains:
    identities;
 7. the kernel-assigned ingest time as an i64.
 
+Trace attributes are limited to the Resource, Instrumentation Scope, and
+Record/Span namespaces. The Log-only Stream namespace is not a valid Trace
+Store value and its wire tag is rejected.
+
 Native values use tags for null, boolean, signed integer, floating-point bits,
 string, bytes, array, and ordered key/value list. The decoder applies the
 Release 1 value limits before allocating nested values. Names, attribute keys,

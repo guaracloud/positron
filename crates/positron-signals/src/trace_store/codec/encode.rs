@@ -54,7 +54,7 @@ fn encode_observation(
     put_bytes(output, observation.name().as_bytes())?;
     put_count(output, observation.attributes().len())?;
     for attribute in observation.attributes() {
-        put_u8(output, namespace_tag(attribute.namespace()))?;
+        put_u8(output, namespace_tag(attribute.namespace())?)?;
         put_bytes(output, attribute.key().as_bytes())?;
         put_count(output, attribute.len())?;
         for index in 0..attribute.len() {

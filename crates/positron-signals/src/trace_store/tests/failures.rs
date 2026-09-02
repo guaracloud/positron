@@ -185,6 +185,11 @@ fn malformed_trace_record_shapes_fail_closed_at_their_boundaries() -> Result<(),
             TraceStoreFailureCode::MalformedBlock,
         ),
         (
+            "log-only stream attribute namespace",
+            replaced_byte(&valid, 68, 4)?,
+            TraceStoreFailureCode::MalformedBlock,
+        ),
+        (
             "empty occurrence set",
             replaced_bytes(&valid, 76, [0, 0])?,
             TraceStoreFailureCode::MalformedBlock,

@@ -49,14 +49,15 @@ tag and applied-policy path), `valid_boundary_key` (65,536-byte key/path),
 `valid_boundary_occurrences` (1,024 occurrences), and
 `valid_boundary_nested` (1,024 nested entries), plus `truncated_tail`,
 `structural_trailing_byte`, `corrupt_magic`, `corrupt_tenant`,
-`malformed_key_65537`, and `malformed_occurrences_1025`. Replay the named
+`malformed_key_65537`, `malformed_occurrences_1025`, and
+`malformed_stream_namespace`. Replay the named
 corpus before the bounded run with:
 
 ```console
 cargo +nightly fuzz run trace_store_block_decode --sanitizer none -- fuzz/corpus/trace_store_block_decode -runs=1
 ```
 
-The corpus replay covers all ten named seeds (the target may report each
+The corpus replay covers all eleven named seeds (the target may report each
 twice when the package and absolute corpus paths are both supplied); the
 bounded command is the required 1,000-run untrusted-input check.
 

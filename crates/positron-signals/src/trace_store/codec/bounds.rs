@@ -69,7 +69,7 @@ fn preflight_observation(
         attributes_count,
         super::DECODED_VECTOR_SLOT_BYTES,
     )?;
-    let mut occurrences_by_namespace = [0_usize; 4];
+    let mut occurrences_by_namespace = [0_usize; 3];
     bound = checked_bound_add(bound, checked_u64(name.len())?)?;
     for _ in 0..attributes_count {
         let namespace = decode_namespace(input.u8()?)?;
@@ -82,7 +82,7 @@ fn preflight_observation(
         if count == 0 {
             return Err(TraceStoreFailure::malformed_block());
         }
-        let index = namespace_index(namespace);
+        let index = namespace_index(namespace)?;
         occurrences_by_namespace[index] = occurrences_by_namespace[index]
             .checked_add(count)
             .filter(|total| *total <= limits.occurrences_per_namespace)
