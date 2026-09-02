@@ -6,8 +6,7 @@ use super::super::{
     ActiveSegmentLedger, CommitReceipt, CompactionBlock, LedgerSnapshot, SegmentId,
     StoreBlockIdentity,
 };
-use crate::StorageKernelResourceAuthority;
-use positron_domain::time::UnixNanoseconds;
+use crate::{IngestTime, StorageKernelResourceAuthority};
 
 pub(super) struct Oracle {
     records: Vec<Record>,
@@ -35,7 +34,7 @@ struct Record {
     identity: StoreBlockIdentity,
     payload: Vec<u8>,
     receipt: CommitReceipt,
-    ingest_nanos: u64,
+    ingest_time: IngestTime,
 }
 
 impl Oracle {
@@ -61,7 +60,7 @@ impl Oracle {
         identity: StoreBlockIdentity,
         payload: Vec<u8>,
         receipt: CommitReceipt,
-        ingest_nanos: u64,
+        ingest_time: IngestTime,
     ) {
         assert_eq!(receipt.position().value(), self.expected_position());
         assert!(
@@ -73,7 +72,7 @@ impl Oracle {
             identity,
             payload,
             receipt,
-            ingest_nanos,
+            ingest_time,
         });
         self.frontier = receipt.position();
     }
@@ -102,10 +101,13 @@ impl Oracle {
     pub(super) fn expired_segments(
         &self,
         active: SegmentId,
-        now_nanos: u64,
+        now: IngestTime,
         retention_nanos: u64,
     ) -> BTreeSet<SegmentId> {
-        let Some(cutoff) = now_nanos.checked_sub(retention_nanos) else {
+        let Ok(retention_nanos) = i64::try_from(retention_nanos) else {
+            return BTreeSet::new();
+        };
+        let Some(cutoff) = now.instant().value().checked_sub(retention_nanos) else {
             return BTreeSet::new();
         };
         let segments = self
@@ -120,7 +122,7 @@ impl Oracle {
                 self.records
                     .iter()
                     .filter(|record| record.receipt.segment_id() == *segment)
-                    .map(|record| record.ingest_nanos)
+                    .map(|record| record.ingest_time.instant().value())
                     .max()
                     .is_some_and(|latest| latest <= cutoff)
             })
@@ -216,9 +218,6 @@ impl Oracle {
             let record = self.records.iter().find(|record| {
                 record.receipt.position() == block.position() && record.identity == block.identity()
             })?;
-            let instant = i64::try_from(record.ingest_nanos).ok()?;
-            let ingest =
-                crate::IngestTime::from_authenticated_durable(UnixNanoseconds::new(instant));
             blocks.push(
                 CompactionBlock::new(
                     scope,
@@ -227,7 +226,7 @@ impl Oracle {
                     block.position(),
                     block.payload().to_vec(),
                     block.content_digest().ok()?,
-                    ingest,
+                    record.ingest_time,
                 )
                 .ok()?,
             );
@@ -248,6 +247,30 @@ impl Oracle {
         if changed {
             self.compactions = self.compactions.saturating_add(1);
         }
+    }
+
+    pub(super) fn assert_compaction_replaced(
+        &self,
+        snapshot: &LedgerSnapshot<'_>,
+        source_segments: &BTreeSet<SegmentId>,
+    ) {
+        self.assert_snapshot(snapshot);
+        assert!(
+            snapshot
+                .blocks()
+                .iter()
+                .all(|block| !source_segments.contains(&block.segment_id())),
+            "successful compaction must retire every source segment"
+        );
+    }
+
+    pub(super) fn assert_source_segments_retired(&self, source_segments: &BTreeSet<SegmentId>) {
+        assert!(
+            self.records
+                .iter()
+                .all(|record| !source_segments.contains(&record.receipt.segment_id())),
+            "oracle must track every compacted source as retired"
+        );
     }
 
     pub(super) fn frontier(&self) -> CommitPosition {

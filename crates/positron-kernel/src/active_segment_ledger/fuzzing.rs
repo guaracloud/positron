@@ -9,9 +9,10 @@ use positron_domain::routing::{SignalKind, VirtualShardId};
 
 use crate::catalog::fuzz_authority;
 use crate::{
-    Catalog, CatalogObject, CatalogProposal, CatalogSecret, FormatEpoch, InstanceId,
-    MountQualification, PrimaryDataVolume, ResourceAmounts, ResourceDimension,
-    RetentionTimeAuthority, StorageKernelResourceAuthority, TransactionId, WorkClaim, WorkKind,
+    Catalog, CatalogObject, CatalogProposal, CatalogSecret, CompactionBlock, FormatEpoch,
+    IngestTime, InstanceId, MountQualification, PrimaryDataVolume, ResourceAmounts,
+    ResourceDimension, RetentionTimeAuthority, StorageKernelResourceAuthority, TransactionId,
+    WorkClaim, WorkKind,
 };
 
 use super::fault::{LedgerFileEvent, with_ledger_fault};
@@ -83,15 +84,12 @@ pub(super) fn fuzz_active_segment_stateful(data: &[u8]) {
         match operation {
             0 => {
                 let (identity, payload) = block_parts(index, selector);
+                let (prepared, ingest_time) =
+                    prepared_retained_with_time(&ledger, &authority, identity, payload.clone());
                 let receipt = ledger
-                    .append(prepared_retained(
-                        &ledger,
-                        &authority,
-                        identity,
-                        payload.clone(),
-                    ))
+                    .append(prepared)
                     .expect("ordinary bounded fuzz append succeeds");
-                oracle.record(identity, payload, receipt, elapsed.nanoseconds());
+                oracle.record(identity, payload, receipt, ingest_time);
             },
             1 => {
                 let event = fault_event(selector);
@@ -108,15 +106,12 @@ pub(super) fn fuzz_active_segment_stateful(data: &[u8]) {
                 };
                 ledger = recovered;
                 if fault_commits(event) {
+                    let (prepared, ingest_time) =
+                        prepared_retained_with_time(&ledger, &authority, identity, payload.clone());
                     let receipt = ledger
-                        .append(prepared_retained(
-                            &ledger,
-                            &authority,
-                            identity,
-                            payload.clone(),
-                        ))
+                        .append(prepared)
                         .expect("ambiguous successor replays exactly");
-                    oracle.record(identity, payload, receipt, elapsed.nanoseconds());
+                    oracle.record(identity, payload, receipt, ingest_time);
                 }
             },
             2 => {
@@ -161,15 +156,16 @@ pub(super) fn fuzz_active_segment_stateful(data: &[u8]) {
                     let identity = identity(index);
                     if !oracle.contains(identity) {
                         let payload = existing_payload.to_vec();
+                        let (prepared, ingest_time) = prepared_retained_with_time(
+                            &ledger,
+                            &authority,
+                            identity,
+                            payload.clone(),
+                        );
                         let receipt = ledger
-                            .append(prepared_retained(
-                                &ledger,
-                                &authority,
-                                identity,
-                                payload.clone(),
-                            ))
+                            .append(prepared)
                             .expect("equal bytes under distinct identity append");
-                        oracle.record(identity, payload, receipt, elapsed.nanoseconds());
+                        oracle.record(identity, payload, receipt, ingest_time);
                     }
                 }
             },
@@ -264,11 +260,10 @@ pub(super) fn fuzz_active_segment_stateful(data: &[u8]) {
                         .advance(2_000_000_000)
                         .expect("bounded fuzz retention movement");
                 }
-                let retired = oracle.expired_segments(
-                    active,
-                    elapsed.nanoseconds(),
-                    duration.get() * 1_000_000_000,
-                );
+                let now = retention_time
+                    .ingest_time(scope, None)
+                    .expect("bounded fuzz retention time");
+                let retired = oracle.expired_segments(active, now, duration.get() * 1_000_000_000);
                 let mut protected = std::collections::BTreeSet::new();
                 if let Some((_, expected)) = &protected_snapshot {
                     protected.extend(expected.segments());
@@ -306,6 +301,10 @@ pub(super) fn fuzz_active_segment_stateful(data: &[u8]) {
                 let active = ledger.active_segment_id().expect("active segment identity");
                 let snapshot = ledger.snapshot().expect("compaction fuzz snapshot");
                 if let Some(blocks) = oracle.compaction_inputs(&snapshot, scope, active) {
+                    let source_segments = blocks
+                        .iter()
+                        .map(CompactionBlock::source_segment)
+                        .collect::<std::collections::BTreeSet<_>>();
                     let preparation = ledger
                         .prepare_compaction(&snapshot)
                         .expect("compaction fuzz admission is bounded");
@@ -328,7 +327,18 @@ pub(super) fn fuzz_active_segment_stateful(data: &[u8]) {
                         })
                     };
                     drop(snapshot);
-                    if result.is_ok() {
+                    if !cancellation_enabled {
+                        let publication = result.expect(
+                            "uninterrupted compaction with oracle-authenticated inputs succeeds",
+                        );
+                        assert!(publication.input_segments() >= 2);
+                        let current = ledger
+                            .snapshot()
+                            .expect("compaction fuzz successor snapshot");
+                        oracle.assert_compaction_replaced(&current, &source_segments);
+                        oracle.note_compaction(&current);
+                        oracle.assert_source_segments_retired(&source_segments);
+                    } else if result.is_ok() {
                         let current = ledger
                             .snapshot()
                             .expect("compaction fuzz successor snapshot");
@@ -463,6 +473,15 @@ fn prepared_retained<'capacity>(
     identity: StoreBlockIdentity,
     payload: Vec<u8>,
 ) -> PreparedStoreBlock<'capacity> {
+    prepared_retained_with_time(ledger, authority, identity, payload).0
+}
+
+fn prepared_retained_with_time<'capacity>(
+    ledger: &ActiveSegmentLedger<'_, '_>,
+    authority: &'capacity StorageKernelResourceAuthority,
+    identity: StoreBlockIdentity,
+    payload: Vec<u8>,
+) -> (PreparedStoreBlock<'capacity>, IngestTime) {
     let capacity = authority
         .governor()
         .reserve(
@@ -475,11 +494,12 @@ fn prepared_retained<'capacity>(
             .expect("bounded fuzz claim"),
         )
         .expect("bounded fuzz reservation");
-    ledger
+    let preparation = ledger
         .begin_store_block(capacity, identity)
-        .expect("kernel fuzz preparation")
-        .finish(payload)
-        .expect("bounded fuzz block")
+        .expect("kernel fuzz preparation");
+    let ingest_time = preparation.ingest_time();
+    let block = preparation.finish(payload).expect("bounded fuzz block");
+    (block, ingest_time)
 }
 
 fn identity(index: usize) -> StoreBlockIdentity {

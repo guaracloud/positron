@@ -1,5 +1,6 @@
 #![no_main]
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -7,6 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use libfuzzer_sys::fuzz_target;
 use positron_domain::identity::TenantId;
 use positron_domain::routing::{SignalKind, VirtualShardId};
+use positron_domain::time::UnixNanoseconds;
 use positron_domain::value::{
     AttributeNamespace, CandidateAttributeValue, CandidateKeyValue, ValueLimitProfile,
 };
@@ -14,7 +16,7 @@ use positron_governance::{InitialAuditContext, InitialGovernanceIntent, InitialT
 use positron_kernel::{
     ActiveSegmentLedger, Catalog, CatalogObject, CatalogProposal, CatalogSecret, FormatEpoch,
     InstanceId, ResourceAmounts, ResourceDimension, RetentionTimeAuthority,
-    SegmentProtectionKey, SegmentScope, StoreBlockIdentity, WorkClaim, WorkKind,
+    SegmentId, SegmentProtectionKey, SegmentScope, StoreBlockIdentity, WorkClaim, WorkKind,
 };
 use positron_policy::{
     IngestPolicy, NativeLogAttribute, NativeLogCandidate, PolicyEvaluation, PolicyReceiver,
@@ -71,7 +73,7 @@ fn run_once(
     tenant: TenantId,
     root: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let authority = authority::establish(root, tenant)?;
+    let authority = authority::establish_for_compaction(root, tenant)?;
     let instance = InstanceId::new([0x61; 16])?;
     let catalog = Catalog::open(
         &authority,
@@ -79,7 +81,10 @@ fn run_once(
         CatalogSecret::from_owned(Box::new([0x62; 32]), Box::new([0x63; 32])),
     )?;
     install_policy(&catalog, instance, tenant)?;
-    let retention_time = RetentionTimeAuthority::establish()?;
+    const BUCKET_NANOS: u64 = 3_600_000_000_000;
+    let (retention_time, elapsed) = RetentionTimeAuthority::establish_with_manual_elapsed(
+        UnixNanoseconds::new(1_000_000_000),
+    );
     let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(61)?);
     let key = || SegmentProtectionKey::from_owned(Box::new([0x64; 32]));
     let store = LogStore::new();
@@ -91,7 +96,73 @@ fn run_once(
     )?;
     let policy = LogRetentionPolicy::from_catalog(&catalog.pin()?)?;
 
-    for segment in 0_u8..2 {
+    // The first sealed segment deliberately spans two fixed retention buckets.
+    // It is never a compaction input: Log Store must select complete segments,
+    // not individual blocks.
+    let mixed = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    let mixed_first = append_fuzz_block(
+        &mixed,
+        &authority,
+        &store,
+        &ingest_policy,
+        &mut schema,
+        data,
+        0,
+        0x70,
+    )?;
+    let snapshot = mixed.snapshot()?;
+    let mixed_block = snapshot
+        .blocks()
+        .iter()
+        .find(|block| block.identity() == mixed_first)
+        .ok_or("missing mixed fuzz block")?;
+    let path = SchemaPath::root(AttributeNamespace::Record, "fuzz.attribute".to_owned())?;
+    let mut promotion = schema.stage_query_update()?;
+    promotion.record_query_use(&path)?;
+    promotion.index_replayed_query_path(tenant, &snapshot, mixed_block, &path)?;
+    schema.commit_query_update(promotion)?;
+    if !schema
+        .catalog()
+        .entry(&path)
+        .is_some_and(positron_signals::SchemaEntry::promoted)
+    {
+        return Err("fuzz schema path was not promoted".into());
+    }
+    let mut demotion = schema.stage_query_update()?;
+    demotion.remove_query_evidence(&path)?;
+    schema.commit_query_update(demotion)?;
+    if schema
+        .catalog()
+        .entry(&path)
+        .is_some_and(positron_signals::SchemaEntry::promoted)
+    {
+        return Err("fuzz schema path did not demote".into());
+    }
+    drop(snapshot);
+    elapsed.advance(BUCKET_NANOS)?;
+    append_fuzz_block(
+        &mixed,
+        &authority,
+        &store,
+        &ingest_policy,
+        &mut schema,
+        data,
+        1,
+        0x71,
+    )?;
+    mixed.seal()?;
+
+    // Two complete sealed segments share bucket one and are independently
+    // eligible as a target. Two more share bucket two, while the final block
+    // remains active. The input selects either target without selecting a
+    // bucket from the first record's wall-clock timing.
+    for (segment, marker) in [(2_u8, 0x72_u8), (3, 0x73)] {
         let ledger = ActiveSegmentLedger::open_with_retention_time(
             &authority,
             &retention_time,
@@ -99,53 +170,57 @@ fn run_once(
             scope,
             key(),
         )?;
-        let identity = StoreBlockIdentity::new([segment.saturating_add(0x70); 16])?;
-        let mut records = vec![fuzz_record(&ingest_policy, data, segment)?];
-        let delta = schema.stage_group(&mut records)?;
-        let block = store
-            .prepare(
-                ledger.begin_store_block(
-                    ingest_capacity(&authority, tenant)?,
-                    identity,
-                )?,
-                records,
-            )?
-            .into_store_block();
-        let digest = block.content_digest()?;
-        ledger.append(block)?;
-        schema.commit(delta, identity, digest)?;
-        if segment == 0 {
-            let snapshot = ledger.snapshot()?;
-            let block = snapshot
-                .blocks()
-                .iter()
-                .find(|block| block.identity() == identity)
-                .ok_or("missing first fuzz block")?;
-            let path = SchemaPath::root(AttributeNamespace::Record, "fuzz.attribute".to_owned())?;
-            let mut promotion = schema.stage_query_update()?;
-            promotion.record_query_use(&path)?;
-            promotion.index_replayed_query_path(tenant, &snapshot, block, &path)?;
-            schema.commit_query_update(promotion)?;
-            if !schema
-                .catalog()
-                .entry(&path)
-                .is_some_and(positron_signals::SchemaEntry::promoted)
-            {
-                return Err("fuzz schema path was not promoted".into());
-            }
-            let mut demotion = schema.stage_query_update()?;
-            demotion.remove_query_evidence(&path)?;
-            schema.commit_query_update(demotion)?;
-            if schema
-                .catalog()
-                .entry(&path)
-                .is_some_and(positron_signals::SchemaEntry::promoted)
-            {
-                return Err("fuzz schema path did not demote".into());
-            }
-        }
+        append_fuzz_block(
+            &ledger,
+            &authority,
+            &store,
+            &ingest_policy,
+            &mut schema,
+            data,
+            segment,
+            marker,
+        )?;
         ledger.seal()?;
     }
+    elapsed.advance(BUCKET_NANOS)?;
+    for (segment, marker) in [(4_u8, 0x74_u8), (5, 0x75)] {
+        let ledger = ActiveSegmentLedger::open_with_retention_time(
+            &authority,
+            &retention_time,
+            &catalog,
+            scope,
+            key(),
+        )?;
+        append_fuzz_block(
+            &ledger,
+            &authority,
+            &store,
+            &ingest_policy,
+            &mut schema,
+            data,
+            segment,
+            marker,
+        )?;
+        ledger.seal()?;
+    }
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    append_fuzz_block(
+        &ledger,
+        &authority,
+        &store,
+        &ingest_policy,
+        &mut schema,
+        data,
+        6,
+        0x76,
+    )?;
+    drop(ledger);
 
     let mut ledger = ActiveSegmentLedger::open_with_retention_time(
         &authority,
@@ -161,18 +236,54 @@ fn run_once(
         &before_snapshot,
         LogScan::all(ScanLimit::new(8)?),
     )?;
-    let first = before.records().first().ok_or("missing fuzz record")?;
-    let bucket = policy.bucket(tenant, first.ingest_time())?;
-    let path = SchemaPath::root(AttributeNamespace::Record, "fuzz.attribute".to_owned())?;
-    let second_identity = StoreBlockIdentity::new([0x71; 16])?;
-    let second_block = before_snapshot
+    assert_eq!(
+        before.records().len(),
+        7,
+        "deterministic bucket fixture must expose every mixed, alternate, and active record"
+    );
+    let segment_for = |identity: StoreBlockIdentity| -> Result<SegmentId, Box<dyn std::error::Error>> {
+        before_snapshot
+            .blocks()
+            .iter()
+            .find(|block| block.identity() == identity)
+            .map(|block| block.segment_id())
+            .ok_or_else(|| format!("missing segment for fuzz block {identity:?}").into())
+    };
+    let mixed_segment = segment_for(StoreBlockIdentity::new([0x70; 16])?)?;
+    assert_eq!(segment_for(StoreBlockIdentity::new([0x71; 16])?)?, mixed_segment);
+    let bucket_one_segments = BTreeSet::from([
+        segment_for(StoreBlockIdentity::new([0x72; 16])?)?,
+        segment_for(StoreBlockIdentity::new([0x73; 16])?)?,
+    ]);
+    let bucket_two_segments = BTreeSet::from([
+        segment_for(StoreBlockIdentity::new([0x74; 16])?)?,
+        segment_for(StoreBlockIdentity::new([0x75; 16])?)?,
+    ]);
+    let target_selector = data.get(1).map_or(0, |byte| byte & 1);
+    let target_record_index = if target_selector == 0 { 2 } else { 4 };
+    let target_first = before
+        .records()
+        .get(target_record_index)
+        .ok_or("missing selected target record")?;
+    let bucket = policy.bucket(tenant, target_first.ingest_time())?;
+    let target_identity = if target_selector == 0 {
+        StoreBlockIdentity::new([0x72; 16])?
+    } else {
+        StoreBlockIdentity::new([0x74; 16])?
+    };
+    let target_segments = if target_selector == 0 {
+        bucket_one_segments.clone()
+    } else {
+        bucket_two_segments.clone()
+    };
+    let target_block = before_snapshot
         .blocks()
         .iter()
-        .find(|block| block.identity() == second_identity)
-        .ok_or("missing second fuzz block")?;
+        .find(|block| block.identity() == target_identity)
+        .ok_or("missing selected target block")?;
     let mut re_promotion = schema.stage_query_update()?;
     re_promotion.record_query_use(&path)?;
-    re_promotion.index_replayed_query_path(tenant, &before_snapshot, second_block, &path)?;
+    re_promotion.index_replayed_query_path(tenant, &before_snapshot, target_block, &path)?;
     schema.commit_query_update(re_promotion)?;
     if schema.catalog().overflow_record_count() == 0 {
         return Err("fuzz schema overflow was not retained".into());
@@ -254,7 +365,7 @@ fn run_once(
             &ledger.snapshot()?,
             LogScan::all(ScanLimit::new(8)?),
         )?;
-        assert_eq!(recovered.records().len(), 2);
+        assert_eq!(recovered.records().len(), 7);
         drop(recovered);
         store.compact(&ledger, tenant, policy, bucket)?;
     }
@@ -271,6 +382,60 @@ fn run_once(
         LogScan::all(ScanLimit::new(8)?),
     )?;
     let after_snapshot = ledger.snapshot()?;
+    let segment_for_after =
+        |identity: StoreBlockIdentity| -> Result<SegmentId, Box<dyn std::error::Error>> {
+            after_snapshot
+                .blocks()
+                .iter()
+                .find(|block| block.identity() == identity)
+                .map(|block| block.segment_id())
+                .ok_or_else(|| format!("missing compacted fuzz block {identity:?}").into())
+        };
+    assert_eq!(
+        segment_for_after(StoreBlockIdentity::new([0x70; 16])?)?,
+        mixed_segment
+    );
+    assert_eq!(
+        segment_for_after(StoreBlockIdentity::new([0x71; 16])?)?,
+        mixed_segment
+    );
+    let target_markers = if target_selector == 0 {
+        [0x72_u8, 0x73_u8]
+    } else {
+        [0x74_u8, 0x75_u8]
+    };
+    let target_output_segments = target_markers
+        .into_iter()
+        .map(|marker| segment_for_after(StoreBlockIdentity::new([marker; 16])?))
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    assert_eq!(target_output_segments.len(), 1);
+    assert!(target_output_segments.is_disjoint(&target_segments));
+    for marker in target_markers {
+        let identity = StoreBlockIdentity::new([marker; 16])?;
+        let output = after_snapshot
+            .blocks()
+            .iter()
+            .find(|block| block.identity() == identity)
+            .ok_or("missing target output block")?;
+        let original = before
+            .records()
+            .iter()
+            .find(|record| record.commit_position() == output.position())
+            .ok_or("missing target source record")?;
+        assert_eq!(policy.bucket(tenant, original.ingest_time())?, bucket);
+    }
+    let other_markers = if target_selector == 0 {
+        [0x74_u8, 0x75_u8]
+    } else {
+        [0x72_u8, 0x73_u8]
+    };
+    for marker in other_markers {
+        let identity = StoreBlockIdentity::new([marker; 16])?;
+        assert_eq!(
+            segment_for_after(identity)?,
+            segment_for(identity)?
+        );
+    }
     let schema_after = store.scan_schema(
         authority.governor(),
         tenant,
@@ -328,7 +493,7 @@ fn run_once(
         &reopened.snapshot()?,
         LogScan::all(ScanLimit::new(8)?),
     )?;
-    assert_eq!(restarted.records().len(), 2);
+    assert_eq!(restarted.records().len(), 7);
     let schema_encoding = schema.catalog().encode_catalog_object()?;
     let reopened_schema = positron_signals::SchemaCatalog::decode_catalog_object(&schema_encoding)?;
     let restarted_snapshot = reopened.snapshot()?;
@@ -342,6 +507,31 @@ fn run_once(
     )?;
     assert_eq!(restarted_schema.records(), expected_schema_records.as_slice());
     Ok(())
+}
+
+fn append_fuzz_block<'authority, 'catalog>(
+    ledger: &ActiveSegmentLedger<'authority, 'catalog>,
+    authority: &'authority positron_kernel::StorageKernelResourceAuthority,
+    store: &LogStore,
+    policy: &IngestPolicy,
+    schema: &mut SchemaSessionStore,
+    data: &[u8],
+    segment: u8,
+    marker: u8,
+) -> Result<StoreBlockIdentity, Box<dyn std::error::Error>> {
+    let identity = StoreBlockIdentity::new([marker; 16])?;
+    let mut records = vec![fuzz_record(policy, data, segment)?];
+    let delta = schema.stage_group(&mut records)?;
+    let block = store
+        .prepare(
+            ledger.begin_store_block(ingest_capacity(authority, ledger.scope().tenant_id())?, identity)?,
+            records,
+        )?
+        .into_store_block();
+    let digest = block.content_digest()?;
+    ledger.append(block)?;
+    schema.commit(delta, identity, digest)?;
+    Ok(identity)
 }
 
 fn fuzz_record(
