@@ -300,46 +300,11 @@ impl super::TraceStore {
             return Err(TraceStoreFailure::physical_scope_mismatch());
         }
         check_cancel(cancellation)?;
-        let mut encoded_bytes = 0_u64;
-        let mut decoded_memory = 0_u64;
-        let mut preflight_scanned_bytes = 0_u64;
-        for block in snapshot.blocks() {
-            check_cancel(cancellation)?;
-            if includes_block(scan, block.position()) {
-                let block_bytes = u64::try_from(block.payload().len())
-                    .map_err(|_| TraceStoreFailure::limit_exceeded())?;
-                let next_scanned = preflight_scanned_bytes
-                    .checked_add(block_bytes)
-                    .ok_or_else(TraceStoreFailure::limit_exceeded)?;
-                if scan
-                    .scanned_bytes_limit()
-                    .is_some_and(|limit| next_scanned > limit)
-                {
-                    break;
-                }
-                encoded_bytes = encoded_bytes
-                    .checked_add(block_bytes)
-                    .ok_or_else(TraceStoreFailure::limit_exceeded)?;
-                decoded_memory = decoded_memory
-                    .checked_add(codec::decoded_memory_bound(
-                        tenant,
-                        block.payload(),
-                        cancellation,
-                    )?)
-                    .ok_or_else(TraceStoreFailure::limit_exceeded)?;
-                preflight_scanned_bytes = next_scanned;
-            }
-        }
         let output_memory = u64::try_from(scan.limit().value())
             .map_err(|_| TraceStoreFailure::limit_exceeded())?
             .checked_mul(SPAN_RESULT_SLOT_BYTES)
             .ok_or_else(TraceStoreFailure::limit_exceeded)?;
-        let memory = encoded_bytes
-            .checked_add(decoded_memory)
-            .ok_or_else(TraceStoreFailure::limit_exceeded)?
-            .checked_add(output_memory)
-            .ok_or_else(TraceStoreFailure::limit_exceeded)?
-            .max(1);
+        let memory = output_memory.max(1);
         let amounts = ResourceAmounts::only(ResourceDimension::MemoryBytes, memory)
             .map_err(|_| TraceStoreFailure::limit_exceeded())?;
         let claim = WorkClaim::tenant(tenant, WorkKind::InteractiveQueryTail, amounts)
@@ -352,6 +317,7 @@ impl super::TraceStore {
         observations
             .try_reserve_exact(scan.limit().value())
             .map_err(|_| TraceStoreFailure::resource_exhausted())?;
+        let mut retained_size_bytes = output_memory;
         let mut scanned_bytes = 0_u64;
         let mut complete = true;
         let mut scanned_bytes_limited = false;
@@ -382,6 +348,18 @@ impl super::TraceStore {
                 .observe_scanned_bytes(block_bytes)
                 .map_err(TraceStoreFailure::observation)?;
             scanned_bytes = next_scanned;
+            let staged_memory = retained_size_bytes
+                .checked_add(block_bytes)
+                .ok_or_else(TraceStoreFailure::limit_exceeded)?
+                .max(1);
+            resize_capacity(&mut capacity, staged_memory)?;
+            let decoded_memory =
+                codec::decoded_memory_bound(tenant, block.payload(), cancellation, observer)?;
+            let admitted_memory = retained_size_bytes
+                .checked_add(block_bytes)
+                .and_then(|memory| memory.checked_add(decoded_memory))
+                .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+            resize_capacity(&mut capacity, admitted_memory)?;
             let decoder =
                 codec::BlockDecode::observed(tenant, block.payload(), cancellation, observer)?;
             let skipped = skipped_records(scan, block.position());
@@ -404,16 +382,12 @@ impl super::TraceStore {
                 complete = false;
                 break;
             }
+            retained_size_bytes = retained_size(observations.capacity(), &observations)?;
+            resize_capacity(&mut capacity, retained_size_bytes.max(1))?;
         }
         check_cancel(cancellation)?;
-        let retained_size_bytes = retained_size(observations.capacity(), &observations)?;
-        let granted_retained_size = retained_size_bytes.max(1);
-        let retained_amounts =
-            ResourceAmounts::only(ResourceDimension::MemoryBytes, granted_retained_size)
-                .map_err(|_| TraceStoreFailure::limit_exceeded())?;
-        capacity
-            .try_resize(retained_amounts)
-            .map_err(|_| TraceStoreFailure::resource_admission_refused())?;
+        retained_size_bytes = retained_size(observations.capacity(), &observations)?;
+        resize_capacity(&mut capacity, retained_size_bytes.max(1))?;
         let decoded_observations =
             u64::try_from(observations.len()).map_err(|_| TraceStoreFailure::limit_exceeded())?;
         Ok(TraceScanResult::new(
@@ -426,6 +400,18 @@ impl super::TraceStore {
             capacity,
         ))
     }
+}
+
+fn resize_capacity(
+    capacity: &mut ResourceReservation<'_>,
+    memory: u64,
+) -> Result<(), TraceStoreFailure> {
+    let amounts = ResourceAmounts::only(ResourceDimension::MemoryBytes, memory)
+        .map_err(|_| TraceStoreFailure::limit_exceeded())?;
+    capacity
+        .try_resize(amounts)
+        .map_err(|_| TraceStoreFailure::resource_admission_refused())
+        .map(|_| ())
 }
 
 struct NeverCancelled;

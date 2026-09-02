@@ -14,7 +14,7 @@ pub fn fuzz_trace_store_block(data: &[u8]) {
     };
     let cancellation = NeverCancelled;
     let observer = Unobserved;
-    let Ok(_) = codec::decoded_memory_bound(tenant, bounded, &cancellation) else {
+    let Ok(_) = codec::decoded_memory_bound(tenant, bounded, &cancellation, &observer) else {
         return;
     };
     let Ok(mut decoder) = codec::BlockDecode::observed(tenant, bounded, &cancellation, &observer)

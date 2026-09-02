@@ -177,6 +177,7 @@ fn decode_policy(
         .try_reserve_exact(count)
         .map_err(|_| TraceStoreFailure::resource_exhausted())?;
     for _ in 0..count {
+        input.observe_component()?;
         rules.push(input.string(positron_policy::PolicyProvenance::MAX_RULE_ID_BYTES)?);
     }
     positron_policy::PolicyProvenance::new(generation, digest, rules)
@@ -256,6 +257,7 @@ pub(crate) struct Input<'a> {
 }
 
 impl<'a> Input<'a> {
+    #[cfg(test)]
     pub(crate) fn cancelable(bytes: &'a [u8], cancellation: &'a dyn ScanCancellation) -> Self {
         Self {
             remaining: bytes,

@@ -290,7 +290,7 @@ fn admission_preflight_rejects_oversized_native_bytes_and_decoded_payloads() {
     );
     let mut oversized_bytes = encode_block(tenant, &[stored]).expect("encoded block");
     oversized_bytes[83..87].copy_from_slice(&65_537_u32.to_be_bytes());
-    let failure = decoded_memory_bound(tenant, &oversized_bytes, &NeverCancelled)
+    let failure = decoded_memory_bound(tenant, &oversized_bytes, &NeverCancelled, &NeverObserved)
         .expect_err("native bytes beyond profile must be rejected pre-decode");
     assert_eq!(failure.code(), crate::TraceStoreFailureCode::MalformedBlock);
 
@@ -322,7 +322,7 @@ fn admission_preflight_rejects_oversized_native_bytes_and_decoded_payloads() {
     oversized_decoded.extend_from_slice(&[1; 32]);
     oversized_decoded.extend_from_slice(&0_u16.to_be_bytes());
     oversized_decoded.extend_from_slice(&1_i64.to_be_bytes());
-    let failure = decoded_memory_bound(tenant, &oversized_decoded, &NeverCancelled)
+    let failure = decoded_memory_bound(tenant, &oversized_decoded, &NeverCancelled, &NeverObserved)
         .expect_err("decoded payload growth must be rejected before allocation");
     assert_eq!(failure.code(), crate::TraceStoreFailureCode::MalformedBlock);
 }

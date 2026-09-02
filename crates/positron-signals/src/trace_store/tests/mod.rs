@@ -27,6 +27,7 @@ mod codec_boundaries;
 mod failures;
 mod native;
 mod physical;
+mod resource_admission;
 mod visibility;
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);

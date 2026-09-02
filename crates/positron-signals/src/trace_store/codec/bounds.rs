@@ -8,7 +8,7 @@ use super::format::{
     MAGIC, MAX_RECORDS, VERSION, decode_kind, decode_namespace, decode_quality, decode_sampling,
     namespace_index,
 };
-use crate::ScanCancellation;
+use crate::{ScanCancellation, ScanObserver};
 
 /// Computes a conservative peak heap bound without constructing a decoded
 /// value. The scan reserves this amount before its first allocating decode.
@@ -16,9 +16,11 @@ pub(crate) fn decoded_memory_bound(
     expected_tenant: TenantId,
     bytes: &[u8],
     cancellation: &dyn ScanCancellation,
+    observer: &dyn ScanObserver,
 ) -> Result<u64, TraceStoreFailure> {
     let limits = release_1_limits()?;
-    let mut input = Input::cancelable(bytes, cancellation);
+    let mut input = Input::observed(bytes, cancellation, observer);
+    input.observe_component()?;
     if input.take(MAGIC.len())? != MAGIC || input.u16()? != VERSION {
         return Err(TraceStoreFailure::malformed_block());
     }
@@ -48,6 +50,7 @@ fn preflight_observation(
     input: &mut Input<'_>,
     limits: &TraceLimits,
 ) -> Result<u64, TraceStoreFailure> {
+    input.observe_component()?;
     let _ = input.array::<16>()?;
     let _ = input.array::<8>()?;
     match input.u8()? {
@@ -117,6 +120,7 @@ fn preflight_value(
     depth: u8,
     limits: &TraceLimits,
 ) -> Result<ValueBound, TraceStoreFailure> {
+    input.observe_component()?;
     match input.u8()? {
         0 => Ok(ValueBound {
             decoded_bytes: 0,
@@ -221,6 +225,7 @@ pub(crate) fn preflight_policy(
     input: &mut Input<'_>,
     bound: &mut u64,
 ) -> Result<(), TraceStoreFailure> {
+    input.observe_component()?;
     let generation = input.u64()?;
     let digest = input.array::<32>()?;
     let count = input.count(positron_policy::PolicyProvenance::MAX_APPLIED_RULES)?;
@@ -234,6 +239,7 @@ pub(crate) fn preflight_policy(
         )?,
     )?;
     for _ in 0..count {
+        input.observe_component()?;
         let rule = input.raw_string(positron_policy::PolicyProvenance::MAX_RULE_ID_BYTES)?;
         if rule.is_empty() {
             return Err(TraceStoreFailure::malformed_block());
