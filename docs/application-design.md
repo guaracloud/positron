@@ -613,7 +613,8 @@ the complete version 1 reader contract in
 
 The Trace Store hides immutable Span Observations, logical-span consolidation,
 conflicts, trace-summary deltas, quiescence, structural indexes, and incomplete
-analysis.
+analysis. Its initial canonical observation block is specified by
+[`trace-store-block-format-v1.md`](trace-store-block-format-v1.md).
 
 No Release 1 Metric Store or Profile Store adapter exists. Adding one later
 requires a complete native implementation and conformance target, not an empty

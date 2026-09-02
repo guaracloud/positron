@@ -91,6 +91,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "trace_store_block_decode"
+path = "fuzz_targets/trace_store_block_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "log_store_compaction_stateful"
 path = "fuzz_targets/log_store_compaction_stateful.rs"
 test = false
