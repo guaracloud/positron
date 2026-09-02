@@ -307,6 +307,7 @@ pub struct CompactionPreparation<'kernel> {
     pub(super) catalog_instance: crate::InstanceId,
     pub(super) catalog_identity: crate::CatalogGenerationId,
     pub(super) catalog_generation: u64,
+    pub(super) retention_policy: Option<crate::CatalogLogRetentionPolicy>,
     pub(super) frontier: CommitPosition,
     pub(super) source_digest: [u8; 32],
     pub(super) maximum_blocks: usize,

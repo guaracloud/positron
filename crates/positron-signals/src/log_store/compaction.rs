@@ -77,8 +77,9 @@ pub(super) fn compact<'kernel, 'catalog>(
     // Admit the kernel's complete copy-on-write peak while only the immutable
     // snapshot exists. This is intentionally before any payload is cloned.
     let preparation = ledger
-        .prepare_compaction(&snapshot)
+        .prepare_compaction_with_policy(&snapshot, policy.kernel_policy())
         .map_err(LogStoreFailure::kernel)?;
+    policy.verify_current(ledger)?;
     let mut inputs = Vec::new();
     inputs
         .try_reserve_exact(snapshot.blocks().len())
@@ -128,6 +129,7 @@ pub(super) fn compact<'kernel, 'catalog>(
         }
         ingest_times.push(ingest_time);
     }
+    policy.verify_current(ledger)?;
     let mut evidence_index = 0_usize;
     for block in snapshot.blocks() {
         check_scan_cancellation(cancellation)?;

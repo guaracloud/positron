@@ -24,6 +24,25 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         &self,
         snapshot: &super::LedgerSnapshot<'_>,
     ) -> Result<CompactionPreparation<'kernel>, LedgerFailure> {
+        self.prepare_compaction_inner(snapshot, None)
+    }
+
+    /// Admits compaction against one authenticated POSGOV03 retention policy.
+    /// Later Catalog generations remain eligible only when that exact policy
+    /// object and duration are unchanged.
+    pub fn prepare_compaction_with_policy(
+        &self,
+        snapshot: &super::LedgerSnapshot<'_>,
+        policy: crate::CatalogLogRetentionPolicy,
+    ) -> Result<CompactionPreparation<'kernel>, LedgerFailure> {
+        self.prepare_compaction_inner(snapshot, Some(policy))
+    }
+
+    fn prepare_compaction_inner(
+        &self,
+        snapshot: &super::LedgerSnapshot<'_>,
+        expected_policy: Option<crate::CatalogLogRetentionPolicy>,
+    ) -> Result<CompactionPreparation<'kernel>, LedgerFailure> {
         if snapshot.scope() != self.scope {
             return Err(LedgerFailure::new(LedgerFailureCode::PhysicalScopeMismatch));
         }
@@ -34,9 +53,14 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         })?;
         self.catalog.refresh_state()?;
         let basis = self.catalog.pin()?;
-        if basis.identity() != snapshot.catalog_identity()
-            || basis.number() != snapshot.catalog_generation()
-        {
+        let basis_is_stale = match expected_policy {
+            Some(expected) => basis.log_retention_policy()? != expected,
+            None => {
+                basis.identity() != snapshot.catalog_identity()
+                    || basis.number() != snapshot.catalog_generation()
+            },
+        };
+        if basis_is_stale {
             return Err(LedgerFailure::new(LedgerFailureCode::StaleGeneration));
         }
         let catalog_bytes = basis
@@ -55,7 +79,8 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
                 maximum_blocks,
                 catalog_bytes,
                 basis.plaintext_object_count(),
-            )?,
+            )
+            .map_err(|failure| LedgerFailure::new(failure.code()))?,
         )
         .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
         let capacity = self
@@ -67,8 +92,9 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             capacity,
             scope: snapshot.scope(),
             catalog_instance: self.catalog.instance(),
-            catalog_identity: snapshot.catalog_identity(),
-            catalog_generation: snapshot.catalog_generation(),
+            catalog_identity: basis.identity(),
+            catalog_generation: basis.number(),
+            retention_policy: expected_policy,
             frontier: snapshot.frontier(),
             source_digest: snapshot_source_digest(snapshot)?,
             maximum_blocks,
@@ -149,8 +175,14 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         state.require_healthy()?;
         self.catalog.refresh_state()?;
         let basis = self.catalog.pin()?;
-        if basis.identity() != preparation.catalog_identity
-            || basis.number() != preparation.catalog_generation
+        let catalog_is_stale = match preparation.retention_policy {
+            Some(expected_policy) => basis.log_retention_policy()? != expected_policy,
+            None => {
+                basis.identity() != preparation.catalog_identity
+                    || basis.number() != preparation.catalog_generation
+            },
+        };
+        if catalog_is_stale
             || state.frontier != preparation.frontier
             || snapshot_source_digest_from_blocks(self.scope, state.frontier, &state.blocks)?
                 != preparation.source_digest

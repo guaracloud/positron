@@ -1,7 +1,7 @@
 use positron_domain::identity::TenantId;
 use positron_domain::routing::SignalKind;
 use positron_domain::time::UnixNanoseconds;
-use positron_kernel::{ActiveSegmentLedger, IngestTime};
+use positron_kernel::{ActiveSegmentLedger, CatalogLogRetentionPolicy, IngestTime};
 
 use super::{LogStoreFailure, codec};
 
@@ -30,6 +30,10 @@ impl LogRetentionPolicy {
     #[must_use]
     pub const fn retention_seconds(self) -> u64 {
         self.configured.retention_seconds().get()
+    }
+
+    pub(super) const fn kernel_policy(self) -> CatalogLogRetentionPolicy {
+        self.configured
     }
 
     /// Derives the fixed compaction boundary owned by this tenant Log Store.
