@@ -463,6 +463,205 @@ fn compaction_keeps_sealed_segments_in_other_retention_buckets_untouched()
 }
 
 #[test]
+fn compaction_skips_mixed_bucket_segments_and_compacts_complete_targets()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let instance = InstanceId::new([0xa1; 16])?;
+    let catalog = Catalog::open(
+        &authority,
+        instance,
+        CatalogSecret::from_owned(Box::new([0xa2; 32]), Box::new([0xa3; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(11)?);
+    let (retention_time, elapsed) =
+        RetentionTimeAuthority::establish_with_manual_elapsed(UnixNanoseconds::new(1_000_000_000));
+    let key = || SegmentProtectionKey::from_owned(Box::new([0xa4; 32]));
+    let store = LogStore::new();
+    let mixed = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    let policy = retention_policy(&catalog, &mixed, tenant, 2)?;
+    mixed.append(
+        store
+            .prepare(
+                mixed.begin_store_block(
+                    preparation_capacity(&authority, tenant)?,
+                    StoreBlockIdentity::new([0xa5; 16])?,
+                )?,
+                vec![record("mixed-old-bucket")?],
+            )?
+            .into_store_block(),
+    )?;
+    elapsed.advance(3_000_000_000)?;
+    mixed.append(
+        store
+            .prepare(
+                mixed.begin_store_block(
+                    preparation_capacity(&authority, tenant)?,
+                    StoreBlockIdentity::new([0xa6; 16])?,
+                )?,
+                vec![record("mixed-target-bucket")?],
+            )?
+            .into_store_block(),
+    )?;
+    let mixed_segment = mixed.seal()?.segment_id();
+
+    for (identity, body) in [
+        ([0xa7; 16], "complete-target-one"),
+        ([0xa8; 16], "complete-target-two"),
+    ] {
+        let segment = ActiveSegmentLedger::open_with_retention_time(
+            &authority,
+            &retention_time,
+            &catalog,
+            scope,
+            key(),
+        )?;
+        segment.append(
+            store
+                .prepare(
+                    segment.begin_store_block(
+                        preparation_capacity(&authority, tenant)?,
+                        StoreBlockIdentity::new(identity)?,
+                    )?,
+                    vec![record(body)?],
+                )?
+                .into_store_block(),
+        )?;
+        segment.seal()?;
+    }
+
+    let active = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    let before_snapshot = active.snapshot()?;
+    let before_scan = store.scan(
+        authority.governor(),
+        tenant,
+        &before_snapshot,
+        LogScan::all(ScanLimit::new(16)?),
+    )?;
+    let target_bucket = policy.bucket(
+        tenant,
+        before_scan
+            .records()
+            .get(1)
+            .ok_or("mixed-bucket target record is missing")?
+            .ingest_time(),
+    )?;
+    let expected = before_scan
+        .records()
+        .iter()
+        .map(|record| {
+            (
+                record.record().clone(),
+                record.commit_position(),
+                record.record_ordinal(),
+            )
+        })
+        .collect::<Vec<_>>();
+    drop(before_scan);
+    drop(before_snapshot);
+    let governor_before = authority.governor().inspect()?;
+    let outcome = store.compact(&active, tenant, policy, target_bucket)?;
+    assert_eq!(outcome.input_segments(), 2);
+    assert_eq!(outcome.output_segments(), 1);
+    let governor_after = authority.governor().inspect()?;
+    assert_eq!(
+        governor_after.outstanding_total(),
+        governor_before.outstanding_total()
+    );
+    for dimension in ResourceDimension::ALL {
+        assert_eq!(
+            governor_after.usage(dimension),
+            governor_before.usage(dimension)
+        );
+        assert_eq!(
+            governor_after.recovery_shared_usage(dimension),
+            governor_before.recovery_shared_usage(dimension)
+        );
+    }
+
+    let after_snapshot = active.snapshot()?;
+    assert_eq!(
+        after_snapshot
+            .blocks()
+            .iter()
+            .filter(|block| block.segment_id() == mixed_segment)
+            .count(),
+        2
+    );
+    let after_scan = store.scan(
+        authority.governor(),
+        tenant,
+        &after_snapshot,
+        LogScan::all(ScanLimit::new(16)?),
+    )?;
+    let actual = after_scan
+        .records()
+        .iter()
+        .map(|record| {
+            (
+                record.record().clone(),
+                record.commit_position(),
+                record.record_ordinal(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actual, expected);
+    drop(after_scan);
+    drop(after_snapshot);
+    drop(active);
+
+    let reopened = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    let restarted_snapshot = reopened.snapshot()?;
+    assert_eq!(
+        restarted_snapshot
+            .blocks()
+            .iter()
+            .filter(|block| block.segment_id() == mixed_segment)
+            .count(),
+        2
+    );
+    let restarted = store.scan(
+        authority.governor(),
+        tenant,
+        &restarted_snapshot,
+        LogScan::all(ScanLimit::new(16)?),
+    )?;
+    let restarted_actual = restarted
+        .records()
+        .iter()
+        .map(|record| {
+            (
+                record.record().clone(),
+                record.commit_position(),
+                record.record_ordinal(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(restarted_actual, expected);
+    Ok(())
+}
+
+#[test]
 fn compaction_with_only_an_active_segment_is_an_empty_noop() -> Result<(), Box<dyn Error>> {
     let root = TemporaryRoot::new()?;
     let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;

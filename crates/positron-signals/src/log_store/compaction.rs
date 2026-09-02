@@ -83,6 +83,14 @@ pub(super) fn compact<'kernel, 'catalog>(
     inputs
         .try_reserve_exact(snapshot.blocks().len())
         .map_err(|_| LogStoreFailure::resource_exhausted())?;
+    let mut segment_buckets = Vec::new();
+    segment_buckets
+        .try_reserve_exact(snapshot.blocks().len())
+        .map_err(|_| LogStoreFailure::resource_exhausted())?;
+    let mut ingest_times = Vec::new();
+    ingest_times
+        .try_reserve_exact(snapshot.blocks().len())
+        .map_err(|_| LogStoreFailure::resource_exhausted())?;
     for block in snapshot.blocks() {
         check_scan_cancellation(cancellation)?;
         if block.segment_id() == active {
@@ -110,7 +118,33 @@ pub(super) fn compact<'kernel, 'catalog>(
                     .map(|candidate| candidate == bucket)
             })
             .try_fold(true, |all, current| current.map(|current| all && current))?;
-        let input = in_bucket
+        if let Some((_, all_in_bucket)) = segment_buckets
+            .iter_mut()
+            .find(|(segment, _)| *segment == block.segment_id())
+        {
+            *all_in_bucket &= in_bucket;
+        } else {
+            segment_buckets.push((block.segment_id(), in_bucket));
+        }
+        ingest_times.push(ingest_time);
+    }
+    let mut evidence_index = 0_usize;
+    for block in snapshot.blocks() {
+        check_scan_cancellation(cancellation)?;
+        if block.segment_id() == active {
+            continue;
+        }
+        let ingest_time = *ingest_times
+            .get(evidence_index)
+            .ok_or_else(LogStoreFailure::malformed_block)?;
+        evidence_index = evidence_index
+            .checked_add(1)
+            .ok_or_else(LogStoreFailure::limit_exceeded)?;
+        let complete_in_bucket = segment_buckets
+            .iter()
+            .find(|(segment, _)| *segment == block.segment_id())
+            .is_some_and(|(_, all_in_bucket)| *all_in_bucket);
+        let input = complete_in_bucket
             .then(|| {
                 CompactionBlock::new(
                     snapshot.scope(),

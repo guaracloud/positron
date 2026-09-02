@@ -26,7 +26,7 @@ use positron_policy::{
     PolicyReceiver,
 };
 use positron_runtime::GovernanceTestFixture;
-use positron_signals::{LogRecord, LogStore};
+use positron_signals::{LogRecord, LogStore, SchemaSessionStore};
 
 pub struct TestClock(AtomicU64);
 
@@ -1191,6 +1191,49 @@ impl KernelFixture {
         Ok(())
     }
 
+    pub fn append_attribute_logs_with_schema(
+        &self,
+        schema: &mut SchemaSessionStore,
+        candidates: Vec<(Option<i64>, Vec<NativeLogAttribute>)>,
+        identity: u8,
+    ) -> Result<(), Box<dyn Error>> {
+        if schema.tenant() != self.tenant {
+            return Err("query fixture schema scope mismatch".into());
+        }
+        let mut records = Vec::new();
+        records.try_reserve_exact(candidates.len())?;
+        for (event_time, attributes) in candidates {
+            let candidate =
+                NativeLogCandidate::new(event_time, None, None, attributes, LogMetadata::empty());
+            let PolicyEvaluation::Accepted(evaluated) =
+                IngestPolicy::preserving(1)?.evaluate(candidate, PolicyReceiver::OtlpGrpc)?
+            else {
+                return Err("preserving policy rejected the schema query fixture".into());
+            };
+            records.push(LogRecord::checked_evaluated(
+                ValueLimitProfile::release_1_system_maximum(),
+                *evaluated,
+            )?);
+        }
+        let delta = schema.stage_group(&mut records)?;
+        let capacity = self.authority.governor().reserve(WorkClaim::tenant(
+            self.tenant,
+            WorkKind::Ingest,
+            ResourceAmounts::only(ResourceDimension::MemoryBytes, 1_048_576)?,
+        )?)?;
+        let block_identity = StoreBlockIdentity::new([identity; 16])?;
+        let block = LogStore::new()
+            .prepare(
+                self.ledger()?.begin_store_block(capacity, block_identity)?,
+                records,
+            )?
+            .into_store_block();
+        let digest = block.content_digest()?;
+        self.ledger()?.append(block)?;
+        schema.commit(delta, block_identity, digest)?;
+        Ok(())
+    }
+
     pub fn append_indexed_attribute_logs(
         &self,
         candidates: Vec<(Option<i64>, Vec<NativeLogAttribute>)>,
@@ -1226,19 +1269,21 @@ impl KernelFixture {
             WorkKind::Ingest,
             ResourceAmounts::only(ResourceDimension::MemoryBytes, 1_048_576)?,
         )?)?;
-        let block = LogStore::new()
-            .prepare(
-                self.ledger()?.begin_store_block_for_test(
-                    capacity,
-                    StoreBlockIdentity::new([identity; 16])?,
-                    self.retention_time,
-                )?,
-                records,
+        let block_identity = StoreBlockIdentity::new([identity; 16])?;
+        let preparation = if self.retention_enabled {
+            self.ledger()?.begin_store_block(capacity, block_identity)?
+        } else {
+            self.ledger()?.begin_store_block_for_test(
+                capacity,
+                block_identity,
+                self.retention_time,
             )?
+        };
+        let block = LogStore::new()
+            .prepare(preparation, records)?
             .into_store_block();
         let digest = block.content_digest()?;
         self.ledger()?.append(block)?;
-        let block_identity = StoreBlockIdentity::new([identity; 16])?;
         schema.commit(delta, block_identity, digest)?;
         let snapshot = self.ledger()?.snapshot()?;
         let indexed_block = snapshot

@@ -21,7 +21,8 @@ use positron_policy::{
 };
 use positron_signals::{
     LogMetadata, LogRecord, LogRetentionPolicy, LogScan, LogStore, ScanCancellation, ScanLimit,
-    ScanObservationFailureCode, ScanObserver, SchemaBudget, SchemaSessionStore,
+    OccurrenceSelector, ScanObservationFailureCode, ScanObserver, SchemaBudget, SchemaPath,
+    SchemaQuery, SchemaSessionStore, SchemaValue,
 };
 
 #[path = "schema_discovery_query/authority.rs"]
@@ -113,6 +114,36 @@ fn run_once(
         let digest = block.content_digest()?;
         ledger.append(block)?;
         schema.commit(delta, identity, digest)?;
+        if segment == 0 {
+            let snapshot = ledger.snapshot()?;
+            let block = snapshot
+                .blocks()
+                .iter()
+                .find(|block| block.identity() == identity)
+                .ok_or("missing first fuzz block")?;
+            let path = SchemaPath::root(AttributeNamespace::Record, "fuzz.attribute".to_owned())?;
+            let mut promotion = schema.stage_query_update()?;
+            promotion.record_query_use(&path)?;
+            promotion.index_replayed_query_path(tenant, &snapshot, block, &path)?;
+            schema.commit_query_update(promotion)?;
+            if !schema
+                .catalog()
+                .entry(&path)
+                .is_some_and(positron_signals::SchemaEntry::promoted)
+            {
+                return Err("fuzz schema path was not promoted".into());
+            }
+            let mut demotion = schema.stage_query_update()?;
+            demotion.remove_query_evidence(&path)?;
+            schema.commit_query_update(demotion)?;
+            if schema
+                .catalog()
+                .entry(&path)
+                .is_some_and(positron_signals::SchemaEntry::promoted)
+            {
+                return Err("fuzz schema path did not demote".into());
+            }
+        }
         ledger.seal()?;
     }
 
@@ -132,6 +163,35 @@ fn run_once(
     )?;
     let first = before.records().first().ok_or("missing fuzz record")?;
     let bucket = policy.bucket(tenant, first.ingest_time())?;
+    let path = SchemaPath::root(AttributeNamespace::Record, "fuzz.attribute".to_owned())?;
+    let second_identity = StoreBlockIdentity::new([0x71; 16])?;
+    let second_block = before_snapshot
+        .blocks()
+        .iter()
+        .find(|block| block.identity() == second_identity)
+        .ok_or("missing second fuzz block")?;
+    let mut re_promotion = schema.stage_query_update()?;
+    re_promotion.record_query_use(&path)?;
+    re_promotion.index_replayed_query_path(tenant, &before_snapshot, second_block, &path)?;
+    schema.commit_query_update(re_promotion)?;
+    if schema.catalog().overflow_record_count() == 0 {
+        return Err("fuzz schema overflow was not retained".into());
+    }
+    let schema_query = SchemaQuery::value(
+        path.clone(),
+        OccurrenceSelector::Any,
+        SchemaValue::signed_integer(0),
+    );
+    let schema_before = store.scan_schema(
+        authority.governor(),
+        tenant,
+        &before_snapshot,
+        LogScan::all(ScanLimit::new(8)?),
+        schema.catalog(),
+        &schema_query,
+    )?;
+    assert_eq!(schema_before.records().len(), 1);
+    let expected_schema_records = schema_before.records().to_vec();
     let lease = ledger.create_snapshot_lease_for(0, NonZeroU64::new(60).ok_or("lease ttl")?)?;
     let leased_before = store.scan(
         authority.governor(),
@@ -201,12 +261,27 @@ fn run_once(
     if cancelled.is_cancelled() {
         store.compact(&ledger, tenant, policy, bucket)?;
     }
+    let repeated = store.compact(&ledger, tenant, policy, bucket)?;
+    assert_eq!(repeated.input_segments(), 0);
+    assert_eq!(repeated.output_segments(), 0);
     let after = store.scan(
         authority.governor(),
         tenant,
         &ledger.snapshot()?,
         LogScan::all(ScanLimit::new(8)?),
     )?;
+    let after_snapshot = ledger.snapshot()?;
+    let schema_after = store.scan_schema(
+        authority.governor(),
+        tenant,
+        &after_snapshot,
+        LogScan::all(ScanLimit::new(8)?),
+        schema.catalog(),
+        &schema_query,
+    )?;
+    assert_eq!(schema_after.records(), expected_schema_records.as_slice());
+    assert!(schema_after.reduced_pruning());
+    drop(after_snapshot);
     assert_eq!(
         before
             .records()
@@ -233,6 +308,8 @@ fn run_once(
     );
     drop(before_snapshot);
     drop(before);
+    drop(schema_before);
+    drop(schema_after);
     drop(leased_before);
     drop(lease);
     drop(after);
@@ -252,6 +329,18 @@ fn run_once(
         LogScan::all(ScanLimit::new(8)?),
     )?;
     assert_eq!(restarted.records().len(), 2);
+    let schema_encoding = schema.catalog().encode_catalog_object()?;
+    let reopened_schema = positron_signals::SchemaCatalog::decode_catalog_object(&schema_encoding)?;
+    let restarted_snapshot = reopened.snapshot()?;
+    let restarted_schema = store.scan_schema(
+        authority.governor(),
+        tenant,
+        &restarted_snapshot,
+        LogScan::all(ScanLimit::new(8)?),
+        &reopened_schema,
+        &schema_query,
+    )?;
+    assert_eq!(restarted_schema.records(), expected_schema_records.as_slice());
     Ok(())
 }
 
@@ -290,14 +379,18 @@ fn fuzz_record(
             ),
         ])),
     };
-    let attributes = vec![NativeLogAttribute::new(
-        AttributeNamespace::Record,
-        "fuzz.attribute".to_owned(),
-        vec![
-            CandidateAttributeValue::signed_integer(i64::from(segment)),
-            CandidateAttributeValue::string("generic".to_owned()),
-        ],
-    )];
+    let attributes = vec![
+        NativeLogAttribute::new(
+            AttributeNamespace::Record,
+            "fuzz.attribute".to_owned(),
+            vec![CandidateAttributeValue::signed_integer(i64::from(segment))],
+        ),
+        NativeLogAttribute::new(
+            AttributeNamespace::Record,
+            "fuzz.overflow".to_owned(),
+            vec![CandidateAttributeValue::array(vec![CandidateAttributeValue::null()])],
+        ),
+    ];
     let candidate = NativeLogCandidate::new(
         Some(i64::from(segment)),
         (selector == 1).then_some(0),
