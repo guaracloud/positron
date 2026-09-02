@@ -44,6 +44,22 @@ trailing-byte validation:
 cargo +nightly fuzz run trace_store_block_decode --sanitizer none -- -runs=1000
 ```
 
+Its named corpus includes `valid_all_native` (every observation/native value
+tag and applied-policy path), `valid_boundary_key` (65,536-byte key/path),
+`valid_boundary_occurrences` (1,024 occurrences), and
+`valid_boundary_nested` (1,024 nested entries), plus `truncated_tail`,
+`structural_trailing_byte`, `corrupt_magic`, `corrupt_tenant`,
+`malformed_key_65537`, and `malformed_occurrences_1025`. Replay the named
+corpus before the bounded run with:
+
+```console
+cargo +nightly fuzz run trace_store_block_decode --sanitizer none -- fuzz/corpus/trace_store_block_decode -runs=1
+```
+
+The corpus replay covers all ten named seeds (the target may report each
+twice when the package and absolute corpus paths are both supplied); the
+bounded command is the required 1,000-run untrusted-input check.
+
 The active-segment state-machine target also exercises bounded snapshot-lease
 creation, marked resume/repeat, usage recording, release, expiry, and reopen
 recovery alongside append and persisted-corruption transitions:

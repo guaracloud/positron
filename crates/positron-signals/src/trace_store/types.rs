@@ -1,4 +1,4 @@
-use positron_domain::time::{EventTime, SourceTimeQuality, UnixNanoseconds};
+use positron_domain::time::EventTime;
 use positron_domain::value::{AttributeOccurrenceSet, ValueLimitProfile};
 use positron_kernel::{IngestTime, PreparedStoreBlock};
 
@@ -53,39 +53,11 @@ pub struct SpanObservation {
 
 impl SpanObservation {
     /// The maximum native span name size for Release 1.
-    pub const MAX_NAME_BYTES: usize = 65_536;
-
-    /// Builds a bounded native observation from source timestamps.
-    ///
-    /// Missing timestamps remain missing. No duration, parent, completion, or
-    /// sampling state is inferred by this constructor.
-    #[allow(clippy::too_many_arguments)]
-    pub fn checked_minimal(
-        trace_id: [u8; 16],
-        span_id: [u8; 8],
-        parent_span_id: Option<[u8; 8]>,
-        name: String,
-        start_time_unix_nanos: Option<i64>,
-        end_time_unix_nanos: Option<i64>,
-        attributes: Vec<AttributeOccurrenceSet>,
-        kind: SpanKind,
-        sampling: SamplingDecision,
-    ) -> Result<Self, TraceStoreFailure> {
-        let policy = positron_policy::PolicyProvenance::new(1, [1; 32], Vec::new())
-            .map_err(|_| TraceStoreFailure::invalid_input())?;
-        Self::checked_native(
-            trace_id,
-            span_id,
-            parent_span_id,
-            name,
-            event_time(start_time_unix_nanos)?,
-            event_time(end_time_unix_nanos)?,
-            attributes,
-            kind,
-            sampling,
-            policy,
-        )
-    }
+    pub const MAX_NAME_BYTES: usize = ValueLimitProfile::release_1_system_maximum()
+        .system_limits()
+        .dynamic_value()
+        .key_path_bytes()
+        .value() as usize;
 
     /// Builds a native observation with an explicit policy provenance.
     #[allow(clippy::too_many_arguments)]
@@ -101,33 +73,28 @@ impl SpanObservation {
         sampling: SamplingDecision,
         policy: positron_policy::PolicyProvenance,
     ) -> Result<Self, TraceStoreFailure> {
+        let limits = release_1_limits()?;
         if trace_id.iter().all(|byte| *byte == 0)
             || span_id.iter().all(|byte| *byte == 0)
             || parent_span_id.is_some_and(|id| id.iter().all(|byte| *byte == 0))
             || name.is_empty()
-            || name.len() > Self::MAX_NAME_BYTES
+            || name.len() > limits.key_path_bytes
         {
             return Err(TraceStoreFailure::invalid_input());
         }
-        let profile = ValueLimitProfile::release_1_system_maximum();
-        let maximum_attributes = profile
-            .effective_limits()
-            .dynamic_value()
-            .attributes_per_namespace()
-            .value()
-            .checked_mul(3)
-            .ok_or_else(TraceStoreFailure::limit_exceeded)?
-            as usize;
         if attributes.is_empty() {
             // Empty attribute collections are valid native spans.
-        } else if attributes.len() > maximum_attributes {
+        } else if attributes.len() > limits.attribute_sets {
             return Err(TraceStoreFailure::limit_exceeded());
         }
+        let mut occurrences_by_namespace = [0_usize; 4];
         let mut decoded_bytes = name.len();
         for attribute in &attributes {
-            if attribute.is_empty() {
-                return Err(TraceStoreFailure::invalid_input());
-            }
+            let namespace_index = namespace_index(attribute.namespace());
+            occurrences_by_namespace[namespace_index] = occurrences_by_namespace[namespace_index]
+                .checked_add(attribute.len())
+                .filter(|count| *count <= limits.occurrences_per_namespace)
+                .ok_or_else(TraceStoreFailure::limit_exceeded)?;
             decoded_bytes = decoded_bytes
                 .checked_add(attribute.key().len())
                 .ok_or_else(TraceStoreFailure::limit_exceeded)?;
@@ -144,7 +111,7 @@ impl SpanObservation {
                     .ok_or_else(TraceStoreFailure::limit_exceeded)?;
             }
         }
-        if decoded_bytes > 1_048_576 {
+        if decoded_bytes > limits.decoded_bytes {
             return Err(TraceStoreFailure::limit_exceeded());
         }
         Ok(Self {
@@ -212,13 +179,55 @@ impl SpanObservation {
     }
 }
 
-fn event_time(value: Option<i64>) -> Result<EventTime, TraceStoreFailure> {
-    match value {
-        None => Ok(EventTime::missing()),
-        Some(0) => EventTime::received(UnixNanoseconds::new(0), SourceTimeQuality::Zero)
-            .map_err(TraceStoreFailure::domain),
-        Some(value) => EventTime::received(UnixNanoseconds::new(value), SourceTimeQuality::Usable)
-            .map_err(TraceStoreFailure::domain),
+/// The one Release 1 native Trace profile used by both admission and decode.
+/// Keeping these derived limits here prevents a wire decoder from silently
+/// accepting a shape that native construction would reject.
+pub(super) struct TraceLimits {
+    pub(super) attribute_sets: usize,
+    pub(super) occurrences_per_namespace: usize,
+    pub(super) key_path_bytes: usize,
+    pub(super) value_bytes: usize,
+    pub(super) nesting_depth: u8,
+    pub(super) array_entries: usize,
+    pub(super) key_value_list_entries: usize,
+    pub(super) decoded_bytes: usize,
+}
+
+pub(super) fn release_1_limits() -> Result<TraceLimits, TraceStoreFailure> {
+    let profile = ValueLimitProfile::release_1_system_maximum().effective_limits();
+    let dynamic = profile.dynamic_value();
+    Ok(TraceLimits {
+        attribute_sets: usize::try_from(
+            dynamic
+                .attributes_per_namespace()
+                .value()
+                .checked_mul(3)
+                .ok_or_else(TraceStoreFailure::limit_exceeded)?,
+        )
+        .map_err(|_| TraceStoreFailure::limit_exceeded())?,
+        occurrences_per_namespace: usize::try_from(dynamic.attributes_per_namespace().value())
+            .map_err(|_| TraceStoreFailure::limit_exceeded())?,
+        key_path_bytes: usize::try_from(dynamic.key_path_bytes().value())
+            .map_err(|_| TraceStoreFailure::limit_exceeded())?,
+        value_bytes: usize::try_from(dynamic.individual_value_bytes().value())
+            .map_err(|_| TraceStoreFailure::limit_exceeded())?,
+        nesting_depth: u8::try_from(dynamic.nesting_depth().value())
+            .map_err(|_| TraceStoreFailure::limit_exceeded())?,
+        array_entries: usize::try_from(dynamic.array_entries().value())
+            .map_err(|_| TraceStoreFailure::limit_exceeded())?,
+        key_value_list_entries: usize::try_from(dynamic.key_value_list_entries().value())
+            .map_err(|_| TraceStoreFailure::limit_exceeded())?,
+        decoded_bytes: usize::try_from(profile.record().decoded_bytes().value())
+            .map_err(|_| TraceStoreFailure::limit_exceeded())?,
+    })
+}
+
+fn namespace_index(namespace: positron_domain::value::AttributeNamespace) -> usize {
+    match namespace {
+        positron_domain::value::AttributeNamespace::Stream => 0,
+        positron_domain::value::AttributeNamespace::Resource => 1,
+        positron_domain::value::AttributeNamespace::InstrumentationScope => 2,
+        positron_domain::value::AttributeNamespace::Record => 3,
     }
 }
 

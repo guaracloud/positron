@@ -1,6 +1,9 @@
 use positron_domain::identity::TenantId;
 use positron_domain::routing::{SignalKind, VirtualShardId};
-use positron_domain::time::UnixNanoseconds;
+use positron_domain::time::{EventTime, SourceTimeQuality, UnixNanoseconds};
+use positron_domain::value::{
+    AttributeNamespace, AttributeOccurrenceSetCandidate, CandidateAttributeValue, ValueLimitProfile,
+};
 use positron_kernel::{
     ActiveSegmentLedger, Catalog, CatalogSecret, DiskPressureThresholds, GovernorPolicy,
     InstanceId, InventoryCardinalityLimits, MountQualification, ObservedResourceEnvironment,
@@ -11,7 +14,7 @@ use positron_kernel::{
     WorkKind,
 };
 use positron_signals::{
-    SamplingDecision, ScanLimit, SpanKind, SpanObservation, TraceScan, TraceStore,
+    PolicyProvenance, SamplingDecision, ScanLimit, SpanKind, SpanObservation, TraceScan, TraceStore,
 };
 use std::error::Error;
 use std::fs;
@@ -41,16 +44,24 @@ fn public_trace_store_seam_commits_and_reads_a_native_observation() -> Result<()
         scope,
         SegmentProtectionKey::from_owned(Box::new([0x85; 32])),
     )?;
-    let observation = SpanObservation::checked_minimal(
+    let observation = SpanObservation::checked_native(
         [0x86; 16],
         [0x87; 8],
         None,
         "public".to_owned(),
-        Some(1),
-        None,
-        Vec::new(),
+        EventTime::received(UnixNanoseconds::new(1), SourceTimeQuality::Usable)?,
+        EventTime::missing(),
+        vec![
+            AttributeOccurrenceSetCandidate::new(
+                AttributeNamespace::Resource,
+                "k".repeat(SpanObservation::MAX_NAME_BYTES),
+                vec![CandidateAttributeValue::boolean(true)],
+            )
+            .validate(ValueLimitProfile::release_1_system_maximum())?,
+        ],
         SpanKind::Server,
         SamplingDecision::Unknown,
+        PolicyProvenance::new(7, [0x91; 32], Vec::new())?,
     )?;
     let empty_failure = TraceStore::new()
         .prepare(
@@ -118,6 +129,32 @@ fn public_trace_store_seam_commits_and_reads_a_native_observation() -> Result<()
     )?;
     assert_eq!(result.observations().len(), 1);
     assert_eq!(result.observations()[0].observation(), &observation);
+    assert_eq!(
+        result.observations()[0].observation().attributes()[0]
+            .key()
+            .len(),
+        SpanObservation::MAX_NAME_BYTES
+    );
+    drop(result);
+    let _sealed = ledger.seal()?;
+    let reopened = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention,
+        &catalog,
+        scope,
+        SegmentProtectionKey::from_owned(Box::new([0x85; 32])),
+    )?;
+    let restarted_result = TraceStore::new().scan(
+        authority.governor(),
+        tenant,
+        &reopened.snapshot()?,
+        TraceScan::all(ScanLimit::new(1)?),
+    )?;
+    assert!(restarted_result.complete());
+    assert_eq!(
+        restarted_result.observations()[0].observation(),
+        &observation
+    );
     Ok(())
 }
 

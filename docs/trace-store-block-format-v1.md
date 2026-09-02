@@ -32,9 +32,13 @@ Each observation contains:
 
 Native values use tags for null, boolean, signed integer, floating-point bits,
 string, bytes, array, and ordered key/value list. The decoder applies the
-Release 1 value limits before allocating nested values and rejects unknown
-tags, invalid UTF-8, truncated fields, trailing bytes, and invalid policy
-provenance.
+Release 1 value limits before allocating nested values. Names, attribute keys,
+and nested map keys accept `1..=65536` UTF-8 bytes; each namespace accepts at
+most 1,024 total occurrences across all of its sets. An allocation-free
+recursive preflight accounts string/bytes payloads, every nested vector and
+policy rule, and the validation-transfer peak before scan admission. The
+decoder rejects unknown tags, invalid UTF-8, truncated fields, trailing bytes,
+and invalid policy provenance.
 
 Every accepted observation remains an immutable physical observation. This
 format does not consolidate retries, derive summaries, infer completion, or

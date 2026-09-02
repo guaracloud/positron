@@ -10,7 +10,7 @@ use super::failure::TraceStoreFailure;
 use super::types::StoredSpanObservation;
 use crate::{ScanCancellation, ScanLimit, ScanObservationFailureCode, ScanObserver};
 
-const SPAN_RESULT_SLOT_BYTES: u64 = 512;
+const SPAN_RESULT_SLOT_BYTES: u64 = codec::DECODED_RECORD_SLOT_BYTES;
 
 /// A bounded native Trace Store scan over one authenticated snapshot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -301,15 +301,33 @@ impl super::TraceStore {
         }
         check_cancel(cancellation)?;
         let mut encoded_bytes = 0_u64;
+        let mut decoded_memory = 0_u64;
+        let mut preflight_scanned_bytes = 0_u64;
         for block in snapshot.blocks() {
             check_cancel(cancellation)?;
             if includes_block(scan, block.position()) {
-                encoded_bytes = encoded_bytes
-                    .checked_add(
-                        u64::try_from(block.payload().len())
-                            .map_err(|_| TraceStoreFailure::limit_exceeded())?,
-                    )
+                let block_bytes = u64::try_from(block.payload().len())
+                    .map_err(|_| TraceStoreFailure::limit_exceeded())?;
+                let next_scanned = preflight_scanned_bytes
+                    .checked_add(block_bytes)
                     .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+                if scan
+                    .scanned_bytes_limit()
+                    .is_some_and(|limit| next_scanned > limit)
+                {
+                    break;
+                }
+                encoded_bytes = encoded_bytes
+                    .checked_add(block_bytes)
+                    .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+                decoded_memory = decoded_memory
+                    .checked_add(codec::decoded_memory_bound(
+                        tenant,
+                        block.payload(),
+                        cancellation,
+                    )?)
+                    .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+                preflight_scanned_bytes = next_scanned;
             }
         }
         let output_memory = u64::try_from(scan.limit().value())
@@ -317,6 +335,8 @@ impl super::TraceStore {
             .checked_mul(SPAN_RESULT_SLOT_BYTES)
             .ok_or_else(TraceStoreFailure::limit_exceeded)?;
         let memory = encoded_bytes
+            .checked_add(decoded_memory)
+            .ok_or_else(TraceStoreFailure::limit_exceeded)?
             .checked_add(output_memory)
             .ok_or_else(TraceStoreFailure::limit_exceeded)?
             .max(1);
@@ -324,7 +344,7 @@ impl super::TraceStore {
             .map_err(|_| TraceStoreFailure::limit_exceeded())?;
         let claim = WorkClaim::tenant(tenant, WorkKind::InteractiveQueryTail, amounts)
             .map_err(|_| TraceStoreFailure::limit_exceeded())?;
-        let capacity = governor
+        let mut capacity = governor
             .reserve(claim)
             .map_err(|_| TraceStoreFailure::resource_admission_refused())?;
         check_cancel(cancellation)?;
@@ -386,7 +406,14 @@ impl super::TraceStore {
             }
         }
         check_cancel(cancellation)?;
-        let retained_size_bytes = retained_size(&observations)?;
+        let retained_size_bytes = retained_size(observations.capacity(), &observations)?;
+        let granted_retained_size = retained_size_bytes.max(1);
+        let retained_amounts =
+            ResourceAmounts::only(ResourceDimension::MemoryBytes, granted_retained_size)
+                .map_err(|_| TraceStoreFailure::limit_exceeded())?;
+        capacity
+            .try_resize(retained_amounts)
+            .map_err(|_| TraceStoreFailure::resource_admission_refused())?;
         let decoded_observations =
             u64::try_from(observations.len()).map_err(|_| TraceStoreFailure::limit_exceeded())?;
         Ok(TraceScanResult::new(
@@ -440,33 +467,73 @@ fn check_cancel(cancellation: &dyn ScanCancellation) -> Result<(), TraceStoreFai
     }
 }
 
-fn retained_size(observations: &[ScannedSpanObservation]) -> Result<u64, TraceStoreFailure> {
-    let slots = u64::try_from(observations.len())
+fn retained_size(
+    output_capacity: usize,
+    observations: &[ScannedSpanObservation],
+) -> Result<u64, TraceStoreFailure> {
+    let slots = u64::try_from(output_capacity)
         .map_err(|_| TraceStoreFailure::limit_exceeded())?
         .checked_mul(SPAN_RESULT_SLOT_BYTES)
         .ok_or_else(TraceStoreFailure::limit_exceeded)?;
     observations.iter().try_fold(slots, |total, observation| {
-        let dynamic =
-            observation
-                .observation()
-                .attributes()
-                .iter()
-                .try_fold(0_u64, |bytes, attribute| {
-                    (0..attribute.len()).try_fold(bytes, |bytes, index| {
-                        let value = attribute
-                            .occurrence(index)
-                            .ok_or_else(TraceStoreFailure::invalid_input)?;
-                        let retained = u64::try_from(
-                            value
-                                .retained_heap_bytes()
-                                .map_err(TraceStoreFailure::domain)?,
-                        )
-                        .map_err(|_| TraceStoreFailure::limit_exceeded())?;
-                        bytes
-                            .checked_add(retained)
-                            .ok_or_else(TraceStoreFailure::limit_exceeded)
-                    })
-                })?;
+        let native = observation.observation();
+        let mut dynamic =
+            u64::try_from(native.name().len()).map_err(|_| TraceStoreFailure::limit_exceeded())?;
+        dynamic = dynamic
+            .checked_add(
+                u64::try_from(native.attributes().len())
+                    .map_err(|_| TraceStoreFailure::limit_exceeded())?
+                    .checked_mul(64)
+                    .ok_or_else(TraceStoreFailure::limit_exceeded)?,
+            )
+            .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+        for attribute in native.attributes() {
+            dynamic = dynamic
+                .checked_add(
+                    u64::try_from(attribute.key().len())
+                        .map_err(|_| TraceStoreFailure::limit_exceeded())?,
+                )
+                .ok_or_else(TraceStoreFailure::limit_exceeded)?
+                .checked_add(
+                    u64::try_from(attribute.len())
+                        .map_err(|_| TraceStoreFailure::limit_exceeded())?
+                        .checked_mul(64)
+                        .ok_or_else(TraceStoreFailure::limit_exceeded)?,
+                )
+                .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+            for index in 0..attribute.len() {
+                let value = attribute
+                    .occurrence(index)
+                    .ok_or_else(TraceStoreFailure::invalid_input)?;
+                let retained = u64::try_from(
+                    value
+                        .retained_heap_bytes()
+                        .map_err(TraceStoreFailure::domain)?,
+                )
+                .map_err(|_| TraceStoreFailure::limit_exceeded())?;
+                dynamic = dynamic
+                    .checked_add(retained)
+                    .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+            }
+        }
+        dynamic = dynamic
+            .checked_add(
+                u64::try_from(native.policy_provenance().applied_rules().len())
+                    .map_err(|_| TraceStoreFailure::limit_exceeded())?
+                    .checked_mul(
+                        u64::try_from(std::mem::size_of::<String>())
+                            .map_err(|_| TraceStoreFailure::limit_exceeded())?,
+                    )
+                    .ok_or_else(TraceStoreFailure::limit_exceeded)?,
+            )
+            .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+        for rule in native.policy_provenance().applied_rules() {
+            dynamic = dynamic
+                .checked_add(
+                    u64::try_from(rule.len()).map_err(|_| TraceStoreFailure::limit_exceeded())?,
+                )
+                .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+        }
         total
             .checked_add(dynamic)
             .ok_or_else(TraceStoreFailure::limit_exceeded)
