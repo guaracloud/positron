@@ -1,10 +1,10 @@
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
-use positron_domain::value::ValueLimitProfile;
+use positron_domain::value::{ValueLimitProfile, ValueLimitProfileCandidate};
 use prost::Message;
 
 use super::{
-    NativeSpanBatch, TraceReceiveFailure, bounds, decoded, fanout, increment_rejection, request,
-    transport,
+    NativeSpanBatch, TraceReceiveFailure, bounds, decoded, fanout, increment_rejection,
+    map_store_failure, request, transport,
 };
 
 /// OTLP Trace Receiver Adapter for protobuf and ProtoJSON payloads.
@@ -52,16 +52,35 @@ impl OtlpTracesReceiver {
             mut capacity,
             receiver,
         } = request;
+        let system_profile =
+            ValueLimitProfileCandidate::new(self.value_limit_profile.system_limits(), None)
+                .validate()
+                .map_err(|_| TraceReceiveFailure::ValueLimitExceeded)?;
         let decoded = match payload {
-            request::OtlpPayload::Decoded(decoded) => *decoded,
-            encoded => match transport::bounded_payload(encoded, self.value_limit_profile)? {
+            request::OtlpPayload::Decoded(decoded) => {
+                let system_decompressed = usize::try_from(
+                    system_profile
+                        .system_limits()
+                        .request()
+                        .decompressed_bytes()
+                        .value(),
+                )
+                .map_err(|_| TraceReceiveFailure::TransportLimitExceeded)?;
+                if decoded.encoded_len() > system_decompressed {
+                    return Err(TraceReceiveFailure::TransportLimitExceeded);
+                }
+                let encoded = decoded.encode_to_vec();
+                bounds::validate_protobuf(&encoded, system_profile)?;
+                *decoded
+            },
+            encoded => match transport::bounded_payload(encoded, system_profile)? {
                 transport::BoundedOtlpPayload::Protobuf(protobuf) => {
-                    bounds::validate_protobuf(&protobuf, self.value_limit_profile)?;
+                    bounds::validate_protobuf(&protobuf, system_profile)?;
                     ExportTraceServiceRequest::decode(protobuf.as_slice())
                         .map_err(|_| TraceReceiveFailure::MalformedPayload)?
                 },
                 transport::BoundedOtlpPayload::Json(json) => {
-                    bounds::validate_json(&json, self.value_limit_profile)?;
+                    bounds::validate_json(&json, system_profile)?;
                     serde_json::from_slice(&json)
                         .map_err(|_| TraceReceiveFailure::MalformedPayload)?
                 },
@@ -69,11 +88,11 @@ impl OtlpTracesReceiver {
         };
         fanout::reserve_before_materialization(
             &decoded.resource_spans,
-            self.value_limit_profile,
+            system_profile,
             policy,
             capacity.as_mut(),
         )?;
-        let (drafts, mut rejections) = decoded::native_records(decoded, &self.value_limit_profile)?;
+        let (drafts, mut rejections) = decoded::native_records(decoded, &system_profile)?;
         let mut records = Vec::new();
         records
             .try_reserve_exact(drafts.len())
@@ -86,12 +105,59 @@ impl OtlpTracesReceiver {
                 .value(),
         )
         .map_err(|_| TraceReceiveFailure::ValueLimitExceeded)?;
+        let maximum_records = usize::try_from(
+            self.value_limit_profile
+                .effective_limits()
+                .request()
+                .records()
+                .value(),
+        )
+        .map_err(|_| TraceReceiveFailure::ValueLimitExceeded)?;
+        let maximum_decompressed = u64::from(
+            self.value_limit_profile
+                .effective_limits()
+                .request()
+                .decompressed_bytes()
+                .value(),
+        );
         let mut aggregate_attributes = 0_usize;
         let mut decoded_bytes = 0_u64;
         for draft in drafts {
-            let estimated_bytes = draft.estimated_bytes();
             match draft.evaluate(policy, receiver, &self.value_limit_profile) {
                 Ok(Some(record)) => {
+                    if records.len() >= maximum_records {
+                        increment_rejection(
+                            &mut rejections,
+                            crate::IngestFailureCode::ValueLimitExceeded,
+                        );
+                        continue;
+                    }
+                    let record_decoded_bytes = match record.decoded_size_bytes() {
+                        Ok(bytes) => u64::try_from(bytes)
+                            .map_err(|_| TraceReceiveFailure::ValueLimitExceeded)?,
+                        Err(failure) => match map_store_failure(failure) {
+                            TraceReceiveFailure::CapacityUnavailable => {
+                                return Err(TraceReceiveFailure::CapacityUnavailable);
+                            },
+                            TraceReceiveFailure::PolicyEvaluationFailed => {
+                                return Err(TraceReceiveFailure::PolicyEvaluationFailed);
+                            },
+                            TraceReceiveFailure::ValueLimitExceeded => {
+                                increment_rejection(
+                                    &mut rejections,
+                                    crate::IngestFailureCode::ValueLimitExceeded,
+                                );
+                                continue;
+                            },
+                            _ => {
+                                increment_rejection(
+                                    &mut rejections,
+                                    crate::IngestFailureCode::InvalidRecord,
+                                );
+                                continue;
+                            },
+                        },
+                    };
                     let record_attributes = record
                         .attributes()
                         .iter()
@@ -102,11 +168,19 @@ impl OtlpTracesReceiver {
                         .and_then(|count| aggregate_attributes.checked_add(count))
                         .filter(|count| *count <= maximum_attributes)
                     {
-                        aggregate_attributes = total;
-                        decoded_bytes = decoded_bytes
-                            .checked_add(estimated_bytes)
-                            .ok_or(TraceReceiveFailure::ValueLimitExceeded)?;
-                        records.push(record);
+                        if let Some(total_decoded) = decoded_bytes
+                            .checked_add(record_decoded_bytes)
+                            .filter(|bytes| *bytes <= maximum_decompressed)
+                        {
+                            aggregate_attributes = total;
+                            decoded_bytes = total_decoded;
+                            records.push(record);
+                        } else {
+                            increment_rejection(
+                                &mut rejections,
+                                crate::IngestFailureCode::ValueLimitExceeded,
+                            );
+                        }
                     } else {
                         increment_rejection(
                             &mut rejections,

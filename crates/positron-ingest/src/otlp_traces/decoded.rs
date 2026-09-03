@@ -26,7 +26,6 @@ pub(super) struct NativeSpanDraft {
     flags: u32,
     details: NativeSpanDetailDraft,
     has_entity_refs: bool,
-    estimated_bytes: u64,
 }
 
 #[derive(Debug)]

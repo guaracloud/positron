@@ -4,6 +4,7 @@ use opentelemetry_proto::tonic::common::v1::{AnyValue, EntityRef, KeyValue, any_
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use opentelemetry_proto::tonic::trace::v1::span::Link;
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span, Status};
+use positron_domain::time::SourceTimeQuality;
 use prost::Message;
 
 fn attribution() -> positron_domain::identity::TenantAttribution {
@@ -133,9 +134,11 @@ fn invalid_kind_status_timestamps_and_identifiers_have_stable_failures() {
 
     let mut reversed = valid_span();
     reversed.start_time_unix_nano = 21;
+    let reversed = decode(reversed).expect("contradictory source time is retained");
+    assert_eq!(reversed.records().len(), 1);
     assert_eq!(
-        decode(reversed).expect("time order rejection").rejections(),
-        [0, 1, 0]
+        reversed.records()[0].end_time().quality(),
+        SourceTimeQuality::Contradictory
     );
 
     let mut invalid_link = valid_span();

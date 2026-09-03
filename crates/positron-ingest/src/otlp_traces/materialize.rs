@@ -31,7 +31,6 @@ impl NativeSpanDraft {
             flags,
             details,
             has_entity_refs,
-            estimated_bytes: _,
         } = self;
         let candidate = positron_policy::NativeTraceCandidate::new(attributes);
         let evaluation = policy
@@ -52,13 +51,21 @@ impl NativeSpanDraft {
         };
         let start_time = event_time(start_time_unix_nano)?;
         let end_time = event_time(end_time_unix_nano)?;
-        if end_time
+        let end_time = if end_time
             .instant()
             .zip(start_time.instant())
             .is_some_and(|(end, start)| end.value() < start.value())
         {
-            return Err(TraceReceiveFailure::MalformedPayload);
-        }
+            EventTime::received(
+                end_time
+                    .instant()
+                    .ok_or(TraceReceiveFailure::TimestampOutOfRange)?,
+                SourceTimeQuality::Contradictory,
+            )
+            .map_err(|_| TraceReceiveFailure::TimestampOutOfRange)?
+        } else {
+            end_time
+        };
         let kind = super::drafts::native_kind(kind)?;
         let sampling = super::drafts::sampling_decision(flags);
         let details = materialize_details(&details, profile)?;
@@ -77,10 +84,6 @@ impl NativeSpanDraft {
         )
         .map(Some)
         .map_err(super::super::map_store_failure)
-    }
-
-    pub(crate) const fn estimated_bytes(&self) -> u64 {
-        self.estimated_bytes
     }
 }
 

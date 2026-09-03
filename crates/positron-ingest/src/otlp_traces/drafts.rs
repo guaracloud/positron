@@ -5,7 +5,6 @@ use opentelemetry_proto::tonic::common::v1::KeyValue;
 use opentelemetry_proto::tonic::trace::v1::Span as OtlpSpan;
 use positron_domain::value::{AttributeNamespace, CandidateAttributeValue, ValueLimitProfile};
 use positron_policy::NativePolicyAttribute;
-use prost::Message;
 
 use super::super::TraceReceiveFailure;
 use super::{NativeSpanDetailDraft, NativeSpanDraft, SpanDetailMetadata};
@@ -95,28 +94,6 @@ fn native_draft(
     profile: &ValueLimitProfile,
 ) -> Result<NativeSpanDraft, TraceReceiveFailure> {
     validate_raw_span(&span, &metadata, profile)?;
-    let mut estimated_bytes = u64::try_from(span.encoded_len())
-        .map_err(|_| TraceReceiveFailure::ValueLimitExceeded)?
-        .checked_add(512)
-        .ok_or(TraceReceiveFailure::ValueLimitExceeded)?;
-    for values in [resource, scope] {
-        estimated_bytes = estimated_bytes
-            .checked_add(key_values_encoded_bytes(values)?)
-            .ok_or(TraceReceiveFailure::ValueLimitExceeded)?;
-    }
-    estimated_bytes = estimated_bytes
-        .checked_add(
-            u64::try_from(
-                metadata
-                    .resource_schema_url
-                    .len()
-                    .saturating_add(metadata.scope_name.len())
-                    .saturating_add(metadata.scope_version.len())
-                    .saturating_add(metadata.scope_schema_url.len()),
-            )
-            .map_err(|_| TraceReceiveFailure::ValueLimitExceeded)?,
-        )
-        .ok_or(TraceReceiveFailure::ValueLimitExceeded)?;
     let attributes = grouped_attributes(resource, scope, &span.attributes, profile)?;
     let details = NativeSpanDetailDraft {
         trace_state: span.trace_state,
@@ -141,7 +118,6 @@ fn native_draft(
         flags: span.flags,
         details,
         has_entity_refs: metadata.has_entity_refs,
-        estimated_bytes,
     })
 }
 
@@ -213,17 +189,6 @@ fn check_text(value: &str, profile: &ValueLimitProfile) -> Result<(), TraceRecei
         return Err(TraceReceiveFailure::ValueLimitExceeded);
     }
     Ok(())
-}
-
-fn key_values_encoded_bytes(values: &[KeyValue]) -> Result<u64, TraceReceiveFailure> {
-    values.iter().try_fold(0_u64, |total, value| {
-        total
-            .checked_add(
-                u64::try_from(value.encoded_len())
-                    .map_err(|_| TraceReceiveFailure::ValueLimitExceeded)?,
-            )
-            .ok_or(TraceReceiveFailure::ValueLimitExceeded)
-    })
 }
 
 fn rejection_code(failure: TraceReceiveFailure) -> crate::IngestFailureCode {

@@ -10,6 +10,7 @@ use super::{
 mod schema_maintenance;
 mod schema_replay_integrity;
 mod schema_routes;
+mod trace_visibility;
 
 #[test]
 fn service_diagnostics_are_stable_and_secret_free() {

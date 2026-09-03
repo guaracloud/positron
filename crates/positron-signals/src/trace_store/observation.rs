@@ -232,13 +232,6 @@ impl SpanObservation {
         {
             return Err(TraceStoreFailure::invalid_input());
         }
-        if start_time
-            .instant()
-            .zip(end_time.instant())
-            .is_some_and(|(start, end)| end < start)
-        {
-            return Err(TraceStoreFailure::invalid_input());
-        }
         let attribute_set_limit = usize::try_from(dynamic.attributes_per_namespace().value())
             .map_err(|_| TraceStoreFailure::limit_exceeded())?
             .checked_mul(3)
@@ -378,6 +371,34 @@ impl SpanObservation {
             .checked_add(self.details.retained_heap_bytes()?)
             .ok_or_else(TraceStoreFailure::limit_exceeded)?;
         Ok(retained)
+    }
+
+    /// Returns the decoded logical bytes retained by this observation's
+    /// profile-visible fields. This is used for request-level effective-limit
+    /// accounting after policy transformations have been applied.
+    pub fn decoded_size_bytes(&self) -> Result<usize, TraceStoreFailure> {
+        let mut decoded = self.name.len();
+        for attribute in &self.attributes {
+            decoded = decoded
+                .checked_add(attribute.key().len())
+                .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+            for index in 0..attribute.len() {
+                let value = attribute
+                    .occurrence(index)
+                    .ok_or_else(TraceStoreFailure::invalid_input)?;
+                decoded = decoded
+                    .checked_add(
+                        value
+                            .decoded_size_bytes()
+                            .map_err(TraceStoreFailure::domain)?,
+                    )
+                    .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+            }
+        }
+        decoded = decoded
+            .checked_add(self.details.decoded_size_bytes(usize::MAX)?)
+            .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+        Ok(decoded)
     }
 }
 

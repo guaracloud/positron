@@ -10,6 +10,7 @@ const MAX_GROUP_DEPTH: usize = 64;
 const REQUEST_FIELDS: &[(u64, u8)] = &[(1, 2)];
 const RESOURCE_SPANS_FIELDS: &[(u64, u8)] = &[(1, 2), (2, 2), (3, 2)];
 const RESOURCE_FIELDS: &[(u64, u8)] = &[(1, 2), (2, 0), (3, 2)];
+const ENTITY_REF_FIELDS: &[(u64, u8)] = &[(1, 2), (2, 2), (3, 2), (4, 2)];
 const SCOPE_SPANS_FIELDS: &[(u64, u8)] = &[(1, 2), (2, 2), (3, 2)];
 const SCOPE_FIELDS: &[(u64, u8)] = &[(1, 2), (2, 2), (3, 2), (4, 0)];
 const KEY_VALUE_FIELDS: &[(u64, u8)] = &[(1, 2), (2, 2), (3, 0)];
@@ -145,6 +146,8 @@ impl Default for Counters {
             events: 0,
             links: 0,
             attributes: 0,
+            entity_refs: 0,
+            entity_ref_keys: 0,
             decoded_bytes: 0,
             limits: Limits {
                 containers: 1,
@@ -170,6 +173,8 @@ struct Counters {
     events: usize,
     links: usize,
     attributes: usize,
+    entity_refs: usize,
+    entity_ref_keys: usize,
     decoded_bytes: usize,
     limits: Limits,
 }
@@ -203,6 +208,21 @@ impl Counters {
             if field == 1 {
                 increment(&mut entries, self.limits.attribute_entries)?;
                 self.visit_attribute(value, 0)?;
+            } else if field == 3 {
+                increment(&mut self.entity_refs, self.limits.containers)?;
+                self.visit_entity_ref(value)?;
+            }
+            Ok(())
+        })
+    }
+
+    fn visit_entity_ref(&mut self, message: &[u8]) -> Result<(), TraceReceiveFailure> {
+        visit_fields(message, ENTITY_REF_FIELDS, |field, value| {
+            if field == 1 || field == 2 {
+                self.visit_string(value)?;
+            } else if field == 3 || field == 4 {
+                increment(&mut self.entity_ref_keys, self.limits.containers)?;
+                self.visit_string(value)?;
             }
             Ok(())
         })
