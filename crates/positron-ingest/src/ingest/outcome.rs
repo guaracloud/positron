@@ -123,7 +123,7 @@ pub(super) fn increment_rejection(counts: &mut [usize; 3], code: IngestFailureCo
     }
 }
 
-pub(super) fn partial_admission(
+pub(crate) fn partial_admission(
     committed: CommittedAdmission,
     counts: [usize; 3],
 ) -> PartialAdmission {

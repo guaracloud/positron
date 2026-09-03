@@ -129,6 +129,13 @@ fn trace_outcomes_keep_retry_permanent_and_ambiguous_classes() {
     assert_eq!(permanent.code(), Code::InvalidArgument);
     assert_eq!(permanent.message(), "OTLP Traces request was rejected");
 
+    let value_limit = trace_render(single(IngestOutcome::Permanent(
+        IngestFailureCode::ValueLimitExceeded,
+    )))
+    .expect_err("trace value limits must remain permanent");
+    assert_eq!(value_limit.code(), Code::InvalidArgument);
+    assert_eq!(value_limit.message(), "OTLP Traces request was rejected");
+
     let ambiguous = trace_render(single(IngestOutcome::Ambiguous(
         IngestFailureCode::StorageUnavailable,
     )))

@@ -21,12 +21,17 @@ mod bounds;
 mod decoded;
 #[cfg(test)]
 mod detail_boundaries;
+mod fanout;
+#[cfg(test)]
+mod fanout_boundaries;
 #[cfg(test)]
 mod grammar_boundaries;
 #[cfg(test)]
 mod json_boundaries;
 #[cfg(test)]
 mod mapping_matrix;
+#[cfg(test)]
+mod policy_boundaries;
 #[cfg(test)]
 mod protocol_matrix;
 mod request;
@@ -104,6 +109,7 @@ pub(crate) fn ingest_attribution(
 pub struct NativeSpanBatch<'authority> {
     attribution: TenantAttribution,
     records: Vec<SpanObservation>,
+    rejections: [usize; 3],
     value_limit_profile: ValueLimitProfile,
     decoded_bytes: u64,
     capacity: Option<ResourceReservation<'authority>>,
@@ -111,6 +117,7 @@ pub struct NativeSpanBatch<'authority> {
 }
 
 impl<'authority> NativeSpanBatch<'authority> {
+    #[cfg(test)]
     pub(crate) fn new(
         attribution: TenantAttribution,
         records: Vec<SpanObservation>,
@@ -119,9 +126,30 @@ impl<'authority> NativeSpanBatch<'authority> {
         capacity: Option<ResourceReservation<'authority>>,
         receiver: crate::PolicyReceiver,
     ) -> Result<Self, TraceReceiveFailure> {
+        Self::new_with_rejections(
+            attribution,
+            records,
+            value_limit_profile,
+            decoded_bytes,
+            capacity,
+            receiver,
+            [0; 3],
+        )
+    }
+
+    pub(crate) fn new_with_rejections(
+        attribution: TenantAttribution,
+        records: Vec<SpanObservation>,
+        value_limit_profile: ValueLimitProfile,
+        decoded_bytes: u64,
+        capacity: Option<ResourceReservation<'authority>>,
+        receiver: crate::PolicyReceiver,
+        rejections: [usize; 3],
+    ) -> Result<Self, TraceReceiveFailure> {
         let mut batch = Self {
             attribution,
             records,
+            rejections,
             value_limit_profile,
             decoded_bytes,
             capacity,
@@ -139,6 +167,11 @@ impl<'authority> NativeSpanBatch<'authority> {
     #[must_use]
     pub fn records(&self) -> &[SpanObservation] {
         &self.records
+    }
+
+    #[must_use]
+    pub(crate) const fn rejections(&self) -> [usize; 3] {
+        self.rejections
     }
 
     #[must_use]
@@ -176,6 +209,7 @@ impl<'authority> NativeSpanBatch<'authority> {
         let Self {
             attribution,
             records,
+            rejections,
             value_limit_profile,
             decoded_bytes,
             capacity,
@@ -200,6 +234,7 @@ impl<'authority> NativeSpanBatch<'authority> {
         Ok(Self {
             attribution,
             records: rebound,
+            rejections,
             value_limit_profile,
             decoded_bytes,
             capacity,
@@ -254,10 +289,20 @@ impl OtlpTracesReceiver {
         &self,
         request: AuthenticatedOtlpTracesRequest<'authority>,
     ) -> Result<NativeSpanBatch<'authority>, TraceReceiveFailure> {
+        let policy = positron_policy::IngestPolicy::preserving(1)
+            .map_err(|_| TraceReceiveFailure::MalformedPayload)?;
+        self.decode_with_policy(request, &policy)
+    }
+
+    pub fn decode_with_policy<'authority>(
+        &self,
+        request: AuthenticatedOtlpTracesRequest<'authority>,
+        policy: &positron_policy::IngestPolicy,
+    ) -> Result<NativeSpanBatch<'authority>, TraceReceiveFailure> {
         let AuthenticatedOtlpTracesRequest {
             attribution,
             payload,
-            capacity,
+            mut capacity,
             receiver,
         } = request;
         let decoded = match payload {
@@ -275,14 +320,75 @@ impl OtlpTracesReceiver {
                 },
             },
         };
-        let (records, decoded_bytes) = decoded::native_records(decoded, self.value_limit_profile)?;
-        NativeSpanBatch::new(
+        fanout::reserve_before_materialization(
+            &decoded.resource_spans,
+            self.value_limit_profile,
+            capacity.as_mut(),
+        )?;
+        let (drafts, mut rejections) = decoded::native_records(decoded, self.value_limit_profile)?;
+        let mut records = Vec::new();
+        records
+            .try_reserve_exact(drafts.len())
+            .map_err(|_| TraceReceiveFailure::ValueLimitExceeded)?;
+        let maximum_attributes = usize::try_from(
+            self.value_limit_profile
+                .effective_limits()
+                .request()
+                .aggregate_attributes()
+                .value(),
+        )
+        .map_err(|_| TraceReceiveFailure::ValueLimitExceeded)?;
+        let mut aggregate_attributes = 0_usize;
+        let mut decoded_bytes = 0_u64;
+        for draft in drafts {
+            let estimated_bytes = draft.estimated_bytes();
+            match draft.evaluate(policy, receiver, self.value_limit_profile) {
+                Ok(Some(record)) => {
+                    let record_attributes = record
+                        .attributes()
+                        .iter()
+                        .try_fold(0_usize, |total, attribute| {
+                            total.checked_add(attribute.len())
+                        });
+                    if let Some(total) = record_attributes
+                        .and_then(|count| aggregate_attributes.checked_add(count))
+                        .filter(|count| *count <= maximum_attributes)
+                    {
+                        aggregate_attributes = total;
+                        decoded_bytes = decoded_bytes
+                            .checked_add(estimated_bytes)
+                            .ok_or(TraceReceiveFailure::ValueLimitExceeded)?;
+                        records.push(record);
+                    } else {
+                        increment_rejection(
+                            &mut rejections,
+                            crate::IngestFailureCode::ValueLimitExceeded,
+                        );
+                    }
+                },
+                Ok(None) => {
+                    increment_rejection(&mut rejections, crate::IngestFailureCode::PolicyRejected)
+                },
+                Err(TraceReceiveFailure::CapacityUnavailable) => {
+                    return Err(TraceReceiveFailure::CapacityUnavailable);
+                },
+                Err(TraceReceiveFailure::ValueLimitExceeded) => increment_rejection(
+                    &mut rejections,
+                    crate::IngestFailureCode::ValueLimitExceeded,
+                ),
+                Err(_) => {
+                    increment_rejection(&mut rejections, crate::IngestFailureCode::InvalidRecord)
+                },
+            }
+        }
+        NativeSpanBatch::new_with_rejections(
             attribution,
             records,
             self.value_limit_profile,
             decoded_bytes,
             capacity,
             receiver,
+            rejections,
         )
     }
 }
@@ -365,9 +471,30 @@ pub(crate) fn checked_timestamp(value: u64) -> Result<i64, TraceReceiveFailure> 
     i64::try_from(value).map_err(|_| TraceReceiveFailure::TimestampOutOfRange)
 }
 
-pub(crate) fn default_policy() -> Result<positron_policy::PolicyProvenance, TraceReceiveFailure> {
-    positron_policy::PolicyProvenance::new(1, [1; 32], Vec::new())
-        .map_err(|_| TraceReceiveFailure::MalformedPayload)
+pub(crate) fn map_store_failure(
+    failure: positron_signals::TraceStoreFailure,
+) -> TraceReceiveFailure {
+    match failure.code() {
+        positron_signals::TraceStoreFailureCode::LimitExceeded => {
+            TraceReceiveFailure::ValueLimitExceeded
+        },
+        positron_signals::TraceStoreFailureCode::ResourceExhausted => {
+            TraceReceiveFailure::CapacityUnavailable
+        },
+        _ => TraceReceiveFailure::MalformedPayload,
+    }
+}
+
+pub(crate) fn increment_rejection(counts: &mut [usize; 3], code: crate::IngestFailureCode) {
+    let index = match code {
+        crate::IngestFailureCode::PolicyRejected => 0,
+        crate::IngestFailureCode::InvalidRecord => 1,
+        crate::IngestFailureCode::ValueLimitExceeded => 2,
+        _ => return,
+    };
+    if let Some(count) = counts.get_mut(index) {
+        *count = count.saturating_add(1);
+    }
 }
 
 #[cfg(test)]
@@ -511,13 +638,13 @@ mod tests {
                     schema_url: String::new(),
                 }],
             };
-            let failure = OtlpTracesReceiver::new()
+            let batch = OtlpTracesReceiver::new()
                 .decode(AuthenticatedOtlpTracesRequest::test_only_protobuf(
                     attribution(),
                     request.encode_to_vec(),
                 ))
-                .expect_err("invalid span identifier");
-            assert_eq!(failure, TraceReceiveFailure::MalformedPayload);
+                .expect("invalid identifier is a per-span rejection");
+            assert_eq!(batch.rejections(), [0, 1, 0]);
         }
     }
 
@@ -562,36 +689,5 @@ mod tests {
             ))
             .expect_err("JSON record bound must fail before allocation");
         assert_eq!(failure, TraceReceiveFailure::ValueLimitExceeded);
-    }
-
-    #[test]
-    fn native_batch_rebinds_each_span_to_the_active_policy_provenance() {
-        let request = ExportTraceServiceRequest {
-            resource_spans: vec![ResourceSpans {
-                scope_spans: vec![ScopeSpans {
-                    spans: vec![Span {
-                        trace_id: vec![0x11; 16],
-                        span_id: vec![0x22; 8],
-                        name: "checkout".to_owned(),
-                        ..Span::default()
-                    }],
-                    ..ScopeSpans::default()
-                }],
-                ..ResourceSpans::default()
-            }],
-        };
-        let batch = OtlpTracesReceiver::new()
-            .decode(AuthenticatedOtlpTracesRequest::test_only_protobuf(
-                attribution(),
-                request.encode_to_vec(),
-            ))
-            .expect("trace payload should decode");
-        let policy = positron_policy::IngestPolicy::preserving(7)
-            .expect("preserving policy")
-            .provenance();
-        let batch = batch
-            .with_policy_provenance(policy.clone())
-            .expect("policy provenance should bind");
-        assert_eq!(batch.records()[0].policy_provenance(), &policy);
     }
 }

@@ -53,10 +53,9 @@ fn detail_attributes_reject_indexed_event_and_link_values() {
         }],
         ..Event::default()
     });
-    assert!(matches!(
-        decode(event),
-        Err(TraceReceiveFailure::UnsupportedValue)
-    ));
+    let result = decode(event).expect("invalid event is a per-span rejection");
+    assert_eq!(result.records().len(), 0);
+    assert_eq!(result.rejections(), [0, 1, 0]);
 
     let mut link = valid_span();
     link.links.push(Link {
@@ -71,18 +70,16 @@ fn detail_attributes_reject_indexed_event_and_link_values() {
         }],
         ..Link::default()
     });
-    assert!(matches!(
-        decode(link),
-        Err(TraceReceiveFailure::UnsupportedValue)
-    ));
+    let result = decode(link).expect("invalid link is a per-span rejection");
+    assert_eq!(result.records().len(), 0);
+    assert_eq!(result.rejections(), [0, 1, 0]);
 }
 
 #[test]
 fn empty_event_names_are_malformed_instead_of_dropped() {
     let mut span = valid_span();
     span.events.push(Event::default());
-    assert!(matches!(
-        decode(span),
-        Err(TraceReceiveFailure::MalformedPayload)
-    ));
+    let result = decode(span).expect("invalid event is a per-span rejection");
+    assert_eq!(result.records().len(), 0);
+    assert_eq!(result.rejections(), [0, 1, 0]);
 }

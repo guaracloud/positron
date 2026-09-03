@@ -123,14 +123,21 @@ async fn live_trace_receiver_accepts_authenticated_protobuf_and_gzip_clients()
             key_strindex: 1,
             ..KeyValue::default()
         });
-    let failure = tokio::time::timeout(
+    let response = tokio::time::timeout(
         std::time::Duration::from_secs(2),
         client.export(harness.authorize_trace(unsupported)?),
     )
     .await?
-    .expect_err("unsupported development field must be rejected");
-    assert_eq!(failure.code(), Code::InvalidArgument);
-    assert_eq!(failure.message(), "OTLP Traces request was rejected");
+    .expect("unsupported development field is a per-span rejection");
+    let partial = response
+        .into_inner()
+        .partial_success
+        .expect("per-span rejection is reported as partial success");
+    assert_eq!(partial.rejected_spans, 1);
+    assert_eq!(
+        partial.error_message,
+        "some spans were permanently rejected"
+    );
 
     let mut gzip_client = client.send_compressed(tonic::codec::CompressionEncoding::Gzip);
     let response = tokio::time::timeout(

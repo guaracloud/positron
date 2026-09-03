@@ -116,7 +116,7 @@ pub(crate) struct DecodedBlock {
     pub(crate) observations: Vec<StoredSpanObservation>,
 }
 
-#[cfg(any(test, fuzzing))]
+#[cfg(test)]
 pub(crate) fn decode_observation(
     input: &mut Input<'_>,
 ) -> Result<(SpanObservation, UnixNanoseconds), TraceStoreFailure> {

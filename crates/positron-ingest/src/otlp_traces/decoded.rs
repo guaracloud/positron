@@ -6,21 +6,90 @@ use opentelemetry_proto::tonic::trace::v1::Span as OtlpSpan;
 use opentelemetry_proto::tonic::trace::v1::span::SpanKind as OtlpSpanKind;
 use positron_domain::time::{EventTime, SourceTimeQuality, UnixNanoseconds};
 use positron_domain::value::{
-    AttributeNamespace, AttributeOccurrenceSetCandidate, CandidateAttributeValue,
-    CandidateKeyValue, ValueLimitProfile,
+    AttributeNamespace, CandidateAttributeValue, CandidateKeyValue, ValueLimitProfile,
 };
+use positron_policy::{NativePolicyAttribute, NativeTraceCandidate, TracePolicyEvaluation};
 use positron_signals::{
     SamplingDecision, SpanAttributeSet, SpanEvent, SpanKind, SpanLink, SpanObservation,
     SpanObservationDetails, SpanResourceMetadata, SpanScopeMetadata, SpanStatus, SpanStatusCode,
 };
 use prost::Message;
 
-use super::{TraceReceiveFailure, checked_identifier, checked_timestamp, default_policy};
+use super::{TraceReceiveFailure, checked_identifier, checked_timestamp};
+
+/// A bounded native span draft that has not crossed policy or Signal Store
+/// semantic validation. OTLP-specific details are already converted to the
+/// immutable native detail types; policy sees only generic attributes.
+#[derive(Debug)]
+pub(super) struct NativeSpanDraft {
+    trace_id: [u8; 16],
+    span_id: [u8; 8],
+    parent_span_id: Option<[u8; 8]>,
+    name: String,
+    start_time: EventTime,
+    end_time: EventTime,
+    attributes: Vec<NativePolicyAttribute>,
+    kind: SpanKind,
+    sampling: SamplingDecision,
+    details: SpanObservationDetails,
+    estimated_bytes: u64,
+}
+
+impl NativeSpanDraft {
+    pub(super) fn evaluate(
+        self,
+        policy: &positron_policy::IngestPolicy,
+        receiver: crate::PolicyReceiver,
+        profile: ValueLimitProfile,
+    ) -> Result<Option<SpanObservation>, TraceReceiveFailure> {
+        let Self {
+            trace_id,
+            span_id,
+            parent_span_id,
+            name,
+            start_time,
+            end_time,
+            attributes,
+            kind,
+            sampling,
+            details,
+            estimated_bytes: _,
+        } = self;
+        let candidate = NativeTraceCandidate::new(attributes);
+        let evaluation = policy
+            .evaluate_trace(candidate, receiver)
+            .map_err(|_| TraceReceiveFailure::ValueLimitExceeded)?;
+        let TracePolicyEvaluation::Accepted(evaluated) = evaluation else {
+            return Ok(None);
+        };
+        let (attributes, provenance) = evaluated.into_parts();
+        SpanObservation::checked_native_with_policy_attributes(
+            trace_id,
+            span_id,
+            parent_span_id,
+            name,
+            start_time,
+            end_time,
+            attributes,
+            kind,
+            sampling,
+            provenance,
+            details,
+            profile,
+        )
+        .map(Some)
+        .map_err(super::map_store_failure)
+    }
+
+    pub(super) const fn estimated_bytes(&self) -> u64 {
+        self.estimated_bytes
+    }
+}
 
 pub(super) fn native_records(
     decoded: ExportTraceServiceRequest,
     profile: ValueLimitProfile,
-) -> Result<(Vec<SpanObservation>, u64), TraceReceiveFailure> {
+) -> Result<(Vec<NativeSpanDraft>, [usize; 3]), TraceReceiveFailure> {
     let max_records = usize::try_from(profile.effective_limits().request().records().value())
         .map_err(|_| TraceReceiveFailure::ValueLimitExceeded)?;
     let record_count = decoded
@@ -38,15 +107,7 @@ pub(super) fn native_records(
     records
         .try_reserve_exact(record_count)
         .map_err(|_| TraceReceiveFailure::ValueLimitExceeded)?;
-    let mut decoded_bytes = 0_u64;
-    let max_decoded = usize::try_from(
-        profile
-            .system_limits()
-            .request()
-            .decompressed_bytes()
-            .value(),
-    )
-    .map_err(|_| TraceReceiveFailure::ValueLimitExceeded)?;
+    let mut rejections = [0_usize; 3];
     for resource_spans in decoded.resource_spans {
         let resource_schema_url = resource_spans.schema_url;
         let (resource, resource_dropped_attributes_count, entity_refs) =
@@ -60,9 +121,7 @@ pub(super) fn native_records(
                     )
                 },
             );
-        if !entity_refs.is_empty() {
-            return Err(TraceReceiveFailure::UnsupportedValue);
-        }
+        let has_entity_refs = !entity_refs.is_empty();
         for scope_spans in resource_spans.scope_spans {
             let scope_schema_url = scope_spans.schema_url;
             let (scope_name, scope_version, scope, scope_dropped_attributes_count) =
@@ -78,55 +137,17 @@ pub(super) fn native_records(
                     },
                 );
             for span in scope_spans.spans {
-                if records.len() >= max_records {
-                    return Err(TraceReceiveFailure::ValueLimitExceeded);
+                if has_entity_refs {
+                    super::increment_rejection(
+                        &mut rejections,
+                        crate::IngestFailureCode::InvalidRecord,
+                    );
+                    continue;
                 }
-                decoded_bytes = decoded_bytes
-                    .checked_add(
-                        u64::try_from(span.encoded_len())
-                            .map_err(|_| TraceReceiveFailure::ValueLimitExceeded)?,
-                    )
-                    .filter(|bytes| {
-                        usize::try_from(*bytes)
-                            .ok()
-                            .is_some_and(|value| value <= max_decoded)
-                    })
-                    .ok_or(TraceReceiveFailure::ValueLimitExceeded)?;
-                let attributes = grouped_attributes(&resource, &scope, &span.attributes, profile)?;
-                let trace_id = checked_identifier::<16>(&span.trace_id)?;
-                let span_id = checked_identifier::<8>(&span.span_id)?;
-                let parent_span_id = if span.parent_span_id.is_empty() {
-                    None
-                } else {
-                    Some(checked_identifier::<8>(&span.parent_span_id)?)
-                };
-                let start_time = event_time(span.start_time_unix_nano)?;
-                let end_time = event_time(span.end_time_unix_nano)?;
-                if end_time
-                    .instant()
-                    .zip(start_time.instant())
-                    .is_some_and(|(end, start)| end.value() < start.value())
-                {
-                    return Err(TraceReceiveFailure::MalformedPayload);
-                }
-                let kind = match OtlpSpanKind::try_from(span.kind) {
-                    Ok(OtlpSpanKind::Unspecified) => SpanKind::Unspecified,
-                    Ok(OtlpSpanKind::Internal) => SpanKind::Internal,
-                    Ok(OtlpSpanKind::Server) => SpanKind::Server,
-                    Ok(OtlpSpanKind::Client) => SpanKind::Client,
-                    Ok(OtlpSpanKind::Producer) => SpanKind::Producer,
-                    Ok(OtlpSpanKind::Consumer) => SpanKind::Consumer,
-                    Err(_) => return Err(TraceReceiveFailure::MalformedPayload),
-                };
-                let sampling = if span.flags == 0 {
-                    SamplingDecision::Unknown
-                } else if span.flags & 1 == 1 {
-                    SamplingDecision::Sampled
-                } else {
-                    SamplingDecision::NotSampled
-                };
-                let details = details(
-                    &span,
+                match native_draft(
+                    span,
+                    &resource,
+                    &scope,
                     SpanDetailMetadata {
                         resource_dropped_attributes_count,
                         resource_schema_url: &resource_schema_url,
@@ -136,31 +157,112 @@ pub(super) fn native_records(
                         scope_schema_url: &scope_schema_url,
                     },
                     profile,
-                )?;
-                let observation = SpanObservation::checked_native_with_details(
-                    trace_id,
-                    span_id,
-                    parent_span_id,
-                    span.name,
-                    start_time,
-                    end_time,
-                    attributes,
-                    kind,
-                    sampling,
-                    default_policy()?,
-                    details,
-                )
-                .map_err(|failure| match failure.code() {
-                    positron_signals::TraceStoreFailureCode::LimitExceeded => {
-                        TraceReceiveFailure::ValueLimitExceeded
+                ) {
+                    Ok(draft) => records.push(draft),
+                    Err(failure) => {
+                        super::increment_rejection(&mut rejections, rejection_code(failure))
                     },
-                    _ => TraceReceiveFailure::MalformedPayload,
-                })?;
-                records.push(observation);
+                }
             }
         }
     }
-    Ok((records, decoded_bytes))
+    Ok((records, rejections))
+}
+
+fn native_draft(
+    span: OtlpSpan,
+    resource: &[KeyValue],
+    scope: &[KeyValue],
+    metadata: SpanDetailMetadata<'_>,
+    profile: ValueLimitProfile,
+) -> Result<NativeSpanDraft, TraceReceiveFailure> {
+    let mut estimated_bytes = u64::try_from(span.encoded_len())
+        .map_err(|_| TraceReceiveFailure::ValueLimitExceeded)?
+        .checked_add(512)
+        .ok_or(TraceReceiveFailure::ValueLimitExceeded)?;
+    for values in [resource, scope] {
+        estimated_bytes = estimated_bytes
+            .checked_add(key_values_encoded_bytes(values)?)
+            .ok_or(TraceReceiveFailure::ValueLimitExceeded)?;
+    }
+    estimated_bytes = estimated_bytes
+        .checked_add(
+            u64::try_from(
+                metadata
+                    .resource_schema_url
+                    .len()
+                    .saturating_add(metadata.scope_name.len())
+                    .saturating_add(metadata.scope_version.len())
+                    .saturating_add(metadata.scope_schema_url.len()),
+            )
+            .map_err(|_| TraceReceiveFailure::ValueLimitExceeded)?,
+        )
+        .ok_or(TraceReceiveFailure::ValueLimitExceeded)?;
+    let attributes = grouped_attributes(resource, scope, &span.attributes)?;
+    let trace_id = checked_identifier::<16>(&span.trace_id)?;
+    let span_id = checked_identifier::<8>(&span.span_id)?;
+    let parent_span_id = if span.parent_span_id.is_empty() {
+        None
+    } else {
+        Some(checked_identifier::<8>(&span.parent_span_id)?)
+    };
+    let start_time = event_time(span.start_time_unix_nano)?;
+    let end_time = event_time(span.end_time_unix_nano)?;
+    if end_time
+        .instant()
+        .zip(start_time.instant())
+        .is_some_and(|(end, start)| end.value() < start.value())
+    {
+        return Err(TraceReceiveFailure::MalformedPayload);
+    }
+    let kind = match OtlpSpanKind::try_from(span.kind) {
+        Ok(OtlpSpanKind::Unspecified) => SpanKind::Unspecified,
+        Ok(OtlpSpanKind::Internal) => SpanKind::Internal,
+        Ok(OtlpSpanKind::Server) => SpanKind::Server,
+        Ok(OtlpSpanKind::Client) => SpanKind::Client,
+        Ok(OtlpSpanKind::Producer) => SpanKind::Producer,
+        Ok(OtlpSpanKind::Consumer) => SpanKind::Consumer,
+        Err(_) => return Err(TraceReceiveFailure::MalformedPayload),
+    };
+    let sampling = if span.flags == 0 {
+        SamplingDecision::Unknown
+    } else if span.flags & 1 == 1 {
+        SamplingDecision::Sampled
+    } else {
+        SamplingDecision::NotSampled
+    };
+    let details = details(&span, metadata, profile)?;
+    Ok(NativeSpanDraft {
+        trace_id,
+        span_id,
+        parent_span_id,
+        name: span.name,
+        start_time,
+        end_time,
+        attributes,
+        kind,
+        sampling,
+        details,
+        estimated_bytes,
+    })
+}
+
+fn key_values_encoded_bytes(values: &[KeyValue]) -> Result<u64, TraceReceiveFailure> {
+    values.iter().try_fold(0_u64, |total, value| {
+        total
+            .checked_add(
+                u64::try_from(value.encoded_len())
+                    .map_err(|_| TraceReceiveFailure::ValueLimitExceeded)?,
+            )
+            .ok_or(TraceReceiveFailure::ValueLimitExceeded)
+    })
+}
+
+fn rejection_code(failure: TraceReceiveFailure) -> crate::IngestFailureCode {
+    match failure {
+        TraceReceiveFailure::ValueLimitExceeded => crate::IngestFailureCode::ValueLimitExceeded,
+        _ => crate::IngestFailureCode::InvalidRecord,
+    }
 }
 
 fn event_time(value: u64) -> Result<EventTime, TraceReceiveFailure> {
@@ -178,8 +280,7 @@ fn grouped_attributes(
     resource: &[KeyValue],
     scope: &[KeyValue],
     record: &[KeyValue],
-    profile: ValueLimitProfile,
-) -> Result<Vec<positron_domain::value::AttributeOccurrenceSet>, TraceReceiveFailure> {
+) -> Result<Vec<NativePolicyAttribute>, TraceReceiveFailure> {
     let mut groups = BTreeMap::<(AttributeNamespace, String), Vec<CandidateAttributeValue>>::new();
     for (namespace, attributes) in [
         (AttributeNamespace::Resource, resource),
@@ -202,11 +303,7 @@ fn grouped_attributes(
     }
     groups
         .into_iter()
-        .map(|((namespace, key), values)| {
-            AttributeOccurrenceSetCandidate::new(namespace, key, values)
-                .validate(profile)
-                .map_err(|_| TraceReceiveFailure::ValueLimitExceeded)
-        })
+        .map(|((namespace, key), values)| Ok(NativePolicyAttribute::new(namespace, key, values)))
         .collect()
 }
 

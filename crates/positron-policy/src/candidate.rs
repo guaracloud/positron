@@ -4,13 +4,13 @@ use crate::{LogMetadata, PolicyProvenance};
 
 /// One producer-native dynamic attribute before policy and semantic limits.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct NativeLogAttribute {
+pub struct NativePolicyAttribute {
     namespace: AttributeNamespace,
     key: String,
     occurrences: Vec<CandidateAttributeValue>,
 }
 
-impl NativeLogAttribute {
+impl NativePolicyAttribute {
     #[must_use]
     pub const fn new(
         namespace: AttributeNamespace,
@@ -48,6 +48,9 @@ impl NativeLogAttribute {
         &mut self.occurrences
     }
 }
+
+/// Backwards-compatible name for the producer-neutral policy attribute.
+pub type NativeLogAttribute = NativePolicyAttribute;
 
 /// One structurally decoded producer-native Log awaiting policy.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -111,6 +114,40 @@ impl NativeLogCandidate {
     }
 }
 
+/// One structurally decoded producer-native Trace awaiting policy.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeTraceCandidate {
+    body: Option<CandidateAttributeValue>,
+    attributes: Vec<NativePolicyAttribute>,
+}
+
+impl NativeTraceCandidate {
+    #[must_use]
+    pub const fn new(attributes: Vec<NativePolicyAttribute>) -> Self {
+        Self {
+            body: None,
+            attributes,
+        }
+    }
+
+    #[must_use]
+    pub fn attributes(&self) -> &[NativePolicyAttribute] {
+        &self.attributes
+    }
+
+    pub(crate) fn body(&self) -> Option<&CandidateAttributeValue> {
+        self.body.as_ref()
+    }
+
+    pub(crate) fn body_mut(&mut self) -> &mut Option<CandidateAttributeValue> {
+        &mut self.body
+    }
+
+    pub(crate) fn attributes_mut(&mut self) -> &mut Vec<NativePolicyAttribute> {
+        &mut self.attributes
+    }
+}
+
 /// A producer-native record after the bounded policy transition.
 ///
 /// Its fields are private so callers cannot bypass policy evaluation before
@@ -164,5 +201,37 @@ impl EvaluatedLogRecord {
             metadata,
             self.provenance,
         )
+    }
+}
+
+/// A trace after the bounded policy transition and before Signal Store
+/// semantic validation. The provenance is the immutable policy snapshot that
+/// produced this record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvaluatedTraceRecord {
+    candidate: NativeTraceCandidate,
+    provenance: PolicyProvenance,
+}
+
+impl EvaluatedTraceRecord {
+    pub(crate) const fn new(candidate: NativeTraceCandidate, provenance: PolicyProvenance) -> Self {
+        Self {
+            candidate,
+            provenance,
+        }
+    }
+
+    #[must_use]
+    pub const fn policy_provenance(&self) -> &PolicyProvenance {
+        &self.provenance
+    }
+
+    #[must_use]
+    pub fn attributes(&self) -> &[NativePolicyAttribute] {
+        self.candidate.attributes()
+    }
+
+    pub fn into_parts(self) -> (Vec<NativePolicyAttribute>, PolicyProvenance) {
+        (self.candidate.attributes, self.provenance)
     }
 }

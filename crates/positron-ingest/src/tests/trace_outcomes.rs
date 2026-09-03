@@ -10,7 +10,7 @@ use positron_kernel::{
 use positron_signals::{ScanLimit, TraceScan, TraceStore};
 use prost::Message;
 
-use super::support::fixture;
+use super::support::{fixture, fixture_with_ordinary_memory_and_cpu};
 use crate::{
     AuthenticatedOtlpTracesRequest, IngestFailureCode, IngestOutcome, OtlpTracesReceiver,
     TraceIngest,
@@ -325,6 +325,87 @@ fn trace_ingest_cancellation_is_retryable_before_reservation_and_mutation()
     Ok(())
 }
 
+#[test]
+fn trace_ingest_commits_valid_spans_with_bounded_permanent_rejections()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = fixture()?;
+    let catalog = Catalog::open(
+        &fixture.authority,
+        InstanceId::new([0xe7; 16])?,
+        CatalogSecret::from_owned(Box::new([0xe8; 32]), Box::new([0xe9; 32])),
+    )?;
+    let shard = VirtualShardId::new(116)?;
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
+        &fixture.authority,
+        &fixture.retention_time,
+        &catalog,
+        SegmentScope::new(fixture.tenant, SignalKind::Traces, shard),
+        SegmentProtectionKey::from_owned(Box::new([0xea; 32])),
+    )?;
+    let (_, records, profile, capacity, receiver) = trace_batch("partial").into_parts();
+    let batch = crate::NativeSpanBatch::new_with_rejections(
+        attribution(),
+        records,
+        profile,
+        0,
+        capacity,
+        receiver,
+        [1, 0, 0],
+    )?;
+    let outcome = TraceIngest::new(&fixture.authority, &ledger, fixture.tenant, shard)
+        .accept(batch, StoreBlockIdentity::new([0xeb; 16])?);
+    let IngestOutcome::Partial(partial) = outcome else {
+        return Err(format!("expected partial trace outcome, got {outcome:?}").into());
+    };
+    assert_eq!(partial.committed().records(), 1);
+    assert_eq!(partial.permanently_rejected(), 1);
+    assert_eq!(
+        partial.rejections()[0].code(),
+        IngestFailureCode::PolicyRejected
+    );
+    assert_eq!(ledger.snapshot()?.blocks().len(), 1);
+    Ok(())
+}
+
+#[test]
+fn trace_store_record_limit_is_a_permanent_value_limit_not_an_invalid_record()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = fixture_with_ordinary_memory_and_cpu(8_000_000, 2_048)?;
+    let catalog = Catalog::open(
+        &fixture.authority,
+        InstanceId::new([0xec; 16])?,
+        CatalogSecret::from_owned(Box::new([0xed; 32]), Box::new([0xee; 32])),
+    )?;
+    let shard = VirtualShardId::new(117)?;
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
+        &fixture.authority,
+        &fixture.retention_time,
+        &catalog,
+        SegmentScope::new(fixture.tenant, SignalKind::Traces, shard),
+        SegmentProtectionKey::from_owned(Box::new([0xef; 32])),
+    )?;
+    let baseline = fixture.authority.governor().inspect()?.outstanding_total();
+    let reservation = fixture.authority.governor().reserve(WorkClaim::tenant(
+        fixture.tenant,
+        WorkKind::Ingest,
+        ResourceAmounts::new([3_000_000, 1, 1, 0, 1_025, 0, 0, 0, 1_025, 1, 1_048_576]),
+    )?)?;
+    let outcome = TraceIngest::new(&fixture.authority, &ledger, fixture.tenant, shard).accept(
+        oversized_record_batch(reservation),
+        StoreBlockIdentity::new([0xf0; 16])?,
+    );
+    assert_eq!(
+        outcome,
+        IngestOutcome::Permanent(IngestFailureCode::ValueLimitExceeded)
+    );
+    assert!(ledger.snapshot()?.blocks().is_empty());
+    assert_eq!(
+        fixture.authority.governor().inspect()?.outstanding_total(),
+        baseline
+    );
+    Ok(())
+}
+
 fn trace_batch(name: &str) -> crate::NativeSpanBatch<'static> {
     trace_batch_with_attribution(name, attribution())
 }
@@ -379,6 +460,24 @@ fn empty_batch() -> crate::NativeSpanBatch<'static> {
             ExportTraceServiceRequest::default().encode_to_vec(),
         ))
         .expect("empty structural trace fixture")
+}
+
+fn oversized_record_batch<'authority>(
+    reservation: ResourceReservation<'authority>,
+) -> crate::NativeSpanBatch<'authority> {
+    let (_, records, profile, _capacity, receiver) = trace_batch("record-limit").into_parts();
+    let Some(record) = records.into_iter().next() else {
+        panic!("trace fixture should contain one record")
+    };
+    crate::NativeSpanBatch::new(
+        attribution(),
+        vec![record; 1_025],
+        profile,
+        0,
+        Some(reservation),
+        receiver,
+    )
+    .expect("record-limit fixture should pass receiver construction")
 }
 
 fn attribution() -> TenantAttribution {

@@ -21,6 +21,7 @@ pub struct NativeSpanAdmissionGroup<'authority> {
 #[derive(Debug)]
 pub struct NativeSpanAdmissionGroups<'authority> {
     groups: IntoIter<NativeSpanAdmissionGroup<'authority>>,
+    rejections: [usize; 3],
     _retained_capacity: Option<ResourceReservation<'authority>>,
 }
 
@@ -28,6 +29,11 @@ impl NativeSpanAdmissionGroups<'_> {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.groups.as_slice().is_empty()
+    }
+
+    #[must_use]
+    pub const fn rejections(&self) -> [usize; 3] {
+        self.rejections
     }
 }
 
@@ -74,8 +80,16 @@ impl<'authority> NativeSpanBatch<'authority> {
             decoded_bytes,
             mut capacity,
             receiver,
+            rejections,
         } = self;
         let record_count = records.len();
+        if record_count == 0 {
+            return Ok(NativeSpanAdmissionGroups {
+                groups: Vec::new().into_iter(),
+                rejections,
+                _retained_capacity: capacity,
+            });
+        }
         let grouped_bytes = retained_batch_bytes(decoded_bytes, record_count)
             .map_err(|_| AdmissionGroupPlanFailure::RecordCountExceeded)?;
         if let Some(retained) = capacity.as_mut() {
@@ -119,12 +133,14 @@ impl<'authority> NativeSpanBatch<'authority> {
                     decoded_bytes: 0,
                     capacity: None,
                     receiver,
+                    rejections: [0; 3],
                 },
             })
             .collect::<Vec<_>>()
             .into_iter();
         Ok(NativeSpanAdmissionGroups {
             groups,
+            rejections,
             _retained_capacity: capacity,
         })
     }

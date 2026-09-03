@@ -6,6 +6,7 @@ use positron_kernel::{
 };
 use positron_signals::{TraceStore, TraceStoreFailureCode};
 
+use crate::ingest::partial_admission;
 use crate::{IngestFailureCode, IngestOutcome, NativeSpanBatch};
 
 /// Receiver-independent Trace ingestion.  The Storage Kernel remains the only
@@ -56,6 +57,7 @@ impl<'service, 'kernel, 'catalog> TraceIngest<'service, 'kernel, 'catalog> {
         identity: StoreBlockIdentity,
         cancellation: Option<&AppendCancellation>,
     ) -> IngestOutcome {
+        let rejections = batch.rejections();
         let (attribution, records, _profile, incoming_capacity, _receiver) = batch.into_parts();
         if attribution.scope() != Scope::Ingest || attribution.tenant_id() != self.tenant {
             return IngestOutcome::Permanent(IngestFailureCode::TenantConflict);
@@ -137,7 +139,12 @@ impl<'service, 'kernel, 'catalog> TraceIngest<'service, 'kernel, 'catalog> {
         match append {
             Ok(receipt) => match usize::try_from(record_count) {
                 Ok(records) => {
-                    IngestOutcome::Full(crate::CommittedAdmission::new(receipt, records))
+                    let committed = crate::CommittedAdmission::new(receipt, records);
+                    if rejections.into_iter().any(|count| count > 0) {
+                        IngestOutcome::Partial(partial_admission(committed, rejections))
+                    } else {
+                        IngestOutcome::Full(committed)
+                    }
                 },
                 Err(_) => IngestOutcome::Ambiguous(IngestFailureCode::StorageUnavailable),
             },
@@ -150,9 +157,11 @@ fn classify_store_failure(code: TraceStoreFailureCode) -> IngestOutcome {
     match code {
         TraceStoreFailureCode::InvalidInput
         | TraceStoreFailureCode::MalformedBlock
-        | TraceStoreFailureCode::PhysicalScopeMismatch
-        | TraceStoreFailureCode::LimitExceeded => {
+        | TraceStoreFailureCode::PhysicalScopeMismatch => {
             IngestOutcome::Permanent(IngestFailureCode::InvalidRecord)
+        },
+        TraceStoreFailureCode::LimitExceeded => {
+            IngestOutcome::Permanent(IngestFailureCode::ValueLimitExceeded)
         },
         TraceStoreFailureCode::Cancelled => IngestOutcome::Retryable(IngestFailureCode::Cancelled),
         _ => IngestOutcome::Retryable(IngestFailureCode::StorageUnavailable),
@@ -162,8 +171,10 @@ fn classify_store_failure(code: TraceStoreFailureCode) -> IngestOutcome {
 fn classify_ledger_failure(failure: &positron_kernel::LedgerFailure) -> IngestOutcome {
     let code = match failure.code() {
         positron_kernel::LedgerFailureCode::InvalidInput
-        | positron_kernel::LedgerFailureCode::PhysicalScopeMismatch
-        | positron_kernel::LedgerFailureCode::LimitExceeded => IngestFailureCode::InvalidRecord,
+        | positron_kernel::LedgerFailureCode::PhysicalScopeMismatch => {
+            IngestFailureCode::InvalidRecord
+        },
+        positron_kernel::LedgerFailureCode::LimitExceeded => IngestFailureCode::ValueLimitExceeded,
         positron_kernel::LedgerFailureCode::IdempotencyConflict => {
             IngestFailureCode::IdempotencyConflict
         },
@@ -175,7 +186,9 @@ fn classify_ledger_failure(failure: &positron_kernel::LedgerFailure) -> IngestOu
         LedgerCompletionState::RejectedBeforeMutation => {
             if matches!(
                 code,
-                IngestFailureCode::InvalidRecord | IngestFailureCode::IdempotencyConflict
+                IngestFailureCode::InvalidRecord
+                    | IngestFailureCode::ValueLimitExceeded
+                    | IngestFailureCode::IdempotencyConflict
             ) {
                 IngestOutcome::Permanent(code)
             } else {

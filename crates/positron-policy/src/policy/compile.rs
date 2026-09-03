@@ -73,8 +73,11 @@ impl IngestPolicy {
                 retained_bytes: MAX_NATIVE_RECORD_BYTES,
                 scratch_bytes,
                 provenance_bytes,
-                mutation_bytes: u64::try_from(std::mem::size_of::<crate::EvaluatedLogRecord>())
-                    .map_err(|_| PolicyCompileFailure::PolicyBytesExceeded)?,
+                mutation_bytes: u64::try_from(
+                    std::mem::size_of::<crate::EvaluatedLogRecord>()
+                        .max(std::mem::size_of::<crate::EvaluatedTraceRecord>()),
+                )
+                .map_err(|_| PolicyCompileFailure::PolicyBytesExceeded)?,
             },
         })
     }

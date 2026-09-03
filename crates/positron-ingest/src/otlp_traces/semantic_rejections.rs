@@ -66,13 +66,14 @@ fn development_entity_references_are_explicitly_rejected() {
         }],
     }
     .encode_to_vec();
-    assert!(matches!(
-        OtlpTracesReceiver::new().decode(AuthenticatedOtlpTracesRequest::test_only_protobuf(
+    let result = OtlpTracesReceiver::new()
+        .decode(AuthenticatedOtlpTracesRequest::test_only_protobuf(
             attribution(),
             payload,
-        )),
-        Err(TraceReceiveFailure::UnsupportedValue)
-    ));
+        ))
+        .expect("entity references are per-group span rejections");
+    assert!(result.records().is_empty());
+    assert_eq!(result.rejections(), [0, 1, 0]);
 }
 
 #[test]
@@ -83,10 +84,8 @@ fn indexed_wire_strings_are_rejected_instead_of_silently_dropped() {
         key_strindex: 1,
         ..KeyValue::default()
     });
-    assert!(matches!(
-        decode(span),
-        Err(TraceReceiveFailure::UnsupportedValue)
-    ));
+    let result = decode(span).expect("indexed key is a per-span rejection");
+    assert_eq!(result.rejections(), [0, 1, 0]);
 
     let mut span = valid_span();
     span.attributes.push(KeyValue {
@@ -96,44 +95,48 @@ fn indexed_wire_strings_are_rejected_instead_of_silently_dropped() {
         }),
         ..KeyValue::default()
     });
-    assert!(matches!(
-        decode(span),
-        Err(TraceReceiveFailure::UnsupportedValue)
-    ));
+    let result = decode(span).expect("indexed value is a per-span rejection");
+    assert_eq!(result.rejections(), [0, 1, 0]);
 }
 
 #[test]
 fn invalid_kind_status_timestamps_and_identifiers_have_stable_failures() {
     let mut invalid_kind = valid_span();
     invalid_kind.kind = 99;
-    assert!(matches!(
-        decode(invalid_kind),
-        Err(TraceReceiveFailure::MalformedPayload)
-    ));
+    assert_eq!(
+        decode(invalid_kind)
+            .expect("invalid kind rejection")
+            .rejections(),
+        [0, 1, 0]
+    );
 
     let mut invalid_status = valid_span();
     invalid_status.status = Some(Status {
         code: 99,
         message: String::new(),
     });
-    assert!(matches!(
-        decode(invalid_status),
-        Err(TraceReceiveFailure::MalformedPayload)
-    ));
+    assert_eq!(
+        decode(invalid_status)
+            .expect("invalid status rejection")
+            .rejections(),
+        [0, 1, 0]
+    );
 
     let mut out_of_range = valid_span();
     out_of_range.start_time_unix_nano = i64::MAX as u64 + 1;
-    assert!(matches!(
-        decode(out_of_range),
-        Err(TraceReceiveFailure::TimestampOutOfRange)
-    ));
+    assert_eq!(
+        decode(out_of_range)
+            .expect("timestamp rejection")
+            .rejections(),
+        [0, 1, 0]
+    );
 
     let mut reversed = valid_span();
     reversed.start_time_unix_nano = 21;
-    assert!(matches!(
-        decode(reversed),
-        Err(TraceReceiveFailure::MalformedPayload)
-    ));
+    assert_eq!(
+        decode(reversed).expect("time order rejection").rejections(),
+        [0, 1, 0]
+    );
 
     let mut invalid_link = valid_span();
     invalid_link.links.push(Link {
@@ -141,10 +144,10 @@ fn invalid_kind_status_timestamps_and_identifiers_have_stable_failures() {
         span_id: vec![3; 8],
         ..Link::default()
     });
-    assert!(matches!(
-        decode(invalid_link),
-        Err(TraceReceiveFailure::MalformedPayload)
-    ));
+    assert_eq!(
+        decode(invalid_link).expect("link rejection").rejections(),
+        [0, 1, 0]
+    );
 }
 
 #[test]

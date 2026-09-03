@@ -91,8 +91,12 @@ pub(super) fn ingest_authenticated_traces<'authority>(
 ) -> Result<IngestRequestOutcome, ServiceFailure> {
     services.revalidate_ingest_context(context)?;
     let instance = &services.instance;
+    let policy = services
+        .ingest_policy
+        .pin()
+        .map_err(|_| ServiceFailure::Internal)?;
     let batch = OtlpTracesReceiver::with_value_limit_profile(instance.value_limit_profile)
-        .decode(request)
+        .decode_with_policy(request, &policy)
         .map_err(super::failure::map_trace_receive_failure)?;
     ingest_native_trace_batch(services, context, batch)
 }
@@ -104,18 +108,15 @@ fn ingest_native_trace_batch(
 ) -> Result<IngestRequestOutcome, ServiceFailure> {
     services.revalidate_ingest_context(context)?;
     let instance = &services.instance;
-    let policy = services
-        .ingest_policy
-        .pin()
-        .map_err(|_| ServiceFailure::Internal)?;
-    let batch = batch
-        .with_policy_provenance(policy.provenance())
-        .map_err(super::failure::map_trace_receive_failure)?;
     let groups = batch
         .into_admission_groups(instance.admission_group_planner.as_ref())
         .map_err(map_admission_group_plan_failure)?;
+    let request_rejections = groups.rejections();
     if groups.is_empty() {
-        return Ok(IngestRequestOutcome::new(Vec::new()));
+        return Ok(IngestRequestOutcome::with_rejections(
+            Vec::new(),
+            request_rejections,
+        ));
     }
     #[cfg(test)]
     if let Some(backend) = services
@@ -125,7 +126,9 @@ fn ingest_native_trace_batch(
         .clone()
         && backend.handles_traces()
     {
-        return Ok(backend.ingest_traces(groups));
+        return Ok(backend
+            .ingest_traces(groups)
+            .with_additional_rejections(request_rejections));
     }
     let catalog = open_catalog(instance)?;
     let snapshot = catalog
@@ -147,7 +150,10 @@ fn ingest_native_trace_batch(
         outcomes.push(AdmissionGroupOutcome::new(shard, records, outcome));
     }
     drop(catalog);
-    Ok(IngestRequestOutcome::new(outcomes))
+    Ok(IngestRequestOutcome::with_rejections(
+        outcomes,
+        request_rejections,
+    ))
 }
 
 fn ingest_trace_group(

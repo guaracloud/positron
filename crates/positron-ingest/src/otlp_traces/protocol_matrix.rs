@@ -119,6 +119,76 @@ fn unknown_protobuf_wire_shapes_are_skipped_but_truncation_is_rejected() {
 }
 
 #[test]
+fn non_minimal_varints_are_accepted_for_known_lengths_scalars_and_unknown_fields() {
+    let known_length = one_span_request(true, false, false);
+    let known_scalar = one_span_request(false, true, false);
+    let unknown_scalar = one_span_request(false, false, true);
+
+    for (label, payload) in [
+        ("known length", known_length),
+        ("known scalar", known_scalar),
+        ("unknown scalar", unknown_scalar),
+    ] {
+        preflight_otlp_traces_protobuf(&payload)
+            .unwrap_or_else(|failure| panic!("{label} preflight should decode: {failure:?}"));
+        let batch = OtlpTracesReceiver::new()
+            .decode(AuthenticatedOtlpTracesRequest::test_only_protobuf(
+                test_attribution(),
+                payload,
+            ))
+            .unwrap_or_else(|failure| panic!("{label} should decode: {failure:?}"));
+        assert_eq!(batch.records().len(), 1, "{label} record count");
+    }
+}
+
+fn one_span_request(
+    non_minimal_name_length: bool,
+    non_minimal_kind: bool,
+    non_minimal_unknown: bool,
+) -> Vec<u8> {
+    let mut span = Vec::new();
+    append_length_delimited(&mut span, 1, &[0x11; 16], false);
+    append_length_delimited(&mut span, 2, &[0x22; 8], false);
+    append_length_delimited(&mut span, 5, b"non-minimal", non_minimal_name_length);
+    append_scalar(&mut span, 6, 1, non_minimal_kind);
+
+    let mut scope = Vec::new();
+    append_length_delimited(&mut scope, 2, &span, false);
+    let mut resource = Vec::new();
+    append_length_delimited(&mut resource, 2, &scope, false);
+    let mut request = Vec::new();
+    append_length_delimited(&mut request, 1, &resource, false);
+    if non_minimal_unknown {
+        request.extend_from_slice(&[0x98, 0x06, 0x81, 0x00]);
+    }
+    request
+}
+
+fn append_length_delimited(output: &mut Vec<u8>, field: u8, value: &[u8], non_minimal: bool) {
+    output.push(field << 3 | 2);
+    append_length(output, value.len(), non_minimal);
+    output.extend_from_slice(value);
+}
+
+fn append_length(output: &mut Vec<u8>, length: usize, non_minimal: bool) {
+    assert!(length < 128, "test fixture length stays one-byte bounded");
+    if non_minimal {
+        output.extend_from_slice(&[(length as u8) | 0x80, 0]);
+    } else {
+        output.push(length as u8);
+    }
+}
+
+fn append_scalar(output: &mut Vec<u8>, field: u8, value: u8, non_minimal: bool) {
+    output.push(field << 3);
+    if non_minimal {
+        output.extend_from_slice(&[value | 0x80, 0]);
+    } else {
+        output.push(value);
+    }
+}
+
+#[test]
 fn json_structure_and_syntax_fail_before_message_materialization() {
     let too_many_entries = format!(r#"{{"resourceSpans":[{}]}}"#, vec!["{}"; 1_025].join(","));
     assert_eq!(
@@ -194,13 +264,113 @@ fn protojson_base64_bytes_use_the_native_byte_limit_not_encoded_text_length() {
             ..Default::default()
         }],
     };
-    assert!(matches!(
-        OtlpTracesReceiver::new().decode(AuthenticatedOtlpTracesRequest::test_only_json(
+    let rejected = OtlpTracesReceiver::new()
+        .decode(AuthenticatedOtlpTracesRequest::test_only_json(
             test_attribution(),
             serde_json::to_vec(&over).expect("ProtoJSON payload"),
-        )),
-        Err(TraceReceiveFailure::ValueLimitExceeded)
-    ));
+        ))
+        .expect("over-limit span is a permanent partial rejection");
+    assert!(rejected.records().is_empty());
+    assert_eq!(rejected.rejections(), [0, 0, 1]);
+}
+
+#[test]
+fn named_fuzz_seeds_replay_one_span_through_the_receiver_seam() {
+    let seeds = [
+        (
+            "valid_protobuf",
+            include_bytes!("../../../../fuzz/corpus/otlp_traces_decode/valid_protobuf").as_slice(),
+        ),
+        (
+            "valid_protojson",
+            include_bytes!("../../../../fuzz/corpus/otlp_traces_decode/valid_protojson").as_slice(),
+        ),
+        (
+            "valid_gzip_protobuf",
+            include_bytes!("../../../../fuzz/corpus/otlp_traces_decode/valid_gzip_protobuf")
+                .as_slice(),
+        ),
+        (
+            "valid_gzip_protojson",
+            include_bytes!("../../../../fuzz/corpus/otlp_traces_decode/valid_gzip_protojson")
+                .as_slice(),
+        ),
+    ];
+    for (name, seed) in seeds {
+        let (selector, payload) = seed
+            .split_first()
+            .unwrap_or_else(|| panic!("{name} seed must be nonempty"));
+        let request = match selector & 3 {
+            0 => AuthenticatedOtlpTracesRequest::test_only_protobuf(
+                test_attribution(),
+                payload.to_vec(),
+            ),
+            1 => {
+                AuthenticatedOtlpTracesRequest::test_only_json(test_attribution(), payload.to_vec())
+            },
+            2 => AuthenticatedOtlpTracesRequest::test_only_gzip_protobuf(
+                test_attribution(),
+                payload.to_vec(),
+            ),
+            _ => AuthenticatedOtlpTracesRequest::test_only_gzip_json(
+                test_attribution(),
+                payload.to_vec(),
+            ),
+        };
+        let batch = OtlpTracesReceiver::new()
+            .decode(request)
+            .unwrap_or_else(|failure| panic!("{name} seed must decode: {failure:?}"));
+        assert_eq!(batch.records().len(), 1, "{name} native span count");
+    }
+}
+
+#[test]
+fn named_malformed_fuzz_seeds_keep_stable_failures() {
+    let malformed = [
+        (
+            "protobuf_truncated",
+            include_bytes!("../../../../fuzz/corpus/otlp_traces_decode/protobuf_truncated")
+                .as_slice(),
+            TraceReceiveFailure::MalformedPayload,
+        ),
+        (
+            "gzip_truncated",
+            include_bytes!("../../../../fuzz/corpus/otlp_traces_decode/gzip_truncated").as_slice(),
+            TraceReceiveFailure::MalformedCompression,
+        ),
+        (
+            "gzip_json_truncated",
+            include_bytes!("../../../../fuzz/corpus/otlp_traces_decode/gzip_json_truncated")
+                .as_slice(),
+            TraceReceiveFailure::MalformedCompression,
+        ),
+    ];
+    for (name, seed, expected) in malformed {
+        let (selector, payload) = seed
+            .split_first()
+            .unwrap_or_else(|| panic!("{name} seed must be nonempty"));
+        let request = match selector & 3 {
+            0 => AuthenticatedOtlpTracesRequest::test_only_protobuf(
+                test_attribution(),
+                payload.to_vec(),
+            ),
+            1 => {
+                AuthenticatedOtlpTracesRequest::test_only_json(test_attribution(), payload.to_vec())
+            },
+            2 => AuthenticatedOtlpTracesRequest::test_only_gzip_protobuf(
+                test_attribution(),
+                payload.to_vec(),
+            ),
+            _ => AuthenticatedOtlpTracesRequest::test_only_gzip_json(
+                test_attribution(),
+                payload.to_vec(),
+            ),
+        };
+        assert!(
+            matches!(OtlpTracesReceiver::new().decode(request), Err(failure) if failure == expected),
+            "{name}"
+        );
+    }
 }
 
 fn gzip(bytes: &[u8]) -> Vec<u8> {

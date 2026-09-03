@@ -167,6 +167,56 @@ impl SpanObservation {
         })
     }
 
+    /// Builds a native observation from the producer-neutral policy output.
+    /// Policy attributes remain unvalidated until this transition, ensuring
+    /// every accepted trace crosses the same Signal Store limits as other
+    /// native producers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn checked_native_with_policy_attributes(
+        trace_id: [u8; 16],
+        span_id: [u8; 8],
+        parent_span_id: Option<[u8; 8]>,
+        name: String,
+        start_time: EventTime,
+        end_time: EventTime,
+        attributes: Vec<positron_policy::NativePolicyAttribute>,
+        kind: SpanKind,
+        sampling: SamplingDecision,
+        policy: positron_policy::PolicyProvenance,
+        details: SpanObservationDetails,
+        profile: ValueLimitProfile,
+    ) -> Result<Self, TraceStoreFailure> {
+        let mut checked = Vec::new();
+        checked
+            .try_reserve_exact(attributes.len())
+            .map_err(|_| TraceStoreFailure::resource_exhausted())?;
+        for attribute in attributes {
+            let (namespace, key, occurrences) = attribute.into_parts();
+            checked.push(
+                positron_domain::value::AttributeOccurrenceSetCandidate::new(
+                    namespace,
+                    key,
+                    occurrences,
+                )
+                .validate(profile)
+                .map_err(TraceStoreFailure::domain)?,
+            );
+        }
+        Self::checked_native_with_details(
+            trace_id,
+            span_id,
+            parent_span_id,
+            name,
+            start_time,
+            end_time,
+            checked,
+            kind,
+            sampling,
+            policy,
+            details,
+        )
+    }
+
     #[must_use]
     pub const fn trace_id(&self) -> [u8; 16] {
         self.trace_id

@@ -239,6 +239,13 @@ fn trace_retry_permanent_and_ambiguous_outcomes_keep_their_public_classes() {
                 None,
             ),
             (
+                IngestOutcome::Permanent(IngestFailureCode::ValueLimitExceeded),
+                400,
+                3,
+                "OTLP Traces request was rejected",
+                None,
+            ),
+            (
                 IngestOutcome::Ambiguous(IngestFailureCode::StorageUnavailable),
                 503,
                 14,

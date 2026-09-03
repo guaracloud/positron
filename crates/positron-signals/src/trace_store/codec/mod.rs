@@ -19,7 +19,7 @@ pub(super) use decode::Input;
 #[cfg(test)]
 pub(super) use decode::decode_observation;
 #[cfg(fuzzing)]
-pub(super) use decode::{decode_observation, decode_observation_version};
+pub(super) use decode::decode_observation_version;
 #[cfg(test)]
 pub(super) use encode::put_slice;
 #[cfg(test)]

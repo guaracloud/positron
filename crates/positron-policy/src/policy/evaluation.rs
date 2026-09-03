@@ -1,17 +1,48 @@
+use positron_domain::routing::SignalKind;
 use positron_domain::value::{AttributeValueKind, CandidateAttributeValue};
 
 use super::{
     IngestPolicy, PolicyAction, PolicyAttributePath, PolicyEvaluation, PolicyEvaluationFailure,
     PolicyOccurrence, PolicyPathSegment, PolicyPredicate, PolicyReceiver, PolicyRule, PolicyTarget,
+    TracePolicyEvaluation,
 };
-use crate::{EvaluatedLogRecord, NativeLogAttribute, NativeLogCandidate, PolicyProvenance};
+use crate::{
+    EvaluatedLogRecord, EvaluatedTraceRecord, NativeLogCandidate, NativePolicyAttribute,
+    NativeTraceCandidate, PolicyProvenance,
+};
 
 impl IngestPolicy {
     pub fn evaluate(
         &self,
-        mut record: NativeLogCandidate,
+        record: NativeLogCandidate,
         receiver: PolicyReceiver,
     ) -> Result<PolicyEvaluation, PolicyEvaluationFailure> {
+        let Some((record, provenance)) = self.evaluate_record(record, receiver)? else {
+            return Ok(PolicyEvaluation::Rejected);
+        };
+        Ok(PolicyEvaluation::Accepted(Box::new(
+            EvaluatedLogRecord::new(record, provenance),
+        )))
+    }
+
+    pub fn evaluate_trace(
+        &self,
+        record: NativeTraceCandidate,
+        receiver: PolicyReceiver,
+    ) -> Result<TracePolicyEvaluation, PolicyEvaluationFailure> {
+        let Some((record, provenance)) = self.evaluate_record(record, receiver)? else {
+            return Ok(TracePolicyEvaluation::Rejected);
+        };
+        Ok(TracePolicyEvaluation::Accepted(Box::new(
+            EvaluatedTraceRecord::new(record, provenance),
+        )))
+    }
+
+    fn evaluate_record<C: PolicyRecord>(
+        &self,
+        mut record: C,
+        receiver: PolicyReceiver,
+    ) -> Result<Option<(C, PolicyProvenance)>, PolicyEvaluationFailure> {
         let mut applied = Vec::with_capacity(self.rules.len());
         let mut steps = StepBudget(self.budget.evaluation_steps());
         for rule in &self.rules {
@@ -27,7 +58,7 @@ impl IngestPolicy {
                     applied.push(rule.id.clone());
                     break;
                 },
-                PolicyAction::Reject => return Ok(PolicyEvaluation::Rejected),
+                PolicyAction::Reject => return Ok(None),
                 PolicyAction::Remove(target) => remove_target(&mut record, target),
                 PolicyAction::Redact(target) => {
                     transform_target(&mut record, target, Transformation::Redact)
@@ -45,12 +76,71 @@ impl IngestPolicy {
                 applied.push(rule.id.clone());
             }
         }
-        Ok(PolicyEvaluation::Accepted(Box::new(
-            EvaluatedLogRecord::new(
-                record,
-                PolicyProvenance::evaluated(self.generation, self.digest, applied),
-            ),
+        Ok(Some((
+            record,
+            PolicyProvenance::evaluated(self.generation, self.digest, applied),
         )))
+    }
+}
+
+trait PolicyRecord: Sized {
+    fn attributes(&self) -> &[NativePolicyAttribute];
+    fn attributes_mut(&mut self) -> &mut Vec<NativePolicyAttribute>;
+    fn body(&self) -> Option<&CandidateAttributeValue>;
+    fn body_mut(&mut self) -> &mut Option<CandidateAttributeValue>;
+    fn signal(&self) -> SignalKind;
+    fn log_severity(&self) -> Option<i32>;
+}
+
+impl PolicyRecord for NativeLogCandidate {
+    fn attributes(&self) -> &[NativePolicyAttribute] {
+        self.attributes()
+    }
+
+    fn attributes_mut(&mut self) -> &mut Vec<NativePolicyAttribute> {
+        self.attributes_mut()
+    }
+
+    fn body(&self) -> Option<&CandidateAttributeValue> {
+        self.body()
+    }
+
+    fn body_mut(&mut self) -> &mut Option<CandidateAttributeValue> {
+        self.body_mut()
+    }
+
+    fn signal(&self) -> SignalKind {
+        SignalKind::Logs
+    }
+
+    fn log_severity(&self) -> Option<i32> {
+        Some(self.metadata().severity_number())
+    }
+}
+
+impl PolicyRecord for NativeTraceCandidate {
+    fn attributes(&self) -> &[NativePolicyAttribute] {
+        self.attributes()
+    }
+
+    fn attributes_mut(&mut self) -> &mut Vec<NativePolicyAttribute> {
+        self.attributes_mut()
+    }
+
+    fn body(&self) -> Option<&CandidateAttributeValue> {
+        self.body()
+    }
+
+    fn body_mut(&mut self) -> &mut Option<CandidateAttributeValue> {
+        self.body_mut()
+    }
+
+    fn signal(&self) -> SignalKind {
+        SignalKind::Traces
+    }
+
+    fn log_severity(&self) -> Option<i32> {
+        None
     }
 }
 
@@ -67,7 +157,7 @@ impl StepBudget {
 }
 
 impl PolicyRule {
-    fn matches(&self, record: &NativeLogCandidate, receiver: PolicyReceiver) -> bool {
+    fn matches<C: PolicyRecord>(&self, record: &C, receiver: PolicyReceiver) -> bool {
         self.predicates.iter().all(|predicate| match predicate {
             PolicyPredicate::AttributeExists(path) => path_exists(record, path),
             PolicyPredicate::BodyExactText(expected) => record
@@ -75,7 +165,7 @@ impl PolicyRule {
                 .and_then(candidate_text)
                 .is_some_and(|actual| actual == expected),
             PolicyPredicate::SignalStore(signal) => {
-                *signal == positron_domain::routing::SignalKind::Logs
+                *signal == record.signal()
             },
             PolicyPredicate::Receiver(expected) => *expected == receiver,
             PolicyPredicate::AttributeType(path, expected) => {
@@ -89,7 +179,7 @@ impl PolicyRule {
                     })
             }),
             PolicyPredicate::LogSeverity(expected) => {
-                record.metadata().severity_number() == *expected
+                record.log_severity() == Some(*expected)
             },
         })
     }
@@ -110,16 +200,16 @@ enum Transformation {
 }
 
 fn find_attribute<'record>(
-    record: &'record NativeLogCandidate,
+    record: &'record impl PolicyRecord,
     path: &PolicyAttributePath,
-) -> Option<&'record NativeLogAttribute> {
+) -> Option<&'record NativePolicyAttribute> {
     record
         .attributes()
         .iter()
         .find(|attribute| attribute.namespace() == path.namespace && attribute.key() == path.key)
 }
 
-fn path_exists(record: &NativeLogCandidate, path: &PolicyAttributePath) -> bool {
+fn path_exists(record: &impl PolicyRecord, path: &PolicyAttributePath) -> bool {
     find_attribute(record, path).is_some_and(|attribute| {
         selected(attribute.occurrences(), path.occurrence)
             .any(|value| value_path_exists(value, &path.segments))
@@ -127,7 +217,7 @@ fn path_exists(record: &NativeLogCandidate, path: &PolicyAttributePath) -> bool 
 }
 
 fn path_has_type(
-    record: &NativeLogCandidate,
+    record: &impl PolicyRecord,
     path: &PolicyAttributePath,
     expected: AttributeValueKind,
 ) -> bool {
@@ -198,14 +288,14 @@ fn selected(
     })
 }
 
-fn remove_target(record: &mut NativeLogCandidate, target: &PolicyTarget) -> bool {
+fn remove_target(record: &mut impl PolicyRecord, target: &PolicyTarget) -> bool {
     match target {
         PolicyTarget::Body => record.body_mut().take().is_some(),
         PolicyTarget::Attribute(path) => remove_path(record, path),
     }
 }
 
-fn remove_path(record: &mut NativeLogCandidate, path: &PolicyAttributePath) -> bool {
+fn remove_path(record: &mut impl PolicyRecord, path: &PolicyAttributePath) -> bool {
     let Some(position) = record.attributes().iter().position(|attribute| {
         attribute.namespace() == path.namespace && attribute.key() == path.key
     }) else {
@@ -239,7 +329,7 @@ fn remove_path(record: &mut NativeLogCandidate, path: &PolicyAttributePath) -> b
 }
 
 fn transform_target(
-    record: &mut NativeLogCandidate,
+    record: &mut impl PolicyRecord,
     target: &PolicyTarget,
     transformation: Transformation,
 ) -> bool {
@@ -260,7 +350,7 @@ fn transform_target(
 }
 
 fn transform_selected(
-    attribute: &mut NativeLogAttribute,
+    attribute: &mut NativePolicyAttribute,
     path: &PolicyAttributePath,
     transformation: Option<Transformation>,
 ) -> bool {

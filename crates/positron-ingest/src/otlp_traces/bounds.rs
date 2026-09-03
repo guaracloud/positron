@@ -433,9 +433,6 @@ impl<'message> Cursor<'message> {
             }
             value |= u64::from(*byte & 0x7f) << (index * 7);
             if byte & 0x80 == 0 {
-                if index > 0 && value < (1_u64 << (index * 7)) {
-                    return Err(TraceReceiveFailure::MalformedPayload);
-                }
                 return Ok(value);
             }
         }
