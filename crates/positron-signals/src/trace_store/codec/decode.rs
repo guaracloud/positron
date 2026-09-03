@@ -5,17 +5,23 @@ use positron_domain::value::{
 };
 use positron_kernel::CommittedBlock;
 
+use super::super::details::{
+    MAX_DETAIL_COLLECTION, SpanAttributeSet, SpanEvent, SpanLink, SpanObservationDetails,
+    SpanResourceMetadata, SpanScopeMetadata, SpanStatus,
+};
 use super::super::failure::TraceStoreFailure;
-use super::super::types::{SpanObservation, StoredSpanObservation, TraceLimits, release_1_limits};
+use super::super::observation::SpanObservation;
+use super::super::types::{StoredSpanObservation, TraceLimits, release_1_limits};
 use super::format::{
     MAGIC, MAX_RECORDS, VERSION, check_cancel, decode_kind, decode_namespace, decode_quality,
-    decode_sampling,
+    decode_sampling, decode_status_tag, supported_version,
 };
 use crate::{ScanCancellation, ScanObserver};
 
 pub(crate) struct BlockDecode<'input> {
     pub(crate) input: Input<'input>,
     count: usize,
+    version: u16,
 }
 
 impl<'input> BlockDecode<'input> {
@@ -30,7 +36,8 @@ impl<'input> BlockDecode<'input> {
         if input.take(MAGIC.len())? != MAGIC {
             return Err(TraceStoreFailure::malformed_block());
         }
-        if input.u16()? != VERSION {
+        let version = input.u16()?;
+        if !supported_version(version) {
             return Err(TraceStoreFailure::malformed_block());
         }
         let tenant = input.array::<16>()?;
@@ -41,11 +48,20 @@ impl<'input> BlockDecode<'input> {
         if count == 0 {
             return Err(TraceStoreFailure::malformed_block());
         }
-        Ok(Self { input, count })
+        Ok(Self {
+            input,
+            count,
+            version,
+        })
     }
 
     pub(crate) const fn record_count(&self) -> usize {
         self.count
+    }
+
+    #[cfg(fuzzing)]
+    pub(crate) const fn version(&self) -> u16 {
+        self.version
     }
 
     pub(crate) fn decode_after(
@@ -58,7 +74,8 @@ impl<'input> BlockDecode<'input> {
         let skipped = skip.min(self.count);
         for _ in 0..skipped {
             check_cancel(cancellation)?;
-            let (_, encoded_ingest_time) = decode_observation(&mut self.input)?;
+            let (_, encoded_ingest_time) =
+                decode_observation_version(&mut self.input, self.version)?;
             block
                 .observe_ingest_time(encoded_ingest_time)
                 .map_err(TraceStoreFailure::kernel)?;
@@ -70,7 +87,8 @@ impl<'input> BlockDecode<'input> {
             .map_err(|_| TraceStoreFailure::resource_exhausted())?;
         for _ in 0..retained {
             check_cancel(cancellation)?;
-            let (observation, encoded_ingest_time) = decode_observation(&mut self.input)?;
+            let (observation, encoded_ingest_time) =
+                decode_observation_version(&mut self.input, self.version)?;
             let ingest_time = block
                 .observe_ingest_time(encoded_ingest_time)
                 .map_err(TraceStoreFailure::kernel)?;
@@ -82,7 +100,7 @@ impl<'input> BlockDecode<'input> {
         let mut tail = self.input.remaining_input();
         for _ in skipped + retained..self.count {
             check_cancel(cancellation)?;
-            let (_, encoded_ingest_time) = decode_observation(&mut tail)?;
+            let (_, encoded_ingest_time) = decode_observation_version(&mut tail, self.version)?;
             block
                 .observe_ingest_time(encoded_ingest_time)
                 .map_err(TraceStoreFailure::kernel)?;
@@ -98,8 +116,16 @@ pub(crate) struct DecodedBlock {
     pub(crate) observations: Vec<StoredSpanObservation>,
 }
 
+#[cfg(any(test, fuzzing))]
 pub(crate) fn decode_observation(
     input: &mut Input<'_>,
+) -> Result<(SpanObservation, UnixNanoseconds), TraceStoreFailure> {
+    decode_observation_version(input, super::format::LEGACY_VERSION)
+}
+
+pub(crate) fn decode_observation_version(
+    input: &mut Input<'_>,
+    version: u16,
 ) -> Result<(SpanObservation, UnixNanoseconds), TraceStoreFailure> {
     input.observe_component()?;
     let trace_id = input.array::<16>()?;
@@ -148,8 +174,14 @@ pub(crate) fn decode_observation(
                 .map_err(TraceStoreFailure::validation)?,
         );
     }
+    let details = if version == VERSION {
+        decode_details(input)?
+    } else {
+        // BlockDecode::observed admits only VERSION or LEGACY_VERSION.
+        SpanObservationDetails::default()
+    };
     let policy = decode_policy(input)?;
-    let observation = SpanObservation::checked_native(
+    let observation = SpanObservation::checked_native_with_details(
         trace_id,
         span_id,
         parent_span_id,
@@ -160,10 +192,140 @@ pub(crate) fn decode_observation(
         kind,
         sampling,
         policy,
+        details,
     )
     .map_err(|_| TraceStoreFailure::malformed_block())?;
     let ingest_time = UnixNanoseconds::new(input.i64()?);
     Ok((observation, ingest_time))
+}
+
+fn decode_details(input: &mut Input<'_>) -> Result<SpanObservationDetails, TraceStoreFailure> {
+    let limits = release_1_limits()?;
+    let trace_state = input.string(limits.key_path_bytes)?;
+    let flags = input.u32()?;
+    let status_code = decode_status_tag(input.u8()?)?;
+    let status_message = input.string(limits.key_path_bytes)?;
+    let status = SpanStatus::checked(status_code, status_message)
+        .map_err(|_| TraceStoreFailure::malformed_block())?;
+    let dropped_attributes_count = input.u32()?;
+    let dropped_events_count = input.u32()?;
+    let dropped_links_count = input.u32()?;
+    let resource_dropped_attributes_count = input.u32()?;
+    let resource_schema_url = input.string(limits.key_path_bytes)?;
+    let scope_name = input.string(limits.key_path_bytes)?;
+    let scope_version = input.string(limits.key_path_bytes)?;
+    let scope_dropped_attributes_count = input.u32()?;
+    let scope_schema_url = input.string(limits.key_path_bytes)?;
+    let events_count = input.count(MAX_DETAIL_COLLECTION)?;
+    let mut events = Vec::new();
+    events
+        .try_reserve_exact(events_count)
+        .map_err(|_| TraceStoreFailure::resource_exhausted())?;
+    for _ in 0..events_count {
+        events.push(decode_event(
+            input,
+            limits.key_path_bytes,
+            limits.nesting_depth,
+        )?);
+    }
+    let links_count = input.count(MAX_DETAIL_COLLECTION)?;
+    let mut links = Vec::new();
+    links
+        .try_reserve_exact(links_count)
+        .map_err(|_| TraceStoreFailure::resource_exhausted())?;
+    for _ in 0..links_count {
+        links.push(decode_link(
+            input,
+            limits.key_path_bytes,
+            limits.nesting_depth,
+        )?);
+    }
+    SpanObservationDetails::checked(
+        trace_state,
+        flags,
+        status,
+        events,
+        links,
+        dropped_attributes_count,
+        dropped_events_count,
+        dropped_links_count,
+        SpanResourceMetadata::checked(resource_dropped_attributes_count, resource_schema_url)
+            .map_err(|_| TraceStoreFailure::malformed_block())?,
+        SpanScopeMetadata::checked(
+            scope_name,
+            scope_version,
+            scope_dropped_attributes_count,
+            scope_schema_url,
+        )
+        .map_err(|_| TraceStoreFailure::malformed_block())?,
+    )
+    .map_err(|_| TraceStoreFailure::malformed_block())
+}
+
+fn decode_event(
+    input: &mut Input<'_>,
+    key_limit: usize,
+    depth: u8,
+) -> Result<SpanEvent, TraceStoreFailure> {
+    let timestamp = decode_time(input)?;
+    let name = input.string(key_limit)?;
+    let dropped_attributes_count = input.u32()?;
+    let attributes = decode_span_attributes(input, depth)?;
+    SpanEvent::checked(timestamp, name, attributes, dropped_attributes_count)
+        .map_err(|_| TraceStoreFailure::malformed_block())
+}
+
+fn decode_link(
+    input: &mut Input<'_>,
+    key_limit: usize,
+    depth: u8,
+) -> Result<SpanLink, TraceStoreFailure> {
+    let trace_id = input.array::<16>()?;
+    let span_id = input.array::<8>()?;
+    let trace_state = input.string(key_limit)?;
+    let flags = input.u32()?;
+    let dropped_attributes_count = input.u32()?;
+    let attributes = decode_span_attributes(input, depth)?;
+    SpanLink::checked(
+        trace_id,
+        span_id,
+        trace_state,
+        flags,
+        attributes,
+        dropped_attributes_count,
+    )
+    .map_err(|_| TraceStoreFailure::malformed_block())
+}
+
+fn decode_span_attributes(
+    input: &mut Input<'_>,
+    depth: u8,
+) -> Result<Vec<SpanAttributeSet>, TraceStoreFailure> {
+    let limits = release_1_limits()?;
+    let count = input.count(MAX_DETAIL_COLLECTION)?;
+    let mut attributes = Vec::new();
+    attributes
+        .try_reserve_exact(count)
+        .map_err(|_| TraceStoreFailure::resource_exhausted())?;
+    for _ in 0..count {
+        let key = input.string(limits.key_path_bytes)?;
+        let occurrence_count = input.count(limits.occurrences_per_namespace)?;
+        if occurrence_count == 0 {
+            return Err(TraceStoreFailure::malformed_block());
+        }
+        let mut values = Vec::new();
+        values
+            .try_reserve_exact(occurrence_count)
+            .map_err(|_| TraceStoreFailure::resource_exhausted())?;
+        for _ in 0..occurrence_count {
+            values.push(decode_value(input, depth, &limits)?);
+        }
+        attributes.push(
+            SpanAttributeSet::checked(key, values, ValueLimitProfile::release_1_system_maximum())
+                .map_err(|_| TraceStoreFailure::malformed_block())?,
+        );
+    }
+    Ok(attributes)
 }
 
 fn decode_policy(

@@ -780,7 +780,11 @@ version = "0.32.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b0142c63252a9e054e68a4c61a5778f7b14f576274d593f8ce883d191a099682"
 dependencies = [
+ "futures-core",
+ "futures-sink",
  "js-sys",
+ "pin-project-lite",
+ "thiserror",
 ]
 
 [[package]]
@@ -809,7 +813,9 @@ dependencies = [
  "futures-executor",
  "futures-util",
  "opentelemetry",
+ "percent-encoding",
  "portable-atomic",
+ "rand",
  "thiserror",
 ]
 
@@ -919,6 +925,7 @@ dependencies = [
  "positron-policy",
  "positron-signals",
  "prost",
+ "serde",
  "serde_json",
  "snap",
 ]

@@ -1,13 +1,21 @@
 use opentelemetry_proto::tonic::collector::logs::v1::{
     ExportLogsPartialSuccess, ExportLogsServiceResponse,
 };
+use opentelemetry_proto::tonic::collector::trace::v1::{
+    ExportTracePartialSuccess, ExportTraceServiceResponse,
+};
 use positron_domain::routing::VirtualShardId;
 use positron_ingest::{AdmissionGroupOutcome, IngestOutcome, IngestRequestOutcome};
 use prost::Message;
 
-use super::{ResponseEncoding, RpcStatus, ingest_response, success};
+use super::{
+    ResponseEncoding, RpcStatus, ingest_response, success, trace_service_response_with_encoding,
+    trace_success,
+};
 use crate::native_host::native_http::Response;
 
+mod live;
+mod live_outcomes;
 mod outcomes;
 
 fn single(outcome: IngestOutcome) -> IngestRequestOutcome {
@@ -58,6 +66,36 @@ fn decode_success(response: &Response, encoding: ResponseEncoding) -> ExportLogs
                             .to_owned(),
                     });
             ExportLogsServiceResponse { partial_success }
+        },
+    }
+}
+
+fn decode_trace_success(
+    response: &Response,
+    encoding: ResponseEncoding,
+) -> ExportTraceServiceResponse {
+    match encoding {
+        ResponseEncoding::Protobuf => {
+            ExportTraceServiceResponse::decode(response.body()).expect("protobuf response")
+        },
+        ResponseEncoding::Json => {
+            let value: serde_json::Value =
+                serde_json::from_slice(response.body()).expect("JSON response");
+            let partial_success =
+                value
+                    .get("partialSuccess")
+                    .map(|partial| ExportTracePartialSuccess {
+                        rejected_spans: partial["rejectedSpans"]
+                            .as_str()
+                            .expect("decimal string")
+                            .parse()
+                            .expect("i64 spans"),
+                        error_message: partial["errorMessage"]
+                            .as_str()
+                            .expect("error message")
+                            .to_owned(),
+                    });
+            ExportTraceServiceResponse { partial_success }
         },
     }
 }

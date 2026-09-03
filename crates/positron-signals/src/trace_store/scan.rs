@@ -243,7 +243,7 @@ impl ScannedSpanObservation {
     }
 
     #[must_use]
-    pub const fn observation(&self) -> &super::types::SpanObservation {
+    pub const fn observation(&self) -> &super::observation::SpanObservation {
         self.observation.observation()
     }
 

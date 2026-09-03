@@ -1,8 +1,9 @@
 use positron_domain::routing::SignalKind;
 use positron_governance::AuthorizedContext;
 use positron_ingest::{
-    AdmissionGroupOutcome, AuthenticatedOtlpLogsRequest, IngestFailureCode, IngestOutcome,
-    IngestRequestOutcome, LogIngest, NativeLogBatch, OtlpLogsReceiver,
+    AdmissionGroupOutcome, AuthenticatedOtlpLogsRequest, AuthenticatedOtlpTracesRequest,
+    IngestFailureCode, IngestOutcome, IngestRequestOutcome, LogIngest, NativeLogBatch,
+    NativeSpanBatch, OtlpLogsReceiver, OtlpTracesReceiver, TraceIngest,
 };
 use positron_kernel::{
     ActiveSegmentLedger, Catalog, LedgerFailureCode, SegmentScope, StoreBlockIdentity,
@@ -81,6 +82,112 @@ pub(super) fn ingest_native_batch(
     }
     drop(catalog);
     Ok(IngestRequestOutcome::new(outcomes))
+}
+
+pub(super) fn ingest_authenticated_traces<'authority>(
+    services: &'authority ServiceHandle,
+    context: AuthorizedContext,
+    request: AuthenticatedOtlpTracesRequest<'authority>,
+) -> Result<IngestRequestOutcome, ServiceFailure> {
+    services.revalidate_ingest_context(context)?;
+    let instance = &services.instance;
+    let batch = OtlpTracesReceiver::with_value_limit_profile(instance.value_limit_profile)
+        .decode(request)
+        .map_err(super::failure::map_trace_receive_failure)?;
+    ingest_native_trace_batch(services, context, batch)
+}
+
+fn ingest_native_trace_batch(
+    services: &ServiceHandle,
+    context: AuthorizedContext,
+    batch: NativeSpanBatch<'_>,
+) -> Result<IngestRequestOutcome, ServiceFailure> {
+    services.revalidate_ingest_context(context)?;
+    let instance = &services.instance;
+    let policy = services
+        .ingest_policy
+        .pin()
+        .map_err(|_| ServiceFailure::Internal)?;
+    let batch = batch
+        .with_policy_provenance(policy.provenance())
+        .map_err(super::failure::map_trace_receive_failure)?;
+    let groups = batch
+        .into_admission_groups(instance.admission_group_planner.as_ref())
+        .map_err(map_admission_group_plan_failure)?;
+    if groups.is_empty() {
+        return Ok(IngestRequestOutcome::new(Vec::new()));
+    }
+    #[cfg(test)]
+    if let Some(backend) = services
+        .receiver_test_backend
+        .lock()
+        .map_err(|_| ServiceFailure::Internal)?
+        .clone()
+        && backend.handles_traces()
+    {
+        return Ok(backend.ingest_traces(groups));
+    }
+    let catalog = open_catalog(instance)?;
+    let snapshot = catalog
+        .pin()
+        .map_err(|failure| classify_catalog_failure_code(failure.code()))?;
+    let identity =
+        positron_governance::Identity::open(&snapshot).map_err(|_| ServiceFailure::CorruptState)?;
+    identity
+        .validate_ingest_context(context)
+        .map_err(|_| ServiceFailure::Unauthorized)?;
+    let mut outcomes = Vec::new();
+    outcomes
+        .try_reserve_exact(groups.len())
+        .map_err(|_| ServiceFailure::CapacityUnavailable)?;
+    for group in groups {
+        let shard = group.shard();
+        let records = group.records();
+        let outcome = ingest_trace_group(instance, &catalog, group);
+        outcomes.push(AdmissionGroupOutcome::new(shard, records, outcome));
+    }
+    drop(catalog);
+    Ok(IngestRequestOutcome::new(outcomes))
+}
+
+fn ingest_trace_group(
+    instance: &crate::InitializedInstance,
+    catalog: &Catalog<'_>,
+    group: positron_ingest::NativeSpanAdmissionGroup<'_>,
+) -> IngestOutcome {
+    let shard = group.shard();
+    let scope = SegmentScope::new(instance.tenant, SignalKind::Traces, shard);
+    let protection = match instance.key.segment_key(instance.instance, scope) {
+        Ok(protection) => protection,
+        Err(_) => {
+            return IngestOutcome::Retryable(IngestFailureCode::StorageUnavailable);
+        },
+    };
+    let ledger = match ActiveSegmentLedger::open_with_retention_time(
+        &instance._authority,
+        &instance.retention_time,
+        catalog,
+        scope,
+        protection,
+    ) {
+        Ok(ledger) => ledger,
+        Err(failure) => {
+            return IngestOutcome::Retryable(map_ledger_failure_code(failure.code()));
+        },
+    };
+    let identity = match instance
+        .key
+        .random_identifier()
+        .ok()
+        .and_then(|bytes| StoreBlockIdentity::new(bytes).ok())
+    {
+        Some(identity) => identity,
+        None => {
+            return IngestOutcome::Retryable(IngestFailureCode::StorageUnavailable);
+        },
+    };
+    TraceIngest::new(&instance._authority, &ledger, instance.tenant, shard)
+        .accept(group.into_batch(), identity)
 }
 
 fn open_catalog<'instance>(

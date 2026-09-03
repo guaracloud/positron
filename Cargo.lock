@@ -1098,6 +1098,7 @@ dependencies = [
  "positron-runtime",
  "positron-signals",
  "prost 0.14.3",
+ "serde",
  "serde_json",
  "snap",
 ]

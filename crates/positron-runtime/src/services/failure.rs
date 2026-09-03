@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
-use positron_ingest::{AdmissionGroupPlanFailure, ReceiveFailure};
+use positron_ingest::{AdmissionGroupPlanFailure, ReceiveFailure, TraceReceiveFailure};
 use positron_kernel::{CatalogFailureCode, LedgerFailureCode};
 use positron_query::{QueryEvent, QueryFailure, QueryFailureCode, QueryTerminal};
 
@@ -35,6 +35,16 @@ pub(super) fn map_receive_failure(failure: ReceiveFailure) -> ServiceFailure {
         ReceiveFailure::AuthenticationRejected => ServiceFailure::Unauthorized,
         ReceiveFailure::CapacityUnavailable => ServiceFailure::CapacityUnavailable,
         ReceiveFailure::TransportLimitExceeded => ServiceFailure::RequestTooLarge,
+        _ => ServiceFailure::InvalidRequest,
+    }
+}
+
+pub(super) fn map_trace_receive_failure(failure: TraceReceiveFailure) -> ServiceFailure {
+    match failure {
+        TraceReceiveFailure::AuthenticationRejected => ServiceFailure::Unauthorized,
+        TraceReceiveFailure::CapacityUnavailable => ServiceFailure::CapacityUnavailable,
+        TraceReceiveFailure::TransportLimitExceeded => ServiceFailure::RequestTooLarge,
+        TraceReceiveFailure::MalformedCompression => ServiceFailure::InvalidRequest,
         _ => ServiceFailure::InvalidRequest,
     }
 }

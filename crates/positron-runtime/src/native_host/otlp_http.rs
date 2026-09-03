@@ -3,8 +3,13 @@ use std::net::TcpStream;
 use opentelemetry_proto::tonic::collector::logs::v1::{
     ExportLogsPartialSuccess, ExportLogsServiceResponse,
 };
+use opentelemetry_proto::tonic::collector::trace::v1::{
+    ExportTracePartialSuccess, ExportTraceServiceResponse,
+};
 use positron_governance::CompatibilityHints;
-use positron_ingest::{IngestFailureCode, IngestOutcome, OtlpLogsRequestEncoding};
+use positron_ingest::{
+    IngestFailureCode, IngestOutcome, OtlpLogsRequestEncoding, OtlpTracesRequestEncoding,
+};
 use prost::Message;
 
 use super::native_http::{RequestHead, Response, read_body};
@@ -52,6 +57,7 @@ pub(super) fn receive(
     let (request_encoding, response_encoding) = request_encoding(
         head.content_type.as_deref(),
         head.content_encoding.as_deref(),
+        OtlpHttpSignal::Logs,
     )?;
     let bearer = head.bearer.ok_or_else(|| {
         failure(
@@ -124,9 +130,95 @@ pub(super) fn receive(
     Ok(ingest_response(result, response_encoding))
 }
 
+pub(super) fn receive_traces(
+    stream: &mut TcpStream,
+    head: RequestHead,
+    services: &ServiceHandle,
+) -> Result<Response, Response> {
+    let (request_encoding, response_encoding) = request_encoding(
+        head.content_type.as_deref(),
+        head.content_encoding.as_deref(),
+        OtlpHttpSignal::Traces,
+    )?;
+    let bearer = head.bearer.ok_or_else(|| {
+        failure(
+            401,
+            UNAUTHENTICATED,
+            "OTLP Traces request authentication was rejected",
+            response_encoding,
+        )
+    })?;
+    let hints = head
+        .tenant_hint
+        .as_deref()
+        .map(CompatibilityHints::external_tenant_alias)
+        .transpose()
+        .map_err(|_| {
+            failure(
+                401,
+                UNAUTHENTICATED,
+                "OTLP Traces request authentication was rejected",
+                response_encoding,
+            )
+        })?
+        .unwrap_or_else(CompatibilityHints::none);
+    let context = services
+        .authorize_traces_with_hints(&bearer, hints)
+        .map_err(|_| {
+            failure(
+                401,
+                UNAUTHENTICATED,
+                "OTLP Traces request authentication was rejected",
+                response_encoding,
+            )
+        })?;
+    let admission = services
+        .admit_traces(context)
+        .map_err(|failure| trace_service_response_with_encoding(failure, response_encoding))?;
+    let (encoded_limit, decoded_limit) = services
+        .traces_transport_limits()
+        .map_err(|failure| trace_service_response_with_encoding(failure, response_encoding))?;
+    let body_limit = match request_encoding {
+        OtlpLogsRequestEncoding::Protobuf | OtlpLogsRequestEncoding::Json => {
+            encoded_limit.min(decoded_limit)
+        },
+        OtlpLogsRequestEncoding::GzipProtobuf | OtlpLogsRequestEncoding::GzipJson => encoded_limit,
+    };
+    if head.content_length > body_limit {
+        return Err(failure(
+            413,
+            RESOURCE_EXHAUSTED,
+            "OTLP Traces request exceeds the receiver limit",
+            response_encoding,
+        ));
+    }
+    let body = read_body(stream, head.content_length, body_limit).map_err(|_| {
+        failure(
+            400,
+            INVALID_ARGUMENT,
+            "OTLP Traces request body could not be read",
+            response_encoding,
+        )
+    })?;
+    let reservation = admission
+        .take()
+        .map_err(|failure| trace_service_response_with_encoding(failure, response_encoding))?;
+    let trace_encoding = match request_encoding {
+        OtlpLogsRequestEncoding::Protobuf => OtlpTracesRequestEncoding::Protobuf,
+        OtlpLogsRequestEncoding::GzipProtobuf => OtlpTracesRequestEncoding::GzipProtobuf,
+        OtlpLogsRequestEncoding::Json => OtlpTracesRequestEncoding::Json,
+        OtlpLogsRequestEncoding::GzipJson => OtlpTracesRequestEncoding::GzipJson,
+    };
+    Ok(ingest_trace_response(
+        services.ingest_encoded_otlp_http_traces(context, trace_encoding, body, reservation),
+        response_encoding,
+    ))
+}
+
 fn request_encoding(
     content_type: Option<&str>,
     content_encoding: Option<&str>,
+    signal: OtlpHttpSignal,
 ) -> Result<(OtlpLogsRequestEncoding, ResponseEncoding), Response> {
     let media_type = content_type
         .and_then(|value| value.split(';').next())
@@ -138,6 +230,7 @@ fn request_encoding(
                 OtlpLogsRequestEncoding::Protobuf,
                 OtlpLogsRequestEncoding::GzipProtobuf,
                 ResponseEncoding::Protobuf,
+                signal,
             )?;
             Ok((request, ResponseEncoding::Protobuf))
         },
@@ -147,13 +240,14 @@ fn request_encoding(
                 OtlpLogsRequestEncoding::Json,
                 OtlpLogsRequestEncoding::GzipJson,
                 ResponseEncoding::Json,
+                signal,
             )?;
             Ok((request, ResponseEncoding::Json))
         },
         _ => Err(failure(
             415,
             INVALID_ARGUMENT,
-            "OTLP Logs Content-Type is unsupported",
+            signal.unsupported_content_type_message(),
             ResponseEncoding::Json,
         )),
     }
@@ -164,6 +258,7 @@ fn compression_variant(
     plain: OtlpLogsRequestEncoding,
     gzip: OtlpLogsRequestEncoding,
     response_encoding: ResponseEncoding,
+    signal: OtlpHttpSignal,
 ) -> Result<OtlpLogsRequestEncoding, Response> {
     match content_encoding.map(str::trim) {
         None | Some("") => Ok(plain),
@@ -172,9 +267,31 @@ fn compression_variant(
         Some(_) => Err(failure(
             415,
             INVALID_ARGUMENT,
-            "OTLP Logs Content-Encoding is unsupported",
+            signal.unsupported_content_encoding_message(),
             response_encoding,
         )),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum OtlpHttpSignal {
+    Logs,
+    Traces,
+}
+
+impl OtlpHttpSignal {
+    const fn unsupported_content_type_message(self) -> &'static str {
+        match self {
+            Self::Logs => "OTLP Logs Content-Type is unsupported",
+            Self::Traces => "OTLP Traces Content-Type is unsupported",
+        }
+    }
+
+    const fn unsupported_content_encoding_message(self) -> &'static str {
+        match self {
+            Self::Logs => "OTLP Logs Content-Encoding is unsupported",
+            Self::Traces => "OTLP Traces Content-Encoding is unsupported",
+        }
     }
 }
 
@@ -221,6 +338,49 @@ fn ingest_response(
     }
 }
 
+fn ingest_trace_response(
+    result: Result<positron_ingest::IngestRequestOutcome, ServiceFailure>,
+    encoding: ResponseEncoding,
+) -> Response {
+    match result {
+        Ok(outcome) => match outcome.terminal_failure() {
+            Some(IngestOutcome::Retryable(IngestFailureCode::CapacityUnavailable)) => failure(
+                429,
+                RESOURCE_EXHAUSTED,
+                "OTLP Traces ingest capacity is unavailable",
+                encoding,
+            )
+            .with_retry_after(1),
+            Some(IngestOutcome::Retryable(_)) => failure(
+                503,
+                UNAVAILABLE,
+                "OTLP Traces ingest is temporarily unavailable",
+                encoding,
+            ),
+            Some(IngestOutcome::Permanent(_)) => failure(
+                400,
+                INVALID_ARGUMENT,
+                "OTLP Traces request was rejected",
+                encoding,
+            ),
+            Some(IngestOutcome::Ambiguous(_)) => failure(
+                503,
+                UNAVAILABLE,
+                "OTLP Traces commit outcome is ambiguous; retry may duplicate spans",
+                encoding,
+            ),
+            Some(IngestOutcome::Full(_) | IngestOutcome::Partial(_)) => failure(
+                500,
+                INTERNAL,
+                "OTLP Traces outcome aggregation failed",
+                encoding,
+            ),
+            None => trace_success(outcome.permanently_rejected_records(), encoding),
+        },
+        Err(failure_code) => trace_service_response_with_encoding(failure_code, encoding),
+    }
+}
+
 fn success(rejected: usize, encoding: ResponseEncoding) -> Response {
     let partial_success = if rejected == 0 {
         None
@@ -257,6 +417,49 @@ fn success(rejected: usize, encoding: ResponseEncoding) -> Response {
                     500,
                     INTERNAL,
                     "OTLP Logs response encoding failed",
+                    encoding,
+                ),
+            },
+        },
+    }
+}
+
+fn trace_success(rejected: usize, encoding: ResponseEncoding) -> Response {
+    let partial_success = if rejected == 0 {
+        None
+    } else {
+        let Ok(rejected_spans) = i64::try_from(rejected) else {
+            return failure(
+                500,
+                INTERNAL,
+                "OTLP Traces outcome could not be represented",
+                encoding,
+            );
+        };
+        Some(ExportTracePartialSuccess {
+            rejected_spans,
+            error_message: "some spans were permanently rejected".to_owned(),
+        })
+    };
+    match encoding {
+        ResponseEncoding::Protobuf => Response::protobuf(
+            200,
+            ExportTraceServiceResponse { partial_success }.encode_to_vec(),
+        ),
+        ResponseEncoding::Json => match partial_success {
+            None => Response::json(200, "{}".to_owned()),
+            Some(partial) => match serde_json::to_string(&partial.error_message) {
+                Ok(message) => Response::json(
+                    200,
+                    format!(
+                        "{{\"partialSuccess\":{{\"rejectedSpans\":\"{}\",\"errorMessage\":{message}}}}}",
+                        partial.rejected_spans,
+                    ),
+                ),
+                Err(_) => failure(
+                    500,
+                    INTERNAL,
+                    "OTLP Traces response encoding failed",
                     encoding,
                 ),
             },
@@ -305,6 +508,51 @@ fn service_response_with_encoding(
         ),
         ServiceFailure::CorruptState | ServiceFailure::Internal | ServiceFailure::Cancelled => {
             failure(500, INTERNAL, "OTLP Logs ingest failed", encoding)
+        },
+    }
+}
+
+fn trace_service_response_with_encoding(
+    service_failure: ServiceFailure,
+    encoding: ResponseEncoding,
+) -> Response {
+    match service_failure {
+        ServiceFailure::Unauthorized => failure(
+            401,
+            UNAUTHENTICATED,
+            "OTLP Traces request authentication was rejected",
+            encoding,
+        ),
+        ServiceFailure::CapacityUnavailable => failure(
+            429,
+            RESOURCE_EXHAUSTED,
+            "OTLP Traces ingest capacity is unavailable",
+            encoding,
+        )
+        .with_retry_after(1),
+        ServiceFailure::RequestTooLarge => failure(
+            413,
+            RESOURCE_EXHAUSTED,
+            "OTLP Traces request exceeds the receiver limit",
+            encoding,
+        ),
+        ServiceFailure::InvalidRequest => failure(
+            400,
+            INVALID_ARGUMENT,
+            "OTLP Traces request was rejected",
+            encoding,
+        ),
+        ServiceFailure::KeyUnavailable
+        | ServiceFailure::CatalogUnavailable
+        | ServiceFailure::LedgerUnavailable
+        | ServiceFailure::StorageUnavailable => failure(
+            503,
+            UNAVAILABLE,
+            "OTLP Traces ingest is temporarily unavailable",
+            encoding,
+        ),
+        ServiceFailure::CorruptState | ServiceFailure::Internal | ServiceFailure::Cancelled => {
+            failure(500, INTERNAL, "OTLP Traces ingest failed", encoding)
         },
     }
 }

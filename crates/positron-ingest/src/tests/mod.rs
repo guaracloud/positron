@@ -5,5 +5,6 @@ mod outcomes;
 mod policy;
 mod request_outcome;
 pub(crate) mod support;
+mod trace_outcomes;
 mod transport;
 mod value_limits;

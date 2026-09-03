@@ -2,7 +2,9 @@ use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+use opentelemetry_proto::tonic::collector::{
+    logs::v1::ExportLogsServiceRequest, trace::v1::ExportTraceServiceRequest,
+};
 use positron_governance::AuthorizedContext;
 use positron_ingest::IngestRequestOutcome;
 use positron_kernel::TransferredResourceReservation;
@@ -26,6 +28,7 @@ pub(super) struct BlockingIngestHandle {
 
 enum BlockingIngestJob {
     Ingest(Box<BlockingIngestOperation>),
+    TraceIngest(Box<BlockingTraceIngestOperation>),
     #[cfg(test)]
     Stall {
         entered: std::sync::mpsc::SyncSender<()>,
@@ -36,6 +39,14 @@ struct BlockingIngestOperation {
     services: ServiceHandle,
     context: AuthorizedContext,
     request: ExportLogsServiceRequest,
+    reservation: TransferredResourceReservation,
+    response: tokio::sync::oneshot::Sender<Result<IngestRequestOutcome, ServiceFailure>>,
+}
+
+struct BlockingTraceIngestOperation {
+    services: ServiceHandle,
+    context: AuthorizedContext,
+    request: ExportTraceServiceRequest,
     reservation: TransferredResourceReservation,
     response: tokio::sync::oneshot::Sender<Result<IngestRequestOutcome, ServiceFailure>>,
 }
@@ -128,6 +139,28 @@ impl BlockingIngestHandle {
         outcome.await.map_err(|_| ServiceFailure::Internal)?
     }
 
+    pub(super) async fn ingest_traces(
+        &self,
+        services: ServiceHandle,
+        context: AuthorizedContext,
+        request: ExportTraceServiceRequest,
+        reservation: TransferredResourceReservation,
+    ) -> Result<IngestRequestOutcome, ServiceFailure> {
+        let (response, outcome) = tokio::sync::oneshot::channel();
+        let job = BlockingIngestJob::TraceIngest(Box::new(BlockingTraceIngestOperation {
+            services,
+            context,
+            request,
+            reservation,
+            response,
+        }));
+        self.sender.try_send(job).map_err(|failure| match failure {
+            TrySendError::Full(_) => ServiceFailure::CapacityUnavailable,
+            TrySendError::Disconnected(_) => ServiceFailure::Internal,
+        })?;
+        outcome.await.map_err(|_| ServiceFailure::Internal)?
+    }
+
     #[cfg(test)]
     pub(super) fn stall_for_test(
         &self,
@@ -152,6 +185,17 @@ fn run(receiver: Receiver<BlockingIngestJob>, cancellation: TaskCancellation) {
                     continue;
                 }
                 let result = operation.services.ingest_decoded_otlp_logs(
+                    operation.context,
+                    operation.request,
+                    operation.reservation,
+                );
+                let _ = operation.response.send(result);
+            },
+            BlockingIngestJob::TraceIngest(operation) => {
+                if cancellation.is_cancelled() {
+                    continue;
+                }
+                let result = operation.services.ingest_decoded_otlp_traces(
                     operation.context,
                     operation.request,
                     operation.reservation,

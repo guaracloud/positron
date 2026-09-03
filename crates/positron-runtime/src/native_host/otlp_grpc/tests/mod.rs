@@ -4,11 +4,15 @@ use positron_ingest::{
 };
 use tonic::Code;
 
-use super::{map_decode_failure, render, service_status};
+use super::{map_decode_failure, render, service_status, trace_render, trace_service_status};
 use crate::ServiceFailure;
 
 mod blocking_executor;
 mod persistence_outcomes;
+mod trace_cancellation;
+mod trace_support;
+mod trace_wire;
+mod trace_wire_errors;
 
 #[test]
 fn retryable_outcomes_have_stable_public_statuses() {
@@ -101,6 +105,81 @@ fn runtime_service_failures_keep_one_stable_public_taxonomy() {
         ),
     ] {
         let status = service_status(failure);
+        assert_eq!(status.code(), code);
+        assert_eq!(status.message(), message);
+    }
+}
+
+#[test]
+fn trace_outcomes_keep_retry_permanent_and_ambiguous_classes() {
+    let capacity = trace_render(single(IngestOutcome::Retryable(
+        IngestFailureCode::CapacityUnavailable,
+    )))
+    .expect_err("trace capacity refusal must remain retryable");
+    assert_eq!(capacity.code(), Code::ResourceExhausted);
+    assert_eq!(
+        capacity.message(),
+        "OTLP Traces ingest capacity is unavailable"
+    );
+
+    let permanent = trace_render(single(IngestOutcome::Permanent(
+        IngestFailureCode::PolicyRejected,
+    )))
+    .expect_err("trace policy rejection must remain permanent");
+    assert_eq!(permanent.code(), Code::InvalidArgument);
+    assert_eq!(permanent.message(), "OTLP Traces request was rejected");
+
+    let ambiguous = trace_render(single(IngestOutcome::Ambiguous(
+        IngestFailureCode::StorageUnavailable,
+    )))
+    .expect_err("trace commit ambiguity must require an at-least-once retry");
+    assert_eq!(ambiguous.code(), Code::Unavailable);
+    assert_eq!(
+        ambiguous.message(),
+        "OTLP Traces commit outcome is ambiguous; retry may duplicate spans"
+    );
+}
+
+#[test]
+fn trace_service_failures_keep_stable_protocol_statuses() {
+    for (failure, code, message) in [
+        (
+            ServiceFailure::Unauthorized,
+            Code::Unauthenticated,
+            "OTLP Traces request authentication was rejected",
+        ),
+        (
+            ServiceFailure::CapacityUnavailable,
+            Code::ResourceExhausted,
+            "OTLP Traces ingest capacity is unavailable",
+        ),
+        (
+            ServiceFailure::RequestTooLarge,
+            Code::ResourceExhausted,
+            "OTLP Traces request exceeds the receiver limit",
+        ),
+        (
+            ServiceFailure::InvalidRequest,
+            Code::InvalidArgument,
+            "OTLP Traces request was rejected",
+        ),
+        (
+            ServiceFailure::StorageUnavailable,
+            Code::Unavailable,
+            "OTLP Traces ingest is temporarily unavailable",
+        ),
+        (
+            ServiceFailure::Internal,
+            Code::Internal,
+            "OTLP Traces ingest failed",
+        ),
+        (
+            ServiceFailure::Cancelled,
+            Code::Internal,
+            "OTLP Traces ingest failed",
+        ),
+    ] {
+        let status = trace_service_status(failure);
         assert_eq!(status.code(), code);
         assert_eq!(status.message(), message);
     }

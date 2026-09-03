@@ -9,8 +9,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::collector::logs::v1::logs_service_client::LogsServiceClient;
-use opentelemetry_proto::tonic::common::v1::{AnyValue, any_value};
+use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+use opentelemetry_proto::tonic::collector::trace::v1::trace_service_client::TraceServiceClient;
+use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 use positron_ingest::{
     AdmissionGroupOutcome, IngestFailureCode, IngestOutcome, IngestRequestOutcome,
     NativeLogAdmissionGroups,
@@ -84,6 +87,84 @@ async fn live_receiver_distinguishes_precommit_retry_from_postcommit_ambiguity()
     )
     .await??;
     assert_eq!(backend.committed_records(), 3);
+    drop(client);
+    harness.finish()?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn live_trace_receiver_accepts_authenticated_protobuf_and_gzip_clients()
+-> Result<(), Box<dyn std::error::Error>> {
+    let harness = ReceiverHarness::start(Arc::new(ScriptedBackend::new([])))?;
+    let mut client = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        TraceServiceClient::connect(format!("http://{}", harness.endpoint)),
+    )
+    .await??;
+
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        client.export(harness.authorize_trace(trace_request(0x31))?),
+    )
+    .await??;
+    assert!(response.into_inner().partial_success.is_none());
+
+    let mut unsupported = trace_request(0x39);
+    unsupported
+        .get_mut()
+        .resource_spans
+        .first_mut()
+        .and_then(|resource| resource.scope_spans.first_mut())
+        .and_then(|scope| scope.spans.first_mut())
+        .ok_or("trace fixture span missing")?
+        .attributes
+        .push(KeyValue {
+            key: "profile-only".to_owned(),
+            key_strindex: 1,
+            ..KeyValue::default()
+        });
+    let failure = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        client.export(harness.authorize_trace(unsupported)?),
+    )
+    .await?
+    .expect_err("unsupported development field must be rejected");
+    assert_eq!(failure.code(), Code::InvalidArgument);
+    assert_eq!(failure.message(), "OTLP Traces request was rejected");
+
+    let mut gzip_client = client.send_compressed(tonic::codec::CompressionEncoding::Gzip);
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        gzip_client.export(harness.authorize_trace(trace_request(0x41))?),
+    )
+    .await??;
+    assert!(response.into_inner().partial_success.is_none());
+
+    drop(gzip_client);
+    harness.finish()?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn live_trace_receiver_rejects_missing_authentication()
+-> Result<(), Box<dyn std::error::Error>> {
+    let harness = ReceiverHarness::start(Arc::new(ScriptedBackend::new([])))?;
+    let mut client = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        TraceServiceClient::connect(format!("http://{}", harness.endpoint)),
+    )
+    .await??;
+    let failure = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        client.export(trace_request(0x51)),
+    )
+    .await?
+    .expect_err("trace authentication is required");
+    assert_eq!(failure.code(), Code::Unauthenticated);
+    assert_eq!(
+        failure.message(),
+        "OTLP Traces request authentication was rejected"
+    );
     drop(client);
     harness.finish()?;
     Ok(())
@@ -223,6 +304,16 @@ impl ReceiverHarness {
         Ok(request)
     }
 
+    fn authorize_trace(
+        &self,
+        mut request: tonic::Request<ExportTraceServiceRequest>,
+    ) -> Result<tonic::Request<ExportTraceServiceRequest>, Box<dyn std::error::Error>> {
+        request
+            .metadata_mut()
+            .insert("authorization", format!("Bearer {}", self.bearer).parse()?);
+        Ok(request)
+    }
+
     fn finish(mut self) -> Result<(), Box<dyn std::error::Error>> {
         self.stop()
     }
@@ -258,6 +349,25 @@ fn request(body: &str) -> tonic::Request<ExportLogsServiceRequest> {
                 ..ScopeLogs::default()
             }],
             ..ResourceLogs::default()
+        }],
+    })
+}
+
+fn trace_request(seed: u8) -> tonic::Request<ExportTraceServiceRequest> {
+    tonic::Request::new(ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            scope_spans: vec![ScopeSpans {
+                spans: vec![Span {
+                    trace_id: vec![seed; 16],
+                    span_id: vec![seed.wrapping_add(1); 8],
+                    name: "grpc-trace".to_owned(),
+                    start_time_unix_nano: 42,
+                    end_time_unix_nano: 84,
+                    ..Span::default()
+                }],
+                ..ScopeSpans::default()
+            }],
+            ..ResourceSpans::default()
         }],
     })
 }

@@ -5,6 +5,10 @@ use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsSe
 use opentelemetry_proto::tonic::collector::logs::v1::{
     ExportLogsPartialSuccess, ExportLogsServiceRequest, ExportLogsServiceResponse,
 };
+use opentelemetry_proto::tonic::collector::trace::v1::trace_service_server::TraceService;
+use opentelemetry_proto::tonic::collector::trace::v1::{
+    ExportTracePartialSuccess, ExportTraceServiceRequest, ExportTraceServiceResponse,
+};
 use positron_governance::{AuthorizedContext, CompatibilityHints};
 use positron_ingest::{IngestFailureCode, IngestOutcome, IngestRequestOutcome};
 use tokio_stream::wrappers::TcpListenerStream;
@@ -24,6 +28,8 @@ mod blocking;
 use blocking::{BlockingIngestExecutor, BlockingIngestHandle};
 mod codec;
 use codec::OtlpLogsServer;
+mod trace_codec;
+use trace_codec::OtlpTracesServer;
 
 #[cfg(test)]
 mod tests;
@@ -49,9 +55,10 @@ pub(super) fn serve(
         };
         let incoming = TcpListenerStream::new(listener);
         let authentication = services.clone();
+        let trace_authentication = services.clone();
         let receiver = OtlpLogsServer::new(OtlpLogsGrpc {
-            services,
-            blocking: blocking_handle,
+            services: services.clone(),
+            blocking: blocking_handle.clone(),
         })
         .accept_compressed(CompressionEncoding::Gzip)
         .max_decoding_message_size(MAX_MESSAGE_BYTES);
@@ -59,9 +66,19 @@ pub(super) fn serve(
         let receiver = InterceptedService::new(receiver, move |request| {
             authenticate(request, &authentication)
         });
+        let trace_receiver = OtlpTracesServer::new(OtlpTracesGrpc {
+            services,
+            blocking: blocking_handle,
+        })
+        .accept_compressed(CompressionEncoding::Gzip)
+        .max_decoding_message_size(MAX_MESSAGE_BYTES);
+        let trace_receiver = InterceptedService::new(trace_receiver, move |request| {
+            authenticate_traces(request, &trace_authentication)
+        });
         let graceful_admission = Arc::clone(&admission);
         let serving = Server::builder()
             .add_service(receiver)
+            .add_service(trace_receiver)
             .serve_with_incoming_shutdown(incoming, async move {
                 while graceful_admission.is_accepting() && !cancellation.is_cancelled() {
                     tokio::time::sleep(Duration::from_millis(5)).await;
@@ -140,8 +157,48 @@ fn authentication_rejected() -> Status {
     Status::unauthenticated("OTLP Logs request authentication was rejected")
 }
 
+fn authenticate_traces(
+    mut request: Request<()>,
+    services: &ServiceHandle,
+) -> Result<Request<()>, Status> {
+    let bearer = request
+        .metadata()
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .ok_or_else(trace_authentication_rejected)?;
+    let hints = request
+        .metadata()
+        .get("x-scope-orgid")
+        .map(|value| value.to_str().map_err(|_| trace_authentication_rejected()))
+        .transpose()?
+        .map(CompatibilityHints::external_tenant_alias)
+        .transpose()
+        .map_err(|_| trace_authentication_rejected())?
+        .unwrap_or_else(CompatibilityHints::none);
+    let context = services
+        .authorize_traces_with_hints(bearer, hints)
+        .map_err(|_| trace_authentication_rejected())?;
+    let admission = services
+        .admit_traces(context)
+        .map_err(trace_service_status)?;
+    request.extensions_mut().insert(context);
+    request.extensions_mut().insert(admission);
+    Ok(request)
+}
+
+fn trace_authentication_rejected() -> Status {
+    Status::unauthenticated("OTLP Traces request authentication was rejected")
+}
+
 #[derive(Clone, Debug)]
 struct OtlpLogsGrpc {
+    services: ServiceHandle,
+    blocking: BlockingIngestHandle,
+}
+
+#[derive(Clone, Debug)]
+struct OtlpTracesGrpc {
     services: ServiceHandle,
     blocking: BlockingIngestHandle,
 }
@@ -182,6 +239,45 @@ impl LogsService for OtlpLogsGrpc {
             .await
             .map_err(service_status)?;
         render(outcome)
+    }
+}
+
+#[tonic::async_trait]
+impl TraceService for OtlpTracesGrpc {
+    async fn export(
+        &self,
+        mut request: Request<ExportTraceServiceRequest>,
+    ) -> Result<Response<ExportTraceServiceResponse>, Status> {
+        let context = request
+            .extensions()
+            .get::<AuthorizedContext>()
+            .copied()
+            .ok_or_else(trace_authentication_rejected)?;
+        let admission = request
+            .extensions_mut()
+            .remove::<crate::services::ReceiverAdmissionLease>()
+            .ok_or_else(|| Status::internal("OTLP Traces admission context was unavailable"))?;
+        let reservation = admission.take().map_err(trace_service_status)?;
+        if request.get_ref().resource_spans.iter().all(|resource| {
+            resource
+                .scope_spans
+                .iter()
+                .all(|scope| scope.spans.is_empty())
+        }) {
+            drop(reservation);
+            return trace_render(IngestRequestOutcome::new(Vec::new()));
+        }
+        let outcome = self
+            .blocking
+            .ingest_traces(
+                self.services.clone(),
+                context,
+                request.into_inner(),
+                reservation,
+            )
+            .await
+            .map_err(trace_service_status)?;
+        trace_render(outcome)
     }
 }
 
@@ -246,6 +342,75 @@ fn service_status(failure: ServiceFailure) -> Status {
         },
         ServiceFailure::CorruptState | ServiceFailure::Internal | ServiceFailure::Cancelled => {
             Status::internal("OTLP Logs ingest failed")
+        },
+    }
+}
+
+fn trace_render(
+    outcome: IngestRequestOutcome,
+) -> Result<Response<ExportTraceServiceResponse>, Status> {
+    if let Some(failure) = outcome.terminal_failure() {
+        return trace_render_failure(failure);
+    }
+    let rejected = outcome.permanently_rejected_records();
+    if rejected == 0 {
+        Ok(Response::new(ExportTraceServiceResponse {
+            partial_success: None,
+        }))
+    } else {
+        let rejected_spans = i64::try_from(rejected)
+            .map_err(|_| Status::internal("OTLP Traces outcome could not be represented"))?;
+        Ok(Response::new(ExportTraceServiceResponse {
+            partial_success: Some(ExportTracePartialSuccess {
+                rejected_spans,
+                error_message: "some spans were permanently rejected".to_owned(),
+            }),
+        }))
+    }
+}
+
+fn trace_render_failure(
+    outcome: IngestOutcome,
+) -> Result<Response<ExportTraceServiceResponse>, Status> {
+    match outcome {
+        IngestOutcome::Retryable(IngestFailureCode::CapacityUnavailable) => Err(
+            Status::resource_exhausted("OTLP Traces ingest capacity is unavailable"),
+        ),
+        IngestOutcome::Retryable(_) => Err(Status::unavailable(
+            "OTLP Traces ingest is temporarily unavailable",
+        )),
+        IngestOutcome::Permanent(_) => {
+            Err(Status::invalid_argument("OTLP Traces request was rejected"))
+        },
+        IngestOutcome::Ambiguous(_) => Err(Status::unavailable(
+            "OTLP Traces commit outcome is ambiguous; retry may duplicate spans",
+        )),
+        IngestOutcome::Full(_) | IngestOutcome::Partial(_) => {
+            Err(Status::internal("OTLP Traces outcome aggregation failed"))
+        },
+    }
+}
+
+fn trace_service_status(failure: ServiceFailure) -> Status {
+    match failure {
+        ServiceFailure::Unauthorized => trace_authentication_rejected(),
+        ServiceFailure::CapacityUnavailable => {
+            Status::resource_exhausted("OTLP Traces ingest capacity is unavailable")
+        },
+        ServiceFailure::RequestTooLarge => {
+            Status::resource_exhausted("OTLP Traces request exceeds the receiver limit")
+        },
+        ServiceFailure::InvalidRequest => {
+            Status::invalid_argument("OTLP Traces request was rejected")
+        },
+        ServiceFailure::KeyUnavailable
+        | ServiceFailure::CatalogUnavailable
+        | ServiceFailure::LedgerUnavailable
+        | ServiceFailure::StorageUnavailable => {
+            Status::unavailable("OTLP Traces ingest is temporarily unavailable")
+        },
+        ServiceFailure::CorruptState | ServiceFailure::Internal | ServiceFailure::Cancelled => {
+            Status::internal("OTLP Traces ingest failed")
         },
     }
 }

@@ -126,6 +126,32 @@ fn committed_span_is_visible_immediately_from_the_active_segment() -> Result<(),
     );
     drop(limited);
 
+    let bounded_snapshot = ledger.snapshot()?;
+    let block_bytes = u64::try_from(
+        bounded_snapshot
+            .blocks()
+            .first()
+            .ok_or("missing committed trace block")?
+            .payload()
+            .len(),
+    )?;
+    let exact_bytes = store.scan(
+        authority.governor(),
+        tenant,
+        &bounded_snapshot,
+        TraceScan::all(ScanLimit::new(1)?).with_scanned_bytes(block_bytes),
+    )?;
+    assert!(exact_bytes.complete());
+    assert_eq!(exact_bytes.scanned_bytes(), block_bytes);
+    let one_over_bytes = store.scan(
+        authority.governor(),
+        tenant,
+        &bounded_snapshot,
+        TraceScan::all(ScanLimit::new(1)?).with_scanned_bytes(block_bytes + 1),
+    )?;
+    assert!(one_over_bytes.complete());
+    assert_eq!(one_over_bytes.scanned_bytes(), block_bytes);
+
     let after_result = store.scan(
         authority.governor(),
         tenant,

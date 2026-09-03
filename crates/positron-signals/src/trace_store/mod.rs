@@ -1,20 +1,25 @@
 //! Native Trace Signal Store.
 
 mod codec;
+mod details;
 mod failure;
 #[cfg(fuzzing)]
 mod fuzzing;
+mod observation;
 mod scan;
 mod types;
 
 #[cfg(test)]
 mod tests;
 
-pub use failure::{TraceStoreFailure, TraceStoreFailureCode};
-pub use scan::{ScannedSpanObservation, TraceIncompleteness, TraceScan, TraceScanResult};
-pub use types::{
-    PreparedTraceBlock, SamplingDecision, SpanKind, SpanObservation, StoredSpanObservation,
+pub use details::{
+    SpanAttributeSet, SpanEvent, SpanLink, SpanObservationDetails, SpanResourceMetadata,
+    SpanScopeMetadata, SpanStatus, SpanStatusCode,
 };
+pub use failure::{TraceStoreFailure, TraceStoreFailureCode};
+pub use observation::{SamplingDecision, SpanKind, SpanObservation};
+pub use scan::{ScannedSpanObservation, TraceIncompleteness, TraceScan, TraceScanResult};
+pub use types::{PreparedTraceBlock, StoredSpanObservation};
 
 #[cfg(fuzzing)]
 #[doc(hidden)]

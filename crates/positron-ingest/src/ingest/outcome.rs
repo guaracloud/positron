@@ -59,6 +59,10 @@ impl PartialAdmission {
 }
 
 impl CommittedAdmission {
+    pub(crate) const fn new(receipt: CommitReceipt, records: usize) -> Self {
+        Self { receipt, records }
+    }
+
     #[must_use]
     pub const fn receipt(self) -> CommitReceipt {
         self.receipt

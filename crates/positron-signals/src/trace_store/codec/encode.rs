@@ -2,12 +2,13 @@ use positron_domain::identity::TenantId;
 use positron_domain::time::EventTime;
 use positron_domain::value::AttributeValueKind;
 
+use super::super::details::{SpanAttributeSet, SpanEvent, SpanLink, SpanObservationDetails};
 use super::super::failure::TraceStoreFailure;
 use super::super::types::TraceLimits;
 use super::super::types::{StoredSpanObservation, release_1_limits};
 use super::format::{
     MAGIC, MAX_BLOCK_BYTES, MAX_RECORDS, VERSION, kind_tag, namespace_tag, quality_tag,
-    sampling_tag,
+    sampling_tag, status_tag,
 };
 
 pub(crate) fn encode_block(
@@ -64,6 +65,7 @@ fn encode_observation(
             encode_value(output, value, limits.nesting_depth)?;
         }
     }
+    encode_details(output, observation.details(), limits.nesting_depth)?;
     let policy = observation.policy_provenance();
     put_u64(output, policy.generation())?;
     put_slice(output, &policy.digest())?;
@@ -72,6 +74,75 @@ fn encode_observation(
         put_bytes(output, rule.as_bytes())?;
     }
     put_i64(output, stored.ingest_time().instant().value())?;
+    Ok(())
+}
+
+fn encode_details(
+    output: &mut Vec<u8>,
+    details: &SpanObservationDetails,
+    depth: u8,
+) -> Result<(), TraceStoreFailure> {
+    put_bytes(output, details.trace_state().as_bytes())?;
+    put_u32(output, details.flags())?;
+    put_u8(output, status_tag(details.status().code()))?;
+    put_bytes(output, details.status().message().as_bytes())?;
+    put_u32(output, details.dropped_attributes_count())?;
+    put_u32(output, details.dropped_events_count())?;
+    put_u32(output, details.dropped_links_count())?;
+    put_u32(output, details.resource().dropped_attributes_count())?;
+    put_bytes(output, details.resource().schema_url().as_bytes())?;
+    put_bytes(output, details.scope().name().as_bytes())?;
+    put_bytes(output, details.scope().version().as_bytes())?;
+    put_u32(output, details.scope().dropped_attributes_count())?;
+    put_bytes(output, details.scope().schema_url().as_bytes())?;
+    put_count(output, details.events().len())?;
+    for event in details.events() {
+        encode_event(output, event, depth)?;
+    }
+    put_count(output, details.links().len())?;
+    for link in details.links() {
+        encode_link(output, link, depth)?;
+    }
+    Ok(())
+}
+
+fn encode_event(
+    output: &mut Vec<u8>,
+    event: &SpanEvent,
+    depth: u8,
+) -> Result<(), TraceStoreFailure> {
+    encode_time(output, event.timestamp())?;
+    put_bytes(output, event.name().as_bytes())?;
+    put_u32(output, event.dropped_attributes_count())?;
+    encode_span_attributes(output, event.attributes(), depth)
+}
+
+fn encode_link(output: &mut Vec<u8>, link: &SpanLink, depth: u8) -> Result<(), TraceStoreFailure> {
+    put_slice(output, &link.trace_id())?;
+    put_slice(output, &link.span_id())?;
+    put_bytes(output, link.trace_state().as_bytes())?;
+    put_u32(output, link.flags())?;
+    put_u32(output, link.dropped_attributes_count())?;
+    encode_span_attributes(output, link.attributes(), depth)
+}
+
+fn encode_span_attributes(
+    output: &mut Vec<u8>,
+    attributes: &[SpanAttributeSet],
+    depth: u8,
+) -> Result<(), TraceStoreFailure> {
+    let limits = limits()?;
+    put_count(output, attributes.len())?;
+    for attribute in attributes {
+        put_bytes(output, attribute.key().as_bytes())?;
+        put_count(output, attribute.len())?;
+        for index in 0..attribute.len() {
+            let value = attribute
+                .occurrence(index)
+                .ok_or_else(TraceStoreFailure::invalid_input)?;
+            encode_value(output, value, depth.min(limits.nesting_depth))?;
+        }
+    }
     Ok(())
 }
 
@@ -193,6 +264,10 @@ fn put_u8(output: &mut Vec<u8>, value: u8) -> Result<(), TraceStoreFailure> {
 }
 
 fn put_u16(output: &mut Vec<u8>, value: u16) -> Result<(), TraceStoreFailure> {
+    put_slice(output, &value.to_be_bytes())
+}
+
+fn put_u32(output: &mut Vec<u8>, value: u32) -> Result<(), TraceStoreFailure> {
     put_slice(output, &value.to_be_bytes())
 }
 
