@@ -7,7 +7,7 @@ use positron_kernel::{ResourceAmounts, ResourceReservation};
 use crate::{AdmissionGroupPlanFailure, AdmissionGroupPlanner};
 
 use super::NativeSpanBatch;
-use super::bounds::retained_batch_bytes;
+use super::bounds::retained_native_batch_bytes;
 
 /// One planned native batch sharing tenant, Trace Store, and virtual shard.
 #[derive(Debug)]
@@ -77,7 +77,7 @@ impl<'authority> NativeSpanBatch<'authority> {
             attribution,
             records,
             value_limit_profile,
-            decoded_bytes,
+            decoded_bytes: _,
             mut capacity,
             receiver,
             rejections,
@@ -90,7 +90,7 @@ impl<'authority> NativeSpanBatch<'authority> {
                 _retained_capacity: capacity,
             });
         }
-        let grouped_bytes = retained_batch_bytes(decoded_bytes, record_count)
+        let grouped_bytes = retained_native_batch_bytes(&records)
             .map_err(|_| AdmissionGroupPlanFailure::RecordCountExceeded)?;
         if let Some(retained) = capacity.as_mut() {
             retained

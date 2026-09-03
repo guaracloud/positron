@@ -16,8 +16,8 @@ pub(super) struct TraceLimits {
     pub(super) decoded_bytes: usize,
 }
 
-pub(super) fn release_1_limits() -> Result<TraceLimits, TraceStoreFailure> {
-    let profile = ValueLimitProfile::release_1_system_maximum().effective_limits();
+pub(super) fn limits_for(profile: &ValueLimitProfile) -> Result<TraceLimits, TraceStoreFailure> {
+    let profile = profile.effective_limits();
     let dynamic = profile.dynamic_value();
     Ok(TraceLimits {
         attribute_sets: usize::try_from(

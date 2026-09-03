@@ -6,6 +6,7 @@ mod failure;
 #[cfg(fuzzing)]
 mod fuzzing;
 mod observation;
+mod retained;
 mod scan;
 mod types;
 
@@ -47,6 +48,17 @@ impl TraceStore {
         preparation: positron_kernel::StoreBlockPreparation<'capacity>,
         observations: Vec<SpanObservation>,
     ) -> Result<PreparedTraceBlock<'capacity>, TraceStoreFailure> {
+        let profile = Self::value_limit_profile();
+        self.prepare_with_profile(&profile, preparation, observations)
+    }
+
+    /// Prepares canonical bytes under one pinned effective value profile.
+    pub fn prepare_with_profile<'capacity>(
+        &self,
+        profile: &positron_domain::value::ValueLimitProfile,
+        preparation: positron_kernel::StoreBlockPreparation<'capacity>,
+        observations: Vec<SpanObservation>,
+    ) -> Result<PreparedTraceBlock<'capacity>, TraceStoreFailure> {
         if preparation.scope().signal_kind() != positron_domain::routing::SignalKind::Traces {
             return Err(TraceStoreFailure::physical_scope_mismatch());
         }
@@ -64,7 +76,8 @@ impl TraceStore {
         for observation in observations {
             stored.push(StoredSpanObservation::new(observation, ingest_time));
         }
-        let bytes = codec::encode_block(preparation.scope().tenant_id(), &stored)?;
+        let bytes =
+            codec::encode_block_with_profile(profile, preparation.scope().tenant_id(), &stored)?;
         let block = preparation
             .finish(bytes)
             .map_err(TraceStoreFailure::kernel)?;

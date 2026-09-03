@@ -65,17 +65,23 @@ pub(super) fn validate_json(
     json::validate(json, profile)
 }
 
-pub(super) fn retained_batch_bytes(
-    decoded_bytes: u64,
-    records: usize,
+pub(super) fn retained_native_batch_bytes(
+    records: &[positron_signals::SpanObservation],
 ) -> Result<u64, TraceReceiveFailure> {
-    decoded_bytes
-        .checked_add(
-            u64::try_from(records)
-                .map_err(|_| TraceReceiveFailure::ValueLimitExceeded)?
-                .saturating_mul(512),
+    records.iter().try_fold(0_u64, |total, record| {
+        let native = u64::try_from(std::mem::size_of::<positron_signals::SpanObservation>())
+            .map_err(|_| TraceReceiveFailure::ValueLimitExceeded)?;
+        let heap = u64::try_from(
+            record
+                .retained_heap_bytes()
+                .map_err(|_| TraceReceiveFailure::ValueLimitExceeded)?,
         )
-        .ok_or(TraceReceiveFailure::ValueLimitExceeded)
+        .map_err(|_| TraceReceiveFailure::ValueLimitExceeded)?;
+        total
+            .checked_add(native)
+            .and_then(|size| size.checked_add(heap))
+            .ok_or(TraceReceiveFailure::ValueLimitExceeded)
+    })
 }
 
 struct Limits {
@@ -94,7 +100,7 @@ struct Limits {
 
 impl Limits {
     fn from_profile(profile: ValueLimitProfile) -> Result<Self, TraceReceiveFailure> {
-        let system = profile.system_limits();
+        let system = profile.effective_limits();
         let dynamic = system.dynamic_value();
         let containers = 1_024;
         let records = usize::try_from(system.request().records().value())

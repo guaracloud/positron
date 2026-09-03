@@ -1,8 +1,9 @@
 use positron_domain::identity::TenantId;
 use positron_domain::time::SourceTimeQuality;
+use positron_domain::value::ValueLimitProfile;
 
 use super::super::failure::TraceStoreFailure;
-use super::super::types::{TraceLimits, release_1_limits};
+use super::super::types::TraceLimits;
 use super::decode::Input;
 use super::format::{
     MAGIC, MAX_RECORDS, VERSION, decode_kind, decode_namespace, decode_quality, decode_sampling,
@@ -12,13 +13,25 @@ use crate::{ScanCancellation, ScanObserver};
 
 /// Computes a conservative peak heap bound without constructing a decoded
 /// value. The scan reserves this amount before its first allocating decode.
+#[cfg(any(test, fuzzing))]
 pub(crate) fn decoded_memory_bound(
     expected_tenant: TenantId,
     bytes: &[u8],
     cancellation: &dyn ScanCancellation,
     observer: &dyn ScanObserver,
 ) -> Result<u64, TraceStoreFailure> {
-    let limits = release_1_limits()?;
+    let profile = ValueLimitProfile::release_1_system_maximum();
+    decoded_memory_bound_with_profile(expected_tenant, bytes, cancellation, observer, &profile)
+}
+
+pub(crate) fn decoded_memory_bound_with_profile(
+    expected_tenant: TenantId,
+    bytes: &[u8],
+    cancellation: &dyn ScanCancellation,
+    observer: &dyn ScanObserver,
+    profile: &ValueLimitProfile,
+) -> Result<u64, TraceStoreFailure> {
+    let limits = super::super::types::limits_for(profile)?;
     let mut input = Input::observed(bytes, cancellation, observer);
     input.observe_component()?;
     if input.take(MAGIC.len())? != MAGIC {

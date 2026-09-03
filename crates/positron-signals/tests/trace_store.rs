@@ -2,7 +2,8 @@ use positron_domain::identity::TenantId;
 use positron_domain::routing::{SignalKind, VirtualShardId};
 use positron_domain::time::{EventTime, SourceTimeQuality, UnixNanoseconds};
 use positron_domain::value::{
-    AttributeNamespace, AttributeOccurrenceSetCandidate, CandidateAttributeValue, ValueLimitProfile,
+    AttributeNamespace, ByteLimit, CandidateAttributeValue, DynamicValueLimits, RecordLimits,
+    ValueLimitProfile, ValueLimitProfileCandidate, ValueLimitSet,
 };
 use positron_kernel::{
     ActiveSegmentLedger, Catalog, CatalogSecret, DiskPressureThresholds, GovernorPolicy,
@@ -13,10 +14,14 @@ use positron_kernel::{
     SegmentProtectionKey, SegmentScope, StorageKernelResourceAuthority, TenantQuota, WorkClaim,
     WorkKind,
 };
+use positron_policy::{
+    IngestPolicy, NativePolicyAttribute, NativeTraceCandidate, PolicyReceiver,
+    TracePolicyEvaluation,
+};
 use positron_signals::{
-    PolicyProvenance, SamplingDecision, ScanLimit, SpanAttributeSet, SpanEvent, SpanKind, SpanLink,
-    SpanObservation, SpanObservationDetails, SpanResourceMetadata, SpanScopeMetadata, SpanStatus,
-    SpanStatusCode, TraceScan, TraceStore,
+    SamplingDecision, ScanLimit, SpanAttributeSet, SpanEvent, SpanKind, SpanLink, SpanObservation,
+    SpanObservationDetails, SpanResourceMetadata, SpanScopeMetadata, SpanStatus, SpanStatusCode,
+    TraceScan, TraceStore,
 };
 use std::error::Error;
 use std::fs;
@@ -85,26 +90,96 @@ fn public_trace_store_seam_commits_and_reads_a_native_observation() -> Result<()
             "https://scope.example/v2".to_owned(),
         )?,
     )?;
-    let observation = SpanObservation::checked_native_with_details(
+    let policy = IngestPolicy::preserving(7)?;
+    let evaluated = match policy.evaluate_trace(
+        NativeTraceCandidate::new(vec![NativePolicyAttribute::new(
+            AttributeNamespace::Resource,
+            "k".repeat(SpanObservation::MAX_NAME_BYTES),
+            vec![CandidateAttributeValue::boolean(true)],
+        )]),
+        PolicyReceiver::OtlpGrpc,
+    )? {
+        TracePolicyEvaluation::Accepted(evaluated) => *evaluated,
+        TracePolicyEvaluation::Rejected => return Err("preserving policy rejected span".into()),
+    };
+    let observation = SpanObservation::checked_evaluated(
+        ValueLimitProfile::release_1_system_maximum(),
         [0x86; 16],
         [0x87; 8],
         None,
         "public".to_owned(),
         EventTime::received(UnixNanoseconds::new(1), SourceTimeQuality::Usable)?,
         EventTime::missing(),
-        vec![
-            AttributeOccurrenceSetCandidate::new(
-                AttributeNamespace::Resource,
-                "k".repeat(SpanObservation::MAX_NAME_BYTES),
-                vec![CandidateAttributeValue::boolean(true)],
-            )
-            .validate(ValueLimitProfile::release_1_system_maximum())?,
-        ],
         SpanKind::Server,
         SamplingDecision::Unknown,
-        PolicyProvenance::new(7, [0x91; 32], Vec::new())?,
+        evaluated,
         details.clone(),
     )?;
+    let lowered = profile_with_key_limit(4);
+    let over_evaluated = match policy.evaluate_trace(
+        NativeTraceCandidate::new(Vec::new()),
+        PolicyReceiver::OtlpGrpc,
+    )? {
+        TracePolicyEvaluation::Accepted(evaluated) => *evaluated,
+        TracePolicyEvaluation::Rejected => return Err("preserving policy rejected span".into()),
+    };
+    let over_observation = SpanObservation::checked_evaluated(
+        ValueLimitProfile::release_1_system_maximum(),
+        [0x86; 16],
+        [0x8f; 8],
+        None,
+        "four".to_owned(),
+        EventTime::missing(),
+        EventTime::missing(),
+        SpanKind::Internal,
+        SamplingDecision::Unknown,
+        over_evaluated,
+        details.clone(),
+    )?;
+    let exact_evaluated = match policy.evaluate_trace(
+        NativeTraceCandidate::new(Vec::new()),
+        PolicyReceiver::OtlpGrpc,
+    )? {
+        TracePolicyEvaluation::Accepted(evaluated) => *evaluated,
+        TracePolicyEvaluation::Rejected => return Err("preserving policy rejected span".into()),
+    };
+    let exact = SpanObservation::checked_evaluated(
+        lowered,
+        [0x86; 16],
+        [0x88; 8],
+        None,
+        "four".to_owned(),
+        EventTime::missing(),
+        EventTime::missing(),
+        SpanKind::Internal,
+        SamplingDecision::Unknown,
+        exact_evaluated,
+        SpanObservationDetails::default(),
+    )?;
+    let exact_prepared = TraceStore::new().prepare_with_profile(
+        &lowered,
+        ledger.begin_store_block(
+            preparation_capacity(&authority, tenant)?,
+            positron_kernel::StoreBlockIdentity::new([0x8d; 16])?,
+        )?,
+        vec![exact],
+    )?;
+    drop(exact_prepared);
+    let over_failure = match TraceStore::new().prepare_with_profile(
+        &lowered,
+        ledger.begin_store_block(
+            preparation_capacity(&authority, tenant)?,
+            positron_kernel::StoreBlockIdentity::new([0x8e; 16])?,
+        )?,
+        vec![over_observation],
+    ) {
+        Ok(_) => return Err("Trace Store accepted a lowered-profile overflow".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(
+        over_failure.code(),
+        positron_signals::TraceStoreFailureCode::LimitExceeded
+    );
     let empty_failure = TraceStore::new()
         .prepare(
             ledger.begin_store_block(
@@ -388,4 +463,31 @@ fn add(left: ResourceAmounts, right: ResourceAmounts) -> Result<ResourceAmounts,
         value(ResourceDimension::FileDescriptors)?,
         value(ResourceDimension::DiskHeadroomBytes)?,
     ]))
+}
+
+fn profile_with_key_limit(key_path_bytes: u32) -> ValueLimitProfile {
+    let maximum = ValueLimitProfile::release_1_system_maximum();
+    let dynamic = maximum.effective_limits().dynamic_value();
+    let lowered = DynamicValueLimits::new(
+        dynamic.individual_value_bytes(),
+        dynamic.attributes_per_namespace(),
+        ByteLimit::new(key_path_bytes).expect("valid key bound"),
+        dynamic.nesting_depth(),
+        dynamic.array_entries(),
+        dynamic.key_value_list_entries(),
+    );
+    ValueLimitProfileCandidate::new(
+        maximum.system_limits(),
+        Some(ValueLimitSet::new(
+            maximum.effective_limits().request(),
+            RecordLimits::new(
+                maximum.effective_limits().record().encoded_bytes(),
+                maximum.effective_limits().record().decoded_bytes(),
+                maximum.effective_limits().record().log_body_bytes(),
+            ),
+            lowered,
+        )),
+    )
+    .validate()
+    .expect("lowered profile")
 }

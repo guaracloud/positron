@@ -7,9 +7,13 @@ mod format;
 #[cfg(test)]
 mod tests;
 
+#[cfg(any(test, fuzzing))]
 pub(super) use bounds::decoded_memory_bound;
+pub(super) use bounds::decoded_memory_bound_with_profile;
 pub(super) use decode::BlockDecode;
+#[cfg(any(test, fuzzing))]
 pub(super) use encode::encode_block;
+pub(super) use encode::encode_block_with_profile;
 pub(super) use format::MAX_RECORDS;
 
 #[cfg(test)]

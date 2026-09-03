@@ -171,6 +171,52 @@ impl AttributeOccurrenceSet {
         )
     }
 
+    /// Returns the exact heap capacity retained by this checked occurrence set.
+    pub fn retained_heap_bytes(&self) -> Result<usize, DomainFailure> {
+        let mut retained = self.key.capacity();
+        retained = retained
+            .checked_add(
+                self.occurrences
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<ValidatedAttributeValue>())
+                    .ok_or_else(DomainFailure::value_limit_exceeded)?,
+            )
+            .ok_or_else(DomainFailure::value_limit_exceeded)?;
+        for value in &self.occurrences {
+            retained = retained
+                .checked_add(value.retained_heap_bytes()?)
+                .ok_or_else(DomainFailure::value_limit_exceeded)?;
+        }
+        Ok(retained)
+    }
+
+    /// Revalidates this checked occurrence set under a possibly lowered profile.
+    ///
+    /// The traversal does not allocate or alter the native value. It is used
+    /// when a caller transfers an already-typed value into a tenant-bound
+    /// profile with stricter limits.
+    pub fn validate_with_profile(&self, profile: ValueLimitProfile) -> Result<(), DomainFailure> {
+        let limits = profile.effective_limits();
+        if self.key.is_empty()
+            || exceeds_byte_limit(self.key.len(), limits.dynamic_value().key_path_bytes())
+            || self.occurrences.is_empty()
+            || exceeds_collection_limit(
+                self.occurrences.len(),
+                limits.dynamic_value().attributes_per_namespace(),
+            )
+        {
+            return Err(DomainFailure::value_limit_exceeded());
+        }
+        for occurrence in &self.occurrences {
+            occurrence.validate_against(
+                limits,
+                limits.dynamic_value().individual_value_bytes(),
+                limits.dynamic_value().nesting_depth().value(),
+            )?;
+        }
+        Ok(())
+    }
+
     /// Returns the canonical capacity charge for a projected occurrence vector.
     pub fn projected_occurrence_capacity_bytes(
         profile: ValueLimitProfile,

@@ -58,7 +58,7 @@ impl<'service, 'kernel, 'catalog> TraceIngest<'service, 'kernel, 'catalog> {
         cancellation: Option<&AppendCancellation>,
     ) -> IngestOutcome {
         let rejections = batch.rejections();
-        let (attribution, records, _profile, incoming_capacity, _receiver) = batch.into_parts();
+        let (attribution, records, profile, incoming_capacity, _receiver) = batch.into_parts();
         if attribution.scope() != Scope::Ingest || attribution.tenant_id() != self.tenant {
             return IngestOutcome::Permanent(IngestFailureCode::TenantConflict);
         }
@@ -77,12 +77,22 @@ impl<'service, 'kernel, 'catalog> TraceIngest<'service, 'kernel, 'catalog> {
             Ok(value) => value,
             Err(_) => return IngestOutcome::Permanent(IngestFailureCode::ValueLimitExceeded),
         };
-        let memory = match record_count
-            .checked_mul(1_024)
-            .and_then(|record_memory| 1_048_576_u64.checked_add(record_memory))
-        {
-            Some(value) => value,
-            None => return IngestOutcome::Permanent(IngestFailureCode::ValueLimitExceeded),
+        let memory = match records.iter().try_fold(0_u64, |total, record| {
+            let native = u64::try_from(std::mem::size_of::<positron_signals::SpanObservation>())
+                .map_err(|_| ())?;
+            let heap = record.retained_heap_bytes().map_err(|_| ())?;
+            let heap = u64::try_from(heap).map_err(|_| ())?;
+            total
+                .checked_add(native)
+                .and_then(|size| size.checked_add(heap))
+                .ok_or(())
+        }) {
+            // The kernel's Store Block preparation contract has a fixed
+            // 1 MiB floor. Retain the exact native/detail charge above that
+            // floor so admission remains conservative without weakening the
+            // kernel authorization check.
+            Ok(value) => value.max(1_048_576),
+            Err(()) => return IngestOutcome::Permanent(IngestFailureCode::ValueLimitExceeded),
         };
         let amounts = ResourceAmounts::new([
             memory,
@@ -120,11 +130,13 @@ impl<'service, 'kernel, 'catalog> TraceIngest<'service, 'kernel, 'catalog> {
             },
         };
         let prepared = match self.ledger.begin_store_block(capacity, identity) {
-            Ok(preparation) => match TraceStore::new().prepare(preparation, records) {
-                Ok(prepared) => prepared,
-                Err(failure) => {
-                    return classify_store_failure(failure.code());
-                },
+            Ok(preparation) => {
+                match TraceStore::new().prepare_with_profile(&profile, preparation, records) {
+                    Ok(prepared) => prepared,
+                    Err(failure) => {
+                        return classify_store_failure(failure.code());
+                    },
+                }
             },
             Err(failure) => {
                 return classify_ledger_failure(&failure);

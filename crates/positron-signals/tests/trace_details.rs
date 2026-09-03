@@ -1,8 +1,13 @@
 use positron_domain::time::EventTime;
-use positron_domain::value::{CandidateAttributeValue, ValueLimitProfile};
+use positron_domain::value::{
+    ByteLimit, CandidateAttributeValue, DynamicValueLimits, RecordLimits, ValueLimitProfile,
+    ValueLimitProfileCandidate, ValueLimitSet,
+};
+use positron_policy::{IngestPolicy, NativeTraceCandidate, PolicyReceiver, TracePolicyEvaluation};
 use positron_signals::{
-    SpanAttributeSet, SpanEvent, SpanLink, SpanObservationDetails, SpanResourceMetadata,
-    SpanScopeMetadata, SpanStatus, SpanStatusCode, TraceStoreFailureCode,
+    SamplingDecision, SpanAttributeSet, SpanEvent, SpanKind, SpanLink, SpanObservation,
+    SpanObservationDetails, SpanResourceMetadata, SpanScopeMetadata, SpanStatus, SpanStatusCode,
+    TraceStoreFailureCode,
 };
 
 fn profile() -> ValueLimitProfile {
@@ -31,6 +36,76 @@ fn valid_scope() -> SpanScopeMetadata {
         "https://scope.example/v1".to_owned(),
     )
     .expect("valid scope metadata")
+}
+
+fn profile_with_key_limit(key_path_bytes: u32) -> ValueLimitProfile {
+    let maximum = ValueLimitProfile::release_1_system_maximum();
+    let dynamic = maximum.effective_limits().dynamic_value();
+    let lowered = DynamicValueLimits::new(
+        dynamic.individual_value_bytes(),
+        dynamic.attributes_per_namespace(),
+        ByteLimit::new(key_path_bytes).expect("valid key bound"),
+        dynamic.nesting_depth(),
+        dynamic.array_entries(),
+        dynamic.key_value_list_entries(),
+    );
+    ValueLimitProfileCandidate::new(
+        maximum.system_limits(),
+        Some(ValueLimitSet::new(
+            maximum.effective_limits().request(),
+            RecordLimits::new(
+                maximum.effective_limits().record().encoded_bytes(),
+                maximum.effective_limits().record().decoded_bytes(),
+                maximum.effective_limits().record().log_body_bytes(),
+            ),
+            lowered,
+        )),
+    )
+    .validate()
+    .expect("lowered profile")
+}
+
+#[test]
+fn lowered_profile_rejects_system_profile_detail_at_native_seam() {
+    let policy = IngestPolicy::preserving(1).expect("policy");
+    let evaluated = match policy
+        .evaluate_trace(
+            NativeTraceCandidate::new(Vec::new()),
+            PolicyReceiver::OtlpGrpc,
+        )
+        .expect("policy evaluation")
+    {
+        TracePolicyEvaluation::Accepted(evaluated) => *evaluated,
+        TracePolicyEvaluation::Rejected => panic!("preserving policy accepts"),
+    };
+    let details = SpanObservationDetails::checked(
+        String::new(),
+        0,
+        SpanStatus::checked(SpanStatusCode::Error, "12345".to_owned()).expect("system detail"),
+        Vec::new(),
+        Vec::new(),
+        0,
+        0,
+        0,
+        SpanResourceMetadata::checked(0, String::new()).expect("resource"),
+        SpanScopeMetadata::checked(String::new(), String::new(), 0, String::new()).expect("scope"),
+    )
+    .expect("system-profile detail");
+    let failure = SpanObservation::checked_evaluated_with_profile(
+        &profile_with_key_limit(4),
+        [1; 16],
+        [2; 8],
+        None,
+        "span".to_owned(),
+        EventTime::missing(),
+        EventTime::missing(),
+        SpanKind::Internal,
+        SamplingDecision::Unknown,
+        evaluated,
+        details,
+    )
+    .expect_err("system-profile detail must not cross a lowered native profile");
+    assert_eq!(failure.code(), TraceStoreFailureCode::LimitExceeded);
 }
 
 #[test]
