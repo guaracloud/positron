@@ -10,9 +10,7 @@ use opentelemetry_proto::tonic::collector::trace::v1::{
     ExportTracePartialSuccess, ExportTraceServiceRequest, ExportTraceServiceResponse,
 };
 use positron_governance::{AuthorizedContext, CompatibilityHints};
-use positron_ingest::{
-    IngestFailureCode, IngestOutcome, IngestRequestOutcome, OtlpGrpcTransportEvidence,
-};
+use positron_ingest::{IngestRequestOutcome, OtlpGrpcTransportEvidence};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::codec::CompressionEncoding;
 use tonic::service::LayerExt;
@@ -22,6 +20,7 @@ use tonic::{Request, Response, Status};
 use tower::util::MapResponseLayer;
 
 use super::Admission;
+use super::otlp_outcome::{OtlpFailure, OtlpSignal};
 use crate::{ServiceFailure, ServiceHandle, TaskCancellation};
 
 const MAX_MESSAGE_BYTES: usize = 1_048_576;
@@ -167,7 +166,7 @@ fn authenticate(mut request: Request<()>, services: &ServiceHandle) -> Result<Re
 }
 
 fn authentication_rejected() -> Status {
-    Status::unauthenticated("OTLP Logs request authentication was rejected")
+    status_from_failure(OtlpSignal::Logs.authentication_rejected())
 }
 
 fn authenticate_traces(
@@ -201,7 +200,7 @@ fn authenticate_traces(
 }
 
 fn trace_authentication_rejected() -> Status {
-    Status::unauthenticated("OTLP Traces request authentication was rejected")
+    status_from_failure(OtlpSignal::Traces.authentication_rejected())
 }
 
 #[derive(Clone, Debug)]
@@ -302,7 +301,9 @@ impl TraceService for OtlpTracesGrpc {
 
 fn render(outcome: IngestRequestOutcome) -> Result<Response<ExportLogsServiceResponse>, Status> {
     if let Some(failure) = outcome.terminal_failure() {
-        return render_failure(failure);
+        return Err(status_from_failure(
+            OtlpSignal::Logs.outcome_failure(failure),
+        ));
     }
     let rejected = outcome.permanently_rejected_records();
     if rejected == 0 {
@@ -321,55 +322,17 @@ fn render(outcome: IngestRequestOutcome) -> Result<Response<ExportLogsServiceRes
     }
 }
 
-fn render_failure(outcome: IngestOutcome) -> Result<Response<ExportLogsServiceResponse>, Status> {
-    match outcome {
-        IngestOutcome::Retryable(IngestFailureCode::CapacityUnavailable) => Err(
-            Status::resource_exhausted("OTLP Logs ingest capacity is unavailable"),
-        ),
-        IngestOutcome::Retryable(_) => Err(Status::unavailable(
-            "OTLP Logs ingest is temporarily unavailable",
-        )),
-        IngestOutcome::Permanent(_) => {
-            Err(Status::invalid_argument("OTLP Logs request was rejected"))
-        },
-        IngestOutcome::Ambiguous(_) => Err(Status::unavailable(
-            "OTLP Logs commit outcome is ambiguous; retry may duplicate records",
-        )),
-        IngestOutcome::Full(_) | IngestOutcome::Partial(_) => {
-            Err(Status::internal("OTLP Logs outcome aggregation failed"))
-        },
-    }
-}
-
 fn service_status(failure: ServiceFailure) -> Status {
-    match failure {
-        ServiceFailure::Unauthorized => authentication_rejected(),
-        ServiceFailure::CapacityUnavailable => {
-            Status::resource_exhausted("OTLP Logs ingest capacity is unavailable")
-        },
-        ServiceFailure::RequestTooLarge => {
-            Status::resource_exhausted("OTLP Logs request exceeds the receiver limit")
-        },
-        ServiceFailure::InvalidRequest => {
-            Status::invalid_argument("OTLP Logs request was rejected")
-        },
-        ServiceFailure::KeyUnavailable
-        | ServiceFailure::CatalogUnavailable
-        | ServiceFailure::LedgerUnavailable
-        | ServiceFailure::StorageUnavailable => {
-            Status::unavailable("OTLP Logs ingest is temporarily unavailable")
-        },
-        ServiceFailure::CorruptState | ServiceFailure::Internal | ServiceFailure::Cancelled => {
-            Status::internal("OTLP Logs ingest failed")
-        },
-    }
+    status_from_failure(OtlpSignal::Logs.service_failure(failure))
 }
 
 fn trace_render(
     outcome: IngestRequestOutcome,
 ) -> Result<Response<ExportTraceServiceResponse>, Status> {
     if let Some(failure) = outcome.terminal_failure() {
-        return trace_render_failure(failure);
+        return Err(status_from_failure(
+            OtlpSignal::Traces.outcome_failure(failure),
+        ));
     }
     let rejected = outcome.permanently_rejected_records();
     if rejected == 0 {
@@ -388,49 +351,18 @@ fn trace_render(
     }
 }
 
-fn trace_render_failure(
-    outcome: IngestOutcome,
-) -> Result<Response<ExportTraceServiceResponse>, Status> {
-    match outcome {
-        IngestOutcome::Retryable(IngestFailureCode::CapacityUnavailable) => Err(
-            Status::resource_exhausted("OTLP Traces ingest capacity is unavailable"),
-        ),
-        IngestOutcome::Retryable(_) => Err(Status::unavailable(
-            "OTLP Traces ingest is temporarily unavailable",
-        )),
-        IngestOutcome::Permanent(_) => {
-            Err(Status::invalid_argument("OTLP Traces request was rejected"))
-        },
-        IngestOutcome::Ambiguous(_) => Err(Status::unavailable(
-            "OTLP Traces commit outcome is ambiguous; retry may duplicate spans",
-        )),
-        IngestOutcome::Full(_) | IngestOutcome::Partial(_) => {
-            Err(Status::internal("OTLP Traces outcome aggregation failed"))
-        },
-    }
+fn trace_service_status(failure: ServiceFailure) -> Status {
+    status_from_failure(OtlpSignal::Traces.service_failure(failure))
 }
 
-fn trace_service_status(failure: ServiceFailure) -> Status {
-    match failure {
-        ServiceFailure::Unauthorized => trace_authentication_rejected(),
-        ServiceFailure::CapacityUnavailable => {
-            Status::resource_exhausted("OTLP Traces ingest capacity is unavailable")
-        },
-        ServiceFailure::RequestTooLarge => {
-            Status::resource_exhausted("OTLP Traces request exceeds the receiver limit")
-        },
-        ServiceFailure::InvalidRequest => {
-            Status::invalid_argument("OTLP Traces request was rejected")
-        },
-        ServiceFailure::KeyUnavailable
-        | ServiceFailure::CatalogUnavailable
-        | ServiceFailure::LedgerUnavailable
-        | ServiceFailure::StorageUnavailable => {
-            Status::unavailable("OTLP Traces ingest is temporarily unavailable")
-        },
-        ServiceFailure::CorruptState | ServiceFailure::Internal | ServiceFailure::Cancelled => {
-            Status::internal("OTLP Traces ingest failed")
-        },
+fn status_from_failure(failure: OtlpFailure) -> Status {
+    match failure.grpc_code {
+        3 => Status::invalid_argument(failure.message),
+        8 => Status::resource_exhausted(failure.message),
+        13 => Status::internal(failure.message),
+        14 => Status::unavailable(failure.message),
+        16 => Status::unauthenticated(failure.message),
+        _ => Status::internal(failure.message),
     }
 }
 

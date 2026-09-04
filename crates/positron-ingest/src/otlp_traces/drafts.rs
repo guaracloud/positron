@@ -99,6 +99,32 @@ pub(crate) fn native_records(
     Ok((records, rejections))
 }
 
+/// Validates the legacy already-decoded boundary, whose generated protobuf
+/// scalars do not retain fixed64 wire presence. Nonzero values remain
+/// inferably present; a zero value cannot truthfully be classified as either
+/// omitted or explicitly supplied without the raw transport evidence.
+pub(crate) fn validate_legacy_decoded_timestamp_evidence(
+    decoded: &ExportTraceServiceRequest,
+    timestamp_presence: Option<&presence::OtlpTraceTimestampPresence>,
+) -> Result<(), TraceReceiveFailure> {
+    if timestamp_presence.is_some() {
+        return Ok(());
+    }
+    for resource in &decoded.resource_spans {
+        for scope in &resource.scope_spans {
+            for span in &scope.spans {
+                if span.start_time_unix_nano == 0
+                    || span.end_time_unix_nano == 0
+                    || span.events.iter().any(|event| event.time_unix_nano == 0)
+                {
+                    return Err(TraceReceiveFailure::MalformedPayload);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn native_draft(
     span: OtlpSpan,
     resource: &[KeyValue],

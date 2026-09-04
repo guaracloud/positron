@@ -972,6 +972,8 @@ dependencies = [
 name = "positron-runtime"
 version = "0.0.0"
 dependencies = [
+ "bytes",
+ "flate2",
  "http",
  "http-body",
  "opentelemetry-proto",

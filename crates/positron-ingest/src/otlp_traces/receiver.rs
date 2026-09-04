@@ -69,6 +69,7 @@ impl OtlpTracesReceiver {
                     return Err(TraceReceiveFailure::TransportLimitExceeded);
                 }
                 let presence = evidence.timestamp_presence().cloned();
+                decoded::validate_legacy_decoded_timestamp_evidence(&message, presence.as_ref())?;
                 (*message, presence)
             },
             encoded => match transport::bounded_payload(encoded, effective_profile)? {

@@ -170,8 +170,10 @@ fn span_detail_footprint(
 ) -> Result<u64, TraceReceiveFailure> {
     let wire_bytes = wire::span_detail_retained_bytes(span, limits)?;
     let native_bytes = native::span_detail_bytes(span, limits)?;
+    let materialized_detail_string_bytes = native::materialized_detail_string_bytes(span)?;
     wire_bytes
         .checked_add(native_bytes)
+        .and_then(|bytes| bytes.checked_add(materialized_detail_string_bytes))
         .ok_or(TraceReceiveFailure::ValueLimitExceeded)
 }
 

@@ -162,7 +162,7 @@ fn malformed_status() -> Status {
     Status::invalid_argument("OTLP Logs request was malformed")
 }
 
-fn unimplemented_response() -> http::Response<tonic::body::Body> {
+pub(super) fn unimplemented_response() -> http::Response<tonic::body::Body> {
     let mut response = http::Response::new(tonic::body::Body::default());
     response.headers_mut().insert(
         tonic::Status::GRPC_STATUS,

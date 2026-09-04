@@ -108,12 +108,16 @@ fn lowered_record_limit_is_applied_after_policy_on_decoded_grpc() -> Result<(), 
                         trace_id: vec![1; 16],
                         span_id: vec![2; 8],
                         name: "first".to_owned(),
+                        start_time_unix_nano: 1,
+                        end_time_unix_nano: 2,
                         ..Span::default()
                     },
                     Span {
                         trace_id: vec![3; 16],
                         span_id: vec![4; 8],
                         name: "second".to_owned(),
+                        start_time_unix_nano: 3,
+                        end_time_unix_nano: 4,
                         ..Span::default()
                     },
                 ],

@@ -1,8 +1,9 @@
 use positron_ingest::{IngestFailureCode, IngestOutcome};
 
 use super::{
-    ResponseEncoding, decode_status, decode_success, decode_trace_success, ingest_response, single,
-    success, trace_service_response_with_encoding, trace_success,
+    ResponseEncoding, decode_status, decode_success, decode_trace_success, ingest_response,
+    service_response_with_encoding, single, success, trace_service_response_with_encoding,
+    trace_success,
 };
 use crate::ServiceFailure;
 
@@ -112,6 +113,11 @@ fn service_failures_have_stable_protocol_statuses() {
             assert_eq!(response.retry_after_seconds(), retry_after);
         }
     }
+
+    let wrapped =
+        service_response_with_encoding(ServiceFailure::CapacityUnavailable, ResponseEncoding::Json);
+    assert_eq!(wrapped.status(), 429);
+    assert_eq!(decode_status(&wrapped, ResponseEncoding::Json).code, 8);
 }
 
 #[test]

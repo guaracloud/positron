@@ -43,7 +43,10 @@ fn span_with_event(name: &str) -> Span {
         trace_id: vec![1; 16],
         span_id: vec![name.len() as u8; 8],
         name: "span".to_owned(),
+        start_time_unix_nano: 1,
+        end_time_unix_nano: 2,
         events: vec![Event {
+            time_unix_nano: 3,
             name: name.to_owned(),
             ..Event::default()
         }],

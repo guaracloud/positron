@@ -9,7 +9,6 @@ use crate::ServiceHandle;
 const INVALID_ARGUMENT: i32 = 3;
 const RESOURCE_EXHAUSTED: i32 = 8;
 const INTERNAL: i32 = 13;
-const UNAVAILABLE: i32 = 14;
 const UNAUTHENTICATED: i32 = 16;
 
 mod protocol;

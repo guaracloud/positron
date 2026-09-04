@@ -95,6 +95,40 @@ pub(super) fn span_detail_bytes(
     Ok(retained)
 }
 
+/// Returns the destination string storage materialized while the raw span
+/// draft is still live. The raw strings are retained in the draft until
+/// `NativeSpanDraft::evaluate` completes, so this footprint is charged before
+/// materialization rather than after the draft is dropped.
+pub(super) fn materialized_detail_string_bytes(span: &Span) -> Result<u64, TraceReceiveFailure> {
+    let mut retained = u64::try_from(span.trace_state.len())
+        .map_err(|_| TraceReceiveFailure::ValueLimitExceeded)?;
+    if let Some(status) = &span.status {
+        retained = retained
+            .checked_add(
+                u64::try_from(status.message.len())
+                    .map_err(|_| TraceReceiveFailure::ValueLimitExceeded)?,
+            )
+            .ok_or(TraceReceiveFailure::ValueLimitExceeded)?;
+    }
+    for event in &span.events {
+        retained = retained
+            .checked_add(
+                u64::try_from(event.name.len())
+                    .map_err(|_| TraceReceiveFailure::ValueLimitExceeded)?,
+            )
+            .ok_or(TraceReceiveFailure::ValueLimitExceeded)?;
+    }
+    for link in &span.links {
+        retained = retained
+            .checked_add(
+                u64::try_from(link.trace_state.len())
+                    .map_err(|_| TraceReceiveFailure::ValueLimitExceeded)?,
+            )
+            .ok_or(TraceReceiveFailure::ValueLimitExceeded)?;
+    }
+    Ok(retained)
+}
+
 fn native_attribute_footprint(
     value: &KeyValue,
     limits: &ValueLimitSet,

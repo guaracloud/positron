@@ -356,16 +356,20 @@ impl<'de, 'borrow, 'presence> DeserializeSeed<'de> for SpanSeed<'borrow, 'presen
             end: false,
             events: Vec::new(),
         };
-        deserializer.deserialize_any(SpanVisitor { span: &mut span })?;
+        deserializer.deserialize_any(SpanVisitor {
+            span: &mut span,
+            collector: self.collector,
+        })?;
         self.collector.push_span(span)
     }
 }
 
-struct SpanVisitor<'span> {
+struct SpanVisitor<'span, 'collector, 'presence> {
     span: &'span mut SpanTimestampPresence,
+    collector: &'collector mut JsonPresenceCollector<'presence>,
 }
 
-impl<'de> Visitor<'de> for SpanVisitor<'_> {
+impl<'de, 'span, 'collector, 'presence> Visitor<'de> for SpanVisitor<'span, 'collector, 'presence> {
     type Value = ();
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -390,7 +394,10 @@ impl<'de> Visitor<'de> for SpanVisitor<'_> {
                     present: &mut self.span.end,
                 })?;
             } else if key == "events" {
-                map.next_value_seed(EventsSeed { span: self.span })?;
+                map.next_value_seed(EventsSeed {
+                    span: self.span,
+                    collector: self.collector,
+                })?;
             } else {
                 map.next_value::<IgnoredAny>()?;
             }
@@ -399,26 +406,35 @@ impl<'de> Visitor<'de> for SpanVisitor<'_> {
     }
 }
 
-struct EventsSeed<'span> {
+struct EventsSeed<'span, 'collector, 'presence> {
     span: &'span mut SpanTimestampPresence,
+    collector: &'collector mut JsonPresenceCollector<'presence>,
 }
 
-impl<'de> DeserializeSeed<'de> for EventsSeed<'_> {
+impl<'de, 'span, 'collector, 'presence> DeserializeSeed<'de>
+    for EventsSeed<'span, 'collector, 'presence>
+{
     type Value = ();
 
     fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
     where
         D: Deserializer<'de>,
     {
-        deserializer.deserialize_any(EventsVisitor { span: self.span })
+        deserializer.deserialize_any(EventsVisitor {
+            span: self.span,
+            collector: self.collector,
+        })
     }
 }
 
-struct EventsVisitor<'span> {
+struct EventsVisitor<'span, 'collector, 'presence> {
     span: &'span mut SpanTimestampPresence,
+    collector: &'collector mut JsonPresenceCollector<'presence>,
 }
 
-impl<'de> Visitor<'de> for EventsVisitor<'_> {
+impl<'de, 'span, 'collector, 'presence> Visitor<'de>
+    for EventsVisitor<'span, 'collector, 'presence>
+{
     type Value = ();
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -434,18 +450,24 @@ impl<'de> Visitor<'de> for EventsVisitor<'_> {
         A: SeqAccess<'de>,
     {
         while sequence
-            .next_element_seed(EventSeed { span: self.span })?
+            .next_element_seed(EventSeed {
+                span: self.span,
+                collector: self.collector,
+            })?
             .is_some()
         {}
         Ok(())
     }
 }
 
-struct EventSeed<'span> {
+struct EventSeed<'span, 'collector, 'presence> {
     span: &'span mut SpanTimestampPresence,
+    collector: &'collector mut JsonPresenceCollector<'presence>,
 }
 
-impl<'de> DeserializeSeed<'de> for EventSeed<'_> {
+impl<'de, 'span, 'collector, 'presence> DeserializeSeed<'de>
+    for EventSeed<'span, 'collector, 'presence>
+{
     type Value = ();
 
     fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
@@ -457,9 +479,9 @@ impl<'de> DeserializeSeed<'de> for EventSeed<'_> {
             present: &mut present,
         })?;
         if self.span.events.try_reserve(1).is_err() {
-            return Err(de::Error::custom(
-                "OTLP Traces JSON event presence allocation failed",
-            ));
+            return Err(self
+                .collector
+                .fail(TraceReceiveFailure::CapacityUnavailable));
         }
         self.span.events.push(present);
         Ok(())

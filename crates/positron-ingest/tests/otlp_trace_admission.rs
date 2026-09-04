@@ -137,6 +137,58 @@ fn authenticated_trace_constructors_cover_wire_variants_and_decoded_handoff()
 }
 
 #[test]
+fn legacy_decoded_trace_rejects_zero_timestamp_without_wire_presence() -> Result<(), Box<dyn Error>>
+{
+    let roots = support::temporary_roots()?;
+    let paths = BootstrapPaths::new(
+        &roots.data(),
+        &roots.secrets(),
+        MountQualification::LocalHost,
+    )?;
+    drop(InstanceBootstrap::initialize(
+        &paths,
+        InitializationPlan::non_interactive(),
+    )?);
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    let context = instance.attribute(
+        PresentedCredential::parse(claim.ingest_secret().ok_or("ingest credential")?)?,
+        RequestedIntent::Ingest,
+        CompatibilityHints::none(),
+    )?;
+    let governor = instance.resource_governor();
+    let request = ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            scope_spans: vec![ScopeSpans {
+                spans: vec![Span {
+                    trace_id: vec![1; 16],
+                    span_id: vec![2; 8],
+                    name: "legacy-zero".to_owned(),
+                    start_time_unix_nano: 0,
+                    end_time_unix_nano: 0,
+                    ..Span::default()
+                }],
+                ..ScopeSpans::default()
+            }],
+            ..ResourceSpans::default()
+        }],
+    };
+    let encoded = request.encoded_len();
+    let decoded = AuthenticatedOtlpTracesRequest::decoded_otlp_grpc_after_transport_admission(
+        context,
+        request,
+        OtlpGrpcTransportEvidence::prevalidated(encoded + 5, encoded),
+        reserve_trace_receiver_transport(context, governor)?,
+    )?;
+    assert_eq!(
+        OtlpTracesReceiver::new().decode(decoded).err(),
+        Some(TraceReceiveFailure::MalformedPayload),
+        "an already-decoded zero timestamp without wire presence is ambiguous"
+    );
+    Ok(())
+}
+
+#[test]
 fn authenticated_trace_admission_enforces_exact_transport_limit_before_reservation()
 -> Result<(), Box<dyn Error>> {
     let roots = support::temporary_roots()?;

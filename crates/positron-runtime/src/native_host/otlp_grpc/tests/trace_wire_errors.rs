@@ -2,11 +2,13 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use http::Request;
+use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
 use prost::Message;
 
 use super::trace_support::{
     Completion, ReceiverHarness, ScriptedBackend, gzip_trace_frame,
-    gzip_trace_frame_with_span_count, profile_with_transport_limits, trace_request,
+    gzip_trace_frame_with_span_count, profile_with_transport_limits, trace_frame,
+    trace_frame_from_request, trace_request,
 };
 
 #[tokio::test(flavor = "current_thread")]
@@ -24,6 +26,160 @@ async fn malformed_trace_protobuf_has_stable_invalid_argument_status()
         message.as_deref(),
         Some("OTLP%20Traces%20request%20was%20malformed")
     );
+    harness.finish()?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn authenticated_trace_rejects_malformed_gzip_before_backend()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut frame = vec![1, 0, 0, 0, 4];
+    frame.extend_from_slice(&[0, 1, 2, 3]);
+    let profile = profile_with_transport_limits(frame.len(), 1_048_576)?;
+    let backend = std::sync::Arc::new(ScriptedBackend::new([]));
+    let harness = ReceiverHarness::start_with_profile(backend.clone(), profile)?;
+
+    let (status, _message) = raw_trace_request_with_encoding(
+        &harness,
+        "/opentelemetry.proto.collector.trace.v1.TraceService/Export",
+        Some(Bytes::from(frame)),
+        Some("gzip"),
+    )
+    .await?;
+
+    assert_eq!(status, "13");
+    assert_eq!(backend.calls(), 0);
+    harness.finish()?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn authenticated_trace_rejects_compressed_flag_without_gzip_encoding()
+-> Result<(), Box<dyn std::error::Error>> {
+    let frame = gzip_trace_frame(0x41)?;
+    let profile = profile_with_transport_limits(frame.len(), 1_048_576)?;
+    let backend = std::sync::Arc::new(ScriptedBackend::new([]));
+    let harness = ReceiverHarness::start_with_profile(backend.clone(), profile)?;
+
+    let (status, _message) = raw_trace_request(
+        &harness,
+        "/opentelemetry.proto.collector.trace.v1.TraceService/Export",
+        Some(Bytes::from(frame)),
+    )
+    .await?;
+
+    assert_eq!(status, "13");
+    assert_eq!(backend.calls(), 0);
+    harness.finish()?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn authenticated_trace_rejects_an_invalid_compression_flag()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut frame = trace_frame(0x51)?;
+    *frame.first_mut().ok_or("trace frame header missing")? = 2;
+    let profile = profile_with_transport_limits(frame.len(), 1_048_576)?;
+    let backend = std::sync::Arc::new(ScriptedBackend::new([]));
+    let harness = ReceiverHarness::start_with_profile(backend.clone(), profile)?;
+
+    let (status, _message) = raw_trace_request(
+        &harness,
+        "/opentelemetry.proto.collector.trace.v1.TraceService/Export",
+        Some(Bytes::from(frame)),
+    )
+    .await?;
+
+    assert_eq!(status, "13");
+    assert_eq!(backend.calls(), 0);
+    harness.finish()?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn authenticated_trace_rejects_a_truncated_unary_frame()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut frame = trace_frame(0x61)?;
+    let declared_frame_length = frame.len();
+    frame.pop();
+    let profile = profile_with_transport_limits(declared_frame_length, 1_048_576)?;
+    let backend = std::sync::Arc::new(ScriptedBackend::new([]));
+    let harness = ReceiverHarness::start_with_profile(backend.clone(), profile)?;
+
+    let (status, _message) = raw_trace_request(
+        &harness,
+        "/opentelemetry.proto.collector.trace.v1.TraceService/Export",
+        Some(Bytes::from(frame)),
+    )
+    .await?;
+
+    assert_eq!(status, "13");
+    assert_eq!(backend.calls(), 0);
+    harness.finish()?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn authenticated_trace_rejects_uncompressed_payload_above_decompressed_limit()
+-> Result<(), Box<dyn std::error::Error>> {
+    let frame = trace_frame(0x71)?;
+    let payload_length = frame
+        .len()
+        .checked_sub(5)
+        .ok_or("trace frame header missing")?;
+    let profile = profile_with_transport_limits(
+        frame.len(),
+        payload_length
+            .checked_sub(1)
+            .ok_or("trace payload unexpectedly empty")?,
+    )?;
+    let backend = std::sync::Arc::new(ScriptedBackend::new([]));
+    let harness = ReceiverHarness::start_with_profile(backend.clone(), profile)?;
+
+    let (status, _message) = raw_trace_request(
+        &harness,
+        "/opentelemetry.proto.collector.trace.v1.TraceService/Export",
+        Some(Bytes::from(frame)),
+    )
+    .await?;
+
+    assert_eq!(status, "8");
+    assert_eq!(backend.calls(), 0);
+    harness.finish()?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn authenticated_trace_rejects_payload_over_system_value_limit_before_backend()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut request = trace_request(0x79).into_inner();
+    let span = request
+        .resource_spans
+        .first_mut()
+        .and_then(|resource| resource.scope_spans.first_mut())
+        .and_then(|scope| scope.spans.first_mut())
+        .ok_or("trace fixture span missing")?;
+    span.attributes.push(KeyValue {
+        key: "over-system-limit".to_owned(),
+        value: Some(AnyValue {
+            value: Some(any_value::Value::BytesValue(vec![0xa5; 65_537])),
+        }),
+        ..KeyValue::default()
+    });
+    let frame = trace_frame_from_request(request)?;
+    let profile = profile_with_transport_limits(frame.len(), 1_048_576)?;
+    let backend = std::sync::Arc::new(ScriptedBackend::new([]));
+    let harness = ReceiverHarness::start_with_profile(backend.clone(), profile)?;
+
+    let (status, _message) = raw_trace_request(
+        &harness,
+        "/opentelemetry.proto.collector.trace.v1.TraceService/Export",
+        Some(Bytes::from(frame)),
+    )
+    .await?;
+
+    assert_eq!(status, "3");
+    assert_eq!(backend.calls(), 0);
     harness.finish()?;
     Ok(())
 }
@@ -120,6 +276,116 @@ async fn authenticated_gzip_trace_message_uses_effective_decompressed_limit()
     Ok(())
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn authenticated_gzip_trace_allows_compressed_frame_above_decompressed_limit()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (frame, decompressed) = incompressible_gzip_trace_frame(0xa1)?;
+    let compressed = frame.len();
+    assert!(compressed > decompressed);
+    let profile = profile_with_transport_limits(compressed, decompressed)?;
+    let backend = std::sync::Arc::new(ScriptedBackend::new([Completion::Committed]));
+    let harness = ReceiverHarness::start_with_profile(backend.clone(), profile)?;
+
+    let (status, message) = raw_trace_request_with_encoding(
+        &harness,
+        "/opentelemetry.proto.collector.trace.v1.TraceService/Export",
+        Some(Bytes::from(frame)),
+        Some("gzip"),
+    )
+    .await?;
+
+    assert_eq!(
+        status, "0",
+        "valid separately bounded request rejected: {message:?}"
+    );
+    assert_eq!(backend.calls(), 1);
+    harness.finish()?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn authenticated_trace_rejects_multiple_unary_messages()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut body = trace_frame(0xb1)?;
+    body.extend_from_slice(&trace_frame(0xc1)?);
+    let profile = profile_with_transport_limits(body.len(), 1_048_576)?;
+    let backend = std::sync::Arc::new(ScriptedBackend::new([Completion::Committed]));
+    let harness = ReceiverHarness::start_with_profile(backend.clone(), profile)?;
+
+    let (status, message) = raw_trace_request_with_encoding(
+        &harness,
+        "/opentelemetry.proto.collector.trace.v1.TraceService/Export",
+        Some(Bytes::from(body)),
+        None,
+    )
+    .await?;
+
+    assert_eq!(
+        status, "3",
+        "multiple unary messages were accepted: {message:?}"
+    );
+    assert_eq!(backend.calls(), 0);
+    harness.finish()?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn authenticated_trace_accepts_one_message_with_request_trailers()
+-> Result<(), Box<dyn std::error::Error>> {
+    let frame = trace_frame(0xc1)?;
+    let profile = profile_with_transport_limits(frame.len(), 1_048_576)?;
+    let backend = std::sync::Arc::new(ScriptedBackend::new([Completion::Committed]));
+    let harness = ReceiverHarness::start_with_profile(backend.clone(), profile)?;
+
+    let (status, message) = raw_trace_request_with_empty_trailers(
+        &harness,
+        "/opentelemetry.proto.collector.trace.v1.TraceService/Export",
+        Some(Bytes::from(frame)),
+    )
+    .await?;
+
+    assert_eq!(status, "0", "request trailers were rejected: {message:?}");
+    assert_eq!(backend.calls(), 1);
+    harness.finish()?;
+    Ok(())
+}
+
+fn incompressible_gzip_trace_frame(
+    seed: u8,
+) -> Result<(Vec<u8>, usize), Box<dyn std::error::Error>> {
+    let mut request = trace_request(seed).into_inner();
+    let span = request
+        .resource_spans
+        .first_mut()
+        .and_then(|resource| resource.scope_spans.first_mut())
+        .and_then(|scope| scope.spans.first_mut())
+        .ok_or("trace fixture span missing")?;
+    let mut bytes = Vec::with_capacity(60_000);
+    let mut value = u32::from(seed).wrapping_add(1);
+    for _ in 0..60_000 {
+        value = value.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        bytes.push((value >> 24) as u8);
+    }
+    span.attributes.push(KeyValue {
+        key: "incompressible".to_owned(),
+        value: Some(AnyValue {
+            value: Some(any_value::Value::BytesValue(bytes)),
+        }),
+        ..KeyValue::default()
+    });
+    let body = request.encode_to_vec();
+    let decompressed = body.len();
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    std::io::Write::write_all(&mut encoder, &body)?;
+    let compressed = encoder.finish()?;
+    let length = u32::try_from(compressed.len())?;
+    let mut frame = Vec::with_capacity(compressed.len().saturating_add(5));
+    frame.push(1);
+    frame.extend_from_slice(&length.to_be_bytes());
+    frame.extend_from_slice(&compressed);
+    Ok((frame, decompressed))
+}
+
 async fn raw_trace_request(
     harness: &ReceiverHarness,
     path: &str,
@@ -134,6 +400,24 @@ async fn raw_trace_request_with_encoding(
     frame: Option<Bytes>,
     grpc_encoding: Option<&str>,
 ) -> Result<(String, Option<String>), Box<dyn std::error::Error>> {
+    raw_trace_request_inner(harness, path, frame, grpc_encoding, false).await
+}
+
+async fn raw_trace_request_with_empty_trailers(
+    harness: &ReceiverHarness,
+    path: &str,
+    frame: Option<Bytes>,
+) -> Result<(String, Option<String>), Box<dyn std::error::Error>> {
+    raw_trace_request_inner(harness, path, frame, None, true).await
+}
+
+async fn raw_trace_request_inner(
+    harness: &ReceiverHarness,
+    path: &str,
+    frame: Option<Bytes>,
+    grpc_encoding: Option<&str>,
+    request_trailers: bool,
+) -> Result<(String, Option<String>), Box<dyn std::error::Error>> {
     let stream = tokio::net::TcpStream::connect(harness.endpoint).await?;
     let (mut sender, connection) = h2::client::handshake(stream).await?;
     let connection = tokio::spawn(connection);
@@ -147,10 +431,13 @@ async fn raw_trace_request_with_encoding(
         request_builder = request_builder.header("grpc-encoding", grpc_encoding);
     }
     let request = request_builder.body(())?;
-    let end_stream = frame.is_none();
+    let end_stream = frame.is_none() && !request_trailers;
     let (response, mut body) = sender.send_request(request, end_stream)?;
     if let Some(frame) = frame {
-        body.send_data(frame, true)?;
+        body.send_data(frame, !request_trailers)?;
+    }
+    if request_trailers {
+        body.send_trailers(http::HeaderMap::new())?;
     }
     let response = tokio::time::timeout(Duration::from_secs(2), response).await??;
     let headers = response.headers().clone();

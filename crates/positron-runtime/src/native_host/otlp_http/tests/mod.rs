@@ -8,6 +8,7 @@ use positron_domain::routing::VirtualShardId;
 use positron_ingest::{AdmissionGroupOutcome, IngestOutcome, IngestRequestOutcome};
 use prost::Message;
 
+use super::response::service_response_with_encoding;
 use super::{
     ResponseEncoding, RpcStatus, ingest_response, success, trace_service_response_with_encoding,
     trace_success,

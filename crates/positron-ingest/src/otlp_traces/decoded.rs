@@ -7,7 +7,7 @@ mod drafts;
 #[path = "../otlp_traces/materialize.rs"]
 mod materialize;
 
-pub(crate) use drafts::native_records;
+pub(crate) use drafts::{native_records, validate_legacy_decoded_timestamp_evidence};
 
 /// A bounded raw span draft. It contains only structurally decoded protocol
 /// fields and policy-visible generic attributes; native identifiers, times,

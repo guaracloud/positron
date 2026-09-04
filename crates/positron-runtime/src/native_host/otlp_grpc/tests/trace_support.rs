@@ -398,7 +398,13 @@ pub(super) fn trace_request(seed: u8) -> tonic::Request<ExportTraceServiceReques
 }
 
 pub(super) fn trace_frame(seed: u8) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let body = trace_request(seed).into_inner().encode_to_vec();
+    trace_frame_from_request(trace_request(seed).into_inner())
+}
+
+pub(super) fn trace_frame_from_request(
+    request: ExportTraceServiceRequest,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let body = request.encode_to_vec();
     let length = u32::try_from(body.len())?;
     let mut frame = Vec::with_capacity(body.len().saturating_add(5));
     frame.push(0);

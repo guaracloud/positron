@@ -4,13 +4,11 @@ use opentelemetry_proto::tonic::collector::logs::v1::{
 use opentelemetry_proto::tonic::collector::trace::v1::{
     ExportTracePartialSuccess, ExportTraceServiceResponse,
 };
-use positron_ingest::{IngestFailureCode, IngestOutcome};
 use prost::Message;
 
 use super::super::native_http::Response;
-use super::{
-    INTERNAL, INVALID_ARGUMENT, RESOURCE_EXHAUSTED, ResponseEncoding, UNAUTHENTICATED, UNAVAILABLE,
-};
+use super::super::otlp_outcome::{OtlpFailure, OtlpSignal};
+use super::{INTERNAL, ResponseEncoding};
 use crate::ServiceFailure;
 
 #[derive(Clone, PartialEq, Message)]
@@ -25,89 +23,32 @@ pub(crate) fn ingest_response(
     result: Result<positron_ingest::IngestRequestOutcome, ServiceFailure>,
     encoding: ResponseEncoding,
 ) -> Response {
-    match result {
-        Ok(outcome) => match outcome.terminal_failure() {
-            Some(IngestOutcome::Retryable(IngestFailureCode::CapacityUnavailable)) => failure(
-                429,
-                RESOURCE_EXHAUSTED,
-                "OTLP Logs ingest capacity is unavailable",
-                encoding,
-            )
-            .with_retry_after(1),
-            Some(IngestOutcome::Retryable(_)) => failure(
-                503,
-                UNAVAILABLE,
-                "OTLP Logs ingest is temporarily unavailable",
-                encoding,
-            ),
-            Some(IngestOutcome::Permanent(_)) => failure(
-                400,
-                INVALID_ARGUMENT,
-                "OTLP Logs request was rejected",
-                encoding,
-            ),
-            Some(IngestOutcome::Ambiguous(_)) => failure(
-                503,
-                UNAVAILABLE,
-                "OTLP Logs commit outcome is ambiguous; retry may duplicate records",
-                encoding,
-            ),
-            Some(IngestOutcome::Full(_) | IngestOutcome::Partial(_)) => failure(
-                500,
-                INTERNAL,
-                "OTLP Logs outcome aggregation failed",
-                encoding,
-            ),
-            None => success(outcome.permanently_rejected_records(), encoding),
-        },
-        Err(failure_code) => {
-            super::response::service_response_with_encoding(failure_code, encoding)
-        },
-    }
+    response_for_signal(result, encoding, OtlpSignal::Logs)
 }
 
 pub(crate) fn ingest_trace_response(
     result: Result<positron_ingest::IngestRequestOutcome, ServiceFailure>,
     encoding: ResponseEncoding,
 ) -> Response {
+    response_for_signal(result, encoding, OtlpSignal::Traces)
+}
+
+fn response_for_signal(
+    result: Result<positron_ingest::IngestRequestOutcome, ServiceFailure>,
+    encoding: ResponseEncoding,
+    signal: OtlpSignal,
+) -> Response {
     match result {
         Ok(outcome) => match outcome.terminal_failure() {
-            Some(IngestOutcome::Retryable(IngestFailureCode::CapacityUnavailable)) => failure(
-                429,
-                RESOURCE_EXHAUSTED,
-                "OTLP Traces ingest capacity is unavailable",
-                encoding,
-            )
-            .with_retry_after(1),
-            Some(IngestOutcome::Retryable(_)) => failure(
-                503,
-                UNAVAILABLE,
-                "OTLP Traces ingest is temporarily unavailable",
-                encoding,
-            ),
-            Some(IngestOutcome::Permanent(_)) => failure(
-                400,
-                INVALID_ARGUMENT,
-                "OTLP Traces request was rejected",
-                encoding,
-            ),
-            Some(IngestOutcome::Ambiguous(_)) => failure(
-                503,
-                UNAVAILABLE,
-                "OTLP Traces commit outcome is ambiguous; retry may duplicate spans",
-                encoding,
-            ),
-            Some(IngestOutcome::Full(_) | IngestOutcome::Partial(_)) => failure(
-                500,
-                INTERNAL,
-                "OTLP Traces outcome aggregation failed",
-                encoding,
-            ),
-            None => trace_success(outcome.permanently_rejected_records(), encoding),
+            Some(outcome) => failure_response(signal.outcome_failure(outcome), encoding),
+            None => match signal {
+                OtlpSignal::Logs => success(outcome.permanently_rejected_records(), encoding),
+                OtlpSignal::Traces => {
+                    trace_success(outcome.permanently_rejected_records(), encoding)
+                },
+            },
         },
-        Err(failure_code) => {
-            super::response::trace_service_response_with_encoding(failure_code, encoding)
-        },
+        Err(service_failure) => service_response_for_signal(service_failure, encoding, signal),
     }
 }
 
@@ -197,94 +138,40 @@ pub(crate) fn trace_success(rejected: usize, encoding: ResponseEncoding) -> Resp
     }
 }
 
+fn failure_response(classification: OtlpFailure, encoding: ResponseEncoding) -> Response {
+    let response = failure(
+        classification.http_status,
+        classification.grpc_code,
+        classification.message,
+        encoding,
+    );
+    if classification.retry_after {
+        response.with_retry_after(1)
+    } else {
+        response
+    }
+}
+
 pub(crate) fn service_response_with_encoding(
     service_failure: ServiceFailure,
     encoding: ResponseEncoding,
 ) -> Response {
-    match service_failure {
-        ServiceFailure::Unauthorized => failure(
-            401,
-            UNAUTHENTICATED,
-            "OTLP Logs request authentication was rejected",
-            encoding,
-        ),
-        ServiceFailure::CapacityUnavailable => failure(
-            429,
-            RESOURCE_EXHAUSTED,
-            "OTLP Logs ingest capacity is unavailable",
-            encoding,
-        )
-        .with_retry_after(1),
-        ServiceFailure::RequestTooLarge => failure(
-            413,
-            RESOURCE_EXHAUSTED,
-            "OTLP Logs request exceeds the receiver limit",
-            encoding,
-        ),
-        ServiceFailure::InvalidRequest => failure(
-            400,
-            INVALID_ARGUMENT,
-            "OTLP Logs request was rejected",
-            encoding,
-        ),
-        ServiceFailure::KeyUnavailable
-        | ServiceFailure::CatalogUnavailable
-        | ServiceFailure::LedgerUnavailable
-        | ServiceFailure::StorageUnavailable => failure(
-            503,
-            UNAVAILABLE,
-            "OTLP Logs ingest is temporarily unavailable",
-            encoding,
-        ),
-        ServiceFailure::CorruptState | ServiceFailure::Internal | ServiceFailure::Cancelled => {
-            failure(500, INTERNAL, "OTLP Logs ingest failed", encoding)
-        },
-    }
+    service_response_for_signal(service_failure, encoding, OtlpSignal::Logs)
 }
 
 pub(crate) fn trace_service_response_with_encoding(
     service_failure: ServiceFailure,
     encoding: ResponseEncoding,
 ) -> Response {
-    match service_failure {
-        ServiceFailure::Unauthorized => failure(
-            401,
-            UNAUTHENTICATED,
-            "OTLP Traces request authentication was rejected",
-            encoding,
-        ),
-        ServiceFailure::CapacityUnavailable => failure(
-            429,
-            RESOURCE_EXHAUSTED,
-            "OTLP Traces ingest capacity is unavailable",
-            encoding,
-        )
-        .with_retry_after(1),
-        ServiceFailure::RequestTooLarge => failure(
-            413,
-            RESOURCE_EXHAUSTED,
-            "OTLP Traces request exceeds the receiver limit",
-            encoding,
-        ),
-        ServiceFailure::InvalidRequest => failure(
-            400,
-            INVALID_ARGUMENT,
-            "OTLP Traces request was rejected",
-            encoding,
-        ),
-        ServiceFailure::KeyUnavailable
-        | ServiceFailure::CatalogUnavailable
-        | ServiceFailure::LedgerUnavailable
-        | ServiceFailure::StorageUnavailable => failure(
-            503,
-            UNAVAILABLE,
-            "OTLP Traces ingest is temporarily unavailable",
-            encoding,
-        ),
-        ServiceFailure::CorruptState | ServiceFailure::Internal | ServiceFailure::Cancelled => {
-            failure(500, INTERNAL, "OTLP Traces ingest failed", encoding)
-        },
-    }
+    service_response_for_signal(service_failure, encoding, OtlpSignal::Traces)
+}
+
+fn service_response_for_signal(
+    service_failure: ServiceFailure,
+    encoding: ResponseEncoding,
+    signal: OtlpSignal,
+) -> Response {
+    failure_response(signal.service_failure(service_failure), encoding)
 }
 
 pub(crate) fn failure(

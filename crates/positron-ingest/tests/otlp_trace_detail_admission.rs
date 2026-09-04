@@ -8,7 +8,9 @@ use opentelemetry_proto::tonic::trace::v1::span::{Event, Link};
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 use positron_governance::{CompatibilityHints, PresentedCredential, RequestedIntent};
 use positron_ingest::{AuthenticatedOtlpTracesRequest, OtlpTracesReceiver, TraceReceiveFailure};
-use positron_kernel::{MountQualification, ResourceDimension};
+use positron_kernel::{
+    MountQualification, ResourceAmounts, ResourceDimension, WorkClaim, WorkKind,
+};
 use positron_runtime::{BootstrapPaths, InitializationPlan, InstanceBootstrap};
 use prost::Message;
 
@@ -165,6 +167,65 @@ fn event_attribute_sets_are_reserved_before_detail_materialization() -> Result<(
     Ok(())
 }
 
+#[test]
+fn transient_detail_strings_are_reserved_while_materializing() -> Result<(), Box<dyn Error>> {
+    let roots = support::temporary_roots()?;
+    let paths = BootstrapPaths::new(
+        &roots.data(),
+        &roots.secrets(),
+        MountQualification::LocalHost,
+    )?;
+    drop(InstanceBootstrap::initialize(
+        &paths,
+        InitializationPlan::non_interactive(),
+    )?);
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    let context = instance.attribute(
+        PresentedCredential::parse(claim.ingest_secret().ok_or("ingest credential")?)?,
+        RequestedIntent::Ingest,
+        CompatibilityHints::none(),
+    )?;
+    let governor = instance.resource_governor();
+    let request = request_with_event_name_length(800);
+    let tenant = context
+        .tenant_attribution()
+        .ok_or("tenant attribution")?
+        .tenant_id();
+    // Occupy the shared ordinary headroom with an independent live claim so
+    // the receiver's 1,000,000-byte grant cannot grow past its admitted amount
+    // during materialization. The old steady-state accounting fits, while
+    // the source/destination detail peak does not.
+    let blocker = governor.reserve(WorkClaim::tenant(
+        tenant,
+        WorkKind::SecurityLifecycle,
+        ResourceAmounts::only(ResourceDimension::MemoryBytes, 29_000_000)?,
+    )?)?;
+    let capacity = governor.reserve(WorkClaim::tenant(
+        tenant,
+        WorkKind::Ingest,
+        ResourceAmounts::only(ResourceDimension::MemoryBytes, 1_000_000)?,
+    )?)?;
+    let encoded = request.encoded_len();
+    let request = AuthenticatedOtlpTracesRequest::decoded_otlp_grpc_after_transport_admission(
+        context,
+        request,
+        positron_ingest::OtlpGrpcTransportEvidence::prevalidated(encoded + 5, encoded),
+        capacity,
+    )?;
+    let failure = OtlpTracesReceiver::new().decode(request).expect_err(
+        "materialization must be admitted for its simultaneous source/destination peak",
+    );
+    assert!(
+        matches!(failure, TraceReceiveFailure::CapacityUnavailable),
+        "transient source/destination detail peak must fail as capacity unavailable: {failure:?}"
+    );
+    assert_eq!(governor.inspect()?.outstanding_total(), 1);
+    drop(blocker);
+    assert!(governor.inspect()?.complete());
+    Ok(())
+}
+
 fn request(events: usize, links: usize) -> ExportTraceServiceRequest {
     ExportTraceServiceRequest {
         resource_spans: vec![ResourceSpans {
@@ -252,6 +313,32 @@ fn request_with_event_attributes(count: usize) -> ExportTraceServiceRequest {
                             .collect(),
                         ..Link::default()
                     }],
+                    ..Span::default()
+                }],
+                ..ScopeSpans::default()
+            }],
+            ..ResourceSpans::default()
+        }],
+    }
+}
+
+fn request_with_event_name_length(length: usize) -> ExportTraceServiceRequest {
+    ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            scope_spans: vec![ScopeSpans {
+                spans: vec![Span {
+                    trace_id: vec![1; 16],
+                    span_id: vec![2; 8],
+                    name: "transient-detail".to_owned(),
+                    start_time_unix_nano: 1,
+                    end_time_unix_nano: 2,
+                    events: (0..1_024)
+                        .map(|index| Event {
+                            time_unix_nano: u64::try_from(index + 1).unwrap_or(1),
+                            name: "e".repeat(length),
+                            ..Event::default()
+                        })
+                        .collect(),
                     ..Span::default()
                 }],
                 ..ScopeSpans::default()
