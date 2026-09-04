@@ -43,6 +43,18 @@ impl IngestPolicy {
         mut record: C,
         receiver: PolicyReceiver,
     ) -> Result<Option<(C, PolicyProvenance)>, PolicyEvaluationFailure> {
+        if record
+            .body()
+            .is_some_and(CandidateAttributeValue::contains_policy_marker)
+            || record.attributes().iter().any(|attribute| {
+                attribute
+                    .occurrences()
+                    .iter()
+                    .any(CandidateAttributeValue::contains_policy_marker)
+            })
+        {
+            return Err(PolicyEvaluationFailure::UntrustedMarker);
+        }
         let mut applied = Vec::with_capacity(self.rules.len());
         let mut steps = StepBudget(self.budget.evaluation_steps());
         for rule in &self.rules {
@@ -59,18 +71,20 @@ impl IngestPolicy {
                     break;
                 },
                 PolicyAction::Reject => return Ok(None),
-                PolicyAction::Remove(target) => remove_target(&mut record, target),
+                PolicyAction::Remove(target) => {
+                    transform_target(&mut record, target, Transformation::Remove)?
+                },
                 PolicyAction::Redact(target) => {
-                    transform_target(&mut record, target, Transformation::Redact)
+                    transform_target(&mut record, target, Transformation::Redact)?
                 },
                 PolicyAction::TruncateBytes(target, limit) => {
-                    transform_target(&mut record, target, Transformation::TruncateBytes(*limit))
+                    transform_target(&mut record, target, Transformation::TruncateBytes(*limit))?
                 },
                 PolicyAction::TruncateElements(target, limit) => transform_target(
                     &mut record,
                     target,
                     Transformation::TruncateElements(*limit),
-                ),
+                )?,
             };
             if changed {
                 applied.push(rule.id.clone());
@@ -188,12 +202,14 @@ impl PolicyRule {
 fn candidate_text(value: &CandidateAttributeValue) -> Option<&str> {
     match value {
         CandidateAttributeValue::String(value) => Some(value),
+        CandidateAttributeValue::Truncated { value, .. } => candidate_text(value),
         _ => None,
     }
 }
 
 #[derive(Clone, Copy)]
 enum Transformation {
+    Remove,
     Redact,
     TruncateBytes(u32),
     TruncateElements(u16),
@@ -235,6 +251,9 @@ fn value_path_has_type(
     let Some((first, rest)) = segments.split_first() else {
         return candidate_kind(value) == expected;
     };
+    if let CandidateAttributeValue::Truncated { value, .. } = value {
+        return value_path_has_type(value, segments, expected);
+    }
     match (first, value) {
         (PolicyPathSegment::Key(key), CandidateAttributeValue::KeyValueList(entries)) => entries
             .iter()
@@ -256,6 +275,8 @@ fn candidate_kind(value: &CandidateAttributeValue) -> AttributeValueKind {
         CandidateAttributeValue::Bytes(_) => AttributeValueKind::Bytes,
         CandidateAttributeValue::Array(_) => AttributeValueKind::Array,
         CandidateAttributeValue::KeyValueList(_) => AttributeValueKind::KeyValueList,
+        CandidateAttributeValue::Marker(_) => AttributeValueKind::Marker,
+        CandidateAttributeValue::Truncated { value, .. } => candidate_kind(value),
     }
 }
 
@@ -263,6 +284,9 @@ fn value_path_exists(value: &CandidateAttributeValue, segments: &[PolicyPathSegm
     let Some((first, rest)) = segments.split_first() else {
         return true;
     };
+    if let CandidateAttributeValue::Truncated { value, .. } = value {
+        return value_path_exists(value, segments);
+    }
     match (first, value) {
         (PolicyPathSegment::Key(key), CandidateAttributeValue::KeyValueList(entries)) => entries
             .iter()
@@ -288,61 +312,21 @@ fn selected(
     })
 }
 
-fn remove_target(record: &mut impl PolicyRecord, target: &PolicyTarget) -> bool {
-    match target {
-        PolicyTarget::Body => record.body_mut().take().is_some(),
-        PolicyTarget::Attribute(path) => remove_path(record, path),
-    }
-}
-
-fn remove_path(record: &mut impl PolicyRecord, path: &PolicyAttributePath) -> bool {
-    let Some(position) = record.attributes().iter().position(|attribute| {
-        attribute.namespace() == path.namespace && attribute.key() == path.key
-    }) else {
-        return false;
-    };
-    if path.segments.is_empty() && matches!(path.occurrence, PolicyOccurrence::All) {
-        record.attributes_mut().remove(position);
-        return true;
-    }
-    let Some(attribute) = record.attributes_mut().get_mut(position) else {
-        return false;
-    };
-    let changed = if path.segments.is_empty() {
-        match path.occurrence {
-            PolicyOccurrence::All => false,
-            PolicyOccurrence::Index(index)
-                if usize::from(index) < attribute.occurrences().len() =>
-            {
-                attribute.occurrences_mut().remove(usize::from(index));
-                true
-            },
-            PolicyOccurrence::Index(_) => false,
-        }
-    } else {
-        transform_selected(attribute, path, None)
-    };
-    if attribute.occurrences().is_empty() {
-        record.attributes_mut().remove(position);
-    }
-    changed
-}
-
 fn transform_target(
     record: &mut impl PolicyRecord,
     target: &PolicyTarget,
     transformation: Transformation,
-) -> bool {
+) -> Result<bool, PolicyEvaluationFailure> {
     match target {
         PolicyTarget::Body => record
             .body_mut()
             .as_mut()
-            .is_some_and(|body| transform_leaf(body, transformation)),
+            .map_or(Ok(false), |body| transform_leaf(body, transformation)),
         PolicyTarget::Attribute(path) => {
             let Some(attribute) = record.attributes_mut().iter_mut().find(|attribute| {
                 attribute.namespace() == path.namespace && attribute.key() == path.key
             }) else {
-                return false;
+                return Ok(false);
             };
             transform_selected(attribute, path, Some(transformation))
         },
@@ -353,80 +337,81 @@ fn transform_selected(
     attribute: &mut NativePolicyAttribute,
     path: &PolicyAttributePath,
     transformation: Option<Transformation>,
-) -> bool {
+) -> Result<bool, PolicyEvaluationFailure> {
     let occurrence = path.occurrence;
-    attribute
-        .occurrences_mut()
-        .iter_mut()
-        .enumerate()
-        .filter(|(index, _)| match occurrence {
-            PolicyOccurrence::All => true,
-            PolicyOccurrence::Index(expected) => *index == usize::from(expected),
-        })
-        .fold(false, |changed, (_, value)| {
-            transform_value(value, &path.segments, transformation) || changed
-        })
+    let mut changed = false;
+    for (index, value) in attribute.occurrences_mut().iter_mut().enumerate() {
+        if matches!(occurrence, PolicyOccurrence::All)
+            || matches!(occurrence, PolicyOccurrence::Index(expected) if index == usize::from(expected))
+        {
+            changed = transform_value(value, &path.segments, transformation)? || changed;
+        }
+    }
+    Ok(changed)
 }
 
-#[expect(
-    clippy::unnecessary_fold,
-    reason = "every duplicate key must be transformed; Iterator::any would short-circuit"
-)]
 fn transform_value(
     value: &mut CandidateAttributeValue,
     segments: &[PolicyPathSegment],
     transformation: Option<Transformation>,
-) -> bool {
+) -> Result<bool, PolicyEvaluationFailure> {
     let Some((first, rest)) = segments.split_first() else {
-        return transformation.is_some_and(|transformation| transform_leaf(value, transformation));
+        return transformation.map_or(Ok(false), |transformation| {
+            transform_leaf(value, transformation)
+        });
     };
+    if let CandidateAttributeValue::Truncated { value: inner, .. } = value {
+        return transform_value(inner, segments, transformation);
+    }
     match (first, value) {
-        (PolicyPathSegment::Key(key), CandidateAttributeValue::KeyValueList(entries))
-            if rest.is_empty() && transformation.is_none() =>
-        {
-            let before = entries.len();
-            entries.retain(|entry| entry.key() != key);
-            entries.len() != before
-        },
         (PolicyPathSegment::Key(key), CandidateAttributeValue::KeyValueList(entries)) => entries
             .iter_mut()
             .filter(|entry| entry.key() == key)
-            .fold(false, |changed, entry| {
-                transform_value(entry.value_mut(), rest, transformation) || changed
+            .try_fold(false, |changed, entry| {
+                Ok(transform_value(entry.value_mut(), rest, transformation)? || changed)
             }),
-        (PolicyPathSegment::ArrayIndex(index), CandidateAttributeValue::Array(values))
-            if rest.is_empty() && transformation.is_none() =>
-        {
-            let index = usize::from(*index);
-            if index < values.len() {
-                values.remove(index);
-                true
+        (PolicyPathSegment::ArrayIndex(index), CandidateAttributeValue::Array(values)) => {
+            if let Some(value) = values.get_mut(usize::from(*index)) {
+                transform_value(value, rest, transformation)
             } else {
-                false
+                Ok(false)
             }
         },
-        (PolicyPathSegment::ArrayIndex(index), CandidateAttributeValue::Array(values)) => values
-            .get_mut(usize::from(*index))
-            .is_some_and(|value| transform_value(value, rest, transformation)),
-        _ => false,
+        _ => Ok(false),
     }
 }
 
-fn transform_leaf(value: &mut CandidateAttributeValue, transformation: Transformation) -> bool {
+fn transform_leaf(
+    value: &mut CandidateAttributeValue,
+    transformation: Transformation,
+) -> Result<bool, PolicyEvaluationFailure> {
     match transformation {
-        Transformation::Redact if !matches!(value, CandidateAttributeValue::Null) => {
-            *value = CandidateAttributeValue::null();
-            true
+        Transformation::Remove | Transformation::Redact => {
+            let kind = candidate_kind(value);
+            if matches!(kind, AttributeValueKind::Marker) {
+                return Ok(false);
+            }
+            let action = match transformation {
+                Transformation::Remove => positron_domain::value::MarkerAction::Removed,
+                Transformation::Redact => positron_domain::value::MarkerAction::Redacted,
+                Transformation::TruncateBytes(_) | Transformation::TruncateElements(_) => {
+                    return Ok(false);
+                },
+            };
+            *value = CandidateAttributeValue::redaction_marker(kind, action);
+            Ok(true)
         },
-        Transformation::Redact => false,
         Transformation::TruncateBytes(limit) => truncate_bytes(value, limit),
         Transformation::TruncateElements(limit) => truncate_elements(value, limit),
     }
 }
 
-fn truncate_bytes(value: &mut CandidateAttributeValue, limit: u32) -> bool {
+fn truncate_bytes(
+    value: &mut CandidateAttributeValue,
+    limit: u32,
+) -> Result<bool, PolicyEvaluationFailure> {
     let Ok(limit) = usize::try_from(limit) else {
-        return false;
+        return Ok(false);
     };
     match value {
         CandidateAttributeValue::String(text) if text.len() > limit => {
@@ -434,28 +419,67 @@ fn truncate_bytes(value: &mut CandidateAttributeValue, limit: u32) -> bool {
             while !text.is_char_boundary(boundary) {
                 boundary = boundary.saturating_sub(1);
             }
-            text.truncate(boundary);
-            true
+            let mut sanitized = String::new();
+            sanitized
+                .try_reserve_exact(boundary)
+                .map_err(|_| PolicyEvaluationFailure::EvidenceBoundExceeded)?;
+            sanitized.push_str(&text[..boundary]);
+            *value = CandidateAttributeValue::truncated(
+                CandidateAttributeValue::string(sanitized),
+                positron_domain::value::MarkerAction::TruncatedBytes,
+            );
+            Ok(true)
         },
         CandidateAttributeValue::Bytes(bytes) if bytes.len() > limit => {
-            bytes.truncate(limit);
-            true
+            let mut sanitized = Vec::new();
+            sanitized
+                .try_reserve_exact(limit)
+                .map_err(|_| PolicyEvaluationFailure::EvidenceBoundExceeded)?;
+            sanitized.extend_from_slice(&bytes[..limit]);
+            *value = CandidateAttributeValue::truncated(
+                CandidateAttributeValue::bytes(sanitized),
+                positron_domain::value::MarkerAction::TruncatedBytes,
+            );
+            Ok(true)
         },
-        _ => false,
+        _ => Ok(false),
     }
 }
 
-fn truncate_elements(value: &mut CandidateAttributeValue, limit: u16) -> bool {
+fn truncate_elements(
+    value: &mut CandidateAttributeValue,
+    limit: u16,
+) -> Result<bool, PolicyEvaluationFailure> {
     let limit = usize::from(limit);
     match value {
         CandidateAttributeValue::Array(values) if values.len() > limit => {
-            values.truncate(limit);
-            true
+            let original = std::mem::take(values);
+            let keep = original.len().min(limit);
+            let mut sanitized = Vec::new();
+            sanitized
+                .try_reserve_exact(keep)
+                .map_err(|_| PolicyEvaluationFailure::EvidenceBoundExceeded)?;
+            sanitized.extend(original.into_iter().take(keep));
+            *value = CandidateAttributeValue::truncated(
+                CandidateAttributeValue::array(sanitized),
+                positron_domain::value::MarkerAction::TruncatedElements,
+            );
+            Ok(true)
         },
         CandidateAttributeValue::KeyValueList(values) if values.len() > limit => {
-            values.truncate(limit);
-            true
+            let original = std::mem::take(values);
+            let keep = original.len().min(limit);
+            let mut sanitized = Vec::new();
+            sanitized
+                .try_reserve_exact(keep)
+                .map_err(|_| PolicyEvaluationFailure::EvidenceBoundExceeded)?;
+            sanitized.extend(original.into_iter().take(keep));
+            *value = CandidateAttributeValue::truncated(
+                CandidateAttributeValue::key_value_list(sanitized),
+                positron_domain::value::MarkerAction::TruncatedElements,
+            );
+            Ok(true)
         },
-        _ => false,
+        _ => Ok(false),
     }
 }

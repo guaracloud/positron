@@ -5,7 +5,7 @@ use positron_domain::routing::{SignalKind, VirtualShardId};
 use positron_domain::value::CandidateAttributeValue;
 use positron_kernel::{ResourceAmounts, ResourceDimension, WorkClaim, WorkKind};
 
-use super::super::bounds::grouped_retained_bytes;
+use super::super::bounds::grouped_retained_bytes_with_policy_shapes;
 use super::super::{AuthenticatedOtlpLogsRequest, OtlpLogsReceiver, OtlpPayload, ReceiveFailure};
 use crate::tests::support::{Fixture, attribution, fixture};
 use crate::{AdmissionGroupPlanFailure, AdmissionGroupPlanner, NativeLogCandidate};
@@ -42,7 +42,7 @@ fn shared_metadata_fanout_is_reserved_per_clone_and_one_byte_per_record_over_is_
         .usage(ResourceDimension::MemoryBytes);
     assert_eq!(
         retained_bytes,
-        grouped_retained_bytes(batch.decoded_bytes, batch.records().len())?
+        grouped_retained_bytes_with_policy_shapes(batch.decoded_bytes, batch.records().len())?
     );
     assert!(retained_bytes > EXACT_CLONED_METADATA_BYTES);
     drop(batch);

@@ -177,6 +177,21 @@ fn encoded_value_length(
     depth: u8,
     limits: &TraceLimits,
 ) -> Result<usize, TraceStoreFailure> {
+    if value.marker_action().is_some() {
+        return Ok(3);
+    }
+    if value.truncation_action().is_some() {
+        return add_length(
+            3,
+            encoded_value_length(
+                value
+                    .truncated_value()
+                    .ok_or_else(TraceStoreFailure::invalid_input)?,
+                depth,
+                limits,
+            )?,
+        );
+    }
     match value.kind() {
         AttributeValueKind::Null => Ok(1),
         AttributeValueKind::Boolean => Ok(2),
@@ -241,6 +256,7 @@ fn encoded_value_length(
             }
             Ok(bytes)
         },
+        AttributeValueKind::Marker => Err(TraceStoreFailure::invalid_input()),
     }
 }
 

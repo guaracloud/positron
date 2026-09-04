@@ -15,8 +15,8 @@ pub use candidate::{
 };
 pub use metadata::LogMetadata;
 pub use policy::{
-    IngestPolicy, PolicyAction, PolicyAttributePath, PolicyBudget, PolicyCompileFailure,
-    PolicyEvaluation, PolicyEvaluationFailure, PolicyPredicate, PolicyReceiver, PolicyRule,
-    PolicyTarget, TracePolicyEvaluation,
+    IngestPolicy, PolicyAction, PolicyAdmissionShape, PolicyAttributePath, PolicyBudget,
+    PolicyCompileFailure, PolicyEvaluation, PolicyEvaluationFailure, PolicyPredicate,
+    PolicyReceiver, PolicyRule, PolicyTarget, TracePolicyEvaluation,
 };
 pub use provenance::{PolicyProvenance, PolicyProvenanceFailure};

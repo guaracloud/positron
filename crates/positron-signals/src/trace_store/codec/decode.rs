@@ -8,8 +8,8 @@ use super::super::failure::TraceStoreFailure;
 use super::super::observation::SpanObservation;
 use super::super::types::StoredSpanObservation;
 use super::format::{
-    MAGIC, MAX_RECORDS, VERSION, check_cancel, decode_kind, decode_namespace, decode_quality,
-    decode_sampling, supported_version,
+    DETAILS_VERSION, MAGIC, MAX_RECORDS, check_cancel, decode_kind, decode_namespace,
+    decode_quality, decode_sampling, supported_version,
 };
 use crate::{ScanCancellation, ScanObserver};
 
@@ -205,6 +205,7 @@ pub(crate) fn decode_observation_version_with_profile(
                 input,
                 limits.nesting_depth,
                 &limits,
+                version,
             )?);
         }
         let candidate = AttributeOccurrenceSetCandidate::new(namespace, key, values);
@@ -214,8 +215,8 @@ pub(crate) fn decode_observation_version_with_profile(
                 .map_err(TraceStoreFailure::validation)?,
         );
     }
-    let details = if version == VERSION {
-        decode_details::decode_details(input, profile)?
+    let details = if version >= DETAILS_VERSION {
+        decode_details::decode_details(input, profile, version)?
     } else {
         // BlockDecode::observed admits only VERSION or LEGACY_VERSION.
         SpanObservationDetails::default()

@@ -102,7 +102,20 @@ fn receiver_applies_pinned_generic_attribute_transform_before_native_validation(
         .iter()
         .find(|attribute| attribute.key() == "secret")
         .expect("secret attribute");
-    assert!(attribute.occurrence(0).is_some_and(|value| value.is_null()));
+    let value = attribute.occurrence(0).expect("redacted occurrence");
+    assert_eq!(
+        value.marker_action(),
+        Some(positron_domain::value::MarkerAction::Redacted)
+    );
+    assert_eq!(
+        value.marker_original_kind(),
+        Some(positron_domain::value::AttributeValueKind::String)
+    );
+    assert_eq!(
+        value.as_str(),
+        None,
+        "redaction must retain no source payload"
+    );
     assert_eq!(batch.records()[0].policy_provenance().generation(), 10);
 }
 

@@ -4,9 +4,10 @@ use positron_domain::value::ValueLimitProfile;
 use positron_kernel::ResourceReservation;
 use prost::Message;
 
-use super::bounds::{decoded_record_bytes, retained_batch_bytes, retained_record_heap_bytes};
+use super::bounds::{decoded_record_facts, retained_batch_bytes, retained_record_heap_bytes};
 use super::mapping::{candidate_value, checked_identifier, checked_timestamp, grouped_attributes};
 use super::{NativeLogBatch, NativeLogCandidate, ReceiveFailure};
+use positron_policy::PolicyAdmissionShape;
 
 pub(super) fn native_batch<'authority>(
     attribution: TenantAttribution,
@@ -19,6 +20,7 @@ pub(super) fn native_batch<'authority>(
     let mut attribute_count = 0_usize;
     let mut decoded_batch_bytes = 0_usize;
     let mut retained_heap_bytes = 0_usize;
+    let mut policy_shapes = Vec::new();
     let encoded_record_limit = usize::try_from(
         value_limit_profile
             .effective_limits()
@@ -90,7 +92,7 @@ pub(super) fn native_batch<'authority>(
                 {
                     return Err(ReceiveFailure::ValueLimitExceeded);
                 }
-                let decoded_record_bytes = decoded_record_bytes(
+                let decoded_facts = decoded_record_facts(
                     &resource,
                     &scope,
                     &log,
@@ -103,21 +105,22 @@ pub(super) fn native_batch<'authority>(
                     structural_nesting_depth,
                     structural_decoded_record_bytes,
                 )?;
+                let retained_record_heap_bytes = retained_record_heap_bytes(
+                    &resource,
+                    &scope,
+                    &log,
+                    [
+                        &resource_schema_url,
+                        &scope_name,
+                        &scope_version,
+                        &scope_schema_url,
+                    ],
+                )?;
                 retained_heap_bytes = retained_heap_bytes
-                    .checked_add(retained_record_heap_bytes(
-                        &resource,
-                        &scope,
-                        &log,
-                        [
-                            &resource_schema_url,
-                            &scope_name,
-                            &scope_version,
-                            &scope_schema_url,
-                        ],
-                    )?)
+                    .checked_add(retained_record_heap_bytes)
                     .ok_or(ReceiveFailure::ValueLimitExceeded)?;
                 decoded_batch_bytes = decoded_batch_bytes
-                    .checked_add(decoded_record_bytes)
+                    .checked_add(decoded_facts.decoded_bytes)
                     .filter(|bytes| *bytes <= structural_decoded_batch_bytes)
                     .ok_or(ReceiveFailure::ValueLimitExceeded)?;
                 attribute_count = attribute_count
@@ -151,6 +154,18 @@ pub(super) fn native_batch<'authority>(
                     scope_dropped_attributes_count,
                     scope_schema_url.clone(),
                 );
+                let retained_record_heap_bytes = retained_record_heap_bytes
+                    .checked_add(std::mem::size_of::<NativeLogCandidate>())
+                    .ok_or(ReceiveFailure::ValueLimitExceeded)?;
+                policy_shapes.push(PolicyAdmissionShape::from_bounded_decode(
+                    u64::try_from(decoded_facts.decoded_bytes)
+                        .map_err(|_| ReceiveFailure::ValueLimitExceeded)?,
+                    u64::try_from(retained_record_heap_bytes)
+                        .map_err(|_| ReceiveFailure::ValueLimitExceeded)?,
+                    decoded_facts.value_nodes,
+                    decoded_facts.attribute_entries,
+                    decoded_facts.maximum_nesting_depth,
+                ));
                 records.push(NativeLogCandidate::new(
                     Some(checked_timestamp(log.time_unix_nano)?),
                     Some(checked_timestamp(log.observed_time_unix_nano)?),
@@ -161,17 +176,25 @@ pub(super) fn native_batch<'authority>(
             }
         }
     }
+    retained_heap_bytes = retained_heap_bytes
+        .checked_add(
+            policy_shapes
+                .capacity()
+                .checked_mul(std::mem::size_of::<PolicyAdmissionShape>())
+                .ok_or(ReceiveFailure::ValueLimitExceeded)?,
+        )
+        .ok_or(ReceiveFailure::ValueLimitExceeded)?;
     let retained_bytes = retained_batch_bytes(records.capacity(), retained_heap_bytes)?;
     if retained_bytes > 4_194_304 {
         return Err(ReceiveFailure::ValueLimitExceeded);
     }
-    Ok(NativeLogBatch {
+    NativeLogBatch::new_with_policy_shapes(
         attribution,
         records,
         value_limit_profile,
-        decoded_bytes: u64::try_from(retained_bytes)
-            .map_err(|_| ReceiveFailure::ValueLimitExceeded)?,
+        u64::try_from(retained_bytes).map_err(|_| ReceiveFailure::ValueLimitExceeded)?,
         capacity,
         receiver,
-    })
+        policy_shapes,
+    )
 }

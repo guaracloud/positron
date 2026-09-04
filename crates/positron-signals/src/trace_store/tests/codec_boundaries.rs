@@ -1,5 +1,7 @@
 use super::*;
 
+mod markers;
+
 #[test]
 fn trace_blocks_round_trip_native_typed_values_and_missing_times() -> Result<(), Box<dyn Error>> {
     let root = TemporaryRoot::new()?;

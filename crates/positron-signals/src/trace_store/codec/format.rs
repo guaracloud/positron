@@ -7,12 +7,13 @@ use crate::ScanCancellation;
 
 pub(crate) const MAGIC: &[u8; 8] = b"PTRCBL01";
 pub(crate) const LEGACY_VERSION: u16 = 1;
-pub(crate) const VERSION: u16 = 2;
+pub(crate) const DETAILS_VERSION: u16 = 2;
+pub(crate) const VERSION: u16 = 3;
 pub(crate) const MAX_RECORDS: usize = 1_024;
 pub(crate) const MAX_BLOCK_BYTES: usize = 1_048_576;
 
 pub(crate) const fn supported_version(version: u16) -> bool {
-    matches!(version, LEGACY_VERSION | VERSION)
+    matches!(version, LEGACY_VERSION | DETAILS_VERSION | VERSION)
 }
 
 pub(crate) const fn status_tag(status: SpanStatusCode) -> u8 {

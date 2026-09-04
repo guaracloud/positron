@@ -147,7 +147,7 @@ fn malformed_trace_record_shapes_fail_closed_at_their_boundaries() -> Result<(),
         ),
         (
             "wrong version",
-            replaced_bytes(&valid, 8, [0, 3])?,
+            replaced_bytes(&valid, 8, [0, 4])?,
             TraceStoreFailureCode::MalformedBlock,
         ),
         (

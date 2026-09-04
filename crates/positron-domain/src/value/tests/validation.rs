@@ -103,6 +103,242 @@ fn aggregate_collection_bytes_accept_exact_and_reject_nested_over_limit_values()
 }
 
 #[test]
+fn policy_markers_and_sanitized_values_keep_their_public_native_contract() {
+    let profile = super::profile_with_value_and_body_bytes(64, 64);
+    let candidate_marker = CandidateAttributeValue::redaction_marker(
+        AttributeValueKind::String,
+        crate::value::MarkerAction::Redacted,
+    );
+    assert_eq!(
+        candidate_marker.marker_action(),
+        Some(crate::value::MarkerAction::Redacted)
+    );
+    assert_eq!(
+        candidate_marker.marker_original_kind(),
+        Some(AttributeValueKind::String)
+    );
+    assert_eq!(candidate_marker.truncation_action(), None);
+    assert_eq!(candidate_marker.as_str(), None);
+    assert!(candidate_marker.contains_policy_marker());
+    let candidate_truncated = CandidateAttributeValue::truncated(
+        CandidateAttributeValue::string("sanitized".to_owned()),
+        crate::value::MarkerAction::TruncatedBytes,
+    );
+    assert_eq!(candidate_truncated.marker_action(), None);
+    assert_eq!(candidate_truncated.marker_original_kind(), None);
+    assert_eq!(
+        candidate_truncated.truncation_action(),
+        Some(crate::value::MarkerAction::TruncatedBytes)
+    );
+    assert_eq!(candidate_truncated.as_str(), Some("sanitized"));
+    assert!(candidate_truncated.contains_policy_marker());
+
+    let marker = CandidateAttributeValue::redaction_marker(
+        AttributeValueKind::String,
+        crate::value::MarkerAction::Redacted,
+    )
+    .validate_attribute(profile)
+    .expect("a policy marker has no source payload to exceed the value bound");
+
+    assert!(marker.is_marker());
+    assert_eq!(marker.kind(), AttributeValueKind::Marker);
+    assert_eq!(
+        marker.marker_action(),
+        Some(crate::value::MarkerAction::Redacted)
+    );
+    assert_eq!(
+        marker.marker_original_kind(),
+        Some(AttributeValueKind::String)
+    );
+    assert_eq!(marker.truncation_action(), None);
+    assert_eq!(marker.truncated_value(), None);
+    assert!(marker.contains_marker());
+    assert!(!marker.is_null());
+    assert_eq!(marker.as_signed_integer(), None);
+    assert_eq!(marker.as_boolean(), None);
+    assert_eq!(marker.as_floating_point_bits(), None);
+    assert_eq!(marker.as_str(), None);
+    assert_eq!(marker.as_bytes(), None);
+    assert_eq!(marker.array_len(), None);
+    assert_eq!(marker.array_entry(0), None);
+    assert_eq!(marker.key_value_list_len(), None);
+    assert_eq!(marker.key_value_entry(0), None);
+    assert_eq!(marker.clone().into_scalar(), None);
+    assert_eq!(marker.decoded_size_bytes(), Ok(0));
+    assert_eq!(marker.canonical_encoded_size_bytes(), Ok(3));
+    assert_eq!(marker.comparison_encoded_size_bytes(), Ok(3));
+    let mut canonical = Vec::new();
+    marker
+        .append_canonical_encoding(&mut canonical)
+        .expect("marker encoding is bounded");
+    assert_eq!(canonical, vec![8, 1, 4]);
+    let mut comparison = Vec::new();
+    marker
+        .append_comparison_encoding(&mut comparison)
+        .expect("marker comparison encoding is bounded");
+    assert_eq!(comparison, vec![8, 1, 4]);
+
+    let truncated_text = CandidateAttributeValue::truncated(
+        CandidateAttributeValue::string("sanitized".to_owned()),
+        crate::value::MarkerAction::TruncatedBytes,
+    )
+    .validate_attribute(profile)
+    .expect("a same-kind sanitized string remains queryable");
+    assert!(!truncated_text.is_marker());
+    assert_eq!(truncated_text.kind(), AttributeValueKind::String);
+    assert_eq!(truncated_text.marker_action(), None);
+    assert_eq!(truncated_text.marker_original_kind(), None);
+    assert_eq!(
+        truncated_text.truncation_action(),
+        Some(crate::value::MarkerAction::TruncatedBytes)
+    );
+    assert_eq!(
+        truncated_text
+            .truncated_value()
+            .and_then(|value| value.as_str()),
+        Some("sanitized")
+    );
+    assert_eq!(truncated_text.as_str(), Some("sanitized"));
+    assert!(!truncated_text.contains_marker());
+    assert_eq!(truncated_text.as_bytes(), None);
+    assert_eq!(truncated_text.array_len(), None);
+    assert_eq!(truncated_text.key_value_list_len(), None);
+    assert_eq!(truncated_text.decoded_size_bytes(), Ok(9));
+    assert!(truncated_text.canonical_encoded_size_bytes().is_ok());
+    assert!(truncated_text.comparison_encoded_size_bytes().is_ok());
+    assert!(
+        truncated_text.equals_exact(
+            &CandidateAttributeValue::string("sanitized".to_owned())
+                .validate_attribute(profile)
+                .expect("comparison value is bounded")
+        )
+    );
+    assert!(!marker.equals_exact(&marker));
+    assert!(truncated_text.equals_exact(&truncated_text));
+    let native_text = CandidateAttributeValue::string("sanitized".to_owned())
+        .validate_attribute(profile)
+        .expect("comparison value is bounded");
+    assert!(native_text.equals_exact(&truncated_text));
+
+    let truncated_array = CandidateAttributeValue::truncated(
+        CandidateAttributeValue::array(vec![CandidateAttributeValue::redaction_marker(
+            AttributeValueKind::String,
+            crate::value::MarkerAction::Removed,
+        )]),
+        crate::value::MarkerAction::TruncatedElements,
+    )
+    .validate_attribute(profile)
+    .expect("a marker leaf inside a retained collection is valid");
+    assert_eq!(truncated_array.kind(), AttributeValueKind::Array);
+    assert_eq!(truncated_array.array_len(), Some(1));
+    assert!(
+        truncated_array
+            .array_entry(0)
+            .is_some_and(|value| value.is_marker())
+    );
+    assert!(truncated_array.contains_marker());
+    assert_eq!(truncated_array.retained_heap_bytes(), Ok(64));
+
+    let truncated_list = CandidateAttributeValue::truncated(
+        CandidateAttributeValue::key_value_list(vec![CandidateKeyValue::new(
+            "nested".to_owned(),
+            CandidateAttributeValue::redaction_marker(
+                AttributeValueKind::Bytes,
+                crate::value::MarkerAction::Redacted,
+            ),
+        )]),
+        crate::value::MarkerAction::TruncatedElements,
+    )
+    .validate_attribute(profile)
+    .expect("a marker leaf inside a retained key/value list is valid");
+    assert_eq!(truncated_list.kind(), AttributeValueKind::KeyValueList);
+    assert_eq!(truncated_list.key_value_list_len(), Some(1));
+    assert_eq!(
+        truncated_list
+            .key_value_entry(0)
+            .and_then(|entry| entry.value().marker_action()),
+        Some(crate::value::MarkerAction::Redacted)
+    );
+    assert!(truncated_list.contains_marker());
+
+    let ordinary_array =
+        CandidateAttributeValue::array(vec![CandidateAttributeValue::string("value".to_owned())])
+            .validate_attribute(profile)
+            .expect("ordinary array validates");
+    assert!(ordinary_array.equals_exact(&ordinary_array));
+    let ordinary_list = CandidateAttributeValue::key_value_list(vec![CandidateKeyValue::new(
+        "key".to_owned(),
+        CandidateAttributeValue::string("value".to_owned()),
+    )])
+    .validate_attribute(profile)
+    .expect("ordinary key/value list validates");
+    assert!(ordinary_list.equals_exact(&ordinary_list));
+
+    for (kind, tag) in [
+        (AttributeValueKind::Null, 0),
+        (AttributeValueKind::Boolean, 1),
+        (AttributeValueKind::SignedInteger, 2),
+        (AttributeValueKind::FloatingPoint, 3),
+        (AttributeValueKind::String, 4),
+        (AttributeValueKind::Bytes, 5),
+        (AttributeValueKind::Array, 6),
+        (AttributeValueKind::KeyValueList, 7),
+    ] {
+        let marker =
+            CandidateAttributeValue::redaction_marker(kind, crate::value::MarkerAction::Removed)
+                .validate_attribute(profile)
+                .expect("every native kind can be represented by a marker");
+        let mut encoded = Vec::new();
+        marker
+            .append_canonical_encoding(&mut encoded)
+            .expect("marker encoding is bounded");
+        assert_eq!(encoded, vec![8, 0, tag]);
+    }
+}
+
+#[test]
+fn invalid_or_forged_marker_shapes_are_rejected_at_validation_boundary() {
+    let profile = super::profile_with_value_and_body_bytes(64, 64);
+    let invalid = [
+        CandidateAttributeValue::redaction_marker(
+            AttributeValueKind::Marker,
+            crate::value::MarkerAction::Redacted,
+        ),
+        CandidateAttributeValue::redaction_marker(
+            AttributeValueKind::String,
+            crate::value::MarkerAction::TruncatedBytes,
+        ),
+        CandidateAttributeValue::truncated(
+            CandidateAttributeValue::boolean(true),
+            crate::value::MarkerAction::TruncatedBytes,
+        ),
+        CandidateAttributeValue::truncated(
+            CandidateAttributeValue::string("text".to_owned()),
+            crate::value::MarkerAction::TruncatedElements,
+        ),
+        CandidateAttributeValue::truncated(
+            CandidateAttributeValue::redaction_marker(
+                AttributeValueKind::String,
+                crate::value::MarkerAction::Redacted,
+            ),
+            crate::value::MarkerAction::TruncatedBytes,
+        ),
+        CandidateAttributeValue::truncated(
+            CandidateAttributeValue::truncated(
+                CandidateAttributeValue::string("text".to_owned()),
+                crate::value::MarkerAction::TruncatedBytes,
+            ),
+            crate::value::MarkerAction::TruncatedBytes,
+        ),
+    ];
+
+    for candidate in invalid {
+        assert!(candidate.validate_shape(profile).is_err());
+        assert!(candidate.validate_attribute(profile).is_err());
+    }
+}
+
+#[test]
 fn native_values_have_exact_total_order_and_self_delimiting_encoding() {
     let profile = ValueLimitProfile::release_1_system_maximum();
     let negative_zero = CandidateAttributeValue::floating_point_bits((-0.0_f64).to_bits())

@@ -101,8 +101,12 @@ The immutable policy version, digest, and applied-rule evidence attached to acce
 _Avoid_: current policy, receiver version, governance log alone
 
 **Redaction Marker**:
-A typed value proving that an Ingest Policy intentionally removed or replaced source content, distinct from a producer-supplied string that merely looks redacted.
-_Avoid_: empty value, silent deletion, log masking
+A policy-created, payload-free typed value at the original source path and occurrence or array slot that records Removed or Redacted content without retaining its payload. It is a leaf with no descendants, distinct from producer values and native Null, and never matches ordinary native or original-kind predicates.
+_Avoid_: empty value, silent deletion, producer redaction string, null sentinel
+
+**Truncation Marker**:
+A policy-created value at the original source path and occurrence or array slot that records byte or element truncation while retaining only a sanitized native value of the original kind. Its sanitized value keeps the normal typed comparison and projection semantics.
+_Avoid_: silent clipping, source prefix without action, coerced value
 
 **Attribute Occurrence Set**:
 The ordered typed values carried by repeated instances of one attribute key within the same namespace and record, preserved without last-write-wins collapse.

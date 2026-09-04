@@ -5,6 +5,11 @@ Storage Kernel owns the surrounding segment envelope, tenant/signal/shard
 scope, commit position, digest, encryption, and durability. A block never
 contains more than one tenant or signal.
 
+This document remains the byte-level authority for the historical v1 and v2
+formats. Existing v1 and v2 bytes retain their exact meaning and reject the
+marker value tag; new Trace Store blocks are written as v3. The marker-bearing
+extension is defined by [`trace-store-block-format-v3.md`](trace-store-block-format-v3.md).
+
 The payload is big-endian and has no padding:
 
 | Field | Encoding |
@@ -37,8 +42,9 @@ dropped-link counts; resource dropped-attribute count and schema URL;
 instrumentation-scope name, version, dropped-attribute count, and schema URL;
 ordered events (timestamp, name, dropped-attribute count, and typed
 occurrence sets); and ordered links (trace ID, span ID, trace state, flags,
-dropped-attribute count, and typed occurrence sets). Version 2 writers are
-canonical for new observations. Readers retain version 1 compatibility and
+dropped-attribute count, and typed occurrence sets). Before marker-capable v3,
+version 2 writers were canonical for new observations. Readers retain version
+1 compatibility and
 default only fields that version 1 could not contain to explicit empty,
 zero, or `UNSET` values; they never infer producer detail.
 

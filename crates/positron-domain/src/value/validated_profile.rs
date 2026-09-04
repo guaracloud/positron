@@ -29,6 +29,10 @@ impl ValidatedAttributeValue {
             ValidatedAttributeValueInner::Boolean(_) => 1,
             ValidatedAttributeValueInner::SignedInteger(_)
             | ValidatedAttributeValueInner::FloatingPointBits(_) => 8,
+            ValidatedAttributeValueInner::Marker(_) => 0,
+            ValidatedAttributeValueInner::Truncated { value, .. } => {
+                value.validated_size_against(limits, value_bytes, remaining_depth)?
+            },
             ValidatedAttributeValueInner::String(value) => value.len(),
             ValidatedAttributeValueInner::Bytes(value) => value.len(),
             ValidatedAttributeValueInner::Array(values) => {

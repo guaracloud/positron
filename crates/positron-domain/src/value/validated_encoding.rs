@@ -53,6 +53,10 @@ impl ValidatedAttributeValue {
             ValidatedAttributeValueInner::Boolean(_) => Ok(2),
             ValidatedAttributeValueInner::SignedInteger(_)
             | ValidatedAttributeValueInner::FloatingPointBits(_) => Ok(9),
+            ValidatedAttributeValueInner::Marker(_) => Ok(3),
+            ValidatedAttributeValueInner::Truncated { value, .. } => {
+                value.comparison_encoded_size_bytes()
+            },
             ValidatedAttributeValueInner::String(value) => comparison_sequence_size(value.len()),
             ValidatedAttributeValueInner::Bytes(value) => comparison_sequence_size(value.len()),
             ValidatedAttributeValueInner::Array(values) => {
@@ -136,6 +140,14 @@ impl ValidatedAttributeValue {
                 }
                 visit(&[0])
             },
+            ValidatedAttributeValueInner::Marker(marker) => visit(&[
+                8,
+                comparison_marker_action_tag(marker.action()),
+                comparison_native_kind_tag(marker.original_kind()),
+            ]),
+            ValidatedAttributeValueInner::Truncated { value, .. } => {
+                value.visit_comparison_encoding(visit)
+            },
         }
     }
 
@@ -148,7 +160,9 @@ impl ValidatedAttributeValue {
             ValidatedAttributeValueInner::Null
             | ValidatedAttributeValueInner::Boolean(_)
             | ValidatedAttributeValueInner::SignedInteger(_)
-            | ValidatedAttributeValueInner::FloatingPointBits(_) => Ok(0),
+            | ValidatedAttributeValueInner::FloatingPointBits(_)
+            | ValidatedAttributeValueInner::Marker(_) => Ok(0),
+            ValidatedAttributeValueInner::Truncated { value, .. } => value.retained_heap_bytes(),
             ValidatedAttributeValueInner::String(value) => Ok(value.capacity()),
             ValidatedAttributeValueInner::Bytes(value) => Ok(value.capacity()),
             ValidatedAttributeValueInner::Array(values) => {
@@ -208,6 +222,15 @@ impl Ord for ValidatedAttributeValue {
                 ValidatedAttributeValueInner::KeyValueList(left),
                 ValidatedAttributeValueInner::KeyValueList(right),
             ) => left.cmp(right),
+            (
+                ValidatedAttributeValueInner::Marker(left),
+                ValidatedAttributeValueInner::Marker(right),
+            ) => left
+                .original_kind()
+                .cmp(&right.original_kind())
+                .then_with(|| left.action().cmp(&right.action())),
+            (ValidatedAttributeValueInner::Truncated { value, .. }, _) => value.as_ref().cmp(other),
+            (_, ValidatedAttributeValueInner::Truncated { value, .. }) => self.cmp(value.as_ref()),
             _ => self.kind().cmp(&other.kind()),
         }
     }
@@ -228,6 +251,29 @@ fn comparison_bare_sequence_size(length: usize) -> Result<usize, DomainFailure> 
         .checked_mul(2)
         .and_then(|bytes| bytes.checked_add(1))
         .ok_or_else(DomainFailure::value_limit_exceeded)
+}
+
+fn comparison_marker_action_tag(action: super::MarkerAction) -> u8 {
+    match action {
+        super::MarkerAction::Removed => 0,
+        super::MarkerAction::Redacted => 1,
+        super::MarkerAction::TruncatedBytes => 2,
+        super::MarkerAction::TruncatedElements => 3,
+    }
+}
+
+fn comparison_native_kind_tag(kind: super::AttributeValueKind) -> u8 {
+    match kind {
+        super::AttributeValueKind::Null => 0,
+        super::AttributeValueKind::Boolean => 1,
+        super::AttributeValueKind::SignedInteger => 2,
+        super::AttributeValueKind::FloatingPoint => 3,
+        super::AttributeValueKind::String => 4,
+        super::AttributeValueKind::Bytes => 5,
+        super::AttributeValueKind::Array => 6,
+        super::AttributeValueKind::KeyValueList => 7,
+        super::AttributeValueKind::Marker => 0,
+    }
 }
 
 pub(super) fn visit_comparison_sequence<E>(

@@ -1,5 +1,5 @@
 use positron_kernel::ResourceAmounts;
-use positron_policy::{NativeLogCandidate, PolicyBudget};
+use positron_policy::{IngestPolicy, NativeLogCandidate, PolicyAdmissionShape, PolicyBudget};
 use positron_signals::{SchemaBudget, SchemaEntry};
 
 // Resource Governor CPU units are coarse concurrent-work reservations; policy
@@ -103,6 +103,7 @@ fn schema_staging_view_bytes(attribute_count: usize) -> Option<u64> {
     u64::try_from(slots.checked_add(allocator_overhead)?).ok()
 }
 
+#[cfg(test)]
 pub(super) fn group_work_amounts(
     record_count: u64,
     policy: PolicyBudget,
@@ -112,7 +113,45 @@ pub(super) fn group_work_amounts(
         .evaluation_steps()
         .checked_add(POLICY_EVALUATION_STEPS_PER_CPU_WORK_UNIT - 1)?
         / POLICY_EVALUATION_STEPS_PER_CPU_WORK_UNIT;
-    let policy_and_store_work = evaluation_work.checked_mul(record_count)?.checked_add(1)?;
+    group_work_amounts_from_units(
+        record_count,
+        policy,
+        evaluation_work.checked_mul(record_count)?,
+        schema,
+    )
+}
+
+pub(super) fn group_work_amounts_with_policy_shapes(
+    record_count: u64,
+    policy: &IngestPolicy,
+    shapes: Option<&[PolicyAdmissionShape]>,
+    schema: SchemaAdmissionEstimate,
+) -> Option<ResourceAmounts> {
+    let evaluation_work = match usize::try_from(record_count)
+        .ok()
+        .and_then(|count| shapes.filter(|shapes| shapes.len() == count))
+        .and_then(|shapes| policy.admission_cpu_work_units(shapes))
+    {
+        Some(units) => units,
+        None => {
+            let steps = policy.budget().evaluation_steps();
+            steps
+                .checked_add(POLICY_EVALUATION_STEPS_PER_CPU_WORK_UNIT - 1)
+                .and_then(|value| value.checked_div(POLICY_EVALUATION_STEPS_PER_CPU_WORK_UNIT))
+                .unwrap_or(u64::MAX)
+                .saturating_mul(record_count)
+        },
+    };
+    group_work_amounts_from_units(record_count, policy.budget(), evaluation_work, schema)
+}
+
+fn group_work_amounts_from_units(
+    record_count: u64,
+    policy: PolicyBudget,
+    evaluation_work: u64,
+    schema: SchemaAdmissionEstimate,
+) -> Option<ResourceAmounts> {
+    let policy_and_store_work = evaluation_work.checked_add(1)?;
     // Policy and discovery execute sequentially within the admission group;
     // reserve their conservative peak rather than fabricating concurrency.
     let cpu_work = policy_and_store_work.max(schema.schema_work_units());

@@ -1,4 +1,6 @@
-use positron_domain::value::{CandidateAttributeValue, CandidateKeyValue};
+use positron_domain::value::{
+    AttributeValueKind, CandidateAttributeValue, CandidateKeyValue, MarkerAction,
+};
 
 use super::super::{CodecLimits, Input, bounded_vec};
 use crate::log_store::LogStoreFailure;
@@ -8,9 +10,16 @@ pub(in crate::log_store::codec) fn decode(
     depth: u8,
     value_bytes: usize,
     limits: CodecLimits,
-    _version: u16,
+    version: u16,
 ) -> Result<CandidateAttributeValue, LogStoreFailure> {
-    match decode_mode(input, depth, value_bytes, limits, DecodeMode::Build)? {
+    match decode_mode(
+        input,
+        depth,
+        value_bytes,
+        limits,
+        version,
+        DecodeMode::Build,
+    )? {
         DecodedValue::Built(value) => Ok(value),
         DecodedValue::Validated(_) => Err(LogStoreFailure::malformed_block()),
     }
@@ -21,8 +30,16 @@ pub(in crate::log_store::codec) fn validate(
     depth: u8,
     value_bytes: usize,
     limits: CodecLimits,
+    version: u16,
 ) -> Result<ValueSummary, LogStoreFailure> {
-    match decode_mode(input, depth, value_bytes, limits, DecodeMode::ValidateOnly)? {
+    match decode_mode(
+        input,
+        depth,
+        value_bytes,
+        limits,
+        version,
+        DecodeMode::ValidateOnly,
+    )? {
         DecodedValue::Built(_) => Err(LogStoreFailure::malformed_block()),
         DecodedValue::Validated(summary) => Ok(summary),
     }
@@ -43,6 +60,8 @@ enum DecodedValue {
 pub(in crate::log_store::codec) struct ValueSummary {
     value_bytes: usize,
     decoded_bytes: usize,
+    marker: bool,
+    policy_root: bool,
 }
 
 impl ValueSummary {
@@ -56,6 +75,7 @@ fn decode_mode(
     depth: u8,
     value_bytes: usize,
     limits: CodecLimits,
+    version: u16,
     mode: DecodeMode,
 ) -> Result<DecodedValue, LogStoreFailure> {
     input.observe_component()?;
@@ -82,8 +102,9 @@ fn decode_mode(
         ),
         4 => sequence(input, value_bytes, mode, true)?,
         5 => sequence(input, value_bytes, mode, false)?,
-        6 => decode_array(input, depth, value_bytes, limits, mode)?,
-        7 => decode_key_value_list(input, depth, value_bytes, limits, mode)?,
+        6 => decode_array(input, depth, value_bytes, limits, version, mode)?,
+        7 => decode_key_value_list(input, depth, value_bytes, limits, version, mode)?,
+        8 if version >= 3 => decode_marker(input, depth, value_bytes, limits, version, mode)?,
         _ => return Err(LogStoreFailure::malformed_block()),
     };
     if let DecodedValue::Validated(summary) = decoded
@@ -99,6 +120,7 @@ fn decode_array(
     depth: u8,
     value_bytes: usize,
     limits: CodecLimits,
+    version: u16,
     mode: DecodeMode,
 ) -> Result<DecodedValue, LogStoreFailure> {
     let next = depth
@@ -112,14 +134,17 @@ fn decode_array(
     let mut summary = ValueSummary {
         value_bytes: 0,
         decoded_bytes: 0,
+        marker: false,
+        policy_root: false,
     };
     for _ in 0..count {
-        let value = decode_mode(input, next, value_bytes, limits, mode)?;
+        let value = decode_mode(input, next, value_bytes, limits, version, mode)?;
         match (&mut values, value) {
             (Some(values), DecodedValue::Built(value)) => values.push(value),
             (None, DecodedValue::Validated(value)) => {
                 summary.value_bytes = checked_add(summary.value_bytes, value.value_bytes)?;
                 summary.decoded_bytes = checked_add(summary.decoded_bytes, value.decoded_bytes)?;
+                summary.marker |= value.marker;
             },
             _ => return Err(LogStoreFailure::malformed_block()),
         }
@@ -135,6 +160,7 @@ fn decode_key_value_list(
     depth: u8,
     value_bytes: usize,
     limits: CodecLimits,
+    version: u16,
     mode: DecodeMode,
 ) -> Result<DecodedValue, LogStoreFailure> {
     let next = depth
@@ -148,13 +174,15 @@ fn decode_key_value_list(
     let mut summary = ValueSummary {
         value_bytes: 0,
         decoded_bytes: 0,
+        marker: false,
+        policy_root: false,
     };
     for _ in 0..count {
         let key = input.string_slice(limits.key_bytes)?;
         if key.is_empty() {
             return Err(LogStoreFailure::malformed_block());
         }
-        let value = decode_mode(input, next, value_bytes, limits, mode)?;
+        let value = decode_mode(input, next, value_bytes, limits, version, mode)?;
         match (&mut values, value) {
             (Some(values), DecodedValue::Built(value)) => {
                 values.push(CandidateKeyValue::new(try_string(key)?, value));
@@ -163,6 +191,7 @@ fn decode_key_value_list(
                 summary.value_bytes = checked_add(summary.value_bytes, value.value_bytes)?;
                 summary.decoded_bytes = checked_add(summary.decoded_bytes, key.len())?;
                 summary.decoded_bytes = checked_add(summary.decoded_bytes, value.decoded_bytes)?;
+                summary.marker |= value.marker;
             },
             _ => return Err(LogStoreFailure::malformed_block()),
         }
@@ -181,8 +210,114 @@ fn mode_value(mode: DecodeMode, value: CandidateAttributeValue) -> DecodedValue 
         DecodeMode::ValidateOnly => DecodedValue::Validated(ValueSummary {
             value_bytes: 0,
             decoded_bytes: 0,
+            marker: false,
+            policy_root: false,
         }),
     }
+}
+
+fn decode_marker(
+    input: &mut Input<'_>,
+    depth: u8,
+    value_bytes: usize,
+    limits: CodecLimits,
+    version: u16,
+    mode: DecodeMode,
+) -> Result<DecodedValue, LogStoreFailure> {
+    let action = match input.u8()? {
+        0 => MarkerAction::Removed,
+        1 => MarkerAction::Redacted,
+        2 => MarkerAction::TruncatedBytes,
+        3 => MarkerAction::TruncatedElements,
+        _ => return Err(LogStoreFailure::malformed_block()),
+    };
+    let original_kind = match input.u8()? {
+        0 => AttributeValueKind::Null,
+        1 => AttributeValueKind::Boolean,
+        2 => AttributeValueKind::SignedInteger,
+        3 => AttributeValueKind::FloatingPoint,
+        4 => AttributeValueKind::String,
+        5 => AttributeValueKind::Bytes,
+        6 => AttributeValueKind::Array,
+        7 => AttributeValueKind::KeyValueList,
+        _ => return Err(LogStoreFailure::malformed_block()),
+    };
+    match action {
+        MarkerAction::Removed | MarkerAction::Redacted => Ok(match mode {
+            DecodeMode::Build => DecodedValue::Built(CandidateAttributeValue::redaction_marker(
+                original_kind,
+                action,
+            )),
+            DecodeMode::ValidateOnly => DecodedValue::Validated(ValueSummary {
+                value_bytes: 0,
+                decoded_bytes: 0,
+                marker: true,
+                policy_root: true,
+            }),
+        }),
+        MarkerAction::TruncatedBytes | MarkerAction::TruncatedElements => {
+            let child = decode_mode(input, depth, value_bytes, limits, version, mode)?;
+            match child {
+                DecodedValue::Built(child) => {
+                    if candidate_kind(&child) != original_kind
+                        || candidate_has_marker(&child)
+                        || !valid_truncation(action, original_kind)
+                    {
+                        return Err(LogStoreFailure::malformed_block());
+                    }
+                    Ok(DecodedValue::Built(CandidateAttributeValue::truncated(
+                        child, action,
+                    )))
+                },
+                DecodedValue::Validated(summary) => {
+                    if summary.policy_root || !valid_truncation(action, original_kind) {
+                        return Err(LogStoreFailure::malformed_block());
+                    }
+                    Ok(DecodedValue::Validated(ValueSummary {
+                        value_bytes: summary.value_bytes,
+                        decoded_bytes: summary.decoded_bytes,
+                        marker: true,
+                        policy_root: true,
+                    }))
+                },
+            }
+        },
+    }
+}
+
+fn candidate_kind(value: &CandidateAttributeValue) -> AttributeValueKind {
+    match value {
+        CandidateAttributeValue::Null => AttributeValueKind::Null,
+        CandidateAttributeValue::Boolean(_) => AttributeValueKind::Boolean,
+        CandidateAttributeValue::SignedInteger(_) => AttributeValueKind::SignedInteger,
+        CandidateAttributeValue::FloatingPointBits(_) => AttributeValueKind::FloatingPoint,
+        CandidateAttributeValue::String(_) => AttributeValueKind::String,
+        CandidateAttributeValue::Bytes(_) => AttributeValueKind::Bytes,
+        CandidateAttributeValue::Array(_) => AttributeValueKind::Array,
+        CandidateAttributeValue::KeyValueList(_) => AttributeValueKind::KeyValueList,
+        CandidateAttributeValue::Marker(_) => AttributeValueKind::Marker,
+        CandidateAttributeValue::Truncated { value, .. } => candidate_kind(value),
+    }
+}
+
+fn candidate_has_marker(value: &CandidateAttributeValue) -> bool {
+    matches!(
+        value,
+        CandidateAttributeValue::Marker(_) | CandidateAttributeValue::Truncated { .. }
+    )
+}
+
+fn valid_truncation(action: MarkerAction, kind: AttributeValueKind) -> bool {
+    matches!(
+        (action, kind),
+        (
+            MarkerAction::TruncatedBytes,
+            AttributeValueKind::String | AttributeValueKind::Bytes
+        ) | (
+            MarkerAction::TruncatedElements,
+            AttributeValueKind::Array | AttributeValueKind::KeyValueList
+        )
+    )
 }
 
 fn scalar(value: DecodedValue, bytes: usize) -> DecodedValue {
@@ -191,6 +326,8 @@ fn scalar(value: DecodedValue, bytes: usize) -> DecodedValue {
         DecodedValue::Validated(_) => DecodedValue::Validated(ValueSummary {
             value_bytes: bytes,
             decoded_bytes: bytes,
+            marker: false,
+            policy_root: false,
         }),
     }
 }
@@ -211,6 +348,8 @@ fn sequence(
             DecodeMode::ValidateOnly => Ok(DecodedValue::Validated(ValueSummary {
                 value_bytes: bytes.len(),
                 decoded_bytes: bytes.len(),
+                marker: false,
+                policy_root: false,
             })),
         };
     }
@@ -226,6 +365,8 @@ fn sequence(
         DecodeMode::ValidateOnly => Ok(DecodedValue::Validated(ValueSummary {
             value_bytes: bytes.len(),
             decoded_bytes: bytes.len(),
+            marker: false,
+            policy_root: false,
         })),
     }
 }

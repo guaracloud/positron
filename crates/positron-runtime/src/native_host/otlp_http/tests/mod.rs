@@ -17,6 +17,7 @@ use crate::native_host::native_http::Response;
 mod live;
 mod live_outcomes;
 mod outcomes;
+mod policy_markers;
 
 fn single(outcome: IngestOutcome) -> IngestRequestOutcome {
     IngestRequestOutcome::new(vec![AdmissionGroupOutcome::new(

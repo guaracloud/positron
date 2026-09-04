@@ -111,7 +111,15 @@ fn policy_transform_runs_before_lowered_value_limit() -> Result<(), Box<dyn Erro
     let value = transformed.records()[0].attributes()[0]
         .occurrence(0)
         .ok_or("redacted occurrence")?;
-    assert!(value.is_null());
+    assert_eq!(
+        value.marker_action(),
+        Some(positron_domain::value::MarkerAction::Redacted)
+    );
+    assert_eq!(
+        value.marker_original_kind(),
+        Some(positron_domain::value::AttributeValueKind::String)
+    );
+    assert_eq!(value.as_str(), None);
 
     let http = OtlpTracesReceiver::with_value_limit_profile(profile).decode_with_policy(
         AuthenticatedOtlpTracesRequest::otlp_http(
@@ -125,7 +133,12 @@ fn policy_transform_runs_before_lowered_value_limit() -> Result<(), Box<dyn Erro
     assert!(
         http.records()[0].attributes()[0]
             .occurrence(0)
-            .is_some_and(|value| value.is_null())
+            .is_some_and(|value| {
+                value.marker_action() == Some(positron_domain::value::MarkerAction::Redacted)
+                    && value.marker_original_kind()
+                        == Some(positron_domain::value::AttributeValueKind::String)
+                    && value.as_str().is_none()
+            })
     );
     drop(http);
     drop(transformed);
@@ -146,7 +159,8 @@ fn policy_transform_runs_before_lowered_value_limit() -> Result<(), Box<dyn Erro
         &ValueLimitProfile::release_1_system_maximum(),
         transformed_record,
     )?;
-    assert_eq!(encoded_bytes, 198);
+    // The redaction marker's v3 value frame is tag + action + original kind.
+    assert_eq!(encoded_bytes, 200);
     drop(maximum_transformed);
 
     let exact = OtlpTracesReceiver::with_value_limit_profile(

@@ -20,6 +20,8 @@ pub enum AttributeValueKind {
     Array,
     /// An ordered key/value list.
     KeyValueList,
+    /// A payload-free policy marker, not a native producer value kind.
+    Marker,
 }
 /// A profile-bounded typed dynamic attribute value.
 ///
@@ -32,6 +34,9 @@ pub struct ValidatedAttributeValue {
     inner: ValidatedAttributeValueInner,
 }
 
+#[path = "validated/markers.rs"]
+mod markers;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ValidatedAttributeValueInner {
     Null,
@@ -42,6 +47,11 @@ enum ValidatedAttributeValueInner {
     Bytes(Vec<u8>),
     Array(Vec<ValidatedAttributeValue>),
     KeyValueList(Vec<ValidatedKeyValue>),
+    Marker(RedactionMarker),
+    Truncated {
+        value: Box<ValidatedAttributeValue>,
+        action: MarkerAction,
+    },
 }
 
 /// An owned scalar extracted from a validated native value.
@@ -99,7 +109,9 @@ impl ValidatedAttributeValue {
             ValidatedAttributeValueInner::String(value) => ValidatedScalar::String(value),
             ValidatedAttributeValueInner::Bytes(value) => ValidatedScalar::Bytes(value),
             ValidatedAttributeValueInner::Array(_)
-            | ValidatedAttributeValueInner::KeyValueList(_) => return None,
+            | ValidatedAttributeValueInner::KeyValueList(_)
+            | ValidatedAttributeValueInner::Marker(_) => return None,
+            ValidatedAttributeValueInner::Truncated { value, .. } => return value.into_scalar(),
         };
         Some(scalar)
     }
@@ -151,6 +163,15 @@ impl ValidatedAttributeValue {
                 }
                 ValidatedAttributeValueInner::KeyValueList(cloned)
             },
+            ValidatedAttributeValueInner::Marker(marker) => {
+                ValidatedAttributeValueInner::Marker(*marker)
+            },
+            ValidatedAttributeValueInner::Truncated { value, action } => {
+                ValidatedAttributeValueInner::Truncated {
+                    value: Box::new(value.try_clone()?),
+                    action: *action,
+                }
+            },
         };
         Ok(Self { inner })
     }
@@ -167,6 +188,8 @@ impl ValidatedAttributeValue {
             ValidatedAttributeValueInner::Bytes(_) => AttributeValueKind::Bytes,
             ValidatedAttributeValueInner::Array(_) => AttributeValueKind::Array,
             ValidatedAttributeValueInner::KeyValueList(_) => AttributeValueKind::KeyValueList,
+            ValidatedAttributeValueInner::Marker(_) => AttributeValueKind::Marker,
+            ValidatedAttributeValueInner::Truncated { value, .. } => value.kind(),
         }
     }
 
@@ -180,8 +203,10 @@ impl ValidatedAttributeValue {
             | ValidatedAttributeValueInner::String(_)
             | ValidatedAttributeValueInner::Bytes(_)
             | ValidatedAttributeValueInner::Array(_)
-            | ValidatedAttributeValueInner::KeyValueList(_) => None,
+            | ValidatedAttributeValueInner::KeyValueList(_)
+            | ValidatedAttributeValueInner::Marker(_) => None,
             ValidatedAttributeValueInner::SignedInteger(value) => Some(*value),
+            ValidatedAttributeValueInner::Truncated { value, .. } => value.as_signed_integer(),
         }
     }
 
@@ -202,7 +227,9 @@ impl ValidatedAttributeValue {
             | ValidatedAttributeValueInner::String(_)
             | ValidatedAttributeValueInner::Bytes(_)
             | ValidatedAttributeValueInner::Array(_)
-            | ValidatedAttributeValueInner::KeyValueList(_) => None,
+            | ValidatedAttributeValueInner::KeyValueList(_)
+            | ValidatedAttributeValueInner::Marker(_) => None,
+            ValidatedAttributeValueInner::Truncated { value, .. } => value.as_boolean(),
         }
     }
 
@@ -217,7 +244,9 @@ impl ValidatedAttributeValue {
             | ValidatedAttributeValueInner::String(_)
             | ValidatedAttributeValueInner::Bytes(_)
             | ValidatedAttributeValueInner::Array(_)
-            | ValidatedAttributeValueInner::KeyValueList(_) => None,
+            | ValidatedAttributeValueInner::KeyValueList(_)
+            | ValidatedAttributeValueInner::Marker(_) => None,
+            ValidatedAttributeValueInner::Truncated { value, .. } => value.as_floating_point_bits(),
         }
     }
 
@@ -231,8 +260,10 @@ impl ValidatedAttributeValue {
             | ValidatedAttributeValueInner::FloatingPointBits(_)
             | ValidatedAttributeValueInner::Bytes(_)
             | ValidatedAttributeValueInner::Array(_)
-            | ValidatedAttributeValueInner::KeyValueList(_) => None,
+            | ValidatedAttributeValueInner::KeyValueList(_)
+            | ValidatedAttributeValueInner::Marker(_) => None,
             ValidatedAttributeValueInner::String(value) => Some(value),
+            ValidatedAttributeValueInner::Truncated { value, .. } => value.as_str(),
         }
     }
 
@@ -247,7 +278,9 @@ impl ValidatedAttributeValue {
             | ValidatedAttributeValueInner::FloatingPointBits(_)
             | ValidatedAttributeValueInner::String(_)
             | ValidatedAttributeValueInner::Array(_)
-            | ValidatedAttributeValueInner::KeyValueList(_) => None,
+            | ValidatedAttributeValueInner::KeyValueList(_)
+            | ValidatedAttributeValueInner::Marker(_) => None,
+            ValidatedAttributeValueInner::Truncated { value, .. } => value.as_bytes(),
         }
     }
 
@@ -262,7 +295,9 @@ impl ValidatedAttributeValue {
             | ValidatedAttributeValueInner::FloatingPointBits(_)
             | ValidatedAttributeValueInner::String(_)
             | ValidatedAttributeValueInner::Bytes(_)
-            | ValidatedAttributeValueInner::KeyValueList(_) => None,
+            | ValidatedAttributeValueInner::KeyValueList(_)
+            | ValidatedAttributeValueInner::Marker(_) => None,
+            ValidatedAttributeValueInner::Truncated { value, .. } => value.array_len(),
         }
     }
 
@@ -277,7 +312,9 @@ impl ValidatedAttributeValue {
             | ValidatedAttributeValueInner::FloatingPointBits(_)
             | ValidatedAttributeValueInner::String(_)
             | ValidatedAttributeValueInner::Bytes(_)
-            | ValidatedAttributeValueInner::KeyValueList(_) => None,
+            | ValidatedAttributeValueInner::KeyValueList(_)
+            | ValidatedAttributeValueInner::Marker(_) => None,
+            ValidatedAttributeValueInner::Truncated { value, .. } => value.array_entry(index),
         }
     }
 
@@ -292,7 +329,9 @@ impl ValidatedAttributeValue {
             | ValidatedAttributeValueInner::FloatingPointBits(_)
             | ValidatedAttributeValueInner::String(_)
             | ValidatedAttributeValueInner::Bytes(_)
-            | ValidatedAttributeValueInner::Array(_) => None,
+            | ValidatedAttributeValueInner::Array(_)
+            | ValidatedAttributeValueInner::Marker(_) => None,
+            ValidatedAttributeValueInner::Truncated { value, .. } => value.key_value_list_len(),
         }
     }
 
@@ -307,7 +346,9 @@ impl ValidatedAttributeValue {
             | ValidatedAttributeValueInner::FloatingPointBits(_)
             | ValidatedAttributeValueInner::String(_)
             | ValidatedAttributeValueInner::Bytes(_)
-            | ValidatedAttributeValueInner::Array(_) => None,
+            | ValidatedAttributeValueInner::Array(_)
+            | ValidatedAttributeValueInner::Marker(_) => None,
+            ValidatedAttributeValueInner::Truncated { value, .. } => value.key_value_entry(index),
         }
     }
 
@@ -331,6 +372,8 @@ impl ValidatedAttributeValue {
                     checked_decoded_add(total, entry.value.decoded_size_bytes()?)
                 })
             },
+            ValidatedAttributeValueInner::Marker(_) => Ok(0),
+            ValidatedAttributeValueInner::Truncated { value, .. } => value.decoded_size_bytes(),
         }
     }
 

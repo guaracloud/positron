@@ -12,6 +12,10 @@ use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 use positron_domain::value::{
     ByteLimit, RequestLimits, ValueLimitProfile, ValueLimitProfileCandidate, ValueLimitSet,
 };
+use positron_governance::{
+    AdministrativeIdempotencyKey, CompatibilityHints, PresentedCredential, RequestedIntent,
+    ResourceGeneration,
+};
 use positron_ingest::{
     AdmissionGroupOutcome, IngestFailureCode, IngestOutcome, IngestRequestOutcome,
     NativeLogAdmissionGroups, NativeSpanAdmissionGroups,
@@ -135,13 +139,20 @@ impl ReceiverTestBackend for ScriptedBackend {
 pub(super) struct ReceiverHarness {
     pub(super) endpoint: SocketAddr,
     pub(super) bearer: String,
-    pub(super) initialized: Arc<InitializedInstance>,
+    pub(super) initialized: Option<Arc<InitializedInstance>>,
     pub(super) backend: Arc<ScriptedBackend>,
     cancellation: TaskCancellation,
     force: TaskCancellation,
     server: Option<JoinHandle<()>>,
     _test_guard: MutexGuard<'static, ()>,
     _roots: TestRoots,
+}
+
+struct SpawnedServer {
+    endpoint: SocketAddr,
+    cancellation: TaskCancellation,
+    force: TaskCancellation,
+    server: JoinHandle<()>,
 }
 
 impl ReceiverHarness {
@@ -172,6 +183,88 @@ impl ReceiverHarness {
         let initialized = Arc::new(initialized);
         let services = ServiceHandle::new(Arc::clone(&initialized))?;
         services.install_receiver_test_backend(backend.clone())?;
+        let spawned = Self::spawn_server(services)?;
+        Ok(Self {
+            endpoint: spawned.endpoint,
+            bearer,
+            initialized: Some(initialized),
+            backend,
+            cancellation: spawned.cancellation,
+            force: spawned.force,
+            server: Some(spawned.server),
+            _test_guard: test_guard,
+            _roots: roots,
+        })
+    }
+
+    pub(super) fn start_durable_with_policy(
+        policy: positron_ingest::IngestPolicy,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let test_guard = match TRACE_WIRE_TEST.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let roots = TestRoots::new()?;
+        let paths = roots.paths()?;
+        drop(InstanceBootstrap::initialize(
+            &paths,
+            InitializationPlan::non_interactive(),
+        )?);
+        let (administrator_secret, bearer) = {
+            let claim = InstanceBootstrap::claim(&paths)?;
+            let bearer = claim
+                .ingest_secret()
+                .ok_or("ingest secret missing")?
+                .to_owned();
+            (claim.secret().to_owned(), bearer)
+        };
+        let initialized = Arc::new(InstanceBootstrap::reopen(&paths)?);
+        let administrator = initialized.attribute(
+            PresentedCredential::parse(&administrator_secret)?,
+            RequestedIntent::SystemAdministration,
+            CompatibilityHints::none(),
+        )?;
+        let services = ServiceHandle::new(Arc::clone(&initialized))?;
+        services.activate_ingest_policy(
+            administrator,
+            ResourceGeneration::new(1)?,
+            AdministrativeIdempotencyKey::new([0xa7; 16])?,
+            policy,
+        )?;
+        let spawned = Self::spawn_server(services)?;
+        Ok(Self {
+            endpoint: spawned.endpoint,
+            bearer,
+            initialized: Some(initialized),
+            backend: Arc::new(ScriptedBackend::new([])),
+            cancellation: spawned.cancellation,
+            force: spawned.force,
+            server: Some(spawned.server),
+            _test_guard: test_guard,
+            _roots: roots,
+        })
+    }
+
+    pub(super) fn restart_durable(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.stop()?;
+        let old_initialized = self
+            .initialized
+            .take()
+            .ok_or("initialized runtime missing")?;
+        drop(old_initialized);
+        let paths = self._roots.paths()?;
+        let initialized = Arc::new(InstanceBootstrap::reopen(&paths)?);
+        let services = ServiceHandle::new(Arc::clone(&initialized))?;
+        let spawned = Self::spawn_server(services)?;
+        self.endpoint = spawned.endpoint;
+        self.initialized = Some(initialized);
+        self.cancellation = spawned.cancellation;
+        self.force = spawned.force;
+        self.server = Some(spawned.server);
+        Ok(())
+    }
+
+    fn spawn_server(services: ServiceHandle) -> Result<SpawnedServer, Box<dyn std::error::Error>> {
         let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
         listener.set_nonblocking(true)?;
         let endpoint = listener.local_addr()?;
@@ -189,16 +282,11 @@ impl ReceiverHarness {
             serve(admission, serve_cancellation, serve_force, Some(services))
                 .expect("test OTLP gRPC server");
         });
-        Ok(Self {
+        Ok(SpawnedServer {
             endpoint,
-            bearer,
-            initialized,
-            backend,
             cancellation,
             force,
-            server: Some(server),
-            _test_guard: test_guard,
-            _roots: roots,
+            server,
         })
     }
 
@@ -231,7 +319,17 @@ impl ReceiverHarness {
     pub(super) fn snapshot(
         &self,
     ) -> Result<positron_kernel::ResourceSnapshot, Box<dyn std::error::Error>> {
-        Ok(self.initialized.resource_governor().inspect()?)
+        let initialized = self
+            .initialized
+            .as_ref()
+            .ok_or("initialized runtime missing")?;
+        Ok(initialized.resource_governor().inspect()?)
+    }
+
+    pub(super) fn initialized(&self) -> Result<&InitializedInstance, Box<dyn std::error::Error>> {
+        self.initialized
+            .as_deref()
+            .ok_or_else(|| "initialized runtime missing".into())
     }
 
     pub(super) fn finish(mut self) -> Result<(), Box<dyn std::error::Error>> {

@@ -115,6 +115,39 @@ fn validate_attribute_value_observed_with_facts<O: NativeValueObserver>(
                 allocation_bytes,
             )
         },
+        CandidateAttributeValue::Marker(marker) => {
+            if !marker.is_valid() {
+                return Err(DomainFailure::value_limit_exceeded().into());
+            }
+            (ValidatedAttributeValueInner::Marker(marker), 0, 0, 0)
+        },
+        CandidateAttributeValue::Truncated { value, action } => {
+            let Some(native_kind) = candidate_native_kind(&value) else {
+                return Err(DomainFailure::value_limit_exceeded().into());
+            };
+            if !truncation_action_valid(action, native_kind)
+                || matches!(value.as_ref(), CandidateAttributeValue::Marker(_))
+                || matches!(value.as_ref(), CandidateAttributeValue::Truncated { .. })
+            {
+                return Err(DomainFailure::value_limit_exceeded().into());
+            }
+            let transfer = validate_attribute_value_observed_with_facts(
+                *value,
+                limits,
+                value_bytes,
+                remaining_depth,
+                observer,
+            )?;
+            (
+                ValidatedAttributeValueInner::Truncated {
+                    value: Box::new(transfer.value),
+                    action,
+                },
+                transfer.value_size_bytes,
+                transfer.retained_heap_bytes,
+                transfer.allocation_bytes,
+            )
+        },
     };
     Ok(ObservedValueTransfer::new(
         ValidatedAttributeValue { inner },

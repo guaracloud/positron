@@ -5,7 +5,7 @@ use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use positron_domain::routing::SignalKind;
-use positron_domain::value::{AttributeNamespace, AttributeValueKind};
+use positron_domain::value::{AttributeNamespace, AttributeValueKind, MarkerAction};
 use positron_ingest::{
     AuthenticatedOtlpLogsRequest, IngestPolicy, OtlpLogsReceiver, PolicyAction,
     PolicyAttributePath, PolicyPredicate, PolicyReceiver, PolicyRule, PolicyTarget,
@@ -50,7 +50,16 @@ fn predicates_match_signal_receiver_service_severity_path_and_native_type()
         .find(|attribute| attribute.key() == "secret.bytes")
         .and_then(|attribute| attribute.occurrence(0))
         .ok_or("missing redaction marker")?;
-    assert!(secret.is_null());
+    assert_eq!(secret.marker_action(), Some(MarkerAction::Redacted));
+    assert_eq!(
+        secret.marker_original_kind(),
+        Some(AttributeValueKind::Bytes)
+    );
+    assert_eq!(
+        secret.as_bytes(),
+        None,
+        "redaction must retain no source bytes"
+    );
     assert_eq!(
         record.policy_provenance().applied_rules(),
         &["redact-warn-checkout-bytes"]

@@ -16,6 +16,7 @@ mod wire;
 pub(super) struct TraceFanoutFootprint {
     pub(super) aggregate_attributes: usize,
     pub(super) retained_bytes: u64,
+    pub(super) policy_cpu_work_units: u64,
 }
 
 const NATIVE_DRAFT_BYTES: u64 = size_of::<super::decoded::NativeSpanDraft>() as u64;
@@ -48,6 +49,7 @@ pub(super) fn reserve_before_materialization<'authority>(
     let mut footprint = TraceFanoutFootprint {
         aggregate_attributes: 0,
         retained_bytes: 0,
+        policy_cpu_work_units: 0,
     };
     for resource in resources {
         let resource_attributes = resource
@@ -121,6 +123,7 @@ pub(super) fn reserve_before_materialization<'authority>(
                 scope,
                 maximum_attributes,
                 &limits,
+                policy,
             )?;
         }
     }
@@ -141,8 +144,19 @@ pub(super) fn reserve_before_materialization<'authority>(
         return Err(TraceReceiveFailure::ValueLimitExceeded);
     }
     if let Some(capacity) = capacity {
-        let amounts =
-            ResourceAmounts::new([footprint.retained_bytes, 1, 1, 0, 0, 0, 0, 0, 1, 1, 0]);
+        let amounts = ResourceAmounts::new([
+            footprint.retained_bytes,
+            1,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            footprint.policy_cpu_work_units.max(1),
+            1,
+            0,
+        ]);
         capacity
             .try_resize(amounts)
             .map_err(|_| TraceReceiveFailure::CapacityUnavailable)?;
@@ -167,6 +181,7 @@ fn add_scope(
     scope: &ScopeSpans,
     maximum_attributes: usize,
     limits: &positron_domain::value::ValueLimitSet,
+    policy: &positron_policy::IngestPolicy,
 ) -> Result<(), TraceReceiveFailure> {
     let scope_attributes = scope
         .scope
@@ -327,6 +342,44 @@ fn add_scope(
             .checked_add(NATIVE_OBSERVATION_BYTES)
             .and_then(|bytes| bytes.checked_add(detail_slots))
             .ok_or(TraceReceiveFailure::ValueLimitExceeded)?;
+        let policy_retained_bytes = span_attributes
+            .retained_bytes
+            .checked_add(span_native_bytes)
+            .and_then(|bytes| bytes.checked_add(grouped_native_bytes))
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    resource
+                        .bytes
+                        .wire_bytes
+                        .checked_add(resource.bytes.retained_bytes)?
+                        .checked_add(scope_bytes.wire_bytes)?
+                        .checked_add(scope_bytes.retained_bytes)?,
+                )
+            })
+            .and_then(|bytes| bytes.checked_add(resource.native_bytes))
+            .and_then(|bytes| bytes.checked_add(scope_native_bytes))
+            .ok_or(TraceReceiveFailure::ValueLimitExceeded)?;
+        let policy_attribute_entries = resource
+            .attributes
+            .len()
+            .checked_add(scope_attributes.len())
+            .and_then(|count| count.checked_add(span.attributes.len()))
+            .ok_or(TraceReceiveFailure::ValueLimitExceeded)?;
+        let policy_shape = positron_policy::PolicyAdmissionShape::from_bounded_decode(
+            encoded,
+            policy_retained_bytes,
+            policy_retained_bytes,
+            u64::try_from(policy_attribute_entries)
+                .map_err(|_| TraceReceiveFailure::ValueLimitExceeded)?,
+            limits.dynamic_value().nesting_depth().value(),
+        );
+        let policy_cpu_work_units = policy
+            .admission_cpu_work_units_for_shape(policy_shape)
+            .unwrap_or_else(|| static_policy_cpu_work_units(policy));
+        footprint.policy_cpu_work_units = footprint
+            .policy_cpu_work_units
+            .checked_add(policy_cpu_work_units)
+            .ok_or(TraceReceiveFailure::ValueLimitExceeded)?;
         total
             .checked_add(encoded)
             .and_then(|bytes| bytes.checked_add(span_attributes.retained_bytes))
@@ -347,4 +400,14 @@ fn add_scope(
         .and_then(|bytes| bytes.checked_add(span_bytes))
         .ok_or(TraceReceiveFailure::ValueLimitExceeded)?;
     Ok(())
+}
+
+fn static_policy_cpu_work_units(policy: &positron_policy::IngestPolicy) -> u64 {
+    policy
+        .budget()
+        .evaluation_steps()
+        .saturating_add(65_535)
+        .checked_div(65_536)
+        .unwrap_or(u64::MAX)
+        .max(1)
 }

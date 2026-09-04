@@ -1,5 +1,8 @@
 use super::*;
 
+mod markers;
+mod native_marker_kinds;
+
 #[test]
 fn committed_native_log_survives_reopen_and_bounded_scan() -> Result<(), Box<dyn Error>> {
     let root = TemporaryRoot::new()?;

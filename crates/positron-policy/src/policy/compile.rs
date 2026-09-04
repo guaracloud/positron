@@ -4,8 +4,8 @@ use positron_domain::value::AttributeNamespace;
 
 use super::{
     IngestPolicy, MAX_COMPILED_POLICY_BYTES, MAX_EVALUATION_STEPS, MAX_NATIVE_RECORD_BYTES,
-    MAX_RULES, PolicyAction, PolicyBudget, PolicyCompileFailure, PolicyPredicate, PolicyRule,
-    PolicyTarget,
+    MAX_RULES, PolicyAction, PolicyAdmissionShape, PolicyBudget, PolicyCompileFailure,
+    PolicyPredicate, PolicyRule, PolicyTarget,
 };
 use crate::PolicyProvenance;
 
@@ -115,6 +115,123 @@ impl IngestPolicy {
     #[must_use]
     pub const fn budget(&self) -> PolicyBudget {
         self.budget
+    }
+
+    /// Estimates receiver CPU work from facts collected during bounded
+    /// candidate decoding.  The compiled worst-case StepBudget remains the
+    /// evaluator's hard semantic bound; this estimate only avoids charging a
+    /// tiny admitted candidate for the maximum 1 MiB path scan.
+    ///
+    /// Every rule and every candidate is charged additively.  The estimate is
+    /// intentionally an upper bound: it includes the marker pre-scan,
+    /// candidate traversal, path operations, value copies/drops, and the
+    /// metadata allocated by marker/truncation wrappers.  Overflow returns
+    /// `None`, allowing the caller to use the existing static reservation.
+    #[doc(hidden)]
+    pub fn admission_cpu_work_units(&self, shapes: &[PolicyAdmissionShape]) -> Option<u64> {
+        shapes.iter().try_fold(0_u64, |total, shape| {
+            let steps = self.admission_steps_for_shape(*shape)?;
+            let units = steps
+                .checked_add(POLICY_STEPS_PER_CPU_WORK_UNIT - 1)?
+                .checked_div(POLICY_STEPS_PER_CPU_WORK_UNIT)?
+                .max(1);
+            total.checked_add(units)
+        })
+    }
+
+    /// Estimates one candidate without allocating or traversing it.  This is
+    /// used by the Trace receiver while its already-reserved fan-out pass is
+    /// still holding the receiver reservation.
+    #[doc(hidden)]
+    pub fn admission_cpu_work_units_for_shape(&self, shape: PolicyAdmissionShape) -> Option<u64> {
+        let steps = self.admission_steps_for_shape(shape)?;
+        steps
+            .checked_add(POLICY_STEPS_PER_CPU_WORK_UNIT - 1)?
+            .checked_div(POLICY_STEPS_PER_CPU_WORK_UNIT)
+            .map(|units| units.max(1))
+    }
+
+    fn admission_steps_for_shape(&self, shape: PolicyAdmissionShape) -> Option<u64> {
+        let scan = shape.scan_work()?;
+        let marker_scan = scan;
+        let rules = self.rules.iter().try_fold(0_u64, |total, rule| {
+            let predicates = rule.predicates.iter().try_fold(0_u64, |total, predicate| {
+                total.checked_add(predicate.admission_work(shape, scan)?)
+            })?;
+            let action = rule.action.admission_work(shape, scan)?;
+            total
+                .checked_add(predicates)?
+                .checked_add(action)?
+                .checked_add(u64::try_from(rule.id.len()).ok()?)
+                .and_then(|value| value.checked_add(1))
+        })?;
+        Some(marker_scan.checked_add(rules)?.max(1))
+    }
+}
+
+const POLICY_STEPS_PER_CPU_WORK_UNIT: u64 = 65_536;
+const MARKER_METADATA_STEPS: u64 = 2;
+
+impl PolicyAdmissionShape {
+    fn scan_work(self) -> Option<u64> {
+        self.decoded_bytes
+            .max(self.retained_bytes)
+            .checked_add(self.value_nodes)
+            .and_then(|value| value.checked_add(self.attribute_entries))
+            .and_then(|value| value.checked_add(u64::from(self.maximum_nesting_depth)))
+            .and_then(|value| value.checked_add(1))
+    }
+}
+
+impl PolicyPredicate {
+    fn admission_work(&self, shape: PolicyAdmissionShape, scan: u64) -> Option<u64> {
+        match self {
+            Self::AttributeExists(path) | Self::AttributeType(path, _) => {
+                path.admission_work(shape, scan)
+            },
+            Self::BodyExactText(value) | Self::ServiceIdentity(value) => scan
+                .checked_add(u64::try_from(value.len()).ok()?)
+                .and_then(|value| value.checked_add(1)),
+            Self::SignalStore(_) | Self::Receiver(_) | Self::LogSeverity(_) => Some(1),
+        }
+    }
+}
+
+impl PolicyAction {
+    fn admission_work(&self, shape: PolicyAdmissionShape, scan: u64) -> Option<u64> {
+        match self {
+            Self::Accept | Self::Reject => Some(1),
+            Self::Remove(target) | Self::Redact(target) => target
+                .admission_work(shape, scan)?
+                .checked_add(scan)
+                .and_then(|value| value.checked_add(MARKER_METADATA_STEPS)),
+            Self::TruncateBytes(target, limit) => target
+                .admission_work(shape, scan)?
+                .checked_add(scan)
+                .and_then(|value| value.checked_add(u64::from(*limit).min(shape.decoded_bytes)))
+                .and_then(|value| value.checked_add(MARKER_METADATA_STEPS)),
+            Self::TruncateElements(target, _) => target
+                .admission_work(shape, scan)?
+                .checked_add(scan)
+                .and_then(|value| value.checked_add(MARKER_METADATA_STEPS)),
+        }
+    }
+}
+
+impl PolicyTarget {
+    fn admission_work(&self, shape: PolicyAdmissionShape, scan: u64) -> Option<u64> {
+        match self {
+            Self::Body => Some(scan),
+            Self::Attribute(path) => path.admission_work(shape, scan),
+        }
+    }
+}
+
+impl super::PolicyAttributePath {
+    fn admission_work(&self, _shape: PolicyAdmissionShape, scan: u64) -> Option<u64> {
+        let segments = u64::try_from(self.segments.len()).ok()?;
+        let path_steps = segments.checked_add(2)?;
+        scan.checked_mul(path_steps)
     }
 }
 

@@ -1090,11 +1090,13 @@ Release 1 actions are:
 
 -   accept the record
 -   reject the record with a permanent policy result
--   remove a matched non-intrinsic field and attach a typed Redaction
-    Marker
--   replace a matched non-intrinsic value with a typed Redaction Marker
+-   remove the source content of a matched non-intrinsic field while
+    retaining a payload-free typed Redaction Marker at its path and slot
+-   replace a matched non-intrinsic value with a payload-free typed
+    Redaction Marker
 -   truncate a matched non-intrinsic value to an explicit byte or
-    element limit while marking the result as truncated
+    element limit while retaining only a sanitized same-kind native value
+    and a truncation marker
 
 A policy cannot rewrite Tenant ID, Event Time, Ingest Time, Query Time
 provenance, trace ID, span ID, commit position, encryption context, or
@@ -1114,9 +1116,19 @@ The ingest pipeline order is:
 
 Transport and structural failures occur before policy because Positron
 cannot safely evaluate an unbounded or undecodable payload. Policy
-transformations become native values before indexing and persistence;
-the unredacted matched values are not written to Positron storage,
-Operational Telemetry, Governance Audit Records, or error details.
+transformations become internal policy-marked values before indexing and
+persistence. Removed and redacted markers retain only their action and
+original native kind; truncation markers retain only a sanitized same-kind
+native value. No removed or redacted source bytes, value, length, hash, or
+rendering is retained. Payload-free Removed and Redacted marker leaves have no
+descendants, while source paths, duplicate occurrence order and count, and
+array indices remain visible through existing internal projections. Only the
+shared Ingest Policy transition may
+create a marker; producer candidates carrying one are rejected. Marker
+metadata and retained slots count against bounded value-size, memory, and
+reservation budgets. The unredacted matched values are not written to
+Positron storage, Operational Telemetry, Governance Audit Records, or error
+details.
 
 Every admitted request snapshots one policy generation. Records already
 being evaluated finish under that snapshot when a new policy atomically
@@ -1158,7 +1170,7 @@ webhooks, and synchronous external processors are excluded.
 
 ## 3.16 Dynamic Schema and Value Limits
 
-The native value model preserves every supported OTLP value kind:
+The producer native value model preserves every supported OTLP value kind:
 null or absent, boolean, signed integer, floating point, string, bytes,
 array, and ordered key/value list. Receiver Adapters map source values
 into this model without converting values to strings or collapsing
@@ -1180,6 +1192,13 @@ typed values instead of selecting first- or last-write-wins. Query
 operators address one occurrence by index or evaluate explicit `any` or
 `all` semantics. Projecting the path returns the occurrence set, so
 duplicate behavior cannot differ between filtering and output.
+
+Policy-created markers are visible through those same projections without
+becoming producer value kinds. Ordinary scalar, Null, native-kind, and
+original-kind predicates never match a marker; `any` and `all` treat a marker
+as nonmatching, while `index` retains its ordinal position. A truncated value
+continues to use the normal typed comparison and projection of its sanitized
+same-kind value.
 
 One Value Limit Profile bounds:
 

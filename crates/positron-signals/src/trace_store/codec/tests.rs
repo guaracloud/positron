@@ -180,7 +180,7 @@ fn decoder_defensive_paths_remain_typed_after_admission_preflight() {
         crate::TraceStoreFailureCode::MalformedBlock
     );
     let mut wrong_version = valid.clone();
-    wrong_version[9] = 3;
+    wrong_version[9] = 4;
     assert_eq!(
         BlockDecode::observed(tenant, &wrong_version, &NeverCancelled, &observer)
             .err()

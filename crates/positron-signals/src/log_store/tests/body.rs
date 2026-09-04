@@ -1,5 +1,7 @@
 use super::*;
 
+use positron_domain::value::{AttributeValueKind, MarkerAction};
+
 #[test]
 fn body_string_bounds_round_trip_above_attribute_limit_through_exact_maximum()
 -> Result<(), Box<dyn Error>> {
@@ -36,6 +38,31 @@ fn body_bytes_bounds_round_trip_above_attribute_limit_through_exact_maximum()
             Some(body.as_slice())
         );
     }
+    Ok(())
+}
+
+#[test]
+fn sanitized_truncated_body_round_trips_as_a_typed_queryable_value() -> Result<(), Box<dyn Error>> {
+    let profile = value_profile()?;
+    let body = CandidateAttributeValue::truncated(
+        CandidateAttributeValue::string("sanitized-body".to_owned()),
+        MarkerAction::TruncatedBytes,
+    )
+    .validate_log_body(profile)?;
+    let record = LogRecord::checked_native(
+        profile,
+        EventTime::missing(),
+        None,
+        Some(body),
+        vec![],
+        LogMetadata::empty(),
+        PolicyProvenance::new(1, [0x70; 32], vec![])?,
+    )?;
+    let actual = round_trip_record(record, 0x75)?;
+    let body = actual.body().ok_or("missing truncated body")?;
+    assert_eq!(body.truncation_action(), Some(MarkerAction::TruncatedBytes));
+    assert_eq!(body.as_str(), Some("sanitized-body"));
+    assert_eq!(body.kind(), AttributeValueKind::String);
     Ok(())
 }
 

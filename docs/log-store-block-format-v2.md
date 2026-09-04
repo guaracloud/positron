@@ -1,9 +1,13 @@
 # Log Store Block Format v2
 
 This document remains the byte-level authority for native Log Store Block
-version 2. Version 2 extends, and does not reinterpret, the version 1 format in
+version 2. Version 2 is historical: existing version 2 bytes retain their
+exact meaning, while all new blocks are written as version 3; v3 is required
+when a record uses policy markers. Version 2 extends, and does not
+reinterpret, the version 1 format in
 [`log-store-block-format-v1.md`](log-store-block-format-v1.md). Readers retain
-the complete version 1 contract. Store Block writers emit version 2. PSCHEMA1
+the complete version 1 contract. The marker-bearing extension is defined by
+[`log-store-block-format-v3.md`](log-store-block-format-v3.md). PSCHEMA1
 readers accept versions 1, 2, and 3; catalog writers emit version 2 without a
 text sidecar and version 3 when a text sidecar is present.
 

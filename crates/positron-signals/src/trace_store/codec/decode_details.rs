@@ -1,4 +1,6 @@
-use positron_domain::value::{CandidateAttributeValue, CandidateKeyValue, ValueLimitProfile};
+use positron_domain::value::{
+    AttributeValueKind, CandidateAttributeValue, CandidateKeyValue, MarkerAction, ValueLimitProfile,
+};
 
 use super::super::super::details::{
     MAX_DETAIL_COLLECTION, SpanAttributeSet, SpanEvent, SpanLink, SpanObservationDetails,
@@ -12,6 +14,7 @@ use super::{Input, decode_time};
 pub(super) fn decode_details(
     input: &mut Input<'_>,
     profile: &ValueLimitProfile,
+    version: u16,
 ) -> Result<SpanObservationDetails, TraceStoreFailure> {
     let limits = limits_for(profile)?;
     let trace_state = input.string(limits.key_path_bytes)?;
@@ -40,6 +43,7 @@ pub(super) fn decode_details(
             limits.key_path_bytes,
             limits.nesting_depth,
             profile,
+            version,
         )?);
     }
     let links_count = input.count(MAX_DETAIL_COLLECTION)?;
@@ -53,6 +57,7 @@ pub(super) fn decode_details(
             limits.key_path_bytes,
             limits.nesting_depth,
             profile,
+            version,
         )?);
     }
     SpanObservationDetails::checked_with_profile(
@@ -88,11 +93,12 @@ fn decode_event(
     key_limit: usize,
     depth: u8,
     profile: &ValueLimitProfile,
+    version: u16,
 ) -> Result<SpanEvent, TraceStoreFailure> {
     let timestamp = decode_time(input)?;
     let name = input.string(key_limit)?;
     let dropped_attributes_count = input.u32()?;
-    let attributes = decode_span_attributes(input, depth, profile)?;
+    let attributes = decode_span_attributes(input, depth, profile, version)?;
     SpanEvent::checked_with_profile(
         timestamp,
         name,
@@ -108,13 +114,14 @@ fn decode_link(
     key_limit: usize,
     depth: u8,
     profile: &ValueLimitProfile,
+    version: u16,
 ) -> Result<SpanLink, TraceStoreFailure> {
     let trace_id = input.array::<16>()?;
     let span_id = input.array::<8>()?;
     let trace_state = input.string(key_limit)?;
     let flags = input.u32()?;
     let dropped_attributes_count = input.u32()?;
-    let attributes = decode_span_attributes(input, depth, profile)?;
+    let attributes = decode_span_attributes(input, depth, profile, version)?;
     SpanLink::checked_with_profile(
         trace_id,
         span_id,
@@ -131,6 +138,7 @@ fn decode_span_attributes(
     input: &mut Input<'_>,
     depth: u8,
     profile: &ValueLimitProfile,
+    version: u16,
 ) -> Result<Vec<SpanAttributeSet>, TraceStoreFailure> {
     let limits = limits_for(profile)?;
     let count = input.count(MAX_DETAIL_COLLECTION)?;
@@ -149,7 +157,7 @@ fn decode_span_attributes(
             .try_reserve_exact(occurrence_count)
             .map_err(|_| TraceStoreFailure::resource_exhausted())?;
         for _ in 0..occurrence_count {
-            values.push(decode_value(input, depth, &limits)?);
+            values.push(decode_value(input, depth, &limits, version)?);
         }
         attributes.push(
             SpanAttributeSet::checked_with_profile(key, values, profile)
@@ -181,6 +189,7 @@ pub(super) fn decode_value(
     input: &mut Input<'_>,
     depth: u8,
     limits: &super::super::super::types::TraceLimits,
+    version: u16,
 ) -> Result<CandidateAttributeValue, TraceStoreFailure> {
     input.observe_component()?;
     match input.u8()? {
@@ -208,7 +217,7 @@ pub(super) fn decode_value(
                 .try_reserve_exact(count)
                 .map_err(|_| TraceStoreFailure::resource_exhausted())?;
             for _ in 0..count {
-                values.push(decode_value(input, next, limits)?);
+                values.push(decode_value(input, next, limits, version)?);
             }
             Ok(CandidateAttributeValue::array(values))
         },
@@ -225,11 +234,81 @@ pub(super) fn decode_value(
                 let key = input.string(limits.key_path_bytes)?;
                 values.push(CandidateKeyValue::new(
                     key,
-                    decode_value(input, next, limits)?,
+                    decode_value(input, next, limits, version)?,
                 ));
             }
             Ok(CandidateAttributeValue::key_value_list(values))
         },
+        8 if version >= super::super::format::VERSION => {
+            let action = match input.u8()? {
+                0 => MarkerAction::Removed,
+                1 => MarkerAction::Redacted,
+                2 => MarkerAction::TruncatedBytes,
+                3 => MarkerAction::TruncatedElements,
+                _ => return Err(TraceStoreFailure::malformed_block()),
+            };
+            let original_kind = match input.u8()? {
+                0 => AttributeValueKind::Null,
+                1 => AttributeValueKind::Boolean,
+                2 => AttributeValueKind::SignedInteger,
+                3 => AttributeValueKind::FloatingPoint,
+                4 => AttributeValueKind::String,
+                5 => AttributeValueKind::Bytes,
+                6 => AttributeValueKind::Array,
+                7 => AttributeValueKind::KeyValueList,
+                _ => return Err(TraceStoreFailure::malformed_block()),
+            };
+            match action {
+                MarkerAction::Removed | MarkerAction::Redacted => Ok(
+                    CandidateAttributeValue::redaction_marker(original_kind, action),
+                ),
+                MarkerAction::TruncatedBytes | MarkerAction::TruncatedElements => {
+                    if !valid_truncation(action, original_kind) {
+                        return Err(TraceStoreFailure::malformed_block());
+                    }
+                    let child = decode_value(input, depth, limits, version)?;
+                    if candidate_kind(&child) != original_kind || candidate_has_marker(&child) {
+                        return Err(TraceStoreFailure::malformed_block());
+                    }
+                    Ok(CandidateAttributeValue::truncated(child, action))
+                },
+            }
+        },
         _ => Err(TraceStoreFailure::malformed_block()),
     }
+}
+
+fn candidate_kind(value: &CandidateAttributeValue) -> AttributeValueKind {
+    match value {
+        CandidateAttributeValue::Null => AttributeValueKind::Null,
+        CandidateAttributeValue::Boolean(_) => AttributeValueKind::Boolean,
+        CandidateAttributeValue::SignedInteger(_) => AttributeValueKind::SignedInteger,
+        CandidateAttributeValue::FloatingPointBits(_) => AttributeValueKind::FloatingPoint,
+        CandidateAttributeValue::String(_) => AttributeValueKind::String,
+        CandidateAttributeValue::Bytes(_) => AttributeValueKind::Bytes,
+        CandidateAttributeValue::Array(_) => AttributeValueKind::Array,
+        CandidateAttributeValue::KeyValueList(_) => AttributeValueKind::KeyValueList,
+        CandidateAttributeValue::Marker(_) => AttributeValueKind::Marker,
+        CandidateAttributeValue::Truncated { value, .. } => candidate_kind(value),
+    }
+}
+
+fn candidate_has_marker(value: &CandidateAttributeValue) -> bool {
+    matches!(
+        value,
+        CandidateAttributeValue::Marker(_) | CandidateAttributeValue::Truncated { .. }
+    )
+}
+
+fn valid_truncation(action: MarkerAction, kind: AttributeValueKind) -> bool {
+    matches!(
+        (action, kind),
+        (
+            MarkerAction::TruncatedBytes,
+            AttributeValueKind::String | AttributeValueKind::Bytes
+        ) | (
+            MarkerAction::TruncatedElements,
+            AttributeValueKind::Array | AttributeValueKind::KeyValueList
+        )
+    )
 }

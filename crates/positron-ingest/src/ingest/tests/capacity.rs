@@ -1,7 +1,7 @@
 use positron_domain::identity::TenantId;
 use positron_domain::value::{AttributeNamespace, CandidateAttributeValue};
 use positron_kernel::{ResourceAmounts, ResourceDimension, WorkClaim, WorkKind};
-use positron_policy::IngestPolicy;
+use positron_policy::{IngestPolicy, PolicyAction, PolicyAttributePath, PolicyRule, PolicyTarget};
 use positron_policy::{NativeLogAttribute, NativeLogCandidate, PolicyEvaluation, PolicyReceiver};
 use positron_signals::{LogRecord, LogStore, SchemaBudget, SchemaCatalog, SchemaSessionStore};
 
@@ -43,6 +43,30 @@ fn cumulative_discovery_work_is_reserved_at_the_exact_boundary() {
     assert_eq!(
         positron_signals::SchemaBudget::system_max_discovery_nodes(),
         4_096
+    );
+}
+
+#[test]
+fn attribute_marker_reserves_policy_quantum_and_store_work() {
+    let path = PolicyAttributePath::new(AttributeNamespace::Record, "secret").expect("path");
+    let policy = IngestPolicy::compile(
+        1,
+        vec![
+            PolicyRule::new(
+                "redact-secret",
+                Vec::new(),
+                PolicyAction::Redact(PolicyTarget::attribute(path)),
+            )
+            .expect("rule"),
+        ],
+    )
+    .expect("policy");
+    assert_eq!(policy.budget().evaluation_steps(), 2_097_152);
+    let amount = group_work_amounts(1, policy.budget(), schema(1)).expect("amount");
+    assert_eq!(
+        amount.get(ResourceDimension::CpuWorkUnits),
+        33,
+        "32 policy quanta plus one sequential store unit"
     );
 }
 

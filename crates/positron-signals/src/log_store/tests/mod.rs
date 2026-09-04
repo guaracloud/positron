@@ -30,6 +30,7 @@ mod codec;
 mod malformed;
 mod public_contract;
 mod scan;
+mod scan_marker_boundaries;
 mod schema;
 mod schema_overflow_replay;
 mod schema_query;

@@ -9,7 +9,8 @@ use positron_kernel::CommittedBlock;
 const MAGIC: &[u8; 8] = b"PLOGBL01";
 const LEGACY_VERSION: u16 = 1;
 const METADATA_VERSION: u16 = 2;
-const VERSION: u16 = METADATA_VERSION;
+const MARKER_VERSION: u16 = 3;
+const VERSION: u16 = MARKER_VERSION;
 #[cfg(fuzzing)]
 mod fuzz;
 mod limits;
@@ -165,7 +166,7 @@ fn decode_block_header_with<'input>(
         return Err(LogStoreFailure::malformed_block());
     }
     let version = input.u16()?;
-    if !matches!(version, LEGACY_VERSION | METADATA_VERSION) {
+    if !matches!(version, LEGACY_VERSION | METADATA_VERSION | MARKER_VERSION) {
         return Err(LogStoreFailure::malformed_block());
     }
     let tenant: [u8; 16] = input

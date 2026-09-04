@@ -1,6 +1,6 @@
 use positron_domain::identity::TenantId;
 use positron_domain::time::EventTime;
-use positron_domain::value::{AttributeValueKind, ValueLimitProfile};
+use positron_domain::value::{AttributeValueKind, MarkerAction, ValueLimitProfile};
 
 use super::super::details::{SpanAttributeSet, SpanEvent, SpanLink, SpanObservationDetails};
 use super::super::failure::TraceStoreFailure;
@@ -219,6 +219,28 @@ fn encode_value(
     depth: u8,
     limits: &TraceLimits,
 ) -> Result<(), TraceStoreFailure> {
+    if let Some(action) = value.marker_action() {
+        put_u8(output, 8)?;
+        put_u8(output, marker_action_tag(action))?;
+        put_u8(
+            output,
+            native_kind_tag(
+                value
+                    .marker_original_kind()
+                    .ok_or_else(TraceStoreFailure::invalid_input)?,
+            )?,
+        )?;
+        return Ok(());
+    }
+    if let Some(action) = value.truncation_action() {
+        let child = value
+            .truncated_value()
+            .ok_or_else(TraceStoreFailure::invalid_input)?;
+        put_u8(output, 8)?;
+        put_u8(output, marker_action_tag(action))?;
+        put_u8(output, native_kind_tag(child.kind())?)?;
+        return encode_value(output, child, depth, limits);
+    }
     match value.kind() {
         AttributeValueKind::Null => put_u8(output, 0)?,
         AttributeValueKind::Boolean => {
@@ -316,8 +338,32 @@ fn encode_value(
                 encode_value(output, entry.value(), next, limits)?;
             }
         },
+        AttributeValueKind::Marker => return Err(TraceStoreFailure::invalid_input()),
     }
     Ok(())
+}
+
+fn marker_action_tag(action: MarkerAction) -> u8 {
+    match action {
+        MarkerAction::Removed => 0,
+        MarkerAction::Redacted => 1,
+        MarkerAction::TruncatedBytes => 2,
+        MarkerAction::TruncatedElements => 3,
+    }
+}
+
+fn native_kind_tag(kind: AttributeValueKind) -> Result<u8, TraceStoreFailure> {
+    match kind {
+        AttributeValueKind::Null => Ok(0),
+        AttributeValueKind::Boolean => Ok(1),
+        AttributeValueKind::SignedInteger => Ok(2),
+        AttributeValueKind::FloatingPoint => Ok(3),
+        AttributeValueKind::String => Ok(4),
+        AttributeValueKind::Bytes => Ok(5),
+        AttributeValueKind::Array => Ok(6),
+        AttributeValueKind::KeyValueList => Ok(7),
+        AttributeValueKind::Marker => Err(TraceStoreFailure::invalid_input()),
+    }
 }
 
 pub(crate) fn put_slice(output: &mut Vec<u8>, value: &[u8]) -> Result<(), TraceStoreFailure> {

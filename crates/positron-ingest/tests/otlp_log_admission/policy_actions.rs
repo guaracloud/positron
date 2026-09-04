@@ -6,7 +6,7 @@ use opentelemetry_proto::tonic::common::v1::{
 };
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use positron_domain::routing::{SignalKind, VirtualShardId};
-use positron_domain::value::AttributeNamespace;
+use positron_domain::value::{AttributeNamespace, AttributeValueKind, MarkerAction};
 use positron_governance::{CompatibilityHints, PresentedCredential, RequestedIntent};
 use positron_ingest::{
     AuthenticatedOtlpLogsRequest, IngestOutcome, IngestPolicy, LogIngest, OtlpLogsReceiver,
@@ -99,7 +99,18 @@ fn remove_erases_source_content_and_persists_typed_provenance() -> Result<(), Bo
         .iter()
         .map(positron_signals::StoredLogAttribute::occurrences)
         .find(|attribute| attribute.key() == "credentials.password");
-    assert!(removed.is_none());
+    let removed = removed.ok_or("missing removal marker")?;
+    let removed = removed.occurrence(0).ok_or("missing removal occurrence")?;
+    assert_eq!(removed.marker_action(), Some(MarkerAction::Removed));
+    assert_eq!(
+        removed.marker_original_kind(),
+        Some(AttributeValueKind::String)
+    );
+    assert_eq!(
+        removed.as_str(),
+        None,
+        "removal must retain no source payload"
+    );
     let schema_checkpoint = schema.checkpoint()?;
     let discovered = SchemaCatalog::decode_catalog_object(schema_checkpoint.catalog_bytes())?;
     let removed_path = SchemaPath::root(
@@ -176,11 +187,30 @@ fn ordered_rules_transform_repeated_and_nested_native_values() -> Result<(), Box
         secret.occurrence(0).and_then(|value| value.as_str()),
         Some("keep")
     );
-    assert!(secret.occurrence(1).is_some_and(|value| value.is_null()));
+    let redacted = secret.occurrence(1).ok_or("missing redacted occurrence")?;
+    assert_eq!(redacted.marker_action(), Some(MarkerAction::Redacted));
+    assert_eq!(
+        redacted.marker_original_kind(),
+        Some(AttributeValueKind::String)
+    );
+    assert_eq!(redacted.as_str(), None);
     let payload = occurrence(record, "payload")?
         .occurrence(0)
         .ok_or("payload disappeared")?;
-    assert_eq!(payload.key_value_list_len(), Some(0));
+    assert_eq!(payload.key_value_list_len(), Some(1));
+    let nested_marker = payload
+        .key_value_entry(0)
+        .ok_or("nested marker disappeared")?;
+    assert_eq!(nested_marker.key(), "token");
+    assert_eq!(
+        nested_marker.value().marker_action(),
+        Some(MarkerAction::Removed)
+    );
+    assert_eq!(
+        nested_marker.value().marker_original_kind(),
+        Some(AttributeValueKind::String)
+    );
+    assert_eq!(nested_marker.value().as_str(), None);
     let notes = occurrence(record, "notes")?
         .occurrence(0)
         .ok_or("missing truncated notes")?;

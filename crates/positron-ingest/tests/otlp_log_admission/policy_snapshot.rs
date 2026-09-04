@@ -2,6 +2,7 @@ use std::error::Error;
 
 use positron_domain::identity::TenantId;
 use positron_domain::routing::{SignalKind, VirtualShardId};
+use positron_domain::value::{AttributeValueKind, MarkerAction};
 use positron_ingest::{
     AdmissionGroupPlanFailure, AdmissionGroupPlanner, AuthenticatedOtlpLogsRequest, IngestOutcome,
     IngestPolicy, LogIngest, NativeLogCandidate, OtlpLogsReceiver, PolicyAction, PolicyPredicate,
@@ -86,11 +87,15 @@ fn admitted_request_keeps_one_immutable_snapshot_across_groups() -> Result<(), B
             &snapshot,
             LogScan::all(ScanLimit::new(1)?),
         )?;
-        assert!(
-            result.records()[0]
-                .body()
-                .is_some_and(|body| body.is_null())
+        let body = result.records()[0]
+            .body()
+            .ok_or("redaction marker disappeared")?;
+        assert_eq!(body.marker_action(), Some(MarkerAction::Redacted));
+        assert_eq!(
+            body.marker_original_kind(),
+            Some(AttributeValueKind::String)
         );
+        assert_eq!(body.as_str(), None);
         assert_eq!(result.records()[0].policy_provenance().generation(), 31);
     }
 
@@ -102,7 +107,15 @@ fn admitted_request_keeps_one_immutable_snapshot_across_groups() -> Result<(), B
             bodies_request(&["sensitive"]).encode_to_vec(),
         )?)?;
     let new_result = ingest_and_scan(&refreshed_fixture, new_batch, &current, 82)?;
-    assert!(new_result.records()[0].body().is_none());
+    let body = new_result.records()[0]
+        .body()
+        .ok_or("removal marker disappeared")?;
+    assert_eq!(body.marker_action(), Some(MarkerAction::Removed));
+    assert_eq!(
+        body.marker_original_kind(),
+        Some(AttributeValueKind::String)
+    );
+    assert_eq!(body.as_str(), None);
     assert_eq!(new_result.records()[0].policy_provenance().generation(), 32);
     Ok(())
 }
