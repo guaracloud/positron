@@ -973,6 +973,7 @@ name = "positron-runtime"
 version = "0.0.0"
 dependencies = [
  "http",
+ "http-body",
  "opentelemetry-proto",
  "positron-api",
  "positron-domain",

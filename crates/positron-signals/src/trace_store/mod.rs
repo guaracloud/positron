@@ -42,6 +42,18 @@ impl TraceStore {
         positron_domain::value::ValueLimitProfile::release_1_system_maximum()
     }
 
+    /// Returns the canonical encoded bytes for one post-policy span record.
+    ///
+    /// The count includes native details, policy provenance, and the fixed
+    /// ingest-time field, while excluding the enclosing block header. It is
+    /// allocation-free and is shared with durable block encoding.
+    pub fn canonical_encoded_record_bytes(
+        profile: &positron_domain::value::ValueLimitProfile,
+        observation: &SpanObservation,
+    ) -> Result<usize, TraceStoreFailure> {
+        codec::encoded_record_bytes_with_profile(profile, observation)
+    }
+
     /// Prepares canonical Trace Store bytes under a kernel-issued Ingest Time.
     pub fn prepare<'capacity>(
         &self,

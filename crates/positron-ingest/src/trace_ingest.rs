@@ -175,6 +175,9 @@ fn classify_store_failure(code: TraceStoreFailureCode) -> IngestOutcome {
         TraceStoreFailureCode::LimitExceeded => {
             IngestOutcome::Permanent(IngestFailureCode::ValueLimitExceeded)
         },
+        TraceStoreFailureCode::ResourceExhausted => {
+            IngestOutcome::Retryable(IngestFailureCode::CapacityUnavailable)
+        },
         TraceStoreFailureCode::Cancelled => IngestOutcome::Retryable(IngestFailureCode::Cancelled),
         _ => IngestOutcome::Retryable(IngestFailureCode::StorageUnavailable),
     }
@@ -208,5 +211,24 @@ fn classify_ledger_failure(failure: &positron_kernel::LedgerFailure) -> IngestOu
             }
         },
         LedgerCompletionState::RecoveryRequired => IngestOutcome::Retryable(code),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::classify_store_failure;
+    use crate::{IngestFailureCode, IngestOutcome};
+    use positron_signals::TraceStoreFailureCode;
+
+    #[test]
+    fn trace_store_resource_exhaustion_is_capacity_unavailable() {
+        assert_eq!(
+            classify_store_failure(TraceStoreFailureCode::ResourceExhausted),
+            IngestOutcome::Retryable(IngestFailureCode::CapacityUnavailable),
+        );
+        assert_eq!(
+            classify_store_failure(TraceStoreFailureCode::StorageUnavailable),
+            IngestOutcome::Retryable(IngestFailureCode::StorageUnavailable),
+        );
     }
 }

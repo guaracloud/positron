@@ -1,6 +1,6 @@
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
 use opentelemetry_proto::tonic::trace::v1::Span;
-use positron_domain::value::ValueLimitSet;
+use positron_domain::value::{AttributeNamespace, ValueLimitSet};
 use positron_signals::SpanAttributeSet;
 use std::mem::size_of;
 
@@ -14,6 +14,8 @@ const NATIVE_CANDIDATE_VALUE_BYTES: u64 =
 const NATIVE_CANDIDATE_KEY_VALUE_BYTES: u64 =
     size_of::<positron_domain::value::CandidateKeyValue>() as u64;
 
+const NATIVE_GROUPED_CANDIDATE_VALUE_BYTES: u64 = NATIVE_CANDIDATE_VALUE_BYTES;
+
 pub(super) fn key_values_bytes(
     values: &[KeyValue],
     limits: &ValueLimitSet,
@@ -25,6 +27,28 @@ pub(super) fn key_values_bytes(
     })
 }
 
+pub(super) fn grouped_candidate_values_bytes(
+    groups: &[(AttributeNamespace, &[KeyValue])],
+    limits: &ValueLimitSet,
+) -> Result<u64, TraceReceiveFailure> {
+    let attribute_limit =
+        usize::try_from(limits.dynamic_value().attributes_per_namespace().value())
+            .map_err(|_| TraceReceiveFailure::ValueLimitExceeded)?;
+    groups.iter().try_fold(0_u64, |total, (_, values)| {
+        if values.len() > attribute_limit {
+            return Err(TraceReceiveFailure::ValueLimitExceeded);
+        }
+        total
+            .checked_add(
+                u64::try_from(values.len())
+                    .map_err(|_| TraceReceiveFailure::ValueLimitExceeded)?
+                    .checked_mul(NATIVE_GROUPED_CANDIDATE_VALUE_BYTES)
+                    .ok_or(TraceReceiveFailure::ValueLimitExceeded)?,
+            )
+            .ok_or(TraceReceiveFailure::ValueLimitExceeded)
+    })
+}
+
 pub(super) fn span_detail_bytes(
     span: &Span,
     limits: &ValueLimitSet,
@@ -32,11 +56,17 @@ pub(super) fn span_detail_bytes(
     let mut retained = 0_u64;
     for event in &span.events {
         let native_attribute_bytes = key_values_bytes(&event.attributes, limits)?;
+        let grouped_candidate_bytes = grouped_candidate_values_bytes(
+            &[(AttributeNamespace::Record, &event.attributes)],
+            limits,
+        )?;
         let native_attribute_slots = u64::try_from(event.attributes.capacity())
             .map_err(|_| TraceReceiveFailure::ValueLimitExceeded)?
             .checked_mul(NATIVE_ATTRIBUTE_SET_BYTES)
             .ok_or(TraceReceiveFailure::ValueLimitExceeded)?;
         let native_attributes = native_attribute_bytes
+            .checked_add(grouped_candidate_bytes)
+            .ok_or(TraceReceiveFailure::ValueLimitExceeded)?
             .checked_add(native_attribute_slots)
             .ok_or(TraceReceiveFailure::ValueLimitExceeded)?;
         retained = retained
@@ -45,11 +75,17 @@ pub(super) fn span_detail_bytes(
     }
     for link in &span.links {
         let native_attribute_bytes = key_values_bytes(&link.attributes, limits)?;
+        let grouped_candidate_bytes = grouped_candidate_values_bytes(
+            &[(AttributeNamespace::Record, &link.attributes)],
+            limits,
+        )?;
         let native_attribute_slots = u64::try_from(link.attributes.capacity())
             .map_err(|_| TraceReceiveFailure::ValueLimitExceeded)?
             .checked_mul(NATIVE_ATTRIBUTE_SET_BYTES)
             .ok_or(TraceReceiveFailure::ValueLimitExceeded)?;
         let native_attributes = native_attribute_bytes
+            .checked_add(grouped_candidate_bytes)
+            .ok_or(TraceReceiveFailure::ValueLimitExceeded)?
             .checked_add(native_attribute_slots)
             .ok_or(TraceReceiveFailure::ValueLimitExceeded)?;
         retained = retained

@@ -1,11 +1,10 @@
-use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
-use positron_domain::value::{ValueLimitProfile, ValueLimitProfileCandidate};
-use prost::Message;
-
 use super::{
     NativeSpanBatch, TraceReceiveFailure, bounds, decoded, fanout, increment_rejection,
     map_store_failure, request, transport,
 };
+use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+use positron_domain::value::{ValueLimitProfile, ValueLimitProfileCandidate};
+use prost::Message;
 
 /// OTLP Trace Receiver Adapter for protobuf and ProtoJSON payloads.
 #[derive(Clone, Copy, Debug)]
@@ -52,28 +51,26 @@ impl OtlpTracesReceiver {
             mut capacity,
             receiver,
         } = request;
+        let effective_profile = self.value_limit_profile;
         let system_profile =
-            ValueLimitProfileCandidate::new(self.value_limit_profile.system_limits(), None)
+            ValueLimitProfileCandidate::new(effective_profile.system_limits(), None)
                 .validate()
                 .map_err(|_| TraceReceiveFailure::ValueLimitExceeded)?;
         let decoded = match payload {
-            request::OtlpPayload::Decoded(decoded) => {
-                let system_decompressed = usize::try_from(
-                    system_profile
-                        .system_limits()
-                        .request()
-                        .decompressed_bytes()
-                        .value(),
-                )
-                .map_err(|_| TraceReceiveFailure::TransportLimitExceeded)?;
-                if decoded.encoded_len() > system_decompressed {
+            request::OtlpPayload::Decoded { message, evidence } => {
+                let limits = effective_profile.effective_limits().request();
+                let compressed = usize::try_from(limits.compressed_bytes().value())
+                    .map_err(|_| TraceReceiveFailure::TransportLimitExceeded)?;
+                let decompressed = usize::try_from(limits.decompressed_bytes().value())
+                    .map_err(|_| TraceReceiveFailure::TransportLimitExceeded)?;
+                if evidence.wire_body_bytes() > compressed
+                    || evidence.decompressed_message_bytes() > decompressed
+                {
                     return Err(TraceReceiveFailure::TransportLimitExceeded);
                 }
-                let encoded = decoded.encode_to_vec();
-                bounds::validate_protobuf(&encoded, system_profile)?;
-                *decoded
+                *message
             },
-            encoded => match transport::bounded_payload(encoded, system_profile)? {
+            encoded => match transport::bounded_payload(encoded, effective_profile)? {
                 transport::BoundedOtlpPayload::Protobuf(protobuf) => {
                     bounds::validate_protobuf(&protobuf, system_profile)?;
                     ExportTraceServiceRequest::decode(protobuf.as_slice())
@@ -132,6 +129,32 @@ impl OtlpTracesReceiver {
                         );
                         continue;
                     }
+                    if let Err(failure) =
+                        positron_signals::TraceStore::canonical_encoded_record_bytes(
+                            &self.value_limit_profile,
+                            &record,
+                        )
+                    {
+                        match map_store_failure(failure) {
+                            TraceReceiveFailure::CapacityUnavailable => {
+                                return Err(TraceReceiveFailure::CapacityUnavailable);
+                            },
+                            TraceReceiveFailure::ValueLimitExceeded => {
+                                increment_rejection(
+                                    &mut rejections,
+                                    crate::IngestFailureCode::ValueLimitExceeded,
+                                );
+                                continue;
+                            },
+                            _ => {
+                                increment_rejection(
+                                    &mut rejections,
+                                    crate::IngestFailureCode::InvalidRecord,
+                                );
+                                continue;
+                            },
+                        }
+                    }
                     let record_decoded_bytes = match record.decoded_size_bytes() {
                         Ok(bytes) => u64::try_from(bytes)
                             .map_err(|_| TraceReceiveFailure::ValueLimitExceeded)?,
@@ -158,14 +181,9 @@ impl OtlpTracesReceiver {
                             },
                         },
                     };
-                    let record_attributes = record
-                        .attributes()
-                        .iter()
-                        .try_fold(0_usize, |total, attribute| {
-                            total.checked_add(attribute.len())
-                        });
-                    if let Some(total) = record_attributes
-                        .and_then(|count| aggregate_attributes.checked_add(count))
+                    let record_attributes = record_attribute_count(&record)?;
+                    if let Some(total) = aggregate_attributes
+                        .checked_add(record_attributes)
                         .filter(|count| *count <= maximum_attributes)
                     {
                         if let Some(total_decoded) = decoded_bytes
@@ -216,4 +234,55 @@ impl OtlpTracesReceiver {
             rejections,
         )
     }
+}
+
+fn record_attribute_count(
+    record: &positron_signals::SpanObservation,
+) -> Result<usize, TraceReceiveFailure> {
+    let record_attributes = record
+        .attributes()
+        .iter()
+        .try_fold(0_usize, |total, attribute| {
+            total
+                .checked_add(attribute.len())
+                .ok_or(TraceReceiveFailure::ValueLimitExceeded)
+        })?;
+    let event_attributes = record
+        .details()
+        .events()
+        .iter()
+        .try_fold(0_usize, |total, event| {
+            let event_count = event
+                .attributes()
+                .iter()
+                .try_fold(0_usize, |total, attribute| {
+                    total
+                        .checked_add(attribute.len())
+                        .ok_or(TraceReceiveFailure::ValueLimitExceeded)
+                })?;
+            total
+                .checked_add(event_count)
+                .ok_or(TraceReceiveFailure::ValueLimitExceeded)
+        })?;
+    let link_attributes = record
+        .details()
+        .links()
+        .iter()
+        .try_fold(0_usize, |total, link| {
+            let link_count = link
+                .attributes()
+                .iter()
+                .try_fold(0_usize, |total, attribute| {
+                    total
+                        .checked_add(attribute.len())
+                        .ok_or(TraceReceiveFailure::ValueLimitExceeded)
+                })?;
+            total
+                .checked_add(link_count)
+                .ok_or(TraceReceiveFailure::ValueLimitExceeded)
+        })?;
+    record_attributes
+        .checked_add(event_attributes)
+        .and_then(|total| total.checked_add(link_attributes))
+        .ok_or(TraceReceiveFailure::ValueLimitExceeded)
 }

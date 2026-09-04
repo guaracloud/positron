@@ -1,4 +1,5 @@
 use opentelemetry_proto::tonic::common::v1::KeyValue;
+use opentelemetry_proto::tonic::resource::v1::Resource;
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 use positron_domain::value::ValueLimitProfile;
 use positron_kernel::{ResourceAmounts, ResourceReservation};
@@ -21,6 +22,8 @@ const NATIVE_DRAFT_BYTES: u64 = size_of::<super::decoded::NativeSpanDraft>() as 
 const NATIVE_OBSERVATION_BYTES: u64 = size_of::<positron_signals::SpanObservation>() as u64;
 const DETAIL_EVENT_SLOT_BYTES: u64 = size_of::<positron_signals::SpanEvent>() as u64;
 const DETAIL_LINK_SLOT_BYTES: u64 = size_of::<positron_signals::SpanLink>() as u64;
+const WIRE_RESOURCE_SPANS_BYTES: u64 = size_of::<ResourceSpans>() as u64;
+const WIRE_RESOURCE_BYTES: u64 = size_of::<Resource>() as u64;
 const ATTRIBUTE_SLOT_BYTES: u64 =
     size_of::<positron_domain::value::AttributeOccurrenceSet>() as u64;
 
@@ -90,6 +93,27 @@ pub(super) fn reserve_before_materialization<'authority>(
                     .and_then(|scope_slots| bytes.checked_add(scope_slots))
             })
             .ok_or(TraceReceiveFailure::ValueLimitExceeded)?;
+        if resource.scope_spans.is_empty() {
+            let metadata_bytes = u64::try_from(resource.schema_url.capacity())
+                .map_err(|_| TraceReceiveFailure::ValueLimitExceeded)?;
+            let resource_bytes = resource_footprint
+                .bytes
+                .wire_bytes
+                .checked_add(resource_footprint.bytes.retained_bytes)
+                .and_then(|bytes| bytes.checked_add(metadata_bytes))
+                .and_then(|bytes| bytes.checked_add(WIRE_RESOURCE_SPANS_BYTES))
+                .and_then(|bytes| {
+                    resource
+                        .resource
+                        .as_ref()
+                        .map_or(Some(bytes), |_| bytes.checked_add(WIRE_RESOURCE_BYTES))
+                })
+                .ok_or(TraceReceiveFailure::ValueLimitExceeded)?;
+            footprint.retained_bytes = footprint
+                .retained_bytes
+                .checked_add(resource_bytes)
+                .ok_or(TraceReceiveFailure::ValueLimitExceeded)?;
+        }
         for scope in &resource.scope_spans {
             add_scope(
                 &mut footprint,
@@ -166,8 +190,20 @@ fn add_scope(
         .and_then(|count| count.checked_mul(span_count))
         .ok_or(TraceReceiveFailure::ValueLimitExceeded)?;
     let span_attributes = scope.spans.iter().try_fold(0_usize, |total, span| {
+        let event_attributes = span.events.iter().try_fold(0_usize, |total, event| {
+            total
+                .checked_add(event.attributes.len())
+                .ok_or(TraceReceiveFailure::ValueLimitExceeded)
+        })?;
+        let link_attributes = span.links.iter().try_fold(0_usize, |total, link| {
+            total
+                .checked_add(link.attributes.len())
+                .ok_or(TraceReceiveFailure::ValueLimitExceeded)
+        })?;
         total
             .checked_add(span.attributes.len())
+            .and_then(|count| count.checked_add(event_attributes))
+            .and_then(|count| count.checked_add(link_attributes))
             .ok_or(TraceReceiveFailure::ValueLimitExceeded)
     })?;
     footprint.aggregate_attributes = footprint
@@ -254,6 +290,23 @@ fn add_scope(
             limits,
         )?;
         let span_native_bytes = native::key_values_bytes(&span.attributes, limits)?;
+        let grouped_native_bytes = native::grouped_candidate_values_bytes(
+            &[
+                (
+                    positron_domain::value::AttributeNamespace::Resource,
+                    resource.attributes,
+                ),
+                (
+                    positron_domain::value::AttributeNamespace::InstrumentationScope,
+                    scope_attributes,
+                ),
+                (
+                    positron_domain::value::AttributeNamespace::Record,
+                    &span.attributes,
+                ),
+            ],
+            limits,
+        )?;
         let detail_slots = u64::try_from(span.events.len())
             .map_err(|_| TraceReceiveFailure::ValueLimitExceeded)?
             .checked_mul(DETAIL_EVENT_SLOT_BYTES)
@@ -278,6 +331,7 @@ fn add_scope(
             .checked_add(encoded)
             .and_then(|bytes| bytes.checked_add(span_attributes.retained_bytes))
             .and_then(|bytes| bytes.checked_add(span_native_bytes))
+            .and_then(|bytes| bytes.checked_add(grouped_native_bytes))
             .and_then(|bytes| bytes.checked_add(detail_memory))
             .and_then(|bytes| bytes.checked_add(native_slots))
             .ok_or(TraceReceiveFailure::ValueLimitExceeded)

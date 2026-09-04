@@ -9,6 +9,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
+use positron_domain::value::{
+    ByteLimit, RequestLimits, ValueLimitProfile, ValueLimitProfileCandidate, ValueLimitSet,
+};
 use positron_ingest::{
     AdmissionGroupOutcome, IngestFailureCode, IngestOutcome, IngestRequestOutcome,
     NativeLogAdmissionGroups, NativeSpanAdmissionGroups,
@@ -143,6 +146,13 @@ pub(super) struct ReceiverHarness {
 
 impl ReceiverHarness {
     pub(super) fn start(backend: Arc<ScriptedBackend>) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::start_with_profile(backend, ValueLimitProfile::release_1_system_maximum())
+    }
+
+    pub(super) fn start_with_profile(
+        backend: Arc<ScriptedBackend>,
+        profile: ValueLimitProfile,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let test_guard = match TRACE_WIRE_TEST.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -157,7 +167,9 @@ impl ReceiverHarness {
             .ingest_secret()
             .ok_or("ingest secret missing")?
             .to_owned();
-        let initialized = Arc::new(InstanceBootstrap::reopen(&paths)?);
+        let mut initialized = InstanceBootstrap::reopen(&paths)?;
+        initialized.value_limit_profile = profile;
+        let initialized = Arc::new(initialized);
         let services = ServiceHandle::new(Arc::clone(&initialized))?;
         services.install_receiver_test_backend(backend.clone())?;
         let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
@@ -270,6 +282,61 @@ pub(super) fn trace_frame(seed: u8) -> Result<Vec<u8>, Box<dyn std::error::Error
     frame.extend_from_slice(&length.to_be_bytes());
     frame.extend_from_slice(&body);
     Ok(frame)
+}
+
+pub(super) fn gzip_trace_frame(seed: u8) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    gzip_trace_frame_with_span_count(seed, 1)
+}
+
+pub(super) fn gzip_trace_frame_with_span_count(
+    seed: u8,
+    span_count: usize,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut request = trace_request(seed).into_inner();
+    let template = request
+        .resource_spans
+        .first()
+        .and_then(|resource| resource.scope_spans.first())
+        .and_then(|scope| scope.spans.first())
+        .cloned()
+        .ok_or("trace fixture span missing")?;
+    let spans = request
+        .resource_spans
+        .first_mut()
+        .and_then(|resource| resource.scope_spans.first_mut())
+        .ok_or("trace fixture scope missing")?;
+    spans.spans.reserve(span_count.saturating_sub(1));
+    while spans.spans.len() < span_count {
+        spans.spans.push(template.clone());
+    }
+    let body = request.encode_to_vec();
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    std::io::Write::write_all(&mut encoder, &body)?;
+    let compressed = encoder.finish()?;
+    let length = u32::try_from(compressed.len())?;
+    let mut frame = Vec::with_capacity(compressed.len().saturating_add(5));
+    frame.push(1);
+    frame.extend_from_slice(&length.to_be_bytes());
+    frame.extend_from_slice(&compressed);
+    Ok(frame)
+}
+
+pub(super) fn profile_with_transport_limits(
+    compressed: usize,
+    decompressed: usize,
+) -> Result<ValueLimitProfile, Box<dyn std::error::Error>> {
+    let system = ValueLimitProfile::release_1_system_maximum().system_limits();
+    let tenant = ValueLimitSet::new(
+        RequestLimits::new(
+            ByteLimit::new(u32::try_from(compressed)?)?,
+            ByteLimit::new(u32::try_from(decompressed)?)?,
+            system.request().records(),
+            system.request().aggregate_attributes(),
+        ),
+        system.record(),
+        system.dynamic_value(),
+    );
+    Ok(ValueLimitProfileCandidate::new(system, Some(tenant)).validate()?)
 }
 
 struct TestRoots {

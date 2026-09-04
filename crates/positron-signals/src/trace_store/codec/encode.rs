@@ -5,6 +5,7 @@ use positron_domain::value::{AttributeValueKind, ValueLimitProfile};
 use super::super::details::{SpanAttributeSet, SpanEvent, SpanLink, SpanObservationDetails};
 use super::super::failure::TraceStoreFailure;
 use super::super::types::{StoredSpanObservation, TraceLimits, limits_for};
+use super::encoded_size::encoded_record_bytes_with_limits;
 use super::format::{
     MAGIC, MAX_BLOCK_BYTES, MAX_RECORDS, VERSION, kind_tag, namespace_tag, quality_tag,
     sampling_tag, status_tag,
@@ -33,6 +34,7 @@ pub(crate) fn encode_block_with_profile(
     put_slice(&mut output, &tenant.to_bytes())?;
     put_count(&mut output, records.len())?;
     for record in records {
+        encoded_record_bytes_with_limits(record.observation(), &limits_for(profile)?)?;
         encode_observation(&mut output, record, profile)?;
     }
     Ok(output)

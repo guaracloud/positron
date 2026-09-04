@@ -42,7 +42,9 @@ pub use admission_groups::{NativeSpanAdmissionGroup, NativeSpanAdmissionGroups};
 pub use batch::NativeSpanBatch;
 pub use failure::TraceReceiveFailure;
 pub use receiver::OtlpTracesReceiver;
-pub use request::{AuthenticatedOtlpTracesRequest, OtlpTracesRequestEncoding};
+pub use request::{
+    AuthenticatedOtlpTracesRequest, OtlpGrpcTransportEvidence, OtlpTracesRequestEncoding,
+};
 
 pub(super) const MAX_RETAINED_BYTES: u64 = 4_194_304;
 const MAX_RECORDS: u64 = 1_024;
@@ -85,10 +87,19 @@ pub(crate) fn ingest_attribution(
 
 /// Validates the Release 1 OTLP Traces protobuf shape before materializing it.
 pub fn preflight_otlp_traces_protobuf(protobuf: &[u8]) -> Result<(), TraceReceiveFailure> {
-    bounds::validate_protobuf(
+    preflight_otlp_traces_protobuf_with_profile(
         protobuf,
         positron_domain::value::ValueLimitProfile::release_1_system_maximum(),
     )
+}
+
+/// Validates the OTLP Traces protobuf shape under one already validated
+/// effective profile before structural decode.
+pub fn preflight_otlp_traces_protobuf_with_profile(
+    protobuf: &[u8],
+    profile: positron_domain::value::ValueLimitProfile,
+) -> Result<(), TraceReceiveFailure> {
+    bounds::validate_protobuf(protobuf, profile)
 }
 
 /// Validates the Release 1 OTLP Traces ProtoJSON shape before materializing it.
@@ -103,6 +114,17 @@ pub fn preflight_otlp_traces_json(json: &[u8]) -> Result<(), TraceReceiveFailure
 /// The selector only chooses the wire representation; it does not bypass
 /// authentication or admission, which remain runtime-owned at ingestion.
 pub fn preflight_otlp_traces_gzip(gzip: &[u8], json: bool) -> Result<(), TraceReceiveFailure> {
+    let maximum_compressed = usize::try_from(
+        positron_domain::value::ValueLimitProfile::release_1_system_maximum()
+            .system_limits()
+            .request()
+            .compressed_bytes()
+            .value(),
+    )
+    .map_err(|_| TraceReceiveFailure::TransportLimitExceeded)?;
+    if gzip.len() > maximum_compressed {
+        return Err(TraceReceiveFailure::TransportLimitExceeded);
+    }
     let payload = if json {
         request::OtlpPayload::GzipJson(gzip.to_vec())
     } else {

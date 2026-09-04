@@ -186,6 +186,26 @@ fn span_detail_attributes(
             return Err(TraceReceiveFailure::UnsupportedValue);
         }
         check_text(&attribute.key, profile)?;
+        let key = attribute.key.clone();
+        let values = match groups.entry(key.clone()) {
+            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                let count = attributes.iter().try_fold(0_usize, |total, value| {
+                    if value.key == key {
+                        total
+                            .checked_add(1)
+                            .ok_or(TraceReceiveFailure::ValueLimitExceeded)
+                    } else {
+                        Ok(total)
+                    }
+                })?;
+                let mut values = Vec::new();
+                values
+                    .try_reserve_exact(count)
+                    .map_err(|_| TraceReceiveFailure::CapacityUnavailable)?;
+                entry.insert(values)
+            },
+        };
         let value = attribute.value.clone().map_or_else(
             || Ok(CandidateAttributeValue::null()),
             |value| {
@@ -196,7 +216,7 @@ fn span_detail_attributes(
                 )
             },
         )?;
-        groups.entry(attribute.key.clone()).or_default().push(value);
+        values.push(value);
     }
     groups
         .into_iter()

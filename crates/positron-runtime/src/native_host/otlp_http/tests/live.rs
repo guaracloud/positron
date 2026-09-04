@@ -8,6 +8,9 @@ use opentelemetry_proto::tonic::collector::trace::v1::{
     ExportTraceServiceRequest, ExportTraceServiceResponse,
 };
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
+use positron_domain::value::{
+    ByteLimit, RequestLimits, ValueLimitProfile, ValueLimitProfileCandidate, ValueLimitSet,
+};
 use positron_kernel::MountQualification;
 use prost::Message;
 
@@ -266,6 +269,82 @@ fn live_http_trace_export_rejects_invalid_alias_and_compressed_body_limit()
     Ok(())
 }
 
+#[test]
+fn live_http_trace_export_enforces_effective_gzip_limits_before_decode()
+-> Result<(), Box<dyn std::error::Error>> {
+    let request = ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            scope_spans: vec![ScopeSpans {
+                spans: vec![Span {
+                    trace_id: vec![0x71; 16],
+                    span_id: vec![0x72; 8],
+                    name: "effective-gzip-limits".to_owned(),
+                    start_time_unix_nano: 10,
+                    end_time_unix_nano: 20,
+                    ..Span::default()
+                }],
+                ..ScopeSpans::default()
+            }],
+            ..ResourceSpans::default()
+        }],
+    };
+    let protobuf = request.encode_to_vec();
+    let compressed = gzip(&protobuf)?;
+
+    let exact_compressed = profile_with_transport_limits(compressed.len(), 1_048_576)?;
+    {
+        let (_roots, bearer, services) = http_services_with_profile(exact_compressed)?;
+        let response = receive_http(
+            &services,
+            &bearer,
+            compressed.clone(),
+            "application/x-protobuf",
+            Some("gzip"),
+        )?;
+        assert_eq!(response.status(), 200);
+    }
+
+    let one_under_compressed = profile_with_transport_limits(compressed.len() - 1, 1_048_576)?;
+    {
+        let (_roots, bearer, services) = http_services_with_profile(one_under_compressed)?;
+        let response = rejected(receive_http(
+            &services,
+            &bearer,
+            compressed.clone(),
+            "application/x-protobuf",
+            Some("gzip"),
+        ))?;
+        assert_eq!(response.status(), 413);
+    }
+
+    let exact_decompressed = profile_with_transport_limits(1_048_576, protobuf.len())?;
+    {
+        let (_roots, bearer, services) = http_services_with_profile(exact_decompressed)?;
+        let response = receive_http(
+            &services,
+            &bearer,
+            compressed.clone(),
+            "application/x-protobuf",
+            Some("gzip"),
+        )?;
+        assert_eq!(response.status(), 200);
+    }
+
+    let one_under_decompressed = profile_with_transport_limits(1_048_576, protobuf.len() - 1)?;
+    {
+        let (_roots, bearer, services) = http_services_with_profile(one_under_decompressed)?;
+        let response = receive_http(
+            &services,
+            &bearer,
+            compressed,
+            "application/x-protobuf",
+            Some("gzip"),
+        )?;
+        assert_eq!(response.status(), 413);
+    }
+    Ok(())
+}
+
 fn rejected(
     result: Result<crate::native_host::native_http::Response, ReceiveHttpError>,
 ) -> Result<crate::native_host::native_http::Response, Box<dyn std::error::Error>> {
@@ -379,6 +458,43 @@ fn gzip(bytes: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
     encoder.write_all(bytes)?;
     Ok(encoder.finish()?)
+}
+
+fn profile_with_transport_limits(
+    compressed: usize,
+    decompressed: usize,
+) -> Result<ValueLimitProfile, Box<dyn std::error::Error>> {
+    let system = ValueLimitProfile::release_1_system_maximum().system_limits();
+    let tenant = ValueLimitSet::new(
+        RequestLimits::new(
+            ByteLimit::new(u32::try_from(compressed)?)?,
+            ByteLimit::new(u32::try_from(decompressed)?)?,
+            system.request().records(),
+            system.request().aggregate_attributes(),
+        ),
+        system.record(),
+        system.dynamic_value(),
+    );
+    Ok(ValueLimitProfileCandidate::new(system, Some(tenant)).validate()?)
+}
+
+fn http_services_with_profile(
+    profile: ValueLimitProfile,
+) -> Result<(TestRoots, String, ServiceHandle), Box<dyn std::error::Error>> {
+    let roots = TestRoots::new()?;
+    let paths = roots.paths()?;
+    drop(InstanceBootstrap::initialize(
+        &paths,
+        InitializationPlan::non_interactive(),
+    )?);
+    let bearer = InstanceBootstrap::claim(&paths)?
+        .ingest_secret()
+        .ok_or("ingest secret missing")?
+        .to_owned();
+    let mut initialized = InstanceBootstrap::reopen(&paths)?;
+    initialized.value_limit_profile = profile;
+    let services = ServiceHandle::new(std::sync::Arc::new(initialized))?;
+    Ok((roots, bearer, services))
 }
 
 struct TestRoots {

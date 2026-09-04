@@ -18,6 +18,7 @@ test-support = [
 ]
 
 [dependencies]
+http-body = "=1.1.0"
 http = { version = "=1.5.0", default-features = false }
 opentelemetry-proto = { version = "=0.32.0", default-features = false, features = ["gen-tonic", "logs", "trace", "with-serde"] }
 positron-api = { path = "../positron-api" }

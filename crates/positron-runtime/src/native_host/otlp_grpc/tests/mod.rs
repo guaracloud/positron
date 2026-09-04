@@ -4,7 +4,10 @@ use positron_ingest::{
 };
 use tonic::Code;
 
-use super::{map_decode_failure, render, service_status, trace_render, trace_service_status};
+use super::{
+    map_decode_failure, map_trace_decode_failure, render, service_status, trace_render,
+    trace_service_status,
+};
 use crate::ServiceFailure;
 
 mod blocking_executor;
@@ -227,5 +230,30 @@ fn protobuf_wire_decode_failure_is_narrowly_mapped_to_invalid_argument() {
     assert_eq!(
         map_decode_failure(unrelated).headers().get("grpc-status"),
         Some(&http::HeaderValue::from_static("13"))
+    );
+}
+
+#[test]
+fn trace_protobuf_wire_decode_failure_is_mapped_to_invalid_argument() {
+    let mut decode = http::Response::new(());
+    decode
+        .headers_mut()
+        .insert("grpc-status", http::HeaderValue::from_static("13"));
+    decode.headers_mut().insert(
+        "grpc-message",
+        http::HeaderValue::from_static(
+            "failed%20to%20decode%20Protobuf%20message:%20private-parser-detail",
+        ),
+    );
+    let decode = map_trace_decode_failure(decode);
+    assert_eq!(
+        decode.headers().get("grpc-status"),
+        Some(&http::HeaderValue::from_static("3"))
+    );
+    assert_eq!(
+        decode.headers().get("grpc-message"),
+        Some(&http::HeaderValue::from_static(
+            "OTLP%20Traces%20request%20was%20malformed"
+        ))
     );
 }

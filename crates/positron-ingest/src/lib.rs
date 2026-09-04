@@ -28,8 +28,9 @@ pub use otlp_logs::{
 pub use otlp_traces::fuzz_otlp_traces;
 pub use otlp_traces::{
     AuthenticatedOtlpTracesRequest, NativeSpanAdmissionGroup, NativeSpanAdmissionGroups,
-    NativeSpanBatch, OtlpTracesReceiver, OtlpTracesRequestEncoding, TraceReceiveFailure,
-    preflight_otlp_traces_gzip, preflight_otlp_traces_json, preflight_otlp_traces_protobuf,
+    NativeSpanBatch, OtlpGrpcTransportEvidence, OtlpTracesReceiver, OtlpTracesRequestEncoding,
+    TraceReceiveFailure, preflight_otlp_traces_gzip, preflight_otlp_traces_json,
+    preflight_otlp_traces_protobuf, preflight_otlp_traces_protobuf_with_profile,
     reserve_trace_receiver_transport,
 };
 pub use planning::{AdmissionGroupPlanFailure, AdmissionGroupPlanner, FixedAdmissionGroupPlanner};

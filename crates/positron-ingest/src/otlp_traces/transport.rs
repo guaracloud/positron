@@ -47,7 +47,7 @@ pub(super) fn bounded_payload(
             }
             Ok(BoundedOtlpPayload::Json(decompress(bytes, decompressed)?))
         },
-        OtlpPayload::Decoded(_) => Err(TraceReceiveFailure::MalformedPayload),
+        OtlpPayload::Decoded { .. } => Err(TraceReceiveFailure::MalformedPayload),
     }
 }
 

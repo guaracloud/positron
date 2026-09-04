@@ -10,7 +10,9 @@ use opentelemetry_proto::tonic::collector::trace::v1::{
     ExportTracePartialSuccess, ExportTraceServiceRequest, ExportTraceServiceResponse,
 };
 use positron_governance::{AuthorizedContext, CompatibilityHints};
-use positron_ingest::{IngestFailureCode, IngestOutcome, IngestRequestOutcome};
+use positron_ingest::{
+    IngestFailureCode, IngestOutcome, IngestRequestOutcome, OtlpGrpcTransportEvidence,
+};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::codec::CompressionEncoding;
 use tonic::service::LayerExt;
@@ -70,8 +72,9 @@ pub(super) fn serve(
             services,
             blocking: blocking_handle,
         })
-        .accept_compressed(CompressionEncoding::Gzip)
-        .max_decoding_message_size(MAX_MESSAGE_BYTES);
+        .accept_compressed(CompressionEncoding::Gzip);
+        let trace_receiver =
+            MapResponseLayer::new(map_trace_decode_failure).named_layer(trace_receiver);
         let trace_receiver = InterceptedService::new(trace_receiver, move |request| {
             authenticate_traces(request, &trace_authentication)
         });
@@ -98,7 +101,18 @@ pub(super) fn serve(
     result
 }
 
-fn map_decode_failure<B>(mut response: http::Response<B>) -> http::Response<B> {
+fn map_decode_failure<B>(response: http::Response<B>) -> http::Response<B> {
+    map_wire_decode_failure(response, "OTLP%20Logs%20request%20was%20malformed")
+}
+
+fn map_trace_decode_failure<B>(response: http::Response<B>) -> http::Response<B> {
+    map_wire_decode_failure(response, "OTLP%20Traces%20request%20was%20malformed")
+}
+
+fn map_wire_decode_failure<B>(
+    mut response: http::Response<B>,
+    message: &'static str,
+) -> http::Response<B> {
     let is_wire_decode_failure = response
         .headers()
         .get("grpc-status")
@@ -114,10 +128,9 @@ fn map_decode_failure<B>(mut response: http::Response<B>) -> http::Response<B> {
         response
             .headers_mut()
             .insert("grpc-status", http::HeaderValue::from_static("3"));
-        response.headers_mut().insert(
-            "grpc-message",
-            http::HeaderValue::from_static("OTLP%20Logs%20request%20was%20malformed"),
-        );
+        response
+            .headers_mut()
+            .insert("grpc-message", http::HeaderValue::from_static(message));
     }
     response
 }
@@ -257,6 +270,11 @@ impl TraceService for OtlpTracesGrpc {
             .extensions_mut()
             .remove::<crate::services::ReceiverAdmissionLease>()
             .ok_or_else(|| Status::internal("OTLP Traces admission context was unavailable"))?;
+        let evidence = request
+            .extensions()
+            .get::<OtlpGrpcTransportEvidence>()
+            .copied()
+            .ok_or_else(|| Status::internal("OTLP Traces transport evidence was unavailable"))?;
         let reservation = admission.take().map_err(trace_service_status)?;
         if request.get_ref().resource_spans.iter().all(|resource| {
             resource
@@ -273,6 +291,7 @@ impl TraceService for OtlpTracesGrpc {
                 self.services.clone(),
                 context,
                 request.into_inner(),
+                evidence,
                 reservation,
             )
             .await

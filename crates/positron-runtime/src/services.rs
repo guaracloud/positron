@@ -234,6 +234,7 @@ impl ServiceHandle {
         &self,
         context: AuthorizedContext,
         decoded: opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest,
+        evidence: positron_ingest::OtlpGrpcTransportEvidence,
         reservation: TransferredResourceReservation,
     ) -> Result<IngestRequestOutcome, ServiceFailure> {
         self.revalidate_ingest_context(context)?;
@@ -241,7 +242,7 @@ impl ServiceHandle {
             .reclaim(self.instance.resource_governor())
             .map_err(|_| ServiceFailure::Internal)?;
         let request = AuthenticatedOtlpTracesRequest::decoded_otlp_grpc_after_transport_admission(
-            context, decoded, capacity,
+            context, decoded, evidence, capacity,
         )
         .map_err(map_trace_receive_failure)?;
         ingest::ingest_authenticated_traces(self, context, request)
@@ -321,6 +322,7 @@ impl ServiceHandle {
         context: AuthorizedContext,
     ) -> Result<ReceiverAdmissionLease, ServiceFailure> {
         self.revalidate_ingest_context(context)?;
+        let value_limit_profile = self.instance.value_limit_profile;
         let reservation =
             reserve_log_receiver_transport(context, self.instance.resource_governor())
                 .map_err(|failure| match failure {
@@ -334,6 +336,7 @@ impl ServiceHandle {
             inner: Arc::new(ReceiverAdmissionLeaseInner {
                 services: self.clone(),
                 reservation: Mutex::new(Some(reservation)),
+                value_limit_profile,
             }),
         })
     }
@@ -343,6 +346,7 @@ impl ServiceHandle {
         context: AuthorizedContext,
     ) -> Result<ReceiverAdmissionLease, ServiceFailure> {
         self.revalidate_ingest_context(context)?;
+        let value_limit_profile = self.instance.value_limit_profile;
         let reservation =
             reserve_trace_receiver_transport(context, self.instance.resource_governor())
                 .map_err(|failure| match failure {
@@ -356,6 +360,7 @@ impl ServiceHandle {
             inner: Arc::new(ReceiverAdmissionLeaseInner {
                 services: self.clone(),
                 reservation: Mutex::new(Some(reservation)),
+                value_limit_profile,
             }),
         })
     }
@@ -441,9 +446,14 @@ pub(crate) struct ReceiverAdmissionLease {
 struct ReceiverAdmissionLeaseInner {
     services: ServiceHandle,
     reservation: Mutex<Option<TransferredResourceReservation>>,
+    value_limit_profile: positron_domain::value::ValueLimitProfile,
 }
 
 impl ReceiverAdmissionLease {
+    pub(crate) fn value_limit_profile(&self) -> positron_domain::value::ValueLimitProfile {
+        self.inner.value_limit_profile
+    }
+
     pub(crate) fn take(&self) -> Result<TransferredResourceReservation, ServiceFailure> {
         self.inner
             .reservation

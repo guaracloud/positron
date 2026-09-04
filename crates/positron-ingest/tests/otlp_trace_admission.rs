@@ -4,8 +4,9 @@ use std::io::Write;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use positron_governance::{CompatibilityHints, PresentedCredential, RequestedIntent};
 use positron_ingest::{
-    AuthenticatedOtlpTracesRequest, OtlpTracesReceiver, OtlpTracesRequestEncoding, PolicyReceiver,
-    TraceReceiveFailure, reserve_trace_receiver_transport,
+    AuthenticatedOtlpTracesRequest, OtlpGrpcTransportEvidence, OtlpTracesReceiver,
+    OtlpTracesRequestEncoding, PolicyReceiver, TraceReceiveFailure,
+    reserve_trace_receiver_transport,
 };
 use positron_kernel::MountQualification;
 use positron_runtime::{BootstrapPaths, InitializationPlan, InstanceBootstrap};
@@ -87,6 +88,7 @@ fn authenticated_trace_constructors_cover_wire_variants_and_decoded_handoff()
     let decoded = AuthenticatedOtlpTracesRequest::decoded_otlp_grpc_after_transport_admission(
         context,
         ExportTraceServiceRequest::default(),
+        OtlpGrpcTransportEvidence::prevalidated(5, 0),
         capacity,
     )?;
     assert_eq!(

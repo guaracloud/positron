@@ -10,7 +10,39 @@ pub(super) enum OtlpPayload {
     GzipProtobuf(Vec<u8>),
     Json(Vec<u8>),
     GzipJson(Vec<u8>),
-    Decoded(Box<ExportTraceServiceRequest>),
+    Decoded {
+        message: Box<ExportTraceServiceRequest>,
+        evidence: OtlpGrpcTransportEvidence,
+    },
+}
+
+/// Measurements captured after authenticated gRPC transport admission and
+/// before the decoded request reaches the receiver.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OtlpGrpcTransportEvidence {
+    wire_body_bytes: usize,
+    decompressed_message_bytes: usize,
+}
+
+impl OtlpGrpcTransportEvidence {
+    /// Records the actual gRPC body and decompressed message sizes measured by
+    /// the transport adapter. The body count includes each five-byte gRPC
+    /// frame header, matching the compressed request limit's wire semantics.
+    #[must_use]
+    pub const fn prevalidated(wire_body_bytes: usize, decompressed_message_bytes: usize) -> Self {
+        Self {
+            wire_body_bytes,
+            decompressed_message_bytes,
+        }
+    }
+
+    pub(crate) const fn wire_body_bytes(self) -> usize {
+        self.wire_body_bytes
+    }
+
+    pub(crate) const fn decompressed_message_bytes(self) -> usize {
+        self.decompressed_message_bytes
+    }
 }
 
 /// Supported OTLP Trace body encodings after HTTP metadata validation.
@@ -75,11 +107,15 @@ impl<'authority> AuthenticatedOtlpTracesRequest<'authority> {
     pub fn decoded_otlp_grpc_after_transport_admission(
         context: AuthorizedContext,
         decoded: ExportTraceServiceRequest,
+        evidence: OtlpGrpcTransportEvidence,
         capacity: ResourceReservation<'authority>,
     ) -> Result<Self, TraceReceiveFailure> {
         Ok(Self {
             attribution: ingest_attribution(context)?,
-            payload: OtlpPayload::Decoded(Box::new(decoded)),
+            payload: OtlpPayload::Decoded {
+                message: Box::new(decoded),
+                evidence,
+            },
             capacity: Some(capacity),
             receiver: crate::PolicyReceiver::OtlpGrpc,
         })
@@ -188,7 +224,7 @@ impl OtlpPayload {
             | Self::GzipProtobuf(bytes)
             | Self::Json(bytes)
             | Self::GzipJson(bytes) => bytes.len(),
-            Self::Decoded(message) => prost::Message::encoded_len(message.as_ref()),
+            Self::Decoded { message, .. } => prost::Message::encoded_len(message.as_ref()),
         }
     }
 }

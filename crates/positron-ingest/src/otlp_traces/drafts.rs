@@ -235,20 +235,51 @@ fn grouped_attributes(
     let attribute_limit =
         usize::try_from(limits.dynamic_value().attributes_per_namespace().value())
             .map_err(|_| TraceReceiveFailure::ValueLimitExceeded)?;
-    let mut groups = BTreeMap::<(AttributeNamespace, String), Vec<CandidateAttributeValue>>::new();
-    for (namespace, attributes) in [
+    let namespaces = [
         (AttributeNamespace::Resource, resource),
         (AttributeNamespace::InstrumentationScope, scope),
         (AttributeNamespace::Record, record),
-    ] {
+    ];
+    for (_, attributes) in namespaces {
         if attributes.len() > attribute_limit {
             return Err(TraceReceiveFailure::ValueLimitExceeded);
         }
+    }
+    let mut groups = BTreeMap::<(AttributeNamespace, String), Vec<CandidateAttributeValue>>::new();
+    for (namespace, attributes) in namespaces {
         for attribute in attributes {
             if attribute.key_strindex != 0 {
                 return Err(TraceReceiveFailure::UnsupportedValue);
             }
             check_text(&attribute.key, profile)?;
+            let key = attribute.key.clone();
+            let values = match groups.entry((namespace, key.clone())) {
+                std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    let count =
+                        namespaces
+                            .iter()
+                            .try_fold(0_usize, |total, (candidate, values)| {
+                                if *candidate != namespace {
+                                    return Ok(total);
+                                }
+                                values.iter().try_fold(total, |total, value| {
+                                    if value.key == key {
+                                        total
+                                            .checked_add(1)
+                                            .ok_or(TraceReceiveFailure::ValueLimitExceeded)
+                                    } else {
+                                        Ok(total)
+                                    }
+                                })
+                            })?;
+                    let mut values = Vec::new();
+                    values
+                        .try_reserve_exact(count)
+                        .map_err(|_| TraceReceiveFailure::CapacityUnavailable)?;
+                    entry.insert(values)
+                },
+            };
             let value = attribute.value.clone().map_or_else(
                 || Ok(CandidateAttributeValue::null()),
                 |value| {
@@ -259,10 +290,7 @@ fn grouped_attributes(
                     )
                 },
             )?;
-            groups
-                .entry((namespace, attribute.key.clone()))
-                .or_default()
-                .push(value);
+            values.push(value);
         }
     }
     groups

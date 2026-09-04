@@ -156,20 +156,41 @@ fn public_trace_store_seam_commits_and_reads_a_native_observation() -> Result<()
         exact_evaluated,
         SpanObservationDetails::default(),
     )?;
+    let canonical_exact_bytes = TraceStore::canonical_encoded_record_bytes(
+        &ValueLimitProfile::release_1_system_maximum(),
+        &exact,
+    )?;
+    assert_eq!(canonical_exact_bytes, 142);
+    let encoded_exact_profile = profile_with_encoded_record_bytes(142);
     let exact_prepared = TraceStore::new().prepare_with_profile(
-        &lowered,
+        &encoded_exact_profile,
         ledger.begin_store_block(
             preparation_capacity(&authority, tenant)?,
             positron_kernel::StoreBlockIdentity::new([0x8d; 16])?,
         )?,
-        vec![exact],
+        vec![exact.clone()],
     )?;
     drop(exact_prepared);
+    let one_under_failure = match TraceStore::new().prepare_with_profile(
+        &profile_with_encoded_record_bytes(141),
+        ledger.begin_store_block(
+            preparation_capacity(&authority, tenant)?,
+            positron_kernel::StoreBlockIdentity::new([0x8e; 16])?,
+        )?,
+        vec![exact],
+    ) {
+        Ok(_) => return Err("Trace Store accepted a one-under encoded record".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(
+        one_under_failure.code(),
+        positron_signals::TraceStoreFailureCode::LimitExceeded
+    );
     let over_failure = match TraceStore::new().prepare_with_profile(
         &lowered,
         ledger.begin_store_block(
             preparation_capacity(&authority, tenant)?,
-            positron_kernel::StoreBlockIdentity::new([0x8e; 16])?,
+            positron_kernel::StoreBlockIdentity::new([0x9e; 16])?,
         )?,
         vec![over_observation],
     ) {
@@ -486,6 +507,24 @@ fn profile_with_key_limit(key_path_bytes: u32) -> ValueLimitProfile {
                 maximum.effective_limits().record().log_body_bytes(),
             ),
             lowered,
+        )),
+    )
+    .validate()
+    .expect("lowered profile")
+}
+
+fn profile_with_encoded_record_bytes(bytes: u32) -> ValueLimitProfile {
+    let maximum = ValueLimitProfile::release_1_system_maximum();
+    ValueLimitProfileCandidate::new(
+        maximum.system_limits(),
+        Some(ValueLimitSet::new(
+            maximum.effective_limits().request(),
+            RecordLimits::new(
+                ByteLimit::new(bytes).expect("encoded record bound"),
+                maximum.effective_limits().record().decoded_bytes(),
+                maximum.effective_limits().record().log_body_bytes(),
+            ),
+            maximum.effective_limits().dynamic_value(),
         )),
     )
     .validate()

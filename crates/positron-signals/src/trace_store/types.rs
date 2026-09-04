@@ -13,6 +13,7 @@ pub(super) struct TraceLimits {
     pub(super) nesting_depth: u8,
     pub(super) array_entries: usize,
     pub(super) key_value_list_entries: usize,
+    pub(super) encoded_bytes: usize,
     pub(super) decoded_bytes: usize,
 }
 
@@ -39,6 +40,8 @@ pub(super) fn limits_for(profile: &ValueLimitProfile) -> Result<TraceLimits, Tra
         array_entries: usize::try_from(dynamic.array_entries().value())
             .map_err(|_| TraceStoreFailure::limit_exceeded())?,
         key_value_list_entries: usize::try_from(dynamic.key_value_list_entries().value())
+            .map_err(|_| TraceStoreFailure::limit_exceeded())?,
+        encoded_bytes: usize::try_from(profile.record().encoded_bytes().value())
             .map_err(|_| TraceStoreFailure::limit_exceeded())?,
         decoded_bytes: usize::try_from(profile.record().decoded_bytes().value())
             .map_err(|_| TraceStoreFailure::limit_exceeded())?,

@@ -6,7 +6,7 @@ use opentelemetry_proto::tonic::collector::{
     logs::v1::ExportLogsServiceRequest, trace::v1::ExportTraceServiceRequest,
 };
 use positron_governance::AuthorizedContext;
-use positron_ingest::IngestRequestOutcome;
+use positron_ingest::{IngestRequestOutcome, OtlpGrpcTransportEvidence};
 use positron_kernel::TransferredResourceReservation;
 
 use crate::{ServiceFailure, ServiceHandle, TaskCancellation};
@@ -47,6 +47,7 @@ struct BlockingTraceIngestOperation {
     services: ServiceHandle,
     context: AuthorizedContext,
     request: ExportTraceServiceRequest,
+    evidence: OtlpGrpcTransportEvidence,
     reservation: TransferredResourceReservation,
     response: tokio::sync::oneshot::Sender<Result<IngestRequestOutcome, ServiceFailure>>,
 }
@@ -144,6 +145,7 @@ impl BlockingIngestHandle {
         services: ServiceHandle,
         context: AuthorizedContext,
         request: ExportTraceServiceRequest,
+        evidence: OtlpGrpcTransportEvidence,
         reservation: TransferredResourceReservation,
     ) -> Result<IngestRequestOutcome, ServiceFailure> {
         let (response, outcome) = tokio::sync::oneshot::channel();
@@ -151,6 +153,7 @@ impl BlockingIngestHandle {
             services,
             context,
             request,
+            evidence,
             reservation,
             response,
         }));
@@ -198,6 +201,7 @@ fn run(receiver: Receiver<BlockingIngestJob>, cancellation: TaskCancellation) {
                 let result = operation.services.ingest_decoded_otlp_traces(
                     operation.context,
                     operation.request,
+                    operation.evidence,
                     operation.reservation,
                 );
                 let _ = operation.response.send(result);
