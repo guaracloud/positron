@@ -149,8 +149,15 @@ impl Display for PolicyEvaluationFailure {
 
 impl std::error::Error for PolicyEvaluationFailure {}
 
+#[derive(Debug, Eq, PartialEq)]
 pub enum PolicyEvaluation {
     Accepted(Box<crate::EvaluatedLogRecord>),
+    Rejected,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum TracePolicyEvaluation {
+    Accepted(Box<crate::EvaluatedTraceRecord>),
     Rejected,
 }
 

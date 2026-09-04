@@ -5,6 +5,7 @@ use positron_domain::identity::TenantId;
 use positron_domain::routing::{SignalKind, VirtualShardId};
 
 use crate::NativeLogCandidate;
+use positron_signals::SpanObservation;
 
 /// Typed refusal from a trusted Admission Group assignment authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -31,6 +32,16 @@ pub trait AdmissionGroupPlanner: Send + Sync {
         record_ordinal: u32,
         record: &NativeLogCandidate,
     ) -> Result<VirtualShardId, AdmissionGroupPlanFailure>;
+
+    fn assigned_trace_shard(
+        &self,
+        _tenant: TenantId,
+        _signal: SignalKind,
+        _record_ordinal: u32,
+        _record: &SpanObservation,
+    ) -> Result<VirtualShardId, AdmissionGroupPlanFailure> {
+        Err(AdmissionGroupPlanFailure::UnsupportedSignal)
+    }
 }
 
 /// The accepted standalone plan that assigns all records to one configured shard.
@@ -55,6 +66,19 @@ impl AdmissionGroupPlanner for FixedAdmissionGroupPlanner {
         _record: &NativeLogCandidate,
     ) -> Result<VirtualShardId, AdmissionGroupPlanFailure> {
         if signal != SignalKind::Logs {
+            return Err(AdmissionGroupPlanFailure::UnsupportedSignal);
+        }
+        Ok(self.shard)
+    }
+
+    fn assigned_trace_shard(
+        &self,
+        _tenant: TenantId,
+        signal: SignalKind,
+        _record_ordinal: u32,
+        _record: &SpanObservation,
+    ) -> Result<VirtualShardId, AdmissionGroupPlanFailure> {
+        if signal != SignalKind::Traces {
             return Err(AdmissionGroupPlanFailure::UnsupportedSignal);
         }
         Ok(self.shard)

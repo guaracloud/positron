@@ -5,9 +5,9 @@ use positron_governance::{
     RequestedIntent,
 };
 use positron_ingest::{
-    AuthenticatedLokiPushRequest, AuthenticatedOtlpLogsRequest, IngestRequestOutcome,
-    LokiPushReceiver, LokiPushRequestEncoding, TenantSchemaRegistry, TenantSchemaSession,
-    reserve_log_receiver_transport,
+    AuthenticatedLokiPushRequest, AuthenticatedOtlpLogsRequest, AuthenticatedOtlpTracesRequest,
+    IngestRequestOutcome, LokiPushReceiver, LokiPushRequestEncoding, TenantSchemaRegistry,
+    TenantSchemaSession, reserve_log_receiver_transport, reserve_trace_receiver_transport,
 };
 use positron_kernel::TransferredResourceReservation;
 use positron_query::QueryBudget;
@@ -28,6 +28,7 @@ use failure::map_query_failure_code;
 use failure::{
     classify_bootstrap_failure_code, classify_catalog_failure_code, classify_ledger_failure_code,
     collect_query_bodies, map_admission_group_plan_failure, map_query_failure, map_receive_failure,
+    map_trace_receive_failure,
 };
 #[cfg(test)]
 mod tests;
@@ -48,6 +49,17 @@ pub struct ServiceHandle {
 pub(crate) trait ReceiverTestBackend: Send + Sync {
     fn ingest(&self, groups: positron_ingest::NativeLogAdmissionGroups<'_>)
     -> IngestRequestOutcome;
+
+    fn handles_traces(&self) -> bool {
+        false
+    }
+
+    fn ingest_traces(
+        &self,
+        _groups: positron_ingest::NativeSpanAdmissionGroups<'_>,
+    ) -> IngestRequestOutcome {
+        IngestRequestOutcome::new(Vec::new())
+    }
 }
 
 impl std::fmt::Debug for ServiceHandle {
@@ -146,6 +158,37 @@ impl ServiceHandle {
         ingest::ingest_authenticated(self, context, request)
     }
 
+    pub fn ingest_otlp_traces(
+        &self,
+        bearer: &str,
+        protobuf: Vec<u8>,
+    ) -> Result<IngestRequestOutcome, ServiceFailure> {
+        let context = self.authorize_traces(bearer)?;
+        self.revalidate_ingest_context(context)?;
+        let request = AuthenticatedOtlpTracesRequest::otlp_grpc_protobuf(
+            context,
+            self.instance._authority.governor(),
+            protobuf,
+        )
+        .map_err(map_trace_receive_failure)?;
+        ingest::ingest_authenticated_traces(self, context, request)
+    }
+
+    pub(crate) fn authorize_traces(
+        &self,
+        bearer: &str,
+    ) -> Result<AuthorizedContext, ServiceFailure> {
+        self.authorize_logs_with_hints(bearer, CompatibilityHints::none())
+    }
+
+    pub(crate) fn authorize_traces_with_hints(
+        &self,
+        bearer: &str,
+        hints: CompatibilityHints,
+    ) -> Result<AuthorizedContext, ServiceFailure> {
+        self.authorize_logs_with_hints(bearer, hints)
+    }
+
     pub(crate) fn authorize_logs(&self, bearer: &str) -> Result<AuthorizedContext, ServiceFailure> {
         self.authorize_logs_with_hints(bearer, CompatibilityHints::none())
     }
@@ -187,6 +230,42 @@ impl ServiceHandle {
         ingest::ingest_authenticated(self, context, request)
     }
 
+    pub(crate) fn ingest_decoded_otlp_traces(
+        &self,
+        context: AuthorizedContext,
+        decoded: opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest,
+        evidence: positron_ingest::OtlpGrpcTransportEvidence,
+        reservation: TransferredResourceReservation,
+    ) -> Result<IngestRequestOutcome, ServiceFailure> {
+        self.revalidate_ingest_context(context)?;
+        let capacity = reservation
+            .reclaim(self.instance.resource_governor())
+            .map_err(|_| ServiceFailure::Internal)?;
+        let request = AuthenticatedOtlpTracesRequest::decoded_otlp_grpc_after_transport_admission(
+            context, decoded, evidence, capacity,
+        )
+        .map_err(map_trace_receive_failure)?;
+        ingest::ingest_authenticated_traces(self, context, request)
+    }
+
+    pub(crate) fn ingest_encoded_otlp_http_traces(
+        &self,
+        context: AuthorizedContext,
+        encoding: positron_ingest::OtlpTracesRequestEncoding,
+        body: Vec<u8>,
+        reservation: TransferredResourceReservation,
+    ) -> Result<IngestRequestOutcome, ServiceFailure> {
+        self.revalidate_ingest_context(context)?;
+        let capacity = reservation
+            .reclaim(self.instance.resource_governor())
+            .map_err(|_| ServiceFailure::Internal)?;
+        let request = AuthenticatedOtlpTracesRequest::encoded_otlp_http_after_transport_admission(
+            context, encoding, body, capacity,
+        )
+        .map_err(map_trace_receive_failure)?;
+        ingest::ingest_authenticated_traces(self, context, request)
+    }
+
     pub(crate) fn ingest_encoded_loki_push(
         &self,
         context: AuthorizedContext,
@@ -222,6 +301,10 @@ impl ServiceHandle {
         ))
     }
 
+    pub(crate) fn traces_transport_limits(&self) -> Result<(usize, usize), ServiceFailure> {
+        self.logs_transport_limits()
+    }
+
     #[cfg(test)]
     pub(crate) fn install_receiver_test_backend(
         &self,
@@ -239,6 +322,7 @@ impl ServiceHandle {
         context: AuthorizedContext,
     ) -> Result<ReceiverAdmissionLease, ServiceFailure> {
         self.revalidate_ingest_context(context)?;
+        let value_limit_profile = self.instance.value_limit_profile;
         let reservation =
             reserve_log_receiver_transport(context, self.instance.resource_governor())
                 .map_err(|failure| match failure {
@@ -252,6 +336,31 @@ impl ServiceHandle {
             inner: Arc::new(ReceiverAdmissionLeaseInner {
                 services: self.clone(),
                 reservation: Mutex::new(Some(reservation)),
+                value_limit_profile,
+            }),
+        })
+    }
+
+    pub(crate) fn admit_traces(
+        &self,
+        context: AuthorizedContext,
+    ) -> Result<ReceiverAdmissionLease, ServiceFailure> {
+        self.revalidate_ingest_context(context)?;
+        let value_limit_profile = self.instance.value_limit_profile;
+        let reservation =
+            reserve_trace_receiver_transport(context, self.instance.resource_governor())
+                .map_err(|failure| match failure {
+                    positron_ingest::TraceReceiveFailure::CapacityUnavailable => {
+                        ServiceFailure::CapacityUnavailable
+                    },
+                    _ => ServiceFailure::InvalidRequest,
+                })?
+                .transfer();
+        Ok(ReceiverAdmissionLease {
+            inner: Arc::new(ReceiverAdmissionLeaseInner {
+                services: self.clone(),
+                reservation: Mutex::new(Some(reservation)),
+                value_limit_profile,
             }),
         })
     }
@@ -337,9 +446,14 @@ pub(crate) struct ReceiverAdmissionLease {
 struct ReceiverAdmissionLeaseInner {
     services: ServiceHandle,
     reservation: Mutex<Option<TransferredResourceReservation>>,
+    value_limit_profile: positron_domain::value::ValueLimitProfile,
 }
 
 impl ReceiverAdmissionLease {
+    pub(crate) fn value_limit_profile(&self) -> positron_domain::value::ValueLimitProfile {
+        self.inner.value_limit_profile
+    }
+
     pub(crate) fn take(&self) -> Result<TransferredResourceReservation, ServiceFailure> {
         self.inner
             .reservation

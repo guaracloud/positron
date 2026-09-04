@@ -18,10 +18,11 @@ mod schema_resolution;
 use capacity::{group_work_amounts, schema_admission_estimate};
 pub(crate) use failure::classify_log_store_failure_code;
 use failure::map_ledger_failure;
+use outcome::increment_rejection;
+pub(crate) use outcome::partial_admission;
 pub use outcome::{
     CommittedAdmission, IngestFailureCode, IngestOutcome, PartialAdmission, RejectionDetail,
 };
-use outcome::{increment_rejection, partial_admission};
 use schema_resolution::{
     RetentionResolution, SchemaCapacityRetention, map_schema_session_failure,
     resolve_after_retention_failure, retain_schema_capacity, rollback_schema,

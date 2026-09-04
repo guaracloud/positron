@@ -1,13 +1,38 @@
 use positron_domain::value::AttributeNamespace;
 
+use super::super::details::SpanStatusCode;
 use super::super::failure::TraceStoreFailure;
-use super::super::types::{SamplingDecision, SpanKind};
+use super::super::observation::{SamplingDecision, SpanKind};
 use crate::ScanCancellation;
 
 pub(crate) const MAGIC: &[u8; 8] = b"PTRCBL01";
-pub(crate) const VERSION: u16 = 1;
+pub(crate) const LEGACY_VERSION: u16 = 1;
+pub(crate) const VERSION: u16 = 2;
 pub(crate) const MAX_RECORDS: usize = 1_024;
 pub(crate) const MAX_BLOCK_BYTES: usize = 1_048_576;
+
+pub(crate) const fn supported_version(version: u16) -> bool {
+    matches!(version, LEGACY_VERSION | VERSION)
+}
+
+pub(crate) const fn status_tag(status: SpanStatusCode) -> u8 {
+    match status {
+        SpanStatusCode::Unset => 0,
+        SpanStatusCode::Ok => 1,
+        SpanStatusCode::Error => 2,
+    }
+}
+
+pub(crate) const fn decode_status_tag(
+    tag: u8,
+) -> Result<SpanStatusCode, super::super::failure::TraceStoreFailure> {
+    match tag {
+        0 => Ok(SpanStatusCode::Unset),
+        1 => Ok(SpanStatusCode::Ok),
+        2 => Ok(SpanStatusCode::Error),
+        _ => Err(super::super::failure::TraceStoreFailure::malformed_block()),
+    }
+}
 
 pub(crate) fn check_cancel(cancellation: &dyn ScanCancellation) -> Result<(), TraceStoreFailure> {
     if cancellation.is_cancelled() {

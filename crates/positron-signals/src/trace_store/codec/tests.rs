@@ -1,7 +1,8 @@
 use super::{
     BlockDecode, Input, MAX_BLOCK_BYTES, decode_kind, decode_namespace, decode_observation,
-    decode_quality, decode_sampling, decoded_memory_bound, encode_block, kind_tag, namespace_index,
-    namespace_tag, preflight_policy, put_slice, quality_tag, sampling_tag,
+    decode_quality, decode_sampling, decoded_memory_bound, encode_block,
+    encoded_record_bytes_with_profile, kind_tag, namespace_index, namespace_tag, preflight_policy,
+    put_slice, quality_tag, sampling_tag,
 };
 use crate::trace_store::{SamplingDecision, SpanKind, SpanObservation, StoredSpanObservation};
 use crate::{ScanCancellation, ScanObservationFailureCode, ScanObserver};
@@ -163,7 +164,11 @@ fn decoder_defensive_paths_remain_typed_after_admission_preflight() {
         .assign_ingest_time()
         .expect("ingest time"),
     );
+    let profile = ValueLimitProfile::release_1_system_maximum();
+    let expected_record_length =
+        encoded_record_bytes_with_profile(&profile, stored.observation()).expect("record length");
     let valid = encode_block(tenant, &[stored]).expect("encoded block");
+    assert_eq!(valid.len() - 28, expected_record_length);
     let observer = NeverObserved;
     let mut wrong_magic = valid.clone();
     wrong_magic[0] = 0;
@@ -175,7 +180,7 @@ fn decoder_defensive_paths_remain_typed_after_admission_preflight() {
         crate::TraceStoreFailureCode::MalformedBlock
     );
     let mut wrong_version = valid.clone();
-    wrong_version[9] = 2;
+    wrong_version[9] = 3;
     assert_eq!(
         BlockDecode::observed(tenant, &wrong_version, &NeverCancelled, &observer)
             .err()

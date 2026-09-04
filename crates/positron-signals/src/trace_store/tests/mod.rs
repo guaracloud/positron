@@ -13,10 +13,11 @@ use positron_domain::value::{
 use positron_kernel::{
     ActiveSegmentLedger, Catalog, CatalogSecret, FixedLifecycleClockSource, GovernorPolicy,
     InstanceId, LifecycleClock, MountQualification, ObservedResourceEnvironment, OperatorLimits,
-    OrdinaryPoolPolicy, OwnedPrimaryDataVolume, PrimaryDataVolume, RecoveryPoolCapacities,
-    RecoveryReserve, RegisteredResourceBounds, ResourceAmounts, ResourceDimension,
-    ResourceGovernorConfiguration, ResourceInventory, RetentionTimeAuthority, SegmentProtectionKey,
-    SegmentScope, StorageKernelResourceAuthority, TenantQuota, WorkClaim, WorkKind,
+    OrdinaryPoolPolicy, OwnedPrimaryDataVolume, PreparedStoreBlock, PrimaryDataVolume,
+    RecoveryPoolCapacities, RecoveryReserve, RegisteredResourceBounds, ResourceAmounts,
+    ResourceDimension, ResourceGovernorConfiguration, ResourceInventory, RetentionTimeAuthority,
+    SegmentProtectionKey, SegmentScope, StorageKernelResourceAuthority, StoreBlockIdentity,
+    TenantQuota, WorkClaim, WorkKind,
 };
 use std::error::Error;
 use std::fs;
@@ -24,6 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 mod codec_boundaries;
+mod detail_corruption;
 mod failures;
 mod native;
 mod physical;

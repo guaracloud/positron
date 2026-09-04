@@ -1,20 +1,26 @@
 //! Native Trace Signal Store.
 
 mod codec;
+mod details;
 mod failure;
 #[cfg(fuzzing)]
 mod fuzzing;
+mod observation;
+mod retained;
 mod scan;
 mod types;
 
 #[cfg(test)]
 mod tests;
 
-pub use failure::{TraceStoreFailure, TraceStoreFailureCode};
-pub use scan::{ScannedSpanObservation, TraceIncompleteness, TraceScan, TraceScanResult};
-pub use types::{
-    PreparedTraceBlock, SamplingDecision, SpanKind, SpanObservation, StoredSpanObservation,
+pub use details::{
+    SpanAttributeSet, SpanEvent, SpanLink, SpanObservationDetails, SpanResourceMetadata,
+    SpanScopeMetadata, SpanStatus, SpanStatusCode,
 };
+pub use failure::{TraceStoreFailure, TraceStoreFailureCode};
+pub use observation::{SamplingDecision, SpanKind, SpanObservation};
+pub use scan::{ScannedSpanObservation, TraceIncompleteness, TraceScan, TraceScanResult};
+pub use types::{PreparedTraceBlock, StoredSpanObservation};
 
 #[cfg(fuzzing)]
 #[doc(hidden)]
@@ -36,9 +42,32 @@ impl TraceStore {
         positron_domain::value::ValueLimitProfile::release_1_system_maximum()
     }
 
+    /// Returns the canonical encoded bytes for one post-policy span record.
+    ///
+    /// The count includes native details, policy provenance, and the fixed
+    /// ingest-time field, while excluding the enclosing block header. It is
+    /// allocation-free and is shared with durable block encoding.
+    pub fn canonical_encoded_record_bytes(
+        profile: &positron_domain::value::ValueLimitProfile,
+        observation: &SpanObservation,
+    ) -> Result<usize, TraceStoreFailure> {
+        codec::encoded_record_bytes_with_profile(profile, observation)
+    }
+
     /// Prepares canonical Trace Store bytes under a kernel-issued Ingest Time.
     pub fn prepare<'capacity>(
         &self,
+        preparation: positron_kernel::StoreBlockPreparation<'capacity>,
+        observations: Vec<SpanObservation>,
+    ) -> Result<PreparedTraceBlock<'capacity>, TraceStoreFailure> {
+        let profile = Self::value_limit_profile();
+        self.prepare_with_profile(&profile, preparation, observations)
+    }
+
+    /// Prepares canonical bytes under one pinned effective value profile.
+    pub fn prepare_with_profile<'capacity>(
+        &self,
+        profile: &positron_domain::value::ValueLimitProfile,
         preparation: positron_kernel::StoreBlockPreparation<'capacity>,
         observations: Vec<SpanObservation>,
     ) -> Result<PreparedTraceBlock<'capacity>, TraceStoreFailure> {
@@ -59,7 +88,8 @@ impl TraceStore {
         for observation in observations {
             stored.push(StoredSpanObservation::new(observation, ingest_time));
         }
-        let bytes = codec::encode_block(preparation.scope().tenant_id(), &stored)?;
+        let bytes =
+            codec::encode_block_with_profile(profile, preparation.scope().tenant_id(), &stored)?;
         let block = preparation
             .finish(bytes)
             .map_err(TraceStoreFailure::kernel)?;

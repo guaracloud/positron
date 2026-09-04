@@ -59,6 +59,10 @@ impl PartialAdmission {
 }
 
 impl CommittedAdmission {
+    pub(crate) const fn new(receipt: CommitReceipt, records: usize) -> Self {
+        Self { receipt, records }
+    }
+
     #[must_use]
     pub const fn receipt(self) -> CommitReceipt {
         self.receipt
@@ -119,7 +123,7 @@ pub(super) fn increment_rejection(counts: &mut [usize; 3], code: IngestFailureCo
     }
 }
 
-pub(super) fn partial_admission(
+pub(crate) fn partial_admission(
     committed: CommittedAdmission,
     counts: [usize; 3],
 ) -> PartialAdmission {

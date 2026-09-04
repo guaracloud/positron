@@ -1098,6 +1098,7 @@ dependencies = [
  "positron-runtime",
  "positron-signals",
  "prost 0.14.3",
+ "serde",
  "serde_json",
  "snap",
 ]
@@ -1151,6 +1152,7 @@ dependencies = [
  "flate2",
  "h2",
  "http",
+ "http-body",
  "opentelemetry",
  "opentelemetry-http",
  "opentelemetry-otlp",

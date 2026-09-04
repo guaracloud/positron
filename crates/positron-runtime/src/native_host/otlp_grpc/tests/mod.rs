@@ -4,11 +4,18 @@ use positron_ingest::{
 };
 use tonic::Code;
 
-use super::{map_decode_failure, render, service_status};
+use super::{
+    map_decode_failure, map_trace_decode_failure, render, service_status, trace_render,
+    trace_service_status,
+};
 use crate::ServiceFailure;
 
 mod blocking_executor;
 mod persistence_outcomes;
+mod trace_cancellation;
+mod trace_support;
+mod trace_wire;
+mod trace_wire_errors;
 
 #[test]
 fn retryable_outcomes_have_stable_public_statuses() {
@@ -107,6 +114,88 @@ fn runtime_service_failures_keep_one_stable_public_taxonomy() {
 }
 
 #[test]
+fn trace_outcomes_keep_retry_permanent_and_ambiguous_classes() {
+    let capacity = trace_render(single(IngestOutcome::Retryable(
+        IngestFailureCode::CapacityUnavailable,
+    )))
+    .expect_err("trace capacity refusal must remain retryable");
+    assert_eq!(capacity.code(), Code::ResourceExhausted);
+    assert_eq!(
+        capacity.message(),
+        "OTLP Traces ingest capacity is unavailable"
+    );
+
+    let permanent = trace_render(single(IngestOutcome::Permanent(
+        IngestFailureCode::PolicyRejected,
+    )))
+    .expect_err("trace policy rejection must remain permanent");
+    assert_eq!(permanent.code(), Code::InvalidArgument);
+    assert_eq!(permanent.message(), "OTLP Traces request was rejected");
+
+    let value_limit = trace_render(single(IngestOutcome::Permanent(
+        IngestFailureCode::ValueLimitExceeded,
+    )))
+    .expect_err("trace value limits must remain permanent");
+    assert_eq!(value_limit.code(), Code::InvalidArgument);
+    assert_eq!(value_limit.message(), "OTLP Traces request was rejected");
+
+    let ambiguous = trace_render(single(IngestOutcome::Ambiguous(
+        IngestFailureCode::StorageUnavailable,
+    )))
+    .expect_err("trace commit ambiguity must require an at-least-once retry");
+    assert_eq!(ambiguous.code(), Code::Unavailable);
+    assert_eq!(
+        ambiguous.message(),
+        "OTLP Traces commit outcome is ambiguous; retry may duplicate spans"
+    );
+}
+
+#[test]
+fn trace_service_failures_keep_stable_protocol_statuses() {
+    for (failure, code, message) in [
+        (
+            ServiceFailure::Unauthorized,
+            Code::Unauthenticated,
+            "OTLP Traces request authentication was rejected",
+        ),
+        (
+            ServiceFailure::CapacityUnavailable,
+            Code::ResourceExhausted,
+            "OTLP Traces ingest capacity is unavailable",
+        ),
+        (
+            ServiceFailure::RequestTooLarge,
+            Code::ResourceExhausted,
+            "OTLP Traces request exceeds the receiver limit",
+        ),
+        (
+            ServiceFailure::InvalidRequest,
+            Code::InvalidArgument,
+            "OTLP Traces request was rejected",
+        ),
+        (
+            ServiceFailure::StorageUnavailable,
+            Code::Unavailable,
+            "OTLP Traces ingest is temporarily unavailable",
+        ),
+        (
+            ServiceFailure::Internal,
+            Code::Internal,
+            "OTLP Traces ingest failed",
+        ),
+        (
+            ServiceFailure::Cancelled,
+            Code::Internal,
+            "OTLP Traces ingest failed",
+        ),
+    ] {
+        let status = trace_service_status(failure);
+        assert_eq!(status.code(), code);
+        assert_eq!(status.message(), message);
+    }
+}
+
+#[test]
 fn protobuf_wire_decode_failure_is_narrowly_mapped_to_invalid_argument() {
     let mut decode = http::Response::new(());
     decode
@@ -141,5 +230,30 @@ fn protobuf_wire_decode_failure_is_narrowly_mapped_to_invalid_argument() {
     assert_eq!(
         map_decode_failure(unrelated).headers().get("grpc-status"),
         Some(&http::HeaderValue::from_static("13"))
+    );
+}
+
+#[test]
+fn trace_protobuf_wire_decode_failure_is_mapped_to_invalid_argument() {
+    let mut decode = http::Response::new(());
+    decode
+        .headers_mut()
+        .insert("grpc-status", http::HeaderValue::from_static("13"));
+    decode.headers_mut().insert(
+        "grpc-message",
+        http::HeaderValue::from_static(
+            "failed%20to%20decode%20Protobuf%20message:%20private-parser-detail",
+        ),
+    );
+    let decode = map_trace_decode_failure(decode);
+    assert_eq!(
+        decode.headers().get("grpc-status"),
+        Some(&http::HeaderValue::from_static("3"))
+    );
+    assert_eq!(
+        decode.headers().get("grpc-message"),
+        Some(&http::HeaderValue::from_static(
+            "OTLP%20Traces%20request%20was%20malformed"
+        ))
     );
 }

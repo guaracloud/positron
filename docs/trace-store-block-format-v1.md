@@ -1,4 +1,4 @@
-# Trace Store Block v1
+# Trace Store Block v1 and v2
 
 Trace Store Blocks are the Trace Store's canonical authenticated payload. The
 Storage Kernel owns the surrounding segment envelope, tenant/signal/shard
@@ -10,12 +10,12 @@ The payload is big-endian and has no padding:
 | Field | Encoding |
 | --- | --- |
 | magic | `PTRCBL01` (8 bytes) |
-| version | unsigned 16-bit (`1`) |
+| version | unsigned 16-bit (`1` or `2`) |
 | tenant ID | 16 bytes |
 | observation count | unsigned 16-bit, `1..=1024` |
 | observations | repeated v1 observation records |
 
-Each observation contains:
+Version 1 observations contain:
 
 1. trace ID (16 bytes), span ID (8 bytes), and a parent-present byte followed
    by the parent span ID when present;
@@ -29,6 +29,18 @@ Each observation contains:
 6. policy provenance: generation (u64), digest (32 bytes), and applied rule
    identities;
 7. the kernel-assigned ingest time as an i64.
+
+Version 2 retains every version 1 field and adds the bounded native OTLP
+detail section before policy provenance: span trace state and complete flags;
+status code and message; span dropped-attribute, dropped-event, and
+dropped-link counts; resource dropped-attribute count and schema URL;
+instrumentation-scope name, version, dropped-attribute count, and schema URL;
+ordered events (timestamp, name, dropped-attribute count, and typed
+occurrence sets); and ordered links (trace ID, span ID, trace state, flags,
+dropped-attribute count, and typed occurrence sets). Version 2 writers are
+canonical for new observations. Readers retain version 1 compatibility and
+default only fields that version 1 could not contain to explicit empty,
+zero, or `UNSET` values; they never infer producer detail.
 
 Trace attributes are limited to the Resource, Instrumentation Scope, and
 Record/Span namespaces. The Log-only Stream namespace is not a valid Trace

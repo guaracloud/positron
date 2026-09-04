@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-opentelemetry-proto = { version = "=0.32.0", default-features = false, features = ["gen-tonic-messages", "logs"] }
+opentelemetry-proto = { version = "=0.32.0", default-features = false, features = ["gen-tonic-messages", "logs", "trace"] }
 positron-kernel = { path = "../crates/positron-kernel" }
 positron-domain = { path = "../crates/positron-domain" }
 positron-governance = { path = "../crates/positron-governance" }
@@ -107,6 +107,13 @@ bench = false
 [[bin]]
 name = "otlp_logs_decode"
 path = "fuzz_targets/otlp_logs_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "otlp_traces_decode"
+path = "fuzz_targets/otlp_traces_decode.rs"
 test = false
 doc = false
 bench = false
