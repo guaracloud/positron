@@ -56,8 +56,12 @@ fn encoded_observation_length(
         if attribute.key().len() > limits.key_path_bytes {
             return Err(TraceStoreFailure::limit_exceeded());
         }
-        let namespace = super::format::namespace_index(attribute.namespace())?;
-        occurrences_by_namespace[namespace] = occurrences_by_namespace[namespace]
+        let namespace = super::format::namespace_index(attribute.namespace())
+            .ok_or_else(TraceStoreFailure::invalid_input)?;
+        let occurrences = occurrences_by_namespace
+            .get_mut(namespace)
+            .ok_or_else(TraceStoreFailure::invalid_input)?;
+        *occurrences = occurrences
             .checked_add(attribute.len())
             .filter(|count| *count <= limits.occurrences_per_namespace)
             .ok_or_else(TraceStoreFailure::limit_exceeded)?;
@@ -261,7 +265,7 @@ fn encoded_value_length(
 }
 
 fn encoded_time_length(time: EventTime) -> usize {
-    1 + usize::from(time.instant().is_some()) * 8
+    1 + usize::from(time.instant().is_some() || time.source_value().is_some()) * 8
 }
 
 fn add_bytes_length(total: usize, bytes: usize) -> Result<usize, TraceStoreFailure> {

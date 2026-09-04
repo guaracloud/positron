@@ -6,12 +6,13 @@ use opentelemetry_proto::tonic::trace::v1::Span as OtlpSpan;
 use positron_domain::value::{AttributeNamespace, CandidateAttributeValue, ValueLimitProfile};
 use positron_policy::NativePolicyAttribute;
 
-use super::super::TraceReceiveFailure;
+use super::super::{TraceReceiveFailure, presence};
 use super::{NativeSpanDetailDraft, NativeSpanDraft, SpanDetailMetadata};
 
 pub(crate) fn native_records(
     decoded: ExportTraceServiceRequest,
     profile: &ValueLimitProfile,
+    timestamp_presence: Option<&presence::OtlpTraceTimestampPresence>,
 ) -> Result<(Vec<NativeSpanDraft>, [usize; 3]), TraceReceiveFailure> {
     let max_records = usize::try_from(profile.effective_limits().request().records().value())
         .map_err(|_| TraceReceiveFailure::ValueLimitExceeded)?;
@@ -31,6 +32,7 @@ pub(crate) fn native_records(
         .try_reserve_exact(record_count)
         .map_err(|_| TraceReceiveFailure::ValueLimitExceeded)?;
     let mut rejections = [0_usize; 3];
+    let mut span_ordinal = 0_usize;
     for resource_spans in decoded.resource_spans {
         let resource_schema_url = resource_spans.schema_url;
         let (resource, resource_dropped_attributes_count, entity_refs) =
@@ -60,6 +62,16 @@ pub(crate) fn native_records(
                     },
                 );
             for span in scope_spans.spans {
+                let span_presence = timestamp_presence
+                    .map(|presence| {
+                        presence
+                            .span(span_ordinal)
+                            .ok_or(TraceReceiveFailure::MalformedPayload)
+                    })
+                    .transpose()?;
+                span_ordinal = span_ordinal
+                    .checked_add(1)
+                    .ok_or(TraceReceiveFailure::ValueLimitExceeded)?;
                 match native_draft(
                     span,
                     &resource,
@@ -74,6 +86,7 @@ pub(crate) fn native_records(
                         has_entity_refs,
                     },
                     profile,
+                    span_presence,
                 ) {
                     Ok(draft) => records.push(draft),
                     Err(failure) => {
@@ -92,14 +105,22 @@ fn native_draft(
     scope: &[KeyValue],
     metadata: SpanDetailMetadata,
     profile: &ValueLimitProfile,
+    timestamp_presence: Option<&presence::SpanTimestampPresence>,
 ) -> Result<NativeSpanDraft, TraceReceiveFailure> {
     validate_raw_span(&span, &metadata, profile)?;
     let attributes = grouped_attributes(resource, scope, &span.attributes, profile)?;
+    let event_time_present = span
+        .events
+        .iter()
+        .enumerate()
+        .map(|(index, _)| timestamp_presence.is_none_or(|presence| presence.event(index)))
+        .collect();
     let details = NativeSpanDetailDraft {
         trace_state: span.trace_state,
         flags: span.flags,
         status: span.status,
         events: span.events,
+        event_time_present,
         links: span.links,
         dropped_attributes_count: span.dropped_attributes_count,
         dropped_events_count: span.dropped_events_count,
@@ -113,6 +134,8 @@ fn native_draft(
         name: span.name,
         start_time_unix_nano: span.start_time_unix_nano,
         end_time_unix_nano: span.end_time_unix_nano,
+        start_time_present: timestamp_presence.is_none_or(presence::SpanTimestampPresence::start),
+        end_time_present: timestamp_presence.is_none_or(presence::SpanTimestampPresence::end),
         attributes,
         kind: span.kind,
         flags: span.flags,

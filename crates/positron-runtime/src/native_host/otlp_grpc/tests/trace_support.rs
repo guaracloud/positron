@@ -200,6 +200,26 @@ impl ReceiverHarness {
     pub(super) fn start_durable_with_policy(
         policy: positron_ingest::IngestPolicy,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::start_durable_with_profile_and_optional_backend(
+            ValueLimitProfile::release_1_system_maximum(),
+            None,
+            policy,
+        )
+    }
+
+    pub(super) fn start_durable_with_profile_and_policy(
+        profile: ValueLimitProfile,
+        backend: Arc<ScriptedBackend>,
+        policy: positron_ingest::IngestPolicy,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::start_durable_with_profile_and_optional_backend(profile, Some(backend), policy)
+    }
+
+    fn start_durable_with_profile_and_optional_backend(
+        profile: ValueLimitProfile,
+        backend: Option<Arc<ScriptedBackend>>,
+        policy: positron_ingest::IngestPolicy,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let test_guard = match TRACE_WIRE_TEST.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -218,13 +238,18 @@ impl ReceiverHarness {
                 .to_owned();
             (claim.secret().to_owned(), bearer)
         };
-        let initialized = Arc::new(InstanceBootstrap::reopen(&paths)?);
+        let mut initialized = InstanceBootstrap::reopen(&paths)?;
+        initialized.value_limit_profile = profile;
+        let initialized = Arc::new(initialized);
         let administrator = initialized.attribute(
             PresentedCredential::parse(&administrator_secret)?,
             RequestedIntent::SystemAdministration,
             CompatibilityHints::none(),
         )?;
         let services = ServiceHandle::new(Arc::clone(&initialized))?;
+        if let Some(backend) = backend.as_ref() {
+            services.install_receiver_test_backend(backend.clone())?;
+        }
         services.activate_ingest_policy(
             administrator,
             ResourceGeneration::new(1)?,
@@ -236,7 +261,7 @@ impl ReceiverHarness {
             endpoint: spawned.endpoint,
             bearer,
             initialized: Some(initialized),
-            backend: Arc::new(ScriptedBackend::new([])),
+            backend: backend.unwrap_or_else(|| Arc::new(ScriptedBackend::new([]))),
             cancellation: spawned.cancellation,
             force: spawned.force,
             server: Some(spawned.server),
@@ -435,6 +460,32 @@ pub(super) fn profile_with_transport_limits(
         system.dynamic_value(),
     );
     Ok(ValueLimitProfileCandidate::new(system, Some(tenant)).validate()?)
+}
+
+pub(super) fn profile_with_individual_value_bytes(bytes: u32) -> ValueLimitProfile {
+    let maximum = ValueLimitProfile::release_1_system_maximum();
+    let dynamic = maximum.effective_limits().dynamic_value();
+    let dynamic = positron_domain::value::DynamicValueLimits::new(
+        ByteLimit::new(bytes).expect("valid value bound"),
+        dynamic.attributes_per_namespace(),
+        dynamic.key_path_bytes(),
+        positron_domain::value::NestingLimit::new(dynamic.nesting_depth().value())
+            .expect("valid depth"),
+        positron_domain::value::CollectionLimit::new(dynamic.array_entries().value())
+            .expect("valid arrays"),
+        positron_domain::value::CollectionLimit::new(dynamic.key_value_list_entries().value())
+            .expect("valid lists"),
+    );
+    ValueLimitProfileCandidate::new(
+        maximum.system_limits(),
+        Some(ValueLimitSet::new(
+            maximum.effective_limits().request(),
+            maximum.effective_limits().record(),
+            dynamic,
+        )),
+    )
+    .validate()
+    .expect("lowered profile")
 }
 
 struct TestRoots {

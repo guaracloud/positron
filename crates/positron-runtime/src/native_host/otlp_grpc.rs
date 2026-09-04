@@ -273,7 +273,7 @@ impl TraceService for OtlpTracesGrpc {
         let evidence = request
             .extensions()
             .get::<OtlpGrpcTransportEvidence>()
-            .copied()
+            .cloned()
             .ok_or_else(|| Status::internal("OTLP Traces transport evidence was unavailable"))?;
         let reservation = admission.take().map_err(trace_service_status)?;
         if request.get_ref().resource_spans.iter().all(|resource| {

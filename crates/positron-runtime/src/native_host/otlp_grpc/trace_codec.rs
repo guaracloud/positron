@@ -8,7 +8,7 @@ use opentelemetry_proto::tonic::collector::trace::v1::trace_service_server::Trac
 use opentelemetry_proto::tonic::collector::trace::v1::{
     ExportTraceServiceRequest, ExportTraceServiceResponse,
 };
-use positron_domain::value::ValueLimitProfile;
+use positron_domain::value::{ValueLimitProfile, ValueLimitProfileCandidate};
 use positron_ingest::{
     OtlpGrpcTransportEvidence, TraceReceiveFailure, preflight_otlp_traces_protobuf_with_profile,
 };
@@ -124,10 +124,17 @@ impl<T: TraceService> tonic::server::UnaryService<ExportTraceServiceRequest> for
                 let measurement = measurement
                     .lock()
                     .map_err(|_| Status::internal("OTLP Traces transport measurement failed"))?;
-                OtlpGrpcTransportEvidence::prevalidated(
-                    measurement.wire_body_bytes,
-                    measurement.decompressed_message_bytes,
-                )
+                match measurement.timestamp_presence.clone() {
+                    Some(presence) => OtlpGrpcTransportEvidence::prevalidated_with_presence(
+                        measurement.wire_body_bytes,
+                        measurement.decompressed_message_bytes,
+                        presence,
+                    ),
+                    None => OtlpGrpcTransportEvidence::prevalidated(
+                        measurement.wire_body_bytes,
+                        measurement.decompressed_message_bytes,
+                    ),
+                }
             };
             request.extensions_mut().insert(evidence);
             T::export(&inner, request).await
@@ -189,18 +196,34 @@ impl Decoder for OtlpTracesDecoder {
             .map_err(|_| Status::internal("OTLP Traces transport measurement failed"))?
             .decompressed_message_bytes = frame_length;
         let frame = source.copy_to_bytes(frame_length);
-        preflight_otlp_traces_protobuf_with_profile(frame.as_ref(), self.profile)
+        // Transport and decompressed-message ceilings are enforced by the
+        // bounded body and tonic's message-size limit above. This preflight
+        // must use only the system semantic profile: tenant semantic limits
+        // apply after the ingest policy has had a chance to redact or
+        // truncate a value.
+        let system_profile = ValueLimitProfileCandidate::new(self.profile.system_limits(), None)
+            .validate()
+            .map_err(|_| Status::internal("OTLP Traces system profile was invalid"))?;
+        preflight_otlp_traces_protobuf_with_profile(frame.as_ref(), system_profile)
             .map_err(preflight_status)?;
+        let timestamp_presence =
+            positron_ingest::otlp_traces_timestamp_presence_protobuf(frame.as_ref())
+                .map_err(preflight_status)?;
+        self.measurement
+            .lock()
+            .map_err(|_| Status::internal("OTLP Traces transport measurement failed"))?
+            .timestamp_presence = Some(timestamp_presence);
         ExportTraceServiceRequest::decode(frame)
             .map(Some)
             .map_err(|_| malformed_status())
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct WireMeasurement {
     wire_body_bytes: usize,
     decompressed_message_bytes: usize,
+    timestamp_presence: Option<positron_ingest::OtlpTraceTimestampPresence>,
 }
 
 struct BoundedGrpcBody<B> {

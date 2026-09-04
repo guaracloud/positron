@@ -97,6 +97,45 @@ fn encoder_rejects_empty_and_overlarge_blocks_before_allocation() {
     );
 }
 
+#[test]
+fn v3_codec_round_trips_an_unsigned_out_of_range_source_time() {
+    let tenant = TenantId::from_bytes([0x43; 16]).expect("tenant");
+    let source = u64::MAX;
+    let observation = SpanObservation::checked_native(
+        [0x73; 16],
+        [0x74; 8],
+        None,
+        "out-of-range".to_owned(),
+        EventTime::out_of_range(source).expect("out-of-range source"),
+        EventTime::missing(),
+        Vec::new(),
+        SpanKind::Internal,
+        SamplingDecision::Unknown,
+        positron_policy::PolicyProvenance::new(1, [0x75; 32], Vec::new())
+            .expect("policy provenance"),
+    )
+    .expect("observation");
+    let stored = StoredSpanObservation::new(
+        observation,
+        LifecycleClock::new(FixedLifecycleClockSource::new(
+            positron_domain::time::UnixNanoseconds::new(1),
+        ))
+        .assign_ingest_time()
+        .expect("ingest time"),
+    );
+    let encoded = encode_block(tenant, &[stored]).expect("v3 block");
+    let mut input = Input::cancelable(&encoded[28..], &NeverCancelled);
+    let (decoded, _) = super::decode::decode_observation_version_with_profile(
+        &mut input,
+        super::format::VERSION,
+        &ValueLimitProfile::release_1_system_maximum(),
+    )
+    .expect("decoded v3 record");
+    assert_eq!(decoded.start_time().source_value(), Some(source));
+    assert_eq!(decoded.start_time().quality(), SourceTimeQuality::Outlier);
+    assert_eq!(decoded.start_time().instant(), None);
+}
+
 struct NeverCancelled;
 
 impl ScanCancellation for NeverCancelled {
@@ -247,7 +286,7 @@ fn decoder_defensive_paths_remain_typed_after_admission_preflight() {
         namespace_index(AttributeNamespace::Record).expect("namespace"),
         2
     );
-    assert!(namespace_index(AttributeNamespace::Stream).is_err());
+    assert!(namespace_index(AttributeNamespace::Stream).is_none());
     let mut empty_rule = Vec::new();
     empty_rule.extend_from_slice(&1_u64.to_be_bytes());
     empty_rule.extend_from_slice(&[1; 32]);

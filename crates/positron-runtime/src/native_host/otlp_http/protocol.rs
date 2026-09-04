@@ -1,4 +1,4 @@
-use positron_ingest::OtlpLogsRequestEncoding;
+use positron_ingest::OtlpRequestEncoding;
 
 use super::{INVALID_ARGUMENT, Response};
 
@@ -44,7 +44,7 @@ pub(crate) fn request_encoding(
     content_type: Option<&str>,
     content_encoding: Option<&str>,
     signal: OtlpHttpSignal,
-) -> Result<(OtlpLogsRequestEncoding, ResponseEncoding), Response> {
+) -> Result<(OtlpRequestEncoding, ResponseEncoding), Response> {
     let media_type = content_type
         .and_then(|value| value.split(';').next())
         .map(str::trim);
@@ -52,8 +52,8 @@ pub(crate) fn request_encoding(
         Some(value) if value.eq_ignore_ascii_case("application/x-protobuf") => {
             let request = compression_variant(
                 content_encoding,
-                OtlpLogsRequestEncoding::Protobuf,
-                OtlpLogsRequestEncoding::GzipProtobuf,
+                OtlpRequestEncoding::Protobuf,
+                OtlpRequestEncoding::GzipProtobuf,
                 ResponseEncoding::Protobuf,
                 signal,
             )?;
@@ -62,8 +62,8 @@ pub(crate) fn request_encoding(
         Some(value) if value.eq_ignore_ascii_case("application/json") => {
             let request = compression_variant(
                 content_encoding,
-                OtlpLogsRequestEncoding::Json,
-                OtlpLogsRequestEncoding::GzipJson,
+                OtlpRequestEncoding::Json,
+                OtlpRequestEncoding::GzipJson,
                 ResponseEncoding::Json,
                 signal,
             )?;
@@ -80,11 +80,11 @@ pub(crate) fn request_encoding(
 
 fn compression_variant(
     content_encoding: Option<&str>,
-    plain: OtlpLogsRequestEncoding,
-    gzip: OtlpLogsRequestEncoding,
+    plain: OtlpRequestEncoding,
+    gzip: OtlpRequestEncoding,
     response_encoding: ResponseEncoding,
     signal: OtlpHttpSignal,
-) -> Result<OtlpLogsRequestEncoding, Response> {
+) -> Result<OtlpRequestEncoding, Response> {
     match content_encoding.map(str::trim) {
         None | Some("") => Ok(plain),
         Some(value) if value.eq_ignore_ascii_case("gzip") => Ok(gzip),

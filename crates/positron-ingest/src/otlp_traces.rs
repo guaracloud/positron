@@ -10,6 +10,8 @@ use positron_kernel::{
     ResourceAmounts, ResourceGovernor, ResourceReservation, WorkClaim, WorkKind,
 };
 
+pub(crate) use crate::ingest::outcome::increment_rejection;
+
 mod admission_groups;
 mod batch;
 mod bounds;
@@ -28,6 +30,7 @@ mod json_boundaries;
 mod mapping_matrix;
 #[cfg(test)]
 mod policy_boundaries;
+mod presence;
 #[cfg(test)]
 mod protocol_matrix;
 mod receiver;
@@ -41,10 +44,23 @@ mod transport;
 pub use admission_groups::{NativeSpanAdmissionGroup, NativeSpanAdmissionGroups};
 pub use batch::NativeSpanBatch;
 pub use failure::TraceReceiveFailure;
+pub use presence::OtlpTraceTimestampPresence;
 pub use receiver::OtlpTracesReceiver;
 pub use request::{
     AuthenticatedOtlpTracesRequest, OtlpGrpcTransportEvidence, OtlpTracesRequestEncoding,
 };
+
+pub fn otlp_traces_timestamp_presence_protobuf(
+    protobuf: &[u8],
+) -> Result<OtlpTraceTimestampPresence, TraceReceiveFailure> {
+    OtlpTraceTimestampPresence::protobuf(protobuf)
+}
+
+pub fn otlp_traces_timestamp_presence_json(
+    json: &[u8],
+) -> Result<OtlpTraceTimestampPresence, TraceReceiveFailure> {
+    OtlpTraceTimestampPresence::json(json)
+}
 
 pub(super) const MAX_RETAINED_BYTES: u64 = 4_194_304;
 const MAX_RECORDS: u64 = 1_024;
@@ -188,10 +204,6 @@ pub(crate) fn checked_identifier<const N: usize>(
     Ok(identifier)
 }
 
-pub(crate) fn checked_timestamp(value: u64) -> Result<i64, TraceReceiveFailure> {
-    i64::try_from(value).map_err(|_| TraceReceiveFailure::TimestampOutOfRange)
-}
-
 pub(crate) fn map_store_failure(
     failure: positron_signals::TraceStoreFailure,
 ) -> TraceReceiveFailure {
@@ -203,18 +215,6 @@ pub(crate) fn map_store_failure(
             TraceReceiveFailure::CapacityUnavailable
         },
         _ => TraceReceiveFailure::MalformedPayload,
-    }
-}
-
-pub(crate) fn increment_rejection(counts: &mut [usize; 3], code: crate::IngestFailureCode) {
-    let index = match code {
-        crate::IngestFailureCode::PolicyRejected => 0,
-        crate::IngestFailureCode::InvalidRecord => 1,
-        crate::IngestFailureCode::ValueLimitExceeded => 2,
-        _ => return,
-    };
-    if let Some(count) = counts.get_mut(index) {
-        *count = count.saturating_add(1);
     }
 }
 

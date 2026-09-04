@@ -26,6 +26,8 @@ impl NativeSpanDraft {
             name,
             start_time_unix_nano,
             end_time_unix_nano,
+            start_time_present,
+            end_time_present,
             attributes,
             kind,
             flags,
@@ -49,8 +51,8 @@ impl NativeSpanDraft {
         } else {
             Some(super::super::checked_identifier::<8>(&parent_span_id)?)
         };
-        let start_time = event_time(start_time_unix_nano)?;
-        let end_time = event_time(end_time_unix_nano)?;
+        let start_time = event_time(start_time_unix_nano, start_time_present)?;
+        let end_time = event_time(end_time_unix_nano, end_time_present)?;
         let end_time = if end_time
             .instant()
             .zip(start_time.instant())
@@ -100,9 +102,17 @@ fn materialize_details(
     let events = detail
         .events
         .iter()
-        .map(|event| {
+        .enumerate()
+        .map(|(index, event)| {
             SpanEvent::checked_with_profile(
-                event_time(event.time_unix_nano)?,
+                event_time(
+                    event.time_unix_nano,
+                    detail
+                        .event_time_present
+                        .get(index)
+                        .copied()
+                        .unwrap_or(true),
+                )?,
                 event.name.clone(),
                 span_detail_attributes(&event.attributes, profile)?,
                 event.dropped_attributes_count,
@@ -339,8 +349,15 @@ fn check_text(value: &str, profile: &ValueLimitProfile) -> Result<(), TraceRecei
     Ok(())
 }
 
-fn event_time(value: u64) -> Result<EventTime, TraceReceiveFailure> {
-    let timestamp = super::super::checked_timestamp(value)?;
+fn event_time(value: u64, present: bool) -> Result<EventTime, TraceReceiveFailure> {
+    if !present {
+        return Ok(EventTime::missing());
+    }
+    if value > i64::MAX as u64 {
+        return EventTime::out_of_range(value)
+            .map_err(|_| TraceReceiveFailure::TimestampOutOfRange);
+    }
+    let timestamp = value as i64;
     let quality = if timestamp == 0 {
         SourceTimeQuality::Zero
     } else {

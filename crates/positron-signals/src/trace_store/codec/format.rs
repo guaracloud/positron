@@ -11,6 +11,7 @@ pub(crate) const DETAILS_VERSION: u16 = 2;
 pub(crate) const VERSION: u16 = 3;
 pub(crate) const MAX_RECORDS: usize = 1_024;
 pub(crate) const MAX_BLOCK_BYTES: usize = 1_048_576;
+pub(crate) const OUT_OF_RANGE_TIME_TAG: u8 = 6;
 
 pub(crate) const fn supported_version(version: u16) -> bool {
     matches!(version, LEGACY_VERSION | DETAILS_VERSION | VERSION)
@@ -84,12 +85,12 @@ pub(crate) fn decode_namespace(tag: u8) -> Result<AttributeNamespace, TraceStore
     }
 }
 
-pub(crate) fn namespace_index(namespace: AttributeNamespace) -> Result<usize, TraceStoreFailure> {
+pub(crate) const fn namespace_index(namespace: AttributeNamespace) -> Option<usize> {
     match namespace {
-        AttributeNamespace::Resource => Ok(0),
-        AttributeNamespace::InstrumentationScope => Ok(1),
-        AttributeNamespace::Record => Ok(2),
-        AttributeNamespace::Stream => Err(TraceStoreFailure::malformed_block()),
+        AttributeNamespace::Resource => Some(0),
+        AttributeNamespace::InstrumentationScope => Some(1),
+        AttributeNamespace::Record => Some(2),
+        AttributeNamespace::Stream => None,
     }
 }
 

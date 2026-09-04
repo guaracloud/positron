@@ -160,7 +160,9 @@ fn policy_transform_runs_before_lowered_value_limit() -> Result<(), Box<dyn Erro
         transformed_record,
     )?;
     // The redaction marker's v3 value frame is tag + action + original kind.
-    assert_eq!(encoded_bytes, 200);
+    // This fixture omits both span time scalars, so their source absence is
+    // preserved without the eight-byte payloads used by explicit zeroes.
+    assert_eq!(encoded_bytes, 184);
     drop(maximum_transformed);
 
     let exact = OtlpTracesReceiver::with_value_limit_profile(

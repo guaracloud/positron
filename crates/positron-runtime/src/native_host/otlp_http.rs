@@ -1,7 +1,7 @@
 use std::net::TcpStream;
 
 use positron_governance::CompatibilityHints;
-use positron_ingest::{OtlpLogsRequestEncoding, OtlpTracesRequestEncoding};
+use positron_ingest::{OtlpRequestEncoding, OtlpTracesRequestEncoding};
 
 use super::native_http::{RequestHead, Response, read_body};
 use crate::ServiceHandle;
@@ -77,10 +77,10 @@ pub(super) fn receive(
         .logs_transport_limits()
         .map_err(|failure| service_response_with_encoding(failure, response_encoding))?;
     let body_limit = match request_encoding {
-        OtlpLogsRequestEncoding::Protobuf | OtlpLogsRequestEncoding::Json => {
+        OtlpRequestEncoding::Protobuf | OtlpRequestEncoding::Json => {
             encoded_limit.min(decoded_limit)
         },
-        OtlpLogsRequestEncoding::GzipProtobuf | OtlpLogsRequestEncoding::GzipJson => encoded_limit,
+        OtlpRequestEncoding::GzipProtobuf | OtlpRequestEncoding::GzipJson => encoded_limit,
     };
     if head.content_length > body_limit {
         return Err(failure(
@@ -158,10 +158,10 @@ pub(super) fn receive_traces(
         .traces_transport_limits()
         .map_err(|failure| trace_service_response_with_encoding(failure, response_encoding))?;
     let body_limit = match request_encoding {
-        OtlpLogsRequestEncoding::Protobuf | OtlpLogsRequestEncoding::Json => {
+        OtlpRequestEncoding::Protobuf | OtlpRequestEncoding::Json => {
             encoded_limit.min(decoded_limit)
         },
-        OtlpLogsRequestEncoding::GzipProtobuf | OtlpLogsRequestEncoding::GzipJson => encoded_limit,
+        OtlpRequestEncoding::GzipProtobuf | OtlpRequestEncoding::GzipJson => encoded_limit,
     };
     if head.content_length > body_limit {
         return Err(failure(
@@ -182,12 +182,7 @@ pub(super) fn receive_traces(
     let reservation = admission
         .take()
         .map_err(|failure| trace_service_response_with_encoding(failure, response_encoding))?;
-    let trace_encoding = match request_encoding {
-        OtlpLogsRequestEncoding::Protobuf => OtlpTracesRequestEncoding::Protobuf,
-        OtlpLogsRequestEncoding::GzipProtobuf => OtlpTracesRequestEncoding::GzipProtobuf,
-        OtlpLogsRequestEncoding::Json => OtlpTracesRequestEncoding::Json,
-        OtlpLogsRequestEncoding::GzipJson => OtlpTracesRequestEncoding::GzipJson,
-    };
+    let trace_encoding: OtlpTracesRequestEncoding = request_encoding;
     Ok(ingest_trace_response(
         services.ingest_encoded_otlp_http_traces(context, trace_encoding, body, reservation),
         response_encoding,

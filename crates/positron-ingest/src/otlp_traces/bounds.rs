@@ -68,10 +68,16 @@ pub(super) fn validate_json(
 
 pub(super) fn retained_native_batch_bytes(
     records: &[positron_signals::SpanObservation],
+    record_capacity: usize,
 ) -> Result<u64, TraceReceiveFailure> {
-    records.iter().try_fold(0_u64, |total, record| {
-        let native = u64::try_from(std::mem::size_of::<positron_signals::SpanObservation>())
-            .map_err(|_| TraceReceiveFailure::ValueLimitExceeded)?;
+    let native = u64::try_from(record_capacity)
+        .map_err(|_| TraceReceiveFailure::ValueLimitExceeded)?
+        .checked_mul(
+            u64::try_from(std::mem::size_of::<positron_signals::SpanObservation>())
+                .map_err(|_| TraceReceiveFailure::ValueLimitExceeded)?,
+        )
+        .ok_or(TraceReceiveFailure::ValueLimitExceeded)?;
+    records.iter().try_fold(native, |total, record| {
         let heap = u64::try_from(
             record
                 .retained_heap_bytes()
@@ -79,10 +85,61 @@ pub(super) fn retained_native_batch_bytes(
         )
         .map_err(|_| TraceReceiveFailure::ValueLimitExceeded)?;
         total
-            .checked_add(native)
-            .and_then(|size| size.checked_add(heap))
+            .checked_add(heap)
             .ok_or(TraceReceiveFailure::ValueLimitExceeded)
     })
+}
+
+pub(super) fn grouped_retained_native_batch_bytes(
+    records: &[positron_signals::SpanObservation],
+    record_capacity: usize,
+) -> Result<u64, TraceReceiveFailure> {
+    let source = retained_native_batch_bytes(records, record_capacity)?;
+    let record_count = records.len();
+    let shard_items = std::mem::size_of::<positron_domain::routing::VirtualShardId>()
+        .checked_mul(2)
+        .ok_or(TraceReceiveFailure::ValueLimitExceeded)?;
+    let per_record = std::mem::size_of::<positron_signals::SpanObservation>()
+        .checked_add(std::mem::size_of::<super::NativeSpanAdmissionGroup<'static>>())
+        .and_then(|bytes| {
+            bytes.checked_add(std::mem::size_of::<(
+                positron_domain::routing::VirtualShardId,
+                Vec<positron_signals::SpanObservation>,
+            )>())
+        })
+        .and_then(|bytes| {
+            bytes.checked_add(std::mem::size_of::<positron_domain::routing::VirtualShardId>())
+        })
+        .and_then(|bytes| bytes.checked_add(shard_items))
+        .and_then(|bytes| {
+            bytes.checked_add(std::mem::size_of::<Vec<positron_signals::SpanObservation>>())
+        })
+        .ok_or(TraceReceiveFailure::ValueLimitExceeded)?;
+    let vector_metadata = std::mem::size_of::<Vec<positron_domain::routing::VirtualShardId>>()
+        .checked_add(std::mem::size_of::<
+            Vec<positron_domain::routing::VirtualShardId>,
+        >())
+        .and_then(|bytes| {
+            bytes.checked_add(std::mem::size_of::<
+                Vec<(
+                    positron_domain::routing::VirtualShardId,
+                    Vec<positron_signals::SpanObservation>,
+                )>,
+            >())
+        })
+        .and_then(|bytes| {
+            bytes.checked_add(std::mem::size_of::<
+                Vec<super::NativeSpanAdmissionGroup<'static>>,
+            >())
+        })
+        .ok_or(TraceReceiveFailure::ValueLimitExceeded)?;
+    let planning = record_count
+        .checked_mul(per_record)
+        .and_then(|bytes| bytes.checked_add(vector_metadata))
+        .ok_or(TraceReceiveFailure::ValueLimitExceeded)?;
+    source
+        .checked_add(u64::try_from(planning).map_err(|_| TraceReceiveFailure::ValueLimitExceeded)?)
+        .ok_or(TraceReceiveFailure::ValueLimitExceeded)
 }
 
 struct Limits {
@@ -404,6 +461,19 @@ fn visit_fields(
     known_fields: &[(u64, u8)],
     mut visit: impl FnMut(u64, &[u8]) -> Result<(), TraceReceiveFailure>,
 ) -> Result<(), TraceReceiveFailure> {
+    visit_fields_with_wire(message, known_fields, |field, wire, value| {
+        if wire == 2 {
+            visit(field, value.ok_or(TraceReceiveFailure::MalformedPayload)?)?;
+        }
+        Ok(())
+    })
+}
+
+pub(super) fn visit_fields_with_wire(
+    message: &[u8],
+    known_fields: &[(u64, u8)],
+    mut visit: impl FnMut(u64, u8, Option<&[u8]>) -> Result<(), TraceReceiveFailure>,
+) -> Result<(), TraceReceiveFailure> {
     let mut cursor = Cursor::new(message);
     while !cursor.is_empty() {
         let (field, wire) = cursor.take_key()?;
@@ -414,11 +484,13 @@ fn visit_fields(
         {
             return Err(TraceReceiveFailure::MalformedPayload);
         }
-        if wire == 2 {
-            visit(field, cursor.take_length_delimited()?)?;
+        let value = if wire == 2 {
+            Some(cursor.take_length_delimited()?)
         } else {
             cursor.skip_value(field, wire)?;
-        }
+            None
+        };
+        visit(field, wire, value)?;
     }
     Ok(())
 }

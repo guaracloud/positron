@@ -95,7 +95,7 @@ fn decode_event(
     profile: &ValueLimitProfile,
     version: u16,
 ) -> Result<SpanEvent, TraceStoreFailure> {
-    let timestamp = decode_time(input)?;
+    let timestamp = decode_time(input, version)?;
     let name = input.string(key_limit)?;
     let dropped_attributes_count = input.u32()?;
     let attributes = decode_span_attributes(input, depth, profile, version)?;

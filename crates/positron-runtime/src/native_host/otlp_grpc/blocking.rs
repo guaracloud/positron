@@ -204,7 +204,15 @@ fn run(receiver: Receiver<BlockingIngestJob>, cancellation: TaskCancellation) {
                     operation.evidence,
                     operation.reservation,
                 );
-                let _ = operation.response.send(result);
+                match operation.response.send(result) {
+                    Ok(()) => {},
+                    Err(result) => {
+                        // The caller cancelled after admission. The result is
+                        // dropped here; its owned reservation has already been
+                        // settled or released by the ingest service.
+                        drop(result);
+                    },
+                }
             },
             #[cfg(test)]
             BlockingIngestJob::Stall { entered } => {

@@ -18,41 +18,61 @@ pub(super) enum OtlpPayload {
 
 /// Measurements captured after authenticated gRPC transport admission and
 /// before the decoded request reaches the receiver.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OtlpGrpcTransportEvidence {
     wire_body_bytes: usize,
     decompressed_message_bytes: usize,
+    timestamp_presence: Option<super::presence::OtlpTraceTimestampPresence>,
 }
 
 impl OtlpGrpcTransportEvidence {
     /// Records the actual gRPC body and decompressed message sizes measured by
     /// the transport adapter. The body count includes each five-byte gRPC
     /// frame header, matching the compressed request limit's wire semantics.
+    /// This legacy constructor intentionally has no timestamp-presence data:
+    /// an already-decoded generated protobuf scalar cannot recover whether a
+    /// zero value was omitted on the wire.
     #[must_use]
     pub const fn prevalidated(wire_body_bytes: usize, decompressed_message_bytes: usize) -> Self {
         Self {
             wire_body_bytes,
             decompressed_message_bytes,
+            timestamp_presence: None,
         }
     }
 
-    pub(crate) const fn wire_body_bytes(self) -> usize {
+    /// Records transport measurements together with scalar timestamp wire
+    /// presence captured before protobuf decoding.
+    #[must_use]
+    pub fn prevalidated_with_presence(
+        wire_body_bytes: usize,
+        decompressed_message_bytes: usize,
+        timestamp_presence: super::presence::OtlpTraceTimestampPresence,
+    ) -> Self {
+        Self {
+            wire_body_bytes,
+            decompressed_message_bytes,
+            timestamp_presence: Some(timestamp_presence),
+        }
+    }
+
+    pub(crate) const fn wire_body_bytes(&self) -> usize {
         self.wire_body_bytes
     }
 
-    pub(crate) const fn decompressed_message_bytes(self) -> usize {
+    pub(crate) const fn decompressed_message_bytes(&self) -> usize {
         self.decompressed_message_bytes
+    }
+
+    pub(crate) fn timestamp_presence(
+        &self,
+    ) -> Option<&super::presence::OtlpTraceTimestampPresence> {
+        self.timestamp_presence.as_ref()
     }
 }
 
-/// Supported OTLP Trace body encodings after HTTP metadata validation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum OtlpTracesRequestEncoding {
-    Protobuf,
-    GzipProtobuf,
-    Json,
-    GzipJson,
-}
+/// Backwards-compatible signal-specific alias for the shared OTLP encoding.
+pub type OtlpTracesRequestEncoding = crate::OtlpRequestEncoding;
 
 /// OTLP bytes that can exist only after authoritative Tenant Attribution.
 pub struct AuthenticatedOtlpTracesRequest<'authority> {

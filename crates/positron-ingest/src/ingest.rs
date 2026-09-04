@@ -12,7 +12,7 @@ use positron_signals::LogStore;
 mod capacity;
 mod entry;
 mod failure;
-mod outcome;
+pub(crate) mod outcome;
 mod schema_resolution;
 
 use capacity::{group_work_amounts_with_policy_shapes, schema_admission_estimate};

@@ -82,8 +82,8 @@ fn preflight_observation(
     }
     let _ = decode_kind(input.u8()?)?;
     let _ = decode_sampling(input.u8()?)?;
-    preflight_time(input)?;
-    preflight_time(input)?;
+    preflight_time(input, version)?;
+    preflight_time(input, version)?;
     let name = input.raw_string(limits.key_path_bytes)?;
     let mut decoded_bytes = name.len();
     let attributes_count = input.count(limits.attribute_sets)?;
@@ -105,8 +105,11 @@ fn preflight_observation(
         if count == 0 {
             return Err(TraceStoreFailure::malformed_block());
         }
-        let index = namespace_index(namespace)?;
-        occurrences_by_namespace[index] = occurrences_by_namespace[index]
+        let index = namespace_index(namespace).ok_or_else(TraceStoreFailure::malformed_block)?;
+        let occurrences = occurrences_by_namespace
+            .get_mut(index)
+            .ok_or_else(TraceStoreFailure::malformed_block)?;
+        *occurrences = occurrences
             .checked_add(count)
             .filter(|total| *total <= limits.occurrences_per_namespace)
             .ok_or_else(TraceStoreFailure::malformed_block)?;
@@ -172,7 +175,7 @@ fn preflight_details(
     let events = input.count(super::super::details::MAX_DETAIL_COLLECTION)?;
     *bound = checked_slot_bound(*bound, events, super::DECODED_VECTOR_SLOT_BYTES)?;
     for _ in 0..events {
-        preflight_time(input)?;
+        preflight_time(input, version)?;
         let name = input.raw_string(limits.key_path_bytes)?;
         decoded_bytes = decoded_bytes
             .checked_add(name.len())
@@ -427,8 +430,16 @@ fn preflight_value(
     }
 }
 
-fn preflight_time(input: &mut Input<'_>) -> Result<(), TraceStoreFailure> {
-    let quality = decode_quality(input.u8()?)?;
+fn preflight_time(input: &mut Input<'_>, version: u16) -> Result<(), TraceStoreFailure> {
+    let tag = input.u8()?;
+    if tag == super::format::OUT_OF_RANGE_TIME_TAG {
+        if version < VERSION {
+            return Err(TraceStoreFailure::malformed_block());
+        }
+        let _ = input.u64()?;
+        return Ok(());
+    }
+    let quality = decode_quality(tag)?;
     if quality != SourceTimeQuality::Missing {
         let _ = input.i64()?;
     }

@@ -125,11 +125,15 @@ fn invalid_kind_status_timestamps_and_identifiers_have_stable_failures() {
 
     let mut out_of_range = valid_span();
     out_of_range.start_time_unix_nano = i64::MAX as u64 + 1;
+    let out_of_range = decode(out_of_range).expect("timestamp remains searchable");
+    assert_eq!(out_of_range.records().len(), 1);
     assert_eq!(
-        decode(out_of_range)
-            .expect("timestamp rejection")
-            .rejections(),
-        [0, 1, 0]
+        out_of_range.records()[0].start_time().source_value(),
+        Some(i64::MAX as u64 + 1)
+    );
+    assert_eq!(
+        out_of_range.records()[0].start_time().quality(),
+        SourceTimeQuality::Outlier
     );
 
     let mut reversed = valid_span();

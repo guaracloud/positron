@@ -7,8 +7,8 @@ use super::super::failure::TraceStoreFailure;
 use super::super::types::{StoredSpanObservation, TraceLimits, limits_for};
 use super::encoded_size::encoded_record_bytes_with_limits;
 use super::format::{
-    MAGIC, MAX_BLOCK_BYTES, MAX_RECORDS, VERSION, kind_tag, namespace_tag, quality_tag,
-    sampling_tag, status_tag,
+    MAGIC, MAX_BLOCK_BYTES, MAX_RECORDS, OUT_OF_RANGE_TIME_TAG, VERSION, kind_tag, namespace_tag,
+    quality_tag, sampling_tag, status_tag,
 };
 
 #[cfg(any(test, fuzzing))]
@@ -84,8 +84,12 @@ fn encode_observation(
         if attribute.key().len() > limits.key_path_bytes {
             return Err(TraceStoreFailure::limit_exceeded());
         }
-        let namespace = super::format::namespace_index(attribute.namespace())?;
-        occurrences_by_namespace[namespace] = occurrences_by_namespace[namespace]
+        let namespace = super::format::namespace_index(attribute.namespace())
+            .ok_or_else(TraceStoreFailure::invalid_input)?;
+        let occurrences = occurrences_by_namespace
+            .get_mut(namespace)
+            .ok_or_else(TraceStoreFailure::invalid_input)?;
+        *occurrences = occurrences
             .checked_add(attribute.len())
             .filter(|count| *count <= limits.occurrences_per_namespace)
             .ok_or_else(TraceStoreFailure::limit_exceeded)?;
@@ -206,6 +210,11 @@ fn encode_span_attributes(
 }
 
 fn encode_time(output: &mut Vec<u8>, time: EventTime) -> Result<(), TraceStoreFailure> {
+    if let Some(value) = time.source_value().filter(|value| *value > i64::MAX as u64) {
+        put_u8(output, OUT_OF_RANGE_TIME_TAG)?;
+        put_u64(output, value)?;
+        return Ok(());
+    }
     put_u8(output, quality_tag(time.quality()))?;
     if let Some(value) = time.instant() {
         put_i64(output, value.value())?;

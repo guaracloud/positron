@@ -8,8 +8,8 @@ use super::super::failure::TraceStoreFailure;
 use super::super::observation::SpanObservation;
 use super::super::types::StoredSpanObservation;
 use super::format::{
-    DETAILS_VERSION, MAGIC, MAX_RECORDS, check_cancel, decode_kind, decode_namespace,
-    decode_quality, decode_sampling, supported_version,
+    DETAILS_VERSION, MAGIC, MAX_RECORDS, OUT_OF_RANGE_TIME_TAG, check_cancel, decode_kind,
+    decode_namespace, decode_quality, decode_sampling, supported_version,
 };
 use crate::{ScanCancellation, ScanObserver};
 
@@ -173,8 +173,8 @@ pub(crate) fn decode_observation_version_with_profile(
     };
     let kind = decode_kind(input.u8()?)?;
     let sampling = decode_sampling(input.u8()?)?;
-    let start = decode_time(input)?;
-    let end = decode_time(input)?;
+    let start = decode_time(input, version)?;
+    let end = decode_time(input, version)?;
     let limits = super::super::types::limits_for(profile)?;
     let name = input.string(limits.key_path_bytes)?;
     let attributes_count = input.count(limits.attribute_sets)?;
@@ -191,8 +191,12 @@ pub(crate) fn decode_observation_version_with_profile(
         if count == 0 {
             return Err(TraceStoreFailure::malformed_block());
         }
-        let namespace_index = super::format::namespace_index(namespace)?;
-        occurrences_by_namespace[namespace_index] = occurrences_by_namespace[namespace_index]
+        let namespace_index = super::format::namespace_index(namespace)
+            .ok_or_else(TraceStoreFailure::malformed_block)?;
+        let occurrences = occurrences_by_namespace
+            .get_mut(namespace_index)
+            .ok_or_else(TraceStoreFailure::malformed_block)?;
+        *occurrences = occurrences
             .checked_add(count)
             .filter(|total| *total <= limits.occurrences_per_namespace)
             .ok_or_else(TraceStoreFailure::malformed_block)?;
@@ -241,8 +245,19 @@ pub(crate) fn decode_observation_version_with_profile(
     Ok((observation, ingest_time))
 }
 
-fn decode_time(input: &mut Input<'_>) -> Result<EventTime, TraceStoreFailure> {
-    let quality = decode_quality(input.u8()?)?;
+pub(super) fn decode_time(
+    input: &mut Input<'_>,
+    version: u16,
+) -> Result<EventTime, TraceStoreFailure> {
+    let tag = input.u8()?;
+    if tag == OUT_OF_RANGE_TIME_TAG {
+        if version < super::format::VERSION {
+            return Err(TraceStoreFailure::malformed_block());
+        }
+        return EventTime::out_of_range(input.u64()?)
+            .map_err(|_| TraceStoreFailure::malformed_block());
+    }
+    let quality = decode_quality(tag)?;
     if quality == SourceTimeQuality::Missing {
         return Ok(EventTime::missing());
     }

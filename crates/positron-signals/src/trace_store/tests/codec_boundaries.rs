@@ -1,9 +1,14 @@
 use super::*;
+use crate::{
+    SpanEvent, SpanObservationDetails, SpanResourceMetadata, SpanScopeMetadata, SpanStatus,
+    SpanStatusCode,
+};
 
 mod markers;
 
 #[test]
-fn trace_blocks_round_trip_native_typed_values_and_missing_times() -> Result<(), Box<dyn Error>> {
+fn trace_blocks_round_trip_native_typed_values_and_source_time_fallback()
+-> Result<(), Box<dyn Error>> {
     let root = TemporaryRoot::new()?;
     let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
     let authority = establish_kernel_authority(volume)?;
@@ -75,12 +80,29 @@ fn trace_blocks_round_trip_native_typed_values_and_missing_times() -> Result<(),
         )
         .validate(profile)?,
     ];
-    let observation = SpanObservation::checked_native(
+    let details = SpanObservationDetails::checked(
+        String::new(),
+        0,
+        SpanStatus::checked(SpanStatusCode::Unset, String::new())?,
+        vec![SpanEvent::checked(
+            positron_domain::time::EventTime::out_of_range(u64::MAX)?,
+            "event".to_owned(),
+            Vec::new(),
+            0,
+        )?],
+        Vec::new(),
+        0,
+        0,
+        0,
+        SpanResourceMetadata::checked(0, String::new())?,
+        SpanScopeMetadata::checked(String::new(), String::new(), 0, String::new())?,
+    )?;
+    let observation = SpanObservation::checked_native_with_details(
         [0x61; 16],
         [0x62; 8],
         None,
         "typed".to_owned(),
-        positron_domain::time::EventTime::missing(),
+        positron_domain::time::EventTime::out_of_range(u64::MAX)?,
         positron_domain::time::EventTime::received(
             UnixNanoseconds::new(0),
             positron_domain::time::SourceTimeQuality::Zero,
@@ -89,6 +111,7 @@ fn trace_blocks_round_trip_native_typed_values_and_missing_times() -> Result<(),
         SpanKind::Server,
         SamplingDecision::NotSampled,
         positron_policy::PolicyProvenance::new(2, [0x71; 32], vec!["rule".to_owned()])?,
+        details,
     )?;
     let store = TraceStore::new();
     ledger.append(
@@ -109,15 +132,26 @@ fn trace_blocks_round_trip_native_typed_values_and_missing_times() -> Result<(),
         &ledger.snapshot()?,
         TraceScan::all(ScanLimit::new(1)?),
     )?;
-    let actual = result
-        .observations()
-        .first()
-        .ok_or("missing typed span")?
-        .observation();
+    let scanned = result.observations().first().ok_or("missing typed span")?;
+    let actual = scanned.observation();
     assert_eq!(actual, &observation);
+    assert_eq!(actual.start_time().source_value(), Some(u64::MAX));
     assert_eq!(
-        actual.start_time(),
-        positron_domain::time::EventTime::missing()
+        actual.start_time().quality(),
+        positron_domain::time::SourceTimeQuality::Outlier
+    );
+    assert_eq!(
+        actual.details().events()[0].timestamp().source_value(),
+        Some(u64::MAX)
+    );
+    let query = positron_domain::time::QueryTime::for_span(
+        &actual.start_time(),
+        positron_domain::time::IngestTimeCandidate::new(scanned.stored().ingest_time().instant()),
+    );
+    assert_eq!(query.instant(), UnixNanoseconds::new(100));
+    assert_eq!(
+        query.provenance(),
+        positron_domain::time::QueryTimeProvenance::Ingest
     );
     assert_eq!(
         actual.end_time().quality(),

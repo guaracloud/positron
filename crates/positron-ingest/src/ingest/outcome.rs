@@ -111,7 +111,7 @@ impl IngestOutcome {
     }
 }
 
-pub(super) fn increment_rejection(counts: &mut [usize; 3], code: IngestFailureCode) {
+pub(crate) fn increment_rejection(counts: &mut [usize; 3], code: IngestFailureCode) {
     let index = match code {
         IngestFailureCode::PolicyRejected => 0,
         IngestFailureCode::InvalidRecord => 1,

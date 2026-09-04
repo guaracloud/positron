@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::vec::IntoIter;
 
 use positron_domain::routing::{SignalKind, VirtualShardId};
@@ -7,7 +6,7 @@ use positron_kernel::{ResourceAmounts, ResourceReservation};
 use crate::{AdmissionGroupPlanFailure, AdmissionGroupPlanner};
 
 use super::NativeSpanBatch;
-use super::bounds::retained_native_batch_bytes;
+use super::bounds::grouped_retained_native_batch_bytes;
 
 /// One planned native batch sharing tenant, Trace Store, and virtual shard.
 #[derive(Debug)]
@@ -90,7 +89,7 @@ impl<'authority> NativeSpanBatch<'authority> {
                 _retained_capacity: capacity,
             });
         }
-        let grouped_bytes = retained_native_batch_bytes(&records)
+        let grouped_bytes = grouped_retained_native_batch_bytes(&records, records.capacity())
             .map_err(|_| AdmissionGroupPlanFailure::RecordCountExceeded)?;
         if let Some(retained) = capacity.as_mut() {
             retained
@@ -110,17 +109,67 @@ impl<'authority> NativeSpanBatch<'authority> {
                 ]))
                 .map_err(|_| AdmissionGroupPlanFailure::AssignmentUnavailable)?;
         }
-        let mut planned = BTreeMap::<VirtualShardId, Vec<positron_signals::SpanObservation>>::new();
-        for (ordinal, record) in records.into_iter().enumerate() {
+        let mut assignments = Vec::new();
+        assignments
+            .try_reserve_exact(record_count)
+            .map_err(|_| AdmissionGroupPlanFailure::RecordCountExceeded)?;
+        for (ordinal, record) in records.iter().enumerate() {
             let ordinal = u32::try_from(ordinal)
                 .map_err(|_| AdmissionGroupPlanFailure::RecordCountExceeded)?;
             let shard = planner.assigned_trace_shard(
                 attribution.tenant_id(),
                 SignalKind::Traces,
                 ordinal,
-                &record,
+                record,
             )?;
-            planned.entry(shard).or_default().push(record);
+            assignments.push(shard);
+        }
+        let mut sorted_shards = Vec::new();
+        sorted_shards
+            .try_reserve_exact(record_count)
+            .map_err(|_| AdmissionGroupPlanFailure::RecordCountExceeded)?;
+        sorted_shards.extend_from_slice(&assignments);
+        // Keep the historical shard ordering while using vectors whose exact
+        // capacities can be charged before their backing allocations.
+        sorted_shards.sort_unstable();
+        let mut planned = Vec::<(VirtualShardId, Vec<positron_signals::SpanObservation>)>::new();
+        planned
+            .try_reserve_exact(sorted_shards.len())
+            .map_err(|_| AdmissionGroupPlanFailure::RecordCountExceeded)?;
+        let mut sorted_cursor = 0;
+        while let Some(&shard) = sorted_shards.get(sorted_cursor) {
+            let mut count = 1;
+            while sorted_shards
+                .get(
+                    sorted_cursor
+                        .checked_add(count)
+                        .ok_or(AdmissionGroupPlanFailure::RecordCountExceeded)?,
+                )
+                .is_some_and(|candidate| *candidate == shard)
+            {
+                count = count
+                    .checked_add(1)
+                    .ok_or(AdmissionGroupPlanFailure::RecordCountExceeded)?;
+            }
+            let mut group = Vec::new();
+            group
+                .try_reserve_exact(count)
+                .map_err(|_| AdmissionGroupPlanFailure::RecordCountExceeded)?;
+            planned.push((shard, group));
+            sorted_cursor = sorted_cursor
+                .checked_add(count)
+                .ok_or(AdmissionGroupPlanFailure::RecordCountExceeded)?;
+        }
+        drop(sorted_shards);
+        for (record, shard) in records.into_iter().zip(assignments) {
+            let group_index = planned
+                .binary_search_by_key(&shard, |(candidate, _)| *candidate)
+                .map_err(|_| AdmissionGroupPlanFailure::AssignmentUnavailable)?;
+            let group = planned
+                .get_mut(group_index)
+                .map(|(_, records)| records)
+                .ok_or(AdmissionGroupPlanFailure::AssignmentUnavailable)?;
+            group.push(record);
         }
         let groups = planned
             .into_iter()

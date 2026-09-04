@@ -4,6 +4,7 @@
 
 mod ingest;
 mod loki_push;
+mod otlp;
 mod otlp_logs;
 mod otlp_traces;
 mod planning;
@@ -18,6 +19,7 @@ pub use ingest::{
     RejectionDetail,
 };
 pub use loki_push::{AuthenticatedLokiPushRequest, LokiPushReceiver, LokiPushRequestEncoding};
+pub use otlp::OtlpRequestEncoding;
 pub use otlp_logs::{
     AuthenticatedOtlpLogsRequest, NativeLogAdmissionGroup, NativeLogAdmissionGroups,
     NativeLogBatch, OtlpLogsReceiver, OtlpLogsRequestEncoding, ReceiveFailure,
@@ -28,10 +30,11 @@ pub use otlp_logs::{
 pub use otlp_traces::fuzz_otlp_traces;
 pub use otlp_traces::{
     AuthenticatedOtlpTracesRequest, NativeSpanAdmissionGroup, NativeSpanAdmissionGroups,
-    NativeSpanBatch, OtlpGrpcTransportEvidence, OtlpTracesReceiver, OtlpTracesRequestEncoding,
-    TraceReceiveFailure, preflight_otlp_traces_gzip, preflight_otlp_traces_json,
-    preflight_otlp_traces_protobuf, preflight_otlp_traces_protobuf_with_profile,
-    reserve_trace_receiver_transport,
+    NativeSpanBatch, OtlpGrpcTransportEvidence, OtlpTraceTimestampPresence, OtlpTracesReceiver,
+    OtlpTracesRequestEncoding, TraceReceiveFailure, otlp_traces_timestamp_presence_json,
+    otlp_traces_timestamp_presence_protobuf, preflight_otlp_traces_gzip,
+    preflight_otlp_traces_json, preflight_otlp_traces_protobuf,
+    preflight_otlp_traces_protobuf_with_profile, reserve_trace_receiver_transport,
 };
 pub use planning::{AdmissionGroupPlanFailure, AdmissionGroupPlanner, FixedAdmissionGroupPlanner};
 pub use positron_policy::{

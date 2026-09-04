@@ -19,6 +19,8 @@ fn protobuf_and_protojson_preserve_the_same_public_native_batch() {
                     trace_id: vec![0x11; 16],
                     span_id: vec![0x22; 8],
                     name: "parity".to_owned(),
+                    start_time_unix_nano: 10,
+                    end_time_unix_nano: 20,
                     attributes: vec![
                         KeyValue {
                             key: "attribute".to_owned(),

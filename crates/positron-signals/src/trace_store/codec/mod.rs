@@ -16,7 +16,7 @@ pub(super) use decode::BlockDecode;
 pub(super) use encode::encode_block;
 pub(super) use encode::encode_block_with_profile;
 pub(super) use encoded_size::encoded_record_bytes_with_profile;
-pub(super) use format::MAX_RECORDS;
+pub(super) use format::{MAX_RECORDS, namespace_index};
 
 #[cfg(test)]
 pub(super) use bounds::preflight_policy;
@@ -31,7 +31,7 @@ pub(super) use encode::put_slice;
 #[cfg(test)]
 pub(super) use format::{
     MAX_BLOCK_BYTES, check_cancel, decode_kind, decode_namespace, decode_quality, decode_sampling,
-    kind_tag, namespace_index, namespace_tag, quality_tag, sampling_tag,
+    kind_tag, namespace_tag, quality_tag, sampling_tag,
 };
 
 pub(super) const DECODED_RECORD_SLOT_BYTES: u64 = 512;

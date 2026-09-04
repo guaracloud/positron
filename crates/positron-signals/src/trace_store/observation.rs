@@ -1,5 +1,5 @@
 use positron_domain::time::EventTime;
-use positron_domain::value::{AttributeNamespace, AttributeOccurrenceSet, ValueLimitProfile};
+use positron_domain::value::{AttributeOccurrenceSet, ValueLimitProfile};
 
 use super::details::SpanObservationDetails;
 use super::failure::TraceStoreFailure;
@@ -245,8 +245,12 @@ impl SpanObservation {
         let mut occurrences_by_namespace = [0_usize; 3];
         let mut decoded_bytes = name.len();
         for attribute in &attributes {
-            let namespace_index = namespace_index(attribute.namespace())?;
-            occurrences_by_namespace[namespace_index] = occurrences_by_namespace[namespace_index]
+            let namespace_index = super::codec::namespace_index(attribute.namespace())
+                .ok_or_else(TraceStoreFailure::invalid_input)?;
+            let occurrences = occurrences_by_namespace
+                .get_mut(namespace_index)
+                .ok_or_else(TraceStoreFailure::invalid_input)?;
+            *occurrences = occurrences
                 .checked_add(attribute.len())
                 .filter(|count| *count <= occurrence_limit)
                 .ok_or_else(TraceStoreFailure::limit_exceeded)?;
@@ -399,14 +403,5 @@ impl SpanObservation {
             .checked_add(self.details.decoded_size_bytes(usize::MAX)?)
             .ok_or_else(TraceStoreFailure::limit_exceeded)?;
         Ok(decoded)
-    }
-}
-
-fn namespace_index(namespace: AttributeNamespace) -> Result<usize, TraceStoreFailure> {
-    match namespace {
-        AttributeNamespace::Resource => Ok(0),
-        AttributeNamespace::InstrumentationScope => Ok(1),
-        AttributeNamespace::Record => Ok(2),
-        AttributeNamespace::Stream => Err(TraceStoreFailure::invalid_input()),
     }
 }

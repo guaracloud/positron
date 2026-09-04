@@ -536,6 +536,21 @@ fn source_time_quality_keeps_outliers_queryable_without_using_contradictions()
 }
 
 #[test]
+fn unsigned_out_of_range_source_time_is_exact_and_uses_ingest_query_fallback()
+-> Result<(), DomainFailure> {
+    let source = u64::MAX;
+    let event = EventTime::out_of_range(source)?;
+    let query = QueryTime::for_span(&event, IngestTimeCandidate::new(UnixNanoseconds::new(20)));
+
+    assert_eq!(event.source_value(), Some(source));
+    assert_eq!(event.instant(), None);
+    assert_eq!(event.quality(), SourceTimeQuality::Outlier);
+    assert_eq!(query.instant(), UnixNanoseconds::new(20));
+    assert_eq!(query.provenance(), QueryTimeProvenance::Ingest);
+    Ok(())
+}
+
+#[test]
 fn virtual_shard_identity_rejects_the_zero_sentinel() -> Result<(), DomainFailure> {
     assert_eq!(VirtualShardId::new(1)?.value(), 1);
     assert!(matches!(

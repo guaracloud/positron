@@ -56,7 +56,7 @@ impl OtlpTracesReceiver {
             ValueLimitProfileCandidate::new(effective_profile.system_limits(), None)
                 .validate()
                 .map_err(|_| TraceReceiveFailure::ValueLimitExceeded)?;
-        let decoded = match payload {
+        let (decoded, timestamp_presence) = match payload {
             request::OtlpPayload::Decoded { message, evidence } => {
                 let limits = effective_profile.effective_limits().request();
                 let compressed = usize::try_from(limits.compressed_bytes().value())
@@ -68,18 +68,28 @@ impl OtlpTracesReceiver {
                 {
                     return Err(TraceReceiveFailure::TransportLimitExceeded);
                 }
-                *message
+                let presence = evidence.timestamp_presence().cloned();
+                (*message, presence)
             },
             encoded => match transport::bounded_payload(encoded, effective_profile)? {
                 transport::BoundedOtlpPayload::Protobuf(protobuf) => {
                     bounds::validate_protobuf(&protobuf, system_profile)?;
-                    ExportTraceServiceRequest::decode(protobuf.as_slice())
-                        .map_err(|_| TraceReceiveFailure::MalformedPayload)?
+                    let presence =
+                        super::presence::OtlpTraceTimestampPresence::protobuf(protobuf.as_slice())?;
+                    (
+                        ExportTraceServiceRequest::decode(protobuf.as_slice())
+                            .map_err(|_| TraceReceiveFailure::MalformedPayload)?,
+                        Some(presence),
+                    )
                 },
                 transport::BoundedOtlpPayload::Json(json) => {
                     bounds::validate_json(&json, system_profile)?;
-                    serde_json::from_slice(&json)
-                        .map_err(|_| TraceReceiveFailure::MalformedPayload)?
+                    let presence = super::presence::OtlpTraceTimestampPresence::json(&json)?;
+                    (
+                        serde_json::from_slice(&json)
+                            .map_err(|_| TraceReceiveFailure::MalformedPayload)?,
+                        Some(presence),
+                    )
                 },
             },
         };
@@ -89,7 +99,8 @@ impl OtlpTracesReceiver {
             policy,
             capacity.as_mut(),
         )?;
-        let (drafts, mut rejections) = decoded::native_records(decoded, &system_profile)?;
+        let (drafts, mut rejections) =
+            decoded::native_records(decoded, &system_profile, timestamp_presence.as_ref())?;
         let mut records = Vec::new();
         records
             .try_reserve_exact(drafts.len())

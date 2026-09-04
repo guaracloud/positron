@@ -106,7 +106,8 @@ impl<'authority> NativeSpanBatch<'authority> {
     fn resize_after_decode(&mut self) -> Result<(), TraceReceiveFailure> {
         let record_count = u64::try_from(self.records.len())
             .map_err(|_| TraceReceiveFailure::ValueLimitExceeded)?;
-        let retained_peak = bounds::retained_native_batch_bytes(&self.records)?;
+        let retained_peak =
+            bounds::retained_native_batch_bytes(&self.records, self.records.capacity())?;
         if retained_peak > MAX_RETAINED_BYTES {
             return Err(TraceReceiveFailure::ValueLimitExceeded);
         }

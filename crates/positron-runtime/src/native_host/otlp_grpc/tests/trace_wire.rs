@@ -2,9 +2,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use opentelemetry_proto::tonic::collector::trace::v1::trace_service_client::TraceServiceClient;
+use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
+use positron_domain::value::AttributeNamespace;
+use positron_ingest::{
+    IngestPolicy, PolicyAction, PolicyAttributePath, PolicyPredicate, PolicyRule, PolicyTarget,
+};
 use tonic::Code;
 
-use super::trace_support::{Completion, ReceiverHarness, ScriptedBackend, trace_request};
+use super::trace_support::{
+    Completion, ReceiverHarness, ScriptedBackend, profile_with_individual_value_bytes,
+    trace_request,
+};
 
 #[tokio::test(flavor = "current_thread")]
 async fn trace_grpc_statuses_preserve_retry_classes_and_release_admission()
@@ -171,6 +179,57 @@ async fn trace_grpc_invalid_tenant_alias_is_rejected_before_admission()
     assert_eq!(harness.snapshot()?, baseline);
 
     drop(client);
+    harness.finish()?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn trace_grpc_policy_truncation_runs_before_tenant_value_limit()
+-> Result<(), Box<dyn std::error::Error>> {
+    let path = PolicyAttributePath::new(AttributeNamespace::Record, "secret")?;
+    let policy = IngestPolicy::compile(
+        2,
+        vec![PolicyRule::new(
+            "truncate-secret",
+            vec![PolicyPredicate::attribute_exists(path.clone())],
+            PolicyAction::TruncateBytes(PolicyTarget::attribute(path), 4),
+        )?],
+    )?;
+    let backend = Arc::new(ScriptedBackend::new([Completion::Committed]));
+    let harness = ReceiverHarness::start_durable_with_profile_and_policy(
+        profile_with_individual_value_bytes(4),
+        backend.clone(),
+        policy,
+    )?;
+    let mut client = tokio::time::timeout(
+        Duration::from_secs(2),
+        TraceServiceClient::connect(format!("http://{}", harness.endpoint)),
+    )
+    .await??;
+    let mut request = trace_request(0x81);
+    request
+        .get_mut()
+        .resource_spans
+        .first_mut()
+        .and_then(|resource| resource.scope_spans.first_mut())
+        .and_then(|scope| scope.spans.first_mut())
+        .ok_or("trace fixture span missing")?
+        .attributes
+        .push(KeyValue {
+            key: "secret".to_owned(),
+            value: Some(AnyValue {
+                value: Some(any_value::Value::BytesValue(vec![1, 2, 3, 4, 5])),
+            }),
+            ..KeyValue::default()
+        });
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(2),
+        client.export(harness.authorize_trace(request)?),
+    )
+    .await??;
+    assert!(response.into_inner().partial_success.is_none());
+    assert_eq!(backend.calls(), 1);
     harness.finish()?;
     Ok(())
 }

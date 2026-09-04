@@ -72,7 +72,9 @@ fn lowered_encoded_record_limit_is_applied_after_policy() -> Result<(), Box<dyn 
     )?;
     let record = baseline.records().first().ok_or("baseline record")?;
     let encoded_bytes = TraceStore::canonical_encoded_record_bytes(&maximum, record)?;
-    assert_eq!(encoded_bytes, 191);
+    // The fixture omits both span time scalars; preserving that wire absence
+    // avoids charging the eight-byte payloads used by explicit zero values.
+    assert_eq!(encoded_bytes, 175);
     drop(baseline);
 
     let exact = OtlpTracesReceiver::with_value_limit_profile(profile_with_encoded_record_bytes(

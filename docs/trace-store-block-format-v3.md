@@ -17,6 +17,19 @@ Record/Span attribute occurrences, plus typed occurrences in span events and
 links, recursively through arrays and ordered key/value lists. The Log-only
 Stream namespace remains invalid for Trace Store blocks.
 
+## Source time encoding
+
+Start, end, and detail-event source times retain the historical quality-byte
+encoding. Tags `1..=5` mean usable, missing, zero, outlier, and contradictory;
+tags other than `2` are followed by the exact signed `i64` Unix-nanoseconds
+value. Version 3 additionally defines tag `6` as an exact unsigned `u64`
+source timestamp greater than `i64::MAX`; it is followed by that eight-byte
+value and has `Outlier` quality with no usable native instant. Query Time falls
+back to Ingest Time for this representation while the original source value
+remains available to durable reads. Historical v1/v2 readers and bytes retain
+their prior time meanings and reject tag `6` as malformed; no old field is
+reinterpreted.
+
 ## Native value grammar
 
 Tags `0..=7` retain the exact v1/v2 meanings: null, boolean, signed integer,
