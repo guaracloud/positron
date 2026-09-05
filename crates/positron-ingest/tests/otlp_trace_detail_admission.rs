@@ -7,7 +7,10 @@ use opentelemetry_proto::tonic::resource::v1::Resource;
 use opentelemetry_proto::tonic::trace::v1::span::{Event, Link};
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 use positron_governance::{CompatibilityHints, PresentedCredential, RequestedIntent};
-use positron_ingest::{AuthenticatedOtlpTracesRequest, OtlpTracesReceiver, TraceReceiveFailure};
+use positron_ingest::{
+    AuthenticatedOtlpTracesRequest, OtlpTracesReceiver, TraceLimitClass, TraceLimitViolation,
+    TraceReceiveFailure,
+};
 use positron_kernel::{
     MountQualification, ResourceAmounts, ResourceDimension, WorkClaim, WorkKind,
 };
@@ -62,7 +65,9 @@ fn maximum_event_and_link_collections_are_charged_and_released_before_one_over()
         )?;
         assert_eq!(
             OtlpTracesReceiver::new().decode(request).err(),
-            Some(TraceReceiveFailure::ValueLimitExceeded),
+            Some(TraceReceiveFailure::ValueLimitExceededWithDetail(
+                TraceLimitViolation::new(TraceLimitClass::ContainerCount, 1_025, 1_024),
+            )),
             "one-over detail collection must fail before native materialization"
         );
         assert_eq!(governor.inspect()?.outstanding_total(), baseline);
@@ -109,7 +114,9 @@ fn resource_entity_reference_collection_is_bounded_before_materialization()
     )?;
     assert_eq!(
         OtlpTracesReceiver::new().decode(over).err(),
-        Some(TraceReceiveFailure::ValueLimitExceeded)
+        Some(TraceReceiveFailure::ValueLimitExceededWithDetail(
+            TraceLimitViolation::new(TraceLimitClass::ContainerCount, 1_025, 1_024),
+        ))
     );
     assert_eq!(governor.inspect()?.outstanding_total(), baseline);
     Ok(())
@@ -161,7 +168,9 @@ fn event_attribute_sets_are_reserved_before_detail_materialization() -> Result<(
     )?;
     assert_eq!(
         OtlpTracesReceiver::new().decode(over).err(),
-        Some(TraceReceiveFailure::ValueLimitExceeded)
+        Some(TraceReceiveFailure::ValueLimitExceededWithDetail(
+            TraceLimitViolation::new(TraceLimitClass::AttributesPerNamespace, 1_025, 1_024),
+        ))
     );
     assert_eq!(governor.inspect()?.outstanding_total(), baseline);
     Ok(())
@@ -223,6 +232,62 @@ fn transient_detail_strings_are_reserved_while_materializing() -> Result<(), Box
     assert_eq!(governor.inspect()?.outstanding_total(), 1);
     drop(blocker);
     assert!(governor.inspect()?.complete());
+    Ok(())
+}
+
+#[test]
+fn event_timestamp_presence_scratch_is_reserved_before_materialization()
+-> Result<(), Box<dyn Error>> {
+    let roots = support::temporary_roots()?;
+    let paths = BootstrapPaths::new(
+        &roots.data(),
+        &roots.secrets(),
+        MountQualification::LocalHost,
+    )?;
+    drop(InstanceBootstrap::initialize(
+        &paths,
+        InitializationPlan::non_interactive(),
+    )?);
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    let context = instance.attribute(
+        PresentedCredential::parse(claim.ingest_secret().ok_or("missing ingest secret")?)?,
+        RequestedIntent::Ingest,
+        CompatibilityHints::none(),
+    )?;
+    let governor = instance.resource_governor();
+    let tenant = context
+        .tenant_attribution()
+        .ok_or("tenant attribution")?
+        .tenant_id();
+    let blocker = governor.reserve(WorkClaim::tenant(
+        tenant,
+        WorkKind::SecurityLifecycle,
+        ResourceAmounts::only(ResourceDimension::MemoryBytes, 30_750_000)?,
+    )?)?;
+    let capacity = governor.reserve(WorkClaim::tenant(
+        tenant,
+        WorkKind::Ingest,
+        ResourceAmounts::only(ResourceDimension::MemoryBytes, 100_000)?,
+    )?)?;
+    let mut request = request(1_024, 0);
+    request.resource_spans[0].scope_spans[0].spans[0].start_time_unix_nano = 1;
+    request.resource_spans[0].scope_spans[0].spans[0].end_time_unix_nano = 2;
+    request.resource_spans[0].scope_spans[0].spans[0].events[0].time_unix_nano = 1;
+    let encoded = request.encoded_len();
+    let authenticated =
+        AuthenticatedOtlpTracesRequest::decoded_otlp_grpc_after_transport_admission(
+            context,
+            request,
+            positron_ingest::OtlpGrpcTransportEvidence::prevalidated(encoded + 5, encoded),
+            capacity,
+        )?;
+    let failure = OtlpTracesReceiver::new().decode(authenticated);
+    assert!(
+        matches!(failure, Err(TraceReceiveFailure::CapacityUnavailable)),
+        "presence scratch must be included in reserve-before-materialization accounting"
+    );
+    drop(blocker);
     Ok(())
 }
 

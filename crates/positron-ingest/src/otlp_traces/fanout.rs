@@ -22,6 +22,7 @@ pub(super) struct TraceFanoutFootprint {
 const NATIVE_DRAFT_BYTES: u64 = size_of::<super::decoded::NativeSpanDraft>() as u64;
 const NATIVE_OBSERVATION_BYTES: u64 = size_of::<positron_signals::SpanObservation>() as u64;
 const DETAIL_EVENT_SLOT_BYTES: u64 = size_of::<positron_signals::SpanEvent>() as u64;
+const EVENT_TIMESTAMP_PRESENCE_BYTES: u64 = size_of::<bool>() as u64;
 const DETAIL_LINK_SLOT_BYTES: u64 = size_of::<positron_signals::SpanLink>() as u64;
 const WIRE_RESOURCE_SPANS_BYTES: u64 = size_of::<ResourceSpans>() as u64;
 const WIRE_RESOURCE_BYTES: u64 = size_of::<Resource>() as u64;
@@ -326,7 +327,11 @@ fn add_scope(
         )?;
         let detail_slots = u64::try_from(span.events.len())
             .map_err(|_| TraceReceiveFailure::ValueLimitExceeded)?
-            .checked_mul(DETAIL_EVENT_SLOT_BYTES)
+            .checked_mul(
+                DETAIL_EVENT_SLOT_BYTES
+                    .checked_add(EVENT_TIMESTAMP_PRESENCE_BYTES)
+                    .ok_or(TraceReceiveFailure::ValueLimitExceeded)?,
+            )
             .and_then(|events| {
                 u64::try_from(span.links.len())
                     .ok()?

@@ -89,17 +89,38 @@ impl JsonBounds {
         Ok(())
     }
 
+    fn protocol_key(&mut self, length: usize) -> Result<(), serde_json::Error> {
+        self.decoded_bytes = self
+            .decoded_bytes
+            .checked_add(length)
+            .filter(|bytes| *bytes <= self.limits.decoded_batch_bytes)
+            .ok_or_else(|| self.fail(TraceReceiveFailure::ValueLimitExceeded))?;
+        Ok(())
+    }
+
     fn container(&mut self) -> Result<(), serde_json::Error> {
         self.containers = self
             .containers
             .checked_add(1)
-            .filter(|containers| *containers <= self.limits.containers)
             .ok_or_else(|| self.fail(TraceReceiveFailure::ValueLimitExceeded))?;
+        if self.containers > self.limits.containers {
+            return Err(self.fail(limit_failure(
+                TraceLimitClass::ContainerCount,
+                self.containers,
+                self.limits.containers,
+            )));
+        }
         self.depth = self
             .depth
             .checked_add(1)
-            .filter(|depth| *depth <= self.limits.nesting_depth)
             .ok_or_else(|| self.fail(TraceReceiveFailure::ValueLimitExceeded))?;
+        if self.depth > self.limits.nesting_depth {
+            return Err(self.fail(limit_failure(
+                TraceLimitClass::NestingDepth,
+                self.depth,
+                self.limits.nesting_depth,
+            )));
+        }
         Ok(())
     }
 
@@ -174,8 +195,14 @@ impl<'de> Visitor<'de> for JsonVisitor<'_> {
             {
                 entries = entries
                     .checked_add(1)
-                    .filter(|entries| *entries <= self.bounds.limits.array_entries)
                     .ok_or_else(|| A::Error::custom("OTLP Traces JSON array bound exceeded"))?;
+                if entries > self.bounds.limits.array_entries {
+                    return Err(A::Error::custom(self.bounds.fail(limit_failure(
+                        TraceLimitClass::ArrayEntries,
+                        entries,
+                        self.bounds.limits.array_entries,
+                    ))));
+                }
             }
             Ok(())
         })();
@@ -192,25 +219,31 @@ impl<'de> Visitor<'de> for JsonVisitor<'_> {
             let mut entries = 0_usize;
             while let Some(key) = map.next_key::<String>()? {
                 let key_limit = self.bounds.limits.key_bytes;
-                self.bounds
-                    .text(key.len(), key_limit, TraceLimitClass::KeyPathBytes)
-                    .map_err(A::Error::custom)?;
+                if is_protocol_field_name(&key) {
+                    self.bounds
+                        .protocol_key(key.len())
+                        .map_err(A::Error::custom)?;
+                } else {
+                    self.bounds
+                        .text(key.len(), key_limit, TraceLimitClass::KeyPathBytes)
+                        .map_err(A::Error::custom)?;
+                }
                 entries = entries
                     .checked_add(1)
                     .filter(|entries| *entries <= self.bounds.limits.key_value_entries)
                     .ok_or_else(|| A::Error::custom("OTLP Traces JSON object bound exceeded"))?;
-                let (value_limit, value_class) = if key == "bytesValue" {
-                    (
+                let (value_limit, value_class) = match key.as_str() {
+                    "bytesValue" | "bytes_value" => (
                         self.bounds.limits.json_bytes_text,
                         TraceLimitClass::IndividualValueBytes,
-                    )
-                } else if key == "stringValue" || key == "string_value" {
-                    (
+                    ),
+                    "stringValue" | "string_value" => (
                         self.bounds.limits.value_bytes,
                         TraceLimitClass::IndividualValueBytes,
-                    )
-                } else {
-                    (key_limit, TraceLimitClass::KeyPathBytes)
+                    ),
+                    "traceId" | "trace_id" | "spanId" | "span_id" | "parentSpanId"
+                    | "parent_span_id" => (usize::MAX, TraceLimitClass::KeyPathBytes),
+                    _ => (key_limit, TraceLimitClass::KeyPathBytes),
                 };
                 map.next_value_seed(JsonSeed {
                     bounds: self.bounds,
@@ -223,6 +256,84 @@ impl<'de> Visitor<'de> for JsonVisitor<'_> {
         self.bounds.leave();
         result
     }
+}
+
+fn limit_failure(class: TraceLimitClass, actual: usize, allowed: usize) -> TraceReceiveFailure {
+    match (u64::try_from(actual), u64::try_from(allowed)) {
+        (Ok(actual), Ok(allowed)) => TraceReceiveFailure::ValueLimitExceededWithDetail(
+            TraceLimitViolation::new(class, actual, allowed),
+        ),
+        _ => TraceReceiveFailure::ValueLimitExceeded,
+    }
+}
+
+fn is_protocol_field_name(name: &str) -> bool {
+    matches!(
+        name,
+        "resourceSpans"
+            | "resource_spans"
+            | "resource"
+            | "scopeSpans"
+            | "scope_spans"
+            | "scope"
+            | "spans"
+            | "traceId"
+            | "trace_id"
+            | "spanId"
+            | "span_id"
+            | "traceState"
+            | "trace_state"
+            | "parentSpanId"
+            | "parent_span_id"
+            | "flags"
+            | "name"
+            | "kind"
+            | "startTimeUnixNano"
+            | "start_time_unix_nano"
+            | "endTimeUnixNano"
+            | "end_time_unix_nano"
+            | "attributes"
+            | "droppedAttributesCount"
+            | "dropped_attributes_count"
+            | "events"
+            | "timeUnixNano"
+            | "time_unix_nano"
+            | "droppedEventsCount"
+            | "dropped_events_count"
+            | "links"
+            | "droppedLinksCount"
+            | "dropped_links_count"
+            | "status"
+            | "message"
+            | "code"
+            | "key"
+            | "value"
+            | "stringValue"
+            | "string_value"
+            | "boolValue"
+            | "bool_value"
+            | "intValue"
+            | "int_value"
+            | "doubleValue"
+            | "double_value"
+            | "bytesValue"
+            | "bytes_value"
+            | "arrayValue"
+            | "array_value"
+            | "kvlistValue"
+            | "kvlist_value"
+            | "values"
+            | "schemaUrl"
+            | "schema_url"
+            | "version"
+            | "entityRefs"
+            | "entity_refs"
+            | "id"
+            | "idKeys"
+            | "id_keys"
+            | "type"
+            | "description"
+    )
 }
 
 struct JsonSeed<'bounds> {

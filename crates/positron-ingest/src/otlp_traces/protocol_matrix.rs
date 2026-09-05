@@ -87,6 +87,62 @@ fn independent_value_and_key_limits_admit_both_wire_encodings() {
 }
 
 #[test]
+fn protojson_protocol_field_names_do_not_consume_key_path_budget() {
+    let mut request = string_value_request_with_key("key", "short");
+    request.resource_spans[0].scope_spans[0].spans[0].name = "span".to_owned();
+    let profile = profile_with_limits(64, 4);
+
+    let protobuf = OtlpTracesReceiver::with_value_limit_profile(profile)
+        .decode(AuthenticatedOtlpTracesRequest::test_only_protobuf(
+            test_attribution(),
+            request.encode_to_vec(),
+        ))
+        .expect("protobuf semantic key and name fit key/path limit");
+    assert_eq!(protobuf.records().len(), 1);
+
+    let protojson = OtlpTracesReceiver::with_value_limit_profile(profile)
+        .decode(AuthenticatedOtlpTracesRequest::test_only_json(
+            test_attribution(),
+            serde_json::to_vec(&request).expect("ProtoJSON payload"),
+        ))
+        .expect("fixed ProtoJSON field names are protocol syntax");
+    assert_eq!(protojson.records().len(), 1);
+}
+
+#[test]
+fn protobuf_record_limit_reports_stable_class_and_magnitudes() {
+    let request = ExportTraceServiceRequest {
+        resource_spans: vec![opentelemetry_proto::tonic::trace::v1::ResourceSpans {
+            scope_spans: vec![opentelemetry_proto::tonic::trace::v1::ScopeSpans {
+                spans: (0..1_025)
+                    .map(|ordinal| Span {
+                        trace_id: vec![0x11; 16],
+                        span_id: vec![(ordinal % 256) as u8; 8],
+                        ..Span::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    };
+    let failure = OtlpTracesReceiver::new()
+        .decode(AuthenticatedOtlpTracesRequest::test_only_protobuf(
+            test_attribution(),
+            request.encode_to_vec(),
+        ))
+        .expect_err("record limit must reject the request");
+    assert_eq!(
+        failure,
+        TraceReceiveFailure::ValueLimitExceededWithDetail(TraceLimitViolation::new(
+            TraceLimitClass::RecordCount,
+            1_025,
+            1_024,
+        ))
+    );
+}
+
+#[test]
 fn independent_value_and_key_limits_report_the_rejected_dimension() {
     let value_request = string_value_request_with_key("k", "12345");
     for payload in [
@@ -269,7 +325,9 @@ fn json_structure_and_syntax_fail_before_message_materialization() {
     let too_many_entries = format!(r#"{{"resourceSpans":[{}]}}"#, vec!["{}"; 1_025].join(","));
     assert_eq!(
         preflight_otlp_traces_json(too_many_entries.as_bytes()),
-        Err(TraceReceiveFailure::ValueLimitExceeded)
+        Err(TraceReceiveFailure::ValueLimitExceededWithDetail(
+            TraceLimitViolation::new(TraceLimitClass::ContainerCount, 1_025, 1_024),
+        ))
     );
     assert_eq!(
         preflight_otlp_traces_json(br#"{"resourceSpans":["#),

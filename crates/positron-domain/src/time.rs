@@ -45,8 +45,9 @@ pub enum SourceTimeQuality {
 /// A producer-supplied Event Time with a preserved usability annotation.
 ///
 /// `EventTime` stays distinct from signal-defined observed time and
-/// kernel-assigned Ingest Time. Its checked constructor requires a zero-quality
-/// value to retain the exact zero timestamp.
+/// kernel-assigned Ingest Time. Its checked constructor requires a matching
+/// source-quality annotation to retain the exact timestamp, including a zero
+/// timestamp whose pair-level quality is `Contradictory`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EventTime {
     instant: Option<UnixNanoseconds>,
@@ -294,7 +295,10 @@ fn validate_present_source_time(
 ) -> Result<(), DomainFailure> {
     let is_zero = instant.value() == 0;
     let has_zero_annotation = matches!(quality, SourceTimeQuality::Zero);
-    if matches!(quality, SourceTimeQuality::Missing) || is_zero != has_zero_annotation {
+    let contradictory_zero = is_zero && matches!(quality, SourceTimeQuality::Contradictory);
+    if matches!(quality, SourceTimeQuality::Missing)
+        || (!contradictory_zero && is_zero != has_zero_annotation)
+    {
         return Err(DomainFailure::invalid_time_annotation());
     }
     Ok(())

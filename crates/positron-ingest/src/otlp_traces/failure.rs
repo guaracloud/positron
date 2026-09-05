@@ -3,6 +3,14 @@ use std::fmt::{Display, Formatter};
 /// The semantic value dimension that rejected a bounded receiver payload.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TraceLimitClass {
+    ContainerCount,
+    RecordCount,
+    AggregateAttributeCount,
+    AttributesPerNamespace,
+    NestingDepth,
+    ArrayEntries,
+    KeyValueListEntries,
+    DecodedBatchBytes,
     IndividualValueBytes,
     KeyPathBytes,
 }
@@ -11,6 +19,14 @@ impl TraceLimitClass {
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
+            Self::ContainerCount => "container count",
+            Self::RecordCount => "record count",
+            Self::AggregateAttributeCount => "aggregate attribute count",
+            Self::AttributesPerNamespace => "attributes per namespace",
+            Self::NestingDepth => "nesting depth",
+            Self::ArrayEntries => "array entries",
+            Self::KeyValueListEntries => "key/value-list entries",
+            Self::DecodedBatchBytes => "decoded batch bytes",
             Self::IndividualValueBytes => "individual value bytes",
             Self::KeyPathBytes => "key/path bytes",
         }

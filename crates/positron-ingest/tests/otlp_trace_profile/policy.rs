@@ -64,6 +64,74 @@ fn contradictory_span_times_are_preserved_with_an_invalid_end_quality() -> Resul
 }
 
 #[test]
+fn authenticated_reversed_span_with_explicit_zero_end_is_preserved() -> Result<(), Box<dyn Error>> {
+    let roots = support::temporary_roots()?;
+    let paths = BootstrapPaths::new(
+        &roots.data(),
+        &roots.secrets(),
+        MountQualification::LocalHost,
+    )?;
+    InstanceBootstrap::initialize(&paths, InitializationPlan::non_interactive())?;
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    let context = instance.attribute(
+        PresentedCredential::parse(claim.ingest_secret().ok_or("missing ingest secret")?)?,
+        RequestedIntent::Ingest,
+        CompatibilityHints::none(),
+    )?;
+    let request = explicit_zero_reversed_request();
+    let batch =
+        OtlpTracesReceiver::new().decode(AuthenticatedOtlpTracesRequest::otlp_grpc_protobuf(
+            context,
+            instance.resource_governor(),
+            request,
+        )?)?;
+    let observation = batch.records().first().ok_or("preserved observation")?;
+    assert_eq!(observation.end_time().source_value(), Some(0));
+    assert_eq!(
+        observation.end_time().quality(),
+        SourceTimeQuality::Contradictory
+    );
+    Ok(())
+}
+
+fn explicit_zero_reversed_request() -> Vec<u8> {
+    let mut span = Vec::new();
+    length_field(&mut span, 1, &[1; 16]);
+    length_field(&mut span, 2, &[2; 8]);
+    length_field(&mut span, 5, b"explicit-zero-end");
+    fixed64_field(&mut span, 7, 10);
+    fixed64_field(&mut span, 8, 0);
+
+    let mut scope = Vec::new();
+    length_field(&mut scope, 2, &span);
+    let mut resource = Vec::new();
+    length_field(&mut resource, 2, &scope);
+    let mut request = Vec::new();
+    length_field(&mut request, 1, &resource);
+    request
+}
+
+fn length_field(output: &mut Vec<u8>, field: u32, value: &[u8]) {
+    append_varint(output, u64::from((field << 3) | 2));
+    append_varint(output, value.len() as u64);
+    output.extend_from_slice(value);
+}
+
+fn fixed64_field(output: &mut Vec<u8>, field: u32, value: u64) {
+    append_varint(output, u64::from((field << 3) | 1));
+    output.extend_from_slice(&value.to_le_bytes());
+}
+
+fn append_varint(output: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        output.push((value as u8) | 0x80);
+        value >>= 7;
+    }
+    output.push(value as u8);
+}
+
+#[test]
 fn policy_transform_runs_before_lowered_value_limit() -> Result<(), Box<dyn Error>> {
     let roots = support::temporary_roots()?;
     let paths = BootstrapPaths::new(

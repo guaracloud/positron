@@ -135,12 +135,13 @@ fn native_draft(
 ) -> Result<NativeSpanDraft, TraceReceiveFailure> {
     validate_raw_span(&span, &metadata, profile)?;
     let attributes = grouped_attributes(resource, scope, &span.attributes, profile)?;
-    let event_time_present = span
-        .events
-        .iter()
-        .enumerate()
-        .map(|(index, _)| timestamp_presence.is_none_or(|presence| presence.event(index)))
-        .collect();
+    let mut event_time_present = Vec::new();
+    event_time_present
+        .try_reserve_exact(span.events.len())
+        .map_err(|_| TraceReceiveFailure::CapacityUnavailable)?;
+    for (index, _) in span.events.iter().enumerate() {
+        event_time_present.push(timestamp_presence.is_none_or(|presence| presence.event(index)));
+    }
     let details = NativeSpanDetailDraft {
         trace_state: span.trace_state,
         flags: span.flags,

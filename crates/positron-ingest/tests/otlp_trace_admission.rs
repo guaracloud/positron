@@ -11,8 +11,9 @@ use positron_governance::{CompatibilityHints, PresentedCredential, RequestedInte
 use positron_ingest::{
     AdmissionGroupPlanFailure, AdmissionGroupPlanner, AuthenticatedOtlpTracesRequest,
     OtlpGrpcTransportEvidence, OtlpTracesReceiver, OtlpTracesRequestEncoding, PolicyAction,
-    PolicyAttributePath, PolicyPredicate, PolicyReceiver, PolicyRule, TraceReceiveFailure,
-    otlp_traces_timestamp_presence_json, reserve_trace_receiver_transport,
+    PolicyAttributePath, PolicyPredicate, PolicyReceiver, PolicyRule, TraceLimitClass,
+    TraceLimitViolation, TraceReceiveFailure, otlp_traces_timestamp_presence_json,
+    reserve_trace_receiver_transport,
 };
 use positron_kernel::{MountQualification, ResourceDimension};
 use positron_runtime::{BootstrapPaths, InitializationPlan, InstanceBootstrap};
@@ -158,7 +159,11 @@ fn public_protobuf_timestamp_presence_respects_record_profile_limit() -> Result<
     assert_eq!(
         positron_ingest::otlp_traces_timestamp_presence_protobuf(&request.encode_to_vec())
             .expect_err("presence scan accepted more than the canonical record limit"),
-        TraceReceiveFailure::ValueLimitExceeded
+        TraceReceiveFailure::ValueLimitExceededWithDetail(TraceLimitViolation::new(
+            TraceLimitClass::RecordCount,
+            1_025,
+            1_024,
+        ))
     );
     Ok(())
 }
@@ -805,6 +810,19 @@ fn protojson_trace_timestamps_preserve_wire_presence_and_unsigned_range()
             .timestamp()
             .quality(),
         SourceTimeQuality::Zero
+    );
+
+    let reversed = OtlpTracesReceiver::new().decode(AuthenticatedOtlpTracesRequest::otlp_http(
+        context,
+        governor,
+        OtlpTracesRequestEncoding::Json,
+        json_trace_request(Some(10), Some(0), Some(1)),
+    )?)?;
+    assert_eq!(reversed.records().len(), 1);
+    assert_eq!(reversed.records()[0].end_time().source_value(), Some(0));
+    assert_eq!(
+        reversed.records()[0].end_time().quality(),
+        SourceTimeQuality::Contradictory
     );
 
     let source = u64::MAX;

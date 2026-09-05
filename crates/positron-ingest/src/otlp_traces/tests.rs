@@ -190,5 +190,12 @@ fn json_receiver_uses_streamed_bounds_before_message_materialization() {
             serde_json::to_vec(&oversized).expect("ProtoJSON encoding"),
         ))
         .expect_err("JSON record bound must fail before allocation");
-    assert_eq!(failure, TraceReceiveFailure::ValueLimitExceeded);
+    assert_eq!(
+        failure,
+        TraceReceiveFailure::ValueLimitExceededWithDetail(TraceLimitViolation::new(
+            TraceLimitClass::ContainerCount,
+            1_025,
+            1_024,
+        ))
+    );
 }

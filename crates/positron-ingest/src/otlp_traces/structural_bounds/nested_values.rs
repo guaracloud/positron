@@ -21,8 +21,11 @@ fn nested_values_have_exact_and_one_over_depth_entries_and_bytes() {
     let over_depth_result = decode_with_profile(over_depth, profile);
     assert!(
         matches!(
-            &over_depth_result,
-            Err(TraceReceiveFailure::ValueLimitExceeded)
+            over_depth_result,
+            Err(TraceReceiveFailure::ValueLimitExceededWithDetail(detail))
+                if detail.class() == TraceLimitClass::NestingDepth
+                    && detail.actual() == 4
+                    && detail.allowed() == 3
         ),
         "unexpected nested-depth outcome: {over_depth_result:?}"
     );
@@ -53,7 +56,11 @@ fn nested_values_have_exact_and_one_over_depth_entries_and_bytes() {
                 over_array,
             ))
             .expect_err("one array entry over the configured bound"),
-        TraceReceiveFailure::ValueLimitExceeded
+        TraceReceiveFailure::ValueLimitExceededWithDetail(TraceLimitViolation::new(
+            TraceLimitClass::ArrayEntries,
+            1_025,
+            1_024,
+        ))
     );
 
     let exact_bytes = value_attribute(AnyValue {

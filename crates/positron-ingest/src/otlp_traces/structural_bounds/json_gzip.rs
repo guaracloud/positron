@@ -26,7 +26,9 @@ fn json_bounds_reject_overlong_strings_and_structural_depth_without_intermediate
     let too_many_arrays = format!(r#"{{"unknown":[{}]}}"#, vec!["[]"; 1_023].join(","));
     assert_eq!(
         preflight_otlp_traces_json(too_many_arrays.as_bytes()),
-        Err(TraceReceiveFailure::ValueLimitExceeded)
+        Err(TraceReceiveFailure::ValueLimitExceededWithDetail(
+            TraceLimitViolation::new(TraceLimitClass::ContainerCount, 1_025, 1_024),
+        ))
     );
     assert_eq!(
         preflight_otlp_traces_json(br#"{"unknown":[]} trailing"#),
@@ -38,7 +40,9 @@ fn json_bounds_reject_overlong_strings_and_structural_depth_without_intermediate
     let over_depth = nested_json(127);
     assert_eq!(
         preflight_otlp_traces_json(&over_depth),
-        Err(TraceReceiveFailure::ValueLimitExceeded)
+        Err(TraceReceiveFailure::ValueLimitExceededWithDetail(
+            TraceLimitViolation::new(TraceLimitClass::NestingDepth, 129, 128),
+        ))
     );
 
     let mut exact_body = br#"{"resourceSpans":[]}"#.to_vec();

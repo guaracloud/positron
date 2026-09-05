@@ -1,4 +1,6 @@
-use super::super::{TraceReceiveFailure, preflight_otlp_traces_protobuf};
+use super::super::{
+    TraceLimitClass, TraceLimitViolation, TraceReceiveFailure, preflight_otlp_traces_protobuf,
+};
 use super::support::{
     MAX_ATTRIBUTES, MAX_CONTAINERS, MAX_RECORDS, attribute, attributes, one_scope, request, span,
 };
@@ -24,7 +26,9 @@ fn protobuf_container_limits_are_exact_and_one_over() {
     );
     assert_eq!(
         preflight_otlp_traces_protobuf(&resources_over),
-        Err(TraceReceiveFailure::ValueLimitExceeded)
+        Err(TraceReceiveFailure::ValueLimitExceededWithDetail(
+            TraceLimitViolation::new(TraceLimitClass::ContainerCount, 1_025, 1_024),
+        ))
     );
 
     let scopes = request(vec![ResourceSpans {
@@ -40,7 +44,9 @@ fn protobuf_container_limits_are_exact_and_one_over() {
     }]);
     assert_eq!(
         preflight_otlp_traces_protobuf(&scopes_over),
-        Err(TraceReceiveFailure::ValueLimitExceeded)
+        Err(TraceReceiveFailure::ValueLimitExceededWithDetail(
+            TraceLimitViolation::new(TraceLimitClass::ContainerCount, 1_025, 1_024),
+        ))
     );
 
     let spans = request(vec![one_scope((0..MAX_RECORDS).map(|_| span()).collect())]);
@@ -48,7 +54,9 @@ fn protobuf_container_limits_are_exact_and_one_over() {
     let spans_over = request(vec![one_scope((0..=MAX_RECORDS).map(|_| span()).collect())]);
     assert_eq!(
         preflight_otlp_traces_protobuf(&spans_over),
-        Err(TraceReceiveFailure::ValueLimitExceeded)
+        Err(TraceReceiveFailure::ValueLimitExceededWithDetail(
+            TraceLimitViolation::new(TraceLimitClass::RecordCount, 1_025, 1_024),
+        ))
     );
 }
 
@@ -64,7 +72,9 @@ fn protobuf_event_and_link_limits_are_exact_and_one_over() {
     over_event_span.events = (0..=MAX_CONTAINERS).map(|_| Event::default()).collect();
     assert_eq!(
         preflight_otlp_traces_protobuf(&request(vec![one_scope(vec![over_event_span])])),
-        Err(TraceReceiveFailure::ValueLimitExceeded)
+        Err(TraceReceiveFailure::ValueLimitExceededWithDetail(
+            TraceLimitViolation::new(TraceLimitClass::ContainerCount, 1_025, 1_024),
+        ))
     );
 
     let link = Link {
@@ -82,7 +92,9 @@ fn protobuf_event_and_link_limits_are_exact_and_one_over() {
     over_link_span.links = vec![link; MAX_CONTAINERS + 1];
     assert_eq!(
         preflight_otlp_traces_protobuf(&request(vec![one_scope(vec![over_link_span])])),
-        Err(TraceReceiveFailure::ValueLimitExceeded)
+        Err(TraceReceiveFailure::ValueLimitExceededWithDetail(
+            TraceLimitViolation::new(TraceLimitClass::ContainerCount, 1_025, 1_024),
+        ))
     );
 }
 
@@ -103,7 +115,9 @@ fn protobuf_attribute_limits_cover_per_collection_and_aggregate_occurrences() {
     }])]);
     assert_eq!(
         preflight_otlp_traces_protobuf(&over_attributes),
-        Err(TraceReceiveFailure::ValueLimitExceeded)
+        Err(TraceReceiveFailure::ValueLimitExceededWithDetail(
+            TraceLimitViolation::new(TraceLimitClass::AttributesPerNamespace, 1_025, 1_024),
+        ))
     );
 
     let exact_aggregate = request(vec![one_scope(
@@ -125,12 +139,17 @@ fn protobuf_attribute_limits_cover_per_collection_and_aggregate_occurrences() {
 
     let mut aggregate_over = ExportTraceServiceRequest::decode(exact_aggregate.as_slice())
         .expect("the exact aggregate request is valid");
-    aggregate_over.resource_spans[0].scope_spans[0].spans[3]
-        .attributes
-        .push(attribute("one-over", AnyValue::default()));
+    aggregate_over.resource_spans[0].scope_spans[0]
+        .spans
+        .push(Span {
+            attributes: vec![attribute("one-over", AnyValue::default())],
+            ..span()
+        });
     assert_eq!(
         preflight_otlp_traces_protobuf(&aggregate_over.encode_to_vec()),
-        Err(TraceReceiveFailure::ValueLimitExceeded)
+        Err(TraceReceiveFailure::ValueLimitExceededWithDetail(
+            TraceLimitViolation::new(TraceLimitClass::AggregateAttributeCount, 4_097, 4_096),
+        ))
     );
 }
 
@@ -156,7 +175,9 @@ fn protobuf_attribute_limits_apply_to_resource_scope_event_and_link_collections(
     }]);
     assert_eq!(
         preflight_otlp_traces_protobuf(&resource_over),
-        Err(TraceReceiveFailure::ValueLimitExceeded)
+        Err(TraceReceiveFailure::ValueLimitExceededWithDetail(
+            TraceLimitViolation::new(TraceLimitClass::AttributesPerNamespace, 1_025, 1_024),
+        ))
     );
 
     let scope_exact = request(vec![ResourceSpans {
@@ -182,7 +203,9 @@ fn protobuf_attribute_limits_apply_to_resource_scope_event_and_link_collections(
     }]);
     assert_eq!(
         preflight_otlp_traces_protobuf(&scope_over),
-        Err(TraceReceiveFailure::ValueLimitExceeded)
+        Err(TraceReceiveFailure::ValueLimitExceededWithDetail(
+            TraceLimitViolation::new(TraceLimitClass::AttributesPerNamespace, 1_025, 1_024),
+        ))
     );
 
     let mut event_exact_span = span();
@@ -201,7 +224,9 @@ fn protobuf_attribute_limits_apply_to_resource_scope_event_and_link_collections(
     }];
     assert_eq!(
         preflight_otlp_traces_protobuf(&request(vec![one_scope(vec![event_over_span])])),
-        Err(TraceReceiveFailure::ValueLimitExceeded)
+        Err(TraceReceiveFailure::ValueLimitExceededWithDetail(
+            TraceLimitViolation::new(TraceLimitClass::AttributesPerNamespace, 1_025, 1_024),
+        ))
     );
 
     let mut link_exact_span = span();
@@ -224,6 +249,8 @@ fn protobuf_attribute_limits_apply_to_resource_scope_event_and_link_collections(
     }];
     assert_eq!(
         preflight_otlp_traces_protobuf(&request(vec![one_scope(vec![link_over_span])])),
-        Err(TraceReceiveFailure::ValueLimitExceeded)
+        Err(TraceReceiveFailure::ValueLimitExceededWithDetail(
+            TraceLimitViolation::new(TraceLimitClass::AttributesPerNamespace, 1_025, 1_024),
+        ))
     );
 }
