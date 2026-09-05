@@ -6,6 +6,8 @@ use positron_policy::NativePolicyAttribute;
 mod drafts;
 #[path = "../otlp_traces/materialize.rs"]
 mod materialize;
+#[path = "../otlp_traces/post_policy_limits.rs"]
+mod post_policy_limits;
 
 pub(crate) use drafts::{native_records, validate_legacy_decoded_timestamp_evidence};
 
