@@ -286,6 +286,72 @@ async fn trace_grpc_all_rejected_value_limit_reports_safe_partial_detail()
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn trace_grpc_mixed_value_limit_keeps_one_span_and_maximum_detail()
+-> Result<(), Box<dyn std::error::Error>> {
+    let backend = Arc::new(ScriptedBackend::new([Completion::Committed]));
+    let harness = ReceiverHarness::start_with_profile(
+        backend.clone(),
+        profile_with_individual_value_bytes(4),
+    )?;
+    let mut client = tokio::time::timeout(
+        Duration::from_secs(2),
+        TraceServiceClient::connect(format!("http://{}", harness.endpoint)),
+    )
+    .await??;
+    let mut request = trace_request(0x9a);
+    let spans = request
+        .get_mut()
+        .resource_spans
+        .first_mut()
+        .and_then(|resource| resource.scope_spans.first_mut())
+        .ok_or("trace fixture scope missing")?;
+    let accepted = spans
+        .spans
+        .first()
+        .cloned()
+        .ok_or("trace fixture span missing")?;
+    let mut rejected_seven = accepted.clone();
+    rejected_seven.attributes.push(KeyValue {
+        key: "short-key".to_owned(),
+        value: Some(AnyValue {
+            value: Some(any_value::Value::StringValue("1234567".to_owned())),
+        }),
+        ..KeyValue::default()
+    });
+    let mut rejected_five = accepted.clone();
+    rejected_five.attributes.push(KeyValue {
+        key: "short-key".to_owned(),
+        value: Some(AnyValue {
+            value: Some(any_value::Value::StringValue("12345".to_owned())),
+        }),
+        ..KeyValue::default()
+    });
+    spans.spans = vec![accepted, rejected_seven, rejected_five];
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(2),
+        client.export(harness.authorize_trace(request)?),
+    )
+    .await??;
+    let partial = response
+        .into_inner()
+        .partial_success
+        .ok_or("missing partial success")?;
+    assert_eq!(partial.rejected_spans, 2);
+    assert_eq!(
+        partial.error_message,
+        "some spans were permanently rejected (individual value bytes: actual 7, allowed 4)"
+    );
+    assert!(!partial.error_message.contains("1234567"));
+    assert!(!partial.error_message.contains("12345"));
+    assert_eq!(backend.calls(), 1);
+    assert_eq!(backend.committed_records(), 1);
+    drop(client);
+    harness.finish()?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn trace_grpc_partial_detail_is_bounded_and_class_ordered()
 -> Result<(), Box<dyn std::error::Error>> {
     let backend = Arc::new(ScriptedBackend::new([Completion::Committed]));

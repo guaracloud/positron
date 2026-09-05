@@ -350,7 +350,10 @@ fn trace_ingest_commits_valid_spans_with_bounded_permanent_rejections()
         0,
         capacity,
         receiver,
-        [1, 0, 0],
+        crate::otlp_traces::NativeSpanRejections::new(
+            [1, 0, 0],
+            crate::TraceLimitRejectionSummary::EMPTY,
+        ),
     )?;
     let outcome = TraceIngest::new(&fixture.authority, &ledger, fixture.tenant, shard)
         .accept(batch, StoreBlockIdentity::new([0xeb; 16])?);

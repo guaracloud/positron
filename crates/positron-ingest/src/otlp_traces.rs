@@ -43,6 +43,8 @@ mod transport;
 
 pub use admission_groups::{NativeSpanAdmissionGroup, NativeSpanAdmissionGroups};
 pub use batch::NativeSpanBatch;
+#[cfg(test)]
+pub(crate) use batch::NativeSpanRejections;
 pub use failure::{
     TraceLimitClass, TraceLimitRejectionSummary, TraceLimitViolation, TraceReceiveFailure,
 };

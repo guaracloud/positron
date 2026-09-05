@@ -14,6 +14,7 @@ mod blocking_executor;
 mod persistence_outcomes;
 mod policy_markers;
 mod trace_cancellation;
+mod trace_partial_detail;
 mod trace_support;
 mod trace_wire;
 mod trace_wire_errors;

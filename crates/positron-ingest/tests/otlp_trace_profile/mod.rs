@@ -24,6 +24,7 @@ mod support;
 
 mod accounting;
 mod policy;
+mod post_policy;
 mod transport;
 
 fn request_with_event_names(exact_name: &str, over_name: &str) -> ExportTraceServiceRequest {

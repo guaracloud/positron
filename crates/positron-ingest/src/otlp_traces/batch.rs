@@ -18,6 +18,21 @@ pub struct NativeSpanBatch<'authority> {
     pub(crate) receiver: crate::PolicyReceiver,
 }
 
+/// The two bounded rejection summaries accumulated while a trace batch is
+/// materialized. Keeping them together lets the batch constructor receive one
+/// coherent outcome without a post-construction mutation step.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NativeSpanRejections {
+    permanent: [usize; 3],
+    limits: TraceLimitRejectionSummary,
+}
+
+impl NativeSpanRejections {
+    pub(crate) const fn new(permanent: [usize; 3], limits: TraceLimitRejectionSummary) -> Self {
+        Self { permanent, limits }
+    }
+}
+
 impl<'authority> NativeSpanBatch<'authority> {
     #[cfg(test)]
     pub(crate) fn new(
@@ -35,7 +50,7 @@ impl<'authority> NativeSpanBatch<'authority> {
             decoded_bytes,
             capacity,
             receiver,
-            [0; 3],
+            NativeSpanRejections::new([0; 3], TraceLimitRejectionSummary::EMPTY),
         )
     }
 
@@ -46,13 +61,13 @@ impl<'authority> NativeSpanBatch<'authority> {
         decoded_bytes: u64,
         capacity: Option<ResourceReservation<'authority>>,
         receiver: crate::PolicyReceiver,
-        rejections: [usize; 3],
+        rejections: NativeSpanRejections,
     ) -> Result<Self, TraceReceiveFailure> {
         let mut batch = Self {
             attribution,
             records,
-            rejections,
-            limit_rejections: TraceLimitRejectionSummary::EMPTY,
+            rejections: rejections.permanent,
+            limit_rejections: rejections.limits,
             value_limit_profile,
             decoded_bytes,
             capacity,
@@ -60,14 +75,6 @@ impl<'authority> NativeSpanBatch<'authority> {
         };
         batch.resize_after_decode()?;
         Ok(batch)
-    }
-
-    pub(crate) fn with_limit_rejections(
-        mut self,
-        limit_rejections: TraceLimitRejectionSummary,
-    ) -> Self {
-        self.limit_rejections = limit_rejections;
-        self
     }
 
     #[must_use]

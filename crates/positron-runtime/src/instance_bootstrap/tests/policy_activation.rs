@@ -12,6 +12,7 @@ use super::super::{InitializationPlan, InstanceBootstrap};
 use super::support::Roots;
 
 mod concurrency;
+mod corruption;
 mod live;
 
 #[test]

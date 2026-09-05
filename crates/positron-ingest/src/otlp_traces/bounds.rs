@@ -562,7 +562,11 @@ fn increment_with_class(
     Ok(())
 }
 
-fn limit_failure(class: TraceLimitClass, actual: usize, allowed: usize) -> TraceReceiveFailure {
+pub(super) fn limit_failure(
+    class: TraceLimitClass,
+    actual: usize,
+    allowed: usize,
+) -> TraceReceiveFailure {
     match (u64::try_from(actual), u64::try_from(allowed)) {
         (Ok(actual), Ok(allowed)) => TraceReceiveFailure::ValueLimitExceededWithDetail(
             TraceLimitViolation::new(class, actual, allowed),

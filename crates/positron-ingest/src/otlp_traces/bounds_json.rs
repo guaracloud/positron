@@ -1,7 +1,7 @@
 use serde::de::{self, DeserializeSeed, Deserializer, Error, MapAccess, SeqAccess, Visitor};
 use std::fmt;
 
-use super::{Limits, TraceLimitClass, TraceLimitViolation, TraceReceiveFailure};
+use super::{Limits, TraceLimitClass, TraceReceiveFailure};
 
 pub(super) fn validate(
     json: &[u8],
@@ -73,13 +73,7 @@ impl JsonBounds {
         class: TraceLimitClass,
     ) -> Result<(), serde_json::Error> {
         if length > max_string_bytes {
-            let failure = match (u64::try_from(length), u64::try_from(max_string_bytes)) {
-                (Ok(actual), Ok(allowed)) => TraceReceiveFailure::ValueLimitExceededWithDetail(
-                    TraceLimitViolation::new(class, actual, allowed),
-                ),
-                _ => TraceReceiveFailure::ValueLimitExceeded,
-            };
-            return Err(self.fail(failure));
+            return Err(self.fail(super::limit_failure(class, length, max_string_bytes)));
         }
         self.decoded_bytes = self
             .decoded_bytes
@@ -104,7 +98,7 @@ impl JsonBounds {
             .checked_add(1)
             .ok_or_else(|| self.fail(TraceReceiveFailure::ValueLimitExceeded))?;
         if self.containers > self.limits.containers {
-            return Err(self.fail(limit_failure(
+            return Err(self.fail(super::limit_failure(
                 TraceLimitClass::ContainerCount,
                 self.containers,
                 self.limits.containers,
@@ -115,7 +109,7 @@ impl JsonBounds {
             .checked_add(1)
             .ok_or_else(|| self.fail(TraceReceiveFailure::ValueLimitExceeded))?;
         if self.depth > self.limits.nesting_depth {
-            return Err(self.fail(limit_failure(
+            return Err(self.fail(super::limit_failure(
                 TraceLimitClass::NestingDepth,
                 self.depth,
                 self.limits.nesting_depth,
@@ -197,7 +191,7 @@ impl<'de> Visitor<'de> for JsonVisitor<'_> {
                     .checked_add(1)
                     .ok_or_else(|| A::Error::custom("OTLP Traces JSON array bound exceeded"))?;
                 if entries > self.bounds.limits.array_entries {
-                    return Err(A::Error::custom(self.bounds.fail(limit_failure(
+                    return Err(A::Error::custom(self.bounds.fail(super::limit_failure(
                         TraceLimitClass::ArrayEntries,
                         entries,
                         self.bounds.limits.array_entries,
@@ -255,15 +249,6 @@ impl<'de> Visitor<'de> for JsonVisitor<'_> {
         })();
         self.bounds.leave();
         result
-    }
-}
-
-fn limit_failure(class: TraceLimitClass, actual: usize, allowed: usize) -> TraceReceiveFailure {
-    match (u64::try_from(actual), u64::try_from(allowed)) {
-        (Ok(actual), Ok(allowed)) => TraceReceiveFailure::ValueLimitExceededWithDetail(
-            TraceLimitViolation::new(class, actual, allowed),
-        ),
-        _ => TraceReceiveFailure::ValueLimitExceeded,
     }
 }
 

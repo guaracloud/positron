@@ -250,9 +250,8 @@ impl OtlpTracesReceiver {
             decoded_bytes,
             capacity,
             receiver,
-            rejections,
+            super::batch::NativeSpanRejections::new(rejections, limit_rejections),
         )
-        .map(|batch| batch.with_limit_rejections(limit_rejections))
     }
 }
 

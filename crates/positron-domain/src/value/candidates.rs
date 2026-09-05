@@ -155,8 +155,21 @@ impl CandidateAttributeValue {
     /// this method only prevents an over-limit candidate tree from reaching a
     /// policy or native materialization boundary.
     pub fn validate_shape(&self, profile: ValueLimitProfile) -> Result<(), DomainFailure> {
+        self.validate_shape_detailed(profile)
+            .map_err(|_| DomainFailure::value_limit_exceeded())
+    }
+
+    /// Checks the recursive shape and retains one bounded semantic violation
+    /// when a dynamic-value limit is exceeded.
+    ///
+    /// This borrowed transition is the allocation-free domain seam used by
+    /// policy-aware adapters before they materialize a replacement value.
+    pub fn validate_shape_detailed(
+        &self,
+        profile: ValueLimitProfile,
+    ) -> Result<(), CandidateShapeFailure> {
         let limits = profile.effective_limits();
-        candidate_shape(
+        candidate_shape::validate(
             self,
             limits,
             limits.dynamic_value().individual_value_bytes(),
@@ -349,78 +362,6 @@ impl CandidateAttributeValue {
             observer,
         )
     }
-}
-
-fn candidate_shape(
-    candidate: &CandidateAttributeValue,
-    limits: ValueLimitSet,
-    value_bytes: ByteLimit,
-    remaining_depth: u16,
-) -> Result<usize, DomainFailure> {
-    let size = match candidate {
-        CandidateAttributeValue::Null => 0,
-        CandidateAttributeValue::Boolean(_) => 1,
-        CandidateAttributeValue::SignedInteger(_)
-        | CandidateAttributeValue::FloatingPointBits(_) => 8,
-        CandidateAttributeValue::String(value) => value.len(),
-        CandidateAttributeValue::Bytes(value) => value.len(),
-        CandidateAttributeValue::Array(values) => {
-            let child_depth = remaining_depth
-                .checked_sub(1)
-                .ok_or_else(DomainFailure::value_limit_exceeded)?;
-            if exceeds_collection_limit(values.len(), limits.dynamic_value().array_entries()) {
-                return Err(DomainFailure::value_limit_exceeded());
-            }
-            values.iter().try_fold(0_usize, |total, value| {
-                checked_decoded_add(total, candidate_shape(value, limits, value_bytes, child_depth)?)
-            })?
-        },
-        CandidateAttributeValue::KeyValueList(values) => {
-            let child_depth = remaining_depth
-                .checked_sub(1)
-                .ok_or_else(DomainFailure::value_limit_exceeded)?;
-            if exceeds_collection_limit(
-                values.len(),
-                limits.dynamic_value().key_value_list_entries(),
-            ) {
-                return Err(DomainFailure::value_limit_exceeded());
-            }
-            values.iter().try_fold(0_usize, |total, entry| {
-                if entry.key.is_empty()
-                    || exceeds_byte_limit(entry.key.len(), limits.dynamic_value().key_path_bytes())
-                {
-                    return Err(DomainFailure::value_limit_exceeded());
-                }
-                let total = checked_decoded_add(total, entry.key.len())?;
-                checked_decoded_add(
-                    total,
-                    candidate_shape(&entry.value, limits, value_bytes, child_depth)?,
-                )
-            })?
-        },
-        CandidateAttributeValue::Marker(marker) if marker.is_valid() => 0,
-        CandidateAttributeValue::Marker(_) => {
-            return Err(DomainFailure::value_limit_exceeded());
-        },
-        CandidateAttributeValue::Truncated { value, action } => {
-            if matches!(
-                value.as_ref(),
-                CandidateAttributeValue::Marker(_) | CandidateAttributeValue::Truncated { .. }
-            ) {
-                return Err(DomainFailure::value_limit_exceeded());
-            }
-            let kind = candidate_native_kind(value)
-                .ok_or_else(DomainFailure::value_limit_exceeded)?;
-            if !truncation_action_valid(*action, kind) {
-                return Err(DomainFailure::value_limit_exceeded());
-            }
-            candidate_shape(value, limits, value_bytes, remaining_depth)?
-        },
-    };
-    if exceeds_byte_limit(size, value_bytes) {
-        return Err(DomainFailure::value_limit_exceeded());
-    }
-    Ok(size)
 }
 
 fn candidate_native_kind(value: &CandidateAttributeValue) -> Option<AttributeValueKind> {
