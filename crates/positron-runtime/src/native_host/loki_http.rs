@@ -128,7 +128,9 @@ fn service_response(service_failure: ServiceFailure) -> Response {
         ServiceFailure::RequestTooLarge => {
             failure(413, "Loki Push request exceeds the receiver limit")
         },
-        ServiceFailure::InvalidRequest => failure(400, "Loki Push request was rejected"),
+        ServiceFailure::InvalidRequest | ServiceFailure::InvalidRequestWithLimit(_) => {
+            failure(400, "Loki Push request was rejected")
+        },
         ServiceFailure::KeyUnavailable
         | ServiceFailure::CatalogUnavailable
         | ServiceFailure::LedgerUnavailable

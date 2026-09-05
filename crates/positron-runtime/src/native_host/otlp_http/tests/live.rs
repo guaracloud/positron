@@ -7,9 +7,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use opentelemetry_proto::tonic::collector::trace::v1::{
     ExportTraceServiceRequest, ExportTraceServiceResponse,
 };
+use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 use positron_domain::value::{
-    ByteLimit, RequestLimits, ValueLimitProfile, ValueLimitProfileCandidate, ValueLimitSet,
+    ByteLimit, CollectionLimit, DynamicValueLimits, NestingLimit, RequestLimits, ValueLimitProfile,
+    ValueLimitProfileCandidate, ValueLimitSet,
 };
 use positron_kernel::MountQualification;
 use prost::Message;
@@ -144,6 +146,61 @@ fn live_http_trace_export_has_protobuf_json_and_gzip_parity()
             assert!(decoded.partial_success.is_none());
         }
     }
+    Ok(())
+}
+
+#[test]
+fn live_http_trace_value_limit_reports_safe_class_and_magnitudes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let request = ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            scope_spans: vec![ScopeSpans {
+                spans: vec![Span {
+                    trace_id: vec![0x41; 16],
+                    span_id: vec![0x42; 8],
+                    name: "limit-detail".to_owned(),
+                    attributes: vec![KeyValue {
+                        key: "short-key".to_owned(),
+                        value: Some(AnyValue {
+                            value: Some(any_value::Value::StringValue("12345".to_owned())),
+                        }),
+                        ..KeyValue::default()
+                    }],
+                    ..Span::default()
+                }],
+                ..ScopeSpans::default()
+            }],
+            ..ResourceSpans::default()
+        }],
+    };
+    let (_roots, bearer, services) =
+        http_services_with_profile(profile_with_system_individual_value_bytes(4))?;
+    let response = receive_http(
+        &services,
+        &bearer,
+        serde_json::to_vec(&request)?,
+        "application/json",
+        None,
+    )?;
+    assert_eq!(
+        response.status(),
+        400,
+        "unexpected status={} body={:?}",
+        response.status(),
+        response.body()
+    );
+    let status: serde_json::Value = serde_json::from_slice(response.body())?;
+    assert_eq!(status["code"], 3);
+    assert_eq!(
+        status["message"],
+        "OTLP Traces request exceeded a value limit (individual value bytes: actual 5, allowed 4)"
+    );
+    assert!(
+        !status["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("12345")
+    );
     Ok(())
 }
 
@@ -476,6 +533,29 @@ fn profile_with_transport_limits(
         system.dynamic_value(),
     );
     Ok(ValueLimitProfileCandidate::new(system, Some(tenant)).validate()?)
+}
+
+fn profile_with_system_individual_value_bytes(bytes: u32) -> ValueLimitProfile {
+    let maximum = ValueLimitProfile::release_1_system_maximum();
+    let dynamic = maximum.effective_limits().dynamic_value();
+    let dynamic = DynamicValueLimits::new(
+        ByteLimit::new(bytes).expect("valid value bound"),
+        dynamic.attributes_per_namespace(),
+        dynamic.key_path_bytes(),
+        NestingLimit::new(dynamic.nesting_depth().value()).expect("valid depth"),
+        CollectionLimit::new(dynamic.array_entries().value()).expect("valid arrays"),
+        CollectionLimit::new(dynamic.key_value_list_entries().value()).expect("valid lists"),
+    );
+    ValueLimitProfileCandidate::new(
+        ValueLimitSet::new(
+            maximum.effective_limits().request(),
+            maximum.effective_limits().record(),
+            dynamic,
+        ),
+        None,
+    )
+    .validate()
+    .expect("lowered system profile")
 }
 
 fn http_services_with_profile(

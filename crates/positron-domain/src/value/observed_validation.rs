@@ -138,14 +138,32 @@ fn validate_attribute_value_observed_with_facts<O: NativeValueObserver>(
                 remaining_depth,
                 observer,
             )?;
+            let wrapper_bytes = std::mem::size_of::<ValidatedAttributeValue>();
+            if let Err(failure) = observer.observe_allocation(wrapper_bytes) {
+                return match release_output_capacity(transfer.allocation_bytes, observer) {
+                    Ok(()) => Err(ObservedValueFailure::Observer(failure)),
+                    Err(release_failure) => Err(release_failure),
+                };
+            }
+            let retained_heap_bytes = transfer
+                .retained_heap_bytes
+                .checked_add(wrapper_bytes);
+            let allocation_bytes = transfer.allocation_bytes.checked_add(wrapper_bytes);
+            let (Some(retained_heap_bytes), Some(allocation_bytes)) =
+                (retained_heap_bytes, allocation_bytes)
+            else {
+                release_output_capacity(wrapper_bytes, observer)?;
+                release_output_capacity(transfer.allocation_bytes, observer)?;
+                return Err(DomainFailure::value_limit_exceeded().into());
+            };
             (
                 ValidatedAttributeValueInner::Truncated {
                     value: Box::new(transfer.value),
                     action,
                 },
                 transfer.value_size_bytes,
-                transfer.retained_heap_bytes,
-                transfer.allocation_bytes,
+                retained_heap_bytes,
+                allocation_bytes,
             )
         },
     };

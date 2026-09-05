@@ -1,7 +1,7 @@
 use serde::de::{self, DeserializeSeed, Deserializer, Error, MapAccess, SeqAccess, Visitor};
 use std::fmt;
 
-use super::{Limits, TraceReceiveFailure};
+use super::{Limits, TraceLimitClass, TraceLimitViolation, TraceReceiveFailure};
 
 pub(super) fn validate(
     json: &[u8],
@@ -37,6 +37,7 @@ pub(super) fn validate(
         .deserialize_any(JsonVisitor {
             bounds: &mut bounds,
             max_string_bytes,
+            max_string_class: TraceLimitClass::KeyPathBytes,
         })
         .map_err(|_| {
             bounds
@@ -65,9 +66,20 @@ impl JsonBounds {
         <serde_json::Error as de::Error>::custom("OTLP Traces JSON bound exceeded")
     }
 
-    fn text(&mut self, length: usize, max_string_bytes: usize) -> Result<(), serde_json::Error> {
+    fn text(
+        &mut self,
+        length: usize,
+        max_string_bytes: usize,
+        class: TraceLimitClass,
+    ) -> Result<(), serde_json::Error> {
         if length > max_string_bytes {
-            return Err(self.fail(TraceReceiveFailure::ValueLimitExceeded));
+            let failure = match (u64::try_from(length), u64::try_from(max_string_bytes)) {
+                (Ok(actual), Ok(allowed)) => TraceReceiveFailure::ValueLimitExceededWithDetail(
+                    TraceLimitViolation::new(class, actual, allowed),
+                ),
+                _ => TraceReceiveFailure::ValueLimitExceeded,
+            };
+            return Err(self.fail(failure));
         }
         self.decoded_bytes = self
             .decoded_bytes
@@ -99,6 +111,7 @@ impl JsonBounds {
 struct JsonVisitor<'bounds> {
     bounds: &'bounds mut JsonBounds,
     max_string_bytes: usize,
+    max_string_class: TraceLimitClass,
 }
 
 impl<'de> Visitor<'de> for JsonVisitor<'_> {
@@ -133,7 +146,7 @@ impl<'de> Visitor<'de> for JsonVisitor<'_> {
         E: de::Error,
     {
         self.bounds
-            .text(value.len(), self.max_string_bytes)
+            .text(value.len(), self.max_string_bytes, self.max_string_class)
             .map_err(E::custom)
     }
 
@@ -155,6 +168,7 @@ impl<'de> Visitor<'de> for JsonVisitor<'_> {
                 .next_element_seed(JsonSeed {
                     bounds: self.bounds,
                     max_string_bytes: self.max_string_bytes,
+                    max_string_class: self.max_string_class,
                 })?
                 .is_some()
             {
@@ -179,20 +193,29 @@ impl<'de> Visitor<'de> for JsonVisitor<'_> {
             while let Some(key) = map.next_key::<String>()? {
                 let key_limit = self.bounds.limits.key_bytes;
                 self.bounds
-                    .text(key.len(), key_limit)
+                    .text(key.len(), key_limit, TraceLimitClass::KeyPathBytes)
                     .map_err(A::Error::custom)?;
                 entries = entries
                     .checked_add(1)
                     .filter(|entries| *entries <= self.bounds.limits.key_value_entries)
                     .ok_or_else(|| A::Error::custom("OTLP Traces JSON object bound exceeded"))?;
-                let value_limit = if key == "bytesValue" {
-                    self.bounds.limits.json_bytes_text
+                let (value_limit, value_class) = if key == "bytesValue" {
+                    (
+                        self.bounds.limits.json_bytes_text,
+                        TraceLimitClass::IndividualValueBytes,
+                    )
+                } else if key == "stringValue" || key == "string_value" {
+                    (
+                        self.bounds.limits.value_bytes,
+                        TraceLimitClass::IndividualValueBytes,
+                    )
                 } else {
-                    key_limit
+                    (key_limit, TraceLimitClass::KeyPathBytes)
                 };
                 map.next_value_seed(JsonSeed {
                     bounds: self.bounds,
                     max_string_bytes: value_limit,
+                    max_string_class: value_class,
                 })?;
             }
             Ok(())
@@ -205,6 +228,7 @@ impl<'de> Visitor<'de> for JsonVisitor<'_> {
 struct JsonSeed<'bounds> {
     bounds: &'bounds mut JsonBounds,
     max_string_bytes: usize,
+    max_string_class: TraceLimitClass,
 }
 
 impl<'de> DeserializeSeed<'de> for JsonSeed<'_> {
@@ -217,6 +241,7 @@ impl<'de> DeserializeSeed<'de> for JsonSeed<'_> {
         deserializer.deserialize_any(JsonVisitor {
             bounds: self.bounds,
             max_string_bytes: self.max_string_bytes,
+            max_string_class: self.max_string_class,
         })
     }
 }

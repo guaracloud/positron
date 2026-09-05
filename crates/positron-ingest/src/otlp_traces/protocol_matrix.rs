@@ -1,12 +1,17 @@
 use super::{
-    AuthenticatedOtlpTracesRequest, OtlpTracesReceiver, TraceReceiveFailure,
-    preflight_otlp_traces_gzip, preflight_otlp_traces_json, preflight_otlp_traces_protobuf,
+    AuthenticatedOtlpTracesRequest, OtlpTracesReceiver, TraceLimitClass, TraceLimitViolation,
+    TraceReceiveFailure, preflight_otlp_traces_gzip, preflight_otlp_traces_json,
+    preflight_otlp_traces_protobuf,
 };
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::common::v1::{
     AnyValue, ArrayValue, KeyValue, KeyValueList, any_value,
 };
 use opentelemetry_proto::tonic::trace::v1::Span;
+use positron_domain::value::{
+    ByteLimit, CollectionLimit, DynamicValueLimits, NestingLimit, RecordLimits, RequestLimits,
+    ValueLimitProfile, ValueLimitProfileCandidate, ValueLimitSet,
+};
 use prost::Message;
 use std::io::Write;
 
@@ -57,6 +62,75 @@ fn protobuf_and_protojson_preserve_the_same_public_native_batch() {
         ))
         .expect("ProtoJSON payload");
     assert_eq!(protobuf.records(), protojson.records());
+}
+
+#[test]
+fn independent_value_and_key_limits_admit_both_wire_encodings() {
+    let request = string_value_request("123456789012345678901234567890123");
+    let profile = profile_with_limits(64, 32);
+
+    let protobuf = OtlpTracesReceiver::with_value_limit_profile(profile)
+        .decode(AuthenticatedOtlpTracesRequest::test_only_protobuf(
+            test_attribution(),
+            request.encode_to_vec(),
+        ))
+        .expect("protobuf value limit must be independent from key/path limit");
+    assert_eq!(protobuf.records().len(), 1);
+
+    let protojson = OtlpTracesReceiver::with_value_limit_profile(profile)
+        .decode(AuthenticatedOtlpTracesRequest::test_only_json(
+            test_attribution(),
+            serde_json::to_vec(&request).expect("ProtoJSON payload"),
+        ))
+        .expect("ProtoJSON value limit must be independent from key/path limit");
+    assert_eq!(protojson.records().len(), 1);
+}
+
+#[test]
+fn independent_value_and_key_limits_report_the_rejected_dimension() {
+    let value_request = string_value_request_with_key("k", "12345");
+    for payload in [
+        value_request.encode_to_vec(),
+        serde_json::to_vec(&value_request).expect("ProtoJSON payload"),
+    ] {
+        let failure = OtlpTracesReceiver::with_value_limit_profile(profile_with_limits(4, 32))
+            .decode(if payload.first() == Some(&0x0a) {
+                AuthenticatedOtlpTracesRequest::test_only_protobuf(test_attribution(), payload)
+            } else {
+                AuthenticatedOtlpTracesRequest::test_only_json(test_attribution(), payload)
+            })
+            .expect_err("five-byte value must exceed the value limit");
+        assert_eq!(
+            failure,
+            TraceReceiveFailure::ValueLimitExceededWithDetail(TraceLimitViolation::new(
+                TraceLimitClass::IndividualValueBytes,
+                5,
+                4,
+            ))
+        );
+    }
+
+    let key_request = string_value_request_with_key("123456789012345678901234567890123", "short");
+    for payload in [
+        key_request.encode_to_vec(),
+        serde_json::to_vec(&key_request).expect("ProtoJSON payload"),
+    ] {
+        let failure = OtlpTracesReceiver::with_value_limit_profile(profile_with_limits(64, 32))
+            .decode(if payload.first() == Some(&0x0a) {
+                AuthenticatedOtlpTracesRequest::test_only_protobuf(test_attribution(), payload)
+            } else {
+                AuthenticatedOtlpTracesRequest::test_only_json(test_attribution(), payload)
+            })
+            .expect_err("long key must exceed the key/path limit");
+        assert_eq!(
+            failure,
+            TraceReceiveFailure::ValueLimitExceededWithDetail(TraceLimitViolation::new(
+                TraceLimitClass::KeyPathBytes,
+                33,
+                32,
+            ))
+        );
+    }
 }
 
 #[test]
@@ -414,6 +488,62 @@ fn all_values() -> AnyValue {
             ],
         })),
     }
+}
+
+fn string_value_request(value: &str) -> ExportTraceServiceRequest {
+    string_value_request_with_key("k", value)
+}
+
+fn string_value_request_with_key(key: &str, value: &str) -> ExportTraceServiceRequest {
+    ExportTraceServiceRequest {
+        resource_spans: vec![opentelemetry_proto::tonic::trace::v1::ResourceSpans {
+            scope_spans: vec![opentelemetry_proto::tonic::trace::v1::ScopeSpans {
+                spans: vec![Span {
+                    trace_id: vec![0x11; 16],
+                    span_id: vec![0x22; 8],
+                    name: "short".to_owned(),
+                    attributes: vec![KeyValue {
+                        key: key.to_owned(),
+                        value: Some(AnyValue {
+                            value: Some(any_value::Value::StringValue(value.to_owned())),
+                        }),
+                        ..KeyValue::default()
+                    }],
+                    ..Span::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    }
+}
+
+fn profile_with_limits(individual_value_bytes: u32, key_path_bytes: u32) -> ValueLimitProfile {
+    let byte = |value| ByteLimit::new(value).expect("test byte limit");
+    let collection = |value| CollectionLimit::new(value).expect("test collection limit");
+    let depth = |value| NestingLimit::new(value).expect("test nesting limit");
+    ValueLimitProfileCandidate::new(
+        ValueLimitSet::new(
+            RequestLimits::new(
+                byte(1_048_576),
+                byte(1_048_576),
+                collection(1_024),
+                collection(4_096),
+            ),
+            RecordLimits::new(byte(1_048_576), byte(1_048_576), byte(262_144)),
+            DynamicValueLimits::new(
+                byte(individual_value_bytes),
+                collection(1_024),
+                byte(key_path_bytes),
+                depth(128),
+                collection(1_024),
+                collection(1_024),
+            ),
+        ),
+        None,
+    )
+    .validate()
+    .expect("test profile stays under the system ceiling")
 }
 
 fn test_attribution() -> positron_domain::identity::TenantAttribution {

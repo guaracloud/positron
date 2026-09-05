@@ -356,13 +356,14 @@ fn trace_service_status(failure: ServiceFailure) -> Status {
 }
 
 fn status_from_failure(failure: OtlpFailure) -> Status {
+    let message = failure.rendered_message();
     match failure.grpc_code {
-        3 => Status::invalid_argument(failure.message),
-        8 => Status::resource_exhausted(failure.message),
-        13 => Status::internal(failure.message),
-        14 => Status::unavailable(failure.message),
-        16 => Status::unauthenticated(failure.message),
-        _ => Status::internal(failure.message),
+        3 => Status::invalid_argument(message),
+        8 => Status::resource_exhausted(message),
+        13 => Status::internal(message),
+        14 => Status::unavailable(message),
+        16 => Status::unauthenticated(message),
+        _ => Status::internal(message),
     }
 }
 

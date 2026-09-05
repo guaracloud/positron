@@ -237,7 +237,10 @@ fn policy_markers_and_sanitized_values_keep_their_public_native_contract() {
             .is_some_and(|value| value.is_marker())
     );
     assert!(truncated_array.contains_marker());
-    assert_eq!(truncated_array.retained_heap_bytes(), Ok(64));
+    assert_eq!(
+        truncated_array.retained_heap_bytes(),
+        Ok(64 + std::mem::size_of::<crate::value::ValidatedAttributeValue>()),
+    );
 
     let truncated_list = CandidateAttributeValue::truncated(
         CandidateAttributeValue::key_value_list(vec![CandidateKeyValue::new(

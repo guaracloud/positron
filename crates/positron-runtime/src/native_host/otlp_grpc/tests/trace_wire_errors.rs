@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -7,8 +8,8 @@ use prost::Message;
 
 use super::trace_support::{
     Completion, ReceiverHarness, ScriptedBackend, gzip_trace_frame,
-    gzip_trace_frame_with_span_count, profile_with_transport_limits, trace_frame,
-    trace_frame_from_request, trace_request,
+    gzip_trace_frame_with_span_count, profile_with_system_individual_value_bytes,
+    profile_with_transport_limits, trace_frame, trace_frame_from_request, trace_request,
 };
 
 #[tokio::test(flavor = "current_thread")]
@@ -183,6 +184,55 @@ async fn authenticated_trace_rejects_payload_over_system_value_limit_before_back
     .await?;
 
     assert_eq!(status, "3");
+    assert_eq!(backend.calls(), 0);
+    harness.finish()?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn trace_value_limit_status_names_class_and_magnitudes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut request = trace_request(0x7a).into_inner();
+    let span = request
+        .resource_spans
+        .first_mut()
+        .and_then(|resource| resource.scope_spans.first_mut())
+        .and_then(|scope| scope.spans.first_mut())
+        .ok_or("trace fixture span missing")?;
+    span.attributes.push(KeyValue {
+        key: "short-key".to_owned(),
+        value: Some(AnyValue {
+            value: Some(any_value::Value::StringValue("12345".to_owned())),
+        }),
+        ..KeyValue::default()
+    });
+    let frame = trace_frame_from_request(request)?;
+    let profile = profile_with_system_individual_value_bytes(4);
+    assert_eq!(
+        profile
+            .effective_limits()
+            .dynamic_value()
+            .individual_value_bytes()
+            .value(),
+        4
+    );
+    let backend = Arc::new(ScriptedBackend::new([]));
+    let harness = ReceiverHarness::start_with_profile(backend.clone(), profile)?;
+
+    let (status, message) = raw_trace_request(
+        &harness,
+        "/opentelemetry.proto.collector.trace.v1.TraceService/Export",
+        Some(Bytes::from(frame)),
+    )
+    .await?;
+
+    assert_eq!(status, "3");
+    assert_eq!(
+        message.as_deref(),
+        Some(
+            "OTLP%20Traces%20request%20exceeded%20a%20value%20limit%20(individual%20value%20bytes:%20actual%205,%20allowed%204)",
+        )
+    );
     assert_eq!(backend.calls(), 0);
     harness.finish()?;
     Ok(())

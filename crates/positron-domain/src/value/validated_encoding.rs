@@ -162,7 +162,10 @@ impl ValidatedAttributeValue {
             | ValidatedAttributeValueInner::SignedInteger(_)
             | ValidatedAttributeValueInner::FloatingPointBits(_)
             | ValidatedAttributeValueInner::Marker(_) => Ok(0),
-            ValidatedAttributeValueInner::Truncated { value, .. } => value.retained_heap_bytes(),
+            ValidatedAttributeValueInner::Truncated { value, .. } => value
+                .retained_heap_bytes()?
+                .checked_add(std::mem::size_of::<ValidatedAttributeValue>())
+                .ok_or_else(DomainFailure::value_limit_exceeded),
             ValidatedAttributeValueInner::String(value) => Ok(value.capacity()),
             ValidatedAttributeValueInner::Bytes(value) => Ok(value.capacity()),
             ValidatedAttributeValueInner::Array(values) => {

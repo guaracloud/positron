@@ -1,6 +1,9 @@
 use std::io::Write;
 
-use super::super::{TraceReceiveFailure, preflight_otlp_traces_gzip, preflight_otlp_traces_json};
+use super::super::{
+    TraceLimitClass, TraceLimitViolation, TraceReceiveFailure, preflight_otlp_traces_gzip,
+    preflight_otlp_traces_json,
+};
 use super::support::MAX_BYTES;
 
 #[test]
@@ -10,7 +13,9 @@ fn json_bounds_reject_overlong_strings_and_structural_depth_without_intermediate
     let over = format!(r#"{{"unknown":"{}"}}"#, "x".repeat(65_537));
     assert_eq!(
         preflight_otlp_traces_json(over.as_bytes()),
-        Err(TraceReceiveFailure::ValueLimitExceeded)
+        Err(TraceReceiveFailure::ValueLimitExceededWithDetail(
+            TraceLimitViolation::new(TraceLimitClass::KeyPathBytes, 65_537, 65_536),
+        ))
     );
 
     let exact_containers = format!(r#"{{"unknown":[{}]}}"#, vec!["[]"; 1_022].join(","));

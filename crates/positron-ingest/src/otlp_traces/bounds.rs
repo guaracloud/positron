@@ -1,4 +1,4 @@
-use super::TraceReceiveFailure;
+use super::{TraceLimitClass, TraceLimitViolation, TraceReceiveFailure};
 use positron_domain::value::ValueLimitProfile;
 
 #[path = "bounds_json.rs"]
@@ -381,7 +381,7 @@ impl Counters {
 
     fn visit_any_value(&mut self, message: &[u8], depth: usize) -> Result<(), TraceReceiveFailure> {
         visit_fields(message, ANY_VALUE_FIELDS, |field, value| match field {
-            1 => self.visit_string(value),
+            1 => self.visit_value_string(value),
             7 => self.visit_bytes(value),
             5 => self.visit_array(value, depth),
             6 => self.visit_key_value_list(value, depth),
@@ -426,14 +426,33 @@ impl Counters {
     fn visit_string(&mut self, value: &[u8]) -> Result<(), TraceReceiveFailure> {
         let length = value.len();
         if length > self.limits.key_bytes {
-            return Err(TraceReceiveFailure::ValueLimitExceeded);
+            return Err(limit_failure(
+                TraceLimitClass::KeyPathBytes,
+                length,
+                self.limits.key_bytes,
+            ));
         }
         self.add_decoded(length)
     }
 
+    fn visit_value_string(&mut self, value: &[u8]) -> Result<(), TraceReceiveFailure> {
+        if value.len() > self.limits.value_bytes {
+            return Err(limit_failure(
+                TraceLimitClass::IndividualValueBytes,
+                value.len(),
+                self.limits.value_bytes,
+            ));
+        }
+        self.add_decoded(value.len())
+    }
+
     fn visit_bytes(&mut self, value: &[u8]) -> Result<(), TraceReceiveFailure> {
         if value.len() > self.limits.value_bytes {
-            return Err(TraceReceiveFailure::ValueLimitExceeded);
+            return Err(limit_failure(
+                TraceLimitClass::IndividualValueBytes,
+                value.len(),
+                self.limits.value_bytes,
+            ));
         }
         self.add_decoded(value.len())
     }
@@ -454,6 +473,15 @@ fn increment(value: &mut usize, limit: usize) -> Result<(), TraceReceiveFailure>
         .filter(|value| *value <= limit)
         .ok_or(TraceReceiveFailure::ValueLimitExceeded)?;
     Ok(())
+}
+
+fn limit_failure(class: TraceLimitClass, actual: usize, allowed: usize) -> TraceReceiveFailure {
+    match (u64::try_from(actual), u64::try_from(allowed)) {
+        (Ok(actual), Ok(allowed)) => TraceReceiveFailure::ValueLimitExceededWithDetail(
+            TraceLimitViolation::new(class, actual, allowed),
+        ),
+        _ => TraceReceiveFailure::ValueLimitExceeded,
+    }
 }
 
 fn visit_fields(

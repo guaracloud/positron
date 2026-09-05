@@ -189,9 +189,10 @@ impl ValidatedAttributeValue {
             | ValidatedAttributeValueInner::SignedInteger(_)
             | ValidatedAttributeValueInner::FloatingPointBits(_)
             | ValidatedAttributeValueInner::Marker(_) => Ok(0),
-            ValidatedAttributeValueInner::Truncated { value, .. } => {
-                value.retained_heap_bytes_observed(observer)
-            },
+            ValidatedAttributeValueInner::Truncated { value, .. } => value
+                .retained_heap_bytes_observed(observer)?
+                .checked_add(std::mem::size_of::<ValidatedAttributeValue>())
+                .ok_or_else(|| ObservedValueFailure::Domain(DomainFailure::value_limit_exceeded())),
             ValidatedAttributeValueInner::String(value) => {
                 observe_payload(value.as_bytes(), observer)?;
                 Ok(value.capacity())

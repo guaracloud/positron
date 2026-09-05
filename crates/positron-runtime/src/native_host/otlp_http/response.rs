@@ -139,10 +139,11 @@ pub(crate) fn trace_success(rejected: usize, encoding: ResponseEncoding) -> Resp
 }
 
 fn failure_response(classification: OtlpFailure, encoding: ResponseEncoding) -> Response {
+    let message = classification.rendered_message();
     let response = failure(
         classification.http_status,
         classification.grpc_code,
-        classification.message,
+        &message,
         encoding,
     );
     if classification.retry_after {

@@ -1,4 +1,4 @@
-use positron_ingest::{IngestFailureCode, IngestOutcome, TraceReceiveFailure};
+use positron_ingest::{IngestFailureCode, IngestOutcome, TraceLimitViolation, TraceReceiveFailure};
 
 use crate::ServiceFailure;
 
@@ -19,7 +19,23 @@ pub(super) struct OtlpFailure {
     pub(super) http_status: u16,
     pub(super) grpc_code: i32,
     pub(super) message: &'static str,
+    pub(super) limit: Option<TraceLimitViolation>,
     pub(super) retry_after: bool,
+}
+
+impl OtlpFailure {
+    pub(super) fn rendered_message(self) -> String {
+        match self.limit {
+            Some(limit) => format!(
+                "{} ({}: actual {}, allowed {})",
+                self.message,
+                limit.class().label(),
+                limit.actual(),
+                limit.allowed(),
+            ),
+            None => self.message.to_owned(),
+        }
+    }
 }
 
 impl OtlpSignal {
@@ -40,8 +56,12 @@ impl OtlpSignal {
                         Self::Logs => "OTLP Logs request was malformed",
                         Self::Traces => "OTLP Traces request was malformed",
                     },
+                    limit: None,
                     retry_after: false,
                 }
+            },
+            TraceReceiveFailure::ValueLimitExceededWithDetail(detail) => {
+                self.limit_exceeded(detail)
             },
             TraceReceiveFailure::PolicyEvaluationFailed
             | TraceReceiveFailure::ValueLimitExceeded
@@ -49,6 +69,19 @@ impl OtlpSignal {
             | TraceReceiveFailure::UnsupportedValue => {
                 self.service_failure(ServiceFailure::InvalidRequest)
             },
+        }
+    }
+
+    const fn limit_exceeded(self, detail: TraceLimitViolation) -> OtlpFailure {
+        OtlpFailure {
+            http_status: 400,
+            grpc_code: 3,
+            message: match self {
+                Self::Logs => "OTLP Logs request exceeded a value limit",
+                Self::Traces => "OTLP Traces request exceeded a value limit",
+            },
+            limit: Some(detail),
+            retry_after: false,
         }
     }
 
@@ -60,6 +93,7 @@ impl OtlpSignal {
                 Self::Logs => "OTLP Logs request authentication was rejected",
                 Self::Traces => "OTLP Traces request authentication was rejected",
             },
+            limit: None,
             retry_after: false,
         }
     }
@@ -73,6 +107,7 @@ impl OtlpSignal {
                     Self::Logs => "OTLP Logs ingest capacity is unavailable",
                     Self::Traces => "OTLP Traces ingest capacity is unavailable",
                 },
+                limit: None,
                 retry_after: true,
             },
             IngestOutcome::Retryable(_) => OtlpFailure {
@@ -82,6 +117,7 @@ impl OtlpSignal {
                     Self::Logs => "OTLP Logs ingest is temporarily unavailable",
                     Self::Traces => "OTLP Traces ingest is temporarily unavailable",
                 },
+                limit: None,
                 retry_after: false,
             },
             IngestOutcome::Permanent(_) => OtlpFailure {
@@ -91,6 +127,7 @@ impl OtlpSignal {
                     Self::Logs => "OTLP Logs request was rejected",
                     Self::Traces => "OTLP Traces request was rejected",
                 },
+                limit: None,
                 retry_after: false,
             },
             IngestOutcome::Ambiguous(_) => OtlpFailure {
@@ -104,6 +141,7 @@ impl OtlpSignal {
                         "OTLP Traces commit outcome is ambiguous; retry may duplicate spans"
                     },
                 },
+                limit: None,
                 retry_after: false,
             },
             IngestOutcome::Full(_) | IngestOutcome::Partial(_) => OtlpFailure {
@@ -113,6 +151,7 @@ impl OtlpSignal {
                     Self::Logs => "OTLP Logs outcome aggregation failed",
                     Self::Traces => "OTLP Traces outcome aggregation failed",
                 },
+                limit: None,
                 retry_after: false,
             },
         }
@@ -128,6 +167,7 @@ impl OtlpSignal {
                     Self::Logs => "OTLP Logs ingest capacity is unavailable",
                     Self::Traces => "OTLP Traces ingest capacity is unavailable",
                 },
+                limit: None,
                 retry_after: true,
             },
             ServiceFailure::RequestTooLarge => OtlpFailure {
@@ -137,6 +177,7 @@ impl OtlpSignal {
                     Self::Logs => "OTLP Logs request exceeds the receiver limit",
                     Self::Traces => "OTLP Traces request exceeds the receiver limit",
                 },
+                limit: None,
                 retry_after: false,
             },
             ServiceFailure::InvalidRequest => OtlpFailure {
@@ -146,8 +187,10 @@ impl OtlpSignal {
                     Self::Logs => "OTLP Logs request was rejected",
                     Self::Traces => "OTLP Traces request was rejected",
                 },
+                limit: None,
                 retry_after: false,
             },
+            ServiceFailure::InvalidRequestWithLimit(detail) => self.limit_exceeded(detail),
             ServiceFailure::KeyUnavailable
             | ServiceFailure::CatalogUnavailable
             | ServiceFailure::LedgerUnavailable
@@ -158,6 +201,7 @@ impl OtlpSignal {
                     Self::Logs => "OTLP Logs ingest is temporarily unavailable",
                     Self::Traces => "OTLP Traces ingest is temporarily unavailable",
                 },
+                limit: None,
                 retry_after: false,
             },
             ServiceFailure::CorruptState | ServiceFailure::Internal | ServiceFailure::Cancelled => {
@@ -168,6 +212,7 @@ impl OtlpSignal {
                         Self::Logs => "OTLP Logs ingest failed",
                         Self::Traces => "OTLP Traces ingest failed",
                     },
+                    limit: None,
                     retry_after: false,
                 }
             },

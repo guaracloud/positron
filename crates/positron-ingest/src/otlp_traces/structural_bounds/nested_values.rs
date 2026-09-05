@@ -1,5 +1,6 @@
 use super::super::{
-    AuthenticatedOtlpTracesRequest, NativeSpanBatch, OtlpTracesReceiver, TraceReceiveFailure,
+    AuthenticatedOtlpTracesRequest, NativeSpanBatch, OtlpTracesReceiver, TraceLimitClass,
+    TraceLimitViolation, TraceReceiveFailure,
 };
 use super::support::{MAX_CONTAINERS, one_scope, request, span};
 use opentelemetry_proto::tonic::common::v1::{AnyValue, ArrayValue, any_value};
@@ -77,7 +78,11 @@ fn nested_values_have_exact_and_one_over_depth_entries_and_bytes() {
                 over_bytes,
             ))
             .expect_err("one byte over the value bound"),
-        TraceReceiveFailure::ValueLimitExceeded
+        TraceReceiveFailure::ValueLimitExceededWithDetail(TraceLimitViolation::new(
+            TraceLimitClass::IndividualValueBytes,
+            65_537,
+            65_536,
+        ))
     );
 }
 

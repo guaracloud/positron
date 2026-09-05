@@ -306,7 +306,10 @@ fn observed_marker_and_truncation_paths_preserve_queryable_sanitized_values() {
 
     let mut retained = CountingObserver::default();
     assert_eq!(marker.retained_heap_bytes_observed(&mut retained), Ok(0));
-    assert_eq!(truncated.retained_heap_bytes_observed(&mut retained), Ok(9));
+    assert_eq!(
+        truncated.retained_heap_bytes_observed(&mut retained),
+        Ok(9 + std::mem::size_of::<crate::value::ValidatedAttributeValue>()),
+    );
 
     let mut cloned = CountingObserver::default();
     assert_eq!(
