@@ -3,7 +3,9 @@ use super::super::{
     TraceLimitViolation, TraceReceiveFailure,
 };
 use super::support::{MAX_CONTAINERS, one_scope, request, span};
-use opentelemetry_proto::tonic::common::v1::{AnyValue, ArrayValue, any_value};
+use opentelemetry_proto::tonic::common::v1::{
+    AnyValue, ArrayValue, KeyValue, KeyValueList, any_value,
+};
 use positron_domain::value::{
     ByteLimit, CollectionLimit, DynamicValueLimits, NestingLimit, RequestLimits, ValueLimitProfile,
     ValueLimitProfileCandidate, ValueLimitSet,
@@ -93,12 +95,65 @@ fn nested_values_have_exact_and_one_over_depth_entries_and_bytes() {
     );
 }
 
+#[test]
+fn nested_key_value_lists_report_entry_and_depth_limits() {
+    let profile = profile_with(3, 64, MAX_CONTAINERS, MAX_CONTAINERS, 65_536);
+    let over_entries = value_attribute(AnyValue {
+        value: Some(any_value::Value::KvlistValue(KeyValueList {
+            values: (0..=MAX_CONTAINERS)
+                .map(|index| KeyValue {
+                    key: format!("entry-{index}"),
+                    ..KeyValue::default()
+                })
+                .collect(),
+        })),
+    });
+    let failure = decode_with_profile(over_entries, profile)
+        .expect_err("one key/value-list entry over the bound");
+    assert_eq!(
+        failure,
+        TraceReceiveFailure::ValueLimitExceededWithDetail(TraceLimitViolation::new(
+            TraceLimitClass::KeyValueListEntries,
+            1_025,
+            1_024,
+        ))
+    );
+
+    let over_depth = nested_key_value_list(4);
+    let failure = decode_with_profile(over_depth, profile_with(3, 64, 1_024, 1_024, 65_536))
+        .expect_err("one nested key/value-list level over the bound");
+    assert_eq!(
+        failure,
+        TraceReceiveFailure::ValueLimitExceededWithDetail(TraceLimitViolation::new(
+            TraceLimitClass::NestingDepth,
+            4,
+            3,
+        ))
+    );
+}
+
 fn nested_array(depth: usize) -> Vec<u8> {
     let mut value = AnyValue::default();
     for _ in 0..depth {
         value = AnyValue {
             value: Some(any_value::Value::ArrayValue(ArrayValue {
                 values: vec![value],
+            })),
+        };
+    }
+    value_attribute(value)
+}
+
+fn nested_key_value_list(depth: usize) -> Vec<u8> {
+    let mut value = AnyValue::default();
+    for _ in 0..depth {
+        value = AnyValue {
+            value: Some(any_value::Value::KvlistValue(KeyValueList {
+                values: vec![KeyValue {
+                    key: "nested".to_owned(),
+                    value: Some(value),
+                    ..KeyValue::default()
+                }],
             })),
         };
     }

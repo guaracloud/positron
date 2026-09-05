@@ -3,7 +3,11 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use http::Request;
-use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
+use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+use opentelemetry_proto::tonic::common::v1::{
+    AnyValue, ArrayValue, KeyValue, KeyValueList, any_value,
+};
+use opentelemetry_proto::tonic::trace::v1::Span;
 use prost::Message;
 
 use super::trace_support::{
@@ -233,6 +237,109 @@ async fn trace_value_limit_status_names_class_and_magnitudes()
             "OTLP%20Traces%20request%20exceeded%20a%20value%20limit%20(individual%20value%20bytes:%20actual%205,%20allowed%204)",
         )
     );
+    assert_eq!(backend.calls(), 0);
+    harness.finish()?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn authenticated_trace_reports_structural_limit_classes_and_magnitudes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut array_request = trace_request(0x7b).into_inner();
+    let array_span = array_request
+        .resource_spans
+        .first_mut()
+        .and_then(|resource| resource.scope_spans.first_mut())
+        .and_then(|scope| scope.spans.first_mut())
+        .ok_or("array fixture span missing")?;
+    array_span.attributes.push(KeyValue {
+        key: "array".to_owned(),
+        value: Some(AnyValue {
+            value: Some(any_value::Value::ArrayValue(ArrayValue {
+                values: vec![AnyValue::default(); 1_025],
+            })),
+        }),
+        ..KeyValue::default()
+    });
+    assert_trace_limit_status(
+        array_request,
+        "array%20entries:%20actual%201025,%20allowed%201024",
+    )
+    .await?;
+
+    let mut list_request = trace_request(0x7c).into_inner();
+    let list_span = list_request
+        .resource_spans
+        .first_mut()
+        .and_then(|resource| resource.scope_spans.first_mut())
+        .and_then(|scope| scope.spans.first_mut())
+        .ok_or("key/value-list fixture span missing")?;
+    list_span.attributes.push(KeyValue {
+        key: "key-value-list".to_owned(),
+        value: Some(AnyValue {
+            value: Some(any_value::Value::KvlistValue(KeyValueList {
+                values: (0..=1_024)
+                    .map(|index| KeyValue {
+                        key: format!("entry-{index}"),
+                        ..KeyValue::default()
+                    })
+                    .collect(),
+            })),
+        }),
+        ..KeyValue::default()
+    });
+    assert_trace_limit_status(
+        list_request,
+        "key/value-list%20entries:%20actual%201025,%20allowed%201024",
+    )
+    .await?;
+
+    let mut aggregate_request = trace_request(0x7d).into_inner();
+    let scopes = aggregate_request
+        .resource_spans
+        .first_mut()
+        .and_then(|resource| resource.scope_spans.first_mut())
+        .ok_or("aggregate fixture scope missing")?;
+    let template = scopes
+        .spans
+        .first()
+        .cloned()
+        .ok_or("span template missing")?;
+    scopes.spans = (0..5)
+        .map(|span_index| Span {
+            attributes: (0..1_024)
+                .map(|attribute_index| KeyValue {
+                    key: format!("attribute-{span_index}-{attribute_index}"),
+                    ..KeyValue::default()
+                })
+                .collect(),
+            ..template.clone()
+        })
+        .collect();
+    assert_trace_limit_status(
+        aggregate_request,
+        "aggregate%20attribute%20count:%20actual%204097,%20allowed%204096",
+    )
+    .await?;
+    Ok(())
+}
+
+async fn assert_trace_limit_status(
+    request: ExportTraceServiceRequest,
+    detail: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let frame = trace_frame_from_request(request)?;
+    let backend = Arc::new(ScriptedBackend::new([]));
+    let harness = ReceiverHarness::start(backend.clone())?;
+    let (status, message) = raw_trace_request(
+        &harness,
+        "/opentelemetry.proto.collector.trace.v1.TraceService/Export",
+        Some(Bytes::from(frame)),
+    )
+    .await?;
+    assert_eq!(status, "3");
+    let expected = format!("OTLP%20Traces%20request%20exceeded%20a%20value%20limit%20({detail})");
+    assert_eq!(message.as_deref(), Some(expected.as_str()));
     assert_eq!(backend.calls(), 0);
     harness.finish()?;
     Ok(())

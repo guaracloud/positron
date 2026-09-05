@@ -205,6 +205,27 @@ fn live_http_trace_value_limit_reports_safe_class_and_magnitudes()
 }
 
 #[test]
+fn live_http_trace_array_limit_reports_safe_class_and_magnitudes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let values = vec!["true"; 1_025].join(",");
+    let body = format!(
+        r#"{{"resourceSpans":[{{"scopeSpans":[{{"spans":[{{"attributes":[{{"key":"array","value":{{"arrayValue":{{"values":[{values}]}}}}}}]}}]}}]}}]}}"#
+    )
+    .into_bytes();
+    let (_roots, bearer, services) =
+        http_services_with_profile(ValueLimitProfile::release_1_system_maximum())?;
+    let response = receive_http(&services, &bearer, body, "application/json", None)?;
+    assert_eq!(response.status(), 400);
+    let status: serde_json::Value = serde_json::from_slice(response.body())?;
+    assert_eq!(status["code"], 3);
+    assert_eq!(
+        status["message"],
+        "OTLP Traces request exceeded a value limit (array entries: actual 1025, allowed 1024)"
+    );
+    Ok(())
+}
+
+#[test]
 fn live_http_trace_export_rejects_missing_auth_and_unsupported_content_type()
 -> Result<(), Box<dyn std::error::Error>> {
     let roots = TestRoots::new()?;

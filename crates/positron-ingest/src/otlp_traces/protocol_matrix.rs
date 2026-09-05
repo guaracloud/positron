@@ -110,6 +110,28 @@ fn protojson_protocol_field_names_do_not_consume_key_path_budget() {
 }
 
 #[test]
+fn protojson_array_entry_limit_reports_stable_class_and_magnitudes() {
+    let values = vec!["true"; 1_025].join(",");
+    let payload = format!(
+        r#"{{"resourceSpans":[{{"scopeSpans":[{{"spans":[{{"attributes":[{{"key":"array","value":{{"arrayValue":{{"values":[{values}]}}}}}}]}}]}}]}}]}}"#
+    );
+    let failure = OtlpTracesReceiver::new()
+        .decode(AuthenticatedOtlpTracesRequest::test_only_json(
+            test_attribution(),
+            payload.into_bytes(),
+        ))
+        .expect_err("one array entry over the public bound must stop before materialization");
+    assert_eq!(
+        failure,
+        TraceReceiveFailure::ValueLimitExceededWithDetail(TraceLimitViolation::new(
+            TraceLimitClass::ArrayEntries,
+            1_025,
+            1_024,
+        ))
+    );
+}
+
+#[test]
 fn protobuf_record_limit_reports_stable_class_and_magnitudes() {
     let request = ExportTraceServiceRequest {
         resource_spans: vec![opentelemetry_proto::tonic::trace::v1::ResourceSpans {
@@ -238,7 +260,9 @@ fn unknown_protobuf_wire_shapes_are_skipped_but_truncation_is_rejected() {
     unknown.extend_from_slice(&[0x99, 0x06]);
     unknown.extend_from_slice(&[0; 8]); // fixed64
     unknown.extend_from_slice(&[0x9a, 0x06, 0x02, 0xaa, 0xbb]); // bytes
-    unknown.extend_from_slice(&[0x9b, 0x06, 0x98, 0x06, 0x01, 0x9c, 0x06]); // group
+    unknown.extend_from_slice(&[
+        0x9b, 0x06, 0x98, 0x06, 0x01, 0xa2, 0x06, 0x02, 0xaa, 0xbb, 0x9c, 0x06,
+    ]); // group with nested length-delimited field
     unknown.extend_from_slice(&[0x9d, 0x06]); // fixed32
     unknown.extend_from_slice(&[0; 4]);
     assert!(preflight_otlp_traces_protobuf(&unknown).is_ok());
