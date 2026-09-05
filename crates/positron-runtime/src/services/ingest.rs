@@ -112,10 +112,12 @@ fn ingest_native_trace_batch(
         .into_admission_groups(instance.admission_group_planner.as_ref())
         .map_err(map_admission_group_plan_failure)?;
     let request_rejections = groups.rejections();
+    let limit_rejections = groups.limit_rejections();
     if groups.is_empty() {
-        return Ok(IngestRequestOutcome::with_rejections(
+        return Ok(IngestRequestOutcome::with_rejections_and_limits(
             Vec::new(),
             request_rejections,
+            limit_rejections,
         ));
     }
     #[cfg(test)]
@@ -128,7 +130,8 @@ fn ingest_native_trace_batch(
     {
         return Ok(backend
             .ingest_traces(groups)
-            .with_additional_rejections(request_rejections));
+            .with_additional_rejections(request_rejections)
+            .with_limit_rejections(limit_rejections));
     }
     let catalog = open_catalog(instance)?;
     let snapshot = catalog
@@ -150,9 +153,10 @@ fn ingest_native_trace_batch(
         outcomes.push(AdmissionGroupOutcome::new(shard, records, outcome));
     }
     drop(catalog);
-    Ok(IngestRequestOutcome::with_rejections(
+    Ok(IngestRequestOutcome::with_rejections_and_limits(
         outcomes,
         request_rejections,
+        limit_rejections,
     ))
 }
 

@@ -1,4 +1,8 @@
-use positron_ingest::{IngestFailureCode, IngestOutcome, TraceLimitViolation, TraceReceiveFailure};
+use positron_ingest::{
+    IngestFailureCode, IngestOutcome, TraceLimitRejectionSummary, TraceLimitViolation,
+    TraceReceiveFailure,
+};
+use std::fmt::Write as _;
 
 use crate::ServiceFailure;
 
@@ -39,6 +43,43 @@ impl OtlpFailure {
 }
 
 impl OtlpSignal {
+    pub(super) fn trace_partial_message(summary: TraceLimitRejectionSummary) -> Result<String, ()> {
+        const PREFIX: &str = "some spans were permanently rejected";
+        if summary.is_empty() {
+            return Ok(PREFIX.to_owned());
+        }
+        let details_capacity = summary.iter().try_fold(0_usize, |capacity, violation| {
+            capacity
+                .checked_add(violation.class().label().len())
+                .and_then(|capacity| capacity.checked_add(2 + 20 + 10 + 20 + 2))
+        });
+        let details_capacity = details_capacity.ok_or(())?;
+        let capacity = PREFIX
+            .len()
+            .checked_add(2)
+            .and_then(|capacity| capacity.checked_add(details_capacity))
+            .ok_or(())?;
+        let mut message = String::new();
+        message.try_reserve(capacity).map_err(|_| ())?;
+        message.write_str(PREFIX).map_err(|_| ())?;
+        message.write_str(" (").map_err(|_| ())?;
+        for (index, violation) in summary.iter().enumerate() {
+            if index > 0 {
+                message.write_str("; ").map_err(|_| ())?;
+            }
+            write!(
+                message,
+                "{}: actual {}, allowed {}",
+                violation.class().label(),
+                violation.actual(),
+                violation.allowed(),
+            )
+            .map_err(|_| ())?;
+        }
+        message.write_char(')').map_err(|_| ())?;
+        Ok(message)
+    }
+
     pub(super) const fn receive_failure(self, failure: TraceReceiveFailure) -> OtlpFailure {
         match failure {
             TraceReceiveFailure::AuthenticationRejected => self.authentication_rejected(),

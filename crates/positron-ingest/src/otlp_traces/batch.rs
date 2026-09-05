@@ -3,7 +3,7 @@ use positron_domain::value::ValueLimitProfile;
 use positron_kernel::{ResourceAmounts, ResourceReservation};
 use positron_signals::SpanObservation;
 
-use super::{MAX_RETAINED_BYTES, TraceReceiveFailure, bounds};
+use super::{MAX_RETAINED_BYTES, TraceLimitRejectionSummary, TraceReceiveFailure, bounds};
 
 /// One tenant-bound native span batch after protocol mapping.
 #[derive(Debug)]
@@ -11,6 +11,7 @@ pub struct NativeSpanBatch<'authority> {
     pub(crate) attribution: TenantAttribution,
     pub(crate) records: Vec<SpanObservation>,
     pub(crate) rejections: [usize; 3],
+    pub(crate) limit_rejections: TraceLimitRejectionSummary,
     pub(crate) value_limit_profile: ValueLimitProfile,
     pub(crate) decoded_bytes: u64,
     pub(crate) capacity: Option<ResourceReservation<'authority>>,
@@ -51,6 +52,7 @@ impl<'authority> NativeSpanBatch<'authority> {
             attribution,
             records,
             rejections,
+            limit_rejections: TraceLimitRejectionSummary::EMPTY,
             value_limit_profile,
             decoded_bytes,
             capacity,
@@ -58,6 +60,14 @@ impl<'authority> NativeSpanBatch<'authority> {
         };
         batch.resize_after_decode()?;
         Ok(batch)
+    }
+
+    pub(crate) fn with_limit_rejections(
+        mut self,
+        limit_rejections: TraceLimitRejectionSummary,
+    ) -> Self {
+        self.limit_rejections = limit_rejections;
+        self
     }
 
     #[must_use]
@@ -93,6 +103,7 @@ impl<'authority> NativeSpanBatch<'authority> {
         ValueLimitProfile,
         Option<ResourceReservation<'authority>>,
         crate::PolicyReceiver,
+        TraceLimitRejectionSummary,
     ) {
         (
             self.attribution,
@@ -100,6 +111,7 @@ impl<'authority> NativeSpanBatch<'authority> {
             self.value_limit_profile,
             self.capacity,
             self.receiver,
+            self.limit_rejections,
         )
     }
 

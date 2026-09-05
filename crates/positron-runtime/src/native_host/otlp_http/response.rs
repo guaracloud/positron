@@ -44,7 +44,13 @@ fn response_for_signal(
             None => match signal {
                 OtlpSignal::Logs => success(outcome.permanently_rejected_records(), encoding),
                 OtlpSignal::Traces => {
-                    trace_success(outcome.permanently_rejected_records(), encoding)
+                    let rejected = outcome.permanently_rejected_records();
+                    let summary = outcome.limit_rejections();
+                    if summary.is_empty() {
+                        trace_success(rejected, encoding)
+                    } else {
+                        trace_success_with_summary(rejected, summary, encoding)
+                    }
                 },
             },
         },
@@ -96,6 +102,18 @@ pub(crate) fn success(rejected: usize, encoding: ResponseEncoding) -> Response {
 }
 
 pub(crate) fn trace_success(rejected: usize, encoding: ResponseEncoding) -> Response {
+    trace_success_with_summary(
+        rejected,
+        positron_ingest::TraceLimitRejectionSummary::EMPTY,
+        encoding,
+    )
+}
+
+fn trace_success_with_summary(
+    rejected: usize,
+    summary: positron_ingest::TraceLimitRejectionSummary,
+    encoding: ResponseEncoding,
+) -> Response {
     let partial_success = if rejected == 0 {
         None
     } else {
@@ -107,9 +125,20 @@ pub(crate) fn trace_success(rejected: usize, encoding: ResponseEncoding) -> Resp
                 encoding,
             );
         };
+        let error_message = match OtlpSignal::trace_partial_message(summary) {
+            Ok(message) => message,
+            Err(()) => {
+                return failure(
+                    500,
+                    INTERNAL,
+                    "OTLP Traces response encoding failed",
+                    encoding,
+                );
+            },
+        };
         Some(ExportTracePartialSuccess {
             rejected_spans,
-            error_message: "some spans were permanently rejected".to_owned(),
+            error_message,
         })
     };
     match encoding {

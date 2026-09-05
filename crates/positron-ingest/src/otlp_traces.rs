@@ -43,7 +43,9 @@ mod transport;
 
 pub use admission_groups::{NativeSpanAdmissionGroup, NativeSpanAdmissionGroups};
 pub use batch::NativeSpanBatch;
-pub use failure::{TraceLimitClass, TraceLimitViolation, TraceReceiveFailure};
+pub use failure::{
+    TraceLimitClass, TraceLimitRejectionSummary, TraceLimitViolation, TraceReceiveFailure,
+};
 pub use presence::OtlpTraceTimestampPresence;
 pub use receiver::OtlpTracesReceiver;
 pub use request::{

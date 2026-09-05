@@ -11,6 +11,10 @@ use opentelemetry_proto::tonic::collector::trace::v1::{
     ExportTraceServiceRequest, ExportTraceServiceResponse,
 };
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
+use positron_domain::value::{
+    ByteLimit, CollectionLimit, DynamicValueLimits, NestingLimit, ValueLimitProfile,
+    ValueLimitProfileCandidate, ValueLimitSet,
+};
 use positron_ingest::{
     AdmissionGroupOutcome, IngestFailureCode, IngestOutcome, IngestRequestOutcome,
     NativeLogAdmissionGroups, NativeSpanAdmissionGroups,
@@ -116,6 +120,13 @@ pub(super) struct HttpHarness {
 
 impl HttpHarness {
     pub(super) fn start(backend: Arc<ScriptedBackend>) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::start_with_profile(backend, ValueLimitProfile::release_1_system_maximum())
+    }
+
+    pub(super) fn start_with_profile(
+        backend: Arc<ScriptedBackend>,
+        profile: ValueLimitProfile,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let roots = TestRoots::new()?;
         let paths = roots.paths()?;
         drop(InstanceBootstrap::initialize(
@@ -126,7 +137,9 @@ impl HttpHarness {
             .ingest_secret()
             .ok_or("ingest secret missing")?
             .to_owned();
-        let initialized = Arc::new(InstanceBootstrap::reopen(&paths)?);
+        let mut initialized = InstanceBootstrap::reopen(&paths)?;
+        initialized.value_limit_profile = profile;
+        let initialized = Arc::new(initialized);
         let services = ServiceHandle::new(Arc::clone(&initialized))?;
         services.install_receiver_test_backend(backend.clone())?;
         Ok(Self {
@@ -199,6 +212,39 @@ impl HttpHarness {
             Ok(response) | Err(response) => response,
         })
     }
+}
+
+pub(super) fn profile_with_individual_value_bytes(bytes: u32) -> ValueLimitProfile {
+    profile_with_dynamic_value_limits(bytes, 65_536, 1_024, 1_024, 128)
+}
+
+pub(super) fn profile_with_dynamic_value_limits(
+    individual_value_bytes: u32,
+    key_path_bytes: u32,
+    array_entries: u32,
+    key_value_list_entries: u32,
+    nesting_depth: u16,
+) -> ValueLimitProfile {
+    let maximum = ValueLimitProfile::release_1_system_maximum();
+    let dynamic = maximum.effective_limits().dynamic_value();
+    let dynamic = DynamicValueLimits::new(
+        ByteLimit::new(individual_value_bytes).expect("valid value bound"),
+        dynamic.attributes_per_namespace(),
+        ByteLimit::new(key_path_bytes).expect("valid key bound"),
+        NestingLimit::new(nesting_depth).expect("valid depth"),
+        CollectionLimit::new(array_entries).expect("valid arrays"),
+        CollectionLimit::new(key_value_list_entries).expect("valid lists"),
+    );
+    ValueLimitProfileCandidate::new(
+        maximum.system_limits(),
+        Some(ValueLimitSet::new(
+            maximum.effective_limits().request(),
+            maximum.effective_limits().record(),
+            dynamic,
+        )),
+    )
+    .validate()
+    .expect("lowered profile")
 }
 
 pub(super) fn trace_body() -> Vec<u8> {

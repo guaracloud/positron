@@ -5,8 +5,8 @@ use positron_kernel::{ResourceAmounts, ResourceReservation};
 
 use crate::{AdmissionGroupPlanFailure, AdmissionGroupPlanner};
 
-use super::NativeSpanBatch;
 use super::bounds::grouped_retained_native_batch_bytes;
+use super::{NativeSpanBatch, TraceLimitRejectionSummary};
 
 /// One planned native batch sharing tenant, Trace Store, and virtual shard.
 #[derive(Debug)]
@@ -21,6 +21,7 @@ pub struct NativeSpanAdmissionGroup<'authority> {
 pub struct NativeSpanAdmissionGroups<'authority> {
     groups: IntoIter<NativeSpanAdmissionGroup<'authority>>,
     rejections: [usize; 3],
+    limit_rejections: TraceLimitRejectionSummary,
     _retained_capacity: Option<ResourceReservation<'authority>>,
 }
 
@@ -33,6 +34,11 @@ impl NativeSpanAdmissionGroups<'_> {
     #[must_use]
     pub const fn rejections(&self) -> [usize; 3] {
         self.rejections
+    }
+
+    #[must_use]
+    pub const fn limit_rejections(&self) -> TraceLimitRejectionSummary {
+        self.limit_rejections
     }
 }
 
@@ -80,12 +86,14 @@ impl<'authority> NativeSpanBatch<'authority> {
             mut capacity,
             receiver,
             rejections,
+            limit_rejections,
         } = self;
         let record_count = records.len();
         if record_count == 0 {
             return Ok(NativeSpanAdmissionGroups {
                 groups: Vec::new().into_iter(),
                 rejections,
+                limit_rejections,
                 _retained_capacity: capacity,
             });
         }
@@ -183,6 +191,7 @@ impl<'authority> NativeSpanBatch<'authority> {
                     capacity: None,
                     receiver,
                     rejections: [0; 3],
+                    limit_rejections: TraceLimitRejectionSummary::EMPTY,
                 },
             })
             .collect::<Vec<_>>()
@@ -190,6 +199,7 @@ impl<'authority> NativeSpanBatch<'authority> {
         Ok(NativeSpanAdmissionGroups {
             groups,
             rejections,
+            limit_rejections,
             _retained_capacity: capacity,
         })
     }

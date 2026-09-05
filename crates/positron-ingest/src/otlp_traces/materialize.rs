@@ -9,7 +9,7 @@ use positron_signals::{
     SpanResourceMetadata, SpanScopeMetadata, SpanStatus, SpanStatusCode,
 };
 
-use super::super::TraceReceiveFailure;
+use super::super::{TraceLimitClass, TraceLimitViolation, TraceReceiveFailure};
 use super::{NativeSpanDetailDraft, NativeSpanDraft};
 
 impl NativeSpanDraft {
@@ -41,6 +41,24 @@ impl NativeSpanDraft {
         let TracePolicyEvaluation::Accepted(evaluated) = evaluation else {
             return Ok(None);
         };
+        let key_limit = usize::try_from(
+            profile
+                .effective_limits()
+                .dynamic_value()
+                .key_path_bytes()
+                .value(),
+        )
+        .map_err(|_| TraceReceiveFailure::ValueLimitExceeded)?;
+        if name.len() > key_limit {
+            return Err(detail_failure(
+                TraceLimitClass::KeyPathBytes,
+                name.len(),
+                key_limit,
+            ));
+        }
+        if let Some(detail) = post_policy_limit_violation(evaluated.attributes(), profile) {
+            return Err(TraceReceiveFailure::ValueLimitExceededWithDetail(detail));
+        }
         if has_entity_refs {
             return Err(TraceReceiveFailure::MalformedPayload);
         }
@@ -97,7 +115,11 @@ fn materialize_details(
     let detail_limit = usize::try_from(limits.request().records().value())
         .map_err(|_| TraceReceiveFailure::ValueLimitExceeded)?;
     if detail.events.len() > detail_limit || detail.links.len() > detail_limit {
-        return Err(TraceReceiveFailure::ValueLimitExceeded);
+        return Err(detail_failure(
+            TraceLimitClass::RecordCount,
+            detail.events.len().max(detail.links.len()),
+            detail_limit,
+        ));
     }
     let events = detail
         .events
@@ -179,6 +201,196 @@ fn materialize_details(
     .map_err(map_detail_failure)
 }
 
+fn post_policy_limit_violation(
+    attributes: &[positron_policy::NativePolicyAttribute],
+    profile: &ValueLimitProfile,
+) -> Option<TraceLimitViolation> {
+    let dynamic = profile.effective_limits().dynamic_value();
+    let key_limit = usize::try_from(dynamic.key_path_bytes().value()).ok()?;
+    let attribute_limit = usize::try_from(dynamic.attributes_per_namespace().value()).ok()?;
+    let value_limit = usize::try_from(dynamic.individual_value_bytes().value()).ok()?;
+    let depth_limit = dynamic.nesting_depth().value();
+    let array_limit = usize::try_from(dynamic.array_entries().value()).ok()?;
+    let list_limit = usize::try_from(dynamic.key_value_list_entries().value()).ok()?;
+
+    attributes.iter().find_map(|attribute| {
+        if attribute.key().len() > key_limit {
+            return Some(violation(
+                TraceLimitClass::KeyPathBytes,
+                attribute.key().len(),
+                key_limit,
+            ));
+        }
+        if attribute.occurrences().len() > attribute_limit {
+            return Some(violation(
+                TraceLimitClass::AttributesPerNamespace,
+                attribute.occurrences().len(),
+                attribute_limit,
+            ));
+        }
+        attribute.occurrences().iter().find_map(|value| {
+            inspect_candidate_value(
+                value,
+                depth_limit,
+                value_limit,
+                key_limit,
+                array_limit,
+                list_limit,
+            )
+            .err()
+        })
+    })
+}
+
+fn inspect_candidate_value(
+    value: &CandidateAttributeValue,
+    remaining_depth: u16,
+    value_limit: usize,
+    key_limit: usize,
+    array_limit: usize,
+    list_limit: usize,
+) -> Result<usize, TraceLimitViolation> {
+    let size = match value {
+        CandidateAttributeValue::Null
+        | CandidateAttributeValue::Boolean(_)
+        | CandidateAttributeValue::SignedInteger(_)
+        | CandidateAttributeValue::FloatingPointBits(_)
+        | CandidateAttributeValue::Marker(_) => 0,
+        CandidateAttributeValue::String(value) => {
+            if value.len() > value_limit {
+                return Err(violation(
+                    TraceLimitClass::IndividualValueBytes,
+                    value.len(),
+                    value_limit,
+                ));
+            }
+            value.len()
+        },
+        CandidateAttributeValue::Bytes(value) => {
+            if value.len() > value_limit {
+                return Err(violation(
+                    TraceLimitClass::IndividualValueBytes,
+                    value.len(),
+                    value_limit,
+                ));
+            }
+            value.len()
+        },
+        CandidateAttributeValue::Array(values) => {
+            if remaining_depth == 0 {
+                return Err(violation(
+                    TraceLimitClass::NestingDepth,
+                    usize::from(remaining_depth).saturating_add(1),
+                    usize::from(remaining_depth),
+                ));
+            }
+            if values.len() > array_limit {
+                return Err(violation(
+                    TraceLimitClass::ArrayEntries,
+                    values.len(),
+                    array_limit,
+                ));
+            }
+            let child_depth = remaining_depth - 1;
+            values.iter().try_fold(0_usize, |total, child| {
+                let child_size = inspect_candidate_value(
+                    child,
+                    child_depth,
+                    value_limit,
+                    key_limit,
+                    array_limit,
+                    list_limit,
+                )?;
+                total.checked_add(child_size).ok_or_else(|| {
+                    violation(
+                        TraceLimitClass::IndividualValueBytes,
+                        usize::MAX,
+                        value_limit,
+                    )
+                })
+            })?
+        },
+        CandidateAttributeValue::KeyValueList(values) => {
+            if remaining_depth == 0 {
+                return Err(violation(
+                    TraceLimitClass::NestingDepth,
+                    usize::from(remaining_depth).saturating_add(1),
+                    usize::from(remaining_depth),
+                ));
+            }
+            if values.len() > list_limit {
+                return Err(violation(
+                    TraceLimitClass::KeyValueListEntries,
+                    values.len(),
+                    list_limit,
+                ));
+            }
+            let child_depth = remaining_depth - 1;
+            values.iter().try_fold(0_usize, |total, entry| {
+                if entry.key().len() > key_limit {
+                    return Err(violation(
+                        TraceLimitClass::KeyPathBytes,
+                        entry.key().len(),
+                        key_limit,
+                    ));
+                }
+                let child_size = inspect_candidate_value(
+                    entry.value(),
+                    child_depth,
+                    value_limit,
+                    key_limit,
+                    array_limit,
+                    list_limit,
+                )?;
+                total
+                    .checked_add(entry.key().len())
+                    .and_then(|total| total.checked_add(child_size))
+                    .ok_or_else(|| {
+                        violation(
+                            TraceLimitClass::IndividualValueBytes,
+                            usize::MAX,
+                            value_limit,
+                        )
+                    })
+            })?
+        },
+        CandidateAttributeValue::Truncated { value, .. } => inspect_candidate_value(
+            value,
+            remaining_depth,
+            value_limit,
+            key_limit,
+            array_limit,
+            list_limit,
+        )?,
+    };
+    if size > value_limit {
+        return Err(violation(
+            TraceLimitClass::IndividualValueBytes,
+            size,
+            value_limit,
+        ));
+    }
+    Ok(size)
+}
+
+fn violation(class: TraceLimitClass, actual: usize, allowed: usize) -> TraceLimitViolation {
+    let actual = usize_as_u64(actual);
+    let allowed = usize_as_u64(allowed);
+    TraceLimitViolation::new(class, actual, allowed)
+}
+
+fn usize_as_u64(value: usize) -> u64 {
+    if usize::BITS > u64::BITS && value > u64::MAX as usize {
+        u64::MAX
+    } else {
+        value as u64
+    }
+}
+
+fn detail_failure(class: TraceLimitClass, actual: usize, allowed: usize) -> TraceReceiveFailure {
+    TraceReceiveFailure::ValueLimitExceededWithDetail(violation(class, actual, allowed))
+}
+
 fn span_detail_attributes(
     attributes: &[KeyValue],
     profile: &ValueLimitProfile,
@@ -188,7 +400,11 @@ fn span_detail_attributes(
         usize::try_from(limits.dynamic_value().attributes_per_namespace().value())
             .map_err(|_| TraceReceiveFailure::ValueLimitExceeded)?;
     if attributes.len() > attribute_limit {
-        return Err(TraceReceiveFailure::ValueLimitExceeded);
+        return Err(detail_failure(
+            TraceLimitClass::AttributesPerNamespace,
+            attributes.len(),
+            attribute_limit,
+        ));
     }
     let mut groups = BTreeMap::<String, Vec<CandidateAttributeValue>>::new();
     for attribute in attributes {
@@ -263,7 +479,11 @@ pub(crate) fn candidate_value(
             let maximum = usize::try_from(dynamic.individual_value_bytes().value())
                 .map_err(|_| TraceReceiveFailure::ValueLimitExceeded)?;
             if value.len() > maximum {
-                return Err(TraceReceiveFailure::ValueLimitExceeded);
+                return Err(detail_failure(
+                    TraceLimitClass::IndividualValueBytes,
+                    value.len(),
+                    maximum,
+                ));
             }
             Ok(CandidateAttributeValue::string(value))
         },
@@ -277,19 +497,32 @@ pub(crate) fn candidate_value(
                 > usize::try_from(dynamic.individual_value_bytes().value())
                     .map_err(|_| TraceReceiveFailure::ValueLimitExceeded)?
             {
-                return Err(TraceReceiveFailure::ValueLimitExceeded);
+                return Err(detail_failure(
+                    TraceLimitClass::IndividualValueBytes,
+                    value.len(),
+                    usize::try_from(dynamic.individual_value_bytes().value())
+                        .map_err(|_| TraceReceiveFailure::ValueLimitExceeded)?,
+                ));
             }
             Ok(CandidateAttributeValue::bytes(value))
         },
         any_value::Value::StringValueStrindex(_) => Err(TraceReceiveFailure::UnsupportedValue),
         any_value::Value::ArrayValue(value) => {
-            let next_depth = remaining_depth
-                .checked_sub(1)
-                .ok_or(TraceReceiveFailure::ValueLimitExceeded)?;
+            let next_depth = remaining_depth.checked_sub(1).ok_or_else(|| {
+                detail_failure(
+                    TraceLimitClass::NestingDepth,
+                    usize::from(dynamic.nesting_depth().value()).saturating_add(1),
+                    usize::from(dynamic.nesting_depth().value()),
+                )
+            })?;
             let maximum = usize::try_from(dynamic.array_entries().value())
                 .map_err(|_| TraceReceiveFailure::ValueLimitExceeded)?;
             if value.values.len() > maximum {
-                return Err(TraceReceiveFailure::ValueLimitExceeded);
+                return Err(detail_failure(
+                    TraceLimitClass::ArrayEntries,
+                    value.values.len(),
+                    maximum,
+                ));
             }
             let mut values = Vec::new();
             values
@@ -305,13 +538,21 @@ pub(crate) fn candidate_value(
             Ok(candidate)
         },
         any_value::Value::KvlistValue(value) => {
-            let next_depth = remaining_depth
-                .checked_sub(1)
-                .ok_or(TraceReceiveFailure::ValueLimitExceeded)?;
+            let next_depth = remaining_depth.checked_sub(1).ok_or_else(|| {
+                detail_failure(
+                    TraceLimitClass::NestingDepth,
+                    usize::from(dynamic.nesting_depth().value()).saturating_add(1),
+                    usize::from(dynamic.nesting_depth().value()),
+                )
+            })?;
             let maximum = usize::try_from(dynamic.key_value_list_entries().value())
                 .map_err(|_| TraceReceiveFailure::ValueLimitExceeded)?;
             if value.values.len() > maximum {
-                return Err(TraceReceiveFailure::ValueLimitExceeded);
+                return Err(detail_failure(
+                    TraceLimitClass::KeyValueListEntries,
+                    value.values.len(),
+                    maximum,
+                ));
             }
             let mut values = Vec::new();
             values
@@ -344,7 +585,11 @@ fn check_text(value: &str, profile: &ValueLimitProfile) -> Result<(), TraceRecei
     )
     .map_err(|_| TraceReceiveFailure::ValueLimitExceeded)?;
     if value.len() > maximum {
-        return Err(TraceReceiveFailure::ValueLimitExceeded);
+        return Err(detail_failure(
+            TraceLimitClass::KeyPathBytes,
+            value.len(),
+            maximum,
+        ));
     }
     Ok(())
 }

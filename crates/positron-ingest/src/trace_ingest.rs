@@ -58,7 +58,8 @@ impl<'service, 'kernel, 'catalog> TraceIngest<'service, 'kernel, 'catalog> {
         cancellation: Option<&AppendCancellation>,
     ) -> IngestOutcome {
         let rejections = batch.rejections();
-        let (attribution, records, profile, incoming_capacity, _receiver) = batch.into_parts();
+        let (attribution, records, profile, incoming_capacity, _receiver, _limit_rejections) =
+            batch.into_parts();
         if attribution.scope() != Scope::Ingest || attribution.tenant_id() != self.tenant {
             return IngestOutcome::Permanent(IngestFailureCode::TenantConflict);
         }

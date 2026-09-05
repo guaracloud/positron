@@ -100,7 +100,7 @@ impl OtlpTracesReceiver {
             policy,
             capacity.as_mut(),
         )?;
-        let (drafts, mut rejections) =
+        let (drafts, mut rejections, mut limit_rejections) =
             decoded::native_records(decoded, &system_profile, timestamp_presence.as_ref())?;
         let mut records = Vec::new();
         records
@@ -231,6 +231,13 @@ impl OtlpTracesReceiver {
                     &mut rejections,
                     crate::IngestFailureCode::ValueLimitExceeded,
                 ),
+                Err(TraceReceiveFailure::ValueLimitExceededWithDetail(detail)) => {
+                    limit_rejections.record(detail);
+                    increment_rejection(
+                        &mut rejections,
+                        crate::IngestFailureCode::ValueLimitExceeded,
+                    );
+                },
                 Err(_) => {
                     increment_rejection(&mut rejections, crate::IngestFailureCode::InvalidRecord)
                 },
@@ -245,6 +252,7 @@ impl OtlpTracesReceiver {
             receiver,
             rejections,
         )
+        .map(|batch| batch.with_limit_rejections(limit_rejections))
     }
 }
 

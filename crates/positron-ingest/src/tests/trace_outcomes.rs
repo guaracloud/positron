@@ -342,7 +342,7 @@ fn trace_ingest_commits_valid_spans_with_bounded_permanent_rejections()
         SegmentScope::new(fixture.tenant, SignalKind::Traces, shard),
         SegmentProtectionKey::from_owned(Box::new([0xea; 32])),
     )?;
-    let (_, records, profile, capacity, receiver) = trace_batch("partial").into_parts();
+    let (_, records, profile, capacity, receiver, _) = trace_batch("partial").into_parts();
     let batch = crate::NativeSpanBatch::new_with_rejections(
         attribution(),
         records,
@@ -413,7 +413,7 @@ fn trace_batch(name: &str) -> crate::NativeSpanBatch<'static> {
 fn trace_batch_with_reservation<'authority>(
     reservation: ResourceReservation<'authority>,
 ) -> crate::NativeSpanBatch<'authority> {
-    let (_, records, profile, _, receiver) = trace_batch("incoming-reservation").into_parts();
+    let (_, records, profile, _, receiver, _) = trace_batch("incoming-reservation").into_parts();
     crate::NativeSpanBatch::new(
         attribution(),
         records,
@@ -465,7 +465,7 @@ fn empty_batch() -> crate::NativeSpanBatch<'static> {
 fn oversized_record_batch<'authority>(
     reservation: ResourceReservation<'authority>,
 ) -> crate::NativeSpanBatch<'authority> {
-    let (_, records, profile, _capacity, receiver) = trace_batch("record-limit").into_parts();
+    let (_, records, profile, _capacity, receiver, _) = trace_batch("record-limit").into_parts();
     let Some(record) = records.into_iter().next() else {
         panic!("trace fixture should contain one record")
     };

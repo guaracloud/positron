@@ -342,10 +342,12 @@ fn trace_render(
     } else {
         let rejected_spans = i64::try_from(rejected)
             .map_err(|_| Status::internal("OTLP Traces outcome could not be represented"))?;
+        let error_message = OtlpSignal::trace_partial_message(outcome.limit_rejections())
+            .map_err(|_| Status::internal("OTLP Traces response encoding failed"))?;
         Ok(Response::new(ExportTraceServiceResponse {
             partial_success: Some(ExportTracePartialSuccess {
                 rejected_spans,
-                error_message: "some spans were permanently rejected".to_owned(),
+                error_message,
             }),
         }))
     }

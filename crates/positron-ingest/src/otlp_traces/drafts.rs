@@ -6,14 +6,14 @@ use opentelemetry_proto::tonic::trace::v1::Span as OtlpSpan;
 use positron_domain::value::{AttributeNamespace, CandidateAttributeValue, ValueLimitProfile};
 use positron_policy::NativePolicyAttribute;
 
-use super::super::{TraceReceiveFailure, presence};
+use super::super::{TraceLimitRejectionSummary, TraceReceiveFailure, presence};
 use super::{NativeSpanDetailDraft, NativeSpanDraft, SpanDetailMetadata};
 
 pub(crate) fn native_records(
     decoded: ExportTraceServiceRequest,
     profile: &ValueLimitProfile,
     timestamp_presence: Option<&presence::OtlpTraceTimestampPresence>,
-) -> Result<(Vec<NativeSpanDraft>, [usize; 3]), TraceReceiveFailure> {
+) -> Result<(Vec<NativeSpanDraft>, [usize; 3], TraceLimitRejectionSummary), TraceReceiveFailure> {
     let max_records = usize::try_from(profile.effective_limits().request().records().value())
         .map_err(|_| TraceReceiveFailure::ValueLimitExceeded)?;
     let record_count = decoded
@@ -32,6 +32,7 @@ pub(crate) fn native_records(
         .try_reserve_exact(record_count)
         .map_err(|_| TraceReceiveFailure::CapacityUnavailable)?;
     let mut rejections = [0_usize; 3];
+    let mut limit_rejections = TraceLimitRejectionSummary::EMPTY;
     let mut span_ordinal = 0_usize;
     for resource_spans in decoded.resource_spans {
         let resource_schema_url = resource_spans.schema_url;
@@ -90,13 +91,16 @@ pub(crate) fn native_records(
                 ) {
                     Ok(draft) => records.push(draft),
                     Err(failure) => {
+                        if let Some(detail) = limit_violation(failure) {
+                            limit_rejections.record(detail);
+                        }
                         super::super::increment_rejection(&mut rejections, rejection_code(failure))
                     },
                 }
             }
         }
     }
-    Ok((records, rejections))
+    Ok((records, rejections, limit_rejections))
 }
 
 /// Validates the legacy already-decoded boundary, whose generated protobuf
@@ -243,8 +247,18 @@ fn check_text(value: &str, profile: &ValueLimitProfile) -> Result<(), TraceRecei
 
 fn rejection_code(failure: TraceReceiveFailure) -> crate::IngestFailureCode {
     match failure {
-        TraceReceiveFailure::ValueLimitExceeded => crate::IngestFailureCode::ValueLimitExceeded,
+        TraceReceiveFailure::ValueLimitExceeded
+        | TraceReceiveFailure::ValueLimitExceededWithDetail(_) => {
+            crate::IngestFailureCode::ValueLimitExceeded
+        },
         _ => crate::IngestFailureCode::InvalidRecord,
+    }
+}
+
+fn limit_violation(failure: TraceReceiveFailure) -> Option<super::super::TraceLimitViolation> {
+    match failure {
+        TraceReceiveFailure::ValueLimitExceededWithDetail(detail) => Some(detail),
+        _ => None,
     }
 }
 

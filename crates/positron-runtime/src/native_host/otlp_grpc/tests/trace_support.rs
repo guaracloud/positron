@@ -470,18 +470,25 @@ pub(super) fn profile_with_transport_limits(
 }
 
 pub(super) fn profile_with_individual_value_bytes(bytes: u32) -> ValueLimitProfile {
+    profile_with_dynamic_value_limits(bytes, 65_536, 1_024, 1_024, 128)
+}
+
+pub(super) fn profile_with_dynamic_value_limits(
+    individual_value_bytes: u32,
+    key_path_bytes: u32,
+    array_entries: u32,
+    key_value_list_entries: u32,
+    nesting_depth: u16,
+) -> ValueLimitProfile {
     let maximum = ValueLimitProfile::release_1_system_maximum();
-    let dynamic = maximum.effective_limits().dynamic_value();
-    let dynamic = positron_domain::value::DynamicValueLimits::new(
-        ByteLimit::new(bytes).expect("valid value bound"),
-        dynamic.attributes_per_namespace(),
-        dynamic.key_path_bytes(),
-        positron_domain::value::NestingLimit::new(dynamic.nesting_depth().value())
-            .expect("valid depth"),
-        positron_domain::value::CollectionLimit::new(dynamic.array_entries().value())
-            .expect("valid arrays"),
-        positron_domain::value::CollectionLimit::new(dynamic.key_value_list_entries().value())
-            .expect("valid lists"),
+    let maximum_dynamic = maximum.effective_limits().dynamic_value();
+    let dynamic = DynamicValueLimits::new(
+        ByteLimit::new(individual_value_bytes).expect("valid value bound"),
+        maximum_dynamic.attributes_per_namespace(),
+        ByteLimit::new(key_path_bytes).expect("valid key bound"),
+        NestingLimit::new(nesting_depth).expect("valid depth"),
+        CollectionLimit::new(array_entries).expect("valid arrays"),
+        CollectionLimit::new(key_value_list_entries).expect("valid lists"),
     );
     ValueLimitProfileCandidate::new(
         maximum.system_limits(),

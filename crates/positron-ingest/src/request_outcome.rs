@@ -1,6 +1,6 @@
 use positron_domain::routing::VirtualShardId;
 
-use crate::{IngestFailureCode, IngestOutcome};
+use crate::{IngestFailureCode, IngestOutcome, TraceLimitRejectionSummary};
 
 /// One independently terminal Admission Group outcome within a request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -45,6 +45,7 @@ impl AdmissionGroupOutcome {
 pub struct IngestRequestOutcome {
     groups: Vec<AdmissionGroupOutcome>,
     request_rejections: [usize; 3],
+    limit_rejections: TraceLimitRejectionSummary,
 }
 
 impl IngestRequestOutcome {
@@ -53,6 +54,7 @@ impl IngestRequestOutcome {
         Self {
             groups,
             request_rejections: [0; 3],
+            limit_rejections: TraceLimitRejectionSummary::EMPTY,
         }
     }
 
@@ -64,6 +66,20 @@ impl IngestRequestOutcome {
         Self {
             groups,
             request_rejections,
+            limit_rejections: TraceLimitRejectionSummary::EMPTY,
+        }
+    }
+
+    #[must_use]
+    pub fn with_rejections_and_limits(
+        groups: Vec<AdmissionGroupOutcome>,
+        request_rejections: [usize; 3],
+        limit_rejections: TraceLimitRejectionSummary,
+    ) -> Self {
+        Self {
+            groups,
+            request_rejections,
+            limit_rejections,
         }
     }
 
@@ -73,6 +89,17 @@ impl IngestRequestOutcome {
             *current = current.saturating_add(added);
         }
         self
+    }
+
+    #[must_use]
+    pub fn with_limit_rejections(mut self, additional: TraceLimitRejectionSummary) -> Self {
+        self.limit_rejections.merge(additional);
+        self
+    }
+
+    #[must_use]
+    pub fn limit_rejections(&self) -> TraceLimitRejectionSummary {
+        self.limit_rejections
     }
 
     #[must_use]
