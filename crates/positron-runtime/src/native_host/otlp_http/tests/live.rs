@@ -423,7 +423,7 @@ fn live_http_trace_export_enforces_effective_gzip_limits_before_decode()
     Ok(())
 }
 
-fn rejected(
+pub(super) fn rejected(
     result: Result<crate::native_host::native_http::Response, ReceiveHttpError>,
 ) -> Result<crate::native_host::native_http::Response, Box<dyn std::error::Error>> {
     match result {
@@ -473,7 +473,7 @@ fn receive_http_with_declared_length(
     response.map_err(ReceiveHttpError::Rejected)
 }
 
-fn receive_http_with_tenant(
+pub(super) fn receive_http_with_tenant(
     services: &ServiceHandle,
     bearer: &str,
     body: Vec<u8>,
@@ -504,7 +504,7 @@ fn receive_http_with_tenant(
     response.map_err(ReceiveHttpError::Rejected)
 }
 
-enum ReceiveHttpError {
+pub(super) enum ReceiveHttpError {
     Io(std::io::Error),
     Rejected(crate::native_host::native_http::Response),
 }
@@ -598,14 +598,14 @@ fn http_services_with_profile(
     Ok((roots, bearer, services))
 }
 
-struct TestRoots {
+pub(super) struct TestRoots {
     parent: PathBuf,
     data: PathBuf,
     secrets: PathBuf,
 }
 
 impl TestRoots {
-    fn new() -> Result<Self, std::io::Error> {
+    pub(super) fn new() -> Result<Self, std::io::Error> {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(std::io::Error::other)?
@@ -624,7 +624,7 @@ impl TestRoots {
         })
     }
 
-    fn paths(&self) -> Result<BootstrapPaths, crate::BootstrapFailure> {
+    pub(super) fn paths(&self) -> Result<BootstrapPaths, crate::BootstrapFailure> {
         BootstrapPaths::new(&self.data, &self.secrets, MountQualification::LocalHost)
     }
 }

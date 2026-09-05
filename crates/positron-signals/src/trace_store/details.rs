@@ -34,6 +34,19 @@ pub struct SpanObservationDetails {
     scope: SpanScopeMetadata,
 }
 
+struct SpanObservationDetailsInput {
+    trace_state: String,
+    flags: u32,
+    status: SpanStatus,
+    events: Vec<SpanEvent>,
+    links: Vec<SpanLink>,
+    dropped_attributes_count: u32,
+    dropped_events_count: u32,
+    dropped_links_count: u32,
+    resource: SpanResourceMetadata,
+    scope: SpanScopeMetadata,
+}
+
 impl Default for SpanObservationDetails {
     fn default() -> Self {
         Self {
@@ -75,17 +88,19 @@ impl SpanObservationDetails {
         scope: SpanScopeMetadata,
     ) -> Result<Self, TraceStoreFailure> {
         let profile = ValueLimitProfile::release_1_system_maximum();
-        Self::checked_with_profile(
-            trace_state,
-            flags,
-            status,
-            events,
-            links,
-            dropped_attributes_count,
-            dropped_events_count,
-            dropped_links_count,
-            resource,
-            scope,
+        Self::checked_input(
+            SpanObservationDetailsInput {
+                trace_state,
+                flags,
+                status,
+                events,
+                links,
+                dropped_attributes_count,
+                dropped_events_count,
+                dropped_links_count,
+                resource,
+                scope,
+            },
             &profile,
         )
     }
@@ -105,6 +120,39 @@ impl SpanObservationDetails {
         scope: SpanScopeMetadata,
         profile: &ValueLimitProfile,
     ) -> Result<Self, TraceStoreFailure> {
+        Self::checked_input(
+            SpanObservationDetailsInput {
+                trace_state,
+                flags,
+                status,
+                events,
+                links,
+                dropped_attributes_count,
+                dropped_events_count,
+                dropped_links_count,
+                resource,
+                scope,
+            },
+            profile,
+        )
+    }
+
+    fn checked_input(
+        input: SpanObservationDetailsInput,
+        profile: &ValueLimitProfile,
+    ) -> Result<Self, TraceStoreFailure> {
+        let SpanObservationDetailsInput {
+            trace_state,
+            flags,
+            status,
+            events,
+            links,
+            dropped_attributes_count,
+            dropped_events_count,
+            dropped_links_count,
+            resource,
+            scope,
+        } = input;
         let (key_path_bytes, _) = detail_limits(profile)?;
         let decoded_bytes_limit = profile
             .effective_limits()

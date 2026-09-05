@@ -19,6 +19,7 @@ mod live;
 mod live_outcomes;
 mod outcomes;
 mod policy_markers;
+mod tenant_alias;
 
 fn single(outcome: IngestOutcome) -> IngestRequestOutcome {
     IngestRequestOutcome::new(vec![AdmissionGroupOutcome::new(

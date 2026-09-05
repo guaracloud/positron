@@ -184,6 +184,31 @@ async fn trace_grpc_invalid_tenant_alias_is_rejected_before_admission()
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn trace_grpc_accepts_the_authenticated_external_tenant_alias()
+-> Result<(), Box<dyn std::error::Error>> {
+    let backend = Arc::new(ScriptedBackend::new([Completion::Committed]));
+    let harness = ReceiverHarness::start(backend.clone())?;
+    let mut client = tokio::time::timeout(
+        Duration::from_secs(2),
+        TraceServiceClient::connect(format!("http://{}", harness.endpoint)),
+    )
+    .await??;
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(2),
+        client.export(harness.authorize_trace_with_tenant(trace_request(0x7a), "default")?),
+    )
+    .await??;
+    assert!(response.into_inner().partial_success.is_none());
+    assert_eq!(backend.calls(), 1);
+    assert_eq!(backend.committed_records(), 1);
+
+    drop(client);
+    harness.finish()?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn trace_grpc_policy_truncation_runs_before_tenant_value_limit()
 -> Result<(), Box<dyn std::error::Error>> {
     let path = PolicyAttributePath::new(AttributeNamespace::Record, "secret")?;

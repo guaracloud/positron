@@ -48,6 +48,19 @@ pub struct SpanObservation {
     details: SpanObservationDetails,
 }
 
+struct EvaluatedObservationInput {
+    trace_id: [u8; 16],
+    span_id: [u8; 8],
+    parent_span_id: Option<[u8; 8]>,
+    name: String,
+    start_time: EventTime,
+    end_time: EventTime,
+    kind: SpanKind,
+    sampling: SamplingDecision,
+    evaluated: positron_policy::EvaluatedTraceRecord,
+    details: SpanObservationDetails,
+}
+
 impl SpanObservation {
     /// The maximum native span name size for Release 1.
     pub const MAX_NAME_BYTES: usize = ValueLimitProfile::release_1_system_maximum()
@@ -107,18 +120,20 @@ impl SpanObservation {
         evaluated: positron_policy::EvaluatedTraceRecord,
         details: SpanObservationDetails,
     ) -> Result<Self, TraceStoreFailure> {
-        Self::checked_evaluated_with_profile(
+        Self::checked_evaluated_input(
             &profile,
-            trace_id,
-            span_id,
-            parent_span_id,
-            name,
-            start_time,
-            end_time,
-            kind,
-            sampling,
-            evaluated,
-            details,
+            EvaluatedObservationInput {
+                trace_id,
+                span_id,
+                parent_span_id,
+                name,
+                start_time,
+                end_time,
+                kind,
+                sampling,
+                evaluated,
+                details,
+            },
         )
     }
 
@@ -137,6 +152,39 @@ impl SpanObservation {
         evaluated: positron_policy::EvaluatedTraceRecord,
         details: SpanObservationDetails,
     ) -> Result<Self, TraceStoreFailure> {
+        Self::checked_evaluated_input(
+            profile,
+            EvaluatedObservationInput {
+                trace_id,
+                span_id,
+                parent_span_id,
+                name,
+                start_time,
+                end_time,
+                kind,
+                sampling,
+                evaluated,
+                details,
+            },
+        )
+    }
+
+    fn checked_evaluated_input(
+        profile: &ValueLimitProfile,
+        input: EvaluatedObservationInput,
+    ) -> Result<Self, TraceStoreFailure> {
+        let EvaluatedObservationInput {
+            trace_id,
+            span_id,
+            parent_span_id,
+            name,
+            start_time,
+            end_time,
+            kind,
+            sampling,
+            evaluated,
+            details,
+        } = input;
         let (attributes, policy) = evaluated.into_parts();
         let mut checked = Vec::new();
         checked

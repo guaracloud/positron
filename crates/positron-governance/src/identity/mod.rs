@@ -102,7 +102,14 @@ impl Identity {
         intent: RequestedIntent,
         hints: CompatibilityHints,
     ) -> Result<AuthorizedContext, AttributionFailure> {
-        if hints.external_alias.is_some() || hints.has_untrusted_authority_claims() {
+        if hints.has_untrusted_authority_claims()
+            || (matches!(intent, RequestedIntent::SystemAdministration)
+                && hints.external_alias.is_some())
+            || hints
+                .external_alias
+                .as_deref()
+                .is_some_and(|alias| alias != self.tenant_slug.as_str())
+        {
             return Err(AttributionFailure);
         }
         match intent {
