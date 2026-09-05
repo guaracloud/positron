@@ -1,4 +1,4 @@
-use positron_ingest::{IngestFailureCode, IngestOutcome};
+use positron_ingest::{IngestFailureCode, IngestOutcome, TraceReceiveFailure};
 
 use crate::ServiceFailure;
 
@@ -23,6 +23,35 @@ pub(super) struct OtlpFailure {
 }
 
 impl OtlpSignal {
+    pub(super) const fn receive_failure(self, failure: TraceReceiveFailure) -> OtlpFailure {
+        match failure {
+            TraceReceiveFailure::AuthenticationRejected => self.authentication_rejected(),
+            TraceReceiveFailure::CapacityUnavailable => {
+                self.service_failure(ServiceFailure::CapacityUnavailable)
+            },
+            TraceReceiveFailure::TransportLimitExceeded => {
+                self.service_failure(ServiceFailure::RequestTooLarge)
+            },
+            TraceReceiveFailure::MalformedCompression | TraceReceiveFailure::MalformedPayload => {
+                OtlpFailure {
+                    http_status: 400,
+                    grpc_code: 3,
+                    message: match self {
+                        Self::Logs => "OTLP Logs request was malformed",
+                        Self::Traces => "OTLP Traces request was malformed",
+                    },
+                    retry_after: false,
+                }
+            },
+            TraceReceiveFailure::PolicyEvaluationFailed
+            | TraceReceiveFailure::ValueLimitExceeded
+            | TraceReceiveFailure::TimestampOutOfRange
+            | TraceReceiveFailure::UnsupportedValue => {
+                self.service_failure(ServiceFailure::InvalidRequest)
+            },
+        }
+    }
+
     pub(super) const fn authentication_rejected(self) -> OtlpFailure {
         OtlpFailure {
             http_status: 401,

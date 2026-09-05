@@ -226,8 +226,11 @@ impl Decoder for OtlpTracesDecoder {
         preflight_otlp_traces_protobuf_with_profile(frame.as_ref(), system_profile)
             .map_err(preflight_status)?;
         let timestamp_presence =
-            positron_ingest::otlp_traces_timestamp_presence_protobuf(frame.as_ref())
-                .map_err(preflight_status)?;
+            positron_ingest::otlp_traces_timestamp_presence_protobuf_with_profile(
+                frame.as_ref(),
+                system_profile,
+            )
+            .map_err(preflight_status)?;
         self.measurement
             .lock()
             .map_err(|_| Status::internal("OTLP Traces transport measurement failed"))?
@@ -336,7 +339,8 @@ impl<B> BoundedGrpcBody<B> {
             ));
         }
         let frame_payload = self.frame_payload(frame_length)?;
-        let payload = decompress_gzip(frame_payload, self.decompressed_limit)?;
+        let payload =
+            decompress_gzip(frame_payload, self.decompressed_limit).map_err(preflight_status)?;
         self.consume_input(frame_length);
         Ok(Some(encode_uncompressed_frame(payload)?))
     }
@@ -480,18 +484,20 @@ where
     }
 }
 
-fn decompress_gzip(payload: &[u8], maximum: usize) -> Result<Vec<u8>, Status> {
-    let read_limit = maximum.checked_add(1).ok_or_else(receiver_limit_exceeded)?;
+fn decompress_gzip(payload: &[u8], maximum: usize) -> Result<Vec<u8>, TraceReceiveFailure> {
+    let read_limit = maximum
+        .checked_add(1)
+        .ok_or(TraceReceiveFailure::TransportLimitExceeded)?;
     let mut decoded = Vec::new();
     decoded
         .try_reserve(payload.len().saturating_mul(4).min(maximum))
-        .map_err(|_| receiver_limit_exceeded())?;
+        .map_err(|_| TraceReceiveFailure::CapacityUnavailable)?;
     flate2::read::MultiGzDecoder::new(payload)
-        .take(u64::try_from(read_limit).map_err(|_| receiver_limit_exceeded())?)
+        .take(u64::try_from(read_limit).map_err(|_| TraceReceiveFailure::TransportLimitExceeded)?)
         .read_to_end(&mut decoded)
-        .map_err(|_| Status::internal("OTLP Traces request compression was malformed"))?;
+        .map_err(|_| TraceReceiveFailure::MalformedCompression)?;
     if decoded.len() > maximum {
-        return Err(receiver_limit_exceeded());
+        return Err(TraceReceiveFailure::TransportLimitExceeded);
     }
     Ok(decoded)
 }
@@ -522,10 +528,9 @@ fn receiver_limit_exceeded() -> Status {
 }
 
 fn preflight_status(failure: TraceReceiveFailure) -> Status {
-    match failure {
-        TraceReceiveFailure::MalformedPayload => malformed_status(),
-        _ => Status::invalid_argument("OTLP Traces request was rejected"),
-    }
+    super::status_from_failure(
+        super::super::otlp_outcome::OtlpSignal::Traces.receive_failure(failure),
+    )
 }
 
 fn malformed_status() -> Status {

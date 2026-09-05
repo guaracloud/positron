@@ -53,12 +53,34 @@ pub use request::{
 pub fn otlp_traces_timestamp_presence_protobuf(
     protobuf: &[u8],
 ) -> Result<OtlpTraceTimestampPresence, TraceReceiveFailure> {
+    preflight_otlp_traces_protobuf(protobuf)?;
+    OtlpTraceTimestampPresence::protobuf(protobuf)
+}
+
+/// Validates and scans OTLP Traces protobuf timestamp presence under the
+/// caller's effective system profile.
+pub fn otlp_traces_timestamp_presence_protobuf_with_profile(
+    protobuf: &[u8],
+    profile: positron_domain::value::ValueLimitProfile,
+) -> Result<OtlpTraceTimestampPresence, TraceReceiveFailure> {
+    preflight_otlp_traces_protobuf_with_profile(protobuf, profile)?;
     OtlpTraceTimestampPresence::protobuf(protobuf)
 }
 
 pub fn otlp_traces_timestamp_presence_json(
     json: &[u8],
 ) -> Result<OtlpTraceTimestampPresence, TraceReceiveFailure> {
+    preflight_otlp_traces_json(json)?;
+    OtlpTraceTimestampPresence::json(json)
+}
+
+/// Validates and scans OTLP Traces ProtoJSON timestamp presence under the
+/// caller's effective system profile.
+pub fn otlp_traces_timestamp_presence_json_with_profile(
+    json: &[u8],
+    profile: positron_domain::value::ValueLimitProfile,
+) -> Result<OtlpTraceTimestampPresence, TraceReceiveFailure> {
+    preflight_otlp_traces_json_with_profile(json, profile)?;
     OtlpTraceTimestampPresence::json(json)
 }
 
@@ -120,10 +142,18 @@ pub fn preflight_otlp_traces_protobuf_with_profile(
 
 /// Validates the Release 1 OTLP Traces ProtoJSON shape before materializing it.
 pub fn preflight_otlp_traces_json(json: &[u8]) -> Result<(), TraceReceiveFailure> {
-    bounds::validate_json(
+    preflight_otlp_traces_json_with_profile(
         json,
         positron_domain::value::ValueLimitProfile::release_1_system_maximum(),
     )
+}
+
+/// Validates OTLP Traces ProtoJSON under one effective system profile.
+pub fn preflight_otlp_traces_json_with_profile(
+    json: &[u8],
+    profile: positron_domain::value::ValueLimitProfile,
+) -> Result<(), TraceReceiveFailure> {
+    bounds::validate_json(json, profile)
 }
 
 /// Runs the bounded gzip and protocol preflight used by the HTTP receiver.

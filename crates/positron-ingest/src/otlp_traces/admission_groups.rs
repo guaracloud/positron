@@ -112,7 +112,7 @@ impl<'authority> NativeSpanBatch<'authority> {
         let mut assignments = Vec::new();
         assignments
             .try_reserve_exact(record_count)
-            .map_err(|_| AdmissionGroupPlanFailure::RecordCountExceeded)?;
+            .map_err(|_| AdmissionGroupPlanFailure::CapacityUnavailable)?;
         for (ordinal, record) in records.iter().enumerate() {
             let ordinal = u32::try_from(ordinal)
                 .map_err(|_| AdmissionGroupPlanFailure::RecordCountExceeded)?;
@@ -127,7 +127,7 @@ impl<'authority> NativeSpanBatch<'authority> {
         let mut sorted_shards = Vec::new();
         sorted_shards
             .try_reserve_exact(record_count)
-            .map_err(|_| AdmissionGroupPlanFailure::RecordCountExceeded)?;
+            .map_err(|_| AdmissionGroupPlanFailure::CapacityUnavailable)?;
         sorted_shards.extend_from_slice(&assignments);
         // Keep the historical shard ordering while using vectors whose exact
         // capacities can be charged before their backing allocations.
@@ -135,7 +135,7 @@ impl<'authority> NativeSpanBatch<'authority> {
         let mut planned = Vec::<(VirtualShardId, Vec<positron_signals::SpanObservation>)>::new();
         planned
             .try_reserve_exact(sorted_shards.len())
-            .map_err(|_| AdmissionGroupPlanFailure::RecordCountExceeded)?;
+            .map_err(|_| AdmissionGroupPlanFailure::CapacityUnavailable)?;
         let mut sorted_cursor = 0;
         while let Some(&shard) = sorted_shards.get(sorted_cursor) {
             let mut count = 1;
@@ -154,7 +154,7 @@ impl<'authority> NativeSpanBatch<'authority> {
             let mut group = Vec::new();
             group
                 .try_reserve_exact(count)
-                .map_err(|_| AdmissionGroupPlanFailure::RecordCountExceeded)?;
+                .map_err(|_| AdmissionGroupPlanFailure::CapacityUnavailable)?;
             planned.push((shard, group));
             sorted_cursor = sorted_cursor
                 .checked_add(count)

@@ -47,7 +47,11 @@ async fn authenticated_trace_rejects_malformed_gzip_before_backend()
     )
     .await?;
 
-    assert_eq!(status, "13");
+    assert_eq!(status, "3");
+    assert_eq!(
+        _message.as_deref(),
+        Some("OTLP%20Traces%20request%20was%20malformed")
+    );
     assert_eq!(backend.calls(), 0);
     harness.finish()?;
     Ok(())

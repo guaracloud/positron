@@ -30,7 +30,7 @@ pub(crate) fn native_records(
     let mut records = Vec::new();
     records
         .try_reserve_exact(record_count)
-        .map_err(|_| TraceReceiveFailure::ValueLimitExceeded)?;
+        .map_err(|_| TraceReceiveFailure::CapacityUnavailable)?;
     let mut rejections = [0_usize; 3];
     let mut span_ordinal = 0_usize;
     for resource_spans in decoded.resource_spans {

@@ -1,7 +1,7 @@
 use positron_domain::routing::SignalKind;
 use positron_domain::value::{
     AttributeNamespace, AttributeValueKind, CandidateAttributeValue, CandidateKeyValue,
-    MarkerAction,
+    MarkerAction, ValueLimitProfile,
 };
 use positron_policy::{
     IngestPolicy, LogMetadata, NativeLogAttribute, NativeLogCandidate, PolicyAction,
@@ -221,6 +221,185 @@ fn occurrences<'a>(
         .find(|attribute| attribute.key() == key)
         .expect("attribute")
         .occurrences()
+}
+
+#[test]
+fn repeated_collection_truncation_preserves_a_valid_single_marker() {
+    let array = path("array");
+    let candidate = NativeLogCandidate::new(
+        None,
+        None,
+        None,
+        vec![attribute(
+            "array",
+            vec![CandidateAttributeValue::array(vec![
+                CandidateAttributeValue::signed_integer(1),
+                CandidateAttributeValue::signed_integer(2),
+                CandidateAttributeValue::signed_integer(3),
+            ])],
+        )],
+        LogMetadata::empty(),
+    );
+    let policy = IngestPolicy::compile(
+        14,
+        vec![
+            rule(
+                "truncate-array-2",
+                array.clone(),
+                PolicyAction::TruncateElements(PolicyTarget::attribute(array.clone()), 2),
+            ),
+            rule(
+                "truncate-array-1",
+                array.clone(),
+                PolicyAction::TruncateElements(PolicyTarget::attribute(array), 1),
+            ),
+        ],
+    )
+    .expect("policy");
+
+    let PolicyEvaluation::Accepted(record) = policy
+        .evaluate(candidate, PolicyReceiver::OtlpGrpc)
+        .expect("evaluation")
+    else {
+        panic!("record rejected");
+    };
+    let (_, _, _, attributes, _, provenance) = record.into_parts();
+    let expected = CandidateAttributeValue::truncated(
+        CandidateAttributeValue::array(vec![
+            CandidateAttributeValue::signed_integer(1),
+            CandidateAttributeValue::signed_integer(2),
+        ]),
+        MarkerAction::TruncatedElements,
+    );
+    assert_eq!(occurrences(&attributes, "array"), &[expected]);
+    assert!(
+        occurrences(&attributes, "array")[0]
+            .validate_shape(ValueLimitProfile::release_1_system_maximum())
+            .is_ok()
+    );
+    assert_eq!(provenance.applied_rules(), &["truncate-array-2"]);
+}
+
+#[test]
+fn nested_collection_truncation_keeps_marker_boundaries_valid() {
+    let array_root = path("arrays");
+    let array_inner = array_root.clone().array_index(0).expect("array index");
+    let array_redacted = array_root.clone().array_index(1).expect("array index");
+    let array_redacted = array_redacted.array_index(0).expect("array index");
+    let list_root = path("lists");
+    let list_inner = list_root.clone().key("child").expect("key");
+    let candidate = NativeLogCandidate::new(
+        None,
+        None,
+        None,
+        vec![
+            attribute(
+                "arrays",
+                vec![CandidateAttributeValue::array(vec![
+                    CandidateAttributeValue::array(vec![
+                        CandidateAttributeValue::signed_integer(1),
+                        CandidateAttributeValue::signed_integer(2),
+                        CandidateAttributeValue::signed_integer(3),
+                    ]),
+                    CandidateAttributeValue::array(vec![
+                        CandidateAttributeValue::signed_integer(4),
+                        CandidateAttributeValue::signed_integer(5),
+                    ]),
+                    CandidateAttributeValue::array(vec![CandidateAttributeValue::signed_integer(
+                        6,
+                    )]),
+                ])],
+            ),
+            attribute(
+                "lists",
+                vec![CandidateAttributeValue::key_value_list(vec![
+                    CandidateKeyValue::new(
+                        "child".into(),
+                        CandidateAttributeValue::key_value_list(vec![
+                            CandidateKeyValue::new(
+                                "a".into(),
+                                CandidateAttributeValue::signed_integer(1),
+                            ),
+                            CandidateKeyValue::new(
+                                "b".into(),
+                                CandidateAttributeValue::signed_integer(2),
+                            ),
+                            CandidateKeyValue::new(
+                                "c".into(),
+                                CandidateAttributeValue::signed_integer(3),
+                            ),
+                        ]),
+                    ),
+                    CandidateKeyValue::new("other".into(), CandidateAttributeValue::null()),
+                ])],
+            ),
+        ],
+        LogMetadata::empty(),
+    );
+    let policy = IngestPolicy::compile(
+        14,
+        vec![
+            rule(
+                "redact-array-entry",
+                array_redacted.clone(),
+                PolicyAction::Redact(PolicyTarget::attribute(array_redacted)),
+            ),
+            rule(
+                "truncate-array-child",
+                array_inner.clone(),
+                PolicyAction::TruncateElements(PolicyTarget::attribute(array_inner), 2),
+            ),
+            rule(
+                "truncate-array-root",
+                array_root.clone(),
+                PolicyAction::TruncateElements(PolicyTarget::attribute(array_root), 2),
+            ),
+            rule(
+                "truncate-list-child",
+                list_inner.clone(),
+                PolicyAction::TruncateElements(PolicyTarget::attribute(list_inner), 2),
+            ),
+            rule(
+                "truncate-list-root",
+                list_root.clone(),
+                PolicyAction::TruncateElements(PolicyTarget::attribute(list_root), 1),
+            ),
+        ],
+    )
+    .expect("policy");
+
+    let PolicyEvaluation::Accepted(record) = policy
+        .evaluate(candidate, PolicyReceiver::OtlpGrpc)
+        .expect("evaluation")
+    else {
+        panic!("record rejected");
+    };
+    let (_, _, _, attributes, _, _) = record.into_parts();
+    let arrays = occurrences(&attributes, "arrays")
+        .first()
+        .expect("array occurrence");
+    let lists = occurrences(&attributes, "lists")
+        .first()
+        .expect("list occurrence");
+    let profile = ValueLimitProfile::release_1_system_maximum();
+    assert!(arrays.validate_shape(profile).is_ok());
+    assert!(lists.validate_shape(profile).is_ok());
+    assert!(matches!(
+        arrays,
+        CandidateAttributeValue::Truncated { value, action: MarkerAction::TruncatedElements }
+            if matches!(value.as_ref(), CandidateAttributeValue::Array(values)
+                if matches!(values.first(), Some(CandidateAttributeValue::Truncated { .. }))
+                    && matches!(values.get(1), Some(CandidateAttributeValue::Array(values))
+                        if matches!(values.first(), Some(CandidateAttributeValue::Marker(marker))
+                            if marker.action() == MarkerAction::Redacted)))
+    ));
+    assert!(matches!(
+        lists,
+        CandidateAttributeValue::Truncated { value, action: MarkerAction::TruncatedElements }
+            if matches!(value.as_ref(), CandidateAttributeValue::KeyValueList(entries)
+                if matches!(entries.first(), Some(entry)
+                    if matches!(entry.value(), CandidateAttributeValue::Truncated { .. })))
+    ));
 }
 
 #[test]

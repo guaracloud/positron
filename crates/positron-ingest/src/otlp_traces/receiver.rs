@@ -105,7 +105,7 @@ impl OtlpTracesReceiver {
         let mut records = Vec::new();
         records
             .try_reserve_exact(drafts.len())
-            .map_err(|_| TraceReceiveFailure::ValueLimitExceeded)?;
+            .map_err(|_| TraceReceiveFailure::CapacityUnavailable)?;
         let maximum_attributes = usize::try_from(
             self.value_limit_profile
                 .effective_limits()

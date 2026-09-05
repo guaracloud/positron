@@ -52,17 +52,39 @@ pub(super) fn bounded_payload(
 }
 
 fn decompress(bytes: Vec<u8>, maximum: usize) -> Result<Vec<u8>, TraceReceiveFailure> {
-    let mut decoded = Vec::with_capacity(bytes.len().saturating_mul(4).min(maximum));
     let read_limit = u64::try_from(maximum)
         .ok()
         .and_then(|value| value.checked_add(1))
         .ok_or(TraceReceiveFailure::TransportLimitExceeded)?;
-    MultiGzDecoder::new(bytes.as_slice())
-        .take(read_limit)
-        .read_to_end(&mut decoded)
-        .map_err(|_| TraceReceiveFailure::MalformedCompression)?;
-    if decoded.len() > maximum {
-        return Err(TraceReceiveFailure::TransportLimitExceeded);
+    let initial_capacity = bytes
+        .len()
+        .checked_mul(4)
+        .ok_or(TraceReceiveFailure::TransportLimitExceeded)?
+        .min(maximum);
+    let mut decoded = Vec::new();
+    decoded
+        .try_reserve_exact(initial_capacity)
+        .map_err(|_| TraceReceiveFailure::CapacityUnavailable)?;
+    let mut decoder = MultiGzDecoder::new(bytes.as_slice()).take(read_limit);
+    let mut chunk = [0_u8; 8 * 1024];
+    loop {
+        let read = decoder
+            .read(&mut chunk)
+            .map_err(|_| TraceReceiveFailure::MalformedCompression)?;
+        if read == 0 {
+            break;
+        }
+        let new_length = decoded
+            .len()
+            .checked_add(read)
+            .ok_or(TraceReceiveFailure::TransportLimitExceeded)?;
+        if new_length > maximum {
+            return Err(TraceReceiveFailure::TransportLimitExceeded);
+        }
+        decoded
+            .try_reserve(read)
+            .map_err(|_| TraceReceiveFailure::CapacityUnavailable)?;
+        decoded.extend_from_slice(&chunk[..read]);
     }
     Ok(decoded)
 }

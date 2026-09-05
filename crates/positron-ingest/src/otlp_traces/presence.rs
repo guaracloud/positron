@@ -23,12 +23,16 @@ pub(crate) struct SpanTimestampPresence {
 }
 
 impl OtlpTraceTimestampPresence {
+    /// Scans a payload whose structural and semantic bounds were already
+    /// validated by the receiver adapter.
     pub(crate) fn protobuf(bytes: &[u8]) -> Result<Self, TraceReceiveFailure> {
         let mut presence = Self { spans: Vec::new() };
         visit_request(bytes, &mut presence)?;
         Ok(presence)
     }
 
+    /// Scans a payload whose structural and semantic bounds were already
+    /// validated by the receiver adapter.
     pub(crate) fn json(bytes: &[u8]) -> Result<Self, TraceReceiveFailure> {
         let mut presence = Self { spans: Vec::new() };
         let mut collector = JsonPresenceCollector {
@@ -657,12 +661,19 @@ fn visit_span(
             (8, 1) => span.end = true,
             (11, 2) => {
                 let event = value.ok_or(TraceReceiveFailure::MalformedPayload)?;
+                span.events
+                    .try_reserve(1)
+                    .map_err(|_| TraceReceiveFailure::CapacityUnavailable)?;
                 span.events.push(event_time_present(event)?);
             },
             _ => {},
         }
         Ok(())
     })?;
+    presence
+        .spans
+        .try_reserve(1)
+        .map_err(|_| TraceReceiveFailure::CapacityUnavailable)?;
     presence.spans.push(span);
     Ok(())
 }

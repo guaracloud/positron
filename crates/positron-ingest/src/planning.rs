@@ -12,6 +12,7 @@ use positron_signals::SpanObservation;
 pub enum AdmissionGroupPlanFailure {
     UnsupportedSignal,
     AssignmentUnavailable,
+    CapacityUnavailable,
     RecordCountExceeded,
 }
 

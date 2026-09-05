@@ -56,6 +56,10 @@ fn planner_failures_preserve_permanent_retryable_and_invariant_classes() {
         ServiceFailure::CapacityUnavailable
     );
     assert_eq!(
+        map_admission_group_plan_failure(AdmissionGroupPlanFailure::CapacityUnavailable),
+        ServiceFailure::CapacityUnavailable
+    );
+    assert_eq!(
         map_admission_group_plan_failure(AdmissionGroupPlanFailure::RecordCountExceeded),
         ServiceFailure::Internal
     );

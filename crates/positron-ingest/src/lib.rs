@@ -32,9 +32,11 @@ pub use otlp_traces::{
     AuthenticatedOtlpTracesRequest, NativeSpanAdmissionGroup, NativeSpanAdmissionGroups,
     NativeSpanBatch, OtlpGrpcTransportEvidence, OtlpTraceTimestampPresence, OtlpTracesReceiver,
     OtlpTracesRequestEncoding, TraceReceiveFailure, otlp_traces_timestamp_presence_json,
-    otlp_traces_timestamp_presence_protobuf, preflight_otlp_traces_gzip,
-    preflight_otlp_traces_json, preflight_otlp_traces_protobuf,
-    preflight_otlp_traces_protobuf_with_profile, reserve_trace_receiver_transport,
+    otlp_traces_timestamp_presence_json_with_profile, otlp_traces_timestamp_presence_protobuf,
+    otlp_traces_timestamp_presence_protobuf_with_profile, preflight_otlp_traces_gzip,
+    preflight_otlp_traces_json, preflight_otlp_traces_json_with_profile,
+    preflight_otlp_traces_protobuf, preflight_otlp_traces_protobuf_with_profile,
+    reserve_trace_receiver_transport,
 };
 pub use planning::{AdmissionGroupPlanFailure, AdmissionGroupPlanner, FixedAdmissionGroupPlanner};
 pub use positron_policy::{

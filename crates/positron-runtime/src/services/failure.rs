@@ -26,6 +26,7 @@ pub(super) fn map_admission_group_plan_failure(
     match failure {
         AdmissionGroupPlanFailure::UnsupportedSignal => ServiceFailure::InvalidRequest,
         AdmissionGroupPlanFailure::AssignmentUnavailable => ServiceFailure::CapacityUnavailable,
+        AdmissionGroupPlanFailure::CapacityUnavailable => ServiceFailure::CapacityUnavailable,
         AdmissionGroupPlanFailure::RecordCountExceeded => ServiceFailure::Internal,
     }
 }

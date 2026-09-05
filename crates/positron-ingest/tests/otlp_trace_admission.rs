@@ -137,6 +137,33 @@ fn authenticated_trace_constructors_cover_wire_variants_and_decoded_handoff()
 }
 
 #[test]
+fn public_protobuf_timestamp_presence_respects_record_profile_limit() -> Result<(), Box<dyn Error>>
+{
+    let request = ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            scope_spans: vec![ScopeSpans {
+                spans: (0..1_025)
+                    .map(|ordinal| Span {
+                        trace_id: vec![1; 16],
+                        span_id: vec![(ordinal % 256) as u8; 8],
+                        ..Span::default()
+                    })
+                    .collect(),
+                ..ScopeSpans::default()
+            }],
+            ..ResourceSpans::default()
+        }],
+    };
+
+    assert_eq!(
+        positron_ingest::otlp_traces_timestamp_presence_protobuf(&request.encode_to_vec())
+            .expect_err("presence scan accepted more than the canonical record limit"),
+        TraceReceiveFailure::ValueLimitExceeded
+    );
+    Ok(())
+}
+
+#[test]
 fn legacy_decoded_trace_rejects_zero_timestamp_without_wire_presence() -> Result<(), Box<dyn Error>>
 {
     let roots = support::temporary_roots()?;
