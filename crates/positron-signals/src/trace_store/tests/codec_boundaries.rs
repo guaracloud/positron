@@ -1,10 +1,94 @@
 use super::*;
 use crate::{
-    SpanEvent, SpanObservationDetails, SpanObservationDetailsInput, SpanResourceMetadata,
-    SpanScopeMetadata, SpanStatus, SpanStatusCode,
+    SpanAttributeSet, SpanEvent, SpanLink, SpanObservationDetails, SpanObservationDetailsInput,
+    SpanResourceMetadata, SpanScopeMetadata, SpanStatus, SpanStatusCode,
 };
+use positron_domain::value::{ByteLimit, RecordLimits, ValueLimitProfileCandidate, ValueLimitSet};
 
 mod markers;
+
+#[test]
+fn event_and_link_details_over_the_effective_decoded_record_limit_reject_before_span_creation()
+-> Result<(), Box<dyn Error>> {
+    let system = TraceStore::value_limit_profile().system_limits();
+    let tenant = ValueLimitSet::new(
+        system.request(),
+        RecordLimits::new(
+            system.record().encoded_bytes(),
+            ByteLimit::new(8)?,
+            system.record().log_body_bytes(),
+        ),
+        system.dynamic_value(),
+    );
+    let profile = ValueLimitProfileCandidate::new(system, Some(tenant)).validate()?;
+
+    let event_attribute = SpanAttributeSet::checked_with_profile(
+        "key".to_owned(),
+        vec![CandidateAttributeValue::string("value".to_owned())],
+        &profile,
+    )?;
+    let event = SpanEvent::checked_with_profile(
+        EventTime::missing(),
+        "event".to_owned(),
+        vec![event_attribute],
+        0,
+        &profile,
+    )?;
+    let event_failure = SpanObservationDetails::checked_with_profile(
+        empty_details_input(vec![event], Vec::new())?,
+        &profile,
+    )
+    .expect_err("the event's thirteen decoded bytes exceed the effective eight-byte record limit");
+    assert_eq!(event_failure.code(), TraceStoreFailureCode::LimitExceeded);
+    assert_eq!(
+        event_failure.completion_state(),
+        positron_kernel::LedgerCompletionState::RejectedBeforeMutation
+    );
+
+    let link_attribute = SpanAttributeSet::checked_with_profile(
+        "key".to_owned(),
+        vec![CandidateAttributeValue::string("value".to_owned())],
+        &profile,
+    )?;
+    let link = SpanLink::checked_with_profile(
+        [0x51; 16],
+        [0x52; 8],
+        "state".to_owned(),
+        0,
+        vec![link_attribute],
+        0,
+        &profile,
+    )?;
+    let link_failure = SpanObservationDetails::checked_with_profile(
+        empty_details_input(Vec::new(), vec![link])?,
+        &profile,
+    )
+    .expect_err("the link's thirteen decoded bytes exceed the effective eight-byte record limit");
+    assert_eq!(link_failure.code(), TraceStoreFailureCode::LimitExceeded);
+    assert_eq!(
+        link_failure.completion_state(),
+        positron_kernel::LedgerCompletionState::RejectedBeforeMutation
+    );
+    Ok(())
+}
+
+fn empty_details_input(
+    events: Vec<SpanEvent>,
+    links: Vec<SpanLink>,
+) -> Result<SpanObservationDetailsInput, Box<dyn Error>> {
+    Ok(SpanObservationDetailsInput {
+        trace_state: String::new(),
+        flags: 0,
+        status: SpanStatus::checked(SpanStatusCode::Unset, String::new())?,
+        events,
+        links,
+        dropped_attributes_count: 0,
+        dropped_events_count: 0,
+        dropped_links_count: 0,
+        resource: SpanResourceMetadata::checked(0, String::new())?,
+        scope: SpanScopeMetadata::checked(String::new(), String::new(), 0, String::new())?,
+    })
+}
 
 #[test]
 fn trace_blocks_round_trip_native_typed_values_and_source_time_fallback()
