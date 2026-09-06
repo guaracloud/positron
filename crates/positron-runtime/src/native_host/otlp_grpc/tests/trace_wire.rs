@@ -196,12 +196,21 @@ async fn trace_grpc_accepts_the_authenticated_external_tenant_alias()
 
     let response = tokio::time::timeout(
         Duration::from_secs(2),
-        client.export(harness.authorize_trace_with_tenant(trace_request(0x7a), "default")?),
+        client.export(harness.authorize_trace_with_tenant(trace_request(0x7a), "trace-external")?),
     )
     .await??;
     assert!(response.into_inner().partial_success.is_none());
     assert_eq!(backend.calls(), 1);
     assert_eq!(backend.committed_records(), 1);
+
+    let slug = tokio::time::timeout(
+        Duration::from_secs(2),
+        client.export(harness.authorize_trace_with_tenant(trace_request(0x7b), "default")?),
+    )
+    .await?
+    .expect_err("the tenant slug is not an external alias");
+    assert_eq!(slug.code(), Code::Unauthenticated);
+    assert_eq!(backend.calls(), 1);
 
     drop(client);
     harness.finish()?;

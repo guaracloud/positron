@@ -5,9 +5,9 @@ use positron_domain::value::{
 };
 use positron_policy::{IngestPolicy, NativeTraceCandidate, PolicyReceiver, TracePolicyEvaluation};
 use positron_signals::{
-    SamplingDecision, SpanAttributeSet, SpanEvent, SpanKind, SpanLink, SpanObservation,
-    SpanObservationDetails, SpanResourceMetadata, SpanScopeMetadata, SpanStatus, SpanStatusCode,
-    TraceStoreFailureCode,
+    EvaluatedSpanObservationInput, SamplingDecision, SpanAttributeSet, SpanEvent, SpanKind,
+    SpanLink, SpanObservation, SpanObservationDetails, SpanObservationDetailsInput,
+    SpanResourceMetadata, SpanScopeMetadata, SpanStatus, SpanStatusCode, TraceStoreFailureCode,
 };
 
 fn profile() -> ValueLimitProfile {
@@ -78,31 +78,35 @@ fn lowered_profile_rejects_system_profile_detail_at_native_seam() {
         TracePolicyEvaluation::Accepted(evaluated) => *evaluated,
         TracePolicyEvaluation::Rejected => panic!("preserving policy accepts"),
     };
-    let details = SpanObservationDetails::checked(
-        String::new(),
-        0,
-        SpanStatus::checked(SpanStatusCode::Error, "12345".to_owned()).expect("system detail"),
-        Vec::new(),
-        Vec::new(),
-        0,
-        0,
-        0,
-        SpanResourceMetadata::checked(0, String::new()).expect("resource"),
-        SpanScopeMetadata::checked(String::new(), String::new(), 0, String::new()).expect("scope"),
-    )
+    let details = SpanObservationDetails::checked(SpanObservationDetailsInput {
+        trace_state: String::new(),
+        flags: 0,
+        status: SpanStatus::checked(SpanStatusCode::Error, "12345".to_owned())
+            .expect("system detail"),
+        events: Vec::new(),
+        links: Vec::new(),
+        dropped_attributes_count: 0,
+        dropped_events_count: 0,
+        dropped_links_count: 0,
+        resource: SpanResourceMetadata::checked(0, String::new()).expect("resource"),
+        scope: SpanScopeMetadata::checked(String::new(), String::new(), 0, String::new())
+            .expect("scope"),
+    })
     .expect("system-profile detail");
     let failure = SpanObservation::checked_evaluated_with_profile(
         &profile_with_key_limit(4),
-        [1; 16],
-        [2; 8],
-        None,
-        "span".to_owned(),
-        EventTime::missing(),
-        EventTime::missing(),
-        SpanKind::Internal,
-        SamplingDecision::Unknown,
-        evaluated,
-        details,
+        EvaluatedSpanObservationInput {
+            trace_id: [1; 16],
+            span_id: [2; 8],
+            parent_span_id: None,
+            name: "span".to_owned(),
+            start_time: EventTime::missing(),
+            end_time: EventTime::missing(),
+            kind: SpanKind::Internal,
+            sampling: SamplingDecision::Unknown,
+            evaluated,
+            details,
+        },
     )
     .expect_err("system-profile detail must not cross a lowered native profile");
     assert_eq!(failure.code(), TraceStoreFailureCode::LimitExceeded);
@@ -152,41 +156,42 @@ fn native_detail_boundaries_have_stable_typed_failures() {
             .expect("valid event")
         })
         .collect();
-    let collection_failure = SpanObservationDetails::checked(
-        String::new(),
-        0,
-        SpanStatus::checked(SpanStatusCode::Unset, String::new()).expect("status"),
-        too_many_events,
-        Vec::new(),
-        0,
-        0,
-        0,
-        valid_resource(),
-        valid_scope(),
-    )
+    let collection_failure = SpanObservationDetails::checked(SpanObservationDetailsInput {
+        trace_state: String::new(),
+        flags: 0,
+        status: SpanStatus::checked(SpanStatusCode::Unset, String::new()).expect("status"),
+        events: too_many_events,
+        links: Vec::new(),
+        dropped_attributes_count: 0,
+        dropped_events_count: 0,
+        dropped_links_count: 0,
+        resource: valid_resource(),
+        scope: valid_scope(),
+    })
     .expect_err("event collections must be bounded");
     assert_eq!(
         collection_failure.code(),
         TraceStoreFailureCode::LimitExceeded
     );
 
-    let aggregate_failure = SpanObservationDetails::checked(
-        String::new(),
-        0,
-        SpanStatus::checked(SpanStatusCode::Unset, String::new()).expect("status"),
-        (0..17)
+    let aggregate_failure = SpanObservationDetails::checked(SpanObservationDetailsInput {
+        trace_state: String::new(),
+        flags: 0,
+        status: SpanStatus::checked(SpanStatusCode::Unset, String::new()).expect("status"),
+        events: (0..17)
             .map(|_| {
                 SpanEvent::checked(EventTime::missing(), "x".repeat(65_536), Vec::new(), 0)
                     .expect("valid large event")
             })
             .collect(),
-        Vec::new(),
-        0,
-        0,
-        0,
-        SpanResourceMetadata::checked(0, String::new()).expect("resource"),
-        SpanScopeMetadata::checked(String::new(), String::new(), 0, String::new()).expect("scope"),
-    )
+        links: Vec::new(),
+        dropped_attributes_count: 0,
+        dropped_events_count: 0,
+        dropped_links_count: 0,
+        resource: SpanResourceMetadata::checked(0, String::new()).expect("resource"),
+        scope: SpanScopeMetadata::checked(String::new(), String::new(), 0, String::new())
+            .expect("scope"),
+    })
     .expect_err("aggregate detail bytes must be bounded");
     assert_eq!(
         aggregate_failure.code(),
@@ -212,18 +217,18 @@ fn native_detail_success_preserves_ordered_event_and_link_attributes() {
         8,
     )
     .expect("link");
-    let details = SpanObservationDetails::checked(
-        "vendor=trace".to_owned(),
-        0x400,
-        SpanStatus::checked(SpanStatusCode::Ok, "accepted".to_owned()).expect("status"),
-        vec![event],
-        vec![link],
-        9,
-        10,
-        11,
-        valid_resource(),
-        valid_scope(),
-    )
+    let details = SpanObservationDetails::checked(SpanObservationDetailsInput {
+        trace_state: "vendor=trace".to_owned(),
+        flags: 0x400,
+        status: SpanStatus::checked(SpanStatusCode::Ok, "accepted".to_owned()).expect("status"),
+        events: vec![event],
+        links: vec![link],
+        dropped_attributes_count: 9,
+        dropped_events_count: 10,
+        dropped_links_count: 11,
+        resource: valid_resource(),
+        scope: valid_scope(),
+    })
     .expect("details");
 
     assert_eq!(details.trace_state(), "vendor=trace");

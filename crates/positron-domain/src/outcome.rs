@@ -62,6 +62,8 @@ pub enum FailureSource {
     TenantId,
     /// A tenant slug check failed.
     TenantSlug,
+    /// A protocol-specific external tenant alias check failed.
+    ExternalTenantAlias,
     /// A principal identity check failed.
     PrincipalId,
     /// A tenant attribution check failed.

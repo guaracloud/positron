@@ -1,4 +1,7 @@
-use super::{SamplingDecision, SpanKind, SpanObservation, StoredSpanObservation, codec};
+use super::{
+    SamplingDecision, SpanKind, SpanObservation, SpanObservationDetailsInput,
+    StoredSpanObservation, codec,
+};
 use super::{TraceIncompleteness, TraceScan, TraceStore};
 use crate::{
     ScanCancellation, ScanLimit, ScanObservationFailureCode, ScanObserver, TraceStoreFailureCode,

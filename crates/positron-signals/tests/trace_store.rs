@@ -19,9 +19,9 @@ use positron_policy::{
     TracePolicyEvaluation,
 };
 use positron_signals::{
-    SamplingDecision, ScanLimit, SpanAttributeSet, SpanEvent, SpanKind, SpanLink, SpanObservation,
-    SpanObservationDetails, SpanResourceMetadata, SpanScopeMetadata, SpanStatus, SpanStatusCode,
-    TraceScan, TraceStore,
+    EvaluatedSpanObservationInput, SamplingDecision, ScanLimit, SpanAttributeSet, SpanEvent,
+    SpanKind, SpanLink, SpanObservation, SpanObservationDetails, SpanObservationDetailsInput,
+    SpanResourceMetadata, SpanScopeMetadata, SpanStatus, SpanStatusCode, TraceScan, TraceStore,
 };
 use std::error::Error;
 use std::fs;
@@ -61,17 +61,17 @@ fn public_trace_store_seam_commits_and_reads_a_native_observation() -> Result<()
         vec![CandidateAttributeValue::signed_integer(2)],
         ValueLimitProfile::release_1_system_maximum(),
     )?];
-    let details = SpanObservationDetails::checked(
-        "vendor=positron".to_owned(),
-        0x0301,
-        SpanStatus::checked(SpanStatusCode::Error, "upstream failed".to_owned())?,
-        vec![SpanEvent::checked(
+    let details = SpanObservationDetails::checked(SpanObservationDetailsInput {
+        trace_state: "vendor=positron".to_owned(),
+        flags: 0x0301,
+        status: SpanStatus::checked(SpanStatusCode::Error, "upstream failed".to_owned())?,
+        events: vec![SpanEvent::checked(
             EventTime::received(UnixNanoseconds::new(15), SourceTimeQuality::Usable)?,
             "exception".to_owned(),
             event_attributes,
             4,
         )?],
-        vec![SpanLink::checked(
+        links: vec![SpanLink::checked(
             [0x90; 16],
             [0x91; 8],
             "vendor=link".to_owned(),
@@ -79,17 +79,17 @@ fn public_trace_store_seam_commits_and_reads_a_native_observation() -> Result<()
             link_attributes,
             5,
         )?],
-        6,
-        7,
-        8,
-        SpanResourceMetadata::checked(9, "https://resource.example/v1".to_owned())?,
-        SpanScopeMetadata::checked(
+        dropped_attributes_count: 6,
+        dropped_events_count: 7,
+        dropped_links_count: 8,
+        resource: SpanResourceMetadata::checked(9, "https://resource.example/v1".to_owned())?,
+        scope: SpanScopeMetadata::checked(
             "checkout.instrumentation".to_owned(),
             "1.2.3".to_owned(),
             10,
             "https://scope.example/v2".to_owned(),
         )?,
-    )?;
+    })?;
     let policy = IngestPolicy::preserving(7)?;
     let evaluated = match policy.evaluate_trace(
         NativeTraceCandidate::new(vec![NativePolicyAttribute::new(
@@ -104,16 +104,18 @@ fn public_trace_store_seam_commits_and_reads_a_native_observation() -> Result<()
     };
     let observation = SpanObservation::checked_evaluated(
         ValueLimitProfile::release_1_system_maximum(),
-        [0x86; 16],
-        [0x87; 8],
-        None,
-        "public".to_owned(),
-        EventTime::received(UnixNanoseconds::new(1), SourceTimeQuality::Usable)?,
-        EventTime::missing(),
-        SpanKind::Server,
-        SamplingDecision::Unknown,
-        evaluated,
-        details.clone(),
+        EvaluatedSpanObservationInput {
+            trace_id: [0x86; 16],
+            span_id: [0x87; 8],
+            parent_span_id: None,
+            name: "public".to_owned(),
+            start_time: EventTime::received(UnixNanoseconds::new(1), SourceTimeQuality::Usable)?,
+            end_time: EventTime::missing(),
+            kind: SpanKind::Server,
+            sampling: SamplingDecision::Unknown,
+            evaluated,
+            details: details.clone(),
+        },
     )?;
     let lowered = profile_with_key_limit(4);
     let over_evaluated = match policy.evaluate_trace(
@@ -125,16 +127,18 @@ fn public_trace_store_seam_commits_and_reads_a_native_observation() -> Result<()
     };
     let over_observation = SpanObservation::checked_evaluated(
         ValueLimitProfile::release_1_system_maximum(),
-        [0x86; 16],
-        [0x8f; 8],
-        None,
-        "four".to_owned(),
-        EventTime::missing(),
-        EventTime::missing(),
-        SpanKind::Internal,
-        SamplingDecision::Unknown,
-        over_evaluated,
-        details.clone(),
+        EvaluatedSpanObservationInput {
+            trace_id: [0x86; 16],
+            span_id: [0x8f; 8],
+            parent_span_id: None,
+            name: "four".to_owned(),
+            start_time: EventTime::missing(),
+            end_time: EventTime::missing(),
+            kind: SpanKind::Internal,
+            sampling: SamplingDecision::Unknown,
+            evaluated: over_evaluated,
+            details: details.clone(),
+        },
     )?;
     let exact_evaluated = match policy.evaluate_trace(
         NativeTraceCandidate::new(Vec::new()),
@@ -145,16 +149,18 @@ fn public_trace_store_seam_commits_and_reads_a_native_observation() -> Result<()
     };
     let exact = SpanObservation::checked_evaluated(
         lowered,
-        [0x86; 16],
-        [0x88; 8],
-        None,
-        "four".to_owned(),
-        EventTime::missing(),
-        EventTime::missing(),
-        SpanKind::Internal,
-        SamplingDecision::Unknown,
-        exact_evaluated,
-        SpanObservationDetails::default(),
+        EvaluatedSpanObservationInput {
+            trace_id: [0x86; 16],
+            span_id: [0x88; 8],
+            parent_span_id: None,
+            name: "four".to_owned(),
+            start_time: EventTime::missing(),
+            end_time: EventTime::missing(),
+            kind: SpanKind::Internal,
+            sampling: SamplingDecision::Unknown,
+            evaluated: exact_evaluated,
+            details: SpanObservationDetails::default(),
+        },
     )?;
     let canonical_exact_bytes = TraceStore::canonical_encoded_record_bytes(
         &ValueLimitProfile::release_1_system_maximum(),

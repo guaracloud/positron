@@ -34,17 +34,18 @@ pub struct SpanObservationDetails {
     scope: SpanScopeMetadata,
 }
 
-struct SpanObservationDetailsInput {
-    trace_state: String,
-    flags: u32,
-    status: SpanStatus,
-    events: Vec<SpanEvent>,
-    links: Vec<SpanLink>,
-    dropped_attributes_count: u32,
-    dropped_events_count: u32,
-    dropped_links_count: u32,
-    resource: SpanResourceMetadata,
-    scope: SpanScopeMetadata,
+/// Named native inputs for constructing bounded span details.
+pub struct SpanObservationDetailsInput {
+    pub trace_state: String,
+    pub flags: u32,
+    pub status: SpanStatus,
+    pub events: Vec<SpanEvent>,
+    pub links: Vec<SpanLink>,
+    pub dropped_attributes_count: u32,
+    pub dropped_events_count: u32,
+    pub dropped_links_count: u32,
+    pub resource: SpanResourceMetadata,
+    pub scope: SpanScopeMetadata,
 }
 
 impl Default for SpanObservationDetails {
@@ -74,67 +75,17 @@ impl Default for SpanObservationDetails {
 
 impl SpanObservationDetails {
     /// Builds bounded, ordered span details from native fields.
-    #[allow(clippy::too_many_arguments)]
-    pub fn checked(
-        trace_state: String,
-        flags: u32,
-        status: SpanStatus,
-        events: Vec<SpanEvent>,
-        links: Vec<SpanLink>,
-        dropped_attributes_count: u32,
-        dropped_events_count: u32,
-        dropped_links_count: u32,
-        resource: SpanResourceMetadata,
-        scope: SpanScopeMetadata,
-    ) -> Result<Self, TraceStoreFailure> {
+    pub fn checked(input: SpanObservationDetailsInput) -> Result<Self, TraceStoreFailure> {
         let profile = ValueLimitProfile::release_1_system_maximum();
-        Self::checked_input(
-            SpanObservationDetailsInput {
-                trace_state,
-                flags,
-                status,
-                events,
-                links,
-                dropped_attributes_count,
-                dropped_events_count,
-                dropped_links_count,
-                resource,
-                scope,
-            },
-            &profile,
-        )
+        Self::checked_input(input, &profile)
     }
 
     /// Builds complete span details under the pinned profile.
-    #[allow(clippy::too_many_arguments)]
     pub fn checked_with_profile(
-        trace_state: String,
-        flags: u32,
-        status: SpanStatus,
-        events: Vec<SpanEvent>,
-        links: Vec<SpanLink>,
-        dropped_attributes_count: u32,
-        dropped_events_count: u32,
-        dropped_links_count: u32,
-        resource: SpanResourceMetadata,
-        scope: SpanScopeMetadata,
+        input: SpanObservationDetailsInput,
         profile: &ValueLimitProfile,
     ) -> Result<Self, TraceStoreFailure> {
-        Self::checked_input(
-            SpanObservationDetailsInput {
-                trace_state,
-                flags,
-                status,
-                events,
-                links,
-                dropped_attributes_count,
-                dropped_events_count,
-                dropped_links_count,
-                resource,
-                scope,
-            },
-            profile,
-        )
+        Self::checked_input(input, profile)
     }
 
     fn checked_input(

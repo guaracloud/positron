@@ -1,7 +1,7 @@
 use super::super::*;
 use crate::{
-    SpanAttributeSet, SpanEvent, SpanLink, SpanObservationDetails, SpanResourceMetadata,
-    SpanScopeMetadata, SpanStatus, SpanStatusCode,
+    SpanAttributeSet, SpanEvent, SpanLink, SpanObservationDetails, SpanObservationDetailsInput,
+    SpanResourceMetadata, SpanScopeMetadata, SpanStatus, SpanStatusCode,
 };
 
 #[test]
@@ -34,17 +34,17 @@ fn scan_detail_retention_holds_governor_reservation_until_result_drop() -> Resul
         vec![CandidateAttributeValue::bytes(vec![1, 2, 3, 4])],
         profile,
     )?;
-    let details = SpanObservationDetails::checked(
-        "vendor=trace".to_owned(),
-        0x0301,
-        SpanStatus::checked(SpanStatusCode::Error, "failed".to_owned())?,
-        vec![SpanEvent::checked(
+    let details = SpanObservationDetails::checked(SpanObservationDetailsInput {
+        trace_state: "vendor=trace".to_owned(),
+        flags: 0x0301,
+        status: SpanStatus::checked(SpanStatusCode::Error, "failed".to_owned())?,
+        events: vec![SpanEvent::checked(
             EventTime::missing(),
             "exception".to_owned(),
             vec![event_attribute],
             1,
         )?],
-        vec![SpanLink::checked(
+        links: vec![SpanLink::checked(
             [0x11; 16],
             [0x22; 8],
             "vendor=link".to_owned(),
@@ -52,17 +52,17 @@ fn scan_detail_retention_holds_governor_reservation_until_result_drop() -> Resul
             vec![link_attribute],
             2,
         )?],
-        3,
-        4,
-        5,
-        SpanResourceMetadata::checked(6, "https://resource".to_owned())?,
-        SpanScopeMetadata::checked(
+        dropped_attributes_count: 3,
+        dropped_events_count: 4,
+        dropped_links_count: 5,
+        resource: SpanResourceMetadata::checked(6, "https://resource".to_owned())?,
+        scope: SpanScopeMetadata::checked(
             "instrumentation".to_owned(),
             "1.0".to_owned(),
             7,
             "https://scope".to_owned(),
         )?,
-    )?;
+    })?;
     let observation = SpanObservation::checked_native_with_details(
         [0x31; 16],
         [0x32; 8],

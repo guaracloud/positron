@@ -43,6 +43,7 @@ fn encoded_identity() -> Vec<u8> {
 fn literal_v1_governance_identity_remains_readable() {
     let identity = decode_initial_identity(&literal_v1_identity()).expect("v1 identity");
     assert_eq!(identity.principal.to_bytes(), [3; 16]);
+    assert_eq!(identity.external_alias, None);
     assert_eq!(identity.tenant.to_bytes(), [2; 16]);
 }
 
@@ -58,11 +59,12 @@ fn literal_v2_governance_identity_remains_readable_without_query_authority() {
         Some([12; 16])
     );
     assert!(identity.query.is_none());
+    assert_eq!(identity.external_alias, None);
 }
 
 #[test]
-fn current_governance_identity_uses_v3_magic() {
-    assert!(encoded_identity().starts_with(b"POSGOV03"));
+fn current_governance_identity_uses_v4_magic() {
+    assert!(encoded_identity().starts_with(b"POSGOV04"));
 }
 
 #[test]
@@ -123,6 +125,10 @@ fn initial_identity_decoder_reconstructs_closed_authority_and_reservations() {
     assert_eq!(identity.principal.to_bytes(), [3; 16]);
     assert_eq!(identity.tenant.to_bytes(), [2; 16]);
     assert_eq!(identity.tenant_slug.as_str(), "default");
+    assert_eq!(
+        identity.external_alias.as_ref().map(|alias| alias.as_str()),
+        Some("trace-external")
+    );
     assert_eq!(identity.salt, [4; 32]);
     assert_eq!(identity.hash, [5; 32]);
     assert!(format!("{identity:?}").contains("Identity"));
@@ -146,20 +152,23 @@ fn initial_identity_decoder_rejects_truncation_corruption_and_trailing_data() {
     trailing.push(0);
     assert!(decode_initial_identity(&trailing).is_err());
 
-    for range in [8..24, 483..491, 503..511] {
+    for (index, range) in [8..24, 499..507, 519..527].into_iter().enumerate() {
         let mut zeroed = encoded_identity();
         zeroed[range].fill(0);
-        assert!(decode_initial_identity(&zeroed).is_err());
+        assert!(
+            decode_initial_identity(&zeroed).is_err(),
+            "zeroed corruption range {index} was accepted"
+        );
     }
     let mut oversized_slug = encoded_identity();
     oversized_slug[40] = 64;
     assert!(decode_initial_identity(&oversized_slug).is_err());
     let mut missing_integrity = encoded_identity();
-    missing_integrity[367..369].fill(0);
+    missing_integrity[383..385].fill(0);
     assert!(decode_initial_identity(&missing_integrity).is_err());
     let mut empty_display = encoded_identity();
-    empty_display.drain(49..63);
-    empty_display[48] = 0;
+    empty_display.drain(65..79);
+    empty_display[64] = 0;
     assert!(decode_initial_identity(&empty_display).is_err());
 }
 

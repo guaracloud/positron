@@ -127,6 +127,40 @@ impl TenantSlug {
     }
 }
 
+/// The bounded protocol-specific tenant locator used only to validate an
+/// external compatibility hint such as OTLP's `X-Scope-OrgID`.
+///
+/// An external alias is distinct from [`TenantSlug`]: it may use uppercase
+/// letters, dots, and underscores, and it never selects tenant authority.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ExternalTenantAlias(String);
+
+impl ExternalTenantAlias {
+    /// The largest permitted external alias in its bounded wire form.
+    pub const MAX_BYTES: usize = 128;
+
+    /// Parses one bounded ASCII protocol alias.
+    pub fn parse(source: &str) -> Result<Self, DomainFailure> {
+        if source.is_empty()
+            || source.len() > Self::MAX_BYTES
+            || !source
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        {
+            return Err(DomainFailure::invalid_identifier(
+                FailureSource::ExternalTenantAlias,
+            ));
+        }
+        Ok(Self(source.to_owned()))
+    }
+
+    /// Returns the exact validated alias text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// A fixed authorization capability granted to one principal.
 ///
 /// The variants are a closed native taxonomy. They are not wire values and no

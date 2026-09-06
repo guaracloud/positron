@@ -63,7 +63,7 @@ fn identity_failures_do_not_enumerate_or_expose_secret_material()
         .attribute(
             PresentedCredential::parse(&secret)?,
             RequestedIntent::SystemAdministration,
-            CompatibilityHints::external_tenant_alias("default")?,
+            CompatibilityHints::external_tenant_alias("trace-external")?,
         )
         .expect_err("an alias cannot turn system authority into tenant authority");
     assert_eq!(alias_failure.to_string(), expected);

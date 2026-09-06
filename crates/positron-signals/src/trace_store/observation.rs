@@ -48,17 +48,18 @@ pub struct SpanObservation {
     details: SpanObservationDetails,
 }
 
-struct EvaluatedObservationInput {
-    trace_id: [u8; 16],
-    span_id: [u8; 8],
-    parent_span_id: Option<[u8; 8]>,
-    name: String,
-    start_time: EventTime,
-    end_time: EventTime,
-    kind: SpanKind,
-    sampling: SamplingDecision,
-    evaluated: positron_policy::EvaluatedTraceRecord,
-    details: SpanObservationDetails,
+/// Named native inputs for constructing one policy-evaluated observation.
+pub struct EvaluatedSpanObservationInput {
+    pub trace_id: [u8; 16],
+    pub span_id: [u8; 8],
+    pub parent_span_id: Option<[u8; 8]>,
+    pub name: String,
+    pub start_time: EventTime,
+    pub end_time: EventTime,
+    pub kind: SpanKind,
+    pub sampling: SamplingDecision,
+    pub evaluated: positron_policy::EvaluatedTraceRecord,
+    pub details: SpanObservationDetails,
 }
 
 impl SpanObservation {
@@ -106,74 +107,26 @@ impl SpanObservation {
     /// attributes and policy provenance. Its fields are private to the
     /// policy crate, so callers cannot mint provenance independently of the
     /// canonical policy transition.
-    #[allow(clippy::too_many_arguments)]
     pub fn checked_evaluated(
         profile: ValueLimitProfile,
-        trace_id: [u8; 16],
-        span_id: [u8; 8],
-        parent_span_id: Option<[u8; 8]>,
-        name: String,
-        start_time: EventTime,
-        end_time: EventTime,
-        kind: SpanKind,
-        sampling: SamplingDecision,
-        evaluated: positron_policy::EvaluatedTraceRecord,
-        details: SpanObservationDetails,
+        input: EvaluatedSpanObservationInput,
     ) -> Result<Self, TraceStoreFailure> {
-        Self::checked_evaluated_input(
-            &profile,
-            EvaluatedObservationInput {
-                trace_id,
-                span_id,
-                parent_span_id,
-                name,
-                start_time,
-                end_time,
-                kind,
-                sampling,
-                evaluated,
-                details,
-            },
-        )
+        Self::checked_evaluated_input(&profile, input)
     }
 
     /// Builds a native observation using one pinned effective value profile.
-    #[allow(clippy::too_many_arguments)]
     pub fn checked_evaluated_with_profile(
         profile: &ValueLimitProfile,
-        trace_id: [u8; 16],
-        span_id: [u8; 8],
-        parent_span_id: Option<[u8; 8]>,
-        name: String,
-        start_time: EventTime,
-        end_time: EventTime,
-        kind: SpanKind,
-        sampling: SamplingDecision,
-        evaluated: positron_policy::EvaluatedTraceRecord,
-        details: SpanObservationDetails,
+        input: EvaluatedSpanObservationInput,
     ) -> Result<Self, TraceStoreFailure> {
-        Self::checked_evaluated_input(
-            profile,
-            EvaluatedObservationInput {
-                trace_id,
-                span_id,
-                parent_span_id,
-                name,
-                start_time,
-                end_time,
-                kind,
-                sampling,
-                evaluated,
-                details,
-            },
-        )
+        Self::checked_evaluated_input(profile, input)
     }
 
     fn checked_evaluated_input(
         profile: &ValueLimitProfile,
-        input: EvaluatedObservationInput,
+        input: EvaluatedSpanObservationInput,
     ) -> Result<Self, TraceStoreFailure> {
-        let EvaluatedObservationInput {
+        let EvaluatedSpanObservationInput {
             trace_id,
             span_id,
             parent_span_id,

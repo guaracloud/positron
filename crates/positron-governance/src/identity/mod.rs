@@ -14,7 +14,9 @@ mod tests;
 
 use std::fmt::Formatter;
 
-use positron_domain::identity::{PrincipalId, Scope, TenantAttribution, TenantId, TenantSlug};
+use positron_domain::identity::{
+    ExternalTenantAlias, PrincipalId, Scope, TenantAttribution, TenantId, TenantSlug,
+};
 use positron_domain::lifecycle::TenantLifecycleState;
 use positron_kernel::{BootstrapKeyCustody, CatalogObjectId, CatalogSnapshot};
 
@@ -44,6 +46,7 @@ pub struct Identity {
     principal: PrincipalId,
     tenant: TenantId,
     tenant_slug: TenantSlug,
+    external_alias: Option<ExternalTenantAlias>,
     salt: [u8; 32],
     hash: [u8; 32],
     ingest: Option<IngestIdentity>,
@@ -102,13 +105,15 @@ impl Identity {
         intent: RequestedIntent,
         hints: CompatibilityHints,
     ) -> Result<AuthorizedContext, AttributionFailure> {
+        let alias_matches = match (&self.external_alias, &hints.external_alias) {
+            (_, None) => true,
+            (Some(bound), Some(presented)) => bound == presented,
+            (None, Some(_)) => false,
+        };
         if hints.has_untrusted_authority_claims()
             || (matches!(intent, RequestedIntent::SystemAdministration)
                 && hints.external_alias.is_some())
-            || hints
-                .external_alias
-                .as_deref()
-                .is_some_and(|alias| alias != self.tenant_slug.as_str())
+            || !alias_matches
         {
             return Err(AttributionFailure);
         }

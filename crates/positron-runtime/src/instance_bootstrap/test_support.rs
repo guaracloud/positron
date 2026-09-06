@@ -67,7 +67,8 @@ impl InitializedInstance {
             if let Some(object) = object
                 && (object.starts_with(b"POSGOV01")
                     || object.starts_with(b"POSGOV02")
-                    || object.starts_with(b"POSGOV03"))
+                    || object.starts_with(b"POSGOV03")
+                    || object.starts_with(b"POSGOV04"))
             {
                 return GovernanceTestFixture::new(object);
             }

@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
-    SpanEvent, SpanObservationDetails, SpanResourceMetadata, SpanScopeMetadata, SpanStatus,
-    SpanStatusCode,
+    SpanEvent, SpanObservationDetails, SpanObservationDetailsInput, SpanResourceMetadata,
+    SpanScopeMetadata, SpanStatus, SpanStatusCode,
 };
 
 mod markers;
@@ -80,23 +80,23 @@ fn trace_blocks_round_trip_native_typed_values_and_source_time_fallback()
         )
         .validate(profile)?,
     ];
-    let details = SpanObservationDetails::checked(
-        String::new(),
-        0,
-        SpanStatus::checked(SpanStatusCode::Unset, String::new())?,
-        vec![SpanEvent::checked(
+    let details = SpanObservationDetails::checked(SpanObservationDetailsInput {
+        trace_state: String::new(),
+        flags: 0,
+        status: SpanStatus::checked(SpanStatusCode::Unset, String::new())?,
+        events: vec![SpanEvent::checked(
             positron_domain::time::EventTime::out_of_range(u64::MAX)?,
             "event".to_owned(),
             Vec::new(),
             0,
         )?],
-        Vec::new(),
-        0,
-        0,
-        0,
-        SpanResourceMetadata::checked(0, String::new())?,
-        SpanScopeMetadata::checked(String::new(), String::new(), 0, String::new())?,
-    )?;
+        links: Vec::new(),
+        dropped_attributes_count: 0,
+        dropped_events_count: 0,
+        dropped_links_count: 0,
+        resource: SpanResourceMetadata::checked(0, String::new())?,
+        scope: SpanScopeMetadata::checked(String::new(), String::new(), 0, String::new())?,
+    })?;
     let observation = SpanObservation::checked_native_with_details(
         [0x61; 16],
         [0x62; 8],

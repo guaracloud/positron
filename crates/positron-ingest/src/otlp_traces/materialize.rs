@@ -5,8 +5,9 @@ use positron_domain::time::{EventTime, SourceTimeQuality, UnixNanoseconds};
 use positron_domain::value::{CandidateAttributeValue, CandidateKeyValue, ValueLimitProfile};
 use positron_policy::TracePolicyEvaluation;
 use positron_signals::{
-    SpanAttributeSet, SpanEvent, SpanLink, SpanObservation, SpanObservationDetails,
-    SpanResourceMetadata, SpanScopeMetadata, SpanStatus, SpanStatusCode,
+    EvaluatedSpanObservationInput, SpanAttributeSet, SpanEvent, SpanLink, SpanObservation,
+    SpanObservationDetails, SpanObservationDetailsInput, SpanResourceMetadata, SpanScopeMetadata,
+    SpanStatus, SpanStatusCode,
 };
 
 use super::super::{TraceLimitClass, TraceReceiveFailure};
@@ -92,16 +93,18 @@ impl NativeSpanDraft {
         let details = materialize_details(&details, profile)?;
         SpanObservation::checked_evaluated_with_profile(
             profile,
-            trace_id,
-            span_id,
-            parent_span_id,
-            name,
-            start_time,
-            end_time,
-            kind,
-            sampling,
-            *evaluated,
-            details,
+            EvaluatedSpanObservationInput {
+                trace_id,
+                span_id,
+                parent_span_id,
+                name,
+                start_time,
+                end_time,
+                kind,
+                sampling,
+                evaluated: *evaluated,
+                details,
+            },
         )
         .map(Some)
         .map_err(super::super::map_store_failure)
@@ -175,28 +178,30 @@ fn materialize_details(
     let status = SpanStatus::checked_with_profile(status_code, status.message, profile)
         .map_err(map_detail_failure)?;
     SpanObservationDetails::checked_with_profile(
-        detail.trace_state.clone(),
-        detail.flags,
-        status,
-        events,
-        links,
-        detail.dropped_attributes_count,
-        detail.dropped_events_count,
-        detail.dropped_links_count,
-        SpanResourceMetadata::checked_with_profile(
-            detail.metadata.resource_dropped_attributes_count,
-            detail.metadata.resource_schema_url.clone(),
-            profile,
-        )
-        .map_err(map_detail_failure)?,
-        SpanScopeMetadata::checked_with_profile(
-            detail.metadata.scope_name.clone(),
-            detail.metadata.scope_version.clone(),
-            detail.metadata.scope_dropped_attributes_count,
-            detail.metadata.scope_schema_url.clone(),
-            profile,
-        )
-        .map_err(map_detail_failure)?,
+        SpanObservationDetailsInput {
+            trace_state: detail.trace_state.clone(),
+            flags: detail.flags,
+            status,
+            events,
+            links,
+            dropped_attributes_count: detail.dropped_attributes_count,
+            dropped_events_count: detail.dropped_events_count,
+            dropped_links_count: detail.dropped_links_count,
+            resource: SpanResourceMetadata::checked_with_profile(
+                detail.metadata.resource_dropped_attributes_count,
+                detail.metadata.resource_schema_url.clone(),
+                profile,
+            )
+            .map_err(map_detail_failure)?,
+            scope: SpanScopeMetadata::checked_with_profile(
+                detail.metadata.scope_name.clone(),
+                detail.metadata.scope_version.clone(),
+                detail.metadata.scope_dropped_attributes_count,
+                detail.metadata.scope_schema_url.clone(),
+                profile,
+            )
+            .map_err(map_detail_failure)?,
+        },
         profile,
     )
     .map_err(map_detail_failure)

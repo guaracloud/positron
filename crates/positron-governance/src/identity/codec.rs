@@ -32,6 +32,7 @@ pub(super) fn identity_from_catalog(
         principal: decoded.principal(),
         tenant: decoded.tenant(),
         tenant_slug: decoded.tenant_slug(),
+        external_alias: decoded.external_tenant_alias(),
         salt,
         hash,
         ingest,

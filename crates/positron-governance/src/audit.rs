@@ -3,7 +3,7 @@ mod schema_checkpoint;
 
 use std::fmt::{Display, Formatter};
 
-use positron_domain::identity::{PrincipalId, TenantId, TenantSlug};
+use positron_domain::identity::{ExternalTenantAlias, PrincipalId, TenantId, TenantSlug};
 use positron_kernel::GovernanceAuditRecord;
 
 use crate::identity::IdentityFailure;
@@ -11,7 +11,8 @@ use crate::{AdministrativeIdempotencyKey, ResourceGeneration};
 
 pub use rotation::{CatalogRootRotationAuditEntry, CatalogRootRotationStage};
 
-const MAGIC: [u8; 8] = *b"POSAUD01";
+const MAGIC_V1: [u8; 8] = *b"POSAUD01";
+const MAGIC_V2: [u8; 8] = *b"POSAUD02";
 const ROOT_ROTATION_MAGIC: &[u8] = b"catalog-root-rotation-v1\0";
 const POLICY_ACTIVATION_MAGIC: [u8; 8] = *b"POSPOL02";
 
@@ -20,6 +21,7 @@ const POLICY_ACTIVATION_MAGIC: [u8; 8] = *b"POSPOL02";
 pub struct InitialAuditMetadata {
     non_interactive: bool,
     tenant_slug: TenantSlug,
+    external_alias: Option<ExternalTenantAlias>,
 }
 
 impl InitialAuditMetadata {
@@ -35,6 +37,13 @@ impl InitialAuditMetadata {
     #[must_use]
     pub fn tenant_slug(&self) -> &str {
         self.tenant_slug.as_str()
+    }
+
+    #[must_use]
+    pub fn external_tenant_alias(&self) -> Option<&str> {
+        self.external_alias
+            .as_ref()
+            .map(ExternalTenantAlias::as_str)
     }
 }
 
@@ -184,7 +193,7 @@ impl GovernanceAuditEntry {
         transaction_id: [u8; 16],
         intent: &[u8],
     ) -> Result<Self, IdentityFailure> {
-        if intent.starts_with(MAGIC.as_slice()) {
+        if intent.starts_with(MAGIC_V1.as_slice()) || intent.starts_with(MAGIC_V2.as_slice()) {
             return InitializationAuditEntry::decode_intent(position, intent)
                 .map(Self::Initialization);
         }
@@ -256,7 +265,8 @@ impl Display for GovernanceAuditEntry {
 impl InitializationAuditEntry {
     pub(crate) fn decode_intent(position: u64, encoded: &[u8]) -> Result<Self, IdentityFailure> {
         let mut cursor = Cursor::new(encoded);
-        if cursor.take_array::<8>()? != MAGIC {
+        let magic = cursor.take_array::<8>()?;
+        if magic != MAGIC_V1 && magic != MAGIC_V2 {
             return Err(IdentityFailure);
         }
         let ingest_time_unix_seconds = cursor.take_u64()?;
@@ -290,6 +300,14 @@ impl InitializationAuditEntry {
         };
         let tenant_slug =
             TenantSlug::parse_canonical(cursor.take_text_u8(63)?).map_err(|_| IdentityFailure)?;
+        let external_alias = if magic == MAGIC_V2 {
+            Some(
+                ExternalTenantAlias::parse(cursor.take_text_u8(128)?)
+                    .map_err(|_| IdentityFailure)?,
+            )
+        } else {
+            None
+        };
         if !cursor.is_empty() {
             return Err(IdentityFailure);
         }
@@ -305,6 +323,7 @@ impl InitializationAuditEntry {
             metadata: InitialAuditMetadata {
                 non_interactive,
                 tenant_slug,
+                external_alias,
             },
         })
     }

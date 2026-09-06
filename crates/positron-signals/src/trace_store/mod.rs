@@ -14,11 +14,11 @@ mod types;
 mod tests;
 
 pub use details::{
-    SpanAttributeSet, SpanEvent, SpanLink, SpanObservationDetails, SpanResourceMetadata,
-    SpanScopeMetadata, SpanStatus, SpanStatusCode,
+    SpanAttributeSet, SpanEvent, SpanLink, SpanObservationDetails, SpanObservationDetailsInput,
+    SpanResourceMetadata, SpanScopeMetadata, SpanStatus, SpanStatusCode,
 };
 pub use failure::{TraceStoreFailure, TraceStoreFailureCode};
-pub use observation::{SamplingDecision, SpanKind, SpanObservation};
+pub use observation::{EvaluatedSpanObservationInput, SamplingDecision, SpanKind, SpanObservation};
 pub use scan::{ScannedSpanObservation, TraceIncompleteness, TraceScan, TraceScanResult};
 pub use types::{PreparedTraceBlock, StoredSpanObservation};
 

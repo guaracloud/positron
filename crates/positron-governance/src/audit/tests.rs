@@ -52,6 +52,10 @@ fn committed_initial_audit_has_typed_redacted_meaning() {
     assert_eq!(entry.request_id(), [11; 16]);
     assert_eq!(entry.metadata().initialization_mode(), "non-interactive");
     assert_eq!(entry.metadata().tenant_slug(), "default");
+    assert_eq!(
+        entry.metadata().external_tenant_alias(),
+        Some("trace-external")
+    );
 }
 
 #[test]

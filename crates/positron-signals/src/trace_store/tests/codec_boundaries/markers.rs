@@ -1,8 +1,9 @@
 use super::*;
 
 use crate::{
-    SpanAttributeSet, SpanEvent, SpanLink, SpanObservationDetails, SpanResourceMetadata,
-    SpanScopeMetadata, SpanStatus, SpanStatusCode,
+    EvaluatedSpanObservationInput, SpanAttributeSet, SpanEvent, SpanLink, SpanObservationDetails,
+    SpanObservationDetailsInput, SpanResourceMetadata, SpanScopeMetadata, SpanStatus,
+    SpanStatusCode,
 };
 use positron_domain::value::{AttributeValueKind, MarkerAction};
 use positron_policy::{
@@ -109,30 +110,34 @@ fn public_trace_store_round_trip_preserves_markers_in_span_event_and_link_detail
         &profile,
     )?;
     let details = SpanObservationDetails::checked_with_profile(
-        String::new(),
-        0,
-        SpanStatus::checked(SpanStatusCode::Unset, String::new())?,
-        vec![event],
-        vec![link],
-        0,
-        0,
-        0,
-        SpanResourceMetadata::checked(0, String::new())?,
-        SpanScopeMetadata::checked(String::new(), String::new(), 0, String::new())?,
+        SpanObservationDetailsInput {
+            trace_state: String::new(),
+            flags: 0,
+            status: SpanStatus::checked(SpanStatusCode::Unset, String::new())?,
+            events: vec![event],
+            links: vec![link],
+            dropped_attributes_count: 0,
+            dropped_events_count: 0,
+            dropped_links_count: 0,
+            resource: SpanResourceMetadata::checked(0, String::new())?,
+            scope: SpanScopeMetadata::checked(String::new(), String::new(), 0, String::new())?,
+        },
         &profile,
     )?;
     let observation = SpanObservation::checked_evaluated(
         profile,
-        [0x61; 16],
-        [0x62; 8],
-        None,
-        "marker-span".to_owned(),
-        EventTime::missing(),
-        EventTime::missing(),
-        SpanKind::Internal,
-        SamplingDecision::Unknown,
-        evaluated,
-        details,
+        EvaluatedSpanObservationInput {
+            trace_id: [0x61; 16],
+            span_id: [0x62; 8],
+            parent_span_id: None,
+            name: "marker-span".to_owned(),
+            start_time: EventTime::missing(),
+            end_time: EventTime::missing(),
+            kind: SpanKind::Internal,
+            sampling: SamplingDecision::Unknown,
+            evaluated,
+            details,
+        },
     )?;
     let tenant = TenantId::from_bytes([0x41; 16])?;
     let shard = VirtualShardId::new(72)?;

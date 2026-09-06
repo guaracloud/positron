@@ -3,7 +3,7 @@ use std::fmt::{Display, Formatter};
 use std::path::Path;
 use std::sync::Arc;
 
-use positron_domain::identity::{PrincipalId, TenantId, TenantSlug};
+use positron_domain::identity::{ExternalTenantAlias, PrincipalId, TenantId, TenantSlug};
 use positron_kernel::{
     BootstrapKeyCustody, Catalog, CatalogFailureCode, InstanceBootstrapStorage, InstanceId,
     MountQualification, OwnedPrimaryDataVolume, RetentionTimeAuthority,
@@ -126,9 +126,10 @@ impl BootstrapPaths {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InitializationPlan {
     non_interactive: bool,
+    external_alias: Option<ExternalTenantAlias>,
 }
 
 impl InitializationPlan {
@@ -136,11 +137,34 @@ impl InitializationPlan {
     pub const fn non_interactive() -> Self {
         Self {
             non_interactive: true,
+            external_alias: None,
         }
     }
 
-    pub(super) const fn creates_claim(self) -> bool {
+    /// Creates a non-interactive plan with an explicitly bound protocol alias.
+    pub fn non_interactive_with_external_tenant_alias(
+        alias: &str,
+    ) -> Result<Self, BootstrapFailure> {
+        let external_alias = ExternalTenantAlias::parse(alias)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::InvalidRoots))?;
+        Ok(Self {
+            non_interactive: true,
+            external_alias: Some(external_alias),
+        })
+    }
+
+    pub(super) const fn creates_claim(&self) -> bool {
         self.non_interactive
+    }
+
+    pub(super) fn external_alias(&self) -> Result<ExternalTenantAlias, BootstrapFailure> {
+        self.external_alias.clone().map_or_else(
+            || {
+                ExternalTenantAlias::parse("trace-external")
+                    .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))
+            },
+            Ok,
+        )
     }
 }
 

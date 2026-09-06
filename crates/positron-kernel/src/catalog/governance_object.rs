@@ -1,6 +1,6 @@
 use std::num::NonZeroU64;
 
-use positron_domain::identity::{PrincipalId, TenantId, TenantSlug};
+use positron_domain::identity::{ExternalTenantAlias, PrincipalId, TenantId, TenantSlug};
 use positron_domain::lifecycle::TenantLifecycleState;
 use positron_domain::routing::SignalKind;
 
@@ -9,6 +9,7 @@ use super::{CatalogFailure, CatalogFailureCode, CatalogObjectId, CatalogSnapshot
 const MAGIC_V1: [u8; 8] = *b"POSGOV01";
 const MAGIC_V2: [u8; 8] = *b"POSGOV02";
 const MAGIC_V3: [u8; 8] = *b"POSGOV03";
+const MAGIC_V4: [u8; 8] = *b"POSGOV04";
 const MAX_RETENTION_SECONDS: u64 = i64::MAX as u64 / 1_000_000_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -16,6 +17,7 @@ pub enum CatalogGovernanceVersion {
     V1,
     V2,
     V3,
+    V4,
 }
 
 #[derive(Clone)]
@@ -36,6 +38,7 @@ pub struct CatalogGovernanceObject {
     instance: [u8; 16],
     tenant: TenantId,
     tenant_slug: TenantSlug,
+    external_alias: Option<ExternalTenantAlias>,
     principal: PrincipalId,
     salt: [u8; 32],
     hash: [u8; 32],
@@ -68,6 +71,11 @@ impl CatalogGovernanceObject {
     }
 
     #[must_use]
+    pub fn external_tenant_alias(&self) -> Option<ExternalTenantAlias> {
+        self.external_alias.clone()
+    }
+
+    #[must_use]
     pub const fn principal(&self) -> PrincipalId {
         self.principal
     }
@@ -97,7 +105,7 @@ impl CatalogGovernanceObject {
     }
 }
 
-/// Opaque exact-v3 Log retention evidence from one authenticated Catalog snapshot.
+/// Opaque v3/v4 Log retention evidence from one authenticated Catalog snapshot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CatalogLogRetentionPolicy {
     instance: InstanceId,
@@ -146,10 +154,13 @@ impl CatalogSnapshot {
         found.ok_or_else(|| CatalogFailure::new(CatalogFailureCode::StaleGeneration))
     }
 
-    /// Derives exact POSGOV03 Log-retention evidence from this authenticated snapshot.
+    /// Derives exact current Log-retention evidence from this authenticated snapshot.
     pub fn log_retention_policy(&self) -> Result<CatalogLogRetentionPolicy, CatalogFailure> {
         let (object, governance) = self.governance_object()?;
-        if governance.version != CatalogGovernanceVersion::V3 {
+        if !matches!(
+            governance.version,
+            CatalogGovernanceVersion::V3 | CatalogGovernanceVersion::V4
+        ) {
             return Err(CatalogFailure::new(CatalogFailureCode::UnsupportedFormat));
         }
         let retention_seconds = NonZeroU64::new(governance.retention_seconds)
@@ -170,6 +181,7 @@ fn decode(encoded: &[u8]) -> Result<CatalogGovernanceObject, CatalogFailure> {
         MAGIC_V1 => CatalogGovernanceVersion::V1,
         MAGIC_V2 => CatalogGovernanceVersion::V2,
         MAGIC_V3 => CatalogGovernanceVersion::V3,
+        MAGIC_V4 => CatalogGovernanceVersion::V4,
         _ => return Err(corrupt()),
     };
     let instance = cursor.take_array::<16>()?;
@@ -177,6 +189,17 @@ fn decode(encoded: &[u8]) -> Result<CatalogGovernanceObject, CatalogFailure> {
     let tenant = TenantId::from_bytes(cursor.take_array::<16>()?).map_err(|_| corrupt())?;
     let tenant_slug =
         TenantSlug::parse_canonical(cursor.take_text_u8(63)?).map_err(|_| corrupt())?;
+    let external_alias = if version == CatalogGovernanceVersion::V4 {
+        match cursor.take_u8()? {
+            0 => None,
+            1 => {
+                Some(ExternalTenantAlias::parse(cursor.take_text_u8(128)?).map_err(|_| corrupt())?)
+            },
+            _ => return Err(corrupt()),
+        }
+    } else {
+        None
+    };
     if cursor.take_text_u8(128)?.is_empty() {
         return Err(corrupt());
     }
@@ -187,7 +210,7 @@ fn decode(encoded: &[u8]) -> Result<CatalogGovernanceObject, CatalogFailure> {
     require_nonzero(hash)?;
     let ingest = if matches!(
         version,
-        CatalogGovernanceVersion::V2 | CatalogGovernanceVersion::V3
+        CatalogGovernanceVersion::V2 | CatalogGovernanceVersion::V3 | CatalogGovernanceVersion::V4
     ) {
         let credential = cursor.take_credential()?;
         if credential.principal == principal {
@@ -197,7 +220,10 @@ fn decode(encoded: &[u8]) -> Result<CatalogGovernanceObject, CatalogFailure> {
     } else {
         None
     };
-    let query = if version == CatalogGovernanceVersion::V3 {
+    let query = if matches!(
+        version,
+        CatalogGovernanceVersion::V3 | CatalogGovernanceVersion::V4
+    ) {
         let credential = cursor.take_credential()?;
         if credential.principal == principal
             || ingest
@@ -239,6 +265,7 @@ fn decode(encoded: &[u8]) -> Result<CatalogGovernanceObject, CatalogFailure> {
         instance,
         tenant,
         tenant_slug,
+        external_alias,
         principal,
         salt,
         hash,
@@ -250,7 +277,10 @@ fn decode(encoded: &[u8]) -> Result<CatalogGovernanceObject, CatalogFailure> {
 }
 
 fn is_governance(bytes: &[u8]) -> bool {
-    bytes.starts_with(&MAGIC_V1) || bytes.starts_with(&MAGIC_V2) || bytes.starts_with(&MAGIC_V3)
+    bytes.starts_with(&MAGIC_V1)
+        || bytes.starts_with(&MAGIC_V2)
+        || bytes.starts_with(&MAGIC_V3)
+        || bytes.starts_with(&MAGIC_V4)
 }
 
 fn require_nonzero<const N: usize>(bytes: [u8; N]) -> Result<(), CatalogFailure> {
@@ -282,6 +312,10 @@ impl<'encoded> Cursor<'encoded> {
 
     fn take_u32(&mut self) -> Result<u32, CatalogFailure> {
         self.take_array().map(u32::from_be_bytes)
+    }
+
+    fn take_u8(&mut self) -> Result<u8, CatalogFailure> {
+        self.take_array::<1>().map(|bytes| bytes[0])
     }
 
     fn take_u64(&mut self) -> Result<u64, CatalogFailure> {

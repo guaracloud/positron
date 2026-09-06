@@ -45,12 +45,39 @@ fn live_http_trace_export_accepts_the_authenticated_external_tenant_alias()
         body.clone(),
         "application/x-protobuf",
         None,
-        Some("default"),
+        Some("trace-external"),
         None,
     )?;
     assert_eq!(accepted.status(), 200);
     let response = ExportTraceServiceResponse::decode(accepted.body())?;
     assert!(response.partial_success.is_none());
+
+    let absent = receive_http_with_tenant(
+        &services,
+        &bearer,
+        body.clone(),
+        "application/x-protobuf",
+        None,
+        None,
+        None,
+    )?;
+    assert_eq!(absent.status(), 200);
+    assert!(
+        ExportTraceServiceResponse::decode(absent.body())?
+            .partial_success
+            .is_none()
+    );
+
+    let slug = rejected(receive_http_with_tenant(
+        &services,
+        &bearer,
+        body.clone(),
+        "application/x-protobuf",
+        None,
+        Some("default"),
+        None,
+    ))?;
+    assert_eq!(slug.status(), 401);
 
     let rejected = rejected(receive_http_with_tenant(
         &services,

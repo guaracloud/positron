@@ -133,7 +133,7 @@ fn publish_legacy_governance(
     let mut objects = Vec::new();
     for identity in current.object_identities() {
         let object = current.object(identity)?.ok_or("missing catalog object")?;
-        let plaintext = if object.starts_with(b"POSGOV03") {
+        let plaintext = if object.starts_with(b"POSGOV03") || object.starts_with(b"POSGOV04") {
             replaced = true;
             legacy_governance(object)?
         } else {
@@ -236,10 +236,33 @@ fn rewrite_pending_replacement_as_v1(
 }
 
 fn legacy_governance(current: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    if current.len() < 303 {
+    let mut legacy = current.to_vec();
+    if current.starts_with(b"POSGOV04") {
+        let slug_length = usize::from(*current.get(40).ok_or("truncated slug length")?);
+        let alias_start = 41usize
+            .checked_add(slug_length)
+            .ok_or("slug offset overflow")?;
+        let alias_presence = *current.get(alias_start).ok_or("truncated alias presence")?;
+        let alias_length = usize::from(
+            *current
+                .get(alias_start.checked_add(1).ok_or("alias offset overflow")?)
+                .ok_or("truncated alias length")?,
+        );
+        if alias_presence != 1 {
+            return Err("current alias is not bound".into());
+        }
+        let alias_end = alias_start
+            .checked_add(2)
+            .and_then(|offset| offset.checked_add(alias_length))
+            .ok_or("alias end overflow")?;
+        if alias_end > legacy.len() {
+            return Err("truncated current alias".into());
+        }
+        legacy.drain(alias_start..alias_end);
+    }
+    if legacy.len() < 303 {
         return Err("truncated current governance object".into());
     }
-    let mut legacy = current.to_vec();
     legacy[..8].copy_from_slice(b"POSGOV01");
     legacy.drain(143..303);
     Ok(legacy)

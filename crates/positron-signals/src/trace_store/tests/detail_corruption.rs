@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
-    SpanAttributeSet, SpanEvent, SpanLink, SpanObservationDetails, SpanResourceMetadata,
-    SpanScopeMetadata, SpanStatus, SpanStatusCode,
+    SpanAttributeSet, SpanEvent, SpanLink, SpanObservationDetails, SpanObservationDetailsInput,
+    SpanResourceMetadata, SpanScopeMetadata, SpanStatus, SpanStatusCode,
 };
 
 #[test]
@@ -34,17 +34,17 @@ fn public_scan_rejects_corrupt_detail_occurrences_atomically() -> Result<(), Box
         vec![CandidateAttributeValue::signed_integer(7)],
         profile,
     )?];
-    let details = SpanObservationDetails::checked(
-        "trace-state".to_owned(),
-        0x401,
-        SpanStatus::checked(SpanStatusCode::Error, "status".to_owned())?,
-        vec![SpanEvent::checked(
+    let details = SpanObservationDetails::checked(SpanObservationDetailsInput {
+        trace_state: "trace-state".to_owned(),
+        flags: 0x401,
+        status: SpanStatus::checked(SpanStatusCode::Error, "status".to_owned())?,
+        events: vec![SpanEvent::checked(
             EventTime::missing(),
             "event".to_owned(),
             event_attributes,
             2,
         )?],
-        vec![SpanLink::checked(
+        links: vec![SpanLink::checked(
             [0xb1; 16],
             [0xb2; 8],
             "link-state".to_owned(),
@@ -52,17 +52,17 @@ fn public_scan_rejects_corrupt_detail_occurrences_atomically() -> Result<(), Box
             link_attributes,
             3,
         )?],
-        4,
-        5,
-        6,
-        SpanResourceMetadata::checked(7, "resource-schema".to_owned())?,
-        SpanScopeMetadata::checked(
+        dropped_attributes_count: 4,
+        dropped_events_count: 5,
+        dropped_links_count: 6,
+        resource: SpanResourceMetadata::checked(7, "resource-schema".to_owned())?,
+        scope: SpanScopeMetadata::checked(
             "scope".to_owned(),
             "1.0".to_owned(),
             8,
             "scope-schema".to_owned(),
         )?,
-    )?;
+    })?;
     let observation = SpanObservation::checked_native_with_details(
         [0xb3; 16],
         [0xb4; 8],

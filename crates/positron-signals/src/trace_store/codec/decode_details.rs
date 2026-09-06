@@ -4,7 +4,7 @@ use positron_domain::value::{
 
 use super::super::super::details::{
     MAX_DETAIL_COLLECTION, SpanAttributeSet, SpanEvent, SpanLink, SpanObservationDetails,
-    SpanResourceMetadata, SpanScopeMetadata, SpanStatus,
+    SpanObservationDetailsInput, SpanResourceMetadata, SpanScopeMetadata, SpanStatus,
 };
 use super::super::super::failure::TraceStoreFailure;
 use super::super::super::types::limits_for;
@@ -61,28 +61,30 @@ pub(super) fn decode_details(
         )?);
     }
     SpanObservationDetails::checked_with_profile(
-        trace_state,
-        flags,
-        status,
-        events,
-        links,
-        dropped_attributes_count,
-        dropped_events_count,
-        dropped_links_count,
-        SpanResourceMetadata::checked_with_profile(
-            resource_dropped_attributes_count,
-            resource_schema_url,
-            profile,
-        )
-        .map_err(|_| TraceStoreFailure::malformed_block())?,
-        SpanScopeMetadata::checked_with_profile(
-            scope_name,
-            scope_version,
-            scope_dropped_attributes_count,
-            scope_schema_url,
-            profile,
-        )
-        .map_err(|_| TraceStoreFailure::malformed_block())?,
+        SpanObservationDetailsInput {
+            trace_state,
+            flags,
+            status,
+            events,
+            links,
+            dropped_attributes_count,
+            dropped_events_count,
+            dropped_links_count,
+            resource: SpanResourceMetadata::checked_with_profile(
+                resource_dropped_attributes_count,
+                resource_schema_url,
+                profile,
+            )
+            .map_err(|_| TraceStoreFailure::malformed_block())?,
+            scope: SpanScopeMetadata::checked_with_profile(
+                scope_name,
+                scope_version,
+                scope_dropped_attributes_count,
+                scope_schema_url,
+                profile,
+            )
+            .map_err(|_| TraceStoreFailure::malformed_block())?,
+        },
         profile,
     )
     .map_err(|_| TraceStoreFailure::malformed_block())

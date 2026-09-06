@@ -280,23 +280,23 @@ fn malformed_v2_detail_framing_is_typed_and_atomic() -> Result<(), Box<dyn Error
         CatalogSecret::from_owned(Box::new([0x31; 32]), Box::new([0x41; 32])),
     )?;
     let tenant = TenantId::from_bytes([0x41; 16])?;
-    let details = SpanObservationDetails::checked(
-        "trace-state".to_owned(),
-        0x0102_0304,
-        SpanStatus::checked(SpanStatusCode::Error, "failed".to_owned())?,
-        Vec::new(),
-        Vec::new(),
-        1,
-        2,
-        3,
-        SpanResourceMetadata::checked(4, "resource-schema".to_owned())?,
-        SpanScopeMetadata::checked(
+    let details = SpanObservationDetails::checked(SpanObservationDetailsInput {
+        trace_state: "trace-state".to_owned(),
+        flags: 0x0102_0304,
+        status: SpanStatus::checked(SpanStatusCode::Error, "failed".to_owned())?,
+        events: Vec::new(),
+        links: Vec::new(),
+        dropped_attributes_count: 1,
+        dropped_events_count: 2,
+        dropped_links_count: 3,
+        resource: SpanResourceMetadata::checked(4, "resource-schema".to_owned())?,
+        scope: SpanScopeMetadata::checked(
             "scope".to_owned(),
             "1.0".to_owned(),
             5,
             "scope-schema".to_owned(),
         )?,
-    )?;
+    })?;
     let observation = SpanObservation::checked_native_with_details(
         [0x51; 16],
         [0x52; 8],
