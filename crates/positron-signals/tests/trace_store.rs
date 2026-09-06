@@ -296,7 +296,7 @@ fn public_trace_store_seam_commits_and_reads_a_native_observation() -> Result<()
         vec![observation.clone()],
     )?;
     ledger.append(prepared.into_store_block())?;
-    let result = TraceStore::new().scan(
+    let result = TraceStore::new().scan_physical(
         authority.governor(),
         tenant,
         &ledger.snapshot()?,
@@ -312,7 +312,7 @@ fn public_trace_store_seam_commits_and_reads_a_native_observation() -> Result<()
         SpanObservation::MAX_NAME_BYTES
     );
     drop(result);
-    let logical = TraceStore::new().scan_logical(
+    let logical = TraceStore::new().scan(
         authority.governor(),
         tenant,
         &ledger.snapshot()?,
@@ -341,7 +341,7 @@ fn public_trace_store_seam_commits_and_reads_a_native_observation() -> Result<()
         scope,
         SegmentProtectionKey::from_owned(Box::new([0x85; 32])),
     )?;
-    let restarted_result = TraceStore::new().scan(
+    let restarted_result = TraceStore::new().scan_physical(
         authority.governor(),
         tenant,
         &reopened.snapshot()?,
@@ -387,7 +387,7 @@ fn public_trace_store_reads_v1_blocks_with_explicit_absent_detail_defaults()
     let prepared = preparation.finish(block)?;
     ledger.append(prepared)?;
 
-    let result = TraceStore::new().scan(
+    let result = TraceStore::new().scan_physical(
         authority.governor(),
         tenant,
         &ledger.snapshot()?,
@@ -449,7 +449,7 @@ fn logical_trace_scan_rejects_a_legacy_observation_with_mismatched_ingest_time()
 
     let before = authority.governor().inspect()?.outstanding_total();
     let failure = TraceStore::new()
-        .scan_logical(
+        .scan(
             authority.governor(),
             tenant,
             &ledger.snapshot()?,

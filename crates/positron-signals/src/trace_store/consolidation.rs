@@ -1,6 +1,21 @@
 use super::failure::TraceStoreFailure;
-use super::scan::{ScannedSpanObservation, TraceIncompleteness};
+use super::scan::{ScannedSpanObservation, TraceIncompleteness, check_cancel};
+#[cfg(fuzzing)]
+use crate::ScanObservationFailureCode;
+use crate::{ScanCancellation, ScanObserver};
+use positron_domain::value::ValueLimitProfile;
 use positron_kernel::ResourceReservation;
+
+struct ConsolidationEntry {
+    observation: ScannedSpanObservation,
+    semantic_key: Vec<u8>,
+}
+
+pub(super) struct ConsolidationContext<'a> {
+    pub(super) profile: &'a ValueLimitProfile,
+    pub(super) cancellation: &'a dyn ScanCancellation,
+    pub(super) observer: &'a dyn ScanObserver,
+}
 
 /// A semantic variant retained for one logical span.
 #[derive(Debug)]
@@ -15,10 +30,6 @@ impl SpanObservationVariant {
             observation,
             observation_count: 1,
         })
-    }
-
-    fn matches(&self, observation: &ScannedSpanObservation) -> bool {
-        self.observation.observation() == observation.observation()
     }
 
     fn record(&mut self) -> Result<(), TraceStoreFailure> {
@@ -49,6 +60,7 @@ pub struct LogicalSpan {
     span_id: [u8; 8],
     variants: Vec<SpanObservationVariant>,
     observation_count: u64,
+    structural_variant: usize,
 }
 
 impl LogicalSpan {
@@ -65,6 +77,7 @@ impl LogicalSpan {
             span_id,
             variants,
             observation_count: 1,
+            structural_variant: 0,
         })
     }
 
@@ -73,23 +86,40 @@ impl LogicalSpan {
             && self.span_id == observation.observation().span_id()
     }
 
-    fn record(&mut self, observation: ScannedSpanObservation) -> Result<(), TraceStoreFailure> {
+    fn record_last_variant(&mut self) -> Result<(), TraceStoreFailure> {
         self.observation_count = self
             .observation_count
             .checked_add(1)
             .ok_or_else(TraceStoreFailure::limit_exceeded)?;
-        if let Some(variant) = self
-            .variants
-            .iter_mut()
-            .find(|variant| variant.matches(&observation))
-        {
-            return variant.record();
-        }
+        self.variants
+            .last_mut()
+            .ok_or_else(TraceStoreFailure::invalid_input)?
+            .record()
+    }
+
+    fn record_new_variant(
+        &mut self,
+        observation: ScannedSpanObservation,
+    ) -> Result<(), TraceStoreFailure> {
+        self.observation_count = self
+            .observation_count
+            .checked_add(1)
+            .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+        let is_earlier = self
+            .structural_representative()
+            .is_some_and(|representative| physical_order(&observation, representative).is_lt());
         self.variants
             .try_reserve_exact(1)
             .map_err(|_| TraceStoreFailure::resource_exhausted())?;
         self.variants
             .push(SpanObservationVariant::new(observation)?);
+        if is_earlier {
+            self.structural_variant = self
+                .variants
+                .len()
+                .checked_sub(1)
+                .ok_or_else(TraceStoreFailure::invalid_input)?;
+        }
         Ok(())
     }
 
@@ -131,7 +161,7 @@ impl LogicalSpan {
     #[must_use]
     pub fn structural_representative(&self) -> Option<&ScannedSpanObservation> {
         self.variants
-            .first()
+            .get(self.structural_variant)
             .map(SpanObservationVariant::observation)
     }
 }
@@ -194,23 +224,15 @@ pub(super) fn consolidate<'kernel>(
     scanned_bytes_limited: bool,
     retained_size_bytes: u64,
     mut capacity: ResourceReservation<'kernel>,
+    context: ConsolidationContext<'_>,
 ) -> Result<LogicalTraceScanResult<'kernel>, TraceStoreFailure> {
     let decoded_observations =
         u64::try_from(observations.len()).map_err(|_| TraceStoreFailure::limit_exceeded())?;
-    let maximum_container_bytes = u64::try_from(observations.len())
-        .map_err(|_| TraceStoreFailure::limit_exceeded())?
-        .checked_mul(
-            u64::try_from(
-                std::mem::size_of::<LogicalSpan>() + std::mem::size_of::<SpanObservationVariant>(),
-            )
-            .map_err(|_| TraceStoreFailure::limit_exceeded())?,
-        )
-        .ok_or_else(TraceStoreFailure::limit_exceeded)?;
-    let staging_bytes = retained_size_bytes
-        .checked_add(maximum_container_bytes)
-        .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+    let staging_bytes = consolidation_staging_bytes(&observations, retained_size_bytes, &context)?;
     super::scan::resize_capacity(&mut capacity, staging_bytes.max(1))?;
-    let spans = group_observations(observations)?;
+    let entries = entries_with_semantic_keys(observations, &context)?;
+    let entries = interruptible_sort(entries, &context)?;
+    let spans = group_observations(entries, &context)?;
     let retained_size_bytes = logical_retained_size(&spans, spans.capacity())?;
     super::scan::resize_capacity(&mut capacity, retained_size_bytes.max(1))?;
     Ok(LogicalTraceScanResult {
@@ -224,36 +246,267 @@ pub(super) fn consolidate<'kernel>(
     })
 }
 
-fn group_observations(
-    mut observations: Vec<ScannedSpanObservation>,
-) -> Result<Vec<LogicalSpan>, TraceStoreFailure> {
-    observations.sort_unstable_by(|left, right| {
-        left.observation()
-            .trace_id()
-            .cmp(&right.observation().trace_id())
-            .then_with(|| {
-                left.observation()
-                    .span_id()
-                    .cmp(&right.observation().span_id())
-            })
-            .then_with(|| left.commit_position().cmp(&right.commit_position()))
-            .then_with(|| left.record_ordinal().cmp(&right.record_ordinal()))
-    });
-    let mut spans: Vec<LogicalSpan> = Vec::new();
-    spans
+fn consolidation_staging_bytes(
+    observations: &[ScannedSpanObservation],
+    retained_size_bytes: u64,
+    context: &ConsolidationContext<'_>,
+) -> Result<u64, TraceStoreFailure> {
+    let key_bytes = observations.iter().try_fold(0_u64, |total, observation| {
+        observe_consolidation_unit(context)?;
+        let encoded = super::codec::encoded_record_bytes_with_profile(
+            context.profile,
+            observation.observation(),
+        )?;
+        let semantic = encoded
+            .checked_sub(8)
+            .ok_or_else(TraceStoreFailure::invalid_input)?;
+        total
+            .checked_add(u64::try_from(semantic).map_err(|_| TraceStoreFailure::limit_exceeded())?)
+            .ok_or_else(TraceStoreFailure::limit_exceeded)
+    })?;
+    let count = observations.len();
+    let entry_slots = vector_slots_bytes::<ConsolidationEntry>(count)?;
+    let scratch_slots = vector_slots_bytes::<Option<ConsolidationEntry>>(count)?;
+    let maximum_container_bytes = vector_slots_bytes::<LogicalSpan>(count)?
+        .checked_add(vector_slots_bytes::<SpanObservationVariant>(count)?)
+        .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+    let staging_bytes = retained_size_bytes
+        .checked_add(key_bytes)
+        .and_then(|bytes| bytes.checked_add(entry_slots))
+        .and_then(|bytes| bytes.checked_add(scratch_slots))
+        .and_then(|bytes| bytes.checked_add(maximum_container_bytes))
+        .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+    Ok(staging_bytes)
+}
+
+fn vector_slots_bytes<T>(count: usize) -> Result<u64, TraceStoreFailure> {
+    u64::try_from(count)
+        .map_err(|_| TraceStoreFailure::limit_exceeded())?
+        .checked_mul(
+            u64::try_from(std::mem::size_of::<T>())
+                .map_err(|_| TraceStoreFailure::limit_exceeded())?,
+        )
+        .ok_or_else(TraceStoreFailure::limit_exceeded)
+}
+
+fn entries_with_semantic_keys(
+    observations: Vec<ScannedSpanObservation>,
+    context: &ConsolidationContext<'_>,
+) -> Result<Vec<ConsolidationEntry>, TraceStoreFailure> {
+    let mut entries = Vec::new();
+    entries
         .try_reserve_exact(observations.len())
         .map_err(|_| TraceStoreFailure::resource_exhausted())?;
     for observation in observations {
-        if let Some(span) = spans
-            .last_mut()
-            .filter(|span| span.has_identity(&observation))
-        {
-            span.record(observation)?;
+        observe_consolidation_unit(context)?;
+        let semantic_key = super::codec::encode_semantic_observation_with_profile(
+            context.profile,
+            observation.observation(),
+        )?;
+        entries.push(ConsolidationEntry {
+            observation,
+            semantic_key,
+        });
+    }
+    Ok(entries)
+}
+
+fn interruptible_sort(
+    mut entries: Vec<ConsolidationEntry>,
+    context: &ConsolidationContext<'_>,
+) -> Result<Vec<ConsolidationEntry>, TraceStoreFailure> {
+    if entries.len() < 2 {
+        return Ok(entries);
+    }
+    let length = entries.len();
+    let mut source = Vec::new();
+    source
+        .try_reserve_exact(length)
+        .map_err(|_| TraceStoreFailure::resource_exhausted())?;
+    for entry in entries.drain(..) {
+        source.push(Some(entry));
+    }
+    let mut destination = Vec::new();
+    destination
+        .try_reserve_exact(length)
+        .map_err(|_| TraceStoreFailure::resource_exhausted())?;
+    for _ in 0..length {
+        destination.push(None);
+    }
+    let mut width = 1_usize;
+    while width < length {
+        let mut start = 0_usize;
+        while start < length {
+            let middle = start.saturating_add(width).min(length);
+            let end = middle.saturating_add(width).min(length);
+            merge_runs(&mut source, &mut destination, start, middle, end, context)?;
+            start = end;
+        }
+        std::mem::swap(&mut source, &mut destination);
+        width = width
+            .checked_mul(2)
+            .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+    }
+    let mut sorted = Vec::new();
+    sorted
+        .try_reserve_exact(length)
+        .map_err(|_| TraceStoreFailure::resource_exhausted())?;
+    for entry in source {
+        sorted.push(entry.ok_or_else(TraceStoreFailure::invalid_input)?);
+    }
+    Ok(sorted)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn merge_runs(
+    source: &mut [Option<ConsolidationEntry>],
+    destination: &mut [Option<ConsolidationEntry>],
+    start: usize,
+    middle: usize,
+    end: usize,
+    context: &ConsolidationContext<'_>,
+) -> Result<(), TraceStoreFailure> {
+    let mut left = start;
+    let mut right = middle;
+    let mut output = start;
+    while left < middle && right < end {
+        observe_consolidation_unit(context)?;
+        let left_entry = source
+            .get(left)
+            .and_then(Option::as_ref)
+            .ok_or_else(TraceStoreFailure::invalid_input)?;
+        let right_entry = source
+            .get(right)
+            .and_then(Option::as_ref)
+            .ok_or_else(TraceStoreFailure::invalid_input)?;
+        let input = if entry_order(left_entry, right_entry).is_gt() {
+            let input = right;
+            right = right
+                .checked_add(1)
+                .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+            input
         } else {
-            spans.push(LogicalSpan::new(observation)?);
+            let input = left;
+            left = left
+                .checked_add(1)
+                .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+            input
+        };
+        move_entry(source, destination, input, output)?;
+        output = output
+            .checked_add(1)
+            .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+    }
+    while left < middle {
+        observe_consolidation_unit(context)?;
+        move_entry(source, destination, left, output)?;
+        left = left
+            .checked_add(1)
+            .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+        output = output
+            .checked_add(1)
+            .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+    }
+    while right < end {
+        observe_consolidation_unit(context)?;
+        move_entry(source, destination, right, output)?;
+        right = right
+            .checked_add(1)
+            .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+        output = output
+            .checked_add(1)
+            .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+    }
+    Ok(())
+}
+
+fn move_entry(
+    source: &mut [Option<ConsolidationEntry>],
+    destination: &mut [Option<ConsolidationEntry>],
+    input: usize,
+    output: usize,
+) -> Result<(), TraceStoreFailure> {
+    let entry = source
+        .get_mut(input)
+        .and_then(Option::take)
+        .ok_or_else(TraceStoreFailure::invalid_input)?;
+    let slot = destination
+        .get_mut(output)
+        .ok_or_else(TraceStoreFailure::invalid_input)?;
+    if slot.is_some() {
+        return Err(TraceStoreFailure::invalid_input());
+    }
+    *slot = Some(entry);
+    Ok(())
+}
+
+fn group_observations(
+    entries: Vec<ConsolidationEntry>,
+    context: &ConsolidationContext<'_>,
+) -> Result<Vec<LogicalSpan>, TraceStoreFailure> {
+    let mut spans: Vec<LogicalSpan> = Vec::new();
+    spans
+        .try_reserve_exact(entries.len())
+        .map_err(|_| TraceStoreFailure::resource_exhausted())?;
+    let mut active_key: Option<Vec<u8>> = None;
+    for entry in entries {
+        observe_consolidation_unit(context)?;
+        let same_identity = spans
+            .last()
+            .is_some_and(|span| span.has_identity(&entry.observation));
+        let same_variant = same_identity
+            && active_key
+                .as_ref()
+                .is_some_and(|key| *key == entry.semantic_key);
+        if same_variant {
+            spans
+                .last_mut()
+                .ok_or_else(TraceStoreFailure::invalid_input)?
+                .record_last_variant()?;
+        } else if same_identity {
+            active_key = Some(entry.semantic_key);
+            spans
+                .last_mut()
+                .ok_or_else(TraceStoreFailure::invalid_input)?
+                .record_new_variant(entry.observation)?;
+        } else {
+            active_key = Some(entry.semantic_key);
+            spans.push(LogicalSpan::new(entry.observation)?);
         }
     }
     Ok(spans)
+}
+
+fn entry_order(left: &ConsolidationEntry, right: &ConsolidationEntry) -> std::cmp::Ordering {
+    left.observation
+        .observation()
+        .trace_id()
+        .cmp(&right.observation.observation().trace_id())
+        .then_with(|| {
+            left.observation
+                .observation()
+                .span_id()
+                .cmp(&right.observation.observation().span_id())
+        })
+        .then_with(|| left.semantic_key.cmp(&right.semantic_key))
+        .then_with(|| physical_order(&left.observation, &right.observation))
+}
+
+fn physical_order(
+    left: &ScannedSpanObservation,
+    right: &ScannedSpanObservation,
+) -> std::cmp::Ordering {
+    left.commit_position()
+        .cmp(&right.commit_position())
+        .then_with(|| left.record_ordinal().cmp(&right.record_ordinal()))
+}
+
+fn observe_consolidation_unit(context: &ConsolidationContext<'_>) -> Result<(), TraceStoreFailure> {
+    check_cancel(context.cancellation)?;
+    context
+        .observer
+        .observe_work(1)
+        .map_err(TraceStoreFailure::observation)
 }
 
 #[cfg(fuzzing)]
@@ -262,7 +515,15 @@ pub(super) fn fuzz_group_observations(
 ) -> Result<(), TraceStoreFailure> {
     let expected =
         u64::try_from(observations.len()).map_err(|_| TraceStoreFailure::limit_exceeded())?;
-    let spans = group_observations(observations)?;
+    let profile = ValueLimitProfile::release_1_system_maximum();
+    let context = ConsolidationContext {
+        profile: &profile,
+        cancellation: &FuzzNeverCancelled,
+        observer: &FuzzUnobserved,
+    };
+    let entries = entries_with_semantic_keys(observations, &context)?;
+    let entries = interruptible_sort(entries, &context)?;
+    let spans = group_observations(entries, &context)?;
     let counted = spans.iter().try_fold(0_u64, |total, span| {
         if span.structural_representative().is_none()
             || span.variants().iter().any(|variant| {
@@ -281,6 +542,26 @@ pub(super) fn fuzz_group_observations(
         Ok(())
     } else {
         Err(TraceStoreFailure::invalid_input())
+    }
+}
+
+#[cfg(fuzzing)]
+struct FuzzNeverCancelled;
+
+#[cfg(fuzzing)]
+impl ScanCancellation for FuzzNeverCancelled {
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+}
+
+#[cfg(fuzzing)]
+struct FuzzUnobserved;
+
+#[cfg(fuzzing)]
+impl ScanObserver for FuzzUnobserved {
+    fn observe_work(&self, _units: u64) -> Result<(), ScanObservationFailureCode> {
+        Ok(())
     }
 }
 

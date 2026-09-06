@@ -56,7 +56,7 @@ fn committed_span_is_visible_immediately_from_the_active_segment() -> Result<(),
         .with_scanned_bytes(1);
     assert_eq!(between_record.after_record(), Some((marker, ordinal)));
     assert_eq!(between_record.scanned_bytes_limit(), Some(1));
-    let result = store.scan(
+    let result = store.scan_physical(
         authority.governor(),
         tenant,
         &ledger.snapshot()?,
@@ -87,7 +87,7 @@ fn committed_span_is_visible_immediately_from_the_active_segment() -> Result<(),
         result.observations()[0].ingest_time().instant().value(),
         100
     );
-    let observed_result = store.scan_observed(
+    let observed_result = store.scan_physical_observed(
         authority.governor(),
         tenant,
         &ledger.snapshot()?,
@@ -104,7 +104,7 @@ fn committed_span_is_visible_immediately_from_the_active_segment() -> Result<(),
         SegmentScope::new(tenant, SignalKind::Traces, shard),
         SegmentProtectionKey::from_owned(Box::new([0x53; 32])),
     )?;
-    let restarted = store.scan(
+    let restarted = store.scan_physical(
         authority.governor(),
         tenant,
         &ledger.snapshot()?,
@@ -113,7 +113,7 @@ fn committed_span_is_visible_immediately_from_the_active_segment() -> Result<(),
     assert!(restarted.complete());
     assert_eq!(restarted.observations()[0].observation(), &observation);
 
-    let limited = store.scan(
+    let limited = store.scan_physical(
         authority.governor(),
         tenant,
         &ledger.snapshot()?,
@@ -136,7 +136,7 @@ fn committed_span_is_visible_immediately_from_the_active_segment() -> Result<(),
             .payload()
             .len(),
     )?;
-    let exact_bytes = store.scan(
+    let exact_bytes = store.scan_physical(
         authority.governor(),
         tenant,
         &bounded_snapshot,
@@ -144,7 +144,7 @@ fn committed_span_is_visible_immediately_from_the_active_segment() -> Result<(),
     )?;
     assert!(exact_bytes.complete());
     assert_eq!(exact_bytes.scanned_bytes(), block_bytes);
-    let one_over_bytes = store.scan(
+    let one_over_bytes = store.scan_physical(
         authority.governor(),
         tenant,
         &bounded_snapshot,
@@ -153,7 +153,7 @@ fn committed_span_is_visible_immediately_from_the_active_segment() -> Result<(),
     assert!(one_over_bytes.complete());
     assert_eq!(one_over_bytes.scanned_bytes(), block_bytes);
 
-    let after_result = store.scan(
+    let after_result = store.scan_physical(
         authority.governor(),
         tenant,
         &ledger.snapshot()?,
@@ -161,14 +161,14 @@ fn committed_span_is_visible_immediately_from_the_active_segment() -> Result<(),
     )?;
     assert!(after_result.observations().is_empty());
     assert!(after_result.complete());
-    let through_result = store.scan(
+    let through_result = store.scan_physical(
         authority.governor(),
         tenant,
         &ledger.snapshot()?,
         TraceScan::through(ScanLimit::new(1)?, marker),
     )?;
     assert_eq!(through_result.observations().len(), 1);
-    let between_result = store.scan(
+    let between_result = store.scan_physical(
         authority.governor(),
         tenant,
         &ledger.snapshot()?,
@@ -191,7 +191,7 @@ fn committed_span_is_visible_immediately_from_the_active_segment() -> Result<(),
         ),
     ] {
         let failure = store
-            .scan_logical_observed(
+            .scan_observed(
                 authority.governor(),
                 tenant,
                 &ledger.snapshot()?,
@@ -206,7 +206,7 @@ fn committed_span_is_visible_immediately_from_the_active_segment() -> Result<(),
     let before_cancel = authority.governor().inspect()?.outstanding_total();
     let cancellation = AlwaysCancelled;
     let failure = store
-        .scan_logical_observed(
+        .scan_observed(
             authority.governor(),
             tenant,
             &ledger.snapshot()?,

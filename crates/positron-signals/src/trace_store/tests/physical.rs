@@ -55,7 +55,7 @@ fn physical_observations_are_not_deduplicated_at_the_storage_seam() -> Result<()
             )?
             .into_store_block(),
     )?;
-    let result = store.scan(
+    let result = store.scan_physical(
         authority.governor(),
         tenant,
         &ledger.snapshot()?,
@@ -76,7 +76,7 @@ fn physical_observations_are_not_deduplicated_at_the_storage_seam() -> Result<()
     );
     assert_eq!(result.observations()[2].observation(), &conflict);
     drop(result);
-    let logical = store.scan_logical(
+    let logical = store.scan(
         authority.governor(),
         tenant,
         &ledger.snapshot()?,
@@ -104,7 +104,7 @@ fn physical_observations_are_not_deduplicated_at_the_storage_seam() -> Result<()
         &observation
     );
     drop(logical);
-    let byte_limited = store.scan_logical(
+    let byte_limited = store.scan(
         authority.governor(),
         tenant,
         &ledger.snapshot()?,
@@ -117,7 +117,7 @@ fn physical_observations_are_not_deduplicated_at_the_storage_seam() -> Result<()
         TraceIncompleteness::ScannedBytesLimit
     );
     drop(byte_limited);
-    let observed = store.scan_logical_observed(
+    let observed = store.scan_observed(
         authority.governor(),
         tenant,
         &ledger.snapshot()?,
@@ -128,7 +128,7 @@ fn physical_observations_are_not_deduplicated_at_the_storage_seam() -> Result<()
     assert_eq!(observed.spans().len(), 1);
     assert_eq!(observed.decoded_observations(), 3);
     drop(observed);
-    let resumed = store.scan(
+    let resumed = store.scan_physical(
         authority.governor(),
         tenant,
         &ledger.snapshot()?,
@@ -152,7 +152,7 @@ fn physical_observations_are_not_deduplicated_at_the_storage_seam() -> Result<()
         SegmentScope::new(tenant, SignalKind::Traces, shard),
         SegmentProtectionKey::from_owned(Box::new([0x56; 32])),
     )?;
-    let restarted = store.scan_logical(
+    let restarted = store.scan(
         authority.governor(),
         tenant,
         &reopened.snapshot()?,
@@ -226,7 +226,7 @@ fn logical_scan_keeps_distinct_native_value_bits_as_conflicting_variants()
             )?
             .into_store_block(),
     )?;
-    let logical = store.scan_logical(
+    let logical = store.scan(
         authority.governor(),
         tenant,
         &ledger.snapshot()?,
@@ -308,7 +308,7 @@ fn logical_scan_preserves_native_attribute_type_and_namespace_variants()
             )?
             .into_store_block(),
     )?;
-    let logical = store.scan_logical(
+    let logical = store.scan(
         authority.governor(),
         tenant,
         &ledger.snapshot()?,
@@ -318,19 +318,15 @@ fn logical_scan_preserves_native_attribute_type_and_namespace_variants()
     assert_eq!(logical.spans().len(), 1);
     assert_eq!(span.observation_count(), 4);
     assert_eq!(span.variants().len(), 3);
-    assert_eq!(span.variants()[0].observation_count(), 2);
-    assert_eq!(
-        span.variants()[0].observation().observation(),
-        &record_boolean
-    );
-    assert_eq!(
-        span.variants()[1].observation().observation(),
-        &resource_boolean
-    );
-    assert_eq!(
-        span.variants()[2].observation().observation(),
-        &record_string
-    );
+    let variant = |expected: &SpanObservation| {
+        span.variants()
+            .iter()
+            .find(|variant| variant.observation().observation() == expected)
+            .ok_or("missing semantic variant")
+    };
+    assert_eq!(variant(&record_boolean)?.observation_count(), 2);
+    assert_eq!(variant(&resource_boolean)?.observation_count(), 1);
+    assert_eq!(variant(&record_string)?.observation_count(), 1);
     assert!(span.conflicted());
     assert!(span.structurally_incomplete());
     Ok(())
@@ -431,7 +427,7 @@ fn bounded_trace_scan_reports_explicit_result_incompleteness() -> Result<(), Box
             )?
             .into_store_block(),
     )?;
-    let result = store.scan_logical(
+    let result = store.scan(
         authority.governor(),
         tenant,
         &ledger.snapshot()?,
@@ -444,7 +440,7 @@ fn bounded_trace_scan_reports_explicit_result_incompleteness() -> Result<(), Box
         result.incompleteness(),
         super::TraceIncompleteness::ResultLimit
     );
-    let next_result = store.scan_logical(
+    let next_result = store.scan(
         authority.governor(),
         tenant,
         &ledger.snapshot()?,
@@ -453,7 +449,7 @@ fn bounded_trace_scan_reports_explicit_result_incompleteness() -> Result<(), Box
     assert_eq!(next_result.spans().len(), 1);
     assert_eq!(next_result.decoded_observations(), 1);
     assert!(!next_result.complete());
-    let roomy_result = store.scan_logical(
+    let roomy_result = store.scan(
         authority.governor(),
         tenant,
         &ledger.snapshot()?,

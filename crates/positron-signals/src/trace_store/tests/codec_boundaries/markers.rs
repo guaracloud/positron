@@ -180,7 +180,7 @@ fn public_trace_store_round_trip_preserves_markers_in_span_event_and_link_detail
             .windows("source-secret".len())
             .any(|window| window == b"source-secret")
     );
-    let result = store.scan_logical(
+    let result = store.scan(
         authority.governor(),
         tenant,
         &snapshot,
@@ -321,7 +321,7 @@ fn public_trace_store_reopen_preserves_scalar_marker_kinds_and_actions()
     drop(ledger);
 
     let reopened = ActiveSegmentLedger::open(&authority, &catalog, scope, key)?;
-    let result = TraceStore::new().scan(
+    let result = TraceStore::new().scan_physical(
         authority.governor(),
         tenant,
         &reopened.snapshot()?,
@@ -522,7 +522,7 @@ fn public_trace_store_reads_independent_literal_v1_and_v2_blocks() -> Result<(),
             StoreBlockIdentity::new([u8::try_from(0x70 + index)?; 16])?,
             fixture,
         )?)?;
-        let result = TraceStore::new().scan(
+        let result = TraceStore::new().scan_physical(
             authority.governor(),
             tenant,
             &ledger.snapshot()?,

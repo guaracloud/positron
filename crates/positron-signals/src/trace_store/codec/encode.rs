@@ -45,8 +45,40 @@ fn encode_observation(
     stored: &StoredSpanObservation,
     profile: &ValueLimitProfile,
 ) -> Result<(), TraceStoreFailure> {
+    encode_semantic_observation(output, stored.observation(), profile)?;
+    put_i64(output, stored.ingest_time().instant().value())
+}
+
+/// Encodes the complete immutable native observation without its per-commit
+/// ingest time. These bytes are an exact, collision-free semantic key for
+/// logical retry consolidation: retry metadata is excluded while every native
+/// value distinction remains present.
+pub(crate) fn encode_semantic_observation_with_profile(
+    profile: &ValueLimitProfile,
+    observation: &super::super::observation::SpanObservation,
+) -> Result<Vec<u8>, TraceStoreFailure> {
+    let encoded = encoded_record_bytes_with_limits(observation, &limits_for(profile)?)?;
+    let expected = encoded
+        .checked_sub(8)
+        .ok_or_else(TraceStoreFailure::invalid_input)?;
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(expected)
+        .map_err(|_| TraceStoreFailure::resource_exhausted())?;
+    encode_semantic_observation(&mut output, observation, profile)?;
+    if output.len() == expected {
+        Ok(output)
+    } else {
+        Err(TraceStoreFailure::invalid_input())
+    }
+}
+
+fn encode_semantic_observation(
+    output: &mut Vec<u8>,
+    observation: &super::super::observation::SpanObservation,
+    profile: &ValueLimitProfile,
+) -> Result<(), TraceStoreFailure> {
     let limits = limits_for(profile)?;
-    let observation = stored.observation();
     put_slice(output, &observation.trace_id())?;
     put_slice(output, &observation.span_id())?;
     match observation.parent_span_id() {
@@ -105,7 +137,6 @@ fn encode_observation(
     for rule in policy.applied_rules() {
         put_bytes(output, rule.as_bytes())?;
     }
-    put_i64(output, stored.ingest_time().instant().value())?;
     Ok(())
 }
 

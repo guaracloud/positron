@@ -211,14 +211,13 @@ impl<'kernel> TraceScanResult<'kernel> {
         self.retained_size_bytes
     }
 
-    /// Consolidates this bounded physical scan into logical spans.
-    ///
-    /// Every committed observation stays represented by a semantic variant
-    /// count. Conflicting variants remain visible, and their first committed
-    /// observation is deterministic because physical observations are sorted
-    /// by identity and commit position before grouping.
-    pub fn into_logical_spans(
+    /// Consolidates this bounded physical scan into logical spans while
+    /// retaining the caller's cancellation and work-accounting capabilities.
+    fn into_logical_spans(
         self,
+        profile: &ValueLimitProfile,
+        cancellation: &dyn ScanCancellation,
+        observer: &dyn ScanObserver,
     ) -> Result<super::LogicalTraceScanResult<'kernel>, TraceStoreFailure> {
         let Self {
             observations,
@@ -236,6 +235,11 @@ impl<'kernel> TraceScanResult<'kernel> {
             scanned_bytes_limited,
             retained_size_bytes,
             _capacity,
+            super::consolidation::ConsolidationContext {
+                profile,
+                cancellation,
+                observer,
+            },
         )
     }
 }
@@ -291,14 +295,14 @@ impl std::ops::Deref for ScannedSpanObservation {
 }
 
 impl super::TraceStore {
-    /// Scans authenticated committed observations from active and sealed segments.
+    /// Scans the normal consolidated Trace Store view for one authenticated snapshot.
     pub fn scan<'kernel>(
         &self,
         governor: ResourceGovernor<'kernel>,
         tenant: TenantId,
         snapshot: &LedgerSnapshot<'_>,
         scan: TraceScan,
-    ) -> Result<TraceScanResult<'kernel>, TraceStoreFailure> {
+    ) -> Result<super::LogicalTraceScanResult<'kernel>, TraceStoreFailure> {
         let profile = ValueLimitProfile::release_1_system_maximum();
         self.scan_observed_with_profile(
             &profile,
@@ -311,38 +315,28 @@ impl super::TraceStore {
         )
     }
 
-    /// Scans the normal logical Trace Store view for one authenticated snapshot.
-    ///
-    /// Raw observations remain available through [`Self::scan`] for diagnostic
-    /// expansion. Normal trace results coalesce identical retries and retain
-    /// conflicting semantic variants without overwrite fiction.
-    pub fn scan_logical<'kernel>(
+    /// Scans raw authenticated observations for diagnostic expansion.
+    pub fn scan_physical<'kernel>(
         &self,
         governor: ResourceGovernor<'kernel>,
         tenant: TenantId,
         snapshot: &LedgerSnapshot<'_>,
         scan: TraceScan,
-    ) -> Result<super::LogicalTraceScanResult<'kernel>, TraceStoreFailure> {
-        self.scan(governor, tenant, snapshot, scan)?
-            .into_logical_spans()
+    ) -> Result<TraceScanResult<'kernel>, TraceStoreFailure> {
+        let profile = ValueLimitProfile::release_1_system_maximum();
+        self.scan_physical_observed_with_profile(
+            &profile,
+            governor,
+            tenant,
+            snapshot,
+            scan,
+            &NeverCancelled,
+            &Unobserved,
+        )
     }
 
-    /// Scans the normal logical view with caller-owned cancellation and work budgets.
+    /// Scans the normal consolidated view with caller-owned cancellation and work budgets.
     #[allow(clippy::too_many_arguments)]
-    pub fn scan_logical_observed<'kernel>(
-        &self,
-        governor: ResourceGovernor<'kernel>,
-        tenant: TenantId,
-        snapshot: &LedgerSnapshot<'_>,
-        scan: TraceScan,
-        cancellation: &dyn ScanCancellation,
-        observer: &dyn ScanObserver,
-    ) -> Result<super::LogicalTraceScanResult<'kernel>, TraceStoreFailure> {
-        self.scan_observed(governor, tenant, snapshot, scan, cancellation, observer)?
-            .into_logical_spans()
-    }
-
-    /// Scans with cooperative cancellation and caller-owned bounded work observation.
     pub fn scan_observed<'kernel>(
         &self,
         governor: ResourceGovernor<'kernel>,
@@ -351,7 +345,7 @@ impl super::TraceStore {
         scan: TraceScan,
         cancellation: &dyn ScanCancellation,
         observer: &dyn ScanObserver,
-    ) -> Result<TraceScanResult<'kernel>, TraceStoreFailure> {
+    ) -> Result<super::LogicalTraceScanResult<'kernel>, TraceStoreFailure> {
         let profile = ValueLimitProfile::release_1_system_maximum();
         self.scan_observed_with_profile(
             &profile,
@@ -364,9 +358,55 @@ impl super::TraceStore {
         )
     }
 
-    /// Scans using one pinned effective value profile for decode and retained output.
+    /// Scans raw observations with cooperative cancellation and caller-owned work observation.
+    pub fn scan_physical_observed<'kernel>(
+        &self,
+        governor: ResourceGovernor<'kernel>,
+        tenant: TenantId,
+        snapshot: &LedgerSnapshot<'_>,
+        scan: TraceScan,
+        cancellation: &dyn ScanCancellation,
+        observer: &dyn ScanObserver,
+    ) -> Result<TraceScanResult<'kernel>, TraceStoreFailure> {
+        let profile = ValueLimitProfile::release_1_system_maximum();
+        self.scan_physical_observed_with_profile(
+            &profile,
+            governor,
+            tenant,
+            snapshot,
+            scan,
+            cancellation,
+            observer,
+        )
+    }
+
+    /// Scans the normal consolidated view using one pinned effective value profile.
     #[allow(clippy::too_many_arguments)]
     pub fn scan_observed_with_profile<'kernel>(
+        &self,
+        profile: &ValueLimitProfile,
+        governor: ResourceGovernor<'kernel>,
+        tenant: TenantId,
+        snapshot: &LedgerSnapshot<'_>,
+        scan: TraceScan,
+        cancellation: &dyn ScanCancellation,
+        observer: &dyn ScanObserver,
+    ) -> Result<super::LogicalTraceScanResult<'kernel>, TraceStoreFailure> {
+        self.scan_physical_observed_with_profile(
+            profile,
+            governor,
+            tenant,
+            snapshot,
+            scan,
+            cancellation,
+            observer,
+        )?
+        .into_logical_spans(profile, cancellation, observer)
+    }
+
+    /// Scans raw observations using one pinned effective value profile.
+    #[allow(clippy::too_many_arguments)]
+    pub fn scan_physical_observed_with_profile<'kernel>(
         &self,
         profile: &ValueLimitProfile,
         governor: ResourceGovernor<'kernel>,
@@ -544,7 +584,7 @@ fn skipped_records(scan: TraceScan, position: CommitPosition) -> usize {
         .unwrap_or(0)
 }
 
-fn check_cancel(cancellation: &dyn ScanCancellation) -> Result<(), TraceStoreFailure> {
+pub(super) fn check_cancel(cancellation: &dyn ScanCancellation) -> Result<(), TraceStoreFailure> {
     if cancellation.is_cancelled() {
         Err(TraceStoreFailure::cancelled())
     } else {

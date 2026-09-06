@@ -98,7 +98,7 @@ fn sealed_and_successor_active_segments_have_equivalent_trace_scan_visibility()
             )?
             .into_store_block(),
     )?;
-    let result = store.scan(
+    let result = store.scan_physical(
         authority.governor(),
         tenant,
         &successor.snapshot()?,

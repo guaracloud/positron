@@ -15,6 +15,7 @@ pub(super) use decode::BlockDecode;
 #[cfg(any(test, fuzzing))]
 pub(super) use encode::encode_block;
 pub(super) use encode::encode_block_with_profile;
+pub(super) use encode::encode_semantic_observation_with_profile;
 pub(super) use encoded_size::encoded_record_bytes_with_profile;
 pub(super) use format::{MAX_RECORDS, namespace_index};
 

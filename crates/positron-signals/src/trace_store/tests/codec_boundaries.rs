@@ -132,7 +132,10 @@ fn trace_blocks_round_trip_native_typed_values_and_source_time_fallback()
         &ledger.snapshot()?,
         TraceScan::all(ScanLimit::new(1)?),
     )?;
-    let scanned = result.observations().first().ok_or("missing typed span")?;
+    let span = result.spans().first().ok_or("missing typed span")?;
+    let scanned = span
+        .structural_representative()
+        .ok_or("missing typed structural representative")?;
     let actual = scanned.observation();
     assert_eq!(actual, &observation);
     assert_eq!(actual.start_time().source_value(), Some(u64::MAX));
