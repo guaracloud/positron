@@ -249,6 +249,171 @@ fn consolidation_observes_post_decode_budget_and_cancellation_without_reservatio
 }
 
 #[test]
+fn maximum_native_payload_budget_interrupts_semantic_key_construction() -> Result<(), Box<dyn Error>>
+{
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x96; 16])?,
+        CatalogSecret::from_owned(Box::new([0xa6; 32]), Box::new([0xb6; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let shard = VirtualShardId::new(16)?;
+    let ledger = ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        SegmentScope::new(tenant, SignalKind::Traces, shard),
+        SegmentProtectionKey::from_owned(Box::new([0xc6; 32])),
+    )?;
+    let attribute = |last_byte| {
+        let mut bytes = vec![0x11; 65_535];
+        bytes.push(last_byte);
+        AttributeOccurrenceSetCandidate::new(
+            AttributeNamespace::Record,
+            "payload".to_owned(),
+            vec![CandidateAttributeValue::bytes(bytes)],
+        )
+        .validate(ValueLimitProfile::release_1_system_maximum())
+    };
+    let observation = |attributes| {
+        SpanObservation::checked_native(
+            [0xd6; 16],
+            [0xe6; 8],
+            None,
+            "maximum-payload".to_owned(),
+            EventTime::missing(),
+            EventTime::missing(),
+            attributes,
+            SpanKind::Internal,
+            SamplingDecision::Unknown,
+            positron_policy::PolicyProvenance::new(1, [0xf6; 32], Vec::new())?,
+        )
+    };
+    let first = observation(vec![attribute(0x11)?])?;
+    let second = observation(vec![attribute(0x12)?])?;
+    let store = TraceStore::new();
+    ledger.append(
+        store
+            .prepare_unretained_for_test(
+                preparation_capacity(&authority, tenant)?,
+                &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
+                tenant,
+                shard,
+                positron_kernel::StoreBlockIdentity::new([0x46; 16])?,
+                vec![first, second],
+            )?
+            .into_store_block(),
+    )?;
+    let decode_work = WorkBudget::unlimited();
+    let physical = store.scan_physical_observed(
+        authority.governor(),
+        tenant,
+        &ledger.snapshot()?,
+        TraceScan::all(ScanLimit::new(2)?),
+        &NeverCancelled,
+        &decode_work,
+    )?;
+    drop(physical);
+    let maximum_inline_work = decode_work
+        .work()
+        .checked_add(16)
+        .ok_or("work limit overflow")?;
+    let constrained = WorkBudget::exact(maximum_inline_work);
+    let before = authority.governor().inspect()?.outstanding_total();
+    let failure = store
+        .scan_observed(
+            authority.governor(),
+            tenant,
+            &ledger.snapshot()?,
+            TraceScan::all(ScanLimit::new(2)?),
+            &NeverCancelled,
+            &constrained,
+        )
+        .expect_err("maximum payload key construction must charge bounded work");
+    assert_eq!(failure.code(), TraceStoreFailureCode::BudgetExhausted);
+    assert_eq!(constrained.work(), maximum_inline_work);
+    assert_eq!(authority.governor().inspect()?.outstanding_total(), before);
+    Ok(())
+}
+
+#[test]
+fn tight_governor_refuses_logical_consolidation_before_extra_sort_buffers_allocate()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x97; 16])?,
+        CatalogSecret::from_owned(Box::new([0xa7; 32]), Box::new([0xb7; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let shard = VirtualShardId::new(17)?;
+    let ledger = ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        SegmentScope::new(tenant, SignalKind::Traces, shard),
+        SegmentProtectionKey::from_owned(Box::new([0xc7; 32])),
+    )?;
+    let observation = SpanObservation::checked_native(
+        [0xd7; 16],
+        [0xe7; 8],
+        None,
+        "tight-governor".to_owned(),
+        EventTime::missing(),
+        EventTime::missing(),
+        Vec::new(),
+        SpanKind::Internal,
+        SamplingDecision::Unknown,
+        positron_policy::PolicyProvenance::new(1, [0xf7; 32], Vec::new())?,
+    )?;
+    let store = TraceStore::new();
+    ledger.append(
+        store
+            .prepare_unretained_for_test(
+                preparation_capacity(&authority, tenant)?,
+                &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
+                tenant,
+                shard,
+                positron_kernel::StoreBlockIdentity::new([0x47; 16])?,
+                vec![observation; 512],
+            )?
+            .into_store_block(),
+    )?;
+    let held = authority.governor().reserve(WorkClaim::tenant(
+        tenant,
+        WorkKind::Ingest,
+        ResourceAmounts::only(ResourceDimension::MemoryBytes, 4_000_000)?,
+    )?)?;
+    let before = authority.governor().inspect()?.outstanding_total();
+    let refusal = store
+        .scan(
+            authority.governor(),
+            tenant,
+            &ledger.snapshot()?,
+            TraceScan::all(ScanLimit::new(512)?),
+        )
+        .expect_err("logical scan must admit its complete sort peak before allocating");
+    assert_eq!(
+        refusal.code(),
+        TraceStoreFailureCode::ResourceAdmissionRefused
+    );
+    assert_eq!(authority.governor().inspect()?.outstanding_total(), before);
+    drop(held);
+    let complete = store.scan(
+        authority.governor(),
+        tenant,
+        &ledger.snapshot()?,
+        TraceScan::all(ScanLimit::new(512)?),
+    )?;
+    assert_eq!(complete.spans().len(), 1);
+    assert_eq!(complete.spans()[0].observation_count(), 512);
+    Ok(())
+}
+
+#[test]
 fn policy_rules_consume_their_exact_scan_work_budget() -> Result<(), Box<dyn Error>> {
     let root = TemporaryRoot::new()?;
     let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;

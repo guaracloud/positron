@@ -324,7 +324,6 @@ fn public_trace_store_seam_commits_and_reads_a_native_observation() -> Result<()
     let span = logical.spans().first().ok_or("missing logical span")?;
     assert_eq!(span.observation_count(), 1);
     assert!(!span.conflicted());
-    assert!(!span.structurally_incomplete());
     assert_eq!(span.variants().len(), 1);
     assert_eq!(
         span.structural_representative()

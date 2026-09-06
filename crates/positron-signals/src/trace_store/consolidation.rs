@@ -6,6 +6,8 @@ use crate::{ScanCancellation, ScanObserver};
 use positron_domain::value::ValueLimitProfile;
 use positron_kernel::ResourceReservation;
 
+const SEMANTIC_KEY_WORK_CHUNK_BYTES: usize = 4_096;
+
 struct ConsolidationEntry {
     observation: ScannedSpanObservation,
     semantic_key: Vec<u8>,
@@ -146,15 +148,12 @@ impl LogicalSpan {
     }
 
     /// Returns whether this identity has more than one semantic observation.
+    ///
+    /// A conflict leaves all variants queryable and makes later structural
+    /// analysis unable to select one authoritative observation on this fact.
     #[must_use]
     pub fn conflicted(&self) -> bool {
         self.variants.len() > 1
-    }
-
-    /// Conflicting variants make structural analysis explicitly incomplete.
-    #[must_use]
-    pub fn structurally_incomplete(&self) -> bool {
-        self.conflicted()
     }
 
     /// Returns the deterministic earliest committed structural representative.
@@ -274,6 +273,7 @@ fn consolidation_staging_bytes(
         .checked_add(key_bytes)
         .and_then(|bytes| bytes.checked_add(entry_slots))
         .and_then(|bytes| bytes.checked_add(scratch_slots))
+        .and_then(|bytes| bytes.checked_add(scratch_slots))
         .and_then(|bytes| bytes.checked_add(maximum_container_bytes))
         .ok_or_else(TraceStoreFailure::limit_exceeded)?;
     Ok(staging_bytes)
@@ -299,9 +299,11 @@ fn entries_with_semantic_keys(
         .map_err(|_| TraceStoreFailure::resource_exhausted())?;
     for observation in observations {
         observe_consolidation_unit(context)?;
-        let semantic_key = super::codec::encode_semantic_observation_with_profile(
+        let semantic_key = super::codec::encode_semantic_observation_with_profile_observed(
             context.profile,
             observation.observation(),
+            context.cancellation,
+            context.observer,
         )?;
         entries.push(ConsolidationEntry {
             observation,
@@ -314,10 +316,7 @@ fn entries_with_semantic_keys(
 fn interruptible_sort(
     mut entries: Vec<ConsolidationEntry>,
     context: &ConsolidationContext<'_>,
-) -> Result<Vec<ConsolidationEntry>, TraceStoreFailure> {
-    if entries.len() < 2 {
-        return Ok(entries);
-    }
+) -> Result<Vec<Option<ConsolidationEntry>>, TraceStoreFailure> {
     let length = entries.len();
     let mut source = Vec::new();
     source
@@ -325,6 +324,9 @@ fn interruptible_sort(
         .map_err(|_| TraceStoreFailure::resource_exhausted())?;
     for entry in entries.drain(..) {
         source.push(Some(entry));
+    }
+    if length < 2 {
+        return Ok(source);
     }
     let mut destination = Vec::new();
     destination
@@ -347,14 +349,7 @@ fn interruptible_sort(
             .checked_mul(2)
             .ok_or_else(TraceStoreFailure::limit_exceeded)?;
     }
-    let mut sorted = Vec::new();
-    sorted
-        .try_reserve_exact(length)
-        .map_err(|_| TraceStoreFailure::resource_exhausted())?;
-    for entry in source {
-        sorted.push(entry.ok_or_else(TraceStoreFailure::invalid_input)?);
-    }
-    Ok(sorted)
+    Ok(source)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -379,7 +374,7 @@ fn merge_runs(
             .get(right)
             .and_then(Option::as_ref)
             .ok_or_else(TraceStoreFailure::invalid_input)?;
-        let input = if entry_order(left_entry, right_entry).is_gt() {
+        let input = if entry_order(left_entry, right_entry, context)?.is_gt() {
             let input = right;
             right = right
                 .checked_add(1)
@@ -441,7 +436,7 @@ fn move_entry(
 }
 
 fn group_observations(
-    entries: Vec<ConsolidationEntry>,
+    entries: Vec<Option<ConsolidationEntry>>,
     context: &ConsolidationContext<'_>,
 ) -> Result<Vec<LogicalSpan>, TraceStoreFailure> {
     let mut spans: Vec<LogicalSpan> = Vec::new();
@@ -450,14 +445,15 @@ fn group_observations(
         .map_err(|_| TraceStoreFailure::resource_exhausted())?;
     let mut active_key: Option<Vec<u8>> = None;
     for entry in entries {
+        let entry = entry.ok_or_else(TraceStoreFailure::invalid_input)?;
         observe_consolidation_unit(context)?;
         let same_identity = spans
             .last()
             .is_some_and(|span| span.has_identity(&entry.observation));
-        let same_variant = same_identity
-            && active_key
-                .as_ref()
-                .is_some_and(|key| *key == entry.semantic_key);
+        let same_variant = match (same_identity, active_key.as_ref()) {
+            (true, Some(key)) => semantic_key_order(key, &entry.semantic_key, context)?.is_eq(),
+            _ => false,
+        };
         if same_variant {
             spans
                 .last_mut()
@@ -477,8 +473,13 @@ fn group_observations(
     Ok(spans)
 }
 
-fn entry_order(left: &ConsolidationEntry, right: &ConsolidationEntry) -> std::cmp::Ordering {
-    left.observation
+fn entry_order(
+    left: &ConsolidationEntry,
+    right: &ConsolidationEntry,
+    context: &ConsolidationContext<'_>,
+) -> Result<std::cmp::Ordering, TraceStoreFailure> {
+    let identity_order = left
+        .observation
         .observation()
         .trace_id()
         .cmp(&right.observation.observation().trace_id())
@@ -487,9 +488,44 @@ fn entry_order(left: &ConsolidationEntry, right: &ConsolidationEntry) -> std::cm
                 .observation()
                 .span_id()
                 .cmp(&right.observation.observation().span_id())
-        })
-        .then_with(|| left.semantic_key.cmp(&right.semantic_key))
-        .then_with(|| physical_order(&left.observation, &right.observation))
+        });
+    if !identity_order.is_eq() {
+        return Ok(identity_order);
+    }
+    let semantic_order = semantic_key_order(&left.semantic_key, &right.semantic_key, context)?;
+    if !semantic_order.is_eq() {
+        return Ok(semantic_order);
+    }
+    Ok(physical_order(&left.observation, &right.observation))
+}
+
+fn semantic_key_order(
+    left: &[u8],
+    right: &[u8],
+    context: &ConsolidationContext<'_>,
+) -> Result<std::cmp::Ordering, TraceStoreFailure> {
+    let shared = left.len().min(right.len());
+    let mut offset = 0_usize;
+    while offset < shared {
+        observe_consolidation_unit(context)?;
+        let end = offset
+            .checked_add(SEMANTIC_KEY_WORK_CHUNK_BYTES)
+            .map(|end| end.min(shared))
+            .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+        let order = left
+            .get(offset..end)
+            .ok_or_else(TraceStoreFailure::invalid_input)?
+            .cmp(
+                right
+                    .get(offset..end)
+                    .ok_or_else(TraceStoreFailure::invalid_input)?,
+            );
+        if !order.is_eq() {
+            return Ok(order);
+        }
+        offset = end;
+    }
+    Ok(left.len().cmp(&right.len()))
 }
 
 fn physical_order(

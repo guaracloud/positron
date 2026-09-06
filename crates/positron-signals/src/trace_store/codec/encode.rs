@@ -2,6 +2,8 @@ use positron_domain::identity::TenantId;
 use positron_domain::time::EventTime;
 use positron_domain::value::{AttributeValueKind, MarkerAction, ValueLimitProfile};
 
+use crate::{ScanCancellation, ScanObserver};
+
 use super::super::details::{SpanAttributeSet, SpanEvent, SpanLink, SpanObservationDetails};
 use super::super::failure::TraceStoreFailure;
 use super::super::types::{StoredSpanObservation, TraceLimits, limits_for};
@@ -10,6 +12,43 @@ use super::format::{
     MAGIC, MAX_BLOCK_BYTES, MAX_RECORDS, OUT_OF_RANGE_TIME_TAG, VERSION, kind_tag, namespace_tag,
     quality_tag, sampling_tag, status_tag,
 };
+
+const SEMANTIC_KEY_WORK_CHUNK_BYTES: usize = 4_096;
+
+trait EncodeOutput {
+    fn put_slice(&mut self, value: &[u8]) -> Result<(), TraceStoreFailure>;
+}
+
+impl EncodeOutput for Vec<u8> {
+    fn put_slice(&mut self, value: &[u8]) -> Result<(), TraceStoreFailure> {
+        put_slice(self, value)
+    }
+}
+
+struct ObservedSemanticOutput<'a> {
+    bytes: Vec<u8>,
+    cancellation: &'a dyn ScanCancellation,
+    observer: &'a dyn ScanObserver,
+}
+
+impl ObservedSemanticOutput<'_> {
+    fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+impl EncodeOutput for ObservedSemanticOutput<'_> {
+    fn put_slice(&mut self, value: &[u8]) -> Result<(), TraceStoreFailure> {
+        for chunk in value.chunks(SEMANTIC_KEY_WORK_CHUNK_BYTES) {
+            super::super::scan::check_cancel(self.cancellation)?;
+            self.observer
+                .observe_work(1)
+                .map_err(TraceStoreFailure::observation)?;
+            put_slice(&mut self.bytes, chunk)?;
+        }
+        Ok(())
+    }
+}
 
 #[cfg(any(test, fuzzing))]
 pub(crate) fn encode_block(
@@ -40,8 +79,8 @@ pub(crate) fn encode_block_with_profile(
     Ok(output)
 }
 
-fn encode_observation(
-    output: &mut Vec<u8>,
+fn encode_observation<O: EncodeOutput>(
+    output: &mut O,
     stored: &StoredSpanObservation,
     profile: &ValueLimitProfile,
 ) -> Result<(), TraceStoreFailure> {
@@ -53,19 +92,23 @@ fn encode_observation(
 /// ingest time. These bytes are an exact, collision-free semantic key for
 /// logical retry consolidation: retry metadata is excluded while every native
 /// value distinction remains present.
-pub(crate) fn encode_semantic_observation_with_profile(
+pub(crate) fn encode_semantic_observation_with_profile_observed(
     profile: &ValueLimitProfile,
     observation: &super::super::observation::SpanObservation,
+    cancellation: &dyn ScanCancellation,
+    observer: &dyn ScanObserver,
 ) -> Result<Vec<u8>, TraceStoreFailure> {
     let encoded = encoded_record_bytes_with_limits(observation, &limits_for(profile)?)?;
     let expected = encoded
         .checked_sub(8)
         .ok_or_else(TraceStoreFailure::invalid_input)?;
-    let mut output = Vec::new();
-    output
-        .try_reserve_exact(expected)
-        .map_err(|_| TraceStoreFailure::resource_exhausted())?;
+    let mut output = ObservedSemanticOutput {
+        bytes: Vec::new(),
+        cancellation,
+        observer,
+    };
     encode_semantic_observation(&mut output, observation, profile)?;
+    let output = output.into_bytes();
     if output.len() == expected {
         Ok(output)
     } else {
@@ -73,18 +116,18 @@ pub(crate) fn encode_semantic_observation_with_profile(
     }
 }
 
-fn encode_semantic_observation(
-    output: &mut Vec<u8>,
+fn encode_semantic_observation<O: EncodeOutput>(
+    output: &mut O,
     observation: &super::super::observation::SpanObservation,
     profile: &ValueLimitProfile,
 ) -> Result<(), TraceStoreFailure> {
     let limits = limits_for(profile)?;
-    put_slice(output, &observation.trace_id())?;
-    put_slice(output, &observation.span_id())?;
+    output.put_slice(&observation.trace_id())?;
+    output.put_slice(&observation.span_id())?;
     match observation.parent_span_id() {
         Some(parent) => {
             put_u8(output, 1)?;
-            put_slice(output, &parent)?;
+            output.put_slice(&parent)?;
         },
         None => put_u8(output, 0)?,
     }
@@ -132,7 +175,7 @@ fn encode_semantic_observation(
     encode_details(output, observation.details(), &limits)?;
     let policy = observation.policy_provenance();
     put_u64(output, policy.generation())?;
-    put_slice(output, &policy.digest())?;
+    output.put_slice(&policy.digest())?;
     put_count(output, policy.applied_rules().len())?;
     for rule in policy.applied_rules() {
         put_bytes(output, rule.as_bytes())?;
@@ -140,8 +183,8 @@ fn encode_semantic_observation(
     Ok(())
 }
 
-fn encode_details(
-    output: &mut Vec<u8>,
+fn encode_details<O: EncodeOutput>(
+    output: &mut O,
     details: &SpanObservationDetails,
     limits: &TraceLimits,
 ) -> Result<(), TraceStoreFailure> {
@@ -180,8 +223,8 @@ fn encode_details(
     Ok(())
 }
 
-fn encode_event(
-    output: &mut Vec<u8>,
+fn encode_event<O: EncodeOutput>(
+    output: &mut O,
     event: &SpanEvent,
     limits: &TraceLimits,
 ) -> Result<(), TraceStoreFailure> {
@@ -194,24 +237,24 @@ fn encode_event(
     encode_span_attributes(output, event.attributes(), limits)
 }
 
-fn encode_link(
-    output: &mut Vec<u8>,
+fn encode_link<O: EncodeOutput>(
+    output: &mut O,
     link: &SpanLink,
     limits: &TraceLimits,
 ) -> Result<(), TraceStoreFailure> {
     if link.trace_state().len() > limits.key_path_bytes {
         return Err(TraceStoreFailure::limit_exceeded());
     }
-    put_slice(output, &link.trace_id())?;
-    put_slice(output, &link.span_id())?;
+    output.put_slice(&link.trace_id())?;
+    output.put_slice(&link.span_id())?;
     put_bytes(output, link.trace_state().as_bytes())?;
     put_u32(output, link.flags())?;
     put_u32(output, link.dropped_attributes_count())?;
     encode_span_attributes(output, link.attributes(), limits)
 }
 
-fn encode_span_attributes(
-    output: &mut Vec<u8>,
+fn encode_span_attributes<O: EncodeOutput>(
+    output: &mut O,
     attributes: &[SpanAttributeSet],
     limits: &TraceLimits,
 ) -> Result<(), TraceStoreFailure> {
@@ -240,7 +283,7 @@ fn encode_span_attributes(
     Ok(())
 }
 
-fn encode_time(output: &mut Vec<u8>, time: EventTime) -> Result<(), TraceStoreFailure> {
+fn encode_time<O: EncodeOutput>(output: &mut O, time: EventTime) -> Result<(), TraceStoreFailure> {
     if let Some(value) = time.source_value().filter(|value| *value > i64::MAX as u64) {
         put_u8(output, OUT_OF_RANGE_TIME_TAG)?;
         put_u64(output, value)?;
@@ -253,8 +296,8 @@ fn encode_time(output: &mut Vec<u8>, time: EventTime) -> Result<(), TraceStoreFa
     Ok(())
 }
 
-fn encode_value(
-    output: &mut Vec<u8>,
+fn encode_value<O: EncodeOutput>(
+    output: &mut O,
     value: &positron_domain::value::ValidatedAttributeValue,
     depth: u8,
     limits: &TraceLimits,
@@ -421,33 +464,33 @@ pub(crate) fn put_slice(output: &mut Vec<u8>, value: &[u8]) -> Result<(), TraceS
     Ok(())
 }
 
-fn put_u8(output: &mut Vec<u8>, value: u8) -> Result<(), TraceStoreFailure> {
-    put_slice(output, &[value])
+fn put_u8<O: EncodeOutput>(output: &mut O, value: u8) -> Result<(), TraceStoreFailure> {
+    output.put_slice(&[value])
 }
 
-fn put_u16(output: &mut Vec<u8>, value: u16) -> Result<(), TraceStoreFailure> {
-    put_slice(output, &value.to_be_bytes())
+fn put_u16<O: EncodeOutput>(output: &mut O, value: u16) -> Result<(), TraceStoreFailure> {
+    output.put_slice(&value.to_be_bytes())
 }
 
-fn put_u32(output: &mut Vec<u8>, value: u32) -> Result<(), TraceStoreFailure> {
-    put_slice(output, &value.to_be_bytes())
+fn put_u32<O: EncodeOutput>(output: &mut O, value: u32) -> Result<(), TraceStoreFailure> {
+    output.put_slice(&value.to_be_bytes())
 }
 
-fn put_count(output: &mut Vec<u8>, count: usize) -> Result<(), TraceStoreFailure> {
+fn put_count<O: EncodeOutput>(output: &mut O, count: usize) -> Result<(), TraceStoreFailure> {
     let count = u16::try_from(count).map_err(|_| TraceStoreFailure::limit_exceeded())?;
     put_u16(output, count)
 }
 
-fn put_u64(output: &mut Vec<u8>, value: u64) -> Result<(), TraceStoreFailure> {
-    put_slice(output, &value.to_be_bytes())
+fn put_u64<O: EncodeOutput>(output: &mut O, value: u64) -> Result<(), TraceStoreFailure> {
+    output.put_slice(&value.to_be_bytes())
 }
 
-fn put_i64(output: &mut Vec<u8>, value: i64) -> Result<(), TraceStoreFailure> {
-    put_slice(output, &value.to_be_bytes())
+fn put_i64<O: EncodeOutput>(output: &mut O, value: i64) -> Result<(), TraceStoreFailure> {
+    output.put_slice(&value.to_be_bytes())
 }
 
-fn put_bytes(output: &mut Vec<u8>, value: &[u8]) -> Result<(), TraceStoreFailure> {
+fn put_bytes<O: EncodeOutput>(output: &mut O, value: &[u8]) -> Result<(), TraceStoreFailure> {
     let length = u32::try_from(value.len()).map_err(|_| TraceStoreFailure::limit_exceeded())?;
-    put_slice(output, &length.to_be_bytes())?;
-    put_slice(output, value)
+    output.put_slice(&length.to_be_bytes())?;
+    output.put_slice(value)
 }

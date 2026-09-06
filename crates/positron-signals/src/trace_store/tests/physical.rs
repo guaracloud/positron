@@ -1,4 +1,8 @@
 use super::*;
+use crate::{
+    SpanEvent, SpanLink, SpanObservationDetails, SpanResourceMetadata, SpanScopeMetadata,
+    SpanStatus, SpanStatusCode,
+};
 
 #[test]
 fn physical_observations_are_not_deduplicated_at_the_storage_seam() -> Result<(), Box<dyn Error>> {
@@ -91,7 +95,6 @@ fn physical_observations_are_not_deduplicated_at_the_storage_seam() -> Result<()
     assert_eq!(span.span_id(), [0x32; 8]);
     assert_eq!(span.observation_count(), 3);
     assert!(span.conflicted());
-    assert!(span.structurally_incomplete());
     assert_eq!(span.variants().len(), 2);
     assert_eq!(span.variants()[0].observation_count(), 2);
     assert_eq!(span.variants()[0].observation().observation(), &observation);
@@ -328,7 +331,133 @@ fn logical_scan_preserves_native_attribute_type_and_namespace_variants()
     assert_eq!(variant(&resource_boolean)?.observation_count(), 1);
     assert_eq!(variant(&record_string)?.observation_count(), 1);
     assert!(span.conflicted());
-    assert!(span.structurally_incomplete());
+    Ok(())
+}
+
+#[test]
+fn logical_scan_preserves_event_link_and_provenance_only_conflicts() -> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x29; 16])?,
+        CatalogSecret::from_owned(Box::new([0x39; 32]), Box::new([0x49; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let shard = VirtualShardId::new(19)?;
+    let ledger = ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        SegmentScope::new(tenant, SignalKind::Traces, shard),
+        SegmentProtectionKey::from_owned(Box::new([0x69; 32])),
+    )?;
+    let details = |events, links| {
+        SpanObservationDetails::checked(SpanObservationDetailsInput {
+            trace_state: String::new(),
+            flags: 0,
+            status: SpanStatus::checked(SpanStatusCode::Unset, String::new())?,
+            events,
+            links,
+            dropped_attributes_count: 0,
+            dropped_events_count: 0,
+            dropped_links_count: 0,
+            resource: SpanResourceMetadata::checked(0, String::new())?,
+            scope: SpanScopeMetadata::checked(String::new(), String::new(), 0, String::new())?,
+        })
+    };
+    let base_details = details(Vec::new(), Vec::new())?;
+    let event_details = details(
+        vec![SpanEvent::checked(
+            EventTime::missing(),
+            "event-only".to_owned(),
+            Vec::new(),
+            0,
+        )?],
+        Vec::new(),
+    )?;
+    let link_details = details(
+        Vec::new(),
+        vec![SpanLink::checked(
+            [0x91; 16],
+            [0x92; 8],
+            String::new(),
+            0,
+            Vec::new(),
+            0,
+        )?],
+    )?;
+    let observation = |details, provenance| {
+        SpanObservation::checked_native_with_details(
+            [0x81; 16],
+            [0x82; 8],
+            None,
+            "detail-identity".to_owned(),
+            EventTime::missing(),
+            EventTime::missing(),
+            Vec::new(),
+            SpanKind::Internal,
+            SamplingDecision::Unknown,
+            provenance,
+            details,
+        )
+    };
+    let base = observation(
+        base_details.clone(),
+        positron_policy::PolicyProvenance::new(1, [0xa1; 32], Vec::new())?,
+    )?;
+    let event_only = observation(
+        event_details,
+        positron_policy::PolicyProvenance::new(1, [0xa1; 32], Vec::new())?,
+    )?;
+    let link_only = observation(
+        link_details,
+        positron_policy::PolicyProvenance::new(1, [0xa1; 32], Vec::new())?,
+    )?;
+    let provenance_only = observation(
+        base_details,
+        positron_policy::PolicyProvenance::new(2, [0xa2; 32], Vec::new())?,
+    )?;
+    let store = TraceStore::new();
+    ledger.append(
+        store
+            .prepare_unretained_for_test(
+                preparation_capacity(&authority, tenant)?,
+                &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
+                tenant,
+                shard,
+                positron_kernel::StoreBlockIdentity::new([0x89; 16])?,
+                vec![
+                    base.clone(),
+                    base.clone(),
+                    event_only.clone(),
+                    link_only.clone(),
+                    provenance_only.clone(),
+                ],
+            )?
+            .into_store_block(),
+    )?;
+    let logical = store.scan(
+        authority.governor(),
+        tenant,
+        &ledger.snapshot()?,
+        TraceScan::all(ScanLimit::new(5)?),
+    )?;
+    let span = logical.spans().first().ok_or("missing logical span")?;
+    assert_eq!(logical.spans().len(), 1);
+    assert_eq!(span.observation_count(), 5);
+    assert_eq!(span.variants().len(), 4);
+    let variant = |expected: &SpanObservation| {
+        span.variants()
+            .iter()
+            .find(|variant| variant.observation().observation() == expected)
+            .ok_or("missing semantic variant")
+    };
+    assert_eq!(variant(&base)?.observation_count(), 2);
+    assert_eq!(variant(&event_only)?.observation_count(), 1);
+    assert_eq!(variant(&link_only)?.observation_count(), 1);
+    assert_eq!(variant(&provenance_only)?.observation_count(), 1);
+    assert!(span.conflicted());
     Ok(())
 }
 
