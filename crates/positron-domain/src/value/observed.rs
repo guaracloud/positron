@@ -230,6 +230,44 @@ impl ValidatedAttributeValue {
         }
     }
 
+    /// Returns decoded payload bytes while observing every visited component.
+    pub fn decoded_size_bytes_observed<O: NativeValueObserver>(
+        &self,
+        observer: &mut O,
+    ) -> Result<usize, ObservedValueFailure<O::Error>> {
+        observe_structure(observer)?;
+        match &self.inner {
+            ValidatedAttributeValueInner::Null | ValidatedAttributeValueInner::Marker(_) => Ok(0),
+            ValidatedAttributeValueInner::Boolean(_) => Ok(1),
+            ValidatedAttributeValueInner::SignedInteger(_)
+            | ValidatedAttributeValueInner::FloatingPointBits(_) => Ok(8),
+            ValidatedAttributeValueInner::String(value) => {
+                observe_payload(value.as_bytes(), observer)?;
+                Ok(value.len())
+            },
+            ValidatedAttributeValueInner::Bytes(value) => {
+                observe_payload(value, observer)?;
+                Ok(value.len())
+            },
+            ValidatedAttributeValueInner::Array(values) => {
+                values.iter().try_fold(0_usize, |total, value| {
+                    checked_add(total, value.decoded_size_bytes_observed(observer)?)
+                })
+            },
+            ValidatedAttributeValueInner::KeyValueList(values) => {
+                values.iter().try_fold(0_usize, |total, entry| {
+                    observe_structure(observer)?;
+                    observe_payload(entry.key.as_bytes(), observer)?;
+                    let total = checked_add(total, entry.key.len())?;
+                    checked_add(total, entry.value.decoded_size_bytes_observed(observer)?)
+                })
+            },
+            ValidatedAttributeValueInner::Truncated { value, .. } => {
+                value.decoded_size_bytes_observed(observer)
+            },
+        }
+    }
+
     /// Fallibly clones after caller-owned memory admission, observing all allocations and copies.
     pub fn try_clone_observed<O: NativeValueObserver>(
         &self,

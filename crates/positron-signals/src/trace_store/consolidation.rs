@@ -13,6 +13,11 @@ struct ConsolidationEntry {
     semantic_key: Vec<u8>,
 }
 
+struct SemanticKeySizes {
+    values: Vec<usize>,
+    total_bytes: u64,
+}
+
 pub(super) struct ConsolidationContext<'a> {
     pub(super) profile: &'a ValueLimitProfile,
     pub(super) cancellation: &'a dyn ScanCancellation,
@@ -227,9 +232,20 @@ pub(super) fn consolidate<'kernel>(
 ) -> Result<LogicalTraceScanResult<'kernel>, TraceStoreFailure> {
     let decoded_observations =
         u64::try_from(observations.len()).map_err(|_| TraceStoreFailure::limit_exceeded())?;
-    let staging_bytes = consolidation_staging_bytes(&observations, retained_size_bytes, &context)?;
+    let semantic_size_bytes = vector_slots_bytes::<usize>(observations.len())?;
+    let preflight_bytes = retained_size_bytes
+        .checked_add(semantic_size_bytes)
+        .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+    super::scan::resize_capacity(&mut capacity, preflight_bytes.max(1))?;
+    let semantic_sizes = observed_semantic_key_sizes(&observations, &context)?;
+    let staging_bytes = consolidation_staging_bytes(
+        observations.len(),
+        retained_size_bytes,
+        semantic_size_bytes,
+        semantic_sizes.total_bytes,
+    )?;
     super::scan::resize_capacity(&mut capacity, staging_bytes.max(1))?;
-    let entries = entries_with_semantic_keys(observations, &context)?;
+    let entries = entries_with_semantic_keys(observations, semantic_sizes, &context)?;
     let entries = interruptible_sort(entries, &context)?;
     let spans = group_observations(entries, &context)?;
     let mut retained_observer = ObservedRetainedSize { context: &context };
@@ -248,11 +264,37 @@ pub(super) fn consolidate<'kernel>(
 }
 
 fn consolidation_staging_bytes(
-    observations: &[ScannedSpanObservation],
+    count: usize,
     retained_size_bytes: u64,
-    context: &ConsolidationContext<'_>,
+    semantic_size_bytes: u64,
+    key_bytes: u64,
 ) -> Result<u64, TraceStoreFailure> {
-    let key_bytes = observations.iter().try_fold(0_u64, |total, observation| {
+    let entry_slots = vector_slots_bytes::<ConsolidationEntry>(count)?;
+    let scratch_slots = vector_slots_bytes::<Option<ConsolidationEntry>>(count)?;
+    let maximum_container_bytes = vector_slots_bytes::<LogicalSpan>(count)?
+        .checked_add(vector_slots_bytes::<SpanObservationVariant>(count)?)
+        .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+    let staging_bytes = retained_size_bytes
+        .checked_add(key_bytes)
+        .and_then(|bytes| bytes.checked_add(semantic_size_bytes))
+        .and_then(|bytes| bytes.checked_add(entry_slots))
+        .and_then(|bytes| bytes.checked_add(scratch_slots))
+        .and_then(|bytes| bytes.checked_add(scratch_slots))
+        .and_then(|bytes| bytes.checked_add(maximum_container_bytes))
+        .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+    Ok(staging_bytes)
+}
+
+fn observed_semantic_key_sizes(
+    observations: &[ScannedSpanObservation],
+    context: &ConsolidationContext<'_>,
+) -> Result<SemanticKeySizes, TraceStoreFailure> {
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(observations.len())
+        .map_err(|_| TraceStoreFailure::resource_exhausted())?;
+    let mut total_bytes = 0_u64;
+    for observation in observations {
         observe_consolidation_unit(context)?;
         let encoded = super::codec::encoded_record_bytes_with_profile_observed(
             context.profile,
@@ -263,24 +305,15 @@ fn consolidation_staging_bytes(
         let semantic = encoded
             .checked_sub(8)
             .ok_or_else(TraceStoreFailure::invalid_input)?;
-        total
+        total_bytes = total_bytes
             .checked_add(u64::try_from(semantic).map_err(|_| TraceStoreFailure::limit_exceeded())?)
-            .ok_or_else(TraceStoreFailure::limit_exceeded)
-    })?;
-    let count = observations.len();
-    let entry_slots = vector_slots_bytes::<ConsolidationEntry>(count)?;
-    let scratch_slots = vector_slots_bytes::<Option<ConsolidationEntry>>(count)?;
-    let maximum_container_bytes = vector_slots_bytes::<LogicalSpan>(count)?
-        .checked_add(vector_slots_bytes::<SpanObservationVariant>(count)?)
-        .ok_or_else(TraceStoreFailure::limit_exceeded)?;
-    let staging_bytes = retained_size_bytes
-        .checked_add(key_bytes)
-        .and_then(|bytes| bytes.checked_add(entry_slots))
-        .and_then(|bytes| bytes.checked_add(scratch_slots))
-        .and_then(|bytes| bytes.checked_add(scratch_slots))
-        .and_then(|bytes| bytes.checked_add(maximum_container_bytes))
-        .ok_or_else(TraceStoreFailure::limit_exceeded)?;
-    Ok(staging_bytes)
+            .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+        values.push(semantic);
+    }
+    Ok(SemanticKeySizes {
+        values,
+        total_bytes,
+    })
 }
 
 fn vector_slots_bytes<T>(count: usize) -> Result<u64, TraceStoreFailure> {
@@ -295,17 +328,22 @@ fn vector_slots_bytes<T>(count: usize) -> Result<u64, TraceStoreFailure> {
 
 fn entries_with_semantic_keys(
     observations: Vec<ScannedSpanObservation>,
+    semantic_sizes: SemanticKeySizes,
     context: &ConsolidationContext<'_>,
 ) -> Result<Vec<ConsolidationEntry>, TraceStoreFailure> {
+    if observations.len() != semantic_sizes.values.len() {
+        return Err(TraceStoreFailure::invalid_input());
+    }
     let mut entries = Vec::new();
     entries
         .try_reserve_exact(observations.len())
         .map_err(|_| TraceStoreFailure::resource_exhausted())?;
-    for observation in observations {
+    for (observation, expected) in observations.into_iter().zip(semantic_sizes.values) {
         observe_consolidation_unit(context)?;
         let semantic_key = super::codec::encode_semantic_observation_with_profile_observed(
             context.profile,
             observation.observation(),
+            expected,
             context.cancellation,
             context.observer,
         )?;

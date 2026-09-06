@@ -383,6 +383,60 @@ fn maximum_native_payload_budget_interrupts_semantic_key_construction() -> Resul
         authority.governor().inspect()?.outstanding_total(),
         before_cancellation
     );
+
+    let late_budget = complete_work
+        .work()
+        .checked_sub(1)
+        .ok_or("maximum-payload scan did not perform late consolidation work")?;
+    assert!(late_budget > decode_work.work());
+    let before_late_budget = authority.governor().inspect()?.outstanding_total();
+    let late_observer = WorkBudget::exact(late_budget);
+    let late_failure = store
+        .scan_observed(
+            authority.governor(),
+            tenant,
+            &ledger.snapshot()?,
+            TraceScan::all(ScanLimit::new(2)?),
+            &NeverCancelled,
+            &late_observer,
+        )
+        .expect_err("late consolidation accounting must remain interruptible");
+    assert_eq!(late_failure.code(), TraceStoreFailureCode::BudgetExhausted);
+    assert_eq!(
+        authority.governor().inspect()?.outstanding_total(),
+        before_late_budget
+    );
+
+    let late_cancellation_budget = complete_work
+        .work()
+        .checked_sub(2)
+        .ok_or("maximum-payload scan did not perform enough late consolidation work")?;
+    let cancelled = Arc::new(AtomicU64::new(0));
+    let cancellation = SharedCancellation(Arc::clone(&cancelled));
+    let cancel_late = CancelAfterWork {
+        limit: late_cancellation_budget,
+        observed: AtomicU64::new(0),
+        cancelled,
+    };
+    let before_late_cancellation = authority.governor().inspect()?.outstanding_total();
+    let late_cancellation_failure = store
+        .scan_observed(
+            authority.governor(),
+            tenant,
+            &ledger.snapshot()?,
+            TraceScan::all(ScanLimit::new(2)?),
+            &cancellation,
+            &cancel_late,
+        )
+        .expect_err("late consolidation accounting must poll cancellation");
+    assert_eq!(
+        late_cancellation_failure.code(),
+        TraceStoreFailureCode::Cancelled
+    );
+    assert_eq!(
+        authority.governor().inspect()?.outstanding_total(),
+        before_late_cancellation
+    );
     Ok(())
 }
 

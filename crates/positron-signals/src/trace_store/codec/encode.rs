@@ -95,13 +95,10 @@ fn encode_observation<O: EncodeOutput>(
 pub(crate) fn encode_semantic_observation_with_profile_observed(
     profile: &ValueLimitProfile,
     observation: &super::super::observation::SpanObservation,
+    expected: usize,
     cancellation: &dyn ScanCancellation,
     observer: &dyn ScanObserver,
 ) -> Result<Vec<u8>, TraceStoreFailure> {
-    let encoded = encoded_record_bytes_with_limits(observation, &limits_for(profile)?)?;
-    let expected = encoded
-        .checked_sub(8)
-        .ok_or_else(TraceStoreFailure::invalid_input)?;
     let mut bytes = Vec::new();
     bytes
         .try_reserve_exact(expected)
@@ -173,9 +170,6 @@ fn encode_semantic_observation<O: EncodeOutput>(
             .filter(|count| *count <= limits.occurrences_per_namespace)
             .ok_or_else(TraceStoreFailure::limit_exceeded)?;
     }
-    let _ = observation
-        .details()
-        .decoded_size_bytes(limits.decoded_bytes)?;
     encode_details(output, observation.details(), &limits)?;
     let policy = observation.policy_provenance();
     put_u64(output, policy.generation())?;

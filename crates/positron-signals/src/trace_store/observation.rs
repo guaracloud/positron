@@ -3,6 +3,7 @@ use positron_domain::value::{
     AttributeOccurrenceSet, NATIVE_VALUE_PAYLOAD_CHUNK_BYTES, NativeValueObserver,
     ObservedValueFailure, ValueLimitProfile,
 };
+use positron_policy::{ObservedPolicyProvenanceFailure, PolicyProvenanceObserver};
 
 use super::details::SpanObservationDetails;
 use super::failure::TraceStoreFailure;
@@ -387,11 +388,10 @@ impl SpanObservation {
     ) -> Result<usize, TraceStoreFailure> {
         observer.observe_structure()?;
         observe_payload(self.name.as_bytes(), observer)?;
-        observer.observe_structure()?;
-        for rule in self.policy.applied_rules() {
-            observer.observe_structure()?;
-            observe_payload(rule.as_bytes(), observer)?;
-        }
+        let policy_retained = self
+            .policy
+            .retained_heap_bytes_observed(&mut ObservedPolicySize { observer })
+            .map_err(observed_policy_failure)?;
         let mut retained = self
             .name
             .capacity()
@@ -402,7 +402,7 @@ impl SpanObservation {
                     .ok_or_else(TraceStoreFailure::limit_exceeded)?,
             )
             .and_then(|size| size.checked_add(std::mem::size_of::<SpanObservationDetails>()))
-            .and_then(|size| size.checked_add(self.policy.retained_heap_bytes().ok()?))
+            .and_then(|size| size.checked_add(policy_retained))
             .ok_or_else(TraceStoreFailure::limit_exceeded)?;
         for attribute in &self.attributes {
             retained = retained
@@ -445,6 +445,30 @@ impl SpanObservation {
             .checked_add(self.details.decoded_size_bytes(usize::MAX)?)
             .ok_or_else(TraceStoreFailure::limit_exceeded)?;
         Ok(decoded)
+    }
+}
+
+struct ObservedPolicySize<'a, O> {
+    observer: &'a mut O,
+}
+
+impl<O: NativeValueObserver<Error = TraceStoreFailure>> PolicyProvenanceObserver
+    for ObservedPolicySize<'_, O>
+{
+    type Error = TraceStoreFailure;
+
+    fn observe_rule(&mut self, rule: &str) -> Result<(), Self::Error> {
+        self.observer.observe_structure()?;
+        observe_payload(rule.as_bytes(), self.observer)
+    }
+}
+
+fn observed_policy_failure(
+    failure: ObservedPolicyProvenanceFailure<TraceStoreFailure>,
+) -> TraceStoreFailure {
+    match failure {
+        ObservedPolicyProvenanceFailure::Policy(failure) => TraceStoreFailure::from(failure),
+        ObservedPolicyProvenanceFailure::Observer(failure) => failure,
     }
 }
 

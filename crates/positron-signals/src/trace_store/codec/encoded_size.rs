@@ -1,6 +1,6 @@
 use positron_domain::time::EventTime;
 use positron_domain::value::{
-    AttributeValueKind, NATIVE_VALUE_PAYLOAD_CHUNK_BYTES, ValueLimitProfile,
+    AttributeValueKind, NATIVE_VALUE_PAYLOAD_CHUNK_BYTES, NativeValueObserver, ValueLimitProfile,
 };
 
 use super::super::details::{SpanAttributeSet, SpanObservationDetails};
@@ -9,43 +9,48 @@ use super::super::observation::SpanObservation;
 use super::super::types::{TraceLimits, limits_for};
 use crate::{ScanCancellation, ScanObserver};
 
-trait SizeObserver {
-    fn observe_structure(&mut self) -> Result<(), TraceStoreFailure>;
-    fn observe_payload(&mut self, payload: &[u8]) -> Result<(), TraceStoreFailure>;
-}
+trait SizeObserver: NativeValueObserver<Error = TraceStoreFailure> {}
 
 struct UnobservedSize;
 
-impl SizeObserver for UnobservedSize {
-    fn observe_structure(&mut self) -> Result<(), TraceStoreFailure> {
+impl NativeValueObserver for UnobservedSize {
+    type Error = TraceStoreFailure;
+
+    fn observe_structure(&mut self) -> Result<(), Self::Error> {
         Ok(())
     }
 
-    fn observe_payload(&mut self, _payload: &[u8]) -> Result<(), TraceStoreFailure> {
+    fn observe_payload(&mut self, _payload: &[u8]) -> Result<(), Self::Error> {
         Ok(())
     }
 }
+
+impl SizeObserver for UnobservedSize {}
 
 struct ObservedSize<'a> {
     cancellation: &'a dyn ScanCancellation,
     observer: &'a dyn ScanObserver,
 }
 
-impl SizeObserver for ObservedSize<'_> {
-    fn observe_structure(&mut self) -> Result<(), TraceStoreFailure> {
+impl NativeValueObserver for ObservedSize<'_> {
+    type Error = TraceStoreFailure;
+
+    fn observe_structure(&mut self) -> Result<(), Self::Error> {
         super::super::scan::check_cancel(self.cancellation)?;
         self.observer
             .observe_work(1)
             .map_err(TraceStoreFailure::observation)
     }
 
-    fn observe_payload(&mut self, payload: &[u8]) -> Result<(), TraceStoreFailure> {
+    fn observe_payload(&mut self, payload: &[u8]) -> Result<(), Self::Error> {
         for _ in payload.chunks(NATIVE_VALUE_PAYLOAD_CHUNK_BYTES) {
-            self.observe_structure()?;
+            NativeValueObserver::observe_structure(self)?;
         }
         Ok(())
     }
 }
+
+impl SizeObserver for ObservedSize<'_> {}
 
 /// Returns one canonical encoded Trace Store record length without allocating.
 ///
@@ -177,6 +182,7 @@ fn encoded_details_length(
     {
         return Err(TraceStoreFailure::limit_exceeded());
     }
+    let _ = details.decoded_size_bytes_observed(limits.decoded_bytes, observer)?;
     let mut bytes = 0_usize;
     observer.observe_payload(details.trace_state().as_bytes())?;
     bytes = add_bytes_length(bytes, details.trace_state().len())?;
