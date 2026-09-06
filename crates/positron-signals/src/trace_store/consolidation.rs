@@ -3,7 +3,7 @@ use super::scan::{ScannedSpanObservation, TraceIncompleteness, check_cancel};
 #[cfg(fuzzing)]
 use crate::ScanObservationFailureCode;
 use crate::{ScanCancellation, ScanObserver};
-use positron_domain::value::ValueLimitProfile;
+use positron_domain::value::{NativeValueObserver, ValueLimitProfile};
 use positron_kernel::ResourceReservation;
 
 const SEMANTIC_KEY_WORK_CHUNK_BYTES: usize = 4_096;
@@ -232,7 +232,9 @@ pub(super) fn consolidate<'kernel>(
     let entries = entries_with_semantic_keys(observations, &context)?;
     let entries = interruptible_sort(entries, &context)?;
     let spans = group_observations(entries, &context)?;
-    let retained_size_bytes = logical_retained_size(&spans, spans.capacity())?;
+    let mut retained_observer = ObservedRetainedSize { context: &context };
+    let retained_size_bytes =
+        logical_retained_size(&spans, spans.capacity(), &mut retained_observer)?;
     super::scan::resize_capacity(&mut capacity, retained_size_bytes.max(1))?;
     Ok(LogicalTraceScanResult {
         spans,
@@ -252,9 +254,11 @@ fn consolidation_staging_bytes(
 ) -> Result<u64, TraceStoreFailure> {
     let key_bytes = observations.iter().try_fold(0_u64, |total, observation| {
         observe_consolidation_unit(context)?;
-        let encoded = super::codec::encoded_record_bytes_with_profile(
+        let encoded = super::codec::encoded_record_bytes_with_profile_observed(
             context.profile,
             observation.observation(),
+            context.cancellation,
+            context.observer,
         )?;
         let semantic = encoded
             .checked_sub(8)
@@ -545,6 +549,22 @@ fn observe_consolidation_unit(context: &ConsolidationContext<'_>) -> Result<(), 
         .map_err(TraceStoreFailure::observation)
 }
 
+struct ObservedRetainedSize<'a, 'context> {
+    context: &'a ConsolidationContext<'context>,
+}
+
+impl NativeValueObserver for ObservedRetainedSize<'_, '_> {
+    type Error = TraceStoreFailure;
+
+    fn observe_structure(&mut self) -> Result<(), Self::Error> {
+        observe_consolidation_unit(self.context)
+    }
+
+    fn observe_payload(&mut self, _payload: &[u8]) -> Result<(), Self::Error> {
+        observe_consolidation_unit(self.context)
+    }
+}
+
 #[cfg(fuzzing)]
 pub(super) fn fuzz_group_observations(
     observations: Vec<ScannedSpanObservation>,
@@ -604,7 +624,9 @@ impl ScanObserver for FuzzUnobserved {
 fn logical_retained_size(
     spans: &[LogicalSpan],
     span_capacity: usize,
+    observer: &mut impl NativeValueObserver<Error = TraceStoreFailure>,
 ) -> Result<u64, TraceStoreFailure> {
+    observer.observe_structure()?;
     let span_slots = u64::try_from(span_capacity)
         .map_err(|_| TraceStoreFailure::limit_exceeded())?
         .checked_mul(
@@ -613,6 +635,7 @@ fn logical_retained_size(
         )
         .ok_or_else(TraceStoreFailure::limit_exceeded)?;
     spans.iter().try_fold(span_slots, |total, span| {
+        observer.observe_structure()?;
         let variant_slots = u64::try_from(span.variants.capacity())
             .map_err(|_| TraceStoreFailure::limit_exceeded())?
             .checked_mul(
@@ -624,9 +647,14 @@ fn logical_retained_size(
             .variants
             .iter()
             .try_fold(variant_slots, |size, variant| {
-                let dynamic =
-                    u64::try_from(variant.observation().observation().retained_heap_bytes()?)
-                        .map_err(|_| TraceStoreFailure::limit_exceeded())?;
+                observer.observe_structure()?;
+                let dynamic = u64::try_from(
+                    variant
+                        .observation()
+                        .observation()
+                        .retained_heap_bytes_observed(observer)?,
+                )
+                .map_err(|_| TraceStoreFailure::limit_exceeded())?;
                 size.checked_add(dynamic)
                     .ok_or_else(TraceStoreFailure::limit_exceeded)
             })?;

@@ -316,11 +316,32 @@ fn maximum_native_payload_budget_interrupts_semantic_key_construction() -> Resul
         &decode_work,
     )?;
     drop(physical);
-    let maximum_inline_work = decode_work
+    let complete_work = WorkBudget::unlimited();
+    let complete = store.scan_observed(
+        authority.governor(),
+        tenant,
+        &ledger.snapshot()?,
+        TraceScan::all(ScanLimit::new(2)?),
+        &NeverCancelled,
+        &complete_work,
+    )?;
+    assert!(complete.complete());
+    assert_eq!(complete.spans().len(), 1);
+    assert_eq!(complete.spans()[0].variants().len(), 2);
+    assert_eq!(complete.spans()[0].observation_count(), 2);
+    assert!(complete.spans()[0].conflicted());
+    drop(complete);
+
+    let consolidation_work = complete_work
         .work()
-        .checked_add(16)
+        .checked_sub(decode_work.work())
+        .ok_or("logical scan did not perform consolidation work")?;
+    assert!(consolidation_work > 4);
+    let partial_budget = decode_work
+        .work()
+        .checked_add(consolidation_work / 2)
         .ok_or("work limit overflow")?;
-    let constrained = WorkBudget::exact(maximum_inline_work);
+    let constrained = WorkBudget::exact(partial_budget);
     let before = authority.governor().inspect()?.outstanding_total();
     let failure = store
         .scan_observed(
@@ -331,10 +352,180 @@ fn maximum_native_payload_budget_interrupts_semantic_key_construction() -> Resul
             &NeverCancelled,
             &constrained,
         )
-        .expect_err("maximum payload key construction must charge bounded work");
+        .expect_err("maximum payload consolidation must stop after bounded traversal work");
     assert_eq!(failure.code(), TraceStoreFailureCode::BudgetExhausted);
-    assert_eq!(constrained.work(), maximum_inline_work);
+    assert_eq!(constrained.work(), partial_budget);
     assert_eq!(authority.governor().inspect()?.outstanding_total(), before);
+
+    let cancelled = Arc::new(AtomicU64::new(0));
+    let cancellation = SharedCancellation(Arc::clone(&cancelled));
+    let cancel_after_partial_work = CancelAfterWork {
+        limit: partial_budget,
+        observed: AtomicU64::new(0),
+        cancelled,
+    };
+    let before_cancellation = authority.governor().inspect()?.outstanding_total();
+    let cancellation_failure = store
+        .scan_observed(
+            authority.governor(),
+            tenant,
+            &ledger.snapshot()?,
+            TraceScan::all(ScanLimit::new(2)?),
+            &cancellation,
+            &cancel_after_partial_work,
+        )
+        .expect_err("maximum payload consolidation must poll cancellation during traversal");
+    assert_eq!(
+        cancellation_failure.code(),
+        TraceStoreFailureCode::Cancelled
+    );
+    assert_eq!(
+        authority.governor().inspect()?.outstanding_total(),
+        before_cancellation
+    );
+    Ok(())
+}
+
+#[test]
+fn aggregate_maximum_values_keep_normal_scan_interruptible_and_release_capacity()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x98; 16])?,
+        CatalogSecret::from_owned(Box::new([0xa8; 32]), Box::new([0xb8; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let shard = VirtualShardId::new(18)?;
+    let ledger = ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        SegmentScope::new(tenant, SignalKind::Traces, shard),
+        SegmentProtectionKey::from_owned(Box::new([0xc8; 32])),
+    )?;
+    let profile = ValueLimitProfile::release_1_system_maximum();
+    let mut attributes = Vec::new();
+    for index in 0..15 {
+        let mut value = vec![0x31; 65_535];
+        value.push(u8::try_from(index).map_err(|_| "attribute index exceeded byte")?);
+        attributes.push(
+            AttributeOccurrenceSetCandidate::new(
+                AttributeNamespace::Record,
+                format!("aggregate-{index}"),
+                vec![CandidateAttributeValue::bytes(value)],
+            )
+            .validate(profile)?,
+        );
+    }
+    let observation = SpanObservation::checked_native(
+        [0xd8; 16],
+        [0xe8; 8],
+        None,
+        "aggregate-maximum".to_owned(),
+        EventTime::missing(),
+        EventTime::missing(),
+        attributes,
+        SpanKind::Internal,
+        SamplingDecision::Unknown,
+        positron_policy::PolicyProvenance::new(1, [0xf8; 32], Vec::new())?,
+    )?;
+    let store = TraceStore::new();
+    ledger.append(
+        store
+            .prepare_unretained_for_test(
+                preparation_capacity(&authority, tenant)?,
+                &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
+                tenant,
+                shard,
+                positron_kernel::StoreBlockIdentity::new([0x48; 16])?,
+                vec![observation],
+            )?
+            .into_store_block(),
+    )?;
+    let decode_work = WorkBudget::unlimited();
+    let physical = store.scan_physical_observed(
+        authority.governor(),
+        tenant,
+        &ledger.snapshot()?,
+        TraceScan::all(ScanLimit::new(1)?),
+        &NeverCancelled,
+        &decode_work,
+    )?;
+    drop(physical);
+    let complete_work = WorkBudget::unlimited();
+    let complete = store.scan_observed(
+        authority.governor(),
+        tenant,
+        &ledger.snapshot()?,
+        TraceScan::all(ScanLimit::new(1)?),
+        &NeverCancelled,
+        &complete_work,
+    )?;
+    assert!(complete.complete());
+    assert_eq!(complete.spans().len(), 1);
+    assert_eq!(complete.spans()[0].variants().len(), 1);
+    drop(complete);
+
+    let total_work = complete_work.work();
+    let partial_budget = decode_work
+        .work()
+        .checked_add(
+            total_work
+                .checked_sub(decode_work.work())
+                .ok_or("logical scan did not perform aggregate consolidation work")?
+                / 2,
+        )
+        .ok_or("aggregate work limit overflow")?;
+    let before_budget = authority.governor().inspect()?.outstanding_total();
+    let constrained = WorkBudget::exact(partial_budget);
+    let budget_failure = store
+        .scan_observed(
+            authority.governor(),
+            tenant,
+            &ledger.snapshot()?,
+            TraceScan::all(ScanLimit::new(1)?),
+            &NeverCancelled,
+            &constrained,
+        )
+        .expect_err("aggregate native sizing must stop at the query work budget");
+    assert_eq!(
+        budget_failure.code(),
+        TraceStoreFailureCode::BudgetExhausted
+    );
+    assert_eq!(constrained.work(), partial_budget);
+    assert_eq!(
+        authority.governor().inspect()?.outstanding_total(),
+        before_budget
+    );
+
+    let cancelled = Arc::new(AtomicU64::new(0));
+    let cancellation = SharedCancellation(Arc::clone(&cancelled));
+    let cancel_after_partial_work = CancelAfterWork {
+        limit: partial_budget,
+        observed: AtomicU64::new(0),
+        cancelled,
+    };
+    let before_cancellation = authority.governor().inspect()?.outstanding_total();
+    let cancellation_failure = store
+        .scan_observed(
+            authority.governor(),
+            tenant,
+            &ledger.snapshot()?,
+            TraceScan::all(ScanLimit::new(1)?),
+            &cancellation,
+            &cancel_after_partial_work,
+        )
+        .expect_err("aggregate native sizing must poll cancellation during traversal");
+    assert_eq!(
+        cancellation_failure.code(),
+        TraceStoreFailureCode::Cancelled
+    );
+    assert_eq!(
+        authority.governor().inspect()?.outstanding_total(),
+        before_cancellation
+    );
     Ok(())
 }
 

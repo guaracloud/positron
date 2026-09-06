@@ -44,7 +44,7 @@ impl EncodeOutput for ObservedSemanticOutput<'_> {
             self.observer
                 .observe_work(1)
                 .map_err(TraceStoreFailure::observation)?;
-            put_slice(&mut self.bytes, chunk)?;
+            put_preallocated_slice(&mut self.bytes, chunk)?;
         }
         Ok(())
     }
@@ -102,8 +102,12 @@ pub(crate) fn encode_semantic_observation_with_profile_observed(
     let expected = encoded
         .checked_sub(8)
         .ok_or_else(TraceStoreFailure::invalid_input)?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(expected)
+        .map_err(|_| TraceStoreFailure::resource_exhausted())?;
     let mut output = ObservedSemanticOutput {
-        bytes: Vec::new(),
+        bytes,
         cancellation,
         observer,
     };
@@ -460,6 +464,21 @@ pub(crate) fn put_slice(output: &mut Vec<u8>, value: &[u8]) -> Result<(), TraceS
     output
         .try_reserve_exact(value.len())
         .map_err(|_| TraceStoreFailure::resource_exhausted())?;
+    output.extend_from_slice(value);
+    Ok(())
+}
+
+fn put_preallocated_slice(output: &mut Vec<u8>, value: &[u8]) -> Result<(), TraceStoreFailure> {
+    let length = output
+        .len()
+        .checked_add(value.len())
+        .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+    if length > MAX_BLOCK_BYTES {
+        return Err(TraceStoreFailure::limit_exceeded());
+    }
+    if length > output.capacity() {
+        return Err(TraceStoreFailure::resource_exhausted());
+    }
     output.extend_from_slice(value);
     Ok(())
 }
