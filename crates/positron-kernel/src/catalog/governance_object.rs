@@ -191,7 +191,6 @@ fn decode(encoded: &[u8]) -> Result<CatalogGovernanceObject, CatalogFailure> {
         TenantSlug::parse_canonical(cursor.take_text_u8(63)?).map_err(|_| corrupt())?;
     let external_alias = if version == CatalogGovernanceVersion::V4 {
         match cursor.take_u8()? {
-            0 => None,
             1 => {
                 Some(ExternalTenantAlias::parse(cursor.take_text_u8(128)?).map_err(|_| corrupt())?)
             },
@@ -363,5 +362,59 @@ impl<'encoded> Cursor<'encoded> {
 
     const fn is_empty(&self) -> bool {
         self.remaining.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CatalogFailureCode, CatalogGovernanceObject};
+
+    #[test]
+    fn current_governance_object_requires_an_external_alias() {
+        let encoded = valid_v4_object(false);
+        let failure = match CatalogGovernanceObject::decode(&encoded) {
+            Ok(_) => panic!("a current object without an alias must fail closed"),
+            Err(failure) => failure,
+        };
+        assert_eq!(failure.code(), CatalogFailureCode::IntegrityCorruption);
+    }
+
+    fn valid_v4_object(with_alias: bool) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(b"POSGOV04");
+        encoded.extend_from_slice(&[1; 16]);
+        encoded.extend_from_slice(&[2; 16]);
+        encoded.push(7);
+        encoded.extend_from_slice(b"default");
+        encoded.push(u8::from(with_alias));
+        if with_alias {
+            encoded.push(13);
+            encoded.extend_from_slice(b"trace-external");
+        }
+        encoded.push(7);
+        encoded.extend_from_slice(b"Default");
+        encoded.extend_from_slice(&[3; 16]);
+        encoded.extend_from_slice(&[4; 32]);
+        encoded.extend_from_slice(&[5; 32]);
+        encoded.extend_from_slice(&[6; 16]);
+        encoded.extend_from_slice(&[7; 32]);
+        encoded.extend_from_slice(&[8; 32]);
+        encoded.extend_from_slice(&[9; 16]);
+        encoded.extend_from_slice(&[10; 32]);
+        encoded.extend_from_slice(&[11; 32]);
+        encoded.extend_from_slice(&[12; 32]);
+        encoded.extend_from_slice(&[13; 32]);
+        encoded.extend_from_slice(&2_u16.to_be_bytes());
+        encoded.extend_from_slice(&[14; 2]);
+        encoded.extend_from_slice(&2_u16.to_be_bytes());
+        encoded.extend_from_slice(&[15; 2]);
+        encoded.extend_from_slice(&2_u64.to_be_bytes());
+        encoded.extend_from_slice(&1_u64.to_be_bytes());
+        encoded.extend_from_slice(&1_u32.to_be_bytes());
+        for _ in 0..11 {
+            encoded.extend_from_slice(&1_u64.to_be_bytes());
+        }
+        encoded.extend_from_slice(&[1, 4, 0, 1, 1]);
+        encoded
     }
 }
