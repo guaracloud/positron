@@ -1,6 +1,6 @@
 use std::error::Error;
 use std::fs::{self, OpenOptions};
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use positron_domain::identity::TenantId;
@@ -169,9 +169,13 @@ fn recovery_rejects_frontier_authenticator_corruption() -> Result<(), Box<dyn Er
     let receipt = ledger.append(prepared(fixture.scope, 4, b"authenticated")?)?;
     drop(ledger);
     let path = active_frontier(fixture.root.path(), receipt.segment_id());
-    let mut file = OpenOptions::new().write(true).open(path)?;
+    let mut file = OpenOptions::new().read(true).write(true).open(path)?;
     file.seek(SeekFrom::End(-1))?;
-    file.write_all(&[0x5a])?;
+    let mut authenticator_byte = [0_u8; 1];
+    file.read_exact(&mut authenticator_byte)?;
+    authenticator_byte[0] ^= 1;
+    file.seek(SeekFrom::End(-1))?;
+    file.write_all(&authenticator_byte)?;
     file.sync_all()?;
 
     let failure = fixture
