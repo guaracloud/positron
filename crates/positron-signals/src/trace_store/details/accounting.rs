@@ -1,8 +1,9 @@
-use super::{SpanAttributeSet, SpanEvent, SpanLink, SpanObservationDetails, SpanStatus};
-use crate::trace_store::failure::TraceStoreFailure;
-use positron_domain::value::{
-    NATIVE_VALUE_PAYLOAD_CHUNK_BYTES, NativeValueObserver, ObservedValueFailure,
+use super::{
+    SpanAttributeSet, SpanEvent, SpanLink, SpanObservationDetails, SpanStatus, observe_payload,
+    observed_value_failure,
 };
+use crate::trace_store::failure::TraceStoreFailure;
+use positron_domain::value::NativeValueObserver;
 
 impl SpanAttributeSet {
     pub(crate) fn retained_heap_bytes(&self) -> Result<usize, TraceStoreFailure> {
@@ -225,21 +226,4 @@ fn observe_structure(
     observer: &mut impl NativeValueObserver<Error = TraceStoreFailure>,
 ) -> Result<(), TraceStoreFailure> {
     observer.observe_structure()
-}
-
-fn observe_payload(
-    payload: &[u8],
-    observer: &mut impl NativeValueObserver<Error = TraceStoreFailure>,
-) -> Result<(), TraceStoreFailure> {
-    for chunk in payload.chunks(NATIVE_VALUE_PAYLOAD_CHUNK_BYTES) {
-        observer.observe_payload(chunk)?;
-    }
-    Ok(())
-}
-
-fn observed_value_failure(failure: ObservedValueFailure<TraceStoreFailure>) -> TraceStoreFailure {
-    match failure {
-        ObservedValueFailure::Domain(failure) => TraceStoreFailure::domain(failure),
-        ObservedValueFailure::Observer(failure) => failure,
-    }
 }

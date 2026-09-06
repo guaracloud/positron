@@ -1,11 +1,8 @@
 use positron_domain::time::EventTime;
-use positron_domain::value::{
-    AttributeOccurrenceSet, NATIVE_VALUE_PAYLOAD_CHUNK_BYTES, NativeValueObserver,
-    ObservedValueFailure, ValueLimitProfile,
-};
-use positron_policy::{ObservedPolicyProvenanceFailure, PolicyProvenanceObserver};
+use positron_domain::value::{AttributeOccurrenceSet, NativeValueObserver, ValueLimitProfile};
+use positron_policy::ObservedPolicyProvenanceFailure;
 
-use super::details::SpanObservationDetails;
+use super::details::{SpanObservationDetails, observe_payload, observed_value_failure};
 use super::failure::TraceStoreFailure;
 
 /// The protocol-neutral OTLP span kind retained by the Trace Store.
@@ -390,7 +387,10 @@ impl SpanObservation {
         observe_payload(self.name.as_bytes(), observer)?;
         let policy_retained = self
             .policy
-            .retained_heap_bytes_observed(&mut ObservedPolicySize { observer })
+            .retained_heap_bytes_observed(|rule| {
+                observer.observe_structure()?;
+                observe_payload(rule.as_bytes(), observer)
+            })
             .map_err(observed_policy_failure)?;
         let mut retained = self
             .name
@@ -448,43 +448,11 @@ impl SpanObservation {
     }
 }
 
-struct ObservedPolicySize<'a, O> {
-    observer: &'a mut O,
-}
-
-impl<O: NativeValueObserver<Error = TraceStoreFailure>> PolicyProvenanceObserver
-    for ObservedPolicySize<'_, O>
-{
-    type Error = TraceStoreFailure;
-
-    fn observe_rule(&mut self, rule: &str) -> Result<(), Self::Error> {
-        self.observer.observe_structure()?;
-        observe_payload(rule.as_bytes(), self.observer)
-    }
-}
-
 fn observed_policy_failure(
     failure: ObservedPolicyProvenanceFailure<TraceStoreFailure>,
 ) -> TraceStoreFailure {
     match failure {
         ObservedPolicyProvenanceFailure::Policy(failure) => TraceStoreFailure::from(failure),
         ObservedPolicyProvenanceFailure::Observer(failure) => failure,
-    }
-}
-
-fn observe_payload(
-    payload: &[u8],
-    observer: &mut impl NativeValueObserver<Error = TraceStoreFailure>,
-) -> Result<(), TraceStoreFailure> {
-    for chunk in payload.chunks(NATIVE_VALUE_PAYLOAD_CHUNK_BYTES) {
-        observer.observe_payload(chunk)?;
-    }
-    Ok(())
-}
-
-fn observed_value_failure(failure: ObservedValueFailure<TraceStoreFailure>) -> TraceStoreFailure {
-    match failure {
-        ObservedValueFailure::Domain(failure) => TraceStoreFailure::domain(failure),
-        ObservedValueFailure::Observer(failure) => failure,
     }
 }

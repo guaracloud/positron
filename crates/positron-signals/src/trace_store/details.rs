@@ -322,7 +322,7 @@ fn detail_decoded_bytes_observed(
     Ok(decoded)
 }
 
-fn observe_payload(
+pub(super) fn observe_payload(
     payload: &[u8],
     observer: &mut impl NativeValueObserver<Error = TraceStoreFailure>,
 ) -> Result<(), TraceStoreFailure> {
@@ -332,7 +332,9 @@ fn observe_payload(
     Ok(())
 }
 
-fn observed_value_failure(failure: ObservedValueFailure<TraceStoreFailure>) -> TraceStoreFailure {
+pub(super) fn observed_value_failure(
+    failure: ObservedValueFailure<TraceStoreFailure>,
+) -> TraceStoreFailure {
     match failure {
         ObservedValueFailure::Domain(failure) => TraceStoreFailure::domain(failure),
         ObservedValueFailure::Observer(failure) => failure,

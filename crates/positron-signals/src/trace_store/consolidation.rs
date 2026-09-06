@@ -615,7 +615,8 @@ pub(super) fn fuzz_group_observations(
         cancellation: &FuzzNeverCancelled,
         observer: &FuzzUnobserved,
     };
-    let entries = entries_with_semantic_keys(observations, &context)?;
+    let semantic_sizes = observed_semantic_key_sizes(&observations, &context)?;
+    let entries = entries_with_semantic_keys(observations, semantic_sizes, &context)?;
     let entries = interruptible_sort(entries, &context)?;
     let spans = group_observations(entries, &context)?;
     let counted = spans.iter().try_fold(0_u64, |total, span| {
