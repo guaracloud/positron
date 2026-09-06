@@ -33,6 +33,47 @@ pub struct PolicyBudget {
     mutation_bytes: u64,
 }
 
+/// Bounded shape facts collected while a receiver decodes one candidate.
+///
+/// These facts are deliberately opaque to callers.  Receiver adapters create
+/// them only from work they have already performed under their transport and
+/// structural reservations; policy admission falls back to the compiled
+/// static budget when a receiver cannot provide them.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PolicyAdmissionShape {
+    decoded_bytes: u64,
+    retained_bytes: u64,
+    value_nodes: u64,
+    attribute_entries: u64,
+    maximum_nesting_depth: u16,
+}
+
+impl PolicyAdmissionShape {
+    /// Creates shape facts from a receiver's bounded decode accounting.
+    ///
+    /// This is an internal crate seam rather than a product configuration
+    /// surface.  Its fields remain private so callers cannot alter an
+    /// admitted shape after construction.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn from_bounded_decode(
+        decoded_bytes: u64,
+        retained_bytes: u64,
+        value_nodes: u64,
+        attribute_entries: u64,
+        maximum_nesting_depth: u16,
+    ) -> Self {
+        Self {
+            decoded_bytes,
+            retained_bytes,
+            value_nodes,
+            attribute_entries,
+            maximum_nesting_depth,
+        }
+    }
+}
+
 impl PolicyBudget {
     #[must_use]
     pub const fn evaluation_steps(self) -> u64 {
@@ -139,6 +180,7 @@ impl std::error::Error for PolicyCompileFailure {}
 pub enum PolicyEvaluationFailure {
     StepBudgetExhausted,
     EvidenceBoundExceeded,
+    UntrustedMarker,
 }
 
 impl Display for PolicyEvaluationFailure {
@@ -149,8 +191,15 @@ impl Display for PolicyEvaluationFailure {
 
 impl std::error::Error for PolicyEvaluationFailure {}
 
+#[derive(Debug, Eq, PartialEq)]
 pub enum PolicyEvaluation {
     Accepted(Box<crate::EvaluatedLogRecord>),
+    Rejected,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum TracePolicyEvaluation {
+    Accepted(Box<crate::EvaluatedTraceRecord>),
     Rejected,
 }
 

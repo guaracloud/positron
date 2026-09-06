@@ -1,6 +1,6 @@
 use positron_domain::routing::VirtualShardId;
 
-use crate::{IngestFailureCode, IngestOutcome};
+use crate::{IngestFailureCode, IngestOutcome, TraceLimitRejectionSummary};
 
 /// One independently terminal Admission Group outcome within a request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -44,12 +44,62 @@ impl AdmissionGroupOutcome {
 #[derive(Debug, Eq, PartialEq)]
 pub struct IngestRequestOutcome {
     groups: Vec<AdmissionGroupOutcome>,
+    request_rejections: [usize; 3],
+    limit_rejections: TraceLimitRejectionSummary,
 }
 
 impl IngestRequestOutcome {
     #[must_use]
     pub fn new(groups: Vec<AdmissionGroupOutcome>) -> Self {
-        Self { groups }
+        Self {
+            groups,
+            request_rejections: [0; 3],
+            limit_rejections: TraceLimitRejectionSummary::EMPTY,
+        }
+    }
+
+    #[must_use]
+    pub fn with_rejections(
+        groups: Vec<AdmissionGroupOutcome>,
+        request_rejections: [usize; 3],
+    ) -> Self {
+        Self {
+            groups,
+            request_rejections,
+            limit_rejections: TraceLimitRejectionSummary::EMPTY,
+        }
+    }
+
+    #[must_use]
+    pub fn with_rejections_and_limits(
+        groups: Vec<AdmissionGroupOutcome>,
+        request_rejections: [usize; 3],
+        limit_rejections: TraceLimitRejectionSummary,
+    ) -> Self {
+        Self {
+            groups,
+            request_rejections,
+            limit_rejections,
+        }
+    }
+
+    #[must_use]
+    pub fn with_additional_rejections(mut self, additional: [usize; 3]) -> Self {
+        for (current, added) in self.request_rejections.iter_mut().zip(additional) {
+            *current = current.saturating_add(added);
+        }
+        self
+    }
+
+    #[must_use]
+    pub fn with_limit_rejections(mut self, additional: TraceLimitRejectionSummary) -> Self {
+        self.limit_rejections.merge(additional);
+        self
+    }
+
+    #[must_use]
+    pub fn limit_rejections(&self) -> TraceLimitRejectionSummary {
+        self.limit_rejections
     }
 
     #[must_use]
@@ -71,14 +121,19 @@ impl IngestRequestOutcome {
 
     #[must_use]
     pub fn permanently_rejected_records(&self) -> usize {
-        self.groups
-            .iter()
-            .map(|group| match group.outcome {
-                IngestOutcome::Partial(partial) => partial.permanently_rejected(),
-                IngestOutcome::Permanent(_) => group.attempted_records,
-                _ => 0,
-            })
-            .sum()
+        self.request_rejections
+            .into_iter()
+            .sum::<usize>()
+            .saturating_add(
+                self.groups
+                    .iter()
+                    .map(|group| match group.outcome {
+                        IngestOutcome::Partial(partial) => partial.permanently_rejected(),
+                        IngestOutcome::Permanent(_) => group.attempted_records,
+                        _ => 0,
+                    })
+                    .sum(),
+            )
     }
 
     #[must_use]

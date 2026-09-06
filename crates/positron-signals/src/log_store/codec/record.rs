@@ -2,7 +2,10 @@ use positron_domain::time::{EventTime, ObservedTime, SourceTimeQuality, UnixNano
 use positron_domain::value::{AttributeNamespace, AttributeOccurrenceSetCandidate};
 use positron_kernel::{CommittedBlock, IngestTime};
 
-use super::{CodecLimits, Input, LEGACY_VERSION, METADATA_VERSION, bounded_vec, metadata, value};
+use super::{
+    CodecLimits, Input, LEGACY_VERSION, MARKER_VERSION, METADATA_VERSION, bounded_vec, metadata,
+    value,
+};
 use crate::log_store::types::{
     AttributeRepresentation, LogRecord, NativeRecordValidator, StoredLogAttribute, StoredLogRecord,
     value_profile,
@@ -134,7 +137,13 @@ fn validate_structure_with_ingest_time(
     match input.u8()? {
         0 => {},
         1 => {
-            let summary = value::validate(input, limits.nesting_depth, limits.body_bytes, limits)?;
+            let summary = value::validate(
+                input,
+                limits.nesting_depth,
+                limits.body_bytes,
+                limits,
+                version,
+            )?;
             validation
                 .observe_body(summary.decoded_bytes())
                 .map_err(|_| LogStoreFailure::malformed_block())?;
@@ -159,7 +168,13 @@ fn validate_structure_with_ingest_time(
         }
         let mut occurrence_bytes = 0_usize;
         for _ in 0..occurrences {
-            let summary = value::validate(input, limits.nesting_depth, limits.value_bytes, limits)?;
+            let summary = value::validate(
+                input,
+                limits.nesting_depth,
+                limits.value_bytes,
+                limits,
+                version,
+            )?;
             occurrence_bytes = occurrence_bytes
                 .checked_add(summary.decoded_bytes())
                 .ok_or_else(LogStoreFailure::malformed_block)?;
@@ -352,7 +367,9 @@ pub(super) fn decode_namespace(
         (1, _) => Ok(AttributeNamespace::Resource),
         (2, _) => Ok(AttributeNamespace::InstrumentationScope),
         (3, _) => Ok(AttributeNamespace::Record),
-        (4, METADATA_VERSION) => Ok(AttributeNamespace::Stream),
+        (4, version) if version == METADATA_VERSION || version == MARKER_VERSION => {
+            Ok(AttributeNamespace::Stream)
+        },
         _ => Err(LogStoreFailure::malformed_block()),
     }
 }

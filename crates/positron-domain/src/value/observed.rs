@@ -129,6 +129,18 @@ impl ValidatedAttributeValue {
     ) -> Result<bool, ObservedValueFailure<O::Error>> {
         observe_structure(observer)?;
         match (&self.inner, &other.inner) {
+            (ValidatedAttributeValueInner::Marker(_), _)
+            | (_, ValidatedAttributeValueInner::Marker(_)) => Ok(false),
+            (
+                ValidatedAttributeValueInner::Truncated { value: left, .. },
+                ValidatedAttributeValueInner::Truncated { value: right, .. },
+            ) => left.equals_observed(right, observer),
+            (ValidatedAttributeValueInner::Truncated { value, .. }, _) => {
+                value.equals_observed(other, observer)
+            },
+            (_, ValidatedAttributeValueInner::Truncated { value, .. }) => {
+                self.equals_observed(value, observer)
+            },
             (ValidatedAttributeValueInner::Null, ValidatedAttributeValueInner::Null) => Ok(true),
             (
                 ValidatedAttributeValueInner::Boolean(left),
@@ -175,7 +187,12 @@ impl ValidatedAttributeValue {
             ValidatedAttributeValueInner::Null
             | ValidatedAttributeValueInner::Boolean(_)
             | ValidatedAttributeValueInner::SignedInteger(_)
-            | ValidatedAttributeValueInner::FloatingPointBits(_) => Ok(0),
+            | ValidatedAttributeValueInner::FloatingPointBits(_)
+            | ValidatedAttributeValueInner::Marker(_) => Ok(0),
+            ValidatedAttributeValueInner::Truncated { value, .. } => value
+                .retained_heap_bytes_observed(observer)?
+                .checked_add(std::mem::size_of::<ValidatedAttributeValue>())
+                .ok_or_else(|| ObservedValueFailure::Domain(DomainFailure::value_limit_exceeded())),
             ValidatedAttributeValueInner::String(value) => {
                 observe_payload(value.as_bytes(), observer)?;
                 Ok(value.capacity())
@@ -268,6 +285,15 @@ impl ValidatedAttributeValue {
                     });
                 }
                 ValidatedAttributeValueInner::KeyValueList(cloned)
+            },
+            ValidatedAttributeValueInner::Marker(marker) => {
+                ValidatedAttributeValueInner::Marker(*marker)
+            },
+            ValidatedAttributeValueInner::Truncated { value, action } => {
+                ValidatedAttributeValueInner::Truncated {
+                    value: Box::new(value.try_clone_observed(observer)?),
+                    action: *action,
+                }
             },
         };
         Ok(Self { inner })

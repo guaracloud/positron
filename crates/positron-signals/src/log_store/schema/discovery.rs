@@ -187,7 +187,9 @@ impl SchemaPathSummary {
                 reason: if entry.variants().iter().any(|kind| {
                     !matches!(
                         kind,
-                        AttributeValueKind::Array | AttributeValueKind::KeyValueList
+                        AttributeValueKind::Array
+                            | AttributeValueKind::KeyValueList
+                            | AttributeValueKind::Marker
                     )
                 }) {
                     SchemaPromotionReason::InsufficientEvidence

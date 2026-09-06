@@ -30,6 +30,9 @@ pub(crate) fn visit_terminals(
 }
 
 pub(super) fn value_matches(value: &ValidatedAttributeValue, expected: &QueryValue) -> bool {
+    if value.is_marker() {
+        return false;
+    }
     match expected {
         QueryValue::Scalar(SchemaValue::Null) => value.is_null(),
         QueryValue::Scalar(SchemaValue::Boolean(expected)) => value.as_boolean() == Some(*expected),
@@ -46,7 +49,7 @@ pub(super) fn value_matches(value: &ValidatedAttributeValue, expected: &QueryVal
             value.as_bytes() == Some(expected.as_slice())
         },
         QueryValue::Scalar(SchemaValue::Kind(expected)) => value.kind() == *expected,
-        QueryValue::Native(expected) => value == expected,
+        QueryValue::Native(expected) => value.equals_exact(expected),
     }
 }
 
@@ -84,6 +87,7 @@ pub(crate) fn evaluate_observed<'a, O: NativeValueObserver>(
                     reduced_pruning: true,
                 });
             };
+            reduced_pruning |= value.contains_marker();
             if !visit_terminals_observed(value, remaining, observer, &mut |terminal, observer| {
                 selection.visit(terminal, observer)
             })? || selection.complete

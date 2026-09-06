@@ -133,6 +133,33 @@ fn activation_decoder_fails_closed_for_version_tags_lengths_and_trailing_bytes()
 }
 
 #[test]
+fn activation_decoder_rejects_unknown_nested_tags_and_bounded_text() {
+    let tenant = tenant(13);
+    let invalid_occurrence = prefixed(1, path_bytes(2, &[]));
+    let invalid_segment = prefixed(1, path_bytes(0, &[0]));
+    let invalid_kind = {
+        let mut bytes = prefixed(5, path_bytes(0, &[]));
+        bytes.push(0);
+        bytes
+    };
+    let invalid_objects = [
+        minimal_object(tenant, &[0], &[1]),
+        minimal_object(tenant, &[1, 0], &[1]),
+        minimal_object(tenant, &invalid_occurrence, &[1]),
+        minimal_object(tenant, &invalid_segment, &[1]),
+        minimal_object(tenant, &invalid_kind, &[1]),
+        minimal_object(tenant, &[2, 0xff, 0xff, 0xff, 0xff], &[1]),
+    ];
+
+    for bytes in invalid_objects {
+        assert!(
+            IngestPolicy::decode_activated_object(tenant, &bytes).is_err(),
+            "decoder accepted malformed nested activation"
+        );
+    }
+}
+
+#[test]
 fn provenance_reconstruction_requires_the_exact_activation_and_rule_order() {
     let policy = IngestPolicy::compile(
         7,
@@ -193,5 +220,24 @@ fn minimal_object(tenant: TenantId, predicates: &[u8], action: &[u8]) -> Vec<u8>
     bytes.extend_from_slice(&(u16::from(!predicates.is_empty())).to_be_bytes());
     bytes.extend_from_slice(predicates);
     bytes.extend_from_slice(action);
+    bytes
+}
+
+fn path_bytes(occurrence: u8, segments: &[u8]) -> Vec<u8> {
+    let mut bytes = vec![4];
+    bytes.extend_from_slice(&4_u32.to_be_bytes());
+    bytes.extend_from_slice(b"root");
+    bytes.push(occurrence);
+    bytes.extend_from_slice(
+        &u16::try_from(segments.len())
+            .expect("test path fits")
+            .to_be_bytes(),
+    );
+    bytes.extend_from_slice(segments);
+    bytes
+}
+
+fn prefixed(prefix: u8, mut bytes: Vec<u8>) -> Vec<u8> {
+    bytes.insert(0, prefix);
     bytes
 }

@@ -5,7 +5,10 @@ use crate::value::{
     RequestLimits, ValueLimitProfile, ValueLimitProfileCandidate, ValueLimitSet,
 };
 
+mod candidate_boundaries;
+mod comparison_markers;
 mod observed;
+mod observed_markers;
 mod validation;
 
 fn profile() -> ValueLimitProfile {

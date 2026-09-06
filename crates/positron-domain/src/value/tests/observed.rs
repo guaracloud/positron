@@ -267,3 +267,91 @@ fn observed_validation_reconciles_capacity_failures_without_leaking_admission() 
     assert_eq!(additional_failure.releases, vec![0]);
     assert_eq!(additional_failure.live_bytes, 0);
 }
+
+#[test]
+fn observed_marker_and_truncation_paths_preserve_queryable_sanitized_values() {
+    let profile = super::profile_with_value_and_body_bytes(64, 64);
+    let marker = CandidateAttributeValue::redaction_marker(
+        crate::value::AttributeValueKind::String,
+        crate::value::MarkerAction::Removed,
+    )
+    .validate_log_body(profile)
+    .expect("a payload-free marker validates");
+    let truncated = CandidateAttributeValue::truncated(
+        CandidateAttributeValue::string("sanitized".to_owned()),
+        crate::value::MarkerAction::TruncatedBytes,
+    )
+    .validate_log_body(profile)
+    .expect("a sanitized string truncation validates");
+    let native = CandidateAttributeValue::string("sanitized".to_owned())
+        .validate_log_body(profile)
+        .expect("the sanitized native value validates");
+
+    let mut equality = CountingObserver::default();
+    assert!(
+        !marker
+            .equals_observed(&marker, &mut equality)
+            .expect("marker comparison is not an observer failure")
+    );
+    assert!(
+        !marker
+            .equals_observed(&truncated, &mut equality)
+            .expect("marker and truncated values are distinct")
+    );
+    assert!(
+        truncated
+            .equals_observed(&native, &mut equality)
+            .expect("truncation compares through its sanitized value")
+    );
+
+    let mut retained = CountingObserver::default();
+    assert_eq!(marker.retained_heap_bytes_observed(&mut retained), Ok(0));
+    assert_eq!(
+        truncated.retained_heap_bytes_observed(&mut retained),
+        Ok(9 + std::mem::size_of::<crate::value::ValidatedAttributeValue>()),
+    );
+
+    let mut cloned = CountingObserver::default();
+    assert_eq!(
+        marker
+            .try_clone_observed(&mut cloned)
+            .expect("marker clones"),
+        marker
+    );
+    assert_eq!(
+        truncated
+            .try_clone_observed(&mut cloned)
+            .expect("truncated value clones"),
+        truncated
+    );
+
+    let mut marker_observer = CountingObserver::default();
+    assert_eq!(
+        marker
+            .canonical_encoded_size_bytes_observed(&mut marker_observer)
+            .expect("marker canonical size is observed"),
+        3
+    );
+    let mut marker_encoding = Vec::new();
+    marker
+        .visit_canonical_encoding_observed(&mut marker_observer, &mut |bytes| {
+            marker_encoding.extend_from_slice(bytes)
+        })
+        .expect("marker canonical encoding is observed");
+    assert_eq!(marker_encoding, vec![8, 0, 4]);
+
+    let mut truncated_observer = CountingObserver::default();
+    let mut truncated_encoding = Vec::new();
+    truncated
+        .visit_canonical_encoding_observed(&mut truncated_observer, &mut |bytes| {
+            truncated_encoding.extend_from_slice(bytes)
+        })
+        .expect("truncated canonical encoding is observed");
+    assert_eq!(
+        truncated_encoding,
+        vec![
+            8, 2, 4, 4, 0, 0, 0, 0, 0, 0, 0, 9, b's', b'a', b'n', b'i', b't', b'i', b'z', b'e',
+            b'd'
+        ]
+    );
+}

@@ -7,7 +7,7 @@ use positron_governance::AuthorizedContext;
 use positron_kernel::{
     ResourceAmounts, ResourceGovernor, ResourceReservation, WorkClaim, WorkKind,
 };
-use positron_policy::NativeLogCandidate;
+use positron_policy::{NativeLogCandidate, PolicyAdmissionShape};
 use prost::Message;
 
 mod admission_groups;
@@ -43,6 +43,15 @@ const RECEIVER_CAPACITY: ResourceAmounts = ResourceAmounts::new([
     1,
     0,
 ]);
+
+type NativeLogBatchParts<'authority> = (
+    TenantAttribution,
+    Vec<NativeLogCandidate>,
+    ValueLimitProfile,
+    Option<ResourceReservation<'authority>>,
+    crate::PolicyReceiver,
+    Option<Vec<PolicyAdmissionShape>>,
+);
 
 /// Reserves the canonical receiver budget before an authenticated transport
 /// begins structural decode or decompression.
@@ -115,6 +124,7 @@ pub struct NativeLogBatch<'authority> {
     decoded_bytes: u64,
     capacity: Option<ResourceReservation<'authority>>,
     receiver: crate::PolicyReceiver,
+    policy_shapes: Option<Vec<PolicyAdmissionShape>>,
 }
 
 impl<'authority> NativeLogBatch<'authority> {
@@ -133,6 +143,32 @@ impl<'authority> NativeLogBatch<'authority> {
             decoded_bytes,
             capacity,
             receiver,
+            policy_shapes: None,
+        };
+        batch.resize_after_decode()?;
+        Ok(batch)
+    }
+
+    pub(super) fn new_with_policy_shapes(
+        attribution: TenantAttribution,
+        records: Vec<NativeLogCandidate>,
+        value_limit_profile: ValueLimitProfile,
+        decoded_bytes: u64,
+        capacity: Option<ResourceReservation<'authority>>,
+        receiver: crate::PolicyReceiver,
+        policy_shapes: Vec<PolicyAdmissionShape>,
+    ) -> Result<Self, ReceiveFailure> {
+        if policy_shapes.len() != records.len() {
+            return Err(ReceiveFailure::ValueLimitExceeded);
+        }
+        let mut batch = Self {
+            attribution,
+            records,
+            value_limit_profile,
+            decoded_bytes,
+            capacity,
+            receiver,
+            policy_shapes: Some(policy_shapes),
         };
         batch.resize_after_decode()?;
         Ok(batch)
@@ -158,6 +194,7 @@ impl<'authority> NativeLogBatch<'authority> {
         self.receiver
     }
 
+    #[cfg(test)]
     pub(crate) fn into_parts(
         self,
     ) -> (
@@ -167,19 +204,39 @@ impl<'authority> NativeLogBatch<'authority> {
         Option<ResourceReservation<'authority>>,
         crate::PolicyReceiver,
     ) {
+        let (attribution, records, value_limit_profile, capacity, receiver, _) =
+            self.into_parts_with_policy_shapes();
+        (
+            attribution,
+            records,
+            value_limit_profile,
+            capacity,
+            receiver,
+        )
+    }
+
+    pub(crate) fn into_parts_with_policy_shapes(self) -> NativeLogBatchParts<'authority> {
         (
             self.attribution,
             self.records,
             self.value_limit_profile,
             self.capacity,
             self.receiver,
+            self.policy_shapes,
         )
     }
 
     fn resize_after_decode(&mut self) -> Result<(), ReceiveFailure> {
         let record_count =
             u64::try_from(self.records.len()).map_err(|_| ReceiveFailure::ValueLimitExceeded)?;
-        let retained_peak = bounds::grouped_retained_bytes(self.decoded_bytes, self.records.len())?;
+        let retained_peak = if self.policy_shapes.is_some() {
+            bounds::grouped_retained_bytes_with_policy_shapes(
+                self.decoded_bytes,
+                self.records.len(),
+            )?
+        } else {
+            bounds::grouped_retained_bytes(self.decoded_bytes, self.records.len())?
+        };
         if retained_peak > MAX_RETAINED_BYTES {
             return Err(ReceiveFailure::ValueLimitExceeded);
         }

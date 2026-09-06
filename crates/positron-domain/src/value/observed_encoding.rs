@@ -17,6 +17,10 @@ impl ValidatedAttributeValue {
             ValidatedAttributeValueInner::Boolean(_) => Ok(2),
             ValidatedAttributeValueInner::SignedInteger(_)
             | ValidatedAttributeValueInner::FloatingPointBits(_) => Ok(9),
+            ValidatedAttributeValueInner::Marker(_) => Ok(3),
+            ValidatedAttributeValueInner::Truncated { value, .. } => {
+                checked_add(3, value.canonical_encoded_size_bytes_observed(observer)?)
+            },
             ValidatedAttributeValueInner::String(value) => {
                 observe_payload(value.as_bytes(), observer)?;
                 canonical_sequence_size(value.len())
@@ -101,9 +105,52 @@ impl ValidatedAttributeValue {
                         .visit_canonical_encoding_observed(observer, visit)?;
                 }
             },
+            ValidatedAttributeValueInner::Marker(marker) => {
+                visit(&[
+                    8,
+                    marker_action_tag(marker.action()),
+                    native_kind_tag(marker.original_kind())?,
+                ]);
+            },
+            ValidatedAttributeValueInner::Truncated { value, action } => {
+                visit(&[
+                    8,
+                    marker_action_tag(*action),
+                    native_kind_tag(value.kind())?,
+                ]);
+                value.visit_canonical_encoding_observed(observer, visit)?;
+            },
         }
         Ok(())
     }
+}
+
+fn marker_action_tag(action: super::MarkerAction) -> u8 {
+    match action {
+        super::MarkerAction::Removed => 0,
+        super::MarkerAction::Redacted => 1,
+        super::MarkerAction::TruncatedBytes => 2,
+        super::MarkerAction::TruncatedElements => 3,
+    }
+}
+
+fn native_kind_tag<E>(kind: super::AttributeValueKind) -> Result<u8, ObservedValueFailure<E>> {
+    let tag = match kind {
+        super::AttributeValueKind::Null => 0,
+        super::AttributeValueKind::Boolean => 1,
+        super::AttributeValueKind::SignedInteger => 2,
+        super::AttributeValueKind::FloatingPoint => 3,
+        super::AttributeValueKind::String => 4,
+        super::AttributeValueKind::Bytes => 5,
+        super::AttributeValueKind::Array => 6,
+        super::AttributeValueKind::KeyValueList => 7,
+        super::AttributeValueKind::Marker => {
+            return Err(ObservedValueFailure::Domain(
+                DomainFailure::value_limit_exceeded(),
+            ));
+        },
+    };
+    Ok(tag)
 }
 
 impl AttributeOccurrenceSet {

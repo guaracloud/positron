@@ -1,13 +1,40 @@
 use positron_domain::value::AttributeNamespace;
 
+use super::super::details::SpanStatusCode;
 use super::super::failure::TraceStoreFailure;
-use super::super::types::{SamplingDecision, SpanKind};
+use super::super::observation::{SamplingDecision, SpanKind};
 use crate::ScanCancellation;
 
 pub(crate) const MAGIC: &[u8; 8] = b"PTRCBL01";
-pub(crate) const VERSION: u16 = 1;
+pub(crate) const LEGACY_VERSION: u16 = 1;
+pub(crate) const DETAILS_VERSION: u16 = 2;
+pub(crate) const VERSION: u16 = 3;
 pub(crate) const MAX_RECORDS: usize = 1_024;
 pub(crate) const MAX_BLOCK_BYTES: usize = 1_048_576;
+pub(crate) const OUT_OF_RANGE_TIME_TAG: u8 = 6;
+
+pub(crate) const fn supported_version(version: u16) -> bool {
+    matches!(version, LEGACY_VERSION | DETAILS_VERSION | VERSION)
+}
+
+pub(crate) const fn status_tag(status: SpanStatusCode) -> u8 {
+    match status {
+        SpanStatusCode::Unset => 0,
+        SpanStatusCode::Ok => 1,
+        SpanStatusCode::Error => 2,
+    }
+}
+
+pub(crate) const fn decode_status_tag(
+    tag: u8,
+) -> Result<SpanStatusCode, super::super::failure::TraceStoreFailure> {
+    match tag {
+        0 => Ok(SpanStatusCode::Unset),
+        1 => Ok(SpanStatusCode::Ok),
+        2 => Ok(SpanStatusCode::Error),
+        _ => Err(super::super::failure::TraceStoreFailure::malformed_block()),
+    }
+}
 
 pub(crate) fn check_cancel(cancellation: &dyn ScanCancellation) -> Result<(), TraceStoreFailure> {
     if cancellation.is_cancelled() {
@@ -58,12 +85,12 @@ pub(crate) fn decode_namespace(tag: u8) -> Result<AttributeNamespace, TraceStore
     }
 }
 
-pub(crate) fn namespace_index(namespace: AttributeNamespace) -> Result<usize, TraceStoreFailure> {
+pub(crate) const fn namespace_index(namespace: AttributeNamespace) -> Option<usize> {
     match namespace {
-        AttributeNamespace::Resource => Ok(0),
-        AttributeNamespace::InstrumentationScope => Ok(1),
-        AttributeNamespace::Record => Ok(2),
-        AttributeNamespace::Stream => Err(TraceStoreFailure::malformed_block()),
+        AttributeNamespace::Resource => Some(0),
+        AttributeNamespace::InstrumentationScope => Some(1),
+        AttributeNamespace::Record => Some(2),
+        AttributeNamespace::Stream => None,
     }
 }
 

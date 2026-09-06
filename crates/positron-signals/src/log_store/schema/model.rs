@@ -375,7 +375,7 @@ pub(crate) fn promoted_index_bytes(variants: &[AttributeValueKind]) -> usize {
 pub(crate) const fn scalar_kind(kind: AttributeValueKind) -> bool {
     !matches!(
         kind,
-        AttributeValueKind::Array | AttributeValueKind::KeyValueList
+        AttributeValueKind::Array | AttributeValueKind::KeyValueList | AttributeValueKind::Marker
     )
 }
 

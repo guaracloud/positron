@@ -10,6 +10,7 @@ use super::{
 mod schema_maintenance;
 mod schema_replay_integrity;
 mod schema_routes;
+mod trace_visibility;
 
 #[test]
 fn service_diagnostics_are_stable_and_secret_free() {
@@ -52,6 +53,10 @@ fn planner_failures_preserve_permanent_retryable_and_invariant_classes() {
     );
     assert_eq!(
         map_admission_group_plan_failure(AdmissionGroupPlanFailure::AssignmentUnavailable),
+        ServiceFailure::CapacityUnavailable
+    );
+    assert_eq!(
+        map_admission_group_plan_failure(AdmissionGroupPlanFailure::CapacityUnavailable),
         ServiceFailure::CapacityUnavailable
     );
     assert_eq!(

@@ -7,11 +7,13 @@ include!("value/validated.rs");
 include!("value/occurrences.rs");
 include!("value/observed_validation.rs");
 
+mod candidate_shape;
 mod observed;
 mod observed_encoding;
 mod validated_encoding;
 mod validated_profile;
 
+pub use candidate_shape::{CandidateShapeFailure, ValueLimitDimension, ValueLimitViolation};
 pub use observed::{
     NATIVE_VALUE_PAYLOAD_CHUNK_BYTES, NativeValueObserver, ObservedValueFailure,
     ObservedValueTransfer,

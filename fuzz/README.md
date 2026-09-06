@@ -27,6 +27,19 @@ and durable ingest:
 cargo +nightly fuzz run ingest_policy --sanitizer none -- -runs=1000
 ```
 
+The bounded OTLP Traces target drives protobuf, ProtoJSON, and gzip payloads
+through the receiver's public preflight/decode seam:
+
+```console
+cargo +nightly fuzz run otlp_traces_decode --sanitizer none -- -runs=1000
+```
+
+Replay its named valid, boundary, and malformed seeds before the campaign:
+
+```console
+cargo +nightly fuzz run otlp_traces_decode --sanitizer none -- fuzz/corpus/otlp_traces_decode -runs=1
+```
+
 The repository's production toolchain remains pinned; `cargo-fuzz` uses an
 installed nightly toolchain only for sanitizer instrumentation.
 

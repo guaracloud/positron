@@ -260,6 +260,7 @@ fn value_tag(kind: AttributeValueKind) -> u8 {
         AttributeValueKind::Bytes => 5,
         AttributeValueKind::Array => 6,
         AttributeValueKind::KeyValueList => 7,
+        AttributeValueKind::Marker => 255,
     }
 }
 

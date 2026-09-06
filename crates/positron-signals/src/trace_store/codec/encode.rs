@@ -1,16 +1,27 @@
 use positron_domain::identity::TenantId;
 use positron_domain::time::EventTime;
-use positron_domain::value::AttributeValueKind;
+use positron_domain::value::{AttributeValueKind, MarkerAction, ValueLimitProfile};
 
+use super::super::details::{SpanAttributeSet, SpanEvent, SpanLink, SpanObservationDetails};
 use super::super::failure::TraceStoreFailure;
-use super::super::types::TraceLimits;
-use super::super::types::{StoredSpanObservation, release_1_limits};
+use super::super::types::{StoredSpanObservation, TraceLimits, limits_for};
+use super::encoded_size::encoded_record_bytes_with_limits;
 use super::format::{
-    MAGIC, MAX_BLOCK_BYTES, MAX_RECORDS, VERSION, kind_tag, namespace_tag, quality_tag,
-    sampling_tag,
+    MAGIC, MAX_BLOCK_BYTES, MAX_RECORDS, OUT_OF_RANGE_TIME_TAG, VERSION, kind_tag, namespace_tag,
+    quality_tag, sampling_tag, status_tag,
 };
 
+#[cfg(any(test, fuzzing))]
 pub(crate) fn encode_block(
+    tenant: TenantId,
+    records: &[StoredSpanObservation],
+) -> Result<Vec<u8>, TraceStoreFailure> {
+    let profile = ValueLimitProfile::release_1_system_maximum();
+    encode_block_with_profile(&profile, tenant, records)
+}
+
+pub(crate) fn encode_block_with_profile(
+    profile: &ValueLimitProfile,
     tenant: TenantId,
     records: &[StoredSpanObservation],
 ) -> Result<Vec<u8>, TraceStoreFailure> {
@@ -23,20 +34,18 @@ pub(crate) fn encode_block(
     put_slice(&mut output, &tenant.to_bytes())?;
     put_count(&mut output, records.len())?;
     for record in records {
-        encode_observation(&mut output, record)?;
+        encoded_record_bytes_with_limits(record.observation(), &limits_for(profile)?)?;
+        encode_observation(&mut output, record, profile)?;
     }
     Ok(output)
-}
-
-fn limits() -> Result<TraceLimits, TraceStoreFailure> {
-    release_1_limits()
 }
 
 fn encode_observation(
     output: &mut Vec<u8>,
     stored: &StoredSpanObservation,
+    profile: &ValueLimitProfile,
 ) -> Result<(), TraceStoreFailure> {
-    let limits = limits()?;
+    let limits = limits_for(profile)?;
     let observation = stored.observation();
     put_slice(output, &observation.trace_id())?;
     put_slice(output, &observation.span_id())?;
@@ -61,9 +70,34 @@ fn encode_observation(
             let value = attribute
                 .occurrence(index)
                 .ok_or_else(TraceStoreFailure::invalid_input)?;
-            encode_value(output, value, limits.nesting_depth)?;
+            encode_value(output, value, limits.nesting_depth, &limits)?;
         }
     }
+    if observation.name().is_empty() || observation.name().len() > limits.key_path_bytes {
+        return Err(TraceStoreFailure::invalid_input());
+    }
+    if observation.attributes().len() > limits.attribute_sets {
+        return Err(TraceStoreFailure::limit_exceeded());
+    }
+    let mut occurrences_by_namespace = [0_usize; 3];
+    for attribute in observation.attributes() {
+        if attribute.key().len() > limits.key_path_bytes {
+            return Err(TraceStoreFailure::limit_exceeded());
+        }
+        let namespace = super::format::namespace_index(attribute.namespace())
+            .ok_or_else(TraceStoreFailure::invalid_input)?;
+        let occurrences = occurrences_by_namespace
+            .get_mut(namespace)
+            .ok_or_else(TraceStoreFailure::invalid_input)?;
+        *occurrences = occurrences
+            .checked_add(attribute.len())
+            .filter(|count| *count <= limits.occurrences_per_namespace)
+            .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+    }
+    let _ = observation
+        .details()
+        .decoded_size_bytes(limits.decoded_bytes)?;
+    encode_details(output, observation.details(), &limits)?;
     let policy = observation.policy_provenance();
     put_u64(output, policy.generation())?;
     put_slice(output, &policy.digest())?;
@@ -75,7 +109,112 @@ fn encode_observation(
     Ok(())
 }
 
+fn encode_details(
+    output: &mut Vec<u8>,
+    details: &SpanObservationDetails,
+    limits: &TraceLimits,
+) -> Result<(), TraceStoreFailure> {
+    if details.trace_state().len() > limits.key_path_bytes
+        || details.status().message().len() > limits.key_path_bytes
+        || details.resource().schema_url().len() > limits.key_path_bytes
+        || details.scope().name().len() > limits.key_path_bytes
+        || details.scope().version().len() > limits.key_path_bytes
+        || details.scope().schema_url().len() > limits.key_path_bytes
+        || details.events().len() > super::super::details::MAX_DETAIL_COLLECTION
+        || details.links().len() > super::super::details::MAX_DETAIL_COLLECTION
+    {
+        return Err(TraceStoreFailure::limit_exceeded());
+    }
+    put_bytes(output, details.trace_state().as_bytes())?;
+    put_u32(output, details.flags())?;
+    put_u8(output, status_tag(details.status().code()))?;
+    put_bytes(output, details.status().message().as_bytes())?;
+    put_u32(output, details.dropped_attributes_count())?;
+    put_u32(output, details.dropped_events_count())?;
+    put_u32(output, details.dropped_links_count())?;
+    put_u32(output, details.resource().dropped_attributes_count())?;
+    put_bytes(output, details.resource().schema_url().as_bytes())?;
+    put_bytes(output, details.scope().name().as_bytes())?;
+    put_bytes(output, details.scope().version().as_bytes())?;
+    put_u32(output, details.scope().dropped_attributes_count())?;
+    put_bytes(output, details.scope().schema_url().as_bytes())?;
+    put_count(output, details.events().len())?;
+    for event in details.events() {
+        encode_event(output, event, limits)?;
+    }
+    put_count(output, details.links().len())?;
+    for link in details.links() {
+        encode_link(output, link, limits)?;
+    }
+    Ok(())
+}
+
+fn encode_event(
+    output: &mut Vec<u8>,
+    event: &SpanEvent,
+    limits: &TraceLimits,
+) -> Result<(), TraceStoreFailure> {
+    if event.name().is_empty() || event.name().len() > limits.key_path_bytes {
+        return Err(TraceStoreFailure::invalid_input());
+    }
+    encode_time(output, event.timestamp())?;
+    put_bytes(output, event.name().as_bytes())?;
+    put_u32(output, event.dropped_attributes_count())?;
+    encode_span_attributes(output, event.attributes(), limits)
+}
+
+fn encode_link(
+    output: &mut Vec<u8>,
+    link: &SpanLink,
+    limits: &TraceLimits,
+) -> Result<(), TraceStoreFailure> {
+    if link.trace_state().len() > limits.key_path_bytes {
+        return Err(TraceStoreFailure::limit_exceeded());
+    }
+    put_slice(output, &link.trace_id())?;
+    put_slice(output, &link.span_id())?;
+    put_bytes(output, link.trace_state().as_bytes())?;
+    put_u32(output, link.flags())?;
+    put_u32(output, link.dropped_attributes_count())?;
+    encode_span_attributes(output, link.attributes(), limits)
+}
+
+fn encode_span_attributes(
+    output: &mut Vec<u8>,
+    attributes: &[SpanAttributeSet],
+    limits: &TraceLimits,
+) -> Result<(), TraceStoreFailure> {
+    if attributes.len() > super::super::details::MAX_DETAIL_COLLECTION {
+        return Err(TraceStoreFailure::limit_exceeded());
+    }
+    let mut occurrences = 0_usize;
+    put_count(output, attributes.len())?;
+    for attribute in attributes {
+        if attribute.key().len() > limits.key_path_bytes {
+            return Err(TraceStoreFailure::limit_exceeded());
+        }
+        occurrences = occurrences
+            .checked_add(attribute.len())
+            .filter(|count| *count <= limits.occurrences_per_namespace)
+            .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+        put_bytes(output, attribute.key().as_bytes())?;
+        put_count(output, attribute.len())?;
+        for index in 0..attribute.len() {
+            let value = attribute
+                .occurrence(index)
+                .ok_or_else(TraceStoreFailure::invalid_input)?;
+            encode_value(output, value, limits.nesting_depth, limits)?;
+        }
+    }
+    Ok(())
+}
+
 fn encode_time(output: &mut Vec<u8>, time: EventTime) -> Result<(), TraceStoreFailure> {
+    if let Some(value) = time.source_value().filter(|value| *value > i64::MAX as u64) {
+        put_u8(output, OUT_OF_RANGE_TIME_TAG)?;
+        put_u64(output, value)?;
+        return Ok(());
+    }
     put_u8(output, quality_tag(time.quality()))?;
     if let Some(value) = time.instant() {
         put_i64(output, value.value())?;
@@ -87,7 +226,30 @@ fn encode_value(
     output: &mut Vec<u8>,
     value: &positron_domain::value::ValidatedAttributeValue,
     depth: u8,
+    limits: &TraceLimits,
 ) -> Result<(), TraceStoreFailure> {
+    if let Some(action) = value.marker_action() {
+        put_u8(output, 8)?;
+        put_u8(output, marker_action_tag(action))?;
+        put_u8(
+            output,
+            native_kind_tag(
+                value
+                    .marker_original_kind()
+                    .ok_or_else(TraceStoreFailure::invalid_input)?,
+            )?,
+        )?;
+        return Ok(());
+    }
+    if let Some(action) = value.truncation_action() {
+        let child = value
+            .truncated_value()
+            .ok_or_else(TraceStoreFailure::invalid_input)?;
+        put_u8(output, 8)?;
+        put_u8(output, marker_action_tag(action))?;
+        put_u8(output, native_kind_tag(child.kind())?)?;
+        return encode_value(output, child, depth, limits);
+    }
     match value.kind() {
         AttributeValueKind::Null => put_u8(output, 0)?,
         AttributeValueKind::Boolean => {
@@ -124,6 +286,9 @@ fn encode_value(
             let text = value
                 .as_str()
                 .ok_or_else(TraceStoreFailure::invalid_input)?;
+            if text.len() > limits.value_bytes {
+                return Err(TraceStoreFailure::limit_exceeded());
+            }
             put_bytes(output, text.as_bytes())?;
         },
         AttributeValueKind::Bytes => {
@@ -131,6 +296,9 @@ fn encode_value(
             let bytes = value
                 .as_bytes()
                 .ok_or_else(TraceStoreFailure::invalid_input)?;
+            if bytes.len() > limits.value_bytes {
+                return Err(TraceStoreFailure::limit_exceeded());
+            }
             put_bytes(output, bytes)?;
         },
         AttributeValueKind::Array => {
@@ -141,6 +309,9 @@ fn encode_value(
             let count = value
                 .array_len()
                 .ok_or_else(TraceStoreFailure::invalid_input)?;
+            if count > limits.array_entries {
+                return Err(TraceStoreFailure::limit_exceeded());
+            }
             put_count(output, count)?;
             for index in 0..count {
                 encode_value(
@@ -149,6 +320,7 @@ fn encode_value(
                         .array_entry(index)
                         .ok_or_else(TraceStoreFailure::invalid_input)?,
                     next,
+                    limits,
                 )?;
             }
         },
@@ -160,17 +332,47 @@ fn encode_value(
             let count = value
                 .key_value_list_len()
                 .ok_or_else(TraceStoreFailure::invalid_input)?;
+            if count > limits.key_value_list_entries {
+                return Err(TraceStoreFailure::limit_exceeded());
+            }
             put_count(output, count)?;
             for index in 0..count {
                 let entry = value
                     .key_value_entry(index)
                     .ok_or_else(TraceStoreFailure::invalid_input)?;
+                if entry.key().len() > limits.key_path_bytes {
+                    return Err(TraceStoreFailure::limit_exceeded());
+                }
                 put_bytes(output, entry.key().as_bytes())?;
-                encode_value(output, entry.value(), next)?;
+                encode_value(output, entry.value(), next, limits)?;
             }
         },
+        AttributeValueKind::Marker => return Err(TraceStoreFailure::invalid_input()),
     }
     Ok(())
+}
+
+fn marker_action_tag(action: MarkerAction) -> u8 {
+    match action {
+        MarkerAction::Removed => 0,
+        MarkerAction::Redacted => 1,
+        MarkerAction::TruncatedBytes => 2,
+        MarkerAction::TruncatedElements => 3,
+    }
+}
+
+fn native_kind_tag(kind: AttributeValueKind) -> Result<u8, TraceStoreFailure> {
+    match kind {
+        AttributeValueKind::Null => Ok(0),
+        AttributeValueKind::Boolean => Ok(1),
+        AttributeValueKind::SignedInteger => Ok(2),
+        AttributeValueKind::FloatingPoint => Ok(3),
+        AttributeValueKind::String => Ok(4),
+        AttributeValueKind::Bytes => Ok(5),
+        AttributeValueKind::Array => Ok(6),
+        AttributeValueKind::KeyValueList => Ok(7),
+        AttributeValueKind::Marker => Err(TraceStoreFailure::invalid_input()),
+    }
 }
 
 pub(crate) fn put_slice(output: &mut Vec<u8>, value: &[u8]) -> Result<(), TraceStoreFailure> {
@@ -193,6 +395,10 @@ fn put_u8(output: &mut Vec<u8>, value: u8) -> Result<(), TraceStoreFailure> {
 }
 
 fn put_u16(output: &mut Vec<u8>, value: u16) -> Result<(), TraceStoreFailure> {
+    put_slice(output, &value.to_be_bytes())
+}
+
+fn put_u32(output: &mut Vec<u8>, value: u32) -> Result<(), TraceStoreFailure> {
     put_slice(output, &value.to_be_bytes())
 }
 

@@ -1,7 +1,8 @@
 use std::error::Error;
 
 use positron_domain::value::{
-    ByteLimit, RecordLimits, ValueLimitProfile, ValueLimitProfileCandidate, ValueLimitSet,
+    AttributeValueKind, ByteLimit, MarkerAction, RecordLimits, ValueLimitProfile,
+    ValueLimitProfileCandidate, ValueLimitSet,
 };
 use positron_ingest::{
     AuthenticatedOtlpLogsRequest, IngestFailureCode, IngestOutcome, IngestPolicy, LogIngest,
@@ -49,8 +50,22 @@ fn body_remove_redact_and_utf8_truncate_persist_typed_evidence() -> Result<(), B
     let result = ingest_and_scan(&fixture, batch, &policy, 52)?;
     let records = result.records();
     assert_eq!(records.len(), 3);
-    assert!(records[0].body().is_none());
-    assert!(records[1].body().is_some_and(|body| body.is_null()));
+    let removed = records[0].body().ok_or("removed body marker disappeared")?;
+    assert_eq!(removed.marker_action(), Some(MarkerAction::Removed));
+    assert_eq!(
+        removed.marker_original_kind(),
+        Some(AttributeValueKind::String)
+    );
+    assert_eq!(removed.as_str(), None);
+    let redacted = records[1]
+        .body()
+        .ok_or("redacted body marker disappeared")?;
+    assert_eq!(redacted.marker_action(), Some(MarkerAction::Redacted));
+    assert_eq!(
+        redacted.marker_original_kind(),
+        Some(AttributeValueKind::String)
+    );
+    assert_eq!(redacted.as_str(), None);
     let truncated = records[2].body().ok_or("truncated body disappeared")?;
     assert_eq!(truncated.as_str(), Some("ol\u{00e1}-"));
     assert_eq!(

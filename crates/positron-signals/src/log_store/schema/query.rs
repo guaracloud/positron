@@ -93,7 +93,9 @@ impl SchemaValue {
                 owned.extend_from_slice(source);
                 Self::Bytes(owned)
             },
-            AttributeValueKind::Array | AttributeValueKind::KeyValueList => return Ok(None),
+            AttributeValueKind::Array
+            | AttributeValueKind::KeyValueList
+            | AttributeValueKind::Marker => return Ok(None),
         };
         Ok(Some(scalar))
     }
@@ -329,6 +331,7 @@ pub(super) fn evaluate<'a>(
         reduced_pruning |= representation.is_overflow();
         for index in 0..attribute.len() {
             if let Some(value) = attribute.occurrence(index) {
+                reduced_pruning |= value.contains_marker();
                 visit_terminals(value, remaining, &mut |terminal| state.visit(terminal));
             }
             if state.complete() {

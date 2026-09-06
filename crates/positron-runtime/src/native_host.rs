@@ -20,6 +20,7 @@ mod loki_http;
 mod native_http;
 mod otlp_grpc;
 mod otlp_http;
+mod otlp_outcome;
 
 #[derive(Clone, Debug)]
 pub struct NativeBindings {

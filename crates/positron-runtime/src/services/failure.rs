@@ -1,7 +1,9 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
-use positron_ingest::{AdmissionGroupPlanFailure, ReceiveFailure};
+use positron_ingest::{
+    AdmissionGroupPlanFailure, ReceiveFailure, TraceLimitViolation, TraceReceiveFailure,
+};
 use positron_kernel::{CatalogFailureCode, LedgerFailureCode};
 use positron_query::{QueryEvent, QueryFailure, QueryFailureCode, QueryTerminal};
 
@@ -11,6 +13,7 @@ pub enum ServiceFailure {
     CapacityUnavailable,
     RequestTooLarge,
     InvalidRequest,
+    InvalidRequestWithLimit(TraceLimitViolation),
     KeyUnavailable,
     CatalogUnavailable,
     LedgerUnavailable,
@@ -26,6 +29,7 @@ pub(super) fn map_admission_group_plan_failure(
     match failure {
         AdmissionGroupPlanFailure::UnsupportedSignal => ServiceFailure::InvalidRequest,
         AdmissionGroupPlanFailure::AssignmentUnavailable => ServiceFailure::CapacityUnavailable,
+        AdmissionGroupPlanFailure::CapacityUnavailable => ServiceFailure::CapacityUnavailable,
         AdmissionGroupPlanFailure::RecordCountExceeded => ServiceFailure::Internal,
     }
 }
@@ -35,6 +39,19 @@ pub(super) fn map_receive_failure(failure: ReceiveFailure) -> ServiceFailure {
         ReceiveFailure::AuthenticationRejected => ServiceFailure::Unauthorized,
         ReceiveFailure::CapacityUnavailable => ServiceFailure::CapacityUnavailable,
         ReceiveFailure::TransportLimitExceeded => ServiceFailure::RequestTooLarge,
+        _ => ServiceFailure::InvalidRequest,
+    }
+}
+
+pub(super) fn map_trace_receive_failure(failure: TraceReceiveFailure) -> ServiceFailure {
+    match failure {
+        TraceReceiveFailure::AuthenticationRejected => ServiceFailure::Unauthorized,
+        TraceReceiveFailure::CapacityUnavailable => ServiceFailure::CapacityUnavailable,
+        TraceReceiveFailure::TransportLimitExceeded => ServiceFailure::RequestTooLarge,
+        TraceReceiveFailure::MalformedCompression => ServiceFailure::InvalidRequest,
+        TraceReceiveFailure::ValueLimitExceededWithDetail(detail) => {
+            ServiceFailure::InvalidRequestWithLimit(detail)
+        },
         _ => ServiceFailure::InvalidRequest,
     }
 }
@@ -197,9 +214,11 @@ impl ServiceFailure {
             Self::LedgerUnavailable => crate::BootstrapFailureCode::LedgerUnavailable,
             Self::Cancelled => crate::BootstrapFailureCode::ResourceUnavailable,
             Self::CapacityUnavailable => crate::BootstrapFailureCode::ResourceUnavailable,
-            Self::Unauthorized | Self::RequestTooLarge | Self::InvalidRequest | Self::Internal => {
-                crate::BootstrapFailureCode::ResourceUnavailable
-            },
+            Self::Unauthorized
+            | Self::RequestTooLarge
+            | Self::InvalidRequest
+            | Self::InvalidRequestWithLimit(_)
+            | Self::Internal => crate::BootstrapFailureCode::ResourceUnavailable,
         }
     }
 }

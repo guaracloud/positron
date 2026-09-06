@@ -174,7 +174,9 @@ impl SchemaBlockIndex {
     pub(crate) fn covers_kind(&self, path: &SchemaPath, kind: AttributeValueKind) -> Option<bool> {
         if matches!(
             kind,
-            AttributeValueKind::Array | AttributeValueKind::KeyValueList
+            AttributeValueKind::Array
+                | AttributeValueKind::KeyValueList
+                | AttributeValueKind::Marker
         ) {
             return None;
         }
@@ -241,7 +243,10 @@ fn entry_for_path<'a>(entries: &'a [SchemaEntry], path: &SchemaPath) -> Option<&
 }
 
 pub(super) const fn kind_bit(kind: AttributeValueKind) -> u8 {
-    1_u8 << (kind as u8)
+    match kind {
+        AttributeValueKind::Marker => 0,
+        _ => 1_u8 << (kind as u8),
+    }
 }
 
 pub(super) fn scalar_kind_mask(kinds: &[AttributeValueKind]) -> u8 {
@@ -250,7 +255,9 @@ pub(super) fn scalar_kind_mask(kinds: &[AttributeValueKind]) -> u8 {
         .filter(|kind| {
             !matches!(
                 kind,
-                AttributeValueKind::Array | AttributeValueKind::KeyValueList
+                AttributeValueKind::Array
+                    | AttributeValueKind::KeyValueList
+                    | AttributeValueKind::Marker
             )
         })
         .fold(0_u8, |mask, kind| mask | kind_bit(*kind))

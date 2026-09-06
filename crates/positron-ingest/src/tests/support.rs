@@ -31,16 +31,29 @@ pub fn fixture() -> Result<Fixture, Box<dyn std::error::Error>> {
 pub fn fixture_with_ordinary_memory(
     ordinary_memory_bytes: u64,
 ) -> Result<Fixture, Box<dyn std::error::Error>> {
+    fixture_with_ordinary_memory_and_cpu(ordinary_memory_bytes, 800)
+}
+
+pub fn fixture_with_ordinary_memory_and_cpu(
+    ordinary_memory_bytes: u64,
+    ordinary_cpu_work_units: u64,
+) -> Result<Fixture, Box<dyn std::error::Error>> {
     let root = TemporaryRoot::new()?;
     let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
     let tenant = TenantId::from_bytes([2; 16])?;
-    fixture_for_volume(root, volume, tenant, ordinary_memory_bytes)
+    fixture_for_volume(
+        root,
+        volume,
+        tenant,
+        ordinary_memory_bytes,
+        ordinary_cpu_work_units,
+    )
 }
 
 pub fn fixture_for_tenant(tenant: TenantId) -> Result<Fixture, Box<dyn std::error::Error>> {
     let root = TemporaryRoot::new()?;
     let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
-    fixture_for_volume(root, volume, tenant, DEFAULT_ORDINARY_MEMORY_BYTES)
+    fixture_for_volume(root, volume, tenant, DEFAULT_ORDINARY_MEMORY_BYTES, 800)
 }
 
 fn fixture_for_volume(
@@ -48,6 +61,7 @@ fn fixture_for_volume(
     volume: OwnedPrimaryDataVolume,
     tenant: TenantId,
     ordinary_memory_bytes: u64,
+    ordinary_cpu_work_units: u64,
 ) -> Result<Fixture, Box<dyn std::error::Error>> {
     let cardinality = InventoryCardinalityLimits::new(1, 16)?;
     let observed = ObservedResourceEnvironment::observe(
@@ -69,7 +83,7 @@ fn fixture_for_volume(
         32,
         32,
         32,
-        800,
+        ordinary_cpu_work_units,
         32,
         2_000_000,
     ]);

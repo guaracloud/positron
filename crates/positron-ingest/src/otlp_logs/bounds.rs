@@ -6,14 +6,22 @@ use super::{NativeLogBatch, NativeLogCandidate};
 use positron_domain::value::{CandidateAttributeValue, CandidateKeyValue};
 use positron_policy::NativeLogAttribute;
 
-pub(super) fn decoded_record_bytes(
+#[derive(Clone, Copy, Debug)]
+pub(super) struct DecodedRecordFacts {
+    pub(super) decoded_bytes: usize,
+    pub(super) value_nodes: u64,
+    pub(super) attribute_entries: u64,
+    pub(super) maximum_nesting_depth: u16,
+}
+
+pub(super) fn decoded_record_facts(
     resource: &[KeyValue],
     scope: &[KeyValue],
     record: &LogRecord,
     cloned_metadata: [&str; 4],
     maximum_nesting_depth: u16,
     maximum_decoded_record_bytes: usize,
-) -> Result<usize, ReceiveFailure> {
+) -> Result<DecodedRecordFacts, ReceiveFailure> {
     let mut bytes = add_decoded_bytes(
         record.severity_text.len(),
         record.event_name.len(),
@@ -22,24 +30,56 @@ pub(super) fn decoded_record_bytes(
     for value in cloned_metadata {
         bytes = add_decoded_bytes(bytes, value.len(), maximum_decoded_record_bytes)?;
     }
+    let mut value_nodes = 0_u64;
+    let mut maximum_value_depth = 0_u16;
     if let Some(body) = &record.body {
-        bytes = add_decoded_bytes(
-            bytes,
-            decoded_value_bytes(body, maximum_nesting_depth, maximum_decoded_record_bytes)?,
-            maximum_decoded_record_bytes,
-        )?;
+        let facts =
+            decoded_value_facts(body, maximum_nesting_depth, 1, maximum_decoded_record_bytes)?;
+        bytes = add_decoded_bytes(bytes, facts.bytes, maximum_decoded_record_bytes)?;
+        value_nodes = value_nodes
+            .checked_add(facts.nodes)
+            .ok_or(ReceiveFailure::ValueLimitExceeded)?;
+        maximum_value_depth = maximum_value_depth.max(facts.maximum_depth);
     }
+    let attribute_entries = u64::try_from(
+        resource
+            .len()
+            .checked_add(scope.len())
+            .and_then(|count| count.checked_add(record.attributes.len()))
+            .ok_or(ReceiveFailure::ValueLimitExceeded)?,
+    )
+    .map_err(|_| ReceiveFailure::ValueLimitExceeded)?;
     for attribute in resource.iter().chain(scope).chain(&record.attributes) {
         bytes = add_decoded_bytes(bytes, attribute.key.len(), maximum_decoded_record_bytes)?;
-        if let Some(value) = &attribute.value {
-            bytes = add_decoded_bytes(
-                bytes,
-                decoded_value_bytes(value, maximum_nesting_depth, maximum_decoded_record_bytes)?,
-                maximum_decoded_record_bytes,
-            )?;
-        }
+        let facts = attribute.value.as_ref().map_or_else(
+            || {
+                Ok(DecodedValueFacts {
+                    bytes: 0,
+                    nodes: 1,
+                    maximum_depth: 1,
+                })
+            },
+            |value| {
+                decoded_value_facts(
+                    value,
+                    maximum_nesting_depth,
+                    1,
+                    maximum_decoded_record_bytes,
+                )
+            },
+        )?;
+        bytes = add_decoded_bytes(bytes, facts.bytes, maximum_decoded_record_bytes)?;
+        value_nodes = value_nodes
+            .checked_add(facts.nodes)
+            .ok_or(ReceiveFailure::ValueLimitExceeded)?;
+        maximum_value_depth = maximum_value_depth.max(facts.maximum_depth);
     }
-    Ok(bytes)
+    Ok(DecodedRecordFacts {
+        decoded_bytes: bytes,
+        value_nodes,
+        attribute_entries,
+        maximum_nesting_depth: maximum_value_depth,
+    })
 }
 
 pub(super) fn retained_record_heap_bytes(
@@ -98,6 +138,28 @@ pub(super) fn grouped_retained_bytes(
     batch_bytes: u64,
     record_count: usize,
 ) -> Result<u64, ReceiveFailure> {
+    grouped_retained_bytes_with_shape_capacity(batch_bytes, record_count, 0)
+}
+
+pub(super) fn grouped_retained_bytes_with_policy_shapes(
+    batch_bytes: u64,
+    record_count: usize,
+) -> Result<u64, ReceiveFailure> {
+    // Shape facts are moved into one vector per planned group.  The vectors
+    // grow geometrically while groups are discovered, so reserve two slots
+    // per source record as a checked upper bound for their transient peak.
+    let shape_bytes = record_count
+        .checked_mul(std::mem::size_of::<positron_policy::PolicyAdmissionShape>())
+        .and_then(|bytes| bytes.checked_mul(2))
+        .ok_or(ReceiveFailure::ValueLimitExceeded)?;
+    grouped_retained_bytes_with_shape_capacity(batch_bytes, record_count, shape_bytes)
+}
+
+fn grouped_retained_bytes_with_shape_capacity(
+    batch_bytes: u64,
+    record_count: usize,
+    shape_capacity_bytes: usize,
+) -> Result<u64, ReceiveFailure> {
     let per_record = std::mem::size_of::<NativeLogCandidate>()
         .checked_add(std::mem::size_of::<super::NativeLogAdmissionGroup<'static>>())
         .and_then(|bytes| {
@@ -123,6 +185,13 @@ pub(super) fn grouped_retained_bytes(
             u64::try_from(planning.ok_or(ReceiveFailure::ValueLimitExceeded)?)
                 .map_err(|_| ReceiveFailure::ValueLimitExceeded)?,
         )
+        .and_then(|bytes| {
+            bytes.checked_add(
+                u64::try_from(shape_capacity_bytes)
+                    .map_err(|_| ReceiveFailure::ValueLimitExceeded)
+                    .ok()?,
+            )
+        })
         .ok_or(ReceiveFailure::ValueLimitExceeded)
 }
 
@@ -168,47 +237,129 @@ fn checked_retained_add(left: usize, right: usize) -> Result<usize, ReceiveFailu
         .ok_or(ReceiveFailure::ValueLimitExceeded)
 }
 
-fn decoded_value_bytes(
+#[derive(Clone, Copy)]
+struct DecodedValueFacts {
+    bytes: usize,
+    nodes: u64,
+    maximum_depth: u16,
+}
+
+fn decoded_value_facts(
     value: &AnyValue,
     remaining_depth: u16,
+    depth: u16,
     maximum_decoded_record_bytes: usize,
-) -> Result<usize, ReceiveFailure> {
+) -> Result<DecodedValueFacts, ReceiveFailure> {
     let Some(value) = &value.value else {
-        return Ok(0);
+        return Ok(DecodedValueFacts {
+            bytes: 0,
+            nodes: 1,
+            maximum_depth: depth,
+        });
     };
-    match value {
-        any_value::Value::StringValue(value) => Ok(value.len()),
-        any_value::Value::BytesValue(value) => Ok(value.len()),
-        any_value::Value::BoolValue(_) => Ok(1),
+    let facts = match value {
+        any_value::Value::StringValue(value) => DecodedValueFacts {
+            bytes: value.len(),
+            nodes: 1,
+            maximum_depth: depth,
+        },
+        any_value::Value::BytesValue(value) => DecodedValueFacts {
+            bytes: value.len(),
+            nodes: 1,
+            maximum_depth: depth,
+        },
+        any_value::Value::BoolValue(_) => DecodedValueFacts {
+            bytes: 1,
+            nodes: 1,
+            maximum_depth: depth,
+        },
         any_value::Value::IntValue(_)
         | any_value::Value::DoubleValue(_)
-        | any_value::Value::StringValueStrindex(_) => Ok(8),
+        | any_value::Value::StringValueStrindex(_) => DecodedValueFacts {
+            bytes: 8,
+            nodes: 1,
+            maximum_depth: depth,
+        },
         any_value::Value::ArrayValue(value) => {
             let next = remaining_depth
                 .checked_sub(1)
                 .ok_or(ReceiveFailure::ValueLimitExceeded)?;
-            value.values.iter().try_fold(0, |bytes, value| {
-                add_decoded_bytes(
-                    bytes,
-                    decoded_value_bytes(value, next, maximum_decoded_record_bytes)?,
-                    maximum_decoded_record_bytes,
-                )
-            })
+            value.values.iter().try_fold(
+                DecodedValueFacts {
+                    bytes: 0,
+                    nodes: 1,
+                    maximum_depth: depth,
+                },
+                |mut total, value| {
+                    let child = decoded_value_facts(
+                        value,
+                        next,
+                        depth
+                            .checked_add(1)
+                            .ok_or(ReceiveFailure::ValueLimitExceeded)?,
+                        maximum_decoded_record_bytes,
+                    )?;
+                    total.bytes =
+                        add_decoded_bytes(total.bytes, child.bytes, maximum_decoded_record_bytes)?;
+                    total.nodes = total
+                        .nodes
+                        .checked_add(child.nodes)
+                        .ok_or(ReceiveFailure::ValueLimitExceeded)?;
+                    total.maximum_depth = total.maximum_depth.max(child.maximum_depth);
+                    Ok(total)
+                },
+            )?
         },
         any_value::Value::KvlistValue(value) => {
             let next = remaining_depth
                 .checked_sub(1)
                 .ok_or(ReceiveFailure::ValueLimitExceeded)?;
-            value.values.iter().try_fold(0, |bytes, entry| {
-                let bytes =
-                    add_decoded_bytes(bytes, entry.key.len(), maximum_decoded_record_bytes)?;
-                let value_bytes = entry.value.as_ref().map_or(Ok(0), |value| {
-                    decoded_value_bytes(value, next, maximum_decoded_record_bytes)
-                })?;
-                add_decoded_bytes(bytes, value_bytes, maximum_decoded_record_bytes)
-            })
+            value.values.iter().try_fold(
+                DecodedValueFacts {
+                    bytes: 0,
+                    nodes: 1,
+                    maximum_depth: depth,
+                },
+                |mut total, entry| {
+                    total.bytes = add_decoded_bytes(
+                        total.bytes,
+                        entry.key.len(),
+                        maximum_decoded_record_bytes,
+                    )?;
+                    let child = entry.value.as_ref().map_or_else(
+                        || {
+                            Ok(DecodedValueFacts {
+                                bytes: 0,
+                                nodes: 1,
+                                maximum_depth: depth
+                                    .checked_add(1)
+                                    .ok_or(ReceiveFailure::ValueLimitExceeded)?,
+                            })
+                        },
+                        |value| {
+                            decoded_value_facts(
+                                value,
+                                next,
+                                depth
+                                    .checked_add(1)
+                                    .ok_or(ReceiveFailure::ValueLimitExceeded)?,
+                                maximum_decoded_record_bytes,
+                            )
+                        },
+                    )?;
+                    total.bytes =
+                        add_decoded_bytes(total.bytes, child.bytes, maximum_decoded_record_bytes)?;
+                    total.nodes = total
+                        .nodes
+                        .checked_add(child.nodes)
+                        .ok_or(ReceiveFailure::ValueLimitExceeded)?;
+                    total.maximum_depth = total.maximum_depth.max(child.maximum_depth);
+                    Ok(total)
+                },
+            )?
         },
-    }
+    };
+    Ok(facts)
 }
 
 fn add_decoded_bytes(

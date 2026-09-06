@@ -1,0 +1,575 @@
+use std::collections::VecDeque;
+use std::fs;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread::JoinHandle;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
+use positron_domain::value::{
+    ByteLimit, CollectionLimit, DynamicValueLimits, NestingLimit, RequestLimits, ValueLimitProfile,
+    ValueLimitProfileCandidate, ValueLimitSet,
+};
+use positron_governance::{
+    AdministrativeIdempotencyKey, CompatibilityHints, PresentedCredential, RequestedIntent,
+    ResourceGeneration,
+};
+use positron_ingest::{
+    AdmissionGroupOutcome, IngestFailureCode, IngestOutcome, IngestRequestOutcome,
+    NativeLogAdmissionGroups, NativeSpanAdmissionGroups,
+};
+use positron_kernel::MountQualification;
+use prost::Message;
+
+use super::super::serve;
+use crate::native_host::{Admission, NativeListener};
+use crate::services::ReceiverTestBackend;
+use crate::{
+    BootstrapPaths, InitializationPlan, InitializedInstance, InstanceBootstrap, ListenerRole,
+    ServiceHandle, TaskCancellation,
+};
+
+static TRACE_WIRE_TEST: Mutex<()> = Mutex::new(());
+
+#[derive(Clone, Copy)]
+pub(super) enum Completion {
+    Capacity,
+    Retryable,
+    Permanent,
+    Ambiguous,
+    Committed,
+    Stall,
+}
+
+pub(super) struct ScriptedBackend {
+    completions: Mutex<VecDeque<Completion>>,
+    committed: AtomicUsize,
+    calls: AtomicUsize,
+    stall_entered: AtomicBool,
+    stall_release: AtomicBool,
+}
+
+impl ScriptedBackend {
+    pub(super) fn new(completions: impl IntoIterator<Item = Completion>) -> Self {
+        Self {
+            completions: Mutex::new(completions.into_iter().collect()),
+            committed: AtomicUsize::new(0),
+            calls: AtomicUsize::new(0),
+            stall_entered: AtomicBool::new(false),
+            stall_release: AtomicBool::new(false),
+        }
+    }
+
+    pub(super) fn committed_records(&self) -> usize {
+        self.committed.load(Ordering::Acquire)
+    }
+
+    pub(super) fn calls(&self) -> usize {
+        self.calls.load(Ordering::Acquire)
+    }
+
+    pub(super) fn stall_entered(&self) -> bool {
+        self.stall_entered.load(Ordering::Acquire)
+    }
+
+    pub(super) fn release_stall(&self) {
+        self.stall_release.store(true, Ordering::Release);
+    }
+}
+
+impl ReceiverTestBackend for ScriptedBackend {
+    fn ingest(&self, _groups: NativeLogAdmissionGroups<'_>) -> IngestRequestOutcome {
+        IngestRequestOutcome::new(Vec::new())
+    }
+
+    fn handles_traces(&self) -> bool {
+        true
+    }
+
+    fn ingest_traces(&self, groups: NativeSpanAdmissionGroups<'_>) -> IngestRequestOutcome {
+        self.calls.fetch_add(1, Ordering::AcqRel);
+        let groups = groups
+            .map(|group| (group.shard(), group.records()))
+            .collect::<Vec<_>>();
+        let completion = self
+            .completions
+            .lock()
+            .expect("script lock")
+            .pop_front()
+            .expect("scripted completion");
+        if matches!(completion, Completion::Stall) {
+            self.stall_entered.store(true, Ordering::Release);
+            while !self.stall_release.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            return IngestRequestOutcome::new(Vec::new());
+        }
+        if matches!(completion, Completion::Ambiguous | Completion::Committed) {
+            self.committed.fetch_add(
+                groups.iter().map(|(_, records)| records).sum(),
+                Ordering::AcqRel,
+            );
+        }
+        let outcome = match completion {
+            Completion::Capacity => {
+                IngestOutcome::Retryable(IngestFailureCode::CapacityUnavailable)
+            },
+            Completion::Retryable => {
+                IngestOutcome::Retryable(IngestFailureCode::StorageUnavailable)
+            },
+            Completion::Permanent => IngestOutcome::Permanent(IngestFailureCode::PolicyRejected),
+            Completion::Ambiguous => {
+                IngestOutcome::Ambiguous(IngestFailureCode::StorageUnavailable)
+            },
+            Completion::Committed | Completion::Stall => {
+                return IngestRequestOutcome::new(Vec::new());
+            },
+        };
+        IngestRequestOutcome::new(
+            groups
+                .into_iter()
+                .map(|(shard, records)| AdmissionGroupOutcome::new(shard, records, outcome))
+                .collect(),
+        )
+    }
+}
+
+pub(super) struct ReceiverHarness {
+    pub(super) endpoint: SocketAddr,
+    pub(super) bearer: String,
+    pub(super) initialized: Option<Arc<InitializedInstance>>,
+    pub(super) backend: Arc<ScriptedBackend>,
+    cancellation: TaskCancellation,
+    force: TaskCancellation,
+    server: Option<JoinHandle<()>>,
+    _test_guard: MutexGuard<'static, ()>,
+    _roots: TestRoots,
+}
+
+struct SpawnedServer {
+    endpoint: SocketAddr,
+    cancellation: TaskCancellation,
+    force: TaskCancellation,
+    server: JoinHandle<()>,
+}
+
+impl ReceiverHarness {
+    pub(super) fn start(backend: Arc<ScriptedBackend>) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::start_with_profile(backend, ValueLimitProfile::release_1_system_maximum())
+    }
+
+    pub(super) fn start_with_profile(
+        backend: Arc<ScriptedBackend>,
+        profile: ValueLimitProfile,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let test_guard = match TRACE_WIRE_TEST.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let roots = TestRoots::new()?;
+        let paths = roots.paths()?;
+        drop(InstanceBootstrap::initialize(
+            &paths,
+            InitializationPlan::non_interactive(),
+        )?);
+        let bearer = InstanceBootstrap::claim(&paths)?
+            .ingest_secret()
+            .ok_or("ingest secret missing")?
+            .to_owned();
+        let mut initialized = InstanceBootstrap::reopen(&paths)?;
+        initialized.value_limit_profile = profile;
+        let initialized = Arc::new(initialized);
+        let services = ServiceHandle::new(Arc::clone(&initialized))?;
+        services.install_receiver_test_backend(backend.clone())?;
+        let spawned = Self::spawn_server(services)?;
+        Ok(Self {
+            endpoint: spawned.endpoint,
+            bearer,
+            initialized: Some(initialized),
+            backend,
+            cancellation: spawned.cancellation,
+            force: spawned.force,
+            server: Some(spawned.server),
+            _test_guard: test_guard,
+            _roots: roots,
+        })
+    }
+
+    pub(super) fn start_durable_with_policy(
+        policy: positron_ingest::IngestPolicy,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::start_durable_with_profile_and_optional_backend(
+            ValueLimitProfile::release_1_system_maximum(),
+            None,
+            policy,
+        )
+    }
+
+    pub(super) fn start_durable_with_profile_and_policy(
+        profile: ValueLimitProfile,
+        backend: Arc<ScriptedBackend>,
+        policy: positron_ingest::IngestPolicy,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::start_durable_with_profile_and_optional_backend(profile, Some(backend), policy)
+    }
+
+    fn start_durable_with_profile_and_optional_backend(
+        profile: ValueLimitProfile,
+        backend: Option<Arc<ScriptedBackend>>,
+        policy: positron_ingest::IngestPolicy,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let test_guard = match TRACE_WIRE_TEST.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let roots = TestRoots::new()?;
+        let paths = roots.paths()?;
+        drop(InstanceBootstrap::initialize(
+            &paths,
+            InitializationPlan::non_interactive(),
+        )?);
+        let (administrator_secret, bearer) = {
+            let claim = InstanceBootstrap::claim(&paths)?;
+            let bearer = claim
+                .ingest_secret()
+                .ok_or("ingest secret missing")?
+                .to_owned();
+            (claim.secret().to_owned(), bearer)
+        };
+        let mut initialized = InstanceBootstrap::reopen(&paths)?;
+        initialized.value_limit_profile = profile;
+        let initialized = Arc::new(initialized);
+        let administrator = initialized.attribute(
+            PresentedCredential::parse(&administrator_secret)?,
+            RequestedIntent::SystemAdministration,
+            CompatibilityHints::none(),
+        )?;
+        let services = ServiceHandle::new(Arc::clone(&initialized))?;
+        if let Some(backend) = backend.as_ref() {
+            services.install_receiver_test_backend(backend.clone())?;
+        }
+        services.activate_ingest_policy(
+            administrator,
+            ResourceGeneration::new(1)?,
+            AdministrativeIdempotencyKey::new([0xa7; 16])?,
+            policy,
+        )?;
+        let spawned = Self::spawn_server(services)?;
+        Ok(Self {
+            endpoint: spawned.endpoint,
+            bearer,
+            initialized: Some(initialized),
+            backend: backend.unwrap_or_else(|| Arc::new(ScriptedBackend::new([]))),
+            cancellation: spawned.cancellation,
+            force: spawned.force,
+            server: Some(spawned.server),
+            _test_guard: test_guard,
+            _roots: roots,
+        })
+    }
+
+    pub(super) fn restart_durable(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.stop()?;
+        let old_initialized = self
+            .initialized
+            .take()
+            .ok_or("initialized runtime missing")?;
+        drop(old_initialized);
+        let paths = self._roots.paths()?;
+        let initialized = Arc::new(InstanceBootstrap::reopen(&paths)?);
+        let services = ServiceHandle::new(Arc::clone(&initialized))?;
+        let spawned = Self::spawn_server(services)?;
+        self.endpoint = spawned.endpoint;
+        self.initialized = Some(initialized);
+        self.cancellation = spawned.cancellation;
+        self.force = spawned.force;
+        self.server = Some(spawned.server);
+        Ok(())
+    }
+
+    fn spawn_server(services: ServiceHandle) -> Result<SpawnedServer, Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
+        listener.set_nonblocking(true)?;
+        let endpoint = listener.local_addr()?;
+        let admission = Arc::new(Admission {
+            role: ListenerRole::OtlpGrpc,
+            listener: NativeListener::Tcp(listener),
+            accepting: AtomicBool::new(true),
+            control_path: None,
+        });
+        let cancellation = TaskCancellation::new();
+        let serve_cancellation = cancellation.clone();
+        let force = TaskCancellation::new();
+        let serve_force = force.clone();
+        let server = std::thread::spawn(move || {
+            serve(admission, serve_cancellation, serve_force, Some(services))
+                .expect("test OTLP gRPC server");
+        });
+        Ok(SpawnedServer {
+            endpoint,
+            cancellation,
+            force,
+            server,
+        })
+    }
+
+    pub(super) fn authorize_trace(
+        &self,
+        mut request: tonic::Request<ExportTraceServiceRequest>,
+    ) -> Result<tonic::Request<ExportTraceServiceRequest>, Box<dyn std::error::Error>> {
+        request
+            .metadata_mut()
+            .insert("authorization", format!("Bearer {}", self.bearer).parse()?);
+        Ok(request)
+    }
+
+    pub(super) fn authorize_trace_with_tenant(
+        &self,
+        request: tonic::Request<ExportTraceServiceRequest>,
+        tenant: &str,
+    ) -> Result<tonic::Request<ExportTraceServiceRequest>, Box<dyn std::error::Error>> {
+        let mut request = self.authorize_trace(request)?;
+        request
+            .metadata()
+            .get("authorization")
+            .ok_or("authorization metadata missing")?;
+        request
+            .metadata_mut()
+            .insert("x-scope-orgid", tenant.parse()?);
+        Ok(request)
+    }
+
+    pub(super) fn snapshot(
+        &self,
+    ) -> Result<positron_kernel::ResourceSnapshot, Box<dyn std::error::Error>> {
+        let initialized = self
+            .initialized
+            .as_ref()
+            .ok_or("initialized runtime missing")?;
+        Ok(initialized.resource_governor().inspect()?)
+    }
+
+    pub(super) fn initialized(&self) -> Result<&InitializedInstance, Box<dyn std::error::Error>> {
+        self.initialized
+            .as_deref()
+            .ok_or_else(|| "initialized runtime missing".into())
+    }
+
+    pub(super) fn finish(mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.stop()
+    }
+
+    fn stop(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.backend.release_stall();
+        self.cancellation.cancel();
+        self.force.cancel();
+        if let Some(server) = self.server.take() {
+            server.join().map_err(|_| "server panicked")?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ReceiverHarness {
+    fn drop(&mut self) {
+        let _ = self.stop();
+    }
+}
+
+pub(super) fn trace_request(seed: u8) -> tonic::Request<ExportTraceServiceRequest> {
+    tonic::Request::new(ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            scope_spans: vec![ScopeSpans {
+                spans: vec![Span {
+                    trace_id: vec![seed; 16],
+                    span_id: vec![seed.wrapping_add(1); 8],
+                    name: "grpc-trace".to_owned(),
+                    start_time_unix_nano: 42,
+                    end_time_unix_nano: 84,
+                    ..Span::default()
+                }],
+                ..ScopeSpans::default()
+            }],
+            ..ResourceSpans::default()
+        }],
+    })
+}
+
+pub(super) fn trace_frame(seed: u8) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    trace_frame_from_request(trace_request(seed).into_inner())
+}
+
+pub(super) fn trace_frame_from_request(
+    request: ExportTraceServiceRequest,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let body = request.encode_to_vec();
+    let length = u32::try_from(body.len())?;
+    let mut frame = Vec::with_capacity(body.len().saturating_add(5));
+    frame.push(0);
+    frame.extend_from_slice(&length.to_be_bytes());
+    frame.extend_from_slice(&body);
+    Ok(frame)
+}
+
+pub(super) fn gzip_trace_frame(seed: u8) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    gzip_trace_frame_with_span_count(seed, 1)
+}
+
+pub(super) fn gzip_trace_frame_with_span_count(
+    seed: u8,
+    span_count: usize,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut request = trace_request(seed).into_inner();
+    let template = request
+        .resource_spans
+        .first()
+        .and_then(|resource| resource.scope_spans.first())
+        .and_then(|scope| scope.spans.first())
+        .cloned()
+        .ok_or("trace fixture span missing")?;
+    let spans = request
+        .resource_spans
+        .first_mut()
+        .and_then(|resource| resource.scope_spans.first_mut())
+        .ok_or("trace fixture scope missing")?;
+    spans.spans.reserve(span_count.saturating_sub(1));
+    while spans.spans.len() < span_count {
+        spans.spans.push(template.clone());
+    }
+    let body = request.encode_to_vec();
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    std::io::Write::write_all(&mut encoder, &body)?;
+    let compressed = encoder.finish()?;
+    let length = u32::try_from(compressed.len())?;
+    let mut frame = Vec::with_capacity(compressed.len().saturating_add(5));
+    frame.push(1);
+    frame.extend_from_slice(&length.to_be_bytes());
+    frame.extend_from_slice(&compressed);
+    Ok(frame)
+}
+
+pub(super) fn profile_with_transport_limits(
+    compressed: usize,
+    decompressed: usize,
+) -> Result<ValueLimitProfile, Box<dyn std::error::Error>> {
+    let system = ValueLimitProfile::release_1_system_maximum().system_limits();
+    let tenant = ValueLimitSet::new(
+        RequestLimits::new(
+            ByteLimit::new(u32::try_from(compressed)?)?,
+            ByteLimit::new(u32::try_from(decompressed)?)?,
+            system.request().records(),
+            system.request().aggregate_attributes(),
+        ),
+        system.record(),
+        system.dynamic_value(),
+    );
+    Ok(ValueLimitProfileCandidate::new(system, Some(tenant)).validate()?)
+}
+
+pub(super) fn profile_with_individual_value_bytes(bytes: u32) -> ValueLimitProfile {
+    profile_with_dynamic_value_limits(bytes, 65_536, 1_024, 1_024, 128)
+}
+
+pub(super) fn profile_with_dynamic_value_limits(
+    individual_value_bytes: u32,
+    key_path_bytes: u32,
+    array_entries: u32,
+    key_value_list_entries: u32,
+    nesting_depth: u16,
+) -> ValueLimitProfile {
+    let maximum = ValueLimitProfile::release_1_system_maximum();
+    let maximum_dynamic = maximum.effective_limits().dynamic_value();
+    let dynamic = DynamicValueLimits::new(
+        ByteLimit::new(individual_value_bytes).expect("valid value bound"),
+        maximum_dynamic.attributes_per_namespace(),
+        ByteLimit::new(key_path_bytes).expect("valid key bound"),
+        NestingLimit::new(nesting_depth).expect("valid depth"),
+        CollectionLimit::new(array_entries).expect("valid arrays"),
+        CollectionLimit::new(key_value_list_entries).expect("valid lists"),
+    );
+    ValueLimitProfileCandidate::new(
+        maximum.system_limits(),
+        Some(ValueLimitSet::new(
+            maximum.effective_limits().request(),
+            maximum.effective_limits().record(),
+            dynamic,
+        )),
+    )
+    .validate()
+    .expect("lowered profile")
+}
+
+pub(super) fn profile_with_system_individual_value_bytes(bytes: u32) -> ValueLimitProfile {
+    let maximum = ValueLimitProfile::release_1_system_maximum();
+    let dynamic = maximum.effective_limits().dynamic_value();
+    let dynamic = DynamicValueLimits::new(
+        ByteLimit::new(bytes).expect("valid value bound"),
+        dynamic.attributes_per_namespace(),
+        dynamic.key_path_bytes(),
+        NestingLimit::new(dynamic.nesting_depth().value()).expect("valid depth"),
+        CollectionLimit::new(dynamic.array_entries().value()).expect("valid arrays"),
+        CollectionLimit::new(dynamic.key_value_list_entries().value()).expect("valid lists"),
+    );
+    ValueLimitProfileCandidate::new(
+        ValueLimitSet::new(
+            maximum.effective_limits().request(),
+            maximum.effective_limits().record(),
+            dynamic,
+        ),
+        None,
+    )
+    .validate()
+    .expect("lowered system profile")
+}
+
+struct TestRoots {
+    parent: PathBuf,
+    data: PathBuf,
+    secrets: PathBuf,
+}
+
+impl TestRoots {
+    fn new() -> Result<Self, std::io::Error> {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(std::io::Error::other)?
+            .as_nanos();
+        let parent =
+            PathBuf::from("/tmp").join(format!("p-grpc-trace-wire-{}-{nonce}", std::process::id()));
+        let data = parent.join("data");
+        let secrets = parent.join("secrets");
+        fs::create_dir_all(&data)?;
+        fs::create_dir_all(&secrets)?;
+        set_owner_only(&secrets)?;
+        Ok(Self {
+            parent,
+            data,
+            secrets,
+        })
+    }
+
+    fn paths(&self) -> Result<BootstrapPaths, crate::BootstrapFailure> {
+        BootstrapPaths::new(&self.data, &self.secrets, MountQualification::LocalHost)
+    }
+}
+
+impl Drop for TestRoots {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.parent);
+    }
+}
+
+#[cfg(unix)]
+fn set_owner_only(path: &Path) -> Result<(), std::io::Error> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(not(unix))]
+fn set_owner_only(_path: &Path) -> Result<(), std::io::Error> {
+    Ok(())
+}

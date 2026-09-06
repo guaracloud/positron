@@ -65,6 +65,7 @@ impl GovernanceFixtureTarget for Catalog<'_> {
             if object.starts_with(b"POSGOV01")
                 || object.starts_with(b"POSGOV02")
                 || object.starts_with(b"POSGOV03")
+                || object.starts_with(b"POSGOV04")
             {
                 continue;
             }

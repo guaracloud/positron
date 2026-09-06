@@ -45,12 +45,14 @@ pub enum SourceTimeQuality {
 /// A producer-supplied Event Time with a preserved usability annotation.
 ///
 /// `EventTime` stays distinct from signal-defined observed time and
-/// kernel-assigned Ingest Time. Its checked constructor requires a zero-quality
-/// value to retain the exact zero timestamp.
+/// kernel-assigned Ingest Time. Its checked constructor requires a matching
+/// source-quality annotation to retain the exact timestamp, including a zero
+/// timestamp whose pair-level quality is `Contradictory`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EventTime {
     instant: Option<UnixNanoseconds>,
     quality: SourceTimeQuality,
+    raw_instant: Option<u64>,
 }
 
 impl EventTime {
@@ -60,6 +62,7 @@ impl EventTime {
         Self {
             instant: None,
             quality: SourceTimeQuality::Missing,
+            raw_instant: None,
         }
     }
 
@@ -72,6 +75,20 @@ impl EventTime {
         Ok(Self {
             instant: Some(instant),
             quality,
+            raw_instant: None,
+        })
+    }
+
+    /// Preserves a present unsigned source timestamp that cannot fit in the
+    /// signed native nanoseconds representation.
+    pub fn out_of_range(value: u64) -> Result<Self, DomainFailure> {
+        if value <= i64::MAX as u64 {
+            return Err(DomainFailure::invalid_time_annotation());
+        }
+        Ok(Self {
+            instant: None,
+            quality: SourceTimeQuality::Outlier,
+            raw_instant: Some(value),
         })
     }
 
@@ -87,11 +104,20 @@ impl EventTime {
         self.quality
     }
 
+    /// Returns the exact unsigned source timestamp, including out-of-range
+    /// values that cannot be represented by [`UnixNanoseconds`].
+    #[must_use]
+    pub const fn source_value(self) -> Option<u64> {
+        match (self.instant, self.raw_instant) {
+            (Some(instant), _) if instant.value() >= 0 => Some(instant.value() as u64),
+            (Some(_), _) => None,
+            (None, raw) => raw,
+        }
+    }
+
     const fn is_usable(self) -> bool {
-        matches!(
-            self.quality,
-            SourceTimeQuality::Usable | SourceTimeQuality::Outlier
-        )
+        matches!(self.quality, SourceTimeQuality::Usable)
+            || (matches!(self.quality, SourceTimeQuality::Outlier) && self.raw_instant.is_none())
     }
 
     const fn usable_instant(self) -> Option<UnixNanoseconds> {
@@ -269,7 +295,10 @@ fn validate_present_source_time(
 ) -> Result<(), DomainFailure> {
     let is_zero = instant.value() == 0;
     let has_zero_annotation = matches!(quality, SourceTimeQuality::Zero);
-    if matches!(quality, SourceTimeQuality::Missing) || is_zero != has_zero_annotation {
+    let contradictory_zero = is_zero && matches!(quality, SourceTimeQuality::Contradictory);
+    if matches!(quality, SourceTimeQuality::Missing)
+        || (!contradictory_zero && is_zero != has_zero_annotation)
+    {
         return Err(DomainFailure::invalid_time_annotation());
     }
     Ok(())

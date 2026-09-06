@@ -29,9 +29,10 @@ pub fn fuzz_trace_store_block(data: &[u8]) {
 fn validate(decoder: &mut codec::BlockDecode<'_>) -> Result<(), super::TraceStoreFailure> {
     // No CommittedBlock is available in a raw-byte fuzz target. The decoder's
     // structural path still validates all native values and framing.
+    let version = decoder.version();
     let mut tail = decoder.input.remaining_input();
     for _ in 0..decoder.record_count() {
-        let _ = super::codec::decode_observation(&mut tail)?;
+        let _ = super::codec::decode_observation_version(&mut tail, version)?;
     }
     if tail.is_empty() {
         Ok(())

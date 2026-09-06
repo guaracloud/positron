@@ -504,7 +504,17 @@ The module owns the exact pipeline:
 
 Hard transport, decompression, and structural limits remain earlier than
 policy. Policy is the only mechanism allowed to remove, redact, or truncate
-otherwise valid native values before persistence.
+otherwise valid native values before persistence. Removal and redaction retain
+payload-free typed markers at the original path or slot; truncation retains
+only a sanitized same-kind native value with its truncation action. Removed or
+redacted source bytes, values, lengths, hashes, and renderings are never
+retained; payload-free Removed and Redacted marker leaves have no descendants;
+producer-supplied markers are rejected and only the shared policy transition
+may create them. Existing internal projections preserve marker
+leaves, duplicate occurrence order and count, and array indices, while marker-
+only paths do not contribute native schema types or scalar dictionary entries;
+marker metadata and retained slots consume bounded value-size, memory, and
+reservation budgets.
 
 An Ingest Outcome records each group's unambiguous state. A timeout may leave
 the producer uncertain and retry may duplicate committed observations.
@@ -585,15 +595,21 @@ the authenticated generic scan and set reduced pruning.
 Discovery returns tenant-bound bounded top
 paths, typed conflicts and variants, promotion decisions, budget pressure,
 overflow counts, and sampled path digests without exposing mutation authority.
-The Log Store exposes only the bounded immutable discovery result. The public
+The Log Store exposes only the bounded immutable discovery result. Policy
+markers remain visible through its existing typed projections: ordinary
+scalar, Null, native-kind, and original-kind predicates never match a marker,
+`any` and `all` treat one as nonmatching, and `index` retains its ordinal
+position. A truncated value keeps the normal typed comparison and projection
+of its sanitized same-kind value. The public
 tenant-administrator request, snapshot-bound pagination, and Durable Operation
 are owned by the canonical Tenant Attribution, tenant-lifecycle, and
 administration work in tickets #69 through #71 and the recoverable Durable
 Operation authority in ticket #73. Runtime defines no schema-local operation
 or cursor authority and does not substitute system-administrator inspection.
 
-Committed version 2 blocks, including their generic versus Schema Overflow
-root tags, are authoritative. The tenant-bound `PSCHEMA1` object is rebuildable
+Committed version 1, version 2, and marker-bearing version 3 blocks, including
+their generic versus Schema Overflow root tags, are authoritative. The
+tenant-bound `PSCHEMA1` object is rebuildable
 optimization state. Allocation-free preflight accounts its catalog entries,
 physical block-index sidecars, and per-shard replay frontiers before decode or
 session construction. Runtime loads it and replays authenticated blocks before
@@ -607,13 +623,16 @@ unreachable or replacement block identities; queries then fall back to the
 authoritative generic representation.
 
 The canonical Log Store Block layout and bounded logical scan are defined by
-[`log-store-block-format-v2.md`](log-store-block-format-v2.md), which preserves
-the complete version 1 reader contract in
+[`log-store-block-format-v3.md`](log-store-block-format-v3.md), which preserves
+the complete version 2 contract and the version 1 reader contract in
+[`log-store-block-format-v2.md`](log-store-block-format-v2.md) and
 [`log-store-block-format-v1.md`](log-store-block-format-v1.md).
 
 The Trace Store hides immutable Span Observations, logical-span consolidation,
 conflicts, trace-summary deltas, quiescence, structural indexes, and incomplete
-analysis. Its initial canonical observation block is specified by
+analysis. Its marker-bearing canonical observation block is specified by
+[`trace-store-block-format-v3.md`](trace-store-block-format-v3.md), which
+preserves the historical v1/v2 reader contracts in
 [`trace-store-block-format-v1.md`](trace-store-block-format-v1.md).
 
 No Release 1 Metric Store or Profile Store adapter exists. Adding one later

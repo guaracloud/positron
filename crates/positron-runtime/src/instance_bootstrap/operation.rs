@@ -108,6 +108,7 @@ fn resume(
     let integrity_identity = key
         .integrity_identity(integrity_secret)
         .map_err(key_failure)?;
+    let external_alias = plan.external_alias()?;
     if integrity_identity.fingerprint() != record.integrity_fingerprint {
         return Err(BootstrapFailure::new(
             BootstrapFailureCode::IdentityMismatch,
@@ -123,10 +124,11 @@ fn resume(
     let initial = if before.number() == 0 {
         let ingest = compatibility::require_new_ingest(&record)?;
         let query = compatibility::require_new_query(&record)?;
-        let tenant_intent = InitialTenantIntent::new(
+        let tenant_intent = InitialTenantIntent::new_with_external_tenant_alias(
             record.instance.to_bytes(),
             record.tenant,
             BootstrapRecord::tenant_slug()?,
+            external_alias,
             "Default tenant",
             record.administrator,
             record.api_key_salt,

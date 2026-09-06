@@ -18,8 +18,11 @@ test-support = [
 ]
 
 [dependencies]
+bytes = "=1.12.1"
+flate2 = { version = "=1.0.24", default-features = false, features = ["rust_backend"] }
+http-body = "=1.1.0"
 http = { version = "=1.5.0", default-features = false }
-opentelemetry-proto = { version = "=0.32.0", default-features = false, features = ["gen-tonic", "logs", "with-serde"] }
+opentelemetry-proto = { version = "=0.32.0", default-features = false, features = ["gen-tonic", "logs", "trace", "with-serde"] }
 positron-api = { path = "../positron-api" }
 positron-domain = { path = "../positron-domain" }
 positron-governance = { path = "../positron-governance" }
@@ -38,13 +41,11 @@ zeroize = { version = "=1.9.0", default-features = false, features = ["alloc"] }
 [dev-dependencies]
 positron-kernel = { path = "../positron-kernel", features = ["test-support"] }
 async-trait = "=0.1.89"
-bytes = "=1.12.1"
-flate2 = { version = "=1.0.24", default-features = false, features = ["rust_backend"] }
 h2 = "=0.4.15"
 opentelemetry = { version = "=0.32.0", default-features = false, features = ["logs"] }
 opentelemetry-http = { version = "=0.32.0", default-features = false }
 opentelemetry-otlp = { version = "=0.32.0", default-features = false, features = ["grpc-tonic", "http-proto", "logs"] }
-opentelemetry-proto = { version = "=0.32.0", default-features = false, features = ["gen-tonic", "logs"] }
+opentelemetry-proto = { version = "=0.32.0", default-features = false, features = ["gen-tonic", "logs", "trace"] }
 opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["logs"] }
 tokio = { version = "=1.53.1", default-features = false, features = ["macros", "rt", "time"] }
 tonic = { version = "=0.14.6", default-features = false, features = ["router", "transport"] }

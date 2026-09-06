@@ -9,7 +9,7 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
-use positron_domain::identity::{PrincipalId, TenantId, TenantSlug};
+use positron_domain::identity::{ExternalTenantAlias, PrincipalId, TenantId, TenantSlug};
 
 mod audit;
 mod identity;
@@ -30,8 +30,9 @@ pub use policy_administration::{
     ResourceGeneration,
 };
 
-const GOVERNANCE_OBJECT_MAGIC: [u8; 8] = *b"POSGOV03";
-const GOVERNANCE_AUDIT_MAGIC: [u8; 8] = *b"POSAUD01";
+const GOVERNANCE_OBJECT_MAGIC: [u8; 8] = *b"POSGOV04";
+const GOVERNANCE_AUDIT_MAGIC: [u8; 8] = *b"POSAUD02";
+const DEFAULT_EXTERNAL_TENANT_ALIAS: &str = "trace-external";
 
 /// Administration-owned semantic proposal for the initial governance state.
 pub struct InitialGovernanceIntent {
@@ -43,6 +44,7 @@ pub struct InitialTenantIntent {
     instance: [u8; 16],
     tenant: TenantId,
     slug: TenantSlug,
+    external_alias: ExternalTenantAlias,
     display_name: String,
     principal: PrincipalId,
     api_key_salt: [u8; 32],
@@ -93,12 +95,70 @@ impl InitialAuditContext {
 impl InitialTenantIntent {
     #[expect(
         clippy::too_many_arguments,
-        reason = "canonical tenant creation requires every jointly committed authority"
+        reason = "compatibility constructor delegates to the explicitly bound alias constructor"
     )]
     pub fn new(
         instance: [u8; 16],
         tenant: TenantId,
         slug: TenantSlug,
+        display_name: &str,
+        principal: PrincipalId,
+        api_key_salt: [u8; 32],
+        api_key_hash: [u8; 32],
+        ingest_principal: PrincipalId,
+        ingest_api_key_salt: [u8; 32],
+        ingest_api_key_hash: [u8; 32],
+        query_principal: PrincipalId,
+        query_api_key_salt: [u8; 32],
+        query_api_key_hash: [u8; 32],
+        integrity_public_key: [u8; 32],
+        integrity_key_fingerprint: [u8; 32],
+        protected_integrity_key: Vec<u8>,
+        tenant_key_envelope: Vec<u8>,
+        retention_seconds: u64,
+        quota_generation: u64,
+        quota_weight: u32,
+        quota_resources: [u64; 11],
+        audit: InitialAuditContext,
+    ) -> Result<Self, GovernanceIntentFailure> {
+        let external_alias = ExternalTenantAlias::parse(DEFAULT_EXTERNAL_TENANT_ALIAS)
+            .map_err(|_| GovernanceIntentFailure)?;
+        Self::new_with_external_tenant_alias(
+            instance,
+            tenant,
+            slug,
+            external_alias,
+            display_name,
+            principal,
+            api_key_salt,
+            api_key_hash,
+            ingest_principal,
+            ingest_api_key_salt,
+            ingest_api_key_hash,
+            query_principal,
+            query_api_key_salt,
+            query_api_key_hash,
+            integrity_public_key,
+            integrity_key_fingerprint,
+            protected_integrity_key,
+            tenant_key_envelope,
+            retention_seconds,
+            quota_generation,
+            quota_weight,
+            quota_resources,
+            audit,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "canonical tenant creation requires every jointly committed authority"
+    )]
+    pub fn new_with_external_tenant_alias(
+        instance: [u8; 16],
+        tenant: TenantId,
+        slug: TenantSlug,
+        external_alias: ExternalTenantAlias,
         display_name: &str,
         principal: PrincipalId,
         api_key_salt: [u8; 32],
@@ -135,6 +195,7 @@ impl InitialTenantIntent {
             instance,
             tenant,
             slug,
+            external_alias,
             display_name: display_name.to_owned(),
             principal,
             api_key_salt,
@@ -164,6 +225,7 @@ impl InitialGovernanceIntent {
             instance,
             tenant,
             slug,
+            external_alias,
             display_name,
             principal,
             api_key_salt,
@@ -215,6 +277,10 @@ impl InitialGovernanceIntent {
         object.extend_from_slice(&tenant.to_bytes());
         object.push(slug_length);
         object.extend_from_slice(slug_bytes);
+        object.push(1);
+        let alias_bytes = external_alias.as_str().as_bytes();
+        object.push(u8::try_from(alias_bytes.len()).map_err(|_| GovernanceIntentFailure)?);
+        object.extend_from_slice(alias_bytes);
         object.push(display_length);
         object.extend_from_slice(display_bytes);
         object.extend_from_slice(&principal.to_bytes());
@@ -241,7 +307,7 @@ impl InitialGovernanceIntent {
         // Active lifecycle, system-administration scope, policy generation 1,
         // and independent local-key recovery required.
         object.extend_from_slice(&[1, 4, 0, 1, 1]);
-        let mut audit = Vec::with_capacity(128);
+        let mut audit = Vec::with_capacity(160);
         audit.extend_from_slice(&GOVERNANCE_AUDIT_MAGIC);
         audit.extend_from_slice(&audit_context.ingest_time_unix_seconds.to_be_bytes());
         audit.extend_from_slice(&principal.to_bytes());
@@ -257,6 +323,8 @@ impl InitialGovernanceIntent {
         audit.push(u8::from(audit_context.non_interactive));
         audit.push(slug_length);
         audit.extend_from_slice(slug_bytes);
+        audit.push(u8::try_from(alias_bytes.len()).map_err(|_| GovernanceIntentFailure)?);
+        audit.extend_from_slice(alias_bytes);
         Ok(Self { object, audit })
     }
 

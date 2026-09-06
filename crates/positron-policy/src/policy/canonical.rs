@@ -61,6 +61,9 @@ fn encode_predicate(
                 positron_domain::value::AttributeValueKind::Bytes => 6,
                 positron_domain::value::AttributeValueKind::Array => 7,
                 positron_domain::value::AttributeValueKind::KeyValueList => 8,
+                positron_domain::value::AttributeValueKind::Marker => {
+                    return Err(PolicyCompileFailure::InvalidPredicate);
+                },
             });
         },
         PolicyPredicate::ServiceIdentity(value) => {

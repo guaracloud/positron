@@ -1,4 +1,4 @@
-use positron_domain::value::{AttributeValueKind, ValidatedAttributeValue};
+use positron_domain::value::{AttributeValueKind, MarkerAction, ValidatedAttributeValue};
 
 use super::size::bounded_add;
 use super::{put_bytes, put_count};
@@ -12,6 +12,15 @@ pub(super) fn encoded_length(
     value: &ValidatedAttributeValue,
     depth: u8,
 ) -> Result<usize, LogStoreFailure> {
+    if value.marker_action().is_some() {
+        return Ok(3);
+    }
+    if value.truncation_action().is_some() {
+        let child = value
+            .truncated_value()
+            .ok_or_else(LogStoreFailure::invalid_input)?;
+        return bounded_add(3, encoded_length(child, depth)?);
+    }
     Ok(match value.kind() {
         AttributeValueKind::Null => 1,
         AttributeValueKind::Boolean => 2,
@@ -65,6 +74,7 @@ pub(super) fn encoded_length(
                 bounded_add(total, encoded_length(entry.value(), next)?)
             })?
         },
+        AttributeValueKind::Marker => return Err(LogStoreFailure::invalid_input()),
     })
 }
 
@@ -73,6 +83,25 @@ pub(super) fn encode(
     value: &ValidatedAttributeValue,
     depth: u8,
 ) -> Result<(), LogStoreFailure> {
+    if let Some(action) = value.marker_action() {
+        output.push(8);
+        output.push(marker_action_tag(action)?);
+        output.push(native_kind_tag(
+            value
+                .marker_original_kind()
+                .ok_or_else(LogStoreFailure::invalid_input)?,
+        )?);
+        return Ok(());
+    }
+    if let Some(action) = value.truncation_action() {
+        let child = value
+            .truncated_value()
+            .ok_or_else(LogStoreFailure::invalid_input)?;
+        output.push(8);
+        output.push(marker_action_tag(action)?);
+        output.push(native_kind_tag(child.kind())?);
+        return encode(output, child, depth);
+    }
     match value.kind() {
         AttributeValueKind::Null => output.push(0),
         AttributeValueKind::Boolean => {
@@ -122,8 +151,32 @@ pub(super) fn encode(
         },
         AttributeValueKind::Array => encode_array(output, value, depth)?,
         AttributeValueKind::KeyValueList => encode_key_value_list(output, value, depth)?,
+        AttributeValueKind::Marker => return Err(LogStoreFailure::invalid_input()),
     }
     Ok(())
+}
+
+fn marker_action_tag(action: MarkerAction) -> Result<u8, LogStoreFailure> {
+    match action {
+        MarkerAction::Removed => Ok(0),
+        MarkerAction::Redacted => Ok(1),
+        MarkerAction::TruncatedBytes => Ok(2),
+        MarkerAction::TruncatedElements => Ok(3),
+    }
+}
+
+fn native_kind_tag(kind: AttributeValueKind) -> Result<u8, LogStoreFailure> {
+    match kind {
+        AttributeValueKind::Null => Ok(0),
+        AttributeValueKind::Boolean => Ok(1),
+        AttributeValueKind::SignedInteger => Ok(2),
+        AttributeValueKind::FloatingPoint => Ok(3),
+        AttributeValueKind::String => Ok(4),
+        AttributeValueKind::Bytes => Ok(5),
+        AttributeValueKind::Array => Ok(6),
+        AttributeValueKind::KeyValueList => Ok(7),
+        AttributeValueKind::Marker => Err(LogStoreFailure::invalid_input()),
+    }
 }
 
 fn encode_array(

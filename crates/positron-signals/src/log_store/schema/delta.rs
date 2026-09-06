@@ -301,6 +301,9 @@ fn stage_value(
     value: &ValidatedAttributeValue,
     meter: &mut DiscoveryMeter,
 ) -> Result<bool, SchemaFailure> {
+    if value.is_marker() {
+        return Ok(true);
+    }
     if !meter.consume()? {
         return Ok(false);
     }

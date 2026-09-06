@@ -1,27 +1,44 @@
 use positron_domain::identity::TenantId;
 use positron_domain::time::SourceTimeQuality;
+use positron_domain::value::{AttributeValueKind, MarkerAction, ValueLimitProfile};
 
 use super::super::failure::TraceStoreFailure;
-use super::super::types::{TraceLimits, release_1_limits};
+use super::super::types::TraceLimits;
 use super::decode::Input;
 use super::format::{
     MAGIC, MAX_RECORDS, VERSION, decode_kind, decode_namespace, decode_quality, decode_sampling,
-    namespace_index,
+    decode_status_tag, namespace_index, supported_version,
 };
 use crate::{ScanCancellation, ScanObserver};
 
 /// Computes a conservative peak heap bound without constructing a decoded
 /// value. The scan reserves this amount before its first allocating decode.
+#[cfg(any(test, fuzzing))]
 pub(crate) fn decoded_memory_bound(
     expected_tenant: TenantId,
     bytes: &[u8],
     cancellation: &dyn ScanCancellation,
     observer: &dyn ScanObserver,
 ) -> Result<u64, TraceStoreFailure> {
-    let limits = release_1_limits()?;
+    let profile = ValueLimitProfile::release_1_system_maximum();
+    decoded_memory_bound_with_profile(expected_tenant, bytes, cancellation, observer, &profile)
+}
+
+pub(crate) fn decoded_memory_bound_with_profile(
+    expected_tenant: TenantId,
+    bytes: &[u8],
+    cancellation: &dyn ScanCancellation,
+    observer: &dyn ScanObserver,
+    profile: &ValueLimitProfile,
+) -> Result<u64, TraceStoreFailure> {
+    let limits = super::super::types::limits_for(profile)?;
     let mut input = Input::observed(bytes, cancellation, observer);
     input.observe_component()?;
-    if input.take(MAGIC.len())? != MAGIC || input.u16()? != VERSION {
+    if input.take(MAGIC.len())? != MAGIC {
+        return Err(TraceStoreFailure::malformed_block());
+    }
+    let version = input.u16()?;
+    if !supported_version(version) {
         return Err(TraceStoreFailure::malformed_block());
     }
     if input.array::<16>()? != expected_tenant.to_bytes() {
@@ -33,7 +50,7 @@ pub(crate) fn decoded_memory_bound(
     }
     let mut bound = 0_u64;
     for _ in 0..count {
-        bound = checked_bound_add(bound, preflight_observation(&mut input, &limits)?)?;
+        bound = checked_bound_add(bound, preflight_observation(&mut input, &limits, version)?)?;
     }
     if !input.is_empty() {
         return Err(TraceStoreFailure::malformed_block());
@@ -44,11 +61,14 @@ pub(crate) fn decoded_memory_bound(
 struct ValueBound {
     decoded_bytes: usize,
     dynamic_bytes: u64,
+    marker: bool,
+    policy_root: bool,
 }
 
 fn preflight_observation(
     input: &mut Input<'_>,
     limits: &TraceLimits,
+    version: u16,
 ) -> Result<u64, TraceStoreFailure> {
     input.observe_component()?;
     let _ = input.array::<16>()?;
@@ -62,8 +82,8 @@ fn preflight_observation(
     }
     let _ = decode_kind(input.u8()?)?;
     let _ = decode_sampling(input.u8()?)?;
-    preflight_time(input)?;
-    preflight_time(input)?;
+    preflight_time(input, version)?;
+    preflight_time(input, version)?;
     let name = input.raw_string(limits.key_path_bytes)?;
     let mut decoded_bytes = name.len();
     let attributes_count = input.count(limits.attribute_sets)?;
@@ -85,14 +105,17 @@ fn preflight_observation(
         if count == 0 {
             return Err(TraceStoreFailure::malformed_block());
         }
-        let index = namespace_index(namespace)?;
-        occurrences_by_namespace[index] = occurrences_by_namespace[index]
+        let index = namespace_index(namespace).ok_or_else(TraceStoreFailure::malformed_block)?;
+        let occurrences = occurrences_by_namespace
+            .get_mut(index)
+            .ok_or_else(TraceStoreFailure::malformed_block)?;
+        *occurrences = occurrences
             .checked_add(count)
             .filter(|total| *total <= limits.occurrences_per_namespace)
             .ok_or_else(TraceStoreFailure::malformed_block)?;
         bound = checked_slot_bound(bound, count, super::DECODED_VECTOR_SLOT_BYTES)?;
         for _ in 0..count {
-            let value = preflight_value(input, limits.nesting_depth, limits)?;
+            let value = preflight_value(input, limits.nesting_depth, limits, version)?;
             decoded_bytes = decoded_bytes
                 .checked_add(value.decoded_bytes)
                 .ok_or_else(TraceStoreFailure::limit_exceeded)?;
@@ -101,6 +124,9 @@ fn preflight_observation(
     }
     if decoded_bytes > limits.decoded_bytes {
         return Err(TraceStoreFailure::malformed_block());
+    }
+    if version >= super::format::DETAILS_VERSION {
+        preflight_details(input, limits, &mut bound, version)?;
     }
     preflight_policy(input, &mut bound)?;
     let _ = input.i64()?;
@@ -115,16 +141,131 @@ fn preflight_observation(
     )
 }
 
+fn preflight_details(
+    input: &mut Input<'_>,
+    limits: &TraceLimits,
+    bound: &mut u64,
+    version: u16,
+) -> Result<(), TraceStoreFailure> {
+    let mut decoded_bytes = input.raw_string(limits.key_path_bytes)?.len();
+    *bound = checked_bound_add(*bound, checked_u64(decoded_bytes)?)?;
+    let _ = input.u32()?;
+    let status = decode_status_tag(input.u8()?)?;
+    let _ = status;
+    let status_message = input.raw_string(limits.key_path_bytes)?;
+    decoded_bytes = decoded_bytes
+        .checked_add(status_message.len())
+        .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+    *bound = checked_bound_add(*bound, checked_u64(status_message.len())?)?;
+    let _ = input.u32()?;
+    let _ = input.u32()?;
+    let _ = input.u32()?;
+    let _ = input.u32()?;
+    let resource_schema = input.raw_string(limits.key_path_bytes)?;
+    let scope_name = input.raw_string(limits.key_path_bytes)?;
+    let scope_version = input.raw_string(limits.key_path_bytes)?;
+    let _ = input.u32()?;
+    let scope_schema = input.raw_string(limits.key_path_bytes)?;
+    for value in [resource_schema, scope_name, scope_version, scope_schema] {
+        decoded_bytes = decoded_bytes
+            .checked_add(value.len())
+            .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+        *bound = checked_bound_add(*bound, checked_u64(value.len())?)?;
+    }
+    let events = input.count(super::super::details::MAX_DETAIL_COLLECTION)?;
+    *bound = checked_slot_bound(*bound, events, super::DECODED_VECTOR_SLOT_BYTES)?;
+    for _ in 0..events {
+        preflight_time(input, version)?;
+        let name = input.raw_string(limits.key_path_bytes)?;
+        decoded_bytes = decoded_bytes
+            .checked_add(name.len())
+            .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+        *bound = checked_bound_add(*bound, checked_u64(name.len())?)?;
+        let _ = input.u32()?;
+        let (event_decoded, event_bound) = preflight_span_attributes(input, limits, version)?;
+        decoded_bytes = decoded_bytes
+            .checked_add(event_decoded)
+            .filter(|bytes| *bytes <= limits.decoded_bytes)
+            .ok_or_else(TraceStoreFailure::malformed_block)?;
+        *bound = checked_bound_add(*bound, event_bound)?;
+    }
+    let links = input.count(super::super::details::MAX_DETAIL_COLLECTION)?;
+    *bound = checked_slot_bound(*bound, links, super::DECODED_VECTOR_SLOT_BYTES)?;
+    for _ in 0..links {
+        let trace_id = input.array::<16>()?;
+        let span_id = input.array::<8>()?;
+        if trace_id.iter().all(|byte| *byte == 0) || span_id.iter().all(|byte| *byte == 0) {
+            return Err(TraceStoreFailure::malformed_block());
+        }
+        let trace_state = input.raw_string(limits.key_path_bytes)?;
+        decoded_bytes = decoded_bytes
+            .checked_add(trace_state.len())
+            .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+        *bound = checked_bound_add(*bound, checked_u64(trace_state.len())?)?;
+        let _ = input.u32()?;
+        let _ = input.u32()?;
+        let (link_decoded, link_bound) = preflight_span_attributes(input, limits, version)?;
+        decoded_bytes = decoded_bytes
+            .checked_add(link_decoded)
+            .filter(|bytes| *bytes <= limits.decoded_bytes)
+            .ok_or_else(TraceStoreFailure::malformed_block)?;
+        *bound = checked_bound_add(*bound, link_bound)?;
+    }
+    if decoded_bytes > limits.decoded_bytes {
+        return Err(TraceStoreFailure::malformed_block());
+    }
+    Ok(())
+}
+
+fn preflight_span_attributes(
+    input: &mut Input<'_>,
+    limits: &TraceLimits,
+    version: u16,
+) -> Result<(usize, u64), TraceStoreFailure> {
+    let count = input.count(super::super::details::MAX_DETAIL_COLLECTION)?;
+    let mut decoded_bytes = 0_usize;
+    let mut bound = checked_slot_bound(0, count, super::DECODED_VECTOR_SLOT_BYTES)?;
+    let mut occurrences = 0_usize;
+    for _ in 0..count {
+        let key = input.raw_string(limits.key_path_bytes)?;
+        decoded_bytes = decoded_bytes
+            .checked_add(key.len())
+            .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+        bound = checked_bound_add(bound, checked_u64(key.len())?)?;
+        let values = input.count(limits.occurrences_per_namespace)?;
+        if values == 0 {
+            return Err(TraceStoreFailure::malformed_block());
+        }
+        occurrences = occurrences
+            .checked_add(values)
+            .filter(|total| *total <= limits.occurrences_per_namespace)
+            .ok_or_else(TraceStoreFailure::malformed_block)?;
+        bound = checked_slot_bound(bound, values, super::DECODED_VECTOR_SLOT_BYTES)?;
+        for _ in 0..values {
+            let value = preflight_value(input, limits.nesting_depth, limits, version)?;
+            decoded_bytes = decoded_bytes
+                .checked_add(value.decoded_bytes)
+                .filter(|bytes| *bytes <= limits.decoded_bytes)
+                .ok_or_else(TraceStoreFailure::malformed_block)?;
+            bound = checked_bound_add(bound, value.dynamic_bytes)?;
+        }
+    }
+    Ok((decoded_bytes, bound))
+}
+
 fn preflight_value(
     input: &mut Input<'_>,
     depth: u8,
     limits: &TraceLimits,
+    version: u16,
 ) -> Result<ValueBound, TraceStoreFailure> {
     input.observe_component()?;
     match input.u8()? {
         0 => Ok(ValueBound {
             decoded_bytes: 0,
             dynamic_bytes: 0,
+            marker: false,
+            policy_root: false,
         }),
         1 => {
             let value = input.u8()?;
@@ -134,6 +275,8 @@ fn preflight_value(
             Ok(ValueBound {
                 decoded_bytes: 1,
                 dynamic_bytes: 0,
+                marker: false,
+                policy_root: false,
             })
         },
         2 | 3 => {
@@ -141,6 +284,8 @@ fn preflight_value(
             Ok(ValueBound {
                 decoded_bytes: 8,
                 dynamic_bytes: 0,
+                marker: false,
+                policy_root: false,
             })
         },
         4 => {
@@ -149,6 +294,8 @@ fn preflight_value(
                 decoded_bytes: value.len(),
                 dynamic_bytes: u64::try_from(value.len())
                     .map_err(|_| TraceStoreFailure::limit_exceeded())?,
+                marker: false,
+                policy_root: false,
             })
         },
         5 => {
@@ -157,6 +304,8 @@ fn preflight_value(
                 decoded_bytes: value.len(),
                 dynamic_bytes: u64::try_from(value.len())
                     .map_err(|_| TraceStoreFailure::limit_exceeded())?,
+                marker: false,
+                policy_root: false,
             })
         },
         6 => {
@@ -167,9 +316,11 @@ fn preflight_value(
             let mut result = ValueBound {
                 decoded_bytes: 0,
                 dynamic_bytes: checked_slot_bound(0, count, super::DECODED_VECTOR_SLOT_BYTES)?,
+                marker: false,
+                policy_root: false,
             };
             for _ in 0..count {
-                let child = preflight_value(input, next, limits)?;
+                let child = preflight_value(input, next, limits, version)?;
                 result.decoded_bytes = result
                     .decoded_bytes
                     .checked_add(child.decoded_bytes)
@@ -177,6 +328,7 @@ fn preflight_value(
                     .ok_or_else(TraceStoreFailure::malformed_block)?;
                 result.dynamic_bytes =
                     checked_bound_add(result.dynamic_bytes, child.dynamic_bytes)?;
+                result.marker |= child.marker;
             }
             Ok(result)
         },
@@ -188,6 +340,8 @@ fn preflight_value(
             let mut result = ValueBound {
                 decoded_bytes: 0,
                 dynamic_bytes: checked_slot_bound(0, count, super::DECODED_KEY_VALUE_SLOT_BYTES)?,
+                marker: false,
+                policy_root: false,
             };
             for _ in 0..count {
                 let key = input.raw_string(limits.key_path_bytes)?;
@@ -198,7 +352,7 @@ fn preflight_value(
                     .ok_or_else(TraceStoreFailure::malformed_block)?;
                 result.dynamic_bytes =
                     checked_bound_add(result.dynamic_bytes, checked_u64(key.len())?)?;
-                let child = preflight_value(input, next, limits)?;
+                let child = preflight_value(input, next, limits, version)?;
                 result.decoded_bytes = result
                     .decoded_bytes
                     .checked_add(child.decoded_bytes)
@@ -206,15 +360,86 @@ fn preflight_value(
                     .ok_or_else(TraceStoreFailure::malformed_block)?;
                 result.dynamic_bytes =
                     checked_bound_add(result.dynamic_bytes, child.dynamic_bytes)?;
+                result.marker |= child.marker;
             }
             Ok(result)
+        },
+        8 if version >= VERSION => {
+            let action = match input.u8()? {
+                0 => MarkerAction::Removed,
+                1 => MarkerAction::Redacted,
+                2 => MarkerAction::TruncatedBytes,
+                3 => MarkerAction::TruncatedElements,
+                _ => return Err(TraceStoreFailure::malformed_block()),
+            };
+            let kind = match input.u8()? {
+                0 => AttributeValueKind::Null,
+                1 => AttributeValueKind::Boolean,
+                2 => AttributeValueKind::SignedInteger,
+                3 => AttributeValueKind::FloatingPoint,
+                4 => AttributeValueKind::String,
+                5 => AttributeValueKind::Bytes,
+                6 => AttributeValueKind::Array,
+                7 => AttributeValueKind::KeyValueList,
+                _ => return Err(TraceStoreFailure::malformed_block()),
+            };
+            match action {
+                MarkerAction::Removed | MarkerAction::Redacted => Ok(ValueBound {
+                    decoded_bytes: 0,
+                    dynamic_bytes: 0,
+                    marker: true,
+                    policy_root: true,
+                }),
+                MarkerAction::TruncatedBytes
+                    if matches!(kind, AttributeValueKind::String | AttributeValueKind::Bytes) =>
+                {
+                    let child = preflight_value(input, depth, limits, version)?;
+                    if child.policy_root {
+                        return Err(TraceStoreFailure::malformed_block());
+                    }
+                    Ok(ValueBound {
+                        decoded_bytes: child.decoded_bytes,
+                        dynamic_bytes: child.dynamic_bytes,
+                        marker: true,
+                        policy_root: true,
+                    })
+                },
+                MarkerAction::TruncatedElements
+                    if matches!(
+                        kind,
+                        AttributeValueKind::Array | AttributeValueKind::KeyValueList
+                    ) =>
+                {
+                    let child = preflight_value(input, depth, limits, version)?;
+                    if child.policy_root {
+                        return Err(TraceStoreFailure::malformed_block());
+                    }
+                    Ok(ValueBound {
+                        decoded_bytes: child.decoded_bytes,
+                        dynamic_bytes: child.dynamic_bytes,
+                        marker: true,
+                        policy_root: true,
+                    })
+                },
+                MarkerAction::TruncatedBytes | MarkerAction::TruncatedElements => {
+                    Err(TraceStoreFailure::malformed_block())
+                },
+            }
         },
         _ => Err(TraceStoreFailure::malformed_block()),
     }
 }
 
-fn preflight_time(input: &mut Input<'_>) -> Result<(), TraceStoreFailure> {
-    let quality = decode_quality(input.u8()?)?;
+fn preflight_time(input: &mut Input<'_>, version: u16) -> Result<(), TraceStoreFailure> {
+    let tag = input.u8()?;
+    if tag == super::format::OUT_OF_RANGE_TIME_TAG {
+        if version < VERSION {
+            return Err(TraceStoreFailure::malformed_block());
+        }
+        let _ = input.u64()?;
+        return Ok(());
+    }
+    let quality = decode_quality(tag)?;
     if quality != SourceTimeQuality::Missing {
         let _ = input.i64()?;
     }

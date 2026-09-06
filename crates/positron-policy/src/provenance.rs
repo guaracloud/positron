@@ -79,6 +79,24 @@ impl PolicyProvenance {
     pub fn applied_rules(&self) -> &[String] {
         &self.applied_rules
     }
+
+    /// Returns the heap storage retained by the immutable applied-rule list.
+    ///
+    /// The policy crate owns this representation, so downstream stores do not
+    /// need to approximate its vector capacity or string allocations.
+    pub fn retained_heap_bytes(&self) -> Result<usize, PolicyProvenanceFailure> {
+        let mut retained = self
+            .applied_rules
+            .capacity()
+            .checked_mul(std::mem::size_of::<String>())
+            .ok_or(PolicyProvenanceFailure(()))?;
+        for rule in &self.applied_rules {
+            retained = retained
+                .checked_add(rule.capacity())
+                .ok_or(PolicyProvenanceFailure(()))?;
+        }
+        Ok(retained)
+    }
 }
 
 /// Typed, redacted reason that durable Policy Provenance is invalid.

@@ -1,7 +1,9 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
-use positron_domain::identity::{PrincipalId, Scope, TenantAttribution, TenantId, TenantSlug};
+use positron_domain::identity::{
+    ExternalTenantAlias, PrincipalId, Scope, TenantAttribution, TenantId, TenantSlug,
+};
 use positron_domain::lifecycle::TenantLifecycleState;
 use zeroize::Zeroizing;
 
@@ -60,7 +62,7 @@ pub enum RequestedIntent {
 /// Compatibility evidence that may validate, but never select, authority.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompatibilityHints {
-    pub(super) external_alias: Option<String>,
+    pub(super) external_alias: Option<ExternalTenantAlias>,
     #[cfg(fuzzing)]
     untrusted_proxy_actor: bool,
     #[cfg(fuzzing)]
@@ -82,16 +84,9 @@ impl CompatibilityHints {
     /// Parses one bounded compatibility alias. It remains validation evidence
     /// and can never select a Principal, Scope, or Tenant ID.
     pub fn external_tenant_alias(alias: &str) -> Result<Self, AttributionFailure> {
-        if alias.is_empty()
-            || alias.len() > 128
-            || !alias
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-        {
-            return Err(AttributionFailure);
-        }
+        let alias = ExternalTenantAlias::parse(alias).map_err(|_| AttributionFailure)?;
         Ok(Self {
-            external_alias: Some(alias.to_owned()),
+            external_alias: Some(alias),
             #[cfg(fuzzing)]
             untrusted_proxy_actor: false,
             #[cfg(fuzzing)]

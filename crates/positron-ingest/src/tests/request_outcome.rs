@@ -1,6 +1,9 @@
 use positron_domain::routing::VirtualShardId;
 
-use crate::{AdmissionGroupOutcome, IngestFailureCode, IngestOutcome, IngestRequestOutcome};
+use crate::{
+    AdmissionGroupOutcome, IngestFailureCode, IngestOutcome, IngestRequestOutcome, TraceLimitClass,
+    TraceLimitRejectionSummary, TraceLimitViolation,
+};
 
 fn group(attempted_records: usize, outcome: IngestOutcome) -> AdmissionGroupOutcome {
     AdmissionGroupOutcome::new(
@@ -63,4 +66,80 @@ fn retry_precedes_permanent_and_empty_request_has_no_terminal_failure() {
     let empty = IngestRequestOutcome::new(vec![]);
     assert!(empty.groups().is_empty());
     assert_eq!(empty.terminal_failure(), None);
+}
+
+#[test]
+fn trace_limit_summary_merges_in_fixed_order_and_keeps_maximum_representatives() {
+    let classes = [
+        TraceLimitClass::ContainerCount,
+        TraceLimitClass::RecordCount,
+        TraceLimitClass::AggregateAttributeCount,
+        TraceLimitClass::AttributesPerNamespace,
+        TraceLimitClass::NestingDepth,
+        TraceLimitClass::ArrayEntries,
+        TraceLimitClass::KeyValueListEntries,
+        TraceLimitClass::DecodedBatchBytes,
+        TraceLimitClass::IndividualValueBytes,
+        TraceLimitClass::KeyPathBytes,
+    ];
+    let mut summary = TraceLimitRejectionSummary::new();
+    for (index, class) in classes.into_iter().enumerate() {
+        let actual = u64::try_from(index + 1).expect("fixed class index");
+        summary.record(TraceLimitViolation::new(class, actual, actual - 1));
+    }
+    summary.record(TraceLimitViolation::new(
+        TraceLimitClass::IndividualValueBytes,
+        7,
+        4,
+    ));
+    summary.record(TraceLimitViolation::new(
+        TraceLimitClass::IndividualValueBytes,
+        5,
+        9,
+    ));
+
+    let mut merged = TraceLimitRejectionSummary::default();
+    merged.record(TraceLimitViolation::new(
+        TraceLimitClass::IndividualValueBytes,
+        9,
+        4,
+    ));
+    summary.merge(merged);
+    summary.record(TraceLimitViolation::new(
+        TraceLimitClass::IndividualValueBytes,
+        9,
+        8,
+    ));
+
+    let violations = summary.iter().collect::<Vec<_>>();
+    assert_eq!(
+        violations
+            .iter()
+            .map(|violation| violation.class())
+            .collect::<Vec<_>>(),
+        classes
+    );
+    assert_eq!(
+        violations
+            .iter()
+            .map(|violation| violation.class().label())
+            .collect::<Vec<_>>(),
+        [
+            "container count",
+            "record count",
+            "aggregate attribute count",
+            "attributes per namespace",
+            "nesting depth",
+            "array entries",
+            "key/value-list entries",
+            "decoded batch bytes",
+            "individual value bytes",
+            "key/path bytes",
+        ]
+    );
+    let individual = violations
+        .iter()
+        .find(|violation| violation.class() == TraceLimitClass::IndividualValueBytes)
+        .expect("individual-value representative");
+    assert_eq!((individual.actual(), individual.allowed()), (9, 8));
 }

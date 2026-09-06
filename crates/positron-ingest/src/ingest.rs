@@ -12,16 +12,17 @@ use positron_signals::LogStore;
 mod capacity;
 mod entry;
 mod failure;
-mod outcome;
+pub(crate) mod outcome;
 mod schema_resolution;
 
-use capacity::{group_work_amounts, schema_admission_estimate};
+use capacity::{group_work_amounts_with_policy_shapes, schema_admission_estimate};
 pub(crate) use failure::classify_log_store_failure_code;
 use failure::map_ledger_failure;
+use outcome::increment_rejection;
+pub(crate) use outcome::partial_admission;
 pub use outcome::{
     CommittedAdmission, IngestFailureCode, IngestOutcome, PartialAdmission, RejectionDetail,
 };
-use outcome::{increment_rejection, partial_admission};
 use schema_resolution::{
     RetentionResolution, SchemaCapacityRetention, map_schema_session_failure,
     resolve_after_retention_failure, retain_schema_capacity, rollback_schema,
@@ -44,7 +45,8 @@ impl<'service, 'kernel, 'catalog> LogIngest<'service, 'kernel, 'catalog> {
         identity: StoreBlockIdentity,
         cancellation: Option<&AppendCancellation>,
     ) -> IngestOutcome {
-        let (attribution, records, value_profile, capacity, receiver) = batch.into_parts();
+        let (attribution, records, value_profile, capacity, receiver, policy_shapes) =
+            batch.into_parts_with_policy_shapes();
         if attribution.scope() != Scope::Ingest || attribution.tenant_id() != self.tenant {
             return IngestOutcome::Permanent(IngestFailureCode::TenantConflict);
         }
@@ -66,9 +68,12 @@ impl<'service, 'kernel, 'catalog> LogIngest<'service, 'kernel, 'catalog> {
         let Some(schema_estimate) = schema_admission_estimate(&records) else {
             return IngestOutcome::Permanent(IngestFailureCode::ValueLimitExceeded);
         };
-        let Some(group_amounts) =
-            group_work_amounts(input_record_count, self.policy.budget(), schema_estimate)
-        else {
+        let Some(group_amounts) = group_work_amounts_with_policy_shapes(
+            input_record_count,
+            self.policy,
+            policy_shapes.as_deref(),
+            schema_estimate,
+        ) else {
             return IngestOutcome::Permanent(IngestFailureCode::ValueLimitExceeded);
         };
         let mut capacity = match capacity {
@@ -111,9 +116,10 @@ impl<'service, 'kernel, 'catalog> LogIngest<'service, 'kernel, 'catalog> {
         };
         let mut accepted = Vec::new();
         let mut accepted_attributes = 0_usize;
+        let mut accepted_policy_shapes = policy_shapes.as_ref().map(|_| Vec::new());
         let mut rejection_counts = [0_usize; 3];
         let mut rejection_code = IngestFailureCode::InvalidRecord;
-        for candidate in records {
+        for (record_index, candidate) in records.into_iter().enumerate() {
             let evaluated = match self.policy.evaluate(candidate, receiver) {
                 Ok(PolicyEvaluation::Accepted(record)) => *record,
                 Ok(PolicyEvaluation::Rejected) => {
@@ -145,6 +151,13 @@ impl<'service, 'kernel, 'catalog> LogIngest<'service, 'kernel, 'catalog> {
                         },
                     };
                     accepted.push(record);
+                    if let Some(accepted_shapes) = accepted_policy_shapes.as_mut()
+                        && let Some(shape) = policy_shapes
+                            .as_ref()
+                            .and_then(|shapes| shapes.get(record_index))
+                    {
+                        accepted_shapes.push(*shape);
+                    }
                 },
                 Err(failure) => match classify_log_store_failure_code(failure.code()) {
                     IngestOutcome::Permanent(code) => {
@@ -188,9 +201,12 @@ impl<'service, 'kernel, 'catalog> LogIngest<'service, 'kernel, 'catalog> {
             Ok(count) => count,
             Err(_) => return IngestOutcome::Permanent(IngestFailureCode::ValueLimitExceeded),
         };
-        let Some(accepted_amounts) =
-            group_work_amounts(record_count, self.policy.budget(), schema_estimate)
-        else {
+        let Some(accepted_amounts) = group_work_amounts_with_policy_shapes(
+            record_count,
+            self.policy,
+            accepted_policy_shapes.as_deref(),
+            schema_estimate,
+        ) else {
             return IngestOutcome::Permanent(IngestFailureCode::ValueLimitExceeded);
         };
         if capacity.try_resize(accepted_amounts).is_err() {

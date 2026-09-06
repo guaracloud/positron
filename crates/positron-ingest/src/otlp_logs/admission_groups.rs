@@ -3,10 +3,11 @@ use std::vec::IntoIter;
 
 use positron_domain::routing::{SignalKind, VirtualShardId};
 use positron_kernel::{ResourceAmounts, ResourceReservation};
+use positron_policy::PolicyAdmissionShape;
 
 use crate::{AdmissionGroupPlanFailure, AdmissionGroupPlanner};
 
-use super::bounds::grouped_retained_bytes;
+use super::bounds::{grouped_retained_bytes, grouped_retained_bytes_with_policy_shapes};
 use super::{NativeLogBatch, NativeLogCandidate};
 
 /// One planned native batch sharing tenant, Logs store, and virtual shard.
@@ -74,10 +75,15 @@ impl<'authority> NativeLogBatch<'authority> {
             decoded_bytes,
             mut capacity,
             receiver,
+            policy_shapes,
         } = self;
         let record_count = records.len();
-        let grouped_bytes = grouped_retained_bytes(decoded_bytes, record_count)
-            .map_err(|_| AdmissionGroupPlanFailure::RecordCountExceeded)?;
+        let grouped_bytes = if policy_shapes.is_some() {
+            grouped_retained_bytes_with_policy_shapes(decoded_bytes, record_count)
+        } else {
+            grouped_retained_bytes(decoded_bytes, record_count)
+        }
+        .map_err(|_| AdmissionGroupPlanFailure::RecordCountExceeded)?;
         if let Some(retained) = capacity.as_mut() {
             retained
                 .try_resize(ResourceAmounts::new([
@@ -96,9 +102,12 @@ impl<'authority> NativeLogBatch<'authority> {
                 ]))
                 .map_err(|_| AdmissionGroupPlanFailure::AssignmentUnavailable)?;
         }
-        let mut planned = BTreeMap::<VirtualShardId, Vec<NativeLogCandidate>>::new();
-        for (ordinal, record) in records.into_iter().enumerate() {
-            let ordinal = u32::try_from(ordinal)
+        let mut planned = BTreeMap::<
+            VirtualShardId,
+            (Vec<NativeLogCandidate>, Option<Vec<PolicyAdmissionShape>>),
+        >::new();
+        for (record_index, record) in records.into_iter().enumerate() {
+            let ordinal = u32::try_from(record_index)
                 .map_err(|_| AdmissionGroupPlanFailure::RecordCountExceeded)?;
             let shard = planner.assigned_shard(
                 attribution.tenant_id(),
@@ -106,21 +115,36 @@ impl<'authority> NativeLogBatch<'authority> {
                 ordinal,
                 &record,
             )?;
-            planned.entry(shard).or_default().push(record);
+            let entry = planned
+                .entry(shard)
+                .or_insert_with(|| (Vec::new(), policy_shapes.as_ref().map(|_| Vec::new())));
+            entry.0.push(record);
+            if let Some(shapes) = entry.1.as_mut() {
+                match policy_shapes
+                    .as_ref()
+                    .and_then(|values| values.get(record_index))
+                {
+                    Some(shape) => shapes.push(*shape),
+                    None => entry.1 = None,
+                }
+            }
         }
         let groups = planned
             .into_iter()
-            .map(|(shard, records)| NativeLogAdmissionGroup {
-                shard,
-                batch: NativeLogBatch {
-                    attribution,
-                    records,
-                    value_limit_profile,
-                    decoded_bytes: 0,
-                    capacity: None,
-                    receiver,
+            .map(
+                |(shard, (records, policy_shapes))| NativeLogAdmissionGroup {
+                    shard,
+                    batch: NativeLogBatch {
+                        attribution,
+                        records,
+                        value_limit_profile,
+                        decoded_bytes: 0,
+                        capacity: None,
+                        receiver,
+                        policy_shapes,
+                    },
                 },
-            })
+            )
             .collect::<Vec<_>>()
             .into_iter();
         Ok(NativeLogAdmissionGroups {

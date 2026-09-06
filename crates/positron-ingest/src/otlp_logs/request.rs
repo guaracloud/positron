@@ -15,14 +15,8 @@ pub(super) enum OtlpPayload {
     Decoded(Box<ExportLogsServiceRequest>),
 }
 
-/// Supported OTLP Logs request body encodings after HTTP metadata validation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum OtlpLogsRequestEncoding {
-    Protobuf,
-    GzipProtobuf,
-    Json,
-    GzipJson,
-}
+/// Backwards-compatible signal-specific alias for the shared OTLP encoding.
+pub type OtlpLogsRequestEncoding = crate::OtlpRequestEncoding;
 
 /// OTLP bytes that can exist only after authoritative tenant attribution.
 ///
