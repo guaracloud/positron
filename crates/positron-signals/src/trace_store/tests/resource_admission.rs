@@ -154,7 +154,7 @@ fn policy_rules_consume_their_exact_scan_work_budget() -> Result<(), Box<dyn Err
     let before_failure = authority.governor().inspect()?.outstanding_total();
     let two_observer = WorkBudget::exact(one_work);
     let failure = store
-        .scan_observed(
+        .scan_logical_observed(
             authority.governor(),
             tenant,
             &ledger.snapshot()?,
@@ -233,7 +233,7 @@ fn scan_stages_admission_before_recursive_work_and_stops_at_page_boundaries()
     let before_budget = authority.governor().inspect()?.outstanding_total();
     let zero_budget = WorkBudget::exact(0);
     let failure = store
-        .scan_observed(
+        .scan_logical_observed(
             authority.governor(),
             tenant,
             &ledger.snapshot()?,
@@ -271,7 +271,7 @@ fn scan_stages_admission_before_recursive_work_and_stops_at_page_boundaries()
     let observer = CancelAfterFirstRecord(Arc::clone(&cancelled));
     let before_cancel = authority.governor().inspect()?.outstanding_total();
     let failure = store
-        .scan_observed(
+        .scan_logical_observed(
             authority.governor(),
             tenant,
             &ledger.snapshot()?,

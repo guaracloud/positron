@@ -1,6 +1,7 @@
 //! Native Trace Signal Store.
 
 mod codec;
+mod consolidation;
 mod details;
 mod failure;
 #[cfg(fuzzing)]
@@ -13,6 +14,7 @@ mod types;
 #[cfg(test)]
 mod tests;
 
+pub use consolidation::{LogicalSpan, LogicalTraceScanResult, SpanObservationVariant};
 pub use details::{
     SpanAttributeSet, SpanEvent, SpanLink, SpanObservationDetails, SpanObservationDetailsInput,
     SpanResourceMetadata, SpanScopeMetadata, SpanStatus, SpanStatusCode,

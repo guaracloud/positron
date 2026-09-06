@@ -75,6 +75,59 @@ fn physical_observations_are_not_deduplicated_at_the_storage_seam() -> Result<()
         positron_domain::routing::RecordOrdinal::new(1)?
     );
     assert_eq!(result.observations()[2].observation(), &conflict);
+    drop(result);
+    let logical = store.scan_logical(
+        authority.governor(),
+        tenant,
+        &ledger.snapshot()?,
+        TraceScan::all(ScanLimit::new(3)?),
+    )?;
+    assert!(logical.complete());
+    assert_eq!(logical.incompleteness(), TraceIncompleteness::None);
+    assert_eq!(logical.decoded_observations(), 3);
+    assert_eq!(logical.spans().len(), 1);
+    let span = logical.spans().first().ok_or("missing logical span")?;
+    assert_eq!(span.trace_id(), [0x31; 16]);
+    assert_eq!(span.span_id(), [0x32; 8]);
+    assert_eq!(span.observation_count(), 3);
+    assert!(span.conflicted());
+    assert!(span.structurally_incomplete());
+    assert_eq!(span.variants().len(), 2);
+    assert_eq!(span.variants()[0].observation_count(), 2);
+    assert_eq!(span.variants()[0].observation().observation(), &observation);
+    assert_eq!(span.variants()[1].observation_count(), 1);
+    assert_eq!(span.variants()[1].observation().observation(), &conflict);
+    assert_eq!(
+        span.structural_representative()
+            .ok_or("missing structural representative")?
+            .observation(),
+        &observation
+    );
+    drop(logical);
+    let byte_limited = store.scan_logical(
+        authority.governor(),
+        tenant,
+        &ledger.snapshot()?,
+        TraceScan::all(ScanLimit::new(3)?).with_scanned_bytes(0),
+    )?;
+    assert!(byte_limited.spans().is_empty());
+    assert!(!byte_limited.complete());
+    assert_eq!(
+        byte_limited.incompleteness(),
+        TraceIncompleteness::ScannedBytesLimit
+    );
+    drop(byte_limited);
+    let observed = store.scan_logical_observed(
+        authority.governor(),
+        tenant,
+        &ledger.snapshot()?,
+        TraceScan::all(ScanLimit::new(3)?),
+        &NeverCancelled,
+        &NeverObserved,
+    )?;
+    assert_eq!(observed.spans().len(), 1);
+    assert_eq!(observed.decoded_observations(), 3);
+    drop(observed);
     let resumed = store.scan(
         authority.governor(),
         tenant,
@@ -91,6 +144,195 @@ fn physical_observations_are_not_deduplicated_at_the_storage_seam() -> Result<()
     assert_eq!(resumed.observations()[0].record_ordinal().value(), 1);
     assert_eq!(resumed.observations()[1].record_ordinal().value(), 2);
     assert_eq!(resumed.observations()[1].observation(), &conflict);
+    drop(resumed);
+    ledger.seal()?;
+    let reopened = ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        SegmentScope::new(tenant, SignalKind::Traces, shard),
+        SegmentProtectionKey::from_owned(Box::new([0x56; 32])),
+    )?;
+    let restarted = store.scan_logical(
+        authority.governor(),
+        tenant,
+        &reopened.snapshot()?,
+        TraceScan::all(ScanLimit::new(3)?),
+    )?;
+    let restarted_span = restarted
+        .spans()
+        .first()
+        .ok_or("missing restarted logical span")?;
+    assert_eq!(restarted_span.observation_count(), 3);
+    assert_eq!(restarted_span.variants().len(), 2);
+    assert!(restarted_span.conflicted());
+    assert_eq!(restarted_span.variants()[0].observation_count(), 2);
+    assert_eq!(restarted_span.variants()[1].observation_count(), 1);
+    Ok(())
+}
+
+#[test]
+fn logical_scan_keeps_distinct_native_value_bits_as_conflicting_variants()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x18; 16])?,
+        CatalogSecret::from_owned(Box::new([0x28; 32]), Box::new([0x38; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let shard = VirtualShardId::new(8)?;
+    let ledger = ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        SegmentScope::new(tenant, SignalKind::Traces, shard),
+        SegmentProtectionKey::from_owned(Box::new([0x58; 32])),
+    )?;
+    let attribute = |bits| {
+        AttributeOccurrenceSetCandidate::new(
+            AttributeNamespace::Record,
+            "duration".to_owned(),
+            vec![CandidateAttributeValue::floating_point_bits(bits)],
+        )
+        .validate(ValueLimitProfile::release_1_system_maximum())
+    };
+    let observation = |attributes| {
+        SpanObservation::checked_native(
+            [0x61; 16],
+            [0x62; 8],
+            None,
+            "native-value".to_owned(),
+            EventTime::missing(),
+            EventTime::missing(),
+            attributes,
+            SpanKind::Internal,
+            SamplingDecision::Unknown,
+            positron_policy::PolicyProvenance::new(1, [0x90; 32], Vec::new())?,
+        )
+    };
+    let positive_zero = observation(vec![attribute(0.0_f64.to_bits())?])?;
+    let negative_zero = observation(vec![attribute((-0.0_f64).to_bits())?])?;
+    let store = TraceStore::new();
+    ledger.append(
+        store
+            .prepare_unretained_for_test(
+                preparation_capacity(&authority, tenant)?,
+                &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
+                tenant,
+                shard,
+                positron_kernel::StoreBlockIdentity::new([0x69; 16])?,
+                vec![positive_zero.clone(), positive_zero, negative_zero],
+            )?
+            .into_store_block(),
+    )?;
+    let logical = store.scan_logical(
+        authority.governor(),
+        tenant,
+        &ledger.snapshot()?,
+        TraceScan::all(ScanLimit::new(3)?),
+    )?;
+    let span = logical.spans().first().ok_or("missing logical span")?;
+    assert_eq!(span.observation_count(), 3);
+    assert_eq!(span.variants().len(), 2);
+    assert_eq!(span.variants()[0].observation_count(), 2);
+    assert_eq!(span.variants()[1].observation_count(), 1);
+    assert!(span.conflicted());
+    Ok(())
+}
+
+#[test]
+fn logical_scan_preserves_native_attribute_type_and_namespace_variants()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x28; 16])?,
+        CatalogSecret::from_owned(Box::new([0x38; 32]), Box::new([0x48; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let shard = VirtualShardId::new(18)?;
+    let ledger = ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        SegmentScope::new(tenant, SignalKind::Traces, shard),
+        SegmentProtectionKey::from_owned(Box::new([0x68; 32])),
+    )?;
+    let attribute = |namespace, value| {
+        AttributeOccurrenceSetCandidate::new(namespace, "enabled".to_owned(), vec![value])
+            .validate(ValueLimitProfile::release_1_system_maximum())
+    };
+    let observation = |attributes| {
+        SpanObservation::checked_native(
+            [0x71; 16],
+            [0x72; 8],
+            None,
+            "semantic-identity".to_owned(),
+            EventTime::missing(),
+            EventTime::missing(),
+            attributes,
+            SpanKind::Internal,
+            SamplingDecision::Unknown,
+            positron_policy::PolicyProvenance::new(1, [0xa0; 32], Vec::new())?,
+        )
+    };
+    let record_boolean = observation(vec![attribute(
+        AttributeNamespace::Record,
+        CandidateAttributeValue::boolean(true),
+    )?])?;
+    let resource_boolean = observation(vec![attribute(
+        AttributeNamespace::Resource,
+        CandidateAttributeValue::boolean(true),
+    )?])?;
+    let record_string = observation(vec![attribute(
+        AttributeNamespace::Record,
+        CandidateAttributeValue::string("true".to_owned()),
+    )?])?;
+    let store = TraceStore::new();
+    ledger.append(
+        store
+            .prepare_unretained_for_test(
+                preparation_capacity(&authority, tenant)?,
+                &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
+                tenant,
+                shard,
+                positron_kernel::StoreBlockIdentity::new([0x79; 16])?,
+                vec![
+                    record_boolean.clone(),
+                    record_boolean.clone(),
+                    resource_boolean.clone(),
+                    record_string.clone(),
+                ],
+            )?
+            .into_store_block(),
+    )?;
+    let logical = store.scan_logical(
+        authority.governor(),
+        tenant,
+        &ledger.snapshot()?,
+        TraceScan::all(ScanLimit::new(4)?),
+    )?;
+    let span = logical.spans().first().ok_or("missing logical span")?;
+    assert_eq!(logical.spans().len(), 1);
+    assert_eq!(span.observation_count(), 4);
+    assert_eq!(span.variants().len(), 3);
+    assert_eq!(span.variants()[0].observation_count(), 2);
+    assert_eq!(
+        span.variants()[0].observation().observation(),
+        &record_boolean
+    );
+    assert_eq!(
+        span.variants()[1].observation().observation(),
+        &resource_boolean
+    );
+    assert_eq!(
+        span.variants()[2].observation().observation(),
+        &record_string
+    );
+    assert!(span.conflicted());
+    assert!(span.structurally_incomplete());
     Ok(())
 }
 
@@ -189,33 +431,38 @@ fn bounded_trace_scan_reports_explicit_result_incompleteness() -> Result<(), Box
             )?
             .into_store_block(),
     )?;
-    let result = store.scan(
+    let result = store.scan_logical(
         authority.governor(),
         tenant,
         &ledger.snapshot()?,
         TraceScan::all(ScanLimit::new(1)?),
     )?;
-    assert_eq!(result.observations().len(), 1);
+    assert_eq!(result.spans().len(), 1);
+    assert_eq!(result.decoded_observations(), 1);
     assert!(!result.complete());
     assert_eq!(
         result.incompleteness(),
         super::TraceIncompleteness::ResultLimit
     );
-    let next_result = store.scan(
+    let next_result = store.scan_logical(
         authority.governor(),
         tenant,
         &ledger.snapshot()?,
         TraceScan::after(ScanLimit::new(1)?, first_receipt.position()),
     )?;
-    assert_eq!(next_result.observations().len(), 1);
+    assert_eq!(next_result.spans().len(), 1);
+    assert_eq!(next_result.decoded_observations(), 1);
     assert!(!next_result.complete());
-    let roomy_result = store.scan(
+    let roomy_result = store.scan_logical(
         authority.governor(),
         tenant,
         &ledger.snapshot()?,
         TraceScan::all(ScanLimit::new(8)?),
     )?;
-    assert_eq!(roomy_result.observations().len(), 5);
-    assert!(roomy_result.retained_size_bytes() >= 8 * 512);
+    assert_eq!(roomy_result.spans().len(), 5);
+    assert_eq!(roomy_result.decoded_observations(), 5);
+    assert!(roomy_result.complete());
+    assert!(roomy_result.scanned_bytes() > 0);
+    assert!(roomy_result.retained_size_bytes() > 0);
     Ok(())
 }

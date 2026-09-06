@@ -180,16 +180,17 @@ fn public_trace_store_round_trip_preserves_markers_in_span_event_and_link_detail
             .windows("source-secret".len())
             .any(|window| window == b"source-secret")
     );
-    let result = store.scan(
+    let result = store.scan_logical(
         authority.governor(),
         tenant,
         &snapshot,
         TraceScan::all(ScanLimit::new(1)?),
     )?;
     let actual = result
-        .observations()
+        .spans()
         .first()
-        .ok_or("missing scanned trace")?
+        .and_then(|span| span.structural_representative())
+        .ok_or("missing scanned logical trace")?
         .observation();
     assert_eq!(actual, &observation);
     assert_eq!(

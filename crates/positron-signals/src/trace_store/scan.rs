@@ -148,7 +148,7 @@ pub struct TraceScanResult<'kernel> {
     _capacity: ResourceReservation<'kernel>,
 }
 
-impl TraceScanResult<'_> {
+impl<'kernel> TraceScanResult<'kernel> {
     #[allow(clippy::too_many_arguments)]
     pub(super) const fn new(
         observations: Vec<ScannedSpanObservation>,
@@ -209,6 +209,34 @@ impl TraceScanResult<'_> {
     #[must_use]
     pub const fn retained_size_bytes(&self) -> u64 {
         self.retained_size_bytes
+    }
+
+    /// Consolidates this bounded physical scan into logical spans.
+    ///
+    /// Every committed observation stays represented by a semantic variant
+    /// count. Conflicting variants remain visible, and their first committed
+    /// observation is deterministic because physical observations are sorted
+    /// by identity and commit position before grouping.
+    pub fn into_logical_spans(
+        self,
+    ) -> Result<super::LogicalTraceScanResult<'kernel>, TraceStoreFailure> {
+        let Self {
+            observations,
+            complete,
+            scanned_bytes,
+            scanned_bytes_limited,
+            retained_size_bytes,
+            _capacity,
+            ..
+        } = self;
+        super::consolidation::consolidate(
+            observations,
+            complete,
+            scanned_bytes,
+            scanned_bytes_limited,
+            retained_size_bytes,
+            _capacity,
+        )
     }
 }
 
@@ -281,6 +309,37 @@ impl super::TraceStore {
             &NeverCancelled,
             &Unobserved,
         )
+    }
+
+    /// Scans the normal logical Trace Store view for one authenticated snapshot.
+    ///
+    /// Raw observations remain available through [`Self::scan`] for diagnostic
+    /// expansion. Normal trace results coalesce identical retries and retain
+    /// conflicting semantic variants without overwrite fiction.
+    pub fn scan_logical<'kernel>(
+        &self,
+        governor: ResourceGovernor<'kernel>,
+        tenant: TenantId,
+        snapshot: &LedgerSnapshot<'_>,
+        scan: TraceScan,
+    ) -> Result<super::LogicalTraceScanResult<'kernel>, TraceStoreFailure> {
+        self.scan(governor, tenant, snapshot, scan)?
+            .into_logical_spans()
+    }
+
+    /// Scans the normal logical view with caller-owned cancellation and work budgets.
+    #[allow(clippy::too_many_arguments)]
+    pub fn scan_logical_observed<'kernel>(
+        &self,
+        governor: ResourceGovernor<'kernel>,
+        tenant: TenantId,
+        snapshot: &LedgerSnapshot<'_>,
+        scan: TraceScan,
+        cancellation: &dyn ScanCancellation,
+        observer: &dyn ScanObserver,
+    ) -> Result<super::LogicalTraceScanResult<'kernel>, TraceStoreFailure> {
+        self.scan_observed(governor, tenant, snapshot, scan, cancellation, observer)?
+            .into_logical_spans()
     }
 
     /// Scans with cooperative cancellation and caller-owned bounded work observation.
@@ -442,7 +501,7 @@ impl super::TraceStore {
     }
 }
 
-fn resize_capacity(
+pub(super) fn resize_capacity(
     capacity: &mut ResourceReservation<'_>,
     memory: u64,
 ) -> Result<(), TraceStoreFailure> {

@@ -118,6 +118,37 @@ fn public_trace_store_seam_commits_and_reads_a_native_observation() -> Result<()
         },
     )?;
     let lowered = profile_with_key_limit(4);
+    let lowered_rejected = match policy.evaluate_trace(
+        NativeTraceCandidate::new(vec![NativePolicyAttribute::new(
+            AttributeNamespace::Record,
+            "five!".to_owned(),
+            vec![CandidateAttributeValue::boolean(true)],
+        )]),
+        PolicyReceiver::OtlpGrpc,
+    )? {
+        TracePolicyEvaluation::Accepted(evaluated) => *evaluated,
+        TracePolicyEvaluation::Rejected => return Err("preserving policy rejected span".into()),
+    };
+    let lowered_failure = SpanObservation::checked_evaluated(
+        lowered,
+        EvaluatedSpanObservationInput {
+            trace_id: [0x86; 16],
+            span_id: [0x8e; 8],
+            parent_span_id: None,
+            name: "five".to_owned(),
+            start_time: EventTime::missing(),
+            end_time: EventTime::missing(),
+            kind: SpanKind::Internal,
+            sampling: SamplingDecision::Unknown,
+            evaluated: lowered_rejected,
+            details: SpanObservationDetails::default(),
+        },
+    )
+    .expect_err("lowered profile must reject an over-limit policy attribute");
+    assert_eq!(
+        lowered_failure.code(),
+        positron_signals::TraceStoreFailureCode::LimitExceeded
+    );
     let over_evaluated = match policy.evaluate_trace(
         NativeTraceCandidate::new(Vec::new()),
         PolicyReceiver::OtlpGrpc,
@@ -281,6 +312,27 @@ fn public_trace_store_seam_commits_and_reads_a_native_observation() -> Result<()
         SpanObservation::MAX_NAME_BYTES
     );
     drop(result);
+    let logical = TraceStore::new().scan_logical(
+        authority.governor(),
+        tenant,
+        &ledger.snapshot()?,
+        TraceScan::all(ScanLimit::new(1)?),
+    )?;
+    assert!(logical.complete());
+    assert_eq!(logical.decoded_observations(), 1);
+    assert_eq!(logical.spans().len(), 1);
+    let span = logical.spans().first().ok_or("missing logical span")?;
+    assert_eq!(span.observation_count(), 1);
+    assert!(!span.conflicted());
+    assert!(!span.structurally_incomplete());
+    assert_eq!(span.variants().len(), 1);
+    assert_eq!(
+        span.structural_representative()
+            .ok_or("missing structural representative")?
+            .observation(),
+        &observation
+    );
+    drop(logical);
     let _sealed = ledger.seal()?;
     let reopened = ActiveSegmentLedger::open_with_retention_time(
         &authority,
@@ -358,6 +410,57 @@ fn public_trace_store_reads_v1_blocks_with_explicit_absent_detail_defaults()
         result.observations()[0].ingest_time().instant().value(),
         encoded_ingest_time
     );
+    Ok(())
+}
+
+#[test]
+fn logical_trace_scan_rejects_a_legacy_observation_with_mismatched_ingest_time()
+-> Result<(), Box<dyn Error>> {
+    let root = TestRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0xb1; 16])?,
+        CatalogSecret::from_owned(Box::new([0xb2; 32]), Box::new([0xb3; 32])),
+    )?;
+    let (retention, _) =
+        RetentionTimeAuthority::establish_with_manual_elapsed(UnixNanoseconds::new(100));
+    let tenant = TenantId::from_bytes([0x84; 16])?;
+    let scope = SegmentScope::new(tenant, SignalKind::Traces, VirtualShardId::new(12)?);
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention,
+        &catalog,
+        scope,
+        SegmentProtectionKey::from_owned(Box::new([0xb5; 32])),
+    )?;
+    let preparation = ledger.begin_store_block(
+        preparation_capacity(&authority, tenant)?,
+        positron_kernel::StoreBlockIdentity::new([0xb6; 16])?,
+    )?;
+    let mismatched_ingest_time = preparation
+        .ingest_time()
+        .instant()
+        .value()
+        .checked_add(1)
+        .ok_or("test ingest time overflow")?;
+    ledger.append(preparation.finish(legacy_v1_block(tenant, mismatched_ingest_time))?)?;
+
+    let before = authority.governor().inspect()?.outstanding_total();
+    let failure = TraceStore::new()
+        .scan_logical(
+            authority.governor(),
+            tenant,
+            &ledger.snapshot()?,
+            TraceScan::all(ScanLimit::new(1)?),
+        )
+        .expect_err("logical scan must reject a mismatched persisted ingest time");
+    assert_eq!(
+        failure.code(),
+        positron_signals::TraceStoreFailureCode::IntegrityCorruption
+    );
+    assert_eq!(authority.governor().inspect()?.outstanding_total(), before);
     Ok(())
 }
 

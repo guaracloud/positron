@@ -60,7 +60,7 @@ fn malformed_trace_block_fails_closed_without_a_partial_result() -> Result<(), B
         };
     assert_eq!(failure.code(), TraceStoreFailureCode::MalformedBlock);
     let failure = store
-        .scan(
+        .scan_logical(
             authority.governor(),
             tenant,
             &ledger.snapshot()?,
@@ -257,7 +257,7 @@ fn malformed_trace_record_shapes_fail_closed_at_their_boundaries() -> Result<(),
             bytes,
         )?)?;
         let failure = TraceStore::new()
-            .scan(
+            .scan_logical(
                 authority.governor(),
                 tenant,
                 &ledger.snapshot()?,
@@ -363,7 +363,7 @@ fn malformed_v2_detail_framing_is_typed_and_atomic() -> Result<(), Box<dyn Error
         let snapshot = ledger.snapshot()?;
         let before = authority.governor().inspect()?.outstanding_total();
         let failure = TraceStore::new()
-            .scan(
+            .scan_logical(
                 authority.governor(),
                 tenant,
                 &snapshot,

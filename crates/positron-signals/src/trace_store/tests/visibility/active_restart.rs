@@ -191,7 +191,7 @@ fn committed_span_is_visible_immediately_from_the_active_segment() -> Result<(),
         ),
     ] {
         let failure = store
-            .scan_observed(
+            .scan_logical_observed(
                 authority.governor(),
                 tenant,
                 &ledger.snapshot()?,
@@ -206,7 +206,7 @@ fn committed_span_is_visible_immediately_from_the_active_segment() -> Result<(),
     let before_cancel = authority.governor().inspect()?.outstanding_total();
     let cancellation = AlwaysCancelled;
     let failure = store
-        .scan_observed(
+        .scan_logical_observed(
             authority.governor(),
             tenant,
             &ledger.snapshot()?,
