@@ -123,6 +123,35 @@ fn observed_validation_reports_string_capacity_not_only_length() {
 }
 
 #[test]
+fn observed_decoded_size_matches_checked_value_and_can_interrupt_nested_payloads() {
+    let value = CandidateAttributeValue::key_value_list(vec![CandidateKeyValue::new(
+        "nested".to_owned(),
+        CandidateAttributeValue::array(vec![CandidateAttributeValue::string("payload".to_owned())]),
+    )])
+    .validate_log_body(ValueLimitProfile::release_1_system_maximum())
+    .expect("the bounded nested value validates");
+    let mut observed = CountingObserver::default();
+    assert_eq!(
+        value
+            .decoded_size_bytes_observed(&mut observed)
+            .expect("observed decoded sizing succeeds"),
+        value
+            .decoded_size_bytes()
+            .expect("checked decoded sizing succeeds")
+    );
+    assert!(observed.payloads > 0);
+
+    let mut interrupted = CountingObserver {
+        fail_at_structure: Some(2),
+        ..CountingObserver::default()
+    };
+    assert_eq!(
+        value.decoded_size_bytes_observed(&mut interrupted),
+        Err(ObservedValueFailure::Observer("cancelled traversal"))
+    );
+}
+
+#[test]
 fn observed_validation_releases_output_capacity_on_cancellation() {
     let candidate = CandidateAttributeValue::key_value_list(vec![CandidateKeyValue::new(
         "nested".to_owned(),

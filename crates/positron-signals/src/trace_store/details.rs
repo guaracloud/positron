@@ -1,4 +1,4 @@
-use positron_domain::value::ValueLimitProfile;
+use positron_domain::value::{NativeValueObserver, ObservedValueFailure, ValueLimitProfile};
 
 use super::failure::TraceStoreFailure;
 
@@ -237,5 +237,106 @@ impl SpanObservationDetails {
         self.links.iter().try_fold(with_events, |total, link| {
             detail_decoded_bytes(total, link.trace_state.len(), &link.attributes, limit)
         })
+    }
+
+    pub(super) fn decoded_size_bytes_observed(
+        &self,
+        limit: usize,
+        observer: &mut impl NativeValueObserver<Error = TraceStoreFailure>,
+    ) -> Result<usize, TraceStoreFailure> {
+        observer.observe_structure()?;
+        for value in [
+            self.trace_state.as_bytes(),
+            self.status.message.as_bytes(),
+            self.resource.schema_url.as_bytes(),
+            self.scope.name.as_bytes(),
+            self.scope.version.as_bytes(),
+            self.scope.schema_url.as_bytes(),
+        ] {
+            observe_payload(value, observer)?;
+        }
+        let initial = self
+            .trace_state
+            .len()
+            .checked_add(self.status.message.len())
+            .and_then(|size| size.checked_add(self.resource.schema_url.len()))
+            .and_then(|size| size.checked_add(self.scope.name.len()))
+            .and_then(|size| size.checked_add(self.scope.version.len()))
+            .and_then(|size| size.checked_add(self.scope.schema_url.len()))
+            .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+        let with_events = self.events.iter().try_fold(initial, |total, event| {
+            observer.observe_structure()?;
+            observe_payload(event.name.as_bytes(), observer)?;
+            detail_decoded_bytes_observed(
+                total,
+                event.name.len(),
+                &event.attributes,
+                limit,
+                observer,
+            )
+        })?;
+        self.links.iter().try_fold(with_events, |total, link| {
+            observer.observe_structure()?;
+            observe_payload(link.trace_state.as_bytes(), observer)?;
+            detail_decoded_bytes_observed(
+                total,
+                link.trace_state.len(),
+                &link.attributes,
+                limit,
+                observer,
+            )
+        })
+    }
+}
+
+fn detail_decoded_bytes_observed(
+    current: usize,
+    name_bytes: usize,
+    attributes: &[SpanAttributeSet],
+    limit: usize,
+    observer: &mut impl NativeValueObserver<Error = TraceStoreFailure>,
+) -> Result<usize, TraceStoreFailure> {
+    let mut decoded = current
+        .checked_add(name_bytes)
+        .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+    for attribute in attributes {
+        observer.observe_structure()?;
+        observe_payload(attribute.key().as_bytes(), observer)?;
+        decoded = decoded
+            .checked_add(attribute.key().len())
+            .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+        for index in 0..attribute.len() {
+            let value = attribute
+                .occurrence(index)
+                .ok_or_else(TraceStoreFailure::invalid_input)?;
+            decoded = decoded
+                .checked_add(
+                    value
+                        .decoded_size_bytes_observed(observer)
+                        .map_err(observed_value_failure)?,
+                )
+                .filter(|size| *size <= limit)
+                .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+        }
+    }
+    Ok(decoded)
+}
+
+pub(super) fn observe_payload(
+    payload: &[u8],
+    observer: &mut impl NativeValueObserver<Error = TraceStoreFailure>,
+) -> Result<(), TraceStoreFailure> {
+    for chunk in payload.chunks(positron_domain::value::NATIVE_VALUE_PAYLOAD_CHUNK_BYTES) {
+        observer.observe_payload(chunk)?;
+    }
+    Ok(())
+}
+
+pub(super) fn observed_value_failure(
+    failure: ObservedValueFailure<TraceStoreFailure>,
+) -> TraceStoreFailure {
+    match failure {
+        ObservedValueFailure::Domain(failure) => TraceStoreFailure::domain(failure),
+        ObservedValueFailure::Observer(failure) => failure,
     }
 }

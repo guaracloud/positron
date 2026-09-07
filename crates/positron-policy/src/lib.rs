@@ -19,4 +19,4 @@ pub use policy::{
     PolicyCompileFailure, PolicyEvaluation, PolicyEvaluationFailure, PolicyPredicate,
     PolicyReceiver, PolicyRule, PolicyTarget, TracePolicyEvaluation,
 };
-pub use provenance::{PolicyProvenance, PolicyProvenanceFailure};
+pub use provenance::{ObservedPolicyProvenanceFailure, PolicyProvenance, PolicyProvenanceFailure};

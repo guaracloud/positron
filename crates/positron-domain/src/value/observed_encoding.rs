@@ -154,6 +154,25 @@ fn native_kind_tag<E>(kind: super::AttributeValueKind) -> Result<u8, ObservedVal
 }
 
 impl AttributeOccurrenceSet {
+    /// Returns retained heap bytes while observing the key and every native value.
+    pub fn retained_heap_bytes_observed<O: NativeValueObserver>(
+        &self,
+        observer: &mut O,
+    ) -> Result<usize, ObservedValueFailure<O::Error>> {
+        observe_structure(observer)?;
+        observe_payload(self.key().as_bytes(), observer)?;
+        let slots = self
+            .occurrences
+            .capacity()
+            .checked_mul(std::mem::size_of::<ValidatedAttributeValue>())
+            .ok_or_else(|| ObservedValueFailure::Domain(DomainFailure::value_limit_exceeded()))?;
+        let mut retained = checked_add(self.key.capacity(), slots)?;
+        for value in &self.occurrences {
+            retained = checked_add(retained, value.retained_heap_bytes_observed(observer)?)?;
+        }
+        Ok(retained)
+    }
+
     /// Returns canonical occurrence-set output bytes with observed native traversal.
     pub fn canonical_encoded_size_bytes_observed<O: NativeValueObserver>(
         &self,

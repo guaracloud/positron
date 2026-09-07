@@ -50,8 +50,9 @@ cargo +nightly fuzz run primary_data_volume_stateful
 ```
 
 The bounded Trace Store Block target feeds untrusted bytes through the native
-tenant-bound codec, including typed values, policy provenance, truncation, and
-trailing-byte validation:
+tenant-bound codec and logical-span consolidation, including typed values,
+policy provenance, truncation, trailing-byte validation, semantic variant
+counts, and deterministic representatives:
 
 ```console
 cargo +nightly fuzz run trace_store_block_decode --sanitizer none -- -runs=1000

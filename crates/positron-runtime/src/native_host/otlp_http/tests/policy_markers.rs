@@ -440,7 +440,7 @@ fn assert_trace_marker(
         SegmentScope::new(initialized.tenant, SignalKind::Traces, scope.shard_id()),
         protection,
     )?;
-    let result = TraceStore::new().scan(
+    let result = TraceStore::new().scan_physical(
         initialized.resource_governor(),
         initialized.tenant,
         &ledger.snapshot()?,

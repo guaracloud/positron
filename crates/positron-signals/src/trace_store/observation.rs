@@ -1,7 +1,8 @@
 use positron_domain::time::EventTime;
-use positron_domain::value::{AttributeOccurrenceSet, ValueLimitProfile};
+use positron_domain::value::{AttributeOccurrenceSet, NativeValueObserver, ValueLimitProfile};
+use positron_policy::ObservedPolicyProvenanceFailure;
 
-use super::details::SpanObservationDetails;
+use super::details::{SpanObservationDetails, observe_payload, observed_value_failure};
 use super::failure::TraceStoreFailure;
 
 /// The protocol-neutral OTLP span kind retained by the Trace Store.
@@ -378,6 +379,46 @@ impl SpanObservation {
         Ok(retained)
     }
 
+    pub(crate) fn retained_heap_bytes_observed(
+        &self,
+        observer: &mut impl NativeValueObserver<Error = TraceStoreFailure>,
+    ) -> Result<usize, TraceStoreFailure> {
+        observer.observe_structure()?;
+        observe_payload(self.name.as_bytes(), observer)?;
+        let policy_retained = self
+            .policy
+            .retained_heap_bytes_observed(|rule| {
+                observer.observe_structure()?;
+                observe_payload(rule.as_bytes(), observer)
+            })
+            .map_err(observed_policy_failure)?;
+        let mut retained = self
+            .name
+            .capacity()
+            .checked_add(
+                self.attributes
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<AttributeOccurrenceSet>())
+                    .ok_or_else(TraceStoreFailure::limit_exceeded)?,
+            )
+            .and_then(|size| size.checked_add(std::mem::size_of::<SpanObservationDetails>()))
+            .and_then(|size| size.checked_add(policy_retained))
+            .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+        for attribute in &self.attributes {
+            retained = retained
+                .checked_add(
+                    attribute
+                        .retained_heap_bytes_observed(observer)
+                        .map_err(observed_value_failure)?,
+                )
+                .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+        }
+        retained = retained
+            .checked_add(self.details.retained_heap_bytes_observed(observer)?)
+            .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+        Ok(retained)
+    }
+
     /// Returns the decoded logical bytes retained by this observation's
     /// profile-visible fields. This is used for request-level effective-limit
     /// accounting after policy transformations have been applied.
@@ -404,5 +445,14 @@ impl SpanObservation {
             .checked_add(self.details.decoded_size_bytes(usize::MAX)?)
             .ok_or_else(TraceStoreFailure::limit_exceeded)?;
         Ok(decoded)
+    }
+}
+
+fn observed_policy_failure(
+    failure: ObservedPolicyProvenanceFailure<TraceStoreFailure>,
+) -> TraceStoreFailure {
+    match failure {
+        ObservedPolicyProvenanceFailure::Policy(failure) => TraceStoreFailure::from(failure),
+        ObservedPolicyProvenanceFailure::Observer(failure) => failure,
     }
 }

@@ -61,6 +61,603 @@ impl ScanObserver for CancelAfterFirstRecord {
     }
 }
 
+struct CancelAfterWork {
+    limit: u64,
+    observed: AtomicU64,
+    cancelled: Arc<AtomicU64>,
+}
+
+impl ScanObserver for CancelAfterWork {
+    fn observe_work(&self, units: u64) -> Result<(), ScanObservationFailureCode> {
+        let next = self
+            .observed
+            .fetch_add(units, Ordering::Relaxed)
+            .checked_add(units)
+            .ok_or(ScanObservationFailureCode::BudgetExhausted)?;
+        if next > self.limit {
+            self.cancelled.store(1, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn consolidation_observes_post_decode_budget_and_cancellation_without_reservation_drift()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x95; 16])?,
+        CatalogSecret::from_owned(Box::new([0xa5; 32]), Box::new([0xb5; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let shard = VirtualShardId::new(15)?;
+    let ledger = ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        SegmentScope::new(tenant, SignalKind::Traces, shard),
+        SegmentProtectionKey::from_owned(Box::new([0xc5; 32])),
+    )?;
+    let retry = SpanObservation::checked_native(
+        [0xd5; 16],
+        [0xe5; 8],
+        None,
+        "retry".to_owned(),
+        EventTime::missing(),
+        EventTime::missing(),
+        Vec::new(),
+        SpanKind::Internal,
+        SamplingDecision::Unknown,
+        positron_policy::PolicyProvenance::new(1, [0xf5; 32], Vec::new())?,
+    )?;
+    let conflict = SpanObservation::checked_native(
+        [0xd5; 16],
+        [0xe5; 8],
+        None,
+        "conflict".to_owned(),
+        EventTime::missing(),
+        EventTime::missing(),
+        Vec::new(),
+        SpanKind::Internal,
+        SamplingDecision::Unknown,
+        positron_policy::PolicyProvenance::new(1, [0xf6; 32], Vec::new())?,
+    )?;
+    let store = TraceStore::new();
+    ledger.append(
+        store
+            .prepare_unretained_for_test(
+                preparation_capacity(&authority, tenant)?,
+                &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
+                tenant,
+                shard,
+                positron_kernel::StoreBlockIdentity::new([0x45; 16])?,
+                vec![retry.clone(), retry, conflict],
+            )?
+            .into_store_block(),
+    )?;
+    let physical_work = WorkBudget::unlimited();
+    let physical = store.scan_physical_observed(
+        authority.governor(),
+        tenant,
+        &ledger.snapshot()?,
+        TraceScan::all(ScanLimit::new(3)?),
+        &NeverCancelled,
+        &physical_work,
+    )?;
+    assert_eq!(physical.observations().len(), 3);
+    let decode_work = physical_work.work();
+    drop(physical);
+
+    let complete_work = WorkBudget::unlimited();
+    let complete = store.scan_observed(
+        authority.governor(),
+        tenant,
+        &ledger.snapshot()?,
+        TraceScan::all(ScanLimit::new(3)?),
+        &NeverCancelled,
+        &complete_work,
+    )?;
+    assert_eq!(complete.spans().len(), 1);
+    assert_eq!(complete.spans()[0].observation_count(), 3);
+    drop(complete);
+    let total_work = complete_work.work();
+    let consolidation_work = total_work
+        .checked_sub(decode_work)
+        .ok_or("logical work did not include physical decode")?;
+    assert!(consolidation_work > 1);
+    let partial_budget = decode_work
+        .checked_add(consolidation_work / 2)
+        .ok_or("partial consolidation budget overflow")?;
+    assert!(partial_budget > decode_work);
+    assert!(partial_budget < total_work);
+    let before_partial = authority.governor().inspect()?.outstanding_total();
+    let partial_observer = WorkBudget::exact(partial_budget);
+    let partial_failure = store
+        .scan_observed(
+            authority.governor(),
+            tenant,
+            &ledger.snapshot()?,
+            TraceScan::all(ScanLimit::new(3)?),
+            &NeverCancelled,
+            &partial_observer,
+        )
+        .expect_err("a partial post-decode budget must interrupt consolidation");
+    assert_eq!(
+        partial_failure.code(),
+        TraceStoreFailureCode::BudgetExhausted
+    );
+    assert_eq!(partial_observer.work(), partial_budget);
+    assert_eq!(
+        authority.governor().inspect()?.outstanding_total(),
+        before_partial
+    );
+
+    let before_budget = authority.governor().inspect()?.outstanding_total();
+    let exhausted = WorkBudget::exact(decode_work);
+    let budget_failure = store
+        .scan_observed(
+            authority.governor(),
+            tenant,
+            &ledger.snapshot()?,
+            TraceScan::all(ScanLimit::new(3)?),
+            &NeverCancelled,
+            &exhausted,
+        )
+        .expect_err("logical consolidation must consume work after physical decode");
+    assert_eq!(
+        budget_failure.code(),
+        TraceStoreFailureCode::BudgetExhausted
+    );
+    assert_eq!(
+        budget_failure.completion_state(),
+        positron_kernel::LedgerCompletionState::RejectedBeforeMutation
+    );
+    assert_eq!(
+        authority.governor().inspect()?.outstanding_total(),
+        before_budget
+    );
+
+    let cancelled = Arc::new(AtomicU64::new(0));
+    let cancellation = SharedCancellation(Arc::clone(&cancelled));
+    let cancel_after_decode = CancelAfterWork {
+        limit: decode_work,
+        observed: AtomicU64::new(0),
+        cancelled,
+    };
+    let before_cancel = authority.governor().inspect()?.outstanding_total();
+    let cancellation_failure = store
+        .scan_observed(
+            authority.governor(),
+            tenant,
+            &ledger.snapshot()?,
+            TraceScan::all(ScanLimit::new(3)?),
+            &cancellation,
+            &cancel_after_decode,
+        )
+        .expect_err("logical consolidation must poll cancellation after physical decode");
+    assert_eq!(
+        cancellation_failure.code(),
+        TraceStoreFailureCode::Cancelled
+    );
+    assert_eq!(
+        authority.governor().inspect()?.outstanding_total(),
+        before_cancel
+    );
+    Ok(())
+}
+
+#[test]
+fn maximum_native_payload_budget_interrupts_semantic_key_construction() -> Result<(), Box<dyn Error>>
+{
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x96; 16])?,
+        CatalogSecret::from_owned(Box::new([0xa6; 32]), Box::new([0xb6; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let shard = VirtualShardId::new(16)?;
+    let ledger = ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        SegmentScope::new(tenant, SignalKind::Traces, shard),
+        SegmentProtectionKey::from_owned(Box::new([0xc6; 32])),
+    )?;
+    let attribute = |last_byte| {
+        let mut bytes = vec![0x11; 65_535];
+        bytes.push(last_byte);
+        AttributeOccurrenceSetCandidate::new(
+            AttributeNamespace::Record,
+            "payload".to_owned(),
+            vec![CandidateAttributeValue::bytes(bytes)],
+        )
+        .validate(ValueLimitProfile::release_1_system_maximum())
+    };
+    let observation = |attributes| {
+        SpanObservation::checked_native(
+            [0xd6; 16],
+            [0xe6; 8],
+            None,
+            "maximum-payload".to_owned(),
+            EventTime::missing(),
+            EventTime::missing(),
+            attributes,
+            SpanKind::Internal,
+            SamplingDecision::Unknown,
+            positron_policy::PolicyProvenance::new(1, [0xf6; 32], Vec::new())?,
+        )
+    };
+    let first = observation(vec![attribute(0x11)?])?;
+    let second = observation(vec![attribute(0x12)?])?;
+    let store = TraceStore::new();
+    ledger.append(
+        store
+            .prepare_unretained_for_test(
+                preparation_capacity(&authority, tenant)?,
+                &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
+                tenant,
+                shard,
+                positron_kernel::StoreBlockIdentity::new([0x46; 16])?,
+                vec![first, second],
+            )?
+            .into_store_block(),
+    )?;
+    let decode_work = WorkBudget::unlimited();
+    let physical = store.scan_physical_observed(
+        authority.governor(),
+        tenant,
+        &ledger.snapshot()?,
+        TraceScan::all(ScanLimit::new(2)?),
+        &NeverCancelled,
+        &decode_work,
+    )?;
+    drop(physical);
+    let complete_work = WorkBudget::unlimited();
+    let complete = store.scan_observed(
+        authority.governor(),
+        tenant,
+        &ledger.snapshot()?,
+        TraceScan::all(ScanLimit::new(2)?),
+        &NeverCancelled,
+        &complete_work,
+    )?;
+    assert!(complete.complete());
+    assert_eq!(complete.spans().len(), 1);
+    assert_eq!(complete.spans()[0].variants().len(), 2);
+    assert_eq!(complete.spans()[0].observation_count(), 2);
+    assert!(complete.spans()[0].conflicted());
+    drop(complete);
+
+    let consolidation_work = complete_work
+        .work()
+        .checked_sub(decode_work.work())
+        .ok_or("logical scan did not perform consolidation work")?;
+    assert!(consolidation_work > 4);
+    let partial_budget = decode_work
+        .work()
+        .checked_add(consolidation_work / 2)
+        .ok_or("work limit overflow")?;
+    let constrained = WorkBudget::exact(partial_budget);
+    let before = authority.governor().inspect()?.outstanding_total();
+    let failure = store
+        .scan_observed(
+            authority.governor(),
+            tenant,
+            &ledger.snapshot()?,
+            TraceScan::all(ScanLimit::new(2)?),
+            &NeverCancelled,
+            &constrained,
+        )
+        .expect_err("maximum payload consolidation must stop after bounded traversal work");
+    assert_eq!(failure.code(), TraceStoreFailureCode::BudgetExhausted);
+    assert_eq!(constrained.work(), partial_budget);
+    assert_eq!(authority.governor().inspect()?.outstanding_total(), before);
+
+    let cancelled = Arc::new(AtomicU64::new(0));
+    let cancellation = SharedCancellation(Arc::clone(&cancelled));
+    let cancel_after_partial_work = CancelAfterWork {
+        limit: partial_budget,
+        observed: AtomicU64::new(0),
+        cancelled,
+    };
+    let before_cancellation = authority.governor().inspect()?.outstanding_total();
+    let cancellation_failure = store
+        .scan_observed(
+            authority.governor(),
+            tenant,
+            &ledger.snapshot()?,
+            TraceScan::all(ScanLimit::new(2)?),
+            &cancellation,
+            &cancel_after_partial_work,
+        )
+        .expect_err("maximum payload consolidation must poll cancellation during traversal");
+    assert_eq!(
+        cancellation_failure.code(),
+        TraceStoreFailureCode::Cancelled
+    );
+    assert_eq!(
+        authority.governor().inspect()?.outstanding_total(),
+        before_cancellation
+    );
+
+    let late_budget = complete_work
+        .work()
+        .checked_sub(1)
+        .ok_or("maximum-payload scan did not perform late consolidation work")?;
+    assert!(late_budget > decode_work.work());
+    let before_late_budget = authority.governor().inspect()?.outstanding_total();
+    let late_observer = WorkBudget::exact(late_budget);
+    let late_failure = store
+        .scan_observed(
+            authority.governor(),
+            tenant,
+            &ledger.snapshot()?,
+            TraceScan::all(ScanLimit::new(2)?),
+            &NeverCancelled,
+            &late_observer,
+        )
+        .expect_err("late consolidation accounting must remain interruptible");
+    assert_eq!(late_failure.code(), TraceStoreFailureCode::BudgetExhausted);
+    assert_eq!(
+        authority.governor().inspect()?.outstanding_total(),
+        before_late_budget
+    );
+
+    let late_cancellation_budget = complete_work
+        .work()
+        .checked_sub(2)
+        .ok_or("maximum-payload scan did not perform enough late consolidation work")?;
+    let cancelled = Arc::new(AtomicU64::new(0));
+    let cancellation = SharedCancellation(Arc::clone(&cancelled));
+    let cancel_late = CancelAfterWork {
+        limit: late_cancellation_budget,
+        observed: AtomicU64::new(0),
+        cancelled,
+    };
+    let before_late_cancellation = authority.governor().inspect()?.outstanding_total();
+    let late_cancellation_failure = store
+        .scan_observed(
+            authority.governor(),
+            tenant,
+            &ledger.snapshot()?,
+            TraceScan::all(ScanLimit::new(2)?),
+            &cancellation,
+            &cancel_late,
+        )
+        .expect_err("late consolidation accounting must poll cancellation");
+    assert_eq!(
+        late_cancellation_failure.code(),
+        TraceStoreFailureCode::Cancelled
+    );
+    assert_eq!(
+        authority.governor().inspect()?.outstanding_total(),
+        before_late_cancellation
+    );
+    Ok(())
+}
+
+#[test]
+fn aggregate_maximum_values_keep_normal_scan_interruptible_and_release_capacity()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x98; 16])?,
+        CatalogSecret::from_owned(Box::new([0xa8; 32]), Box::new([0xb8; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let shard = VirtualShardId::new(18)?;
+    let ledger = ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        SegmentScope::new(tenant, SignalKind::Traces, shard),
+        SegmentProtectionKey::from_owned(Box::new([0xc8; 32])),
+    )?;
+    let profile = ValueLimitProfile::release_1_system_maximum();
+    let mut attributes = Vec::new();
+    for index in 0..15 {
+        let mut value = vec![0x31; 65_535];
+        value.push(u8::try_from(index).map_err(|_| "attribute index exceeded byte")?);
+        attributes.push(
+            AttributeOccurrenceSetCandidate::new(
+                AttributeNamespace::Record,
+                format!("aggregate-{index}"),
+                vec![CandidateAttributeValue::bytes(value)],
+            )
+            .validate(profile)?,
+        );
+    }
+    let observation = SpanObservation::checked_native(
+        [0xd8; 16],
+        [0xe8; 8],
+        None,
+        "aggregate-maximum".to_owned(),
+        EventTime::missing(),
+        EventTime::missing(),
+        attributes,
+        SpanKind::Internal,
+        SamplingDecision::Unknown,
+        positron_policy::PolicyProvenance::new(1, [0xf8; 32], Vec::new())?,
+    )?;
+    let store = TraceStore::new();
+    ledger.append(
+        store
+            .prepare_unretained_for_test(
+                preparation_capacity(&authority, tenant)?,
+                &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
+                tenant,
+                shard,
+                positron_kernel::StoreBlockIdentity::new([0x48; 16])?,
+                vec![observation],
+            )?
+            .into_store_block(),
+    )?;
+    let decode_work = WorkBudget::unlimited();
+    let physical = store.scan_physical_observed(
+        authority.governor(),
+        tenant,
+        &ledger.snapshot()?,
+        TraceScan::all(ScanLimit::new(1)?),
+        &NeverCancelled,
+        &decode_work,
+    )?;
+    drop(physical);
+    let complete_work = WorkBudget::unlimited();
+    let complete = store.scan_observed(
+        authority.governor(),
+        tenant,
+        &ledger.snapshot()?,
+        TraceScan::all(ScanLimit::new(1)?),
+        &NeverCancelled,
+        &complete_work,
+    )?;
+    assert!(complete.complete());
+    assert_eq!(complete.spans().len(), 1);
+    assert_eq!(complete.spans()[0].variants().len(), 1);
+    drop(complete);
+
+    let total_work = complete_work.work();
+    let partial_budget = decode_work
+        .work()
+        .checked_add(
+            total_work
+                .checked_sub(decode_work.work())
+                .ok_or("logical scan did not perform aggregate consolidation work")?
+                / 2,
+        )
+        .ok_or("aggregate work limit overflow")?;
+    let before_budget = authority.governor().inspect()?.outstanding_total();
+    let constrained = WorkBudget::exact(partial_budget);
+    let budget_failure = store
+        .scan_observed(
+            authority.governor(),
+            tenant,
+            &ledger.snapshot()?,
+            TraceScan::all(ScanLimit::new(1)?),
+            &NeverCancelled,
+            &constrained,
+        )
+        .expect_err("aggregate native sizing must stop at the query work budget");
+    assert_eq!(
+        budget_failure.code(),
+        TraceStoreFailureCode::BudgetExhausted
+    );
+    assert_eq!(constrained.work(), partial_budget);
+    assert_eq!(
+        authority.governor().inspect()?.outstanding_total(),
+        before_budget
+    );
+
+    let cancelled = Arc::new(AtomicU64::new(0));
+    let cancellation = SharedCancellation(Arc::clone(&cancelled));
+    let cancel_after_partial_work = CancelAfterWork {
+        limit: partial_budget,
+        observed: AtomicU64::new(0),
+        cancelled,
+    };
+    let before_cancellation = authority.governor().inspect()?.outstanding_total();
+    let cancellation_failure = store
+        .scan_observed(
+            authority.governor(),
+            tenant,
+            &ledger.snapshot()?,
+            TraceScan::all(ScanLimit::new(1)?),
+            &cancellation,
+            &cancel_after_partial_work,
+        )
+        .expect_err("aggregate native sizing must poll cancellation during traversal");
+    assert_eq!(
+        cancellation_failure.code(),
+        TraceStoreFailureCode::Cancelled
+    );
+    assert_eq!(
+        authority.governor().inspect()?.outstanding_total(),
+        before_cancellation
+    );
+    Ok(())
+}
+
+#[test]
+fn tight_governor_refuses_logical_consolidation_before_extra_sort_buffers_allocate()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x97; 16])?,
+        CatalogSecret::from_owned(Box::new([0xa7; 32]), Box::new([0xb7; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let shard = VirtualShardId::new(17)?;
+    let ledger = ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        SegmentScope::new(tenant, SignalKind::Traces, shard),
+        SegmentProtectionKey::from_owned(Box::new([0xc7; 32])),
+    )?;
+    let observation = SpanObservation::checked_native(
+        [0xd7; 16],
+        [0xe7; 8],
+        None,
+        "tight-governor".to_owned(),
+        EventTime::missing(),
+        EventTime::missing(),
+        Vec::new(),
+        SpanKind::Internal,
+        SamplingDecision::Unknown,
+        positron_policy::PolicyProvenance::new(1, [0xf7; 32], Vec::new())?,
+    )?;
+    let store = TraceStore::new();
+    ledger.append(
+        store
+            .prepare_unretained_for_test(
+                preparation_capacity(&authority, tenant)?,
+                &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
+                tenant,
+                shard,
+                positron_kernel::StoreBlockIdentity::new([0x47; 16])?,
+                vec![observation; 512],
+            )?
+            .into_store_block(),
+    )?;
+    let held = authority.governor().reserve(WorkClaim::tenant(
+        tenant,
+        WorkKind::Ingest,
+        ResourceAmounts::only(ResourceDimension::MemoryBytes, 4_000_000)?,
+    )?)?;
+    let before = authority.governor().inspect()?.outstanding_total();
+    let refusal = store
+        .scan(
+            authority.governor(),
+            tenant,
+            &ledger.snapshot()?,
+            TraceScan::all(ScanLimit::new(512)?),
+        )
+        .expect_err("logical scan must admit its complete sort peak before allocating");
+    assert_eq!(
+        refusal.code(),
+        TraceStoreFailureCode::ResourceAdmissionRefused
+    );
+    assert_eq!(authority.governor().inspect()?.outstanding_total(), before);
+    drop(held);
+    let complete = store.scan(
+        authority.governor(),
+        tenant,
+        &ledger.snapshot()?,
+        TraceScan::all(ScanLimit::new(512)?),
+    )?;
+    assert_eq!(complete.spans().len(), 1);
+    assert_eq!(complete.spans()[0].observation_count(), 512);
+    Ok(())
+}
+
 #[test]
 fn policy_rules_consume_their_exact_scan_work_budget() -> Result<(), Box<dyn Error>> {
     let root = TemporaryRoot::new()?;
@@ -115,7 +712,7 @@ fn policy_rules_consume_their_exact_scan_work_budget() -> Result<(), Box<dyn Err
     let two_rules = append(3, vec!["rule.one".to_owned(), "rule.two".to_owned()])?;
 
     let base_observer = WorkBudget::unlimited();
-    let base = store.scan_observed(
+    let base = store.scan_physical_observed(
         authority.governor(),
         tenant,
         &ledger.snapshot()?,
@@ -127,7 +724,7 @@ fn policy_rules_consume_their_exact_scan_work_budget() -> Result<(), Box<dyn Err
     let base_work = base_observer.work();
 
     let one_observer = WorkBudget::unlimited();
-    let one = store.scan_observed(
+    let one = store.scan_physical_observed(
         authority.governor(),
         tenant,
         &ledger.snapshot()?,
@@ -140,7 +737,7 @@ fn policy_rules_consume_their_exact_scan_work_budget() -> Result<(), Box<dyn Err
     assert!(one_work > base_work);
 
     let exact_observer = WorkBudget::exact(one_work);
-    let exact = store.scan_observed(
+    let exact = store.scan_physical_observed(
         authority.governor(),
         tenant,
         &ledger.snapshot()?,
@@ -250,7 +847,7 @@ fn scan_stages_admission_before_recursive_work_and_stops_at_page_boundaries()
     );
 
     let before_page = authority.governor().inspect()?.outstanding_total();
-    let page = store.scan(
+    let page = store.scan_physical(
         authority.governor(),
         tenant,
         &ledger.snapshot()?,

@@ -10,6 +10,13 @@ pub struct PolicyProvenance {
     applied_rules: Vec<String>,
 }
 
+/// Distinguishes immutable-provenance accounting failures from observer failures.
+#[derive(Debug, Eq, PartialEq)]
+pub enum ObservedPolicyProvenanceFailure<E> {
+    Policy(PolicyProvenanceFailure),
+    Observer(E),
+}
+
 impl PolicyProvenance {
     /// Maximum number of applied rule identities retained for one record.
     pub const MAX_APPLIED_RULES: usize = MAX_RULES;
@@ -78,6 +85,25 @@ impl PolicyProvenance {
     #[must_use]
     pub fn applied_rules(&self) -> &[String] {
         &self.applied_rules
+    }
+
+    /// Returns retained applied-rule storage while observing every rule identity.
+    pub fn retained_heap_bytes_observed<E>(
+        &self,
+        mut observe_rule: impl FnMut(&str) -> Result<(), E>,
+    ) -> Result<usize, ObservedPolicyProvenanceFailure<E>> {
+        let mut retained = self
+            .applied_rules
+            .capacity()
+            .checked_mul(std::mem::size_of::<String>())
+            .ok_or_else(|| ObservedPolicyProvenanceFailure::Policy(PolicyProvenanceFailure(())))?;
+        for rule in &self.applied_rules {
+            observe_rule(rule).map_err(ObservedPolicyProvenanceFailure::Observer)?;
+            retained = retained.checked_add(rule.capacity()).ok_or_else(|| {
+                ObservedPolicyProvenanceFailure::Policy(PolicyProvenanceFailure(()))
+            })?;
+        }
+        Ok(retained)
     }
 
     /// Returns the heap storage retained by the immutable applied-rule list.

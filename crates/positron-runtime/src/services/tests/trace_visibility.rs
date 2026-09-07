@@ -59,7 +59,7 @@ fn assert_contradictory_observation(
     let protection = initialized.key.segment_key(initialized.instance, scope)?;
     let ledger = ActiveSegmentLedger::open(&initialized._authority, &catalog, scope, protection)?;
     let snapshot = ledger.snapshot()?;
-    let result = TraceStore::new().scan(
+    let result = TraceStore::new().scan_physical(
         initialized.resource_governor(),
         initialized.tenant,
         &snapshot,

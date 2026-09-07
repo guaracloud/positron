@@ -1,11 +1,24 @@
-use super::{SpanAttributeSet, SpanEvent, SpanLink, SpanObservationDetails, SpanStatus};
+use super::{
+    SpanAttributeSet, SpanEvent, SpanLink, SpanObservationDetails, SpanStatus, observe_payload,
+    observed_value_failure,
+};
 use crate::trace_store::failure::TraceStoreFailure;
+use positron_domain::value::NativeValueObserver;
 
 impl SpanAttributeSet {
     pub(crate) fn retained_heap_bytes(&self) -> Result<usize, TraceStoreFailure> {
         self.occurrences
             .retained_heap_bytes()
             .map_err(TraceStoreFailure::domain)
+    }
+
+    pub(crate) fn retained_heap_bytes_observed(
+        &self,
+        observer: &mut impl NativeValueObserver<Error = TraceStoreFailure>,
+    ) -> Result<usize, TraceStoreFailure> {
+        self.occurrences
+            .retained_heap_bytes_observed(observer)
+            .map_err(observed_value_failure)
     }
 
     pub(crate) fn validate_with_profile(
@@ -126,4 +139,91 @@ impl SpanObservationDetails {
         }
         Ok(retained)
     }
+
+    pub(crate) fn retained_heap_bytes_observed(
+        &self,
+        observer: &mut impl NativeValueObserver<Error = TraceStoreFailure>,
+    ) -> Result<usize, TraceStoreFailure> {
+        observe_structure(observer)?;
+        for value in [
+            self.trace_state.as_bytes(),
+            self.status.message.as_bytes(),
+            self.resource.schema_url.as_bytes(),
+            self.scope.name.as_bytes(),
+            self.scope.version.as_bytes(),
+            self.scope.schema_url.as_bytes(),
+        ] {
+            observe_payload(value, observer)?;
+        }
+        let mut retained = self
+            .trace_state
+            .capacity()
+            .checked_add(std::mem::size_of::<SpanStatus>())
+            .and_then(|size| size.checked_add(self.status.message.capacity()))
+            .and_then(|size| {
+                size.checked_add(
+                    self.events
+                        .capacity()
+                        .checked_mul(std::mem::size_of::<SpanEvent>())?,
+                )
+            })
+            .and_then(|size| {
+                size.checked_add(
+                    self.links
+                        .capacity()
+                        .checked_mul(std::mem::size_of::<SpanLink>())?,
+                )
+            })
+            .and_then(|size| size.checked_add(self.resource.schema_url.capacity()))
+            .and_then(|size| size.checked_add(self.scope.name.capacity()))
+            .and_then(|size| size.checked_add(self.scope.version.capacity()))
+            .and_then(|size| size.checked_add(self.scope.schema_url.capacity()))
+            .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+        for event in &self.events {
+            observe_structure(observer)?;
+            observe_payload(event.name.as_bytes(), observer)?;
+            retained = retained
+                .checked_add(event.name.capacity())
+                .and_then(|size| {
+                    size.checked_add(
+                        event
+                            .attributes
+                            .capacity()
+                            .checked_mul(std::mem::size_of::<SpanAttributeSet>())?,
+                    )
+                })
+                .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+            for attribute in &event.attributes {
+                retained = retained
+                    .checked_add(attribute.retained_heap_bytes_observed(observer)?)
+                    .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+            }
+        }
+        for link in &self.links {
+            observe_structure(observer)?;
+            observe_payload(link.trace_state.as_bytes(), observer)?;
+            retained = retained
+                .checked_add(link.trace_state.capacity())
+                .and_then(|size| {
+                    size.checked_add(
+                        link.attributes
+                            .capacity()
+                            .checked_mul(std::mem::size_of::<SpanAttributeSet>())?,
+                    )
+                })
+                .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+            for attribute in &link.attributes {
+                retained = retained
+                    .checked_add(attribute.retained_heap_bytes_observed(observer)?)
+                    .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+            }
+        }
+        Ok(retained)
+    }
+}
+
+fn observe_structure(
+    observer: &mut impl NativeValueObserver<Error = TraceStoreFailure>,
+) -> Result<(), TraceStoreFailure> {
+    observer.observe_structure()
 }

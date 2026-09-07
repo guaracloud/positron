@@ -55,7 +55,7 @@ fn trace_ingest_fallback_reservation_commits_and_can_be_read_immediately()
                 &ledger.snapshot()?,
                 TraceScan::all(ScanLimit::new(1)?),
             )?
-            .observations()
+            .spans()
             .len(),
         1
     );
@@ -72,6 +72,53 @@ fn trace_ingest_fallback_reservation_commits_and_can_be_read_immediately()
         IngestOutcome::Permanent(IngestFailureCode::IdempotencyConflict)
     );
     assert_eq!(ledger.snapshot()?.blocks().len(), 1);
+    Ok(())
+}
+
+#[test]
+fn normal_trace_read_coalesces_ingest_retries_and_retains_conflicts()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = fixture()?;
+    let catalog = Catalog::open(
+        &fixture.authority,
+        InstanceId::new([0xb6; 16])?,
+        CatalogSecret::from_owned(Box::new([0xb7; 32]), Box::new([0xb8; 32])),
+    )?;
+    let shard = VirtualShardId::new(113)?;
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
+        &fixture.authority,
+        &fixture.retention_time,
+        &catalog,
+        SegmentScope::new(fixture.tenant, SignalKind::Traces, shard),
+        SegmentProtectionKey::from_owned(Box::new([0xb9; 32])),
+    )?;
+    let ingest = TraceIngest::new(&fixture.authority, &ledger, fixture.tenant, shard);
+    for (name, identity) in [
+        ("retry", [0xba; 16]),
+        ("retry", [0xbb; 16]),
+        ("conflict", [0xbc; 16]),
+    ] {
+        assert!(matches!(
+            ingest.accept(trace_batch(name), StoreBlockIdentity::new(identity)?),
+            IngestOutcome::Full(_)
+        ));
+    }
+
+    let result = TraceStore::new().scan(
+        fixture.authority.governor(),
+        fixture.tenant,
+        &ledger.snapshot()?,
+        TraceScan::all(ScanLimit::new(3)?),
+    )?;
+    assert!(result.complete());
+    assert_eq!(result.decoded_observations(), 3);
+    assert_eq!(result.spans().len(), 1);
+    let span = result.spans().first().ok_or("logical span")?;
+    assert_eq!(span.observation_count(), 3);
+    assert!(span.conflicted());
+    assert_eq!(span.variants().len(), 2);
+    assert_eq!(span.variants()[0].observation_count(), 2);
+    assert_eq!(span.variants()[1].observation_count(), 1);
     Ok(())
 }
 

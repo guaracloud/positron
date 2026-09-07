@@ -20,11 +20,12 @@ pub use log_store::{
     SchemaTraversalFailure, SchemaValue, StoredLogAttribute, StoredLogRecord, TextSearchCandidate,
 };
 pub use trace_store::{
-    EvaluatedSpanObservationInput, PreparedTraceBlock, SamplingDecision, ScannedSpanObservation,
-    SpanAttributeSet, SpanEvent, SpanKind, SpanLink, SpanObservation, SpanObservationDetails,
-    SpanObservationDetailsInput, SpanResourceMetadata, SpanScopeMetadata, SpanStatus,
-    SpanStatusCode, StoredSpanObservation, TraceIncompleteness, TraceScan, TraceScanResult,
-    TraceStore, TraceStoreFailure, TraceStoreFailureCode,
+    EvaluatedSpanObservationInput, LogicalSpan, LogicalTraceScanResult, PreparedTraceBlock,
+    SamplingDecision, ScannedSpanObservation, SpanAttributeSet, SpanEvent, SpanKind, SpanLink,
+    SpanObservation, SpanObservationDetails, SpanObservationDetailsInput, SpanObservationVariant,
+    SpanResourceMetadata, SpanScopeMetadata, SpanStatus, SpanStatusCode, StoredSpanObservation,
+    TraceIncompleteness, TraceScan, TraceScanResult, TraceStore, TraceStoreFailure,
+    TraceStoreFailureCode,
 };
 
 #[cfg(fuzzing)]
