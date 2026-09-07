@@ -355,6 +355,132 @@ fn public_trace_store_round_trip_preserves_markers_in_span_event_and_link_detail
 }
 
 #[test]
+fn summary_maintenance_keeps_retained_event_and_link_values_untruncated()
+-> Result<(), Box<dyn Error>> {
+    let profile = TraceStore::value_limit_profile();
+    let event_attributes = SpanAttributeSet::checked_with_profile(
+        "retained-event".to_owned(),
+        vec![CandidateAttributeValue::array(vec![
+            CandidateAttributeValue::string("visible".to_owned()),
+            CandidateAttributeValue::key_value_list(vec![CandidateKeyValue::new(
+                "nested".to_owned(),
+                CandidateAttributeValue::string("still-visible".to_owned()),
+            )]),
+        ])],
+        &profile,
+    )?;
+    let link_attributes = SpanAttributeSet::checked_with_profile(
+        "retained-link".to_owned(),
+        vec![CandidateAttributeValue::key_value_list(vec![
+            CandidateKeyValue::new(
+                "nested".to_owned(),
+                CandidateAttributeValue::array(vec![CandidateAttributeValue::string(
+                    "still-visible".to_owned(),
+                )]),
+            ),
+        ])],
+        &profile,
+    )?;
+    let details = SpanObservationDetails::checked_with_profile(
+        SpanObservationDetailsInput {
+            trace_state: String::new(),
+            flags: 0,
+            status: SpanStatus::checked(SpanStatusCode::Unset, String::new())?,
+            events: vec![SpanEvent::checked_with_profile(
+                EventTime::missing(),
+                "retained-event".to_owned(),
+                vec![event_attributes],
+                0,
+                &profile,
+            )?],
+            links: vec![SpanLink::checked_with_profile(
+                [0x83; 16],
+                [0x84; 8],
+                String::new(),
+                0,
+                vec![link_attributes],
+                0,
+                &profile,
+            )?],
+            dropped_attributes_count: 0,
+            dropped_events_count: 0,
+            dropped_links_count: 0,
+            resource: SpanResourceMetadata::checked(0, String::new())?,
+            scope: SpanScopeMetadata::checked(String::new(), String::new(), 0, String::new())?,
+        },
+        &profile,
+    )?;
+    let trace = [0x81; 16];
+    let observation = SpanObservation::checked_native_with_details(
+        trace,
+        [0x82; 8],
+        None,
+        "retained-details".to_owned(),
+        EventTime::missing(),
+        EventTime::missing(),
+        Vec::new(),
+        SpanKind::Internal,
+        SamplingDecision::Unknown,
+        positron_policy::PolicyProvenance::new(16, [0x85; 32], Vec::new())?,
+        details,
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let shard = VirtualShardId::new(75)?;
+    let root = TemporaryRoot::new()?;
+    let authority = establish_kernel_authority(PrimaryDataVolume::acquire(
+        root.path(),
+        MountQualification::LocalHost,
+    )?)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x1b; 16])?,
+        CatalogSecret::from_owned(Box::new([0x2b; 32]), Box::new([0x3b; 32])),
+    )?;
+    let scope = SegmentScope::new(tenant, SignalKind::Traces, shard);
+    let ledger = ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        scope,
+        SegmentProtectionKey::from_owned(Box::new([0x5b; 32])),
+    )?;
+    let store = TraceStore::new();
+    ledger.append(
+        store
+            .prepare_unretained_for_test(
+                preparation_capacity(&authority, tenant)?,
+                &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
+                tenant,
+                shard,
+                positron_kernel::StoreBlockIdentity::new([0x6b; 16])?,
+                vec![observation],
+            )?
+            .into_store_block(),
+    )?;
+    let mut maintainer = TraceSummaryMaintainer::new(
+        authority.governor(),
+        scope,
+        TraceQuietPeriod::new(5)?,
+        ScanLimit::new(1)?,
+    )?;
+    let maintenance = maintainer.maintain(
+        &store,
+        &ledger.snapshot()?,
+        &NeverCancelled,
+        &NeverObserved,
+        &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
+    )?;
+    assert_eq!(maintenance.applied_observations(), 1);
+    assert!(
+        !maintenance
+            .summary(trace)
+            .ok_or("missing retained-details summary")?
+            .truncated(),
+        "retained event and link values must not create a truncation quality flag"
+    );
+    Ok(())
+}
+
+#[test]
 fn public_trace_store_reopen_preserves_scalar_marker_kinds_and_actions()
 -> Result<(), Box<dyn Error>> {
     let profile = TraceStore::value_limit_profile();
