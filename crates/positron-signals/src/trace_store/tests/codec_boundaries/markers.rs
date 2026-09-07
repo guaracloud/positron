@@ -139,6 +139,78 @@ fn public_trace_store_round_trip_preserves_markers_in_span_event_and_link_detail
             details,
         },
     )?;
+    let root_truncated = SpanObservation::checked_native(
+        [0x63; 16],
+        [0x64; 8],
+        None,
+        "root-truncated-span".to_owned(),
+        EventTime::missing(),
+        EventTime::missing(),
+        vec![
+            AttributeOccurrenceSetCandidate::new(
+                AttributeNamespace::Record,
+                "visible-before-marker".to_owned(),
+                vec![CandidateAttributeValue::string("retained".to_owned())],
+            )
+            .validate(profile)?,
+            AttributeOccurrenceSetCandidate::new(
+                AttributeNamespace::Record,
+                "root-truncated".to_owned(),
+                vec![CandidateAttributeValue::truncated(
+                    CandidateAttributeValue::string("retained-root".to_owned()),
+                    MarkerAction::TruncatedBytes,
+                )],
+            )
+            .validate(profile)?,
+        ],
+        SpanKind::Internal,
+        SamplingDecision::Unknown,
+        positron_policy::PolicyProvenance::new(1, [0x65; 32], Vec::new())?,
+    )?;
+    let link_only_attribute = SpanAttributeSet::checked_with_profile(
+        "link-only-truncated".to_owned(),
+        vec![CandidateAttributeValue::truncated(
+            CandidateAttributeValue::string("retained-link".to_owned()),
+            MarkerAction::TruncatedBytes,
+        )],
+        &profile,
+    )?;
+    let link_only_details = SpanObservationDetails::checked_with_profile(
+        SpanObservationDetailsInput {
+            trace_state: String::new(),
+            flags: 0,
+            status: SpanStatus::checked(SpanStatusCode::Unset, String::new())?,
+            events: Vec::new(),
+            links: vec![SpanLink::checked_with_profile(
+                [0x67; 16],
+                [0x68; 8],
+                String::new(),
+                0,
+                vec![link_only_attribute],
+                0,
+                &profile,
+            )?],
+            dropped_attributes_count: 0,
+            dropped_events_count: 0,
+            dropped_links_count: 0,
+            resource: SpanResourceMetadata::checked(0, String::new())?,
+            scope: SpanScopeMetadata::checked(String::new(), String::new(), 0, String::new())?,
+        },
+        &profile,
+    )?;
+    let link_truncated = SpanObservation::checked_native_with_details(
+        [0x66; 16],
+        [0x69; 8],
+        None,
+        "link-truncated-span".to_owned(),
+        EventTime::missing(),
+        EventTime::missing(),
+        Vec::new(),
+        SpanKind::Internal,
+        SamplingDecision::Unknown,
+        positron_policy::PolicyProvenance::new(1, [0x6a; 32], Vec::new())?,
+        link_only_details,
+    )?;
     let tenant = TenantId::from_bytes([0x41; 16])?;
     let shard = VirtualShardId::new(72)?;
     let root = TemporaryRoot::new()?;
@@ -164,7 +236,7 @@ fn public_trace_store_round_trip_preserves_markers_in_span_event_and_link_detail
                 tenant,
                 shard,
                 positron_kernel::StoreBlockIdentity::new([0x69; 16])?,
-                vec![observation.clone()],
+                vec![observation.clone(), root_truncated, link_truncated],
             )?
             .into_store_block(),
     )?;
@@ -249,7 +321,7 @@ fn public_trace_store_round_trip_preserves_markers_in_span_event_and_link_detail
         authority.governor(),
         SegmentScope::new(tenant, SignalKind::Traces, shard),
         TraceQuietPeriod::new(5)?,
-        ScanLimit::new(1)?,
+        ScanLimit::new(3)?,
     )?;
     let maintenance = maintainer.maintain(
         &store,
@@ -264,6 +336,20 @@ fn public_trace_store_round_trip_preserves_markers_in_span_event_and_link_detail
             .ok_or("missing marker-bearing summary")?
             .truncated(),
         "a retained truncation marker must propagate to its trace summary"
+    );
+    assert!(
+        maintenance
+            .summary([0x63; 16])
+            .ok_or("missing root-marker summary")?
+            .truncated(),
+        "a root marker after an ordinary payload must propagate to its trace summary"
+    );
+    assert!(
+        maintenance
+            .summary([0x66; 16])
+            .ok_or("missing link-marker summary")?
+            .truncated(),
+        "a link-only marker must propagate to its trace summary"
     );
     Ok(())
 }

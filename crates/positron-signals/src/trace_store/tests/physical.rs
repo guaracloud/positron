@@ -395,8 +395,8 @@ fn summary_maintenance_applies_committed_deltas_quiesces_and_reopens_after_resta
     };
     let store = TraceStore::new();
     let original = observation("original", [0xa8; 8])?;
-    let conflict = observation("conflict", [0xa8; 8])?;
-    ledger.append(
+    let conflict = observation("conflict-with-longer-name", [0xa8; 8])?;
+    let initial_receipt = ledger.append(
         store
             .prepare_unretained_for_test(
                 preparation_capacity(&authority, tenant)?,
@@ -477,6 +477,7 @@ fn summary_maintenance_applies_committed_deltas_quiesces_and_reopens_after_resta
         assert!(first.complete());
         assert_eq!(first.incompleteness(), TraceIncompleteness::None);
         let summary = first.summary(trace).ok_or("summary is present")?;
+        assert_eq!(summary.trace_id(), trace);
         assert_eq!(summary.observation_count(), 3);
         assert_eq!(summary.logical_span_count(), 1);
         assert_eq!(summary.conflicted_span_count(), 1);
@@ -508,11 +509,30 @@ fn summary_maintenance_applies_committed_deltas_quiesces_and_reopens_after_resta
                 .quiescent()
         );
         assert_eq!(quiesced.applied_observations(), 0);
-        quiesced.coverage()
+        assert!(quiesced.quiescence_complete());
+        let coverage = quiesced.coverage();
+        assert_eq!(
+            coverage.applied_cursor(),
+            Some((
+                initial_receipt.position(),
+                positron_domain::routing::RecordOrdinal::new(2)?,
+            )),
+            "the quiescent result must identify its final applied physical record"
+        );
+        assert!(coverage.physical_complete());
+        assert!(coverage.quiescence_complete());
+        assert_eq!(
+            coverage
+                .quiescence_checked_at()
+                .map(|ingest_time| ingest_time.instant()),
+            Some(UnixNanoseconds::new(105)),
+            "the quiescent result must retain its kernel-assigned check time"
+        );
+        coverage
     };
 
     let stale_snapshot = ledger.snapshot()?;
-    let late = observation("late", [0xaa; 8])?;
+    let late = observation("late", [0xa7; 8])?;
     ledger.append(
         store
             .prepare_unretained_for_test(
@@ -769,6 +789,27 @@ fn summary_maintenance_rejects_a_same_generation_snapshot_with_a_different_ident
     drop(first_snapshot);
     drop(first_ledger);
     drop(first_catalog);
+    Ok(())
+}
+
+#[test]
+fn summary_maintenance_rejects_a_non_trace_scope_at_construction() -> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let authority = establish_kernel_authority(PrimaryDataVolume::acquire(
+        root.path(),
+        MountQualification::LocalHost,
+    )?)?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let failure = match TraceSummaryMaintainer::new(
+        authority.governor(),
+        SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(27)?),
+        TraceQuietPeriod::new(5)?,
+        ScanLimit::new(1)?,
+    ) {
+        Ok(_) => return Err("a trace-summary maintainer accepted a Log Store scope".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(failure.code(), TraceStoreFailureCode::PhysicalScopeMismatch);
     Ok(())
 }
 
