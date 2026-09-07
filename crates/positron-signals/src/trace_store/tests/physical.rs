@@ -1,8 +1,8 @@
 use super::*;
 use crate::{
-    SpanEvent, SpanLink, SpanObservationDetails, SpanResourceMetadata, SpanScopeMetadata,
-    SpanStatus, SpanStatusCode, TraceQuietPeriod, TraceSummaryMaintainer,
-    TraceSummaryTimeProvenance,
+    SpanAttributeSet, SpanEvent, SpanLink, SpanObservationDetails, SpanObservationDetailsInput,
+    SpanResourceMetadata, SpanScopeMetadata, SpanStatus, SpanStatusCode, TraceQuietPeriod,
+    TraceSummaryMaintainer, TraceSummaryTimeProvenance,
 };
 use std::cell::{Cell, RefCell};
 use std::sync::Mutex;
@@ -885,7 +885,7 @@ fn summary_maintenance_rejects_a_lower_catalog_generation_and_retries_current_st
 #[test]
 fn summary_maintenance_retries_every_bounded_work_refusal_without_duplicate_summaries()
 -> Result<(), Box<dyn Error>> {
-    const SWEEP_CEILING: u64 = 64;
+    const SWEEP_CEILING: u64 = 256;
 
     let root = TemporaryRoot::new()?;
     let authority = establish_kernel_authority(PrimaryDataVolume::acquire(
@@ -908,6 +908,57 @@ fn summary_maintenance_retries_every_bounded_work_refusal_without_duplicate_summ
     )?;
     let trace = [0xd1; 16];
     let store = TraceStore::new();
+    let profile = TraceStore::value_limit_profile();
+    let details = SpanObservationDetails::checked_with_profile(
+        SpanObservationDetailsInput {
+            trace_state: String::new(),
+            flags: 0,
+            status: SpanStatus::checked(SpanStatusCode::Unset, String::new())?,
+            events: vec![SpanEvent::checked_with_profile(
+                EventTime::missing(),
+                "retained-event".to_owned(),
+                vec![SpanAttributeSet::checked_with_profile(
+                    "event-values".to_owned(),
+                    vec![CandidateAttributeValue::array(vec![
+                        CandidateAttributeValue::string("event-visible".to_owned()),
+                        CandidateAttributeValue::key_value_list(vec![CandidateKeyValue::new(
+                            "nested".to_owned(),
+                            CandidateAttributeValue::string("still-visible".to_owned()),
+                        )]),
+                    ])],
+                    &profile,
+                )?],
+                0,
+                &profile,
+            )?],
+            links: vec![SpanLink::checked_with_profile(
+                [0xd5; 16],
+                [0xd6; 8],
+                String::new(),
+                0,
+                vec![SpanAttributeSet::checked_with_profile(
+                    "link-values".to_owned(),
+                    vec![CandidateAttributeValue::key_value_list(vec![
+                        CandidateKeyValue::new(
+                            "nested".to_owned(),
+                            CandidateAttributeValue::array(vec![CandidateAttributeValue::string(
+                                "still-visible".to_owned(),
+                            )]),
+                        ),
+                    ])],
+                    &profile,
+                )?],
+                0,
+                &profile,
+            )?],
+            dropped_attributes_count: 0,
+            dropped_events_count: 0,
+            dropped_links_count: 0,
+            resource: SpanResourceMetadata::checked(0, String::new())?,
+            scope: SpanScopeMetadata::checked(String::new(), String::new(), 0, String::new())?,
+        },
+        &profile,
+    )?;
     ledger.append(
         store
             .prepare_unretained_for_test(
@@ -916,7 +967,7 @@ fn summary_maintenance_retries_every_bounded_work_refusal_without_duplicate_summ
                 tenant,
                 shard,
                 positron_kernel::StoreBlockIdentity::new([0xd2; 16])?,
-                vec![SpanObservation::checked_native(
+                vec![SpanObservation::checked_native_with_details(
                     trace,
                     [0xd3; 8],
                     None,
@@ -927,6 +978,7 @@ fn summary_maintenance_retries_every_bounded_work_refusal_without_duplicate_summ
                     SpanKind::Internal,
                     SamplingDecision::Unknown,
                     positron_policy::PolicyProvenance::new(1, [0xd4; 32], Vec::new())?,
+                    details,
                 )?],
             )?
             .into_store_block(),
@@ -948,12 +1000,25 @@ fn summary_maintenance_retries_every_bounded_work_refusal_without_duplicate_summ
             &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
         )?;
         assert_eq!(completed.applied_observations(), 1);
+        let summary = completed
+            .summary(trace)
+            .ok_or("completed maintenance must preserve one trace summary")?;
+        assert_eq!(summary.observation_count(), 1);
+        assert!(
+            !summary.truncated(),
+            "retained event and link values must not create a truncation quality flag"
+        );
     }
-    let allowances = measure.work().min(SWEEP_CEILING);
+    let allowances = measure.work();
     assert!(
         allowances > 0,
         "maintenance must observe bounded public work"
     );
+    assert!(
+        allowances <= SWEEP_CEILING,
+        "the small public detail fixture consumed {allowances} units beyond the explicit bounded sweep ceiling"
+    );
+    let mut saw_refusal = false;
     for allowance in 0..allowances {
         let baseline = authority
             .governor()
@@ -974,9 +1039,20 @@ fn summary_maintenance_retries_every_bounded_work_refusal_without_duplicate_summ
                 &bounded,
                 &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
             ) {
-                Ok(maintenance) => maintenance.applied_observations(),
+                Ok(maintenance) => {
+                    let summary = maintenance
+                        .summary(trace)
+                        .ok_or("completed maintenance must preserve one trace summary")?;
+                    assert_eq!(summary.observation_count(), 1);
+                    assert!(
+                        !summary.truncated(),
+                        "retained event and link values must not create a truncation quality flag"
+                    );
+                    maintenance.applied_observations()
+                },
                 Err(failure) => {
                     assert_eq!(failure.code(), TraceStoreFailureCode::BudgetExhausted);
+                    saw_refusal = true;
                     let retried = maintainer.maintain(
                         &store,
                         &snapshot,
@@ -986,13 +1062,17 @@ fn summary_maintenance_retries_every_bounded_work_refusal_without_duplicate_summ
                             100,
                         ))),
                     )?;
+                    let summary = retried
+                        .summary(trace)
+                        .ok_or("retry must preserve one trace summary")?;
                     assert_eq!(
-                        retried
-                            .summary(trace)
-                            .ok_or("retry must preserve one trace summary")?
-                            .observation_count(),
+                        summary.observation_count(),
                         1,
                         "a bounded refusal must neither skip nor duplicate the physical observation"
+                    );
+                    assert!(
+                        !summary.truncated(),
+                        "a retry must preserve retained-detail quality"
                     );
                     retried.applied_observations()
                 },
@@ -1011,6 +1091,10 @@ fn summary_maintenance_retries_every_bounded_work_refusal_without_duplicate_summ
             "dropping a retried maintenance owner must release its governed capacity"
         );
     }
+    assert!(
+        saw_refusal,
+        "at least one bounded public work allowance must refuse"
+    );
     Ok(())
 }
 
