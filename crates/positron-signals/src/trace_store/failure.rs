@@ -61,11 +61,14 @@ impl TraceStoreFailure {
         Self::rejected(TraceStoreFailureCode::PhysicalScopeMismatch)
     }
 
+    pub(super) const fn stale_generation() -> Self {
+        Self::rejected(TraceStoreFailureCode::StaleGeneration)
+    }
+
     pub(super) const fn resource_exhausted() -> Self {
         Self::rejected(TraceStoreFailureCode::ResourceExhausted)
     }
 
-    #[cfg(any(test, fuzzing))]
     pub(super) const fn rejected_clock() -> Self {
         Self::rejected(TraceStoreFailureCode::ClockUnavailable)
     }

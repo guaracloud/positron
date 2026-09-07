@@ -5,6 +5,19 @@ use crate::{
     TraceSummaryTimeProvenance,
 };
 use std::cell::{Cell, RefCell};
+use std::sync::Mutex;
+
+struct SequenceLifecycleClock(Mutex<Vec<UnixNanoseconds>>);
+
+impl positron_kernel::LifecycleClockSource for SequenceLifecycleClock {
+    fn read(&self) -> Result<UnixNanoseconds, positron_kernel::LifecycleClockFailure> {
+        self.0
+            .lock()
+            .map_err(|_| positron_kernel::LifecycleClockFailure::Unavailable)?
+            .pop()
+            .ok_or(positron_kernel::LifecycleClockFailure::Unavailable)
+    }
+}
 
 struct WorkMeter(Cell<u64>);
 
@@ -15,6 +28,28 @@ impl WorkMeter {
 
     fn work(&self) -> u64 {
         self.0.get()
+    }
+}
+
+struct WorkBudget(Cell<u64>);
+
+impl WorkBudget {
+    const fn exact(work: u64) -> Self {
+        Self(Cell::new(work))
+    }
+}
+
+impl ScanObserver for WorkBudget {
+    fn observe_work(&self, units: u64) -> Result<(), ScanObservationFailureCode> {
+        let Some(remaining) = self.0.get().checked_sub(units) else {
+            return Err(ScanObservationFailureCode::BudgetExhausted);
+        };
+        self.0.set(remaining);
+        Ok(())
+    }
+
+    fn observe_scanned_bytes(&self, _bytes: u64) -> Result<(), ScanObservationFailureCode> {
+        Ok(())
     }
 }
 
@@ -338,7 +373,7 @@ fn summary_maintenance_applies_committed_deltas_quiesces_and_reopens_after_resta
     let quiet_period = TraceQuietPeriod::new(5)?;
     let mut maintainer = TraceSummaryMaintainer::new(
         authority.governor(),
-        tenant,
+        SegmentScope::new(tenant, SignalKind::Traces, shard),
         quiet_period,
         ScanLimit::new(2)?,
     )?;
@@ -347,7 +382,7 @@ fn summary_maintenance_applies_committed_deltas_quiesces_and_reopens_after_resta
         &ledger.snapshot()?,
         &AlwaysCancelled,
         &NeverObserved,
-        UnixNanoseconds::new(104),
+        &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(104))),
     ) {
         Ok(_) => return Err("cancelled maintenance advanced its committed cursor".into()),
         Err(failure) => failure,
@@ -359,7 +394,7 @@ fn summary_maintenance_applies_committed_deltas_quiesces_and_reopens_after_resta
             &ledger.snapshot()?,
             &NeverCancelled,
             &NeverObserved,
-            UnixNanoseconds::new(104),
+            &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(104))),
         )?;
         assert_eq!(first.applied_observations(), 2);
         assert!(!first.complete());
@@ -377,7 +412,7 @@ fn summary_maintenance_applies_committed_deltas_quiesces_and_reopens_after_resta
             &ledger.snapshot()?,
             &NeverCancelled,
             &NeverObserved,
-            UnixNanoseconds::new(104),
+            &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(104))),
         )?;
         assert_eq!(first.applied_observations(), 1);
         assert!(first.complete());
@@ -401,7 +436,7 @@ fn summary_maintenance_applies_committed_deltas_quiesces_and_reopens_after_resta
             &ledger.snapshot()?,
             &NeverCancelled,
             &NeverObserved,
-            UnixNanoseconds::new(105),
+            &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(105))),
         )?;
         assert!(
             quiesced
@@ -412,6 +447,7 @@ fn summary_maintenance_applies_committed_deltas_quiesces_and_reopens_after_resta
         assert_eq!(quiesced.applied_observations(), 0);
     }
 
+    let stale_snapshot = ledger.snapshot()?;
     let late = observation("late", [0xaa; 8])?;
     ledger.append(
         store
@@ -431,7 +467,7 @@ fn summary_maintenance_applies_committed_deltas_quiesces_and_reopens_after_resta
             &ledger.snapshot()?,
             &NeverCancelled,
             &NeverObserved,
-            UnixNanoseconds::new(111),
+            &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(111))),
         )?;
         let reopened_summary = reopened.summary(trace).ok_or("summary is present")?;
         assert_eq!(reopened.applied_observations(), 1);
@@ -443,27 +479,91 @@ fn summary_maintenance_applies_committed_deltas_quiesces_and_reopens_after_resta
             UnixNanoseconds::new(110)
         );
     }
+    let stale = match maintainer.maintain(
+        &store,
+        &stale_snapshot,
+        &NeverCancelled,
+        &NeverObserved,
+        &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(111))),
+    ) {
+        Ok(_) => return Err("a stale snapshot rewound the shard-local summary cursor".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(stale.code(), TraceStoreFailureCode::StaleGeneration);
     drop(maintainer);
 
     let mut recovered = TraceSummaryMaintainer::new(
         authority.governor(),
-        tenant,
+        SegmentScope::new(tenant, SignalKind::Traces, shard),
         quiet_period,
         ScanLimit::new(16)?,
     )?;
-    let replayed = recovered.maintain(
+    {
+        let replayed = recovered.maintain(
+            &store,
+            &ledger.snapshot()?,
+            &NeverCancelled,
+            &NeverObserved,
+            &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(115))),
+        )?;
+        let replayed_summary = replayed
+            .summary(trace)
+            .ok_or("replayed summary is present")?;
+        assert_eq!(replayed.applied_observations(), 4);
+        assert_eq!(replayed_summary.observation_count(), 4);
+        assert!(replayed_summary.quiescent());
+    }
+    let lifecycle_clock = LifecycleClock::new(SequenceLifecycleClock(Mutex::new(vec![
+        UnixNanoseconds::new(100),
+        UnixNanoseconds::new(115),
+    ])));
+    for _ in 0..2 {
+        let maintained = recovered.maintain(
+            &store,
+            &ledger.snapshot()?,
+            &NeverCancelled,
+            &NeverObserved,
+            &lifecycle_clock,
+        )?;
+        assert!(
+            maintained
+                .summary(trace)
+                .ok_or("backward lifecycle observation retained quiescence")?
+                .quiescent()
+        );
+    }
+    let unavailable = match recovered.maintain(
         &store,
         &ledger.snapshot()?,
         &NeverCancelled,
         &NeverObserved,
-        UnixNanoseconds::new(115),
+        &LifecycleClock::new(SequenceLifecycleClock(Mutex::new(Vec::new()))),
+    ) {
+        Ok(_) => return Err("quiescence accepted an unavailable lifecycle clock".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(unavailable.code(), TraceStoreFailureCode::ClockUnavailable);
+    let other_shard = VirtualShardId::new(25)?;
+    let other = ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        SegmentScope::new(tenant, SignalKind::Traces, other_shard),
+        SegmentProtectionKey::from_owned(Box::new([0xac; 32])),
     )?;
-    let replayed_summary = replayed
-        .summary(trace)
-        .ok_or("replayed summary is present")?;
-    assert_eq!(replayed.applied_observations(), 4);
-    assert_eq!(replayed_summary.observation_count(), 4);
-    assert!(replayed_summary.quiescent());
+    let mismatch = match recovered.maintain(
+        &store,
+        &other.snapshot()?,
+        &NeverCancelled,
+        &NeverObserved,
+        &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(115))),
+    ) {
+        Ok(_) => return Err("a shard-local summary cursor scanned another shard".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(
+        mismatch.code(),
+        TraceStoreFailureCode::PhysicalScopeMismatch
+    );
     Ok(())
 }
 
@@ -501,7 +601,7 @@ fn summary_maintenance_refusal_keeps_the_cursor_and_summary_unpublished()
         positron_policy::PolicyProvenance::new(1, [0xb7; 32], Vec::new())?,
     )?;
     let store = TraceStore::new();
-    ledger.append(
+    let receipt = ledger.append(
         store
             .prepare_unretained_for_test(
                 preparation_capacity(&authority, tenant)?,
@@ -526,7 +626,7 @@ fn summary_maintenance_refusal_keeps_the_cursor_and_summary_unpublished()
     drop(scan);
     let mut maintainer = TraceSummaryMaintainer::new(
         authority.governor(),
-        tenant,
+        SegmentScope::new(tenant, SignalKind::Traces, shard),
         TraceQuietPeriod::new(5)?,
         ScanLimit::new(1)?,
     )?;
@@ -543,7 +643,7 @@ fn summary_maintenance_refusal_keeps_the_cursor_and_summary_unpublished()
         &ledger.snapshot()?,
         &NeverCancelled,
         &blocker,
-        UnixNanoseconds::new(100),
+        &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
     ) {
         Ok(_) => return Err("maintenance published a summary after resize refusal".into()),
         Err(failure) => failure,
@@ -554,16 +654,197 @@ fn summary_maintenance_refusal_keeps_the_cursor_and_summary_unpublished()
         TraceStoreFailureCode::ResourceAdmissionRefused
     );
     blocker.release();
-    let replay = maintainer.maintain(
+    {
+        let replay = maintainer.maintain(
+            &store,
+            &ledger.snapshot()?,
+            &NeverCancelled,
+            &NeverObserved,
+            &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
+        )?;
+        assert_eq!(replay.applied_observations(), 1);
+        let summary = replay.summary(trace).ok_or("retry publishes the trace")?;
+        assert_eq!(summary.observation_count(), 1);
+    }
+    let scan_work = WorkMeter::new();
+    let no_delta_scan = store.scan_physical_observed(
+        authority.governor(),
+        tenant,
+        &ledger.snapshot()?,
+        TraceScan::after_cursor(
+            ScanLimit::new(1)?,
+            receipt.position(),
+            positron_domain::routing::RecordOrdinal::new(0)?,
+        ),
+        &NeverCancelled,
+        &scan_work,
+    )?;
+    assert!(no_delta_scan.observations().is_empty());
+    drop(no_delta_scan);
+    let exhausted = match maintainer.maintain(
         &store,
         &ledger.snapshot()?,
         &NeverCancelled,
-        &NeverObserved,
-        UnixNanoseconds::new(100),
+        &WorkBudget::exact(scan_work.work()),
+        &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(105))),
+    ) {
+        Ok(_) => return Err("quiescence traversal bypassed the work budget".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(exhausted.code(), TraceStoreFailureCode::BudgetExhausted);
+    Ok(())
+}
+
+#[test]
+fn summary_maintenance_large_semantic_update_is_budgeted_and_retries_from_the_prior_cursor()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0xbc; 16])?,
+        CatalogSecret::from_owned(Box::new([0xbd; 32]), Box::new([0xbe; 32])),
     )?;
-    assert_eq!(replay.applied_observations(), 1);
-    let summary = replay.summary(trace).ok_or("retry publishes the trace")?;
-    assert_eq!(summary.observation_count(), 1);
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let shard = VirtualShardId::new(26)?;
+    let ledger = ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        SegmentScope::new(tenant, SignalKind::Traces, shard),
+        SegmentProtectionKey::from_owned(Box::new([0xbf; 32])),
+    )?;
+    let trace = [0xc0; 16];
+    let observation = |prefix: char| {
+        SpanObservation::checked_native(
+            trace,
+            [0xc1; 8],
+            None,
+            format!("{prefix}{}", "x".repeat(32_767)),
+            EventTime::missing(),
+            EventTime::missing(),
+            Vec::new(),
+            SpanKind::Internal,
+            SamplingDecision::Unknown,
+            positron_policy::PolicyProvenance::new(1, [0xc2; 32], Vec::new())?,
+        )
+    };
+    let store = TraceStore::new();
+    let first = ledger.append(
+        store
+            .prepare_unretained_for_test(
+                preparation_capacity(&authority, tenant)?,
+                &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
+                tenant,
+                shard,
+                positron_kernel::StoreBlockIdentity::new([0xc3; 16])?,
+                vec![observation('a')?],
+            )?
+            .into_store_block(),
+    )?;
+    let mut maintainer = TraceSummaryMaintainer::new(
+        authority.governor(),
+        SegmentScope::new(tenant, SignalKind::Traces, shard),
+        TraceQuietPeriod::new(5)?,
+        ScanLimit::new(1)?,
+    )?;
+    {
+        let initial = maintainer.maintain(
+            &store,
+            &ledger.snapshot()?,
+            &NeverCancelled,
+            &NeverObserved,
+            &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
+        )?;
+        assert_eq!(initial.applied_observations(), 1);
+        assert_eq!(
+            initial
+                .summary(trace)
+                .ok_or("initial large summary is present")?
+                .observation_count(),
+            1
+        );
+    }
+    let second = observation('b')?;
+    ledger.append(
+        store
+            .prepare_unretained_for_test(
+                preparation_capacity(&authority, tenant)?,
+                &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(101))),
+                tenant,
+                shard,
+                positron_kernel::StoreBlockIdentity::new([0xc4; 16])?,
+                vec![second.clone()],
+            )?
+            .into_store_block(),
+    )?;
+    let physical_work = WorkMeter::new();
+    let physical = store.scan_physical_observed(
+        authority.governor(),
+        tenant,
+        &ledger.snapshot()?,
+        TraceScan::after_cursor(
+            ScanLimit::new(1)?,
+            first.position(),
+            positron_domain::routing::RecordOrdinal::new(0)?,
+        ),
+        &NeverCancelled,
+        &physical_work,
+    )?;
+    assert_eq!(physical.observations().len(), 1);
+    drop(physical);
+    let semantic_work = WorkMeter::new();
+    let profile = ValueLimitProfile::release_1_system_maximum();
+    let semantic_bytes = super::codec::encoded_record_bytes_with_profile_observed(
+        &profile,
+        &second,
+        &NeverCancelled,
+        &semantic_work,
+    )?
+    .checked_sub(8)
+    .ok_or("semantic bytes omit the ingest time")?;
+    drop(
+        super::codec::encode_semantic_observation_with_profile_observed(
+            &profile,
+            &second,
+            semantic_bytes,
+            &NeverCancelled,
+            &semantic_work,
+        )?,
+    );
+    let retained_copy_boundary = physical_work
+        .work()
+        .checked_add(semantic_work.work())
+        .and_then(|work| work.checked_add(4))
+        .ok_or("large maintenance work boundary overflow")?;
+    let exhausted = match maintainer.maintain(
+        &store,
+        &ledger.snapshot()?,
+        &NeverCancelled,
+        // The physical scan, semantic sizing/encoding, handler, summary search,
+        // and clone's span/variant entries fit. The first 4KiB retained-byte copy
+        // must be observed before it can proceed.
+        &WorkBudget::exact(retained_copy_boundary),
+        &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(101))),
+    ) {
+        Ok(_) => return Err("large summary work bypassed the maintenance budget".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(exhausted.code(), TraceStoreFailureCode::BudgetExhausted);
+    {
+        let retried = maintainer.maintain(
+            &store,
+            &ledger.snapshot()?,
+            &NeverCancelled,
+            &NeverObserved,
+            &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(101))),
+        )?;
+        assert_eq!(retried.applied_observations(), 1);
+        let summary = retried.summary(trace).ok_or("retry publishes the update")?;
+        assert_eq!(summary.observation_count(), 2);
+        assert_eq!(summary.logical_span_count(), 1);
+        assert_eq!(summary.conflicted_span_count(), 1);
+    }
     Ok(())
 }
 
