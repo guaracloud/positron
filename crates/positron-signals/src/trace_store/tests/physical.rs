@@ -33,6 +33,44 @@ impl WorkMeter {
 
 struct WorkBudget(Cell<u64>);
 
+struct MaintenanceAdmissionObserver<'authority> {
+    governor: positron_kernel::ResourceGovernor<'authority>,
+    interactive_baseline: u32,
+    maintenance_baseline: u32,
+    observed_maintenance_claim: Cell<bool>,
+    observed_interactive: Cell<u32>,
+    observed_maintenance: Cell<u32>,
+}
+
+impl MaintenanceAdmissionObserver<'_> {
+    fn observed_maintenance_claim(&self) -> bool {
+        self.observed_maintenance_claim.get()
+    }
+}
+
+impl ScanObserver for MaintenanceAdmissionObserver<'_> {
+    fn observe_work(&self, _units: u64) -> Result<(), ScanObservationFailureCode> {
+        Ok(())
+    }
+
+    fn observe_scanned_bytes(&self, _bytes: u64) -> Result<(), ScanObservationFailureCode> {
+        let inspection = self
+            .governor
+            .inspect()
+            .map_err(|_| ScanObservationFailureCode::BudgetExhausted)?;
+        let interactive =
+            inspection.outstanding_for(positron_kernel::WorkClass::InteractiveQueryTail);
+        let maintenance =
+            inspection.outstanding_for(positron_kernel::WorkClass::OrdinaryMaintenanceBackup);
+        self.observed_interactive.set(interactive);
+        self.observed_maintenance.set(maintenance);
+        self.observed_maintenance_claim.set(
+            interactive == self.interactive_baseline && maintenance > self.maintenance_baseline,
+        );
+        Ok(())
+    }
+}
+
 impl WorkBudget {
     const fn exact(work: u64) -> Self {
         Self(Cell::new(work))
@@ -377,6 +415,18 @@ fn summary_maintenance_applies_committed_deltas_quiesces_and_reopens_after_resta
         quiet_period,
         ScanLimit::new(2)?,
     )?;
+    let maintenance_snapshot = ledger.snapshot()?;
+    let inspection = authority.governor().inspect()?;
+    let maintenance_observer = MaintenanceAdmissionObserver {
+        governor: authority.governor(),
+        interactive_baseline: inspection
+            .outstanding_for(positron_kernel::WorkClass::InteractiveQueryTail),
+        maintenance_baseline: inspection
+            .outstanding_for(positron_kernel::WorkClass::OrdinaryMaintenanceBackup),
+        observed_maintenance_claim: Cell::new(false),
+        observed_interactive: Cell::new(0),
+        observed_maintenance: Cell::new(0),
+    };
     let cancelled = match maintainer.maintain(
         &store,
         &ledger.snapshot()?,
@@ -391,9 +441,9 @@ fn summary_maintenance_applies_committed_deltas_quiesces_and_reopens_after_resta
     {
         let first = maintainer.maintain(
             &store,
-            &ledger.snapshot()?,
+            &maintenance_snapshot,
             &NeverCancelled,
-            &NeverObserved,
+            &maintenance_observer,
             &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(104))),
         )?;
         assert_eq!(first.applied_observations(), 2);
@@ -405,7 +455,16 @@ fn summary_maintenance_applies_committed_deltas_quiesces_and_reopens_after_resta
                 .ok_or("partial summary is present")?
                 .quiescent()
         );
+        assert!(
+            maintenance_observer.observed_maintenance_claim(),
+            "summary replay class mismatch: interactive {} (baseline {}), maintenance {} (baseline {})",
+            maintenance_observer.observed_interactive.get(),
+            maintenance_observer.interactive_baseline,
+            maintenance_observer.observed_maintenance.get(),
+            maintenance_observer.maintenance_baseline,
+        );
     }
+    drop(maintenance_snapshot);
     {
         let first = maintainer.maintain(
             &store,
@@ -845,6 +904,246 @@ fn summary_maintenance_large_semantic_update_is_budgeted_and_retries_from_the_pr
         assert_eq!(summary.logical_span_count(), 1);
         assert_eq!(summary.conflicted_span_count(), 1);
     }
+    Ok(())
+}
+
+#[test]
+fn summary_maintenance_continues_across_a_newer_authenticated_catalog_generation()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0xd3; 16])?,
+        CatalogSecret::from_owned(Box::new([0xd4; 32]), Box::new([0xd5; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let shard = VirtualShardId::new(28)?;
+    let scope = SegmentScope::new(tenant, SignalKind::Traces, shard);
+    let ledger = ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        scope,
+        SegmentProtectionKey::from_owned(Box::new([0xd6; 32])),
+    )?;
+    let trace = [0xd7; 16];
+    let observation = SpanObservation::checked_native(
+        trace,
+        [0xd8; 8],
+        None,
+        "catalog-rotation".to_owned(),
+        EventTime::missing(),
+        EventTime::missing(),
+        Vec::new(),
+        SpanKind::Internal,
+        SamplingDecision::Unknown,
+        positron_policy::PolicyProvenance::new(1, [0xd9; 32], Vec::new())?,
+    )?;
+    let store = TraceStore::new();
+    ledger.append(
+        store
+            .prepare_unretained_for_test(
+                preparation_capacity(&authority, tenant)?,
+                &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
+                tenant,
+                shard,
+                positron_kernel::StoreBlockIdentity::new([0xda; 16])?,
+                vec![observation],
+            )?
+            .into_store_block(),
+    )?;
+    let first_snapshot = ledger.snapshot()?;
+    let first_generation = first_snapshot.catalog_generation();
+    let mut maintainer = TraceSummaryMaintainer::new(
+        authority.governor(),
+        scope,
+        TraceQuietPeriod::new(5)?,
+        ScanLimit::new(8)?,
+    )?;
+    {
+        let initial = maintainer.maintain(
+            &store,
+            &first_snapshot,
+            &NeverCancelled,
+            &NeverObserved,
+            &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
+        )?;
+        assert_eq!(initial.applied_observations(), 1);
+    }
+    drop(first_snapshot);
+    ledger.seal()?;
+    let reopened = ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        scope,
+        SegmentProtectionKey::from_owned(Box::new([0xd6; 32])),
+    )?;
+    let rotated_snapshot = reopened.snapshot()?;
+    assert!(rotated_snapshot.catalog_generation() > first_generation);
+    let continued = maintainer.maintain(
+        &store,
+        &rotated_snapshot,
+        &NeverCancelled,
+        &NeverObserved,
+        &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(105))),
+    )?;
+    assert_eq!(continued.applied_observations(), 0);
+    assert!(
+        continued
+            .summary(trace)
+            .ok_or("summary survives the catalog generation transition")?
+            .quiescent()
+    );
+    Ok(())
+}
+
+#[test]
+fn summary_maintenance_budgets_the_prior_summary_during_a_replacement_peak()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0xdb; 16])?,
+        CatalogSecret::from_owned(Box::new([0xdc; 32]), Box::new([0xdd; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let shard = VirtualShardId::new(29)?;
+    let ledger = ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        SegmentScope::new(tenant, SignalKind::Traces, shard),
+        SegmentProtectionKey::from_owned(Box::new([0xde; 32])),
+    )?;
+    let trace = [0xdf; 16];
+    let observation = |prefix: char| {
+        SpanObservation::checked_native(
+            trace,
+            [0xe0; 8],
+            None,
+            format!("{prefix}{}", "x".repeat(32_767)),
+            EventTime::missing(),
+            EventTime::missing(),
+            Vec::new(),
+            SpanKind::Internal,
+            SamplingDecision::Unknown,
+            positron_policy::PolicyProvenance::new(1, [0xe1; 32], Vec::new())?,
+        )
+    };
+    let store = TraceStore::new();
+    let first = ledger.append(
+        store
+            .prepare_unretained_for_test(
+                preparation_capacity(&authority, tenant)?,
+                &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
+                tenant,
+                shard,
+                positron_kernel::StoreBlockIdentity::new([0xe2; 16])?,
+                vec![observation('a')?],
+            )?
+            .into_store_block(),
+    )?;
+    let mut maintainer = TraceSummaryMaintainer::new(
+        authority.governor(),
+        SegmentScope::new(tenant, SignalKind::Traces, shard),
+        TraceQuietPeriod::new(5)?,
+        ScanLimit::new(1)?,
+    )?;
+    {
+        let initial = maintainer.maintain(
+            &store,
+            &ledger.snapshot()?,
+            &NeverCancelled,
+            &NeverObserved,
+            &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
+        )?;
+        assert_eq!(initial.applied_observations(), 1);
+    }
+    let replacement = observation('b')?;
+    ledger.append(
+        store
+            .prepare_unretained_for_test(
+                preparation_capacity(&authority, tenant)?,
+                &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(101))),
+                tenant,
+                shard,
+                positron_kernel::StoreBlockIdentity::new([0xe3; 16])?,
+                vec![replacement.clone(), observation('c')?],
+            )?
+            .into_store_block(),
+    )?;
+    let physical_work = WorkMeter::new();
+    let physical = store.scan_physical_observed(
+        authority.governor(),
+        tenant,
+        &ledger.snapshot()?,
+        TraceScan::after_cursor(
+            ScanLimit::new(1)?,
+            first.position(),
+            positron_domain::routing::RecordOrdinal::new(0)?,
+        ),
+        &NeverCancelled,
+        &physical_work,
+    )?;
+    assert_eq!(physical.observations().len(), 1);
+    assert!(!physical.complete());
+    drop(physical);
+    let semantic_work = WorkMeter::new();
+    let profile = ValueLimitProfile::release_1_system_maximum();
+    let semantic_bytes = super::codec::encoded_record_bytes_with_profile_observed(
+        &profile,
+        &replacement,
+        &NeverCancelled,
+        &semantic_work,
+    )?
+    .checked_sub(8)
+    .ok_or("semantic bytes omit the ingest time")?;
+    drop(
+        super::codec::encode_semantic_observation_with_profile_observed(
+            &profile,
+            &replacement,
+            semantic_bytes,
+            &NeverCancelled,
+            &semantic_work,
+        )?,
+    );
+    let new_summary_boundary = physical_work
+        .work()
+        .checked_add(semantic_work.work())
+        // Handler, trace lookup, two old-summary copies, span lookup, and
+        // semantic comparison consume 25 units. The new two-variant summary
+        // and physical admission checks consume six more. The retained prior
+        // summary must still be observed before its rollback copy can drop.
+        .and_then(|work| work.checked_add(31))
+        .ok_or("replacement peak work boundary overflow")?;
+    let exhausted = match maintainer.maintain(
+        &store,
+        &ledger.snapshot()?,
+        &NeverCancelled,
+        &WorkBudget::exact(new_summary_boundary),
+        &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(101))),
+    ) {
+        Ok(_) => return Err("replacement peak omitted the retained prior summary".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(exhausted.code(), TraceStoreFailureCode::BudgetExhausted);
+    let retried = maintainer.maintain(
+        &store,
+        &ledger.snapshot()?,
+        &NeverCancelled,
+        &NeverObserved,
+        &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(101))),
+    )?;
+    assert_eq!(retried.applied_observations(), 1);
+    assert_eq!(
+        retried
+            .summary(trace)
+            .ok_or("retry retains the replacement trace")?
+            .observation_count(),
+        2
+    );
     Ok(())
 }
 

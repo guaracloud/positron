@@ -432,6 +432,52 @@ impl super::TraceStore {
         cancellation: &dyn ScanCancellation,
         observer: &dyn ScanObserver,
     ) -> Result<TraceScanResult<'kernel>, TraceStoreFailure> {
+        self.scan_physical_observed_with_profile_and_work_kind(
+            profile,
+            governor,
+            tenant,
+            snapshot,
+            scan,
+            cancellation,
+            observer,
+            WorkKind::InteractiveQueryTail,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn scan_physical_observed_for_maintenance<'kernel>(
+        &self,
+        governor: ResourceGovernor<'kernel>,
+        tenant: TenantId,
+        snapshot: &LedgerSnapshot<'_>,
+        scan: TraceScan,
+        cancellation: &dyn ScanCancellation,
+        observer: &dyn ScanObserver,
+    ) -> Result<TraceScanResult<'kernel>, TraceStoreFailure> {
+        self.scan_physical_observed_with_profile_and_work_kind(
+            &ValueLimitProfile::release_1_system_maximum(),
+            governor,
+            tenant,
+            snapshot,
+            scan,
+            cancellation,
+            observer,
+            WorkKind::OrdinaryMaintenanceBackup,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn scan_physical_observed_with_profile_and_work_kind<'kernel>(
+        &self,
+        profile: &ValueLimitProfile,
+        governor: ResourceGovernor<'kernel>,
+        tenant: TenantId,
+        snapshot: &LedgerSnapshot<'_>,
+        scan: TraceScan,
+        cancellation: &dyn ScanCancellation,
+        observer: &dyn ScanObserver,
+        work_kind: WorkKind,
+    ) -> Result<TraceScanResult<'kernel>, TraceStoreFailure> {
         let scope = snapshot.scope();
         if scope.tenant_id() != tenant || scope.signal_kind() != SignalKind::Traces {
             return Err(TraceStoreFailure::physical_scope_mismatch());
@@ -444,7 +490,7 @@ impl super::TraceStore {
         let memory = output_memory.max(1);
         let amounts = ResourceAmounts::only(ResourceDimension::MemoryBytes, memory)
             .map_err(|_| TraceStoreFailure::limit_exceeded())?;
-        let claim = WorkClaim::tenant(tenant, WorkKind::InteractiveQueryTail, amounts)
+        let claim = WorkClaim::tenant(tenant, work_kind, amounts)
             .map_err(|_| TraceStoreFailure::limit_exceeded())?;
         let mut capacity = governor
             .reserve(claim)

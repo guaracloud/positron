@@ -143,7 +143,7 @@ pub struct TraceSummaryMaintainer<'kernel> {
     limit: ScanLimit,
     summaries: Vec<TraceSummary>,
     cursor: Option<(CommitPosition, RecordOrdinal)>,
-    catalog_identity: Option<positron_kernel::CatalogGenerationId>,
+    catalog_generation: Option<u64>,
     capacity: ResourceReservation<'kernel>,
 }
 
@@ -175,7 +175,7 @@ impl<'kernel> TraceSummaryMaintainer<'kernel> {
             limit,
             summaries: Vec::new(),
             cursor: None,
-            catalog_identity: None,
+            catalog_generation: None,
             capacity,
         })
     }
@@ -195,7 +195,7 @@ impl<'kernel> TraceSummaryMaintainer<'kernel> {
             },
             None => super::TraceScan::all(self.limit),
         };
-        let result = store.scan_physical_observed(
+        let result = store.scan_physical_observed_for_maintenance(
             self.governor,
             self.scope.tenant_id(),
             snapshot,
@@ -275,7 +275,7 @@ impl<'kernel> TraceSummaryMaintainer<'kernel> {
                 .map_err(|_| TraceStoreFailure::resource_exhausted())?;
             self.summaries.insert(update.index, update.updated);
         }
-        if let Err(failure) = self.resize_capacity(cancellation, observer) {
+        if let Err(failure) = self.resize_capacity(update.prior.as_ref(), cancellation, observer) {
             if let Some(prior) = update.prior {
                 let slot = self
                     .summaries
@@ -325,16 +325,14 @@ impl<'kernel> TraceSummaryMaintainer<'kernel> {
         {
             return Err(TraceStoreFailure::stale_generation());
         }
-        match self.catalog_identity {
-            Some(identity) if identity != snapshot.catalog_identity() => {
-                Err(TraceStoreFailure::stale_generation())
-            },
-            Some(_) => Ok(()),
-            None => {
-                self.catalog_identity = Some(snapshot.catalog_identity());
-                Ok(())
-            },
+        if self
+            .catalog_generation
+            .is_some_and(|generation| snapshot.catalog_generation() < generation)
+        {
+            return Err(TraceStoreFailure::stale_generation());
         }
+        self.catalog_generation = Some(snapshot.catalog_generation());
+        Ok(())
     }
 
     fn find(&self, trace_id: [u8; 16]) -> Result<usize, usize> {
@@ -343,6 +341,7 @@ impl<'kernel> TraceSummaryMaintainer<'kernel> {
 
     fn resize_capacity(
         &mut self,
+        rollback: Option<&TraceSummary>,
         cancellation: &dyn ScanCancellation,
         observer: &dyn ScanObserver,
     ) -> Result<(), TraceStoreFailure> {
@@ -386,6 +385,11 @@ impl<'kernel> TraceSummaryMaintainer<'kernel> {
                 }
             }
         }
+        if let Some(rollback) = rollback {
+            bytes = bytes
+                .checked_add(summary_capacity_bytes(rollback, cancellation, observer)?)
+                .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+        }
         let bytes = bytes.max(1);
         let amounts = ResourceAmounts::only(ResourceDimension::MemoryBytes, bytes)
             .map_err(|_| TraceStoreFailure::limit_exceeded())?;
@@ -417,6 +421,46 @@ impl<'kernel> TraceSummaryMaintainer<'kernel> {
             .map_err(|_| TraceStoreFailure::resource_admission_refused())
             .map(|_| ())
     }
+}
+
+fn summary_capacity_bytes(
+    summary: &TraceSummary,
+    cancellation: &dyn ScanCancellation,
+    observer: &dyn ScanObserver,
+) -> Result<u64, TraceStoreFailure> {
+    let mut bytes = u64::try_from(std::mem::size_of::<TraceSummary>())
+        .map_err(|_| TraceStoreFailure::limit_exceeded())?;
+    bytes = bytes
+        .checked_add(checked_bytes(
+            summary.spans.capacity(),
+            std::mem::size_of::<SpanSummary>(),
+        )?)
+        .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+    for span in &summary.spans {
+        super::scan::check_cancel(cancellation)?;
+        observer
+            .observe_work(1)
+            .map_err(TraceStoreFailure::observation)?;
+        bytes = bytes
+            .checked_add(checked_bytes(
+                span.variants.capacity(),
+                std::mem::size_of::<Vec<u8>>(),
+            )?)
+            .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+        for variant in &span.variants {
+            super::scan::check_cancel(cancellation)?;
+            observer
+                .observe_work(1)
+                .map_err(TraceStoreFailure::observation)?;
+            bytes = bytes
+                .checked_add(
+                    u64::try_from(variant.capacity())
+                        .map_err(|_| TraceStoreFailure::limit_exceeded())?,
+                )
+                .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+        }
+    }
+    Ok(bytes)
 }
 
 fn checked_bytes(capacity: usize, element_bytes: usize) -> Result<u64, TraceStoreFailure> {
