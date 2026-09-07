@@ -54,9 +54,12 @@ impl<'authority> ResourceReservation<'authority> {
         self.try_resize_with_policy(new_amounts, false)
     }
 
-    /// Replans a lease-owned metadata reservation without surrendering the
-    /// existing grant when admission refuses the replacement.
-    pub(crate) fn try_resize_preserving_capacity(
+    /// Replans retained state without surrendering the existing grant when
+    /// admission refuses the replacement.
+    ///
+    /// Callers that retain a bounded, retryable owner use this form so a
+    /// transient capacity refusal leaves the prior accounting capability live.
+    pub fn try_resize_preserving_capacity(
         &mut self,
         new_amounts: ResourceAmounts,
     ) -> Result<ResizeOutcome, ResizeFailure> {

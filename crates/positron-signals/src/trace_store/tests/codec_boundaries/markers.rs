@@ -3,7 +3,7 @@ use super::*;
 use crate::{
     EvaluatedSpanObservationInput, SpanAttributeSet, SpanEvent, SpanLink, SpanObservationDetails,
     SpanObservationDetailsInput, SpanResourceMetadata, SpanScopeMetadata, SpanStatus,
-    SpanStatusCode,
+    SpanStatusCode, TraceQuietPeriod, TraceSummaryMaintainer,
 };
 use positron_domain::value::{AttributeValueKind, MarkerAction};
 use positron_policy::{
@@ -139,6 +139,78 @@ fn public_trace_store_round_trip_preserves_markers_in_span_event_and_link_detail
             details,
         },
     )?;
+    let root_truncated = SpanObservation::checked_native(
+        [0x63; 16],
+        [0x64; 8],
+        None,
+        "root-truncated-span".to_owned(),
+        EventTime::missing(),
+        EventTime::missing(),
+        vec![
+            AttributeOccurrenceSetCandidate::new(
+                AttributeNamespace::Record,
+                "visible-before-marker".to_owned(),
+                vec![CandidateAttributeValue::string("retained".to_owned())],
+            )
+            .validate(profile)?,
+            AttributeOccurrenceSetCandidate::new(
+                AttributeNamespace::Record,
+                "root-truncated".to_owned(),
+                vec![CandidateAttributeValue::truncated(
+                    CandidateAttributeValue::string("retained-root".to_owned()),
+                    MarkerAction::TruncatedBytes,
+                )],
+            )
+            .validate(profile)?,
+        ],
+        SpanKind::Internal,
+        SamplingDecision::Unknown,
+        positron_policy::PolicyProvenance::new(1, [0x65; 32], Vec::new())?,
+    )?;
+    let link_only_attribute = SpanAttributeSet::checked_with_profile(
+        "link-only-truncated".to_owned(),
+        vec![CandidateAttributeValue::truncated(
+            CandidateAttributeValue::string("retained-link".to_owned()),
+            MarkerAction::TruncatedBytes,
+        )],
+        &profile,
+    )?;
+    let link_only_details = SpanObservationDetails::checked_with_profile(
+        SpanObservationDetailsInput {
+            trace_state: String::new(),
+            flags: 0,
+            status: SpanStatus::checked(SpanStatusCode::Unset, String::new())?,
+            events: Vec::new(),
+            links: vec![SpanLink::checked_with_profile(
+                [0x67; 16],
+                [0x68; 8],
+                String::new(),
+                0,
+                vec![link_only_attribute],
+                0,
+                &profile,
+            )?],
+            dropped_attributes_count: 0,
+            dropped_events_count: 0,
+            dropped_links_count: 0,
+            resource: SpanResourceMetadata::checked(0, String::new())?,
+            scope: SpanScopeMetadata::checked(String::new(), String::new(), 0, String::new())?,
+        },
+        &profile,
+    )?;
+    let link_truncated = SpanObservation::checked_native_with_details(
+        [0x66; 16],
+        [0x69; 8],
+        None,
+        "link-truncated-span".to_owned(),
+        EventTime::missing(),
+        EventTime::missing(),
+        Vec::new(),
+        SpanKind::Internal,
+        SamplingDecision::Unknown,
+        positron_policy::PolicyProvenance::new(1, [0x6a; 32], Vec::new())?,
+        link_only_details,
+    )?;
     let tenant = TenantId::from_bytes([0x41; 16])?;
     let shard = VirtualShardId::new(72)?;
     let root = TemporaryRoot::new()?;
@@ -164,7 +236,7 @@ fn public_trace_store_round_trip_preserves_markers_in_span_event_and_link_detail
                 tenant,
                 shard,
                 positron_kernel::StoreBlockIdentity::new([0x69; 16])?,
-                vec![observation.clone()],
+                vec![observation.clone(), root_truncated, link_truncated],
             )?
             .into_store_block(),
     )?;
@@ -243,6 +315,167 @@ fn public_trace_store_round_trip_preserves_markers_in_span_event_and_link_detail
             .key_value_entry(0)
             .and_then(|entry| entry.value().marker_action()),
         Some(MarkerAction::Redacted)
+    );
+    drop(result);
+    let mut maintainer = TraceSummaryMaintainer::new(
+        authority.governor(),
+        SegmentScope::new(tenant, SignalKind::Traces, shard),
+        TraceQuietPeriod::new(5)?,
+        ScanLimit::new(3)?,
+    )?;
+    let maintenance = maintainer.maintain(
+        &store,
+        &snapshot,
+        &NeverCancelled,
+        &NeverObserved,
+        &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
+    )?;
+    assert!(
+        maintenance
+            .summary([0x61; 16])
+            .ok_or("missing marker-bearing summary")?
+            .truncated(),
+        "a retained truncation marker must propagate to its trace summary"
+    );
+    assert!(
+        maintenance
+            .summary([0x63; 16])
+            .ok_or("missing root-marker summary")?
+            .truncated(),
+        "a root marker after an ordinary payload must propagate to its trace summary"
+    );
+    assert!(
+        maintenance
+            .summary([0x66; 16])
+            .ok_or("missing link-marker summary")?
+            .truncated(),
+        "a link-only marker must propagate to its trace summary"
+    );
+    Ok(())
+}
+
+#[test]
+fn summary_maintenance_keeps_retained_event_and_link_values_untruncated()
+-> Result<(), Box<dyn Error>> {
+    let profile = TraceStore::value_limit_profile();
+    let event_attributes = SpanAttributeSet::checked_with_profile(
+        "retained-event".to_owned(),
+        vec![CandidateAttributeValue::array(vec![
+            CandidateAttributeValue::string("visible".to_owned()),
+            CandidateAttributeValue::key_value_list(vec![CandidateKeyValue::new(
+                "nested".to_owned(),
+                CandidateAttributeValue::string("still-visible".to_owned()),
+            )]),
+        ])],
+        &profile,
+    )?;
+    let link_attributes = SpanAttributeSet::checked_with_profile(
+        "retained-link".to_owned(),
+        vec![CandidateAttributeValue::key_value_list(vec![
+            CandidateKeyValue::new(
+                "nested".to_owned(),
+                CandidateAttributeValue::array(vec![CandidateAttributeValue::string(
+                    "still-visible".to_owned(),
+                )]),
+            ),
+        ])],
+        &profile,
+    )?;
+    let details = SpanObservationDetails::checked_with_profile(
+        SpanObservationDetailsInput {
+            trace_state: String::new(),
+            flags: 0,
+            status: SpanStatus::checked(SpanStatusCode::Unset, String::new())?,
+            events: vec![SpanEvent::checked_with_profile(
+                EventTime::missing(),
+                "retained-event".to_owned(),
+                vec![event_attributes],
+                0,
+                &profile,
+            )?],
+            links: vec![SpanLink::checked_with_profile(
+                [0x83; 16],
+                [0x84; 8],
+                String::new(),
+                0,
+                vec![link_attributes],
+                0,
+                &profile,
+            )?],
+            dropped_attributes_count: 0,
+            dropped_events_count: 0,
+            dropped_links_count: 0,
+            resource: SpanResourceMetadata::checked(0, String::new())?,
+            scope: SpanScopeMetadata::checked(String::new(), String::new(), 0, String::new())?,
+        },
+        &profile,
+    )?;
+    let trace = [0x81; 16];
+    let observation = SpanObservation::checked_native_with_details(
+        trace,
+        [0x82; 8],
+        None,
+        "retained-details".to_owned(),
+        EventTime::missing(),
+        EventTime::missing(),
+        Vec::new(),
+        SpanKind::Internal,
+        SamplingDecision::Unknown,
+        positron_policy::PolicyProvenance::new(16, [0x85; 32], Vec::new())?,
+        details,
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let shard = VirtualShardId::new(75)?;
+    let root = TemporaryRoot::new()?;
+    let authority = establish_kernel_authority(PrimaryDataVolume::acquire(
+        root.path(),
+        MountQualification::LocalHost,
+    )?)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x1b; 16])?,
+        CatalogSecret::from_owned(Box::new([0x2b; 32]), Box::new([0x3b; 32])),
+    )?;
+    let scope = SegmentScope::new(tenant, SignalKind::Traces, shard);
+    let ledger = ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        scope,
+        SegmentProtectionKey::from_owned(Box::new([0x5b; 32])),
+    )?;
+    let store = TraceStore::new();
+    ledger.append(
+        store
+            .prepare_unretained_for_test(
+                preparation_capacity(&authority, tenant)?,
+                &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
+                tenant,
+                shard,
+                positron_kernel::StoreBlockIdentity::new([0x6b; 16])?,
+                vec![observation],
+            )?
+            .into_store_block(),
+    )?;
+    let mut maintainer = TraceSummaryMaintainer::new(
+        authority.governor(),
+        scope,
+        TraceQuietPeriod::new(5)?,
+        ScanLimit::new(1)?,
+    )?;
+    let maintenance = maintainer.maintain(
+        &store,
+        &ledger.snapshot()?,
+        &NeverCancelled,
+        &NeverObserved,
+        &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
+    )?;
+    assert_eq!(maintenance.applied_observations(), 1);
+    assert!(
+        !maintenance
+            .summary(trace)
+            .ok_or("missing retained-details summary")?
+            .truncated(),
+        "retained event and link values must not create a truncation quality flag"
     );
     Ok(())
 }

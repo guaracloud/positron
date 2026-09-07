@@ -1,6 +1,7 @@
 use super::{
     AttributeValueKind, MarkerAction, ValidatedAttributeValue, ValidatedAttributeValueInner,
 };
+use crate::value::{NativeValueObserver, ObservedValueFailure};
 
 impl ValidatedAttributeValue {
     /// Returns the payload-free redaction/removal action, if present.
@@ -94,6 +95,43 @@ impl ValidatedAttributeValue {
             | ValidatedAttributeValueInner::FloatingPointBits(_)
             | ValidatedAttributeValueInner::String(_)
             | ValidatedAttributeValueInner::Bytes(_) => false,
+        }
+    }
+
+    /// Returns whether this value or a retained descendant records truncation,
+    /// observing every structural node before it is visited.
+    pub fn contains_truncation_observed<O: NativeValueObserver>(
+        &self,
+        observer: &mut O,
+    ) -> Result<bool, ObservedValueFailure<O::Error>> {
+        observer
+            .observe_structure()
+            .map_err(ObservedValueFailure::Observer)?;
+        match &self.inner {
+            ValidatedAttributeValueInner::Truncated { .. } => Ok(true),
+            ValidatedAttributeValueInner::Array(values) => {
+                for value in values {
+                    if value.contains_truncation_observed(observer)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            },
+            ValidatedAttributeValueInner::KeyValueList(values) => {
+                for entry in values {
+                    if entry.value.contains_truncation_observed(observer)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            },
+            ValidatedAttributeValueInner::Marker(_)
+            | ValidatedAttributeValueInner::Null
+            | ValidatedAttributeValueInner::Boolean(_)
+            | ValidatedAttributeValueInner::SignedInteger(_)
+            | ValidatedAttributeValueInner::FloatingPointBits(_)
+            | ValidatedAttributeValueInner::String(_)
+            | ValidatedAttributeValueInner::Bytes(_) => Ok(false),
         }
     }
 

@@ -16,6 +16,82 @@ impl NativeValueObserver for NoopObserver {
     }
 }
 
+struct StructuralBudget {
+    remaining: usize,
+}
+
+impl StructuralBudget {
+    const fn allowing(structures: usize) -> Self {
+        Self {
+            remaining: structures,
+        }
+    }
+}
+
+impl NativeValueObserver for StructuralBudget {
+    type Error = &'static str;
+
+    fn observe_structure(&mut self) -> Result<(), Self::Error> {
+        if self.remaining == 0 {
+            return Err("structural budget exhausted");
+        }
+        self.remaining -= 1;
+        Ok(())
+    }
+
+    fn observe_payload(&mut self, _payload: &[u8]) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+#[test]
+fn truncation_traversal_observes_nested_retained_values_and_stops_at_budget() {
+    let profile = super::profile();
+    let nested = CandidateAttributeValue::array(vec![
+        CandidateAttributeValue::string("before".to_owned()),
+        CandidateAttributeValue::key_value_list(vec![CandidateKeyValue::new(
+            "retained".to_owned(),
+            CandidateAttributeValue::array(vec![
+                CandidateAttributeValue::string("still-before".to_owned()),
+                CandidateAttributeValue::truncated(
+                    CandidateAttributeValue::string("sanitized".to_owned()),
+                    MarkerAction::TruncatedBytes,
+                ),
+            ]),
+        )]),
+    ])
+    .validate_attribute(profile)
+    .expect("nested retained truncation validates");
+
+    let mut complete = StructuralBudget::allowing(6);
+    assert_eq!(nested.contains_truncation_observed(&mut complete), Ok(true));
+
+    let mut exhausted = StructuralBudget::allowing(5);
+    assert_eq!(
+        nested.contains_truncation_observed(&mut exhausted),
+        Err(ObservedValueFailure::Observer(
+            "structural budget exhausted"
+        ))
+    );
+
+    let without_truncation = CandidateAttributeValue::array(vec![
+        CandidateAttributeValue::string("before".to_owned()),
+        CandidateAttributeValue::key_value_list(vec![CandidateKeyValue::new(
+            "retained".to_owned(),
+            CandidateAttributeValue::array(vec![CandidateAttributeValue::string(
+                "last".to_owned(),
+            )]),
+        )]),
+    ])
+    .validate_attribute(profile)
+    .expect("nested retained native values validate");
+    let mut complete_without_truncation = StructuralBudget::allowing(5);
+    assert_eq!(
+        without_truncation.contains_truncation_observed(&mut complete_without_truncation),
+        Ok(false)
+    );
+}
+
 #[test]
 fn observed_marker_encoding_covers_all_actions_and_original_kinds() {
     let profile = super::profile();
