@@ -32,9 +32,6 @@ pub use types::{PreparedTraceBlock, StoredSpanObservation};
 #[cfg(fuzzing)]
 #[doc(hidden)]
 pub use fuzzing::fuzz_trace_store_block;
-#[cfg(fuzzing)]
-#[doc(hidden)]
-pub use summary::fuzz_trace_summary_state;
 
 /// The concrete Release 1 Trace Signal Store adapter.
 #[derive(Clone, Copy, Debug, Default)]

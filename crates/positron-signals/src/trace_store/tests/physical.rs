@@ -480,6 +480,10 @@ fn summary_maintenance_applies_committed_deltas_quiesces_and_reopens_after_resta
         assert_eq!(summary.observation_count(), 3);
         assert_eq!(summary.logical_span_count(), 1);
         assert_eq!(summary.conflicted_span_count(), 1);
+        assert!(
+            !summary.truncated(),
+            "ordinary observations must not be reported as truncated"
+        );
         assert_eq!(
             summary.time_provenance(),
             TraceSummaryTimeProvenance::IngestTime
@@ -697,6 +701,10 @@ fn summary_maintenance_refusal_keeps_the_cursor_and_summary_unpublished()
             .checked_add(1)
             .ok_or("maintenance work boundary overflow")?,
     );
+    let maintenance_baseline = authority
+        .governor()
+        .inspect()?
+        .reserve_consumption(ResourceDimension::MemoryBytes);
     let failure = match maintainer.maintain(
         &store,
         &ledger.snapshot()?,
@@ -713,6 +721,14 @@ fn summary_maintenance_refusal_keeps_the_cursor_and_summary_unpublished()
         TraceStoreFailureCode::ResourceAdmissionRefused
     );
     blocker.release();
+    assert_eq!(
+        authority
+            .governor()
+            .inspect()?
+            .reserve_consumption(ResourceDimension::MemoryBytes),
+        maintenance_baseline,
+        "a refused update must restore the maintainer's prior capacity before retry"
+    );
     {
         let replay = maintainer.maintain(
             &store,
@@ -876,6 +892,10 @@ fn summary_maintenance_large_semantic_update_is_budgeted_and_retries_from_the_pr
         .checked_add(semantic_work.work())
         .and_then(|work| work.checked_add(4))
         .ok_or("large maintenance work boundary overflow")?;
+    let capacity_before_failure = authority
+        .governor()
+        .inspect()?
+        .usage(ResourceDimension::MemoryBytes);
     let exhausted = match maintainer.maintain(
         &store,
         &ledger.snapshot()?,
@@ -890,6 +910,33 @@ fn summary_maintenance_large_semantic_update_is_budgeted_and_retries_from_the_pr
         Err(failure) => failure,
     };
     assert_eq!(exhausted.code(), TraceStoreFailureCode::BudgetExhausted);
+    assert_eq!(
+        authority
+            .governor()
+            .inspect()?
+            .usage(ResourceDimension::MemoryBytes),
+        capacity_before_failure,
+        "a failed staged update must restore its governed memory before retry"
+    );
+    let repeated = match maintainer.maintain(
+        &store,
+        &ledger.snapshot()?,
+        &NeverCancelled,
+        &WorkBudget::exact(retained_copy_boundary),
+        &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(101))),
+    ) {
+        Ok(_) => return Err("repeated large summary work bypassed the maintenance budget".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(repeated.code(), TraceStoreFailureCode::BudgetExhausted);
+    assert_eq!(
+        authority
+            .governor()
+            .inspect()?
+            .usage(ResourceDimension::MemoryBytes),
+        capacity_before_failure,
+        "repeated failed staged updates must not retain extra governed memory"
+    );
     {
         let retried = maintainer.maintain(
             &store,

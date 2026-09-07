@@ -1,8 +1,10 @@
 //! Incremental, bounded trace-summary maintenance over committed observations.
 
+mod index;
+mod retained;
+mod truncation;
+
 use super::{ScannedSpanObservation, TraceIncompleteness, TraceStore, TraceStoreFailure};
-#[cfg(fuzzing)]
-use crate::ScanObservationFailureCode;
 use crate::{ScanCancellation, ScanLimit, ScanObserver};
 use positron_domain::routing::{CommitPosition, RecordOrdinal, SignalKind};
 use positron_domain::value::ValueLimitProfile;
@@ -10,6 +12,9 @@ use positron_kernel::{
     IngestTime, LedgerSnapshot, LifecycleClock, LifecycleClockSource, ResourceAmounts,
     ResourceDimension, ResourceGovernor, ResourceReservation, SegmentScope, WorkClaim, WorkKind,
 };
+
+use index::{Lookup, SummaryIndex};
+use retained::{checked_bytes, summary_capacity_bytes};
 
 /// A configured ingest-time interval after which a trace is quiescent.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -44,9 +49,17 @@ struct SpanSummary {
 }
 
 struct SummaryUpdate {
-    index: usize,
+    slot: usize,
     prior: Option<TraceSummary>,
     updated: TraceSummary,
+}
+
+struct StagedObservation {
+    trace_id: [u8; 16],
+    span_id: [u8; 8],
+    ingest_time: IngestTime,
+    semantic: Vec<u8>,
+    truncated: bool,
 }
 
 /// A derived, non-authoritative summary for one tenant-scoped trace.
@@ -57,6 +70,7 @@ pub struct TraceSummary {
     last_seen: IngestTime,
     observation_count: u64,
     spans: Vec<SpanSummary>,
+    truncated: bool,
     quiescent: bool,
 }
 
@@ -92,6 +106,11 @@ impl TraceSummary {
     pub const fn quiescent(&self) -> bool {
         self.quiescent
     }
+    /// Whether any committed observation retained an explicit truncation marker.
+    #[must_use]
+    pub const fn truncated(&self) -> bool {
+        self.truncated
+    }
     #[must_use]
     pub const fn time_provenance(&self) -> TraceSummaryTimeProvenance {
         TraceSummaryTimeProvenance::IngestTime
@@ -126,8 +145,7 @@ impl TraceSummaryMaintenance<'_, '_> {
     pub fn summary(&self, trace_id: [u8; 16]) -> Option<&TraceSummary> {
         self.maintainer
             .find(trace_id)
-            .ok()
-            .map(|index| &self.maintainer.summaries[index])
+            .and_then(|index| self.maintainer.summaries.get(index))
     }
 }
 
@@ -142,6 +160,9 @@ pub struct TraceSummaryMaintainer<'kernel> {
     quiet_period: TraceQuietPeriod,
     limit: ScanLimit,
     summaries: Vec<TraceSummary>,
+    summary_capacities: Vec<u64>,
+    summary_bytes: u64,
+    index: SummaryIndex,
     cursor: Option<(CommitPosition, RecordOrdinal)>,
     catalog_generation: Option<u64>,
     capacity: ResourceReservation<'kernel>,
@@ -174,6 +195,9 @@ impl<'kernel> TraceSummaryMaintainer<'kernel> {
             quiet_period,
             limit,
             summaries: Vec::new(),
+            summary_capacities: Vec::new(),
+            summary_bytes: 0,
+            index: SummaryIndex::new(),
             cursor: None,
             catalog_generation: None,
             capacity,
@@ -237,7 +261,26 @@ impl<'kernel> TraceSummaryMaintainer<'kernel> {
         cancellation: &dyn ScanCancellation,
         observer: &dyn ScanObserver,
     ) -> Result<(), TraceStoreFailure> {
+        let capacity_before = self.capacity.granted();
+        match self.apply_staged(scanned, cancellation, observer) {
+            Ok(()) => Ok(()),
+            Err(failure) => {
+                self.capacity
+                    .try_resize_preserving_capacity(capacity_before)
+                    .map_err(|_| TraceStoreFailure::resource_admission_refused())?;
+                Err(failure)
+            },
+        }
+    }
+
+    fn apply_staged(
+        &mut self,
+        scanned: &ScannedSpanObservation,
+        cancellation: &dyn ScanCancellation,
+        observer: &dyn ScanObserver,
+    ) -> Result<(), TraceStoreFailure> {
         let observation = scanned.observation();
+        let truncated = truncation::observation_is_truncated(observation, cancellation, observer)?;
         let expected = super::codec::encoded_record_bytes_with_profile_observed(
             &ValueLimitProfile::release_1_system_maximum(),
             observation,
@@ -246,7 +289,19 @@ impl<'kernel> TraceSummaryMaintainer<'kernel> {
         )?
         .checked_sub(8)
         .ok_or_else(TraceStoreFailure::invalid_input)?;
-        self.reserve_staged_update(expected)?;
+        let trace_id = observation.trace_id();
+        let lookup = self
+            .index
+            .lookup_observed(trace_id, cancellation, observer)?;
+        let (slot, vacant_bucket, index_growth) = match lookup {
+            Lookup::Present(slot) => (slot, None, None),
+            Lookup::Vacant(bucket) => (
+                self.summaries.len(),
+                Some(bucket),
+                self.index.growth_bytes_for_insert()?,
+            ),
+        };
+        self.reserve_staged_update(expected, index_growth.unwrap_or(0))?;
         let semantic = super::codec::encode_semantic_observation_with_profile_observed(
             &ValueLimitProfile::release_1_system_maximum(),
             observation,
@@ -255,37 +310,96 @@ impl<'kernel> TraceSummaryMaintainer<'kernel> {
             observer,
         )?;
         let update = stage_summary_update(
-            &self.summaries,
-            observation.trace_id(),
-            observation.span_id(),
-            scanned.ingest_time(),
-            semantic,
+            self.summaries.get(slot),
+            slot,
+            StagedObservation {
+                trace_id,
+                span_id: observation.span_id(),
+                ingest_time: scanned.ingest_time(),
+                semantic,
+                truncated,
+            },
             cancellation,
             observer,
         )?;
-        if update.prior.is_some() {
-            let slot = self
-                .summaries
-                .get_mut(update.index)
-                .ok_or_else(TraceStoreFailure::invalid_input)?;
-            *slot = update.updated;
+        let updated_bytes = summary_capacity_bytes(&update.updated, cancellation, observer)?;
+        let prior_bytes = if update.prior.is_some() {
+            *self
+                .summary_capacities
+                .get(update.slot)
+                .ok_or_else(TraceStoreFailure::invalid_input)?
         } else {
+            0
+        };
+        let staged_index = if update.prior.is_none() && index_growth.is_some() {
+            Some(
+                self.index
+                    .staged_with_insert(trace_id, update.slot, cancellation, observer)?,
+            )
+        } else {
+            None
+        };
+        if update.prior.is_none() {
             self.summaries
                 .try_reserve_exact(1)
                 .map_err(|_| TraceStoreFailure::resource_exhausted())?;
-            self.summaries.insert(update.index, update.updated);
+            self.summary_capacities
+                .try_reserve_exact(1)
+                .map_err(|_| TraceStoreFailure::resource_exhausted())?;
         }
-        if let Err(failure) = self.resize_capacity(update.prior.as_ref(), cancellation, observer) {
+        let prior_index = staged_index.map(|staged| std::mem::replace(&mut self.index, staged));
+        let inserted_bucket = if update.prior.is_none() && prior_index.is_none() {
+            let bucket = vacant_bucket.ok_or_else(TraceStoreFailure::invalid_input)?;
+            self.index.insert_at(bucket, trace_id, update.slot)?;
+            Some(bucket)
+        } else {
+            None
+        };
+        if update.prior.is_some() {
+            let slot = self
+                .summaries
+                .get_mut(update.slot)
+                .ok_or_else(TraceStoreFailure::invalid_input)?;
+            *slot = update.updated;
+        } else {
+            self.summaries.push(update.updated);
+            self.summary_capacities.push(updated_bytes);
+        }
+        if update.prior.is_some() {
+            let slot = self
+                .summary_capacities
+                .get_mut(update.slot)
+                .ok_or_else(TraceStoreFailure::invalid_input)?;
+            *slot = updated_bytes;
+        }
+        if let Err(failure) = self.resize_capacity(
+            prior_bytes,
+            updated_bytes,
+            update.prior.as_ref(),
+            cancellation,
+            observer,
+        ) {
             if let Some(prior) = update.prior {
                 let slot = self
                     .summaries
-                    .get_mut(update.index)
+                    .get_mut(update.slot)
                     .ok_or_else(TraceStoreFailure::invalid_input)?;
                 *slot = prior;
-            } else if update.index < self.summaries.len() {
-                self.summaries.remove(update.index);
+                let capacity = self
+                    .summary_capacities
+                    .get_mut(update.slot)
+                    .ok_or_else(TraceStoreFailure::invalid_input)?;
+                *capacity = prior_bytes;
+            } else if update.slot.checked_add(1) == Some(self.summaries.len()) {
+                self.summaries.pop();
+                self.summary_capacities.pop();
             } else {
                 return Err(TraceStoreFailure::invalid_input());
+            }
+            if let Some(index) = prior_index {
+                self.index = index;
+            } else if let Some(bucket) = inserted_bucket {
+                self.index.remove_inserted(bucket, trace_id, update.slot)?;
             }
             return Err(failure);
         }
@@ -335,56 +449,35 @@ impl<'kernel> TraceSummaryMaintainer<'kernel> {
         Ok(())
     }
 
-    fn find(&self, trace_id: [u8; 16]) -> Result<usize, usize> {
-        find_summary(&self.summaries, trace_id)
+    fn find(&self, trace_id: [u8; 16]) -> Option<usize> {
+        self.index.slot(trace_id)
     }
 
     fn resize_capacity(
         &mut self,
+        prior_bytes: u64,
+        updated_bytes: u64,
         rollback: Option<&TraceSummary>,
         cancellation: &dyn ScanCancellation,
         observer: &dyn ScanObserver,
     ) -> Result<(), TraceStoreFailure> {
+        let summary_bytes = self
+            .summary_bytes
+            .checked_sub(prior_bytes)
+            .and_then(|bytes| bytes.checked_add(updated_bytes))
+            .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+        let index_bytes = self.index.retained_bytes()?;
         let mut bytes = checked_bytes(
             self.summaries.capacity(),
             std::mem::size_of::<TraceSummary>(),
-        )?;
-        for summary in &self.summaries {
-            super::scan::check_cancel(cancellation)?;
-            observer
-                .observe_work(1)
-                .map_err(TraceStoreFailure::observation)?;
-            bytes = bytes
-                .checked_add(checked_bytes(
-                    summary.spans.capacity(),
-                    std::mem::size_of::<SpanSummary>(),
-                )?)
-                .ok_or_else(TraceStoreFailure::limit_exceeded)?;
-            for span in &summary.spans {
-                super::scan::check_cancel(cancellation)?;
-                observer
-                    .observe_work(1)
-                    .map_err(TraceStoreFailure::observation)?;
-                bytes = bytes
-                    .checked_add(checked_bytes(
-                        span.variants.capacity(),
-                        std::mem::size_of::<Vec<u8>>(),
-                    )?)
-                    .ok_or_else(TraceStoreFailure::limit_exceeded)?;
-                for variant in &span.variants {
-                    super::scan::check_cancel(cancellation)?;
-                    observer
-                        .observe_work(1)
-                        .map_err(TraceStoreFailure::observation)?;
-                    bytes = bytes
-                        .checked_add(
-                            u64::try_from(variant.capacity())
-                                .map_err(|_| TraceStoreFailure::limit_exceeded())?,
-                        )
-                        .ok_or_else(TraceStoreFailure::limit_exceeded)?;
-                }
-            }
-        }
+        )?
+        .checked_add(checked_bytes(
+            self.summary_capacities.capacity(),
+            std::mem::size_of::<u64>(),
+        )?)
+        .and_then(|bytes| bytes.checked_add(index_bytes))
+        .and_then(|bytes| bytes.checked_add(summary_bytes))
+        .ok_or_else(TraceStoreFailure::limit_exceeded)?;
         if let Some(rollback) = rollback {
             bytes = bytes
                 .checked_add(summary_capacity_bytes(rollback, cancellation, observer)?)
@@ -396,10 +489,16 @@ impl<'kernel> TraceSummaryMaintainer<'kernel> {
         self.capacity
             .try_resize_preserving_capacity(amounts)
             .map_err(|_| TraceStoreFailure::resource_admission_refused())
-            .map(|_| ())
+            .map(|_| {
+                self.summary_bytes = summary_bytes;
+            })
     }
 
-    fn reserve_staged_update(&mut self, semantic_capacity: usize) -> Result<(), TraceStoreFailure> {
+    fn reserve_staged_update(
+        &mut self,
+        semantic_capacity: usize,
+        index_growth_bytes: u64,
+    ) -> Result<(), TraceStoreFailure> {
         let current = self.capacity.granted().get(ResourceDimension::MemoryBytes);
         let staged = checked_bytes(semantic_capacity, 1)?
             .checked_add(checked_bytes(1, std::mem::size_of::<TraceSummary>())?)
@@ -413,6 +512,7 @@ impl<'kernel> TraceSummaryMaintainer<'kernel> {
         let required = current
             .checked_mul(3)
             .and_then(|bytes| bytes.checked_add(staged))
+            .and_then(|bytes| bytes.checked_add(index_growth_bytes))
             .ok_or_else(TraceStoreFailure::limit_exceeded)?;
         let amounts = ResourceAmounts::only(ResourceDimension::MemoryBytes, required)
             .map_err(|_| TraceStoreFailure::limit_exceeded())?;
@@ -423,111 +523,54 @@ impl<'kernel> TraceSummaryMaintainer<'kernel> {
     }
 }
 
-fn summary_capacity_bytes(
-    summary: &TraceSummary,
-    cancellation: &dyn ScanCancellation,
-    observer: &dyn ScanObserver,
-) -> Result<u64, TraceStoreFailure> {
-    let mut bytes = u64::try_from(std::mem::size_of::<TraceSummary>())
-        .map_err(|_| TraceStoreFailure::limit_exceeded())?;
-    bytes = bytes
-        .checked_add(checked_bytes(
-            summary.spans.capacity(),
-            std::mem::size_of::<SpanSummary>(),
-        )?)
-        .ok_or_else(TraceStoreFailure::limit_exceeded)?;
-    for span in &summary.spans {
-        super::scan::check_cancel(cancellation)?;
-        observer
-            .observe_work(1)
-            .map_err(TraceStoreFailure::observation)?;
-        bytes = bytes
-            .checked_add(checked_bytes(
-                span.variants.capacity(),
-                std::mem::size_of::<Vec<u8>>(),
-            )?)
-            .ok_or_else(TraceStoreFailure::limit_exceeded)?;
-        for variant in &span.variants {
-            super::scan::check_cancel(cancellation)?;
-            observer
-                .observe_work(1)
-                .map_err(TraceStoreFailure::observation)?;
-            bytes = bytes
-                .checked_add(
-                    u64::try_from(variant.capacity())
-                        .map_err(|_| TraceStoreFailure::limit_exceeded())?,
-                )
-                .ok_or_else(TraceStoreFailure::limit_exceeded)?;
-        }
-    }
-    Ok(bytes)
-}
-
-fn checked_bytes(capacity: usize, element_bytes: usize) -> Result<u64, TraceStoreFailure> {
-    u64::try_from(capacity)
-        .ok()
-        .zip(u64::try_from(element_bytes).ok())
-        .and_then(|(capacity, element_bytes)| capacity.checked_mul(element_bytes))
-        .ok_or_else(TraceStoreFailure::limit_exceeded)
-}
-
 fn stage_summary_update(
-    summaries: &[TraceSummary],
-    trace_id: [u8; 16],
-    span_id: [u8; 8],
-    ingest_time: IngestTime,
-    semantic: Vec<u8>,
+    existing: Option<&TraceSummary>,
+    slot: usize,
+    observation: StagedObservation,
     cancellation: &dyn ScanCancellation,
     observer: &dyn ScanObserver,
 ) -> Result<SummaryUpdate, TraceStoreFailure> {
-    let (index, prior) = match find_summary_observed(summaries, trace_id, cancellation, observer)? {
-        Ok(index) => (
-            index,
-            Some(clone_summary_observed(
-                summaries
-                    .get(index)
-                    .ok_or_else(TraceStoreFailure::invalid_input)?,
-                cancellation,
-                observer,
-            )?),
-        ),
-        Err(index) => (index, None),
-    };
+    let prior = existing
+        .map(|summary| clone_summary_observed(summary, cancellation, observer))
+        .transpose()?;
     let mut updated = match &prior {
         Some(existing) => clone_summary_observed(existing, cancellation, observer)?,
         None => TraceSummary {
-            trace_id,
-            first_seen: ingest_time,
-            last_seen: ingest_time,
+            trace_id: observation.trace_id,
+            first_seen: observation.ingest_time,
+            last_seen: observation.ingest_time,
             observation_count: 0,
             spans: Vec::new(),
+            truncated: false,
             quiescent: false,
         },
     };
-    updated.first_seen = updated.first_seen.min(ingest_time);
-    updated.last_seen = updated.last_seen.max(ingest_time);
+    updated.first_seen = updated.first_seen.min(observation.ingest_time);
+    updated.last_seen = updated.last_seen.max(observation.ingest_time);
     updated.observation_count = updated
         .observation_count
         .checked_add(1)
         .ok_or_else(TraceStoreFailure::limit_exceeded)?;
     updated.quiescent = false;
-    let span_index = match find_span_observed(&updated.spans, span_id, cancellation, observer)? {
-        Ok(index) => index,
-        Err(index) => {
-            updated
-                .spans
-                .try_reserve_exact(1)
-                .map_err(|_| TraceStoreFailure::resource_exhausted())?;
-            updated.spans.insert(
-                index,
-                SpanSummary {
-                    span_id,
-                    variants: Vec::new(),
-                },
-            );
-            index
-        },
-    };
+    updated.truncated |= observation.truncated;
+    let span_index =
+        match find_span_observed(&updated.spans, observation.span_id, cancellation, observer)? {
+            Ok(index) => index,
+            Err(index) => {
+                updated
+                    .spans
+                    .try_reserve_exact(1)
+                    .map_err(|_| TraceStoreFailure::resource_exhausted())?;
+                updated.spans.insert(
+                    index,
+                    SpanSummary {
+                        span_id: observation.span_id,
+                        variants: Vec::new(),
+                    },
+                );
+                index
+            },
+        };
     let variants = &mut updated
         .spans
         .get_mut(span_index)
@@ -539,7 +582,7 @@ fn stage_summary_update(
         observer
             .observe_work(1)
             .map_err(TraceStoreFailure::observation)?;
-        if semantic_equal_observed(variant, &semantic, cancellation, observer)? {
+        if semantic_equal_observed(variant, &observation.semantic, cancellation, observer)? {
             duplicate = true;
             break;
         }
@@ -548,10 +591,10 @@ fn stage_summary_update(
         variants
             .try_reserve_exact(1)
             .map_err(|_| TraceStoreFailure::resource_exhausted())?;
-        variants.push(semantic);
+        variants.push(observation.semantic);
     }
     Ok(SummaryUpdate {
-        index,
+        slot,
         prior,
         updated,
     })
@@ -603,27 +646,9 @@ fn clone_summary_observed(
         last_seen: summary.last_seen,
         observation_count: summary.observation_count,
         spans,
+        truncated: summary.truncated,
         quiescent: summary.quiescent,
     })
-}
-
-fn find_summary(summaries: &[TraceSummary], trace_id: [u8; 16]) -> Result<usize, usize> {
-    summaries.binary_search_by_key(&trace_id, |summary| summary.trace_id)
-}
-
-fn find_summary_observed(
-    summaries: &[TraceSummary],
-    trace_id: [u8; 16],
-    cancellation: &dyn ScanCancellation,
-    observer: &dyn ScanObserver,
-) -> Result<Result<usize, usize>, TraceStoreFailure> {
-    find_sorted_observed(
-        summaries,
-        trace_id,
-        |summary| summary.trace_id,
-        cancellation,
-        observer,
-    )
 }
 
 fn find_span_observed(
@@ -642,18 +667,31 @@ fn find_sorted_observed<T, K: Ord + Copy>(
     cancellation: &dyn ScanCancellation,
     observer: &dyn ScanObserver,
 ) -> Result<Result<usize, usize>, TraceStoreFailure> {
-    for (index, value) in values.iter().enumerate() {
+    let mut lower = 0_usize;
+    let mut upper = values.len();
+    while lower < upper {
         super::scan::check_cancel(cancellation)?;
         observer
             .observe_work(1)
             .map_err(TraceStoreFailure::observation)?;
+        let middle = lower
+            .checked_add(upper - lower)
+            .and_then(|sum| sum.checked_div(2))
+            .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+        let value = values
+            .get(middle)
+            .ok_or_else(TraceStoreFailure::invalid_input)?;
         match key.cmp(&item_key(value)) {
-            std::cmp::Ordering::Less => return Ok(Err(index)),
-            std::cmp::Ordering::Equal => return Ok(Ok(index)),
-            std::cmp::Ordering::Greater => {},
+            std::cmp::Ordering::Less => upper = middle,
+            std::cmp::Ordering::Equal => return Ok(Ok(middle)),
+            std::cmp::Ordering::Greater => {
+                lower = middle
+                    .checked_add(1)
+                    .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+            },
         }
     }
-    Ok(Err(values.len()))
+    Ok(Err(lower))
 }
 
 fn semantic_equal_observed(
@@ -675,80 +713,4 @@ fn semantic_equal_observed(
         }
     }
     Ok(true)
-}
-
-#[cfg(fuzzing)]
-struct FuzzCancellation;
-
-#[cfg(fuzzing)]
-impl ScanCancellation for FuzzCancellation {
-    fn is_cancelled(&self) -> bool {
-        false
-    }
-}
-
-#[cfg(fuzzing)]
-struct FuzzObserver;
-
-#[cfg(fuzzing)]
-impl ScanObserver for FuzzObserver {
-    fn observe_work(&self, _units: u64) -> Result<(), ScanObservationFailureCode> {
-        Ok(())
-    }
-}
-
-#[cfg(fuzzing)]
-#[doc(hidden)]
-pub fn fuzz_trace_summary_state(data: &[u8]) {
-    let mut summaries = Vec::new();
-    let cancellation = FuzzCancellation;
-    let observer = FuzzObserver;
-    let clock =
-        positron_kernel::LifecycleClock::new(positron_kernel::FixedLifecycleClockSource::new(
-            positron_domain::time::UnixNanoseconds::new(1),
-        ));
-    for chunk in data.chunks(40).take(256) {
-        let mut trace_id = [0_u8; 16];
-        let mut span_id = [0_u8; 8];
-        trace_id[..chunk.len().min(16)].copy_from_slice(&chunk[..chunk.len().min(16)]);
-        let span_start = 16.min(chunk.len());
-        let span_end = (span_start + 8).min(chunk.len());
-        span_id[..span_end.saturating_sub(span_start)]
-            .copy_from_slice(&chunk[span_start..span_end]);
-        let semantic = chunk.get(24..).unwrap_or_default().to_vec();
-        let Ok(ingest_time) = clock.assign_ingest_time() else {
-            return;
-        };
-        let Ok(update) = stage_summary_update(
-            &summaries,
-            trace_id,
-            span_id,
-            ingest_time,
-            semantic,
-            &cancellation,
-            &observer,
-        ) else {
-            return;
-        };
-        if update.prior.is_some() {
-            if let Some(slot) = summaries.get_mut(update.index) {
-                *slot = update.updated;
-            } else {
-                return;
-            }
-        } else if update.index <= summaries.len() {
-            summaries.insert(update.index, update.updated);
-        } else {
-            return;
-        }
-    }
-    for summary in &summaries {
-        if !summary
-            .spans
-            .windows(2)
-            .all(|pair| pair[0].span_id < pair[1].span_id)
-        {
-            return;
-        }
-    }
 }

@@ -3,7 +3,7 @@ use super::*;
 use crate::{
     EvaluatedSpanObservationInput, SpanAttributeSet, SpanEvent, SpanLink, SpanObservationDetails,
     SpanObservationDetailsInput, SpanResourceMetadata, SpanScopeMetadata, SpanStatus,
-    SpanStatusCode,
+    SpanStatusCode, TraceQuietPeriod, TraceSummaryMaintainer,
 };
 use positron_domain::value::{AttributeValueKind, MarkerAction};
 use positron_policy::{
@@ -243,6 +243,27 @@ fn public_trace_store_round_trip_preserves_markers_in_span_event_and_link_detail
             .key_value_entry(0)
             .and_then(|entry| entry.value().marker_action()),
         Some(MarkerAction::Redacted)
+    );
+    drop(result);
+    let mut maintainer = TraceSummaryMaintainer::new(
+        authority.governor(),
+        SegmentScope::new(tenant, SignalKind::Traces, shard),
+        TraceQuietPeriod::new(5)?,
+        ScanLimit::new(1)?,
+    )?;
+    let maintenance = maintainer.maintain(
+        &store,
+        &snapshot,
+        &NeverCancelled,
+        &NeverObserved,
+        &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
+    )?;
+    assert!(
+        maintenance
+            .summary([0x61; 16])
+            .ok_or("missing marker-bearing summary")?
+            .truncated(),
+        "a retained truncation marker must propagate to its trace summary"
     );
     Ok(())
 }

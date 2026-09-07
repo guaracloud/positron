@@ -34,4 +34,4 @@ pub use trace_store::{
 pub use log_store::{fuzz_log_retention_block, fuzz_log_store_block, fuzz_text_search_pruning};
 #[cfg(fuzzing)]
 #[doc(hidden)]
-pub use trace_store::{fuzz_trace_store_block, fuzz_trace_summary_state};
+pub use trace_store::fuzz_trace_store_block;
