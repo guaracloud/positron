@@ -454,6 +454,7 @@ impl<'kernel> TraceSummaryMaintainer<'kernel> {
             prior_bytes,
             updated_bytes,
             update.prior.as_ref(),
+            prior_index.as_ref(),
             cancellation,
             observer,
         ) {
@@ -573,6 +574,7 @@ impl<'kernel> TraceSummaryMaintainer<'kernel> {
         prior_bytes: u64,
         updated_bytes: u64,
         rollback: Option<&TraceSummary>,
+        rollback_index: Option<&SummaryIndex>,
         cancellation: &dyn ScanCancellation,
         observer: &dyn ScanObserver,
     ) -> Result<(), TraceStoreFailure> {
@@ -585,6 +587,11 @@ impl<'kernel> TraceSummaryMaintainer<'kernel> {
         if let Some(rollback) = rollback {
             bytes = bytes
                 .checked_add(summary_capacity_bytes(rollback, cancellation, observer)?)
+                .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+        }
+        if let Some(rollback_index) = rollback_index {
+            bytes = bytes
+                .checked_add(rollback_index.retained_bytes()?)
                 .ok_or_else(TraceStoreFailure::limit_exceeded)?;
         }
         let bytes = bytes.max(1);
