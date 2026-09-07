@@ -10,8 +10,9 @@ use crate::{ScanCancellation, ScanLimit, ScanObserver};
 use positron_domain::routing::{CommitPosition, RecordOrdinal, SignalKind};
 use positron_domain::value::ValueLimitProfile;
 use positron_kernel::{
-    IngestTime, LedgerSnapshot, LifecycleClock, LifecycleClockSource, ResourceAmounts,
-    ResourceDimension, ResourceGovernor, ResourceReservation, SegmentScope, WorkClaim, WorkKind,
+    CatalogGenerationId, IngestTime, LedgerSnapshot, LifecycleClock, LifecycleClockSource,
+    ResourceAmounts, ResourceDimension, ResourceGovernor, ResourceReservation, SegmentScope,
+    WorkClaim, WorkKind,
 };
 
 use index::{Lookup, SummaryIndex};
@@ -49,6 +50,7 @@ pub enum TraceSummaryTimeProvenance {
 pub struct TraceSummaryCoverage {
     scope: SegmentScope,
     catalog_generation: u64,
+    catalog_identity: CatalogGenerationId,
     frontier: CommitPosition,
     applied_cursor: Option<(CommitPosition, RecordOrdinal)>,
     physical_complete: bool,
@@ -64,6 +66,10 @@ impl TraceSummaryCoverage {
     #[must_use]
     pub const fn catalog_generation(self) -> u64 {
         self.catalog_generation
+    }
+    #[must_use]
+    pub const fn catalog_identity(self) -> CatalogGenerationId {
+        self.catalog_identity
     }
     #[must_use]
     pub const fn frontier(self) -> CommitPosition {
@@ -208,7 +214,8 @@ pub struct TraceSummaryMaintainer<'kernel> {
     index: SummaryIndex,
     cursor: Option<(CommitPosition, RecordOrdinal)>,
     catalog_generation: Option<u64>,
-    quiescence_basis: Option<(CommitPosition, u64)>,
+    catalog_identity: Option<CatalogGenerationId>,
+    quiescence_basis: Option<(CatalogGenerationId, CommitPosition, u64)>,
     quiescence_target: Option<IngestTime>,
     quiescence_cursor: usize,
     capacity: ResourceReservation<'kernel>,
@@ -246,6 +253,7 @@ impl<'kernel> TraceSummaryMaintainer<'kernel> {
             index: SummaryIndex::new(),
             cursor: None,
             catalog_generation: None,
+            catalog_identity: None,
             quiescence_basis: None,
             quiescence_target: None,
             quiescence_cursor: 0,
@@ -308,6 +316,7 @@ impl<'kernel> TraceSummaryMaintainer<'kernel> {
             coverage: TraceSummaryCoverage {
                 scope: snapshot.scope(),
                 catalog_generation: snapshot.catalog_generation(),
+                catalog_identity: snapshot.catalog_identity(),
                 frontier: snapshot.frontier(),
                 applied_cursor: self.cursor,
                 physical_complete: complete,
@@ -335,9 +344,7 @@ impl<'kernel> TraceSummaryMaintainer<'kernel> {
         match self.apply_staged(scanned, cancellation, observer) {
             Ok(()) => Ok(()),
             Err(failure) => {
-                self.capacity
-                    .try_resize_preserving_capacity(capacity_before)
-                    .map_err(|_| TraceStoreFailure::resource_admission_refused())?;
+                self.restore_failure_capacity(capacity_before)?;
                 Err(failure)
             },
         }
@@ -485,7 +492,12 @@ impl<'kernel> TraceSummaryMaintainer<'kernel> {
         cancellation: &dyn ScanCancellation,
         observer: &dyn ScanObserver,
     ) -> Result<bool, TraceStoreFailure> {
-        let basis = (frontier, catalog_generation);
+        let basis = (
+            self.catalog_identity
+                .ok_or_else(TraceStoreFailure::invalid_input)?,
+            frontier,
+            catalog_generation,
+        );
         if self.quiescence_basis != Some(basis) || self.quiescence_cursor >= self.summaries.len() {
             self.quiescence_basis = Some(basis);
             self.quiescence_target = Some(lifecycle_now);
@@ -495,14 +507,15 @@ impl<'kernel> TraceSummaryMaintainer<'kernel> {
             .quiescence_target
             .ok_or_else(TraceStoreFailure::invalid_input)?;
         let mut refreshed = 0_usize;
-        for summary in self.summaries.iter_mut().skip(self.quiescence_cursor) {
-            if refreshed >= self.limit.value() {
-                break;
-            }
+        while refreshed < self.limit.value() && self.quiescence_cursor < self.summaries.len() {
             super::scan::check_cancel(cancellation)?;
             observer
                 .observe_work(1)
                 .map_err(TraceStoreFailure::observation)?;
+            let summary = self
+                .summaries
+                .get_mut(self.quiescence_cursor)
+                .ok_or_else(TraceStoreFailure::invalid_input)?;
             let elapsed = target
                 .instant()
                 .value()
@@ -512,11 +525,11 @@ impl<'kernel> TraceSummaryMaintainer<'kernel> {
             refreshed = refreshed
                 .checked_add(1)
                 .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+            self.quiescence_cursor = self
+                .quiescence_cursor
+                .checked_add(1)
+                .ok_or_else(TraceStoreFailure::limit_exceeded)?;
         }
-        self.quiescence_cursor = self
-            .quiescence_cursor
-            .checked_add(refreshed)
-            .ok_or_else(TraceStoreFailure::limit_exceeded)?;
         Ok(self.quiescence_cursor >= self.summaries.len())
     }
 
@@ -539,7 +552,15 @@ impl<'kernel> TraceSummaryMaintainer<'kernel> {
         {
             return Err(TraceStoreFailure::stale_generation());
         }
+        if self.catalog_generation == Some(snapshot.catalog_generation())
+            && self
+                .catalog_identity
+                .is_some_and(|identity| identity != snapshot.catalog_identity())
+        {
+            return Err(TraceStoreFailure::stale_generation());
+        }
         self.catalog_generation = Some(snapshot.catalog_generation());
+        self.catalog_identity = Some(snapshot.catalog_identity());
         Ok(())
     }
 
@@ -560,18 +581,7 @@ impl<'kernel> TraceSummaryMaintainer<'kernel> {
             .checked_sub(prior_bytes)
             .and_then(|bytes| bytes.checked_add(updated_bytes))
             .ok_or_else(TraceStoreFailure::limit_exceeded)?;
-        let index_bytes = self.index.retained_bytes()?;
-        let mut bytes = checked_bytes(
-            self.summaries.capacity(),
-            std::mem::size_of::<TraceSummary>(),
-        )?
-        .checked_add(checked_bytes(
-            self.summary_capacities.capacity(),
-            std::mem::size_of::<u64>(),
-        )?)
-        .and_then(|bytes| bytes.checked_add(index_bytes))
-        .and_then(|bytes| bytes.checked_add(summary_bytes))
-        .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+        let mut bytes = self.retained_capacity_bytes(summary_bytes)?;
         if let Some(rollback) = rollback {
             bytes = bytes
                 .checked_add(summary_capacity_bytes(rollback, cancellation, observer)?)
@@ -586,6 +596,39 @@ impl<'kernel> TraceSummaryMaintainer<'kernel> {
             .map(|_| {
                 self.summary_bytes = summary_bytes;
             })
+    }
+
+    fn restore_failure_capacity(
+        &mut self,
+        capacity_before: ResourceAmounts,
+    ) -> Result<(), TraceStoreFailure> {
+        let retained = self.retained_capacity_bytes(self.summary_bytes)?.max(1);
+        let required = ResourceAmounts::only(
+            ResourceDimension::MemoryBytes,
+            capacity_before
+                .get(ResourceDimension::MemoryBytes)
+                .max(retained),
+        )
+        .map_err(|_| TraceStoreFailure::limit_exceeded())?;
+        self.capacity
+            .try_resize_preserving_capacity(required)
+            .map_err(|_| TraceStoreFailure::resource_admission_refused())
+            .map(|_| ())
+    }
+
+    fn retained_capacity_bytes(&self, summary_bytes: u64) -> Result<u64, TraceStoreFailure> {
+        let index_bytes = self.index.retained_bytes()?;
+        checked_bytes(
+            self.summaries.capacity(),
+            std::mem::size_of::<TraceSummary>(),
+        )?
+        .checked_add(checked_bytes(
+            self.summary_capacities.capacity(),
+            std::mem::size_of::<u64>(),
+        )?)
+        .and_then(|bytes| bytes.checked_add(index_bytes))
+        .and_then(|bytes| bytes.checked_add(summary_bytes))
+        .ok_or_else(TraceStoreFailure::limit_exceeded)
     }
 
     fn reserve_staged_update(

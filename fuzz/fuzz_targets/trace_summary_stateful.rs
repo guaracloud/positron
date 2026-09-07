@@ -140,9 +140,11 @@ fn run_once(data: &[u8], root: &std::path::Path) -> Result<(), Box<dyn Error>> {
     )?;
     let mut expected = BTreeMap::new();
     let mut next_identity = 1_u8;
+    let mut next_ingest_time = 1_000_i64;
 
     for command in data.chunks_exact(4).take(MAX_OPERATIONS) {
-        match command[0] % 6 {
+        let mut reopened_trace = None;
+        match command[0] % 7 {
             0 | 1 => {
                 let trace = trace_id(command);
                 let observation = observation(&policy, trace, command[2], command[3])?;
@@ -154,13 +156,54 @@ fn run_once(data: &[u8], root: &std::path::Path) -> Result<(), Box<dyn Error>> {
                     scope.shard_id(),
                     next_identity,
                     observation,
-                    i64::from(100_u16 + u16::from(command[3])),
+                    next_ingest_time,
                 )?;
                 next_identity = next_identity.wrapping_add(1).max(1);
+                next_ingest_time = next_ingest_time
+                    .checked_add(1)
+                    .ok_or("bounded ingest time overflow")?;
                 let count = expected.entry(trace).or_insert(0_u64);
                 *count = count.checked_add(1).ok_or("bounded observation count overflow")?;
             },
             2 => {
+                if let Some(trace) = expected.keys().next().copied() {
+                    let quiescent_at = next_ingest_time
+                        .checked_add(i64::try_from(QUIET_PERIOD_NANOS)?)
+                        .ok_or("bounded quiescence time overflow")?;
+                    source.store(quiescent_at, Ordering::Relaxed);
+                    maintain_until_quiescent(
+                        &mut maintainer,
+                        &ledger,
+                        &store,
+                        &lifecycle_clock,
+                        &expected,
+                    )?;
+                    let late_ingest_time = quiescent_at
+                        .checked_add(1)
+                        .ok_or("bounded late ingest time overflow")?;
+                    append(
+                        &ledger,
+                        &authority,
+                        &store,
+                        tenant,
+                        scope.shard_id(),
+                        next_identity,
+                        observation(&policy, trace, command[2], command[3])?,
+                        late_ingest_time,
+                    )?;
+                    next_identity = next_identity.wrapping_add(1).max(1);
+                    next_ingest_time = late_ingest_time
+                        .checked_add(1)
+                        .ok_or("bounded ingest time overflow")?;
+                    let count = expected.entry(trace).or_insert(0_u64);
+                    *count = count
+                        .checked_add(1)
+                        .ok_or("bounded observation count overflow")?;
+                    source.store(late_ingest_time, Ordering::Relaxed);
+                    reopened_trace = Some(trace);
+                }
+            },
+            3 => {
                 source_set(&source, command[1]);
                 let snapshot = ledger.snapshot()?;
                 let failure = match maintainer.maintain(
@@ -178,7 +221,7 @@ fn run_once(data: &[u8], root: &std::path::Path) -> Result<(), Box<dyn Error>> {
                     TraceStoreFailureCode::Cancelled
                 );
             },
-            3 => {
+            4 => {
                 source_set(&source, command[1]);
                 let snapshot = ledger.snapshot()?;
                 if let Err(failure) = maintainer.maintain(
@@ -191,7 +234,7 @@ fn run_once(data: &[u8], root: &std::path::Path) -> Result<(), Box<dyn Error>> {
                     assert_eq!(failure.code(), TraceStoreFailureCode::BudgetExhausted);
                 }
             },
-            4 => {
+            5 => {
                 source_set(&source, command[1]);
                 let snapshot = ledger.snapshot()?;
                 if let Err(failure) = maintainer.maintain(
@@ -210,7 +253,9 @@ fn run_once(data: &[u8], root: &std::path::Path) -> Result<(), Box<dyn Error>> {
             },
         }
 
-        source_set(&source, command[3]);
+        if reopened_trace.is_none() {
+            source_set(&source, command[3]);
+        }
         let snapshot = ledger.snapshot()?;
         let result = maintainer.maintain(
             &store,
@@ -220,8 +265,29 @@ fn run_once(data: &[u8], root: &std::path::Path) -> Result<(), Box<dyn Error>> {
             &lifecycle_clock,
         )?;
         assert_visible_summary_counts(&result, &expected);
+        if let Some(trace) = reopened_trace {
+            let summary = result.summary(trace).ok_or("late trace summary is present")?;
+            assert!(!summary.quiescent(), "a later span reopens a quiescent trace");
+            assert_eq!(
+                summary.observation_count(),
+                *expected
+                    .get(&trace)
+                    .ok_or("late trace remains in the expected state")?
+            );
+        }
     }
 
+    let quiescent_at = next_ingest_time
+        .checked_add(i64::try_from(QUIET_PERIOD_NANOS)?)
+        .ok_or("bounded final quiescence time overflow")?;
+    source.store(quiescent_at, Ordering::Relaxed);
+    maintain_until_quiescent(
+        &mut maintainer,
+        &ledger,
+        &store,
+        &lifecycle_clock,
+        &expected,
+    )?;
     drop(ledger);
     replay_and_assert(&authority, &catalog, scope, key(), &store, &expected)
 }
@@ -332,6 +398,45 @@ fn assert_visible_summary_counts(
             .is_ok_and(|count| count <= summary.observation_count()));
         assert!(summary.conflicted_span_count() <= summary.logical_span_count());
     }
+}
+
+fn maintain_until_quiescent<'kernel>(
+    maintainer: &mut TraceSummaryMaintainer<'kernel>,
+    ledger: &ActiveSegmentLedger<'kernel, '_>,
+    store: &TraceStore,
+    lifecycle_clock: &LifecycleClock<MutableClock>,
+    expected: &BTreeMap<[u8; 16], u64>,
+) -> Result<(), Box<dyn Error>> {
+    if expected.is_empty() {
+        return Ok(());
+    }
+    let observations = expected.values().copied().sum::<u64>();
+    let summaries = u64::try_from(expected.len())?;
+    let attempts = observations
+        .checked_add(summaries)
+        .and_then(|value| value.checked_add(summaries))
+        .and_then(|value| value.checked_add(1))
+        .ok_or("bounded quiescence attempts overflow")?;
+    for _ in 0..attempts {
+        let snapshot = ledger.snapshot()?;
+        let result = maintainer.maintain(
+            store,
+            &snapshot,
+            &InputCancellation(false),
+            &Unobserved,
+            lifecycle_clock,
+        )?;
+        assert_visible_summary_counts(&result, expected);
+        let all_quiescent = expected.keys().all(|trace| {
+            result
+                .summary(*trace)
+                .is_some_and(|summary| summary.quiescent())
+        });
+        if result.complete() && result.quiescence_complete() && all_quiescent {
+            return Ok(());
+        }
+    }
+    Err("bounded live maintenance did not reach physical and quiescence completion".into())
 }
 
 fn replay_and_assert(

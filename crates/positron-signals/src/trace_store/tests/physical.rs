@@ -534,6 +534,11 @@ fn summary_maintenance_applies_committed_deltas_quiesces_and_reopens_after_resta
         quiescence_coverage.catalog_generation(),
         stale_snapshot.catalog_generation()
     );
+    assert_eq!(
+        quiescence_coverage.catalog_identity(),
+        stale_snapshot.catalog_identity(),
+        "summary coverage must identify the exact authenticated catalog snapshot"
+    );
     assert_eq!(quiescence_coverage.frontier(), stale_snapshot.frontier());
     assert!(
         quiescence_coverage.frontier() < current_snapshot.frontier(),
@@ -643,6 +648,127 @@ fn summary_maintenance_applies_committed_deltas_quiesces_and_reopens_after_resta
         mismatch.code(),
         TraceStoreFailureCode::PhysicalScopeMismatch
     );
+    Ok(())
+}
+
+#[test]
+fn summary_maintenance_rejects_a_same_generation_snapshot_with_a_different_identity()
+-> Result<(), Box<dyn Error>> {
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let shard = VirtualShardId::new(26)?;
+    let scope = SegmentScope::new(tenant, SignalKind::Traces, shard);
+    let first_root = TemporaryRoot::new()?;
+    let first_authority = establish_kernel_authority(PrimaryDataVolume::acquire(
+        first_root.path(),
+        MountQualification::LocalHost,
+    )?)?;
+    let first_catalog = Catalog::open(
+        &first_authority,
+        InstanceId::new([0xad; 16])?,
+        CatalogSecret::from_owned(Box::new([0xae; 32]), Box::new([0xaf; 32])),
+    )?;
+    let first_ledger = ActiveSegmentLedger::open(
+        &first_authority,
+        &first_catalog,
+        scope,
+        SegmentProtectionKey::from_owned(Box::new([0xb0; 32])),
+    )?;
+    let second_root = TemporaryRoot::new()?;
+    let second_authority = establish_kernel_authority(PrimaryDataVolume::acquire(
+        second_root.path(),
+        MountQualification::LocalHost,
+    )?)?;
+    let second_catalog = Catalog::open(
+        &second_authority,
+        InstanceId::new([0xb1; 16])?,
+        CatalogSecret::from_owned(Box::new([0xb2; 32]), Box::new([0xb3; 32])),
+    )?;
+    let second_ledger = ActiveSegmentLedger::open(
+        &second_authority,
+        &second_catalog,
+        scope,
+        SegmentProtectionKey::from_owned(Box::new([0xb4; 32])),
+    )?;
+    let observation = |trace_id| {
+        SpanObservation::checked_native(
+            trace_id,
+            [0xb5; 8],
+            None,
+            "snapshot-identity".to_owned(),
+            EventTime::missing(),
+            EventTime::missing(),
+            Vec::new(),
+            SpanKind::Internal,
+            SamplingDecision::Unknown,
+            positron_policy::PolicyProvenance::new(1, [0xb6; 32], Vec::new())?,
+        )
+    };
+    let store = TraceStore::new();
+    first_ledger.append(
+        store
+            .prepare_unretained_for_test(
+                preparation_capacity(&first_authority, tenant)?,
+                &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
+                tenant,
+                shard,
+                positron_kernel::StoreBlockIdentity::new([0xb8; 16])?,
+                vec![observation([0xb7; 16])?],
+            )?
+            .into_store_block(),
+    )?;
+    second_ledger.append(
+        store
+            .prepare_unretained_for_test(
+                preparation_capacity(&second_authority, tenant)?,
+                &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
+                tenant,
+                shard,
+                positron_kernel::StoreBlockIdentity::new([0xba; 16])?,
+                vec![observation([0xb9; 16])?],
+            )?
+            .into_store_block(),
+    )?;
+    let first_snapshot = first_ledger.snapshot()?;
+    let second_snapshot = second_ledger.snapshot()?;
+    assert_eq!(
+        first_snapshot.catalog_generation(),
+        second_snapshot.catalog_generation(),
+        "the test requires colliding catalog sequence numbers"
+    );
+    assert_ne!(
+        first_snapshot.catalog_identity(),
+        second_snapshot.catalog_identity(),
+        "independent authenticated catalogs have distinct identities"
+    );
+    let mut maintainer = TraceSummaryMaintainer::new(
+        first_authority.governor(),
+        scope,
+        TraceQuietPeriod::new(5)?,
+        ScanLimit::new(1)?,
+    )?;
+    maintainer.maintain(
+        &store,
+        &first_snapshot,
+        &NeverCancelled,
+        &NeverObserved,
+        &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
+    )?;
+    let failure = match maintainer.maintain(
+        &store,
+        &second_snapshot,
+        &NeverCancelled,
+        &NeverObserved,
+        &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
+    ) {
+        Ok(_) => return Err("a different authenticated catalog reused summary state".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(failure.code(), TraceStoreFailureCode::StaleGeneration);
+    drop(maintainer);
+    drop(second_snapshot);
+    drop(first_snapshot);
+    drop(first_ledger);
+    drop(first_catalog);
     Ok(())
 }
 
