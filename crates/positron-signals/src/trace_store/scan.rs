@@ -57,6 +57,22 @@ impl TraceScan {
         }
     }
 
+    /// Returns committed records strictly after one physical record cursor.
+    #[must_use]
+    pub const fn after_cursor(
+        limit: ScanLimit,
+        position: CommitPosition,
+        ordinal: RecordOrdinal,
+    ) -> Self {
+        Self {
+            limit,
+            after: None,
+            after_record: Some((position, ordinal)),
+            frontier: None,
+            scanned_bytes: None,
+        }
+    }
+
     #[must_use]
     pub const fn between(
         limit: ScanLimit,

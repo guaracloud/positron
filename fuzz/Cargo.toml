@@ -98,6 +98,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "trace_summary_stateful"
+path = "fuzz_targets/trace_summary_stateful.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "log_store_compaction_stateful"
 path = "fuzz_targets/log_store_compaction_stateful.rs"
 test = false

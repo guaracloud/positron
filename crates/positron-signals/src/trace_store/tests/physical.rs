@@ -1,8 +1,115 @@
 use super::*;
 use crate::{
     SpanEvent, SpanLink, SpanObservationDetails, SpanResourceMetadata, SpanScopeMetadata,
-    SpanStatus, SpanStatusCode,
+    SpanStatus, SpanStatusCode, TraceQuietPeriod, TraceSummaryMaintainer,
+    TraceSummaryTimeProvenance,
 };
+use std::cell::{Cell, RefCell};
+
+struct WorkMeter(Cell<u64>);
+
+impl WorkMeter {
+    const fn new() -> Self {
+        Self(Cell::new(0))
+    }
+
+    fn work(&self) -> u64 {
+        self.0.get()
+    }
+}
+
+impl ScanObserver for WorkMeter {
+    fn observe_work(&self, units: u64) -> Result<(), ScanObservationFailureCode> {
+        self.0.set(self.0.get().saturating_add(units));
+        Ok(())
+    }
+
+    fn observe_scanned_bytes(&self, _bytes: u64) -> Result<(), ScanObservationFailureCode> {
+        Ok(())
+    }
+}
+
+struct ResizeBlocker<'authority> {
+    governor: positron_kernel::ResourceGovernor<'authority>,
+    tenant: TenantId,
+    arm_after_work: u64,
+    observed_work: std::cell::Cell<u64>,
+    blocker: RefCell<Option<positron_kernel::ResourceReservation<'authority>>>,
+}
+
+impl<'authority> ResizeBlocker<'authority> {
+    fn new(
+        governor: positron_kernel::ResourceGovernor<'authority>,
+        tenant: TenantId,
+        arm_after_work: u64,
+    ) -> Self {
+        Self {
+            governor,
+            tenant,
+            arm_after_work,
+            observed_work: std::cell::Cell::new(0),
+            blocker: RefCell::new(None),
+        }
+    }
+
+    fn armed(&self) -> bool {
+        self.blocker.borrow().is_some()
+    }
+
+    fn release(&self) {
+        drop(self.blocker.borrow_mut().take());
+    }
+}
+
+impl ScanObserver for ResizeBlocker<'_> {
+    fn observe_work(&self, units: u64) -> Result<(), ScanObservationFailureCode> {
+        let observed = self.observed_work.get().saturating_add(units);
+        self.observed_work.set(observed);
+        if observed != self.arm_after_work || self.blocker.borrow().is_some() {
+            return Ok(());
+        }
+        let snapshot = self
+            .governor
+            .inspect()
+            .map_err(|_| ScanObservationFailureCode::BudgetExhausted)?;
+        let dimension = ResourceDimension::MemoryBytes;
+        let shared = snapshot
+            .pool_capacity(positron_kernel::OrdinaryPool::Shared, dimension)
+            .checked_sub(snapshot.pool_usage(positron_kernel::OrdinaryPool::Shared, dimension))
+            .ok_or(ScanObservationFailureCode::BudgetExhausted)?;
+        let maintenance = snapshot
+            .pool_capacity(
+                positron_kernel::OrdinaryPool::OrdinaryMaintenanceBackup,
+                dimension,
+            )
+            .checked_sub(snapshot.pool_usage(
+                positron_kernel::OrdinaryPool::OrdinaryMaintenanceBackup,
+                dimension,
+            ))
+            .ok_or(ScanObservationFailureCode::BudgetExhausted)?;
+        let amount = shared
+            .checked_add(maintenance)
+            .and_then(|available| available.checked_sub(1))
+            .ok_or(ScanObservationFailureCode::BudgetExhausted)?;
+        let claim = WorkClaim::tenant(
+            self.tenant,
+            WorkKind::OrdinaryMaintenanceBackup,
+            ResourceAmounts::only(dimension, amount)
+                .map_err(|_| ScanObservationFailureCode::BudgetExhausted)?,
+        )
+        .map_err(|_| ScanObservationFailureCode::BudgetExhausted)?;
+        let blocker = self
+            .governor
+            .reserve(claim)
+            .map_err(|_| ScanObservationFailureCode::BudgetExhausted)?;
+        *self.blocker.borrow_mut() = Some(blocker);
+        Ok(())
+    }
+
+    fn observe_scanned_bytes(&self, _bytes: u64) -> Result<(), ScanObservationFailureCode> {
+        Ok(())
+    }
+}
 
 #[test]
 fn physical_observations_are_not_deduplicated_at_the_storage_seam() -> Result<(), Box<dyn Error>> {
@@ -170,6 +277,293 @@ fn physical_observations_are_not_deduplicated_at_the_storage_seam() -> Result<()
     assert!(restarted_span.conflicted());
     assert_eq!(restarted_span.variants()[0].observation_count(), 2);
     assert_eq!(restarted_span.variants()[1].observation_count(), 1);
+    Ok(())
+}
+
+#[test]
+fn summary_maintenance_applies_committed_deltas_quiesces_and_reopens_after_restart()
+-> Result<(), Box<dyn Error>> {
+    assert_eq!(
+        TraceQuietPeriod::new(0)
+            .expect_err("a zero quiescence interval is invalid")
+            .code(),
+        TraceStoreFailureCode::InvalidInput
+    );
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0xa1; 16])?,
+        CatalogSecret::from_owned(Box::new([0xa2; 32]), Box::new([0xa3; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let shard = VirtualShardId::new(23)?;
+    let ledger = ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        SegmentScope::new(tenant, SignalKind::Traces, shard),
+        SegmentProtectionKey::from_owned(Box::new([0xa5; 32])),
+    )?;
+    let trace = [0xa6; 16];
+    let observation = |name: &str, span_id: [u8; 8]| {
+        SpanObservation::checked_native(
+            trace,
+            span_id,
+            None,
+            name.to_owned(),
+            EventTime::missing(),
+            EventTime::missing(),
+            Vec::new(),
+            SpanKind::Server,
+            SamplingDecision::Sampled,
+            positron_policy::PolicyProvenance::new(1, [0xa7; 32], Vec::new())?,
+        )
+    };
+    let store = TraceStore::new();
+    let original = observation("original", [0xa8; 8])?;
+    let conflict = observation("conflict", [0xa8; 8])?;
+    ledger.append(
+        store
+            .prepare_unretained_for_test(
+                preparation_capacity(&authority, tenant)?,
+                &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
+                tenant,
+                shard,
+                positron_kernel::StoreBlockIdentity::new([0xa9; 16])?,
+                vec![original.clone(), original, conflict],
+            )?
+            .into_store_block(),
+    )?;
+    let quiet_period = TraceQuietPeriod::new(5)?;
+    let mut maintainer = TraceSummaryMaintainer::new(
+        authority.governor(),
+        tenant,
+        quiet_period,
+        ScanLimit::new(2)?,
+    )?;
+    let cancelled = match maintainer.maintain(
+        &store,
+        &ledger.snapshot()?,
+        &AlwaysCancelled,
+        &NeverObserved,
+        UnixNanoseconds::new(104),
+    ) {
+        Ok(_) => return Err("cancelled maintenance advanced its committed cursor".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(cancelled.code(), TraceStoreFailureCode::Cancelled);
+    {
+        let first = maintainer.maintain(
+            &store,
+            &ledger.snapshot()?,
+            &NeverCancelled,
+            &NeverObserved,
+            UnixNanoseconds::new(104),
+        )?;
+        assert_eq!(first.applied_observations(), 2);
+        assert!(!first.complete());
+        assert_eq!(first.incompleteness(), TraceIncompleteness::ResultLimit);
+        assert!(
+            !first
+                .summary(trace)
+                .ok_or("partial summary is present")?
+                .quiescent()
+        );
+    }
+    {
+        let first = maintainer.maintain(
+            &store,
+            &ledger.snapshot()?,
+            &NeverCancelled,
+            &NeverObserved,
+            UnixNanoseconds::new(104),
+        )?;
+        assert_eq!(first.applied_observations(), 1);
+        assert!(first.complete());
+        assert_eq!(first.incompleteness(), TraceIncompleteness::None);
+        let summary = first.summary(trace).ok_or("summary is present")?;
+        assert_eq!(summary.observation_count(), 3);
+        assert_eq!(summary.logical_span_count(), 1);
+        assert_eq!(summary.conflicted_span_count(), 1);
+        assert_eq!(
+            summary.time_provenance(),
+            TraceSummaryTimeProvenance::IngestTime
+        );
+        assert!(!summary.quiescent());
+        assert_eq!(summary.first_seen().instant(), UnixNanoseconds::new(100));
+        assert_eq!(summary.last_seen().instant(), UnixNanoseconds::new(100));
+    }
+
+    {
+        let quiesced = maintainer.maintain(
+            &store,
+            &ledger.snapshot()?,
+            &NeverCancelled,
+            &NeverObserved,
+            UnixNanoseconds::new(105),
+        )?;
+        assert!(
+            quiesced
+                .summary(trace)
+                .ok_or("summary is present")?
+                .quiescent()
+        );
+        assert_eq!(quiesced.applied_observations(), 0);
+    }
+
+    let late = observation("late", [0xaa; 8])?;
+    ledger.append(
+        store
+            .prepare_unretained_for_test(
+                preparation_capacity(&authority, tenant)?,
+                &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(110))),
+                tenant,
+                shard,
+                positron_kernel::StoreBlockIdentity::new([0xab; 16])?,
+                vec![late],
+            )?
+            .into_store_block(),
+    )?;
+    {
+        let reopened = maintainer.maintain(
+            &store,
+            &ledger.snapshot()?,
+            &NeverCancelled,
+            &NeverObserved,
+            UnixNanoseconds::new(111),
+        )?;
+        let reopened_summary = reopened.summary(trace).ok_or("summary is present")?;
+        assert_eq!(reopened.applied_observations(), 1);
+        assert_eq!(reopened_summary.observation_count(), 4);
+        assert_eq!(reopened_summary.logical_span_count(), 2);
+        assert!(!reopened_summary.quiescent());
+        assert_eq!(
+            reopened_summary.last_seen().instant(),
+            UnixNanoseconds::new(110)
+        );
+    }
+    drop(maintainer);
+
+    let mut recovered = TraceSummaryMaintainer::new(
+        authority.governor(),
+        tenant,
+        quiet_period,
+        ScanLimit::new(16)?,
+    )?;
+    let replayed = recovered.maintain(
+        &store,
+        &ledger.snapshot()?,
+        &NeverCancelled,
+        &NeverObserved,
+        UnixNanoseconds::new(115),
+    )?;
+    let replayed_summary = replayed
+        .summary(trace)
+        .ok_or("replayed summary is present")?;
+    assert_eq!(replayed.applied_observations(), 4);
+    assert_eq!(replayed_summary.observation_count(), 4);
+    assert!(replayed_summary.quiescent());
+    Ok(())
+}
+
+#[test]
+fn summary_maintenance_refusal_keeps_the_cursor_and_summary_unpublished()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0xb1; 16])?,
+        CatalogSecret::from_owned(Box::new([0xb2; 32]), Box::new([0xb3; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let shard = VirtualShardId::new(24)?;
+    let ledger = ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        SegmentScope::new(tenant, SignalKind::Traces, shard),
+        SegmentProtectionKey::from_owned(Box::new([0xb5; 32])),
+    )
+    .map_err(|failure| format!("constrained ledger setup: {failure:?}"))?;
+    let trace = [0xb6; 16];
+    let observation = SpanObservation::checked_native(
+        trace,
+        [0xb8; 8],
+        None,
+        "capacity".to_owned(),
+        EventTime::missing(),
+        EventTime::missing(),
+        Vec::new(),
+        SpanKind::Server,
+        SamplingDecision::Sampled,
+        positron_policy::PolicyProvenance::new(1, [0xb7; 32], Vec::new())?,
+    )?;
+    let store = TraceStore::new();
+    ledger.append(
+        store
+            .prepare_unretained_for_test(
+                preparation_capacity(&authority, tenant)?,
+                &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
+                tenant,
+                shard,
+                positron_kernel::StoreBlockIdentity::new([0xb9; 16])?,
+                vec![observation],
+            )?
+            .into_store_block(),
+    )?;
+    let scan_work = WorkMeter::new();
+    let scan = store.scan_physical_observed(
+        authority.governor(),
+        tenant,
+        &ledger.snapshot()?,
+        TraceScan::all(ScanLimit::new(1)?),
+        &NeverCancelled,
+        &scan_work,
+    )?;
+    assert!(scan.complete());
+    drop(scan);
+    let mut maintainer = TraceSummaryMaintainer::new(
+        authority.governor(),
+        tenant,
+        TraceQuietPeriod::new(5)?,
+        ScanLimit::new(1)?,
+    )?;
+    let blocker = ResizeBlocker::new(
+        authority.governor(),
+        tenant,
+        scan_work
+            .work()
+            .checked_add(1)
+            .ok_or("maintenance work boundary overflow")?,
+    );
+    let failure = match maintainer.maintain(
+        &store,
+        &ledger.snapshot()?,
+        &NeverCancelled,
+        &blocker,
+        UnixNanoseconds::new(100),
+    ) {
+        Ok(_) => return Err("maintenance published a summary after resize refusal".into()),
+        Err(failure) => failure,
+    };
+    assert!(blocker.armed(), "blocker armed after the physical scan");
+    assert_eq!(
+        failure.code(),
+        TraceStoreFailureCode::ResourceAdmissionRefused
+    );
+    blocker.release();
+    let replay = maintainer.maintain(
+        &store,
+        &ledger.snapshot()?,
+        &NeverCancelled,
+        &NeverObserved,
+        UnixNanoseconds::new(100),
+    )?;
+    assert_eq!(replay.applied_observations(), 1);
+    let summary = replay.summary(trace).ok_or("retry publishes the trace")?;
+    assert_eq!(summary.observation_count(), 1);
     Ok(())
 }
 

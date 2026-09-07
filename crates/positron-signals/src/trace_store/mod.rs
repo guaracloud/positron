@@ -9,6 +9,7 @@ mod fuzzing;
 mod observation;
 mod retained;
 mod scan;
+mod summary;
 mod types;
 
 #[cfg(test)]
@@ -22,11 +23,18 @@ pub use details::{
 pub use failure::{TraceStoreFailure, TraceStoreFailureCode};
 pub use observation::{EvaluatedSpanObservationInput, SamplingDecision, SpanKind, SpanObservation};
 pub use scan::{ScannedSpanObservation, TraceIncompleteness, TraceScan, TraceScanResult};
+pub use summary::{
+    TraceQuietPeriod, TraceSummary, TraceSummaryMaintainer, TraceSummaryMaintenance,
+    TraceSummaryTimeProvenance,
+};
 pub use types::{PreparedTraceBlock, StoredSpanObservation};
 
 #[cfg(fuzzing)]
 #[doc(hidden)]
 pub use fuzzing::fuzz_trace_store_block;
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub use summary::fuzz_trace_summary_state;
 
 /// The concrete Release 1 Trace Signal Store adapter.
 #[derive(Clone, Copy, Debug, Default)]
