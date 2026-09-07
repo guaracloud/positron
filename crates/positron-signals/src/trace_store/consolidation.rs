@@ -176,13 +176,13 @@ impl LogicalSpan {
 /// A logical view over one bounded physical Trace Store scan.
 #[derive(Debug)]
 pub struct LogicalTraceScanResult<'kernel> {
-    spans: Vec<LogicalSpan>,
-    decoded_observations: u64,
-    complete: bool,
-    scanned_bytes: u64,
-    scanned_bytes_limited: bool,
-    retained_size_bytes: u64,
-    _capacity: ResourceReservation<'kernel>,
+    pub(super) spans: Vec<LogicalSpan>,
+    pub(super) decoded_observations: u64,
+    pub(super) complete: bool,
+    pub(super) scanned_bytes: u64,
+    pub(super) scanned_bytes_limited: bool,
+    pub(super) retained_size_bytes: u64,
+    pub(super) _capacity: ResourceReservation<'kernel>,
 }
 
 impl LogicalTraceScanResult<'_> {

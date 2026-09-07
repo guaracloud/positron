@@ -258,6 +258,46 @@ impl<'kernel> TraceScanResult<'kernel> {
             },
         )
     }
+
+    fn into_trace_by_id(
+        mut self,
+        trace_id: [u8; 16],
+        profile: &ValueLimitProfile,
+        cancellation: &dyn ScanCancellation,
+        observer: &dyn ScanObserver,
+    ) -> Result<super::TraceByIdResult<'kernel>, TraceStoreFailure> {
+        self.observations
+            .retain(|observation| observation.observation().trace_id() == trace_id);
+        let logical = self.into_logical_spans(profile, cancellation, observer)?;
+        Ok(super::TraceByIdResult::from_logical(trace_id, logical))
+    }
+
+    fn into_matching_logical(
+        mut self,
+        search: &super::TraceSearch,
+        profile: &ValueLimitProfile,
+        cancellation: &dyn ScanCancellation,
+        observer: &dyn ScanObserver,
+    ) -> Result<super::LogicalTraceScanResult<'kernel>, TraceStoreFailure> {
+        let mut index = 0_usize;
+        while index < self.observations.len() {
+            let matched = self
+                .observations
+                .get(index)
+                .ok_or_else(TraceStoreFailure::invalid_input)
+                .and_then(|observation| {
+                    search.matches(observation.observation(), cancellation, observer)
+                })?;
+            if matched {
+                index = index
+                    .checked_add(1)
+                    .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+            } else {
+                self.observations.swap_remove(index);
+            }
+        }
+        self.into_logical_spans(profile, cancellation, observer)
+    }
 }
 
 /// One authenticated observation with its stable physical commit identity.
@@ -311,6 +351,101 @@ impl std::ops::Deref for ScannedSpanObservation {
 }
 
 impl super::TraceStore {
+    /// Searches the normal consolidated Trace Store view for one authenticated snapshot.
+    ///
+    /// The logical result is ordered by trace and span identity and retains all
+    /// conflicting span variants; its completion state discloses finite scan
+    /// boundaries instead of presenting a partial result as exhaustive.
+    pub fn search<'kernel>(
+        &self,
+        governor: ResourceGovernor<'kernel>,
+        tenant: TenantId,
+        snapshot: &LedgerSnapshot<'_>,
+        search: super::TraceSearch,
+    ) -> Result<super::LogicalTraceScanResult<'kernel>, TraceStoreFailure> {
+        self.search_observed(
+            governor,
+            tenant,
+            snapshot,
+            search,
+            &NeverCancelled,
+            &Unobserved,
+        )
+    }
+
+    /// Searches with caller-owned cancellation and cumulative budget observation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_observed<'kernel>(
+        &self,
+        governor: ResourceGovernor<'kernel>,
+        tenant: TenantId,
+        snapshot: &LedgerSnapshot<'_>,
+        search: super::TraceSearch,
+        cancellation: &dyn ScanCancellation,
+        observer: &dyn ScanObserver,
+    ) -> Result<super::LogicalTraceScanResult<'kernel>, TraceStoreFailure> {
+        let profile = ValueLimitProfile::release_1_system_maximum();
+        self.scan_physical_observed_with_profile(
+            &profile,
+            governor,
+            tenant,
+            snapshot,
+            search.scan(),
+            cancellation,
+            observer,
+        )?
+        .into_matching_logical(&search, &profile, cancellation, observer)
+    }
+
+    /// Retrieves one tenant-scoped trace from one authenticated snapshot.
+    ///
+    /// The result remains explicitly incomplete when its finite physical scan
+    /// boundary is reached before the snapshot frontier, so an empty response
+    /// never fabricates trace absence.
+    pub fn trace_by_id<'kernel>(
+        &self,
+        governor: ResourceGovernor<'kernel>,
+        tenant: TenantId,
+        snapshot: &LedgerSnapshot<'_>,
+        trace_id: [u8; 16],
+        search: super::TraceSearch,
+    ) -> Result<super::TraceByIdResult<'kernel>, TraceStoreFailure> {
+        self.trace_by_id_observed(
+            governor,
+            tenant,
+            snapshot,
+            trace_id,
+            search,
+            &NeverCancelled,
+            &Unobserved,
+        )
+    }
+
+    /// Retrieves one trace with caller-owned cancellation and cumulative budget observation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn trace_by_id_observed<'kernel>(
+        &self,
+        governor: ResourceGovernor<'kernel>,
+        tenant: TenantId,
+        snapshot: &LedgerSnapshot<'_>,
+        trace_id: [u8; 16],
+        search: super::TraceSearch,
+        cancellation: &dyn ScanCancellation,
+        observer: &dyn ScanObserver,
+    ) -> Result<super::TraceByIdResult<'kernel>, TraceStoreFailure> {
+        let profile = ValueLimitProfile::release_1_system_maximum();
+        self.scan_physical_observed_with_profile(
+            &profile,
+            governor,
+            tenant,
+            snapshot,
+            search.scan(),
+            cancellation,
+            observer,
+        )?
+        .into_trace_by_id(trace_id, &profile, cancellation, observer)
+    }
+
     /// Scans the normal consolidated Trace Store view for one authenticated snapshot.
     pub fn scan<'kernel>(
         &self,

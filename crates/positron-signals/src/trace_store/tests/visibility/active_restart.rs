@@ -255,3 +255,97 @@ fn committed_span_is_visible_immediately_from_the_active_segment() -> Result<(),
     assert_eq!(too_many.code(), TraceStoreFailureCode::LimitExceeded);
     Ok(())
 }
+
+#[test]
+fn trace_by_id_returns_the_committed_active_trace_from_its_snapshot() -> Result<(), Box<dyn Error>>
+{
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x14; 16])?,
+        CatalogSecret::from_owned(Box::new([0x24; 32]), Box::new([0x34; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let shard = VirtualShardId::new(4)?;
+    let ledger = ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        SegmentScope::new(tenant, SignalKind::Traces, shard),
+        SegmentProtectionKey::from_owned(Box::new([0x54; 32])),
+    )?;
+    let attribute = positron_domain::value::AttributeOccurrenceSetCandidate::new(
+        positron_domain::value::AttributeNamespace::Record,
+        "http.response.status_code".to_owned(),
+        vec![positron_domain::value::CandidateAttributeValue::signed_integer(503)],
+    )
+    .validate(ValueLimitProfile::release_1_system_maximum())?;
+    let expected = attribute
+        .occurrence(0)
+        .ok_or("filter attribute occurrence")?
+        .try_clone()?;
+    let observation = SpanObservation::checked_native(
+        [0x12; 16],
+        [0x23; 8],
+        None,
+        "checkout".to_owned(),
+        EventTime::received(UnixNanoseconds::new(10), SourceTimeQuality::Usable)?,
+        EventTime::received(UnixNanoseconds::new(20), SourceTimeQuality::Usable)?,
+        vec![attribute],
+        SpanKind::Server,
+        SamplingDecision::Sampled,
+        positron_policy::PolicyProvenance::new(1, [0x77; 32], Vec::new())?,
+    )?;
+    let store = TraceStore::new();
+    ledger.append(
+        store
+            .prepare_unretained_for_test(
+                preparation_capacity(&authority, tenant)?,
+                &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
+                tenant,
+                shard,
+                positron_kernel::StoreBlockIdentity::new([0x64; 16])?,
+                vec![observation],
+            )?
+            .into_store_block(),
+    )?;
+    let snapshot = ledger.snapshot()?;
+
+    let trace = store.trace_by_id(
+        authority.governor(),
+        tenant,
+        &snapshot,
+        [0x12; 16],
+        TraceSearch::all(ScanLimit::new(1)?),
+    )?;
+
+    assert_eq!(trace.trace_id(), [0x12; 16]);
+    assert_eq!(trace.spans().len(), 1);
+    assert_eq!(trace.spans()[0].span_id(), [0x23; 8]);
+    assert!(trace.complete());
+
+    let search = store.search(
+        authority.governor(),
+        tenant,
+        &snapshot,
+        TraceSearch::all(ScanLimit::new(1)?),
+    )?;
+    assert_eq!(search.spans().len(), 1);
+    assert_eq!(search.spans()[0].trace_id(), [0x12; 16]);
+    assert!(search.complete());
+
+    let filtered = store.search(
+        authority.governor(),
+        tenant,
+        &snapshot,
+        TraceSearch::all(ScanLimit::new(1)?).with_attribute_equals(
+            positron_domain::value::AttributeNamespace::Record,
+            "http.response.status_code".to_owned(),
+            expected,
+        )?,
+    )?;
+    assert_eq!(filtered.spans().len(), 1);
+    assert_eq!(filtered.spans()[0].trace_id(), [0x12; 16]);
+    Ok(())
+}

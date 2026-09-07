@@ -2,7 +2,7 @@ use super::{
     SamplingDecision, SpanKind, SpanObservation, SpanObservationDetailsInput,
     StoredSpanObservation, codec,
 };
-use super::{TraceIncompleteness, TraceScan, TraceStore};
+use super::{TraceIncompleteness, TraceScan, TraceSearch, TraceStore};
 use crate::{
     ScanCancellation, ScanLimit, ScanObservationFailureCode, ScanObserver, TraceStoreFailureCode,
 };
