@@ -144,7 +144,7 @@ fn run_once(data: &[u8], root: &std::path::Path) -> Result<(), Box<dyn Error>> {
     for command in data.chunks_exact(4).take(MAX_OPERATIONS) {
         match command[0] % 6 {
             0 | 1 => {
-                let trace = trace_id(command[1]);
+                let trace = trace_id(command);
                 let observation = observation(&policy, trace, command[2], command[3])?;
                 append(
                     &ledger,
@@ -235,8 +235,24 @@ fn source_set(source: &AtomicI64, input: u8) {
     source.store(value, Ordering::Relaxed);
 }
 
-fn trace_id(selector: u8) -> [u8; 16] {
-    [selector.max(1); 16]
+fn trace_id(command: &[u8]) -> [u8; 16] {
+    let mut state = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in command {
+        state ^= u64::from(*byte);
+        state = state.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let mut trace_id = [0_u8; 16];
+    trace_id[..8].copy_from_slice(&state.to_be_bytes());
+    trace_id[8..].copy_from_slice(
+        &state
+            .rotate_left(29)
+            .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            .to_be_bytes(),
+    );
+    if trace_id == [0; 16] {
+        trace_id[0] = 1;
+    }
+    trace_id
 }
 
 fn observation(
@@ -335,8 +351,9 @@ fn replay_and_assert(
         ScanLimit::new(1)?,
     )?;
     let total = expected.values().copied().sum::<u64>();
-    let mut completed = total == 0;
-    for _ in 0..=total {
+    let mut completed = false;
+    let mut quiescence_complete = false;
+    for _ in 0..=total.saturating_mul(2) {
         let snapshot = ledger.snapshot()?;
         let result = replay.maintain(
             store,
@@ -348,10 +365,17 @@ fn replay_and_assert(
         assert_visible_summary_counts(&result, expected);
         if result.complete() {
             completed = true;
-            break;
+            if result.quiescence_complete() {
+                quiescence_complete = true;
+                break;
+            }
         }
     }
     assert!(completed, "bounded replay did not reach its authenticated frontier");
+    assert!(
+        quiescence_complete,
+        "bounded replay did not refresh quiescence for its authenticated frontier"
+    );
     let snapshot = ledger.snapshot()?;
     let result = replay.maintain(
         store,

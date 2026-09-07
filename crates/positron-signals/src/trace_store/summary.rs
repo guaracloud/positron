@@ -44,6 +44,49 @@ pub enum TraceSummaryTimeProvenance {
     IngestTime,
 }
 
+/// Immutable authenticated coverage for one trace-summary maintenance result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TraceSummaryCoverage {
+    scope: SegmentScope,
+    catalog_generation: u64,
+    frontier: CommitPosition,
+    applied_cursor: Option<(CommitPosition, RecordOrdinal)>,
+    physical_complete: bool,
+    quiescence_complete: bool,
+    quiescence_checked_at: Option<IngestTime>,
+}
+
+impl TraceSummaryCoverage {
+    #[must_use]
+    pub const fn scope(self) -> SegmentScope {
+        self.scope
+    }
+    #[must_use]
+    pub const fn catalog_generation(self) -> u64 {
+        self.catalog_generation
+    }
+    #[must_use]
+    pub const fn frontier(self) -> CommitPosition {
+        self.frontier
+    }
+    #[must_use]
+    pub const fn applied_cursor(self) -> Option<(CommitPosition, RecordOrdinal)> {
+        self.applied_cursor
+    }
+    #[must_use]
+    pub const fn physical_complete(self) -> bool {
+        self.physical_complete
+    }
+    #[must_use]
+    pub const fn quiescence_complete(self) -> bool {
+        self.quiescence_complete
+    }
+    #[must_use]
+    pub const fn quiescence_checked_at(self) -> Option<IngestTime> {
+        self.quiescence_checked_at
+    }
+}
+
 #[derive(Clone, Debug)]
 struct SpanSummary {
     span_id: [u8; 8],
@@ -108,8 +151,10 @@ impl TraceSummary {
 /// Result of one bounded summary-maintenance handler invocation.
 pub struct TraceSummaryMaintenance<'a, 'kernel> {
     maintainer: &'a TraceSummaryMaintainer<'kernel>,
+    coverage: TraceSummaryCoverage,
     applied_observations: u64,
     complete: bool,
+    quiescence_complete: bool,
     incompleteness: TraceIncompleteness,
 }
 
@@ -122,6 +167,16 @@ impl TraceSummaryMaintenance<'_, '_> {
     #[must_use]
     pub const fn complete(&self) -> bool {
         self.complete
+    }
+    /// Whether every retained summary was refreshed at one ingest-time instant.
+    #[must_use]
+    pub const fn quiescence_complete(&self) -> bool {
+        self.quiescence_complete
+    }
+    /// Returns the authenticated snapshot and cursor this result covers.
+    #[must_use]
+    pub const fn coverage(&self) -> TraceSummaryCoverage {
+        self.coverage
     }
     /// Returns why this invocation stopped before its authenticated snapshot frontier.
     #[must_use]
@@ -153,6 +208,9 @@ pub struct TraceSummaryMaintainer<'kernel> {
     index: SummaryIndex,
     cursor: Option<(CommitPosition, RecordOrdinal)>,
     catalog_generation: Option<u64>,
+    quiescence_basis: Option<(CommitPosition, u64)>,
+    quiescence_target: Option<IngestTime>,
+    quiescence_cursor: usize,
     capacity: ResourceReservation<'kernel>,
 }
 
@@ -188,6 +246,9 @@ impl<'kernel> TraceSummaryMaintainer<'kernel> {
             index: SummaryIndex::new(),
             cursor: None,
             catalog_generation: None,
+            quiescence_basis: None,
+            quiescence_target: None,
+            quiescence_cursor: 0,
             capacity,
         })
     }
@@ -229,16 +290,37 @@ impl<'kernel> TraceSummaryMaintainer<'kernel> {
                 .checked_add(1)
                 .ok_or_else(TraceStoreFailure::limit_exceeded)?;
         }
+        let mut quiescence_complete = false;
         if complete {
             let lifecycle_now = lifecycle_clock
                 .assign_ingest_time()
                 .map_err(|_| TraceStoreFailure::rejected_clock())?;
-            self.refresh_quiescence(lifecycle_now.instant(), cancellation, observer)?;
+            quiescence_complete = self.refresh_quiescence(
+                snapshot.frontier(),
+                snapshot.catalog_generation(),
+                lifecycle_now,
+                cancellation,
+                observer,
+            )?;
         }
         Ok(TraceSummaryMaintenance {
             maintainer: self,
+            coverage: TraceSummaryCoverage {
+                scope: snapshot.scope(),
+                catalog_generation: snapshot.catalog_generation(),
+                frontier: snapshot.frontier(),
+                applied_cursor: self.cursor,
+                physical_complete: complete,
+                quiescence_complete,
+                quiescence_checked_at: if complete {
+                    self.quiescence_target
+                } else {
+                    None
+                },
+            },
             applied_observations: applied,
             complete,
+            quiescence_complete,
             incompleteness,
         })
     }
@@ -281,15 +363,21 @@ impl<'kernel> TraceSummaryMaintainer<'kernel> {
         let lookup = self
             .index
             .lookup_observed(trace_id, cancellation, observer)?;
-        let (slot, vacant_bucket, index_growth) = match lookup {
-            Lookup::Present(slot) => (slot, None, None),
+        let (slot, vacant_bucket, index_growth, appending) = match lookup {
+            Lookup::Present(slot) => (slot, None, None, false),
             Lookup::Vacant(bucket) => (
                 self.summaries.len(),
                 Some(bucket),
                 self.index.growth_bytes_for_insert()?,
+                true,
             ),
         };
-        self.reserve_staged_update(expected, index_growth.unwrap_or(0))?;
+        let outer_growth = if appending {
+            self.outer_growth_bytes_for_append()?
+        } else {
+            0
+        };
+        self.reserve_staged_update(expected, index_growth.unwrap_or(0), outer_growth)?;
         let semantic = super::codec::encode_semantic_observation_with_profile_observed(
             &ValueLimitProfile::release_1_system_maximum(),
             observation,
@@ -328,12 +416,7 @@ impl<'kernel> TraceSummaryMaintainer<'kernel> {
             None
         };
         if update.prior.is_none() {
-            self.summaries
-                .try_reserve_exact(1)
-                .map_err(|_| TraceStoreFailure::resource_exhausted())?;
-            self.summary_capacities
-                .try_reserve_exact(1)
-                .map_err(|_| TraceStoreFailure::resource_exhausted())?;
+            self.reserve_outer_slots()?;
         }
         let prior_index = staged_index.map(|staged| std::mem::replace(&mut self.index, staged));
         let inserted_bucket = if update.prior.is_none() && prior_index.is_none() {
@@ -396,22 +479,45 @@ impl<'kernel> TraceSummaryMaintainer<'kernel> {
 
     fn refresh_quiescence(
         &mut self,
-        lifecycle_now: positron_domain::time::UnixNanoseconds,
+        frontier: CommitPosition,
+        catalog_generation: u64,
+        lifecycle_now: IngestTime,
         cancellation: &dyn ScanCancellation,
         observer: &dyn ScanObserver,
-    ) -> Result<(), TraceStoreFailure> {
-        for summary in &mut self.summaries {
+    ) -> Result<bool, TraceStoreFailure> {
+        let basis = (frontier, catalog_generation);
+        if self.quiescence_basis != Some(basis) || self.quiescence_cursor >= self.summaries.len() {
+            self.quiescence_basis = Some(basis);
+            self.quiescence_target = Some(lifecycle_now);
+            self.quiescence_cursor = 0;
+        }
+        let target = self
+            .quiescence_target
+            .ok_or_else(TraceStoreFailure::invalid_input)?;
+        let mut refreshed = 0_usize;
+        for summary in self.summaries.iter_mut().skip(self.quiescence_cursor) {
+            if refreshed >= self.limit.value() {
+                break;
+            }
             super::scan::check_cancel(cancellation)?;
             observer
                 .observe_work(1)
                 .map_err(TraceStoreFailure::observation)?;
-            let elapsed = lifecycle_now
+            let elapsed = target
+                .instant()
                 .value()
                 .saturating_sub(summary.last_seen.instant().value());
             summary.quiescent = u64::try_from(elapsed)
                 .is_ok_and(|elapsed| elapsed >= self.quiet_period.nanoseconds());
+            refreshed = refreshed
+                .checked_add(1)
+                .ok_or_else(TraceStoreFailure::limit_exceeded)?;
         }
-        Ok(())
+        self.quiescence_cursor = self
+            .quiescence_cursor
+            .checked_add(refreshed)
+            .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+        Ok(self.quiescence_cursor >= self.summaries.len())
     }
 
     fn validate_snapshot(
@@ -486,6 +592,7 @@ impl<'kernel> TraceSummaryMaintainer<'kernel> {
         &mut self,
         semantic_capacity: usize,
         index_growth_bytes: u64,
+        outer_growth_bytes: u64,
     ) -> Result<(), TraceStoreFailure> {
         let current = self.capacity.granted().get(ResourceDimension::MemoryBytes);
         let staged = checked_bytes(semantic_capacity, 1)?
@@ -501,6 +608,7 @@ impl<'kernel> TraceSummaryMaintainer<'kernel> {
             .checked_mul(3)
             .and_then(|bytes| bytes.checked_add(staged))
             .and_then(|bytes| bytes.checked_add(index_growth_bytes))
+            .and_then(|bytes| bytes.checked_add(outer_growth_bytes))
             .ok_or_else(TraceStoreFailure::limit_exceeded)?;
         let amounts = ResourceAmounts::only(ResourceDimension::MemoryBytes, required)
             .map_err(|_| TraceStoreFailure::limit_exceeded())?;
@@ -508,5 +616,49 @@ impl<'kernel> TraceSummaryMaintainer<'kernel> {
             .try_resize_preserving_capacity(amounts)
             .map_err(|_| TraceStoreFailure::resource_admission_refused())
             .map(|_| ())
+    }
+
+    fn outer_growth_bytes_for_append(&self) -> Result<u64, TraceStoreFailure> {
+        let summary_capacity =
+            retained::append_capacity(self.summaries.len(), self.summaries.capacity())?;
+        let capacity_cache = retained::append_capacity(
+            self.summary_capacities.len(),
+            self.summary_capacities.capacity(),
+        )?;
+        let summary_bytes = if summary_capacity > self.summaries.capacity() {
+            checked_bytes(summary_capacity, std::mem::size_of::<TraceSummary>())?
+        } else {
+            0
+        };
+        let cache_bytes = if capacity_cache > self.summary_capacities.capacity() {
+            checked_bytes(capacity_cache, std::mem::size_of::<u64>())?
+        } else {
+            0
+        };
+        summary_bytes
+            .checked_add(cache_bytes)
+            .ok_or_else(TraceStoreFailure::limit_exceeded)
+    }
+
+    fn reserve_outer_slots(&mut self) -> Result<(), TraceStoreFailure> {
+        let summaries = retained::append_capacity(self.summaries.len(), self.summaries.capacity())?;
+        let capacities = retained::append_capacity(
+            self.summary_capacities.len(),
+            self.summary_capacities.capacity(),
+        )?;
+        self.summaries
+            .try_reserve_exact(
+                summaries
+                    .checked_sub(self.summaries.len())
+                    .ok_or_else(TraceStoreFailure::limit_exceeded)?,
+            )
+            .map_err(|_| TraceStoreFailure::resource_exhausted())?;
+        self.summary_capacities
+            .try_reserve_exact(
+                capacities
+                    .checked_sub(self.summary_capacities.len())
+                    .ok_or_else(TraceStoreFailure::limit_exceeded)?,
+            )
+            .map_err(|_| TraceStoreFailure::resource_exhausted())
     }
 }

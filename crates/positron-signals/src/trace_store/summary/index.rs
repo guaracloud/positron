@@ -1,4 +1,6 @@
 use crate::{ScanCancellation, ScanObserver};
+use std::collections::hash_map::RandomState;
+use std::hash::BuildHasher;
 
 use super::TraceStoreFailure;
 
@@ -19,13 +21,15 @@ pub(super) enum Lookup {
 pub(super) struct SummaryIndex {
     buckets: Vec<Option<Bucket>>,
     entries: usize,
+    hasher: RandomState,
 }
 
 impl SummaryIndex {
-    pub(super) const fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             buckets: Vec::new(),
             entries: 0,
+            hasher: RandomState::new(),
         }
     }
 
@@ -53,7 +57,7 @@ impl SummaryIndex {
     /// Looks up an already committed trace without consuming maintenance work.
     pub(super) fn slot(&self, trace_id: [u8; 16]) -> Option<usize> {
         let mask = self.buckets.len().checked_sub(1)?;
-        let mut bucket = bucket_for(trace_id, mask);
+        let mut bucket = self.bucket_for(trace_id, mask);
         for _ in 0..self.buckets.len() {
             match self.buckets.get(bucket)? {
                 Some(entry) if entry.trace_id == trace_id => return Some(entry.slot),
@@ -73,7 +77,7 @@ impl SummaryIndex {
         let Some(mask) = self.buckets.len().checked_sub(1) else {
             return Ok(Lookup::Vacant(0));
         };
-        let mut bucket = bucket_for(trace_id, mask);
+        let mut bucket = self.bucket_for(trace_id, mask);
         for _ in 0..self.buckets.len() {
             observe(cancellation, observer)?;
             match self
@@ -125,6 +129,7 @@ impl SummaryIndex {
         let mut staged = Self {
             buckets,
             entries: 0,
+            hasher: self.hasher.clone(),
         };
         for entry in self.buckets.iter().flatten() {
             let Lookup::Vacant(bucket) =
@@ -194,6 +199,14 @@ impl SummaryIndex {
             .checked_mul(2)
             .ok_or_else(TraceStoreFailure::limit_exceeded)
     }
+
+    fn bucket_for(&self, trace_id: [u8; 16], mask: usize) -> usize {
+        let hash = match usize::try_from(self.hasher.hash_one(trace_id)) {
+            Ok(hash) => hash,
+            Err(_) => usize::MAX,
+        };
+        hash & mask
+    }
 }
 
 fn observe(
@@ -204,12 +217,4 @@ fn observe(
     observer
         .observe_work(1)
         .map_err(TraceStoreFailure::observation)
-}
-
-fn bucket_for(trace_id: [u8; 16], mask: usize) -> usize {
-    let mut hash = 2_166_136_261_usize;
-    for byte in trace_id {
-        hash = hash.wrapping_mul(16_777_619) ^ usize::from(byte);
-    }
-    hash & mask
 }

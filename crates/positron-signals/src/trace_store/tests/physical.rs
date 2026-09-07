@@ -493,7 +493,7 @@ fn summary_maintenance_applies_committed_deltas_quiesces_and_reopens_after_resta
         assert_eq!(summary.last_seen().instant(), UnixNanoseconds::new(100));
     }
 
-    {
+    let quiescence_coverage = {
         let quiesced = maintainer.maintain(
             &store,
             &ledger.snapshot()?,
@@ -508,7 +508,8 @@ fn summary_maintenance_applies_committed_deltas_quiesces_and_reopens_after_resta
                 .quiescent()
         );
         assert_eq!(quiesced.applied_observations(), 0);
-    }
+        quiesced.coverage()
+    };
 
     let stale_snapshot = ledger.snapshot()?;
     let late = observation("late", [0xaa; 8])?;
@@ -524,10 +525,25 @@ fn summary_maintenance_applies_committed_deltas_quiesces_and_reopens_after_resta
             )?
             .into_store_block(),
     )?;
+    let current_snapshot = ledger.snapshot()?;
+    assert_eq!(
+        quiescence_coverage.scope(),
+        SegmentScope::new(tenant, SignalKind::Traces, shard)
+    );
+    assert_eq!(
+        quiescence_coverage.catalog_generation(),
+        stale_snapshot.catalog_generation()
+    );
+    assert_eq!(quiescence_coverage.frontier(), stale_snapshot.frontier());
+    assert!(
+        quiescence_coverage.frontier() < current_snapshot.frontier(),
+        "a quiescent result must retain the authenticated frontier it covered"
+    );
+    assert!(quiescence_coverage.physical_complete());
     {
         let reopened = maintainer.maintain(
             &store,
-            &ledger.snapshot()?,
+            &current_snapshot,
             &NeverCancelled,
             &NeverObserved,
             &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(111))),
@@ -767,6 +783,168 @@ fn summary_maintenance_refusal_keeps_the_cursor_and_summary_unpublished()
         Err(failure) => failure,
     };
     assert_eq!(exhausted.code(), TraceStoreFailureCode::BudgetExhausted);
+    Ok(())
+}
+
+#[test]
+fn summary_maintenance_rejects_and_retries_at_the_outer_capacity_boundary()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x70; 16])?,
+        CatalogSecret::from_owned(Box::new([0x71; 32]), Box::new([0x72; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let shard = VirtualShardId::new(70)?;
+    let scope = SegmentScope::new(tenant, SignalKind::Traces, shard);
+    let ledger = ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        scope,
+        SegmentProtectionKey::from_owned(Box::new([0x73; 32])),
+    )?;
+    let store = TraceStore::new();
+    let mut maintainer = TraceSummaryMaintainer::new(
+        authority.governor(),
+        scope,
+        TraceQuietPeriod::new(5)?,
+        ScanLimit::new(1)?,
+    )?;
+    let append = |trace_value: u8, identity: u8| -> Result<_, Box<dyn Error>> {
+        let observation = SpanObservation::checked_native(
+            [trace_value; 16],
+            [0x74; 8],
+            None,
+            "outer-capacity".to_owned(),
+            EventTime::missing(),
+            EventTime::missing(),
+            Vec::new(),
+            SpanKind::Internal,
+            SamplingDecision::Unknown,
+            positron_policy::PolicyProvenance::new(1, [0x75; 32], Vec::new())?,
+        )?;
+        Ok(ledger.append(
+            store
+                .prepare_unretained_for_test(
+                    preparation_capacity(&authority, tenant)?,
+                    &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
+                    tenant,
+                    shard,
+                    StoreBlockIdentity::new([identity; 16])?,
+                    vec![observation],
+                )?
+                .into_store_block(),
+        )?)
+    };
+    let mut fifth = None;
+    for trace_value in 1..=5 {
+        let receipt = append(trace_value, trace_value)?;
+        if trace_value == 5 {
+            fifth = Some(receipt);
+        }
+        let maintained = maintainer.maintain(
+            &store,
+            &ledger.snapshot()?,
+            &NeverCancelled,
+            &NeverObserved,
+            &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
+        )?;
+        assert_eq!(maintained.applied_observations(), 1);
+        assert!(maintained.summary([trace_value; 16]).is_some());
+    }
+    let fifth_usage = authority
+        .governor()
+        .inspect()?
+        .reserve_consumption(ResourceDimension::MemoryBytes);
+    append(6, 6)?;
+    let fifth = fifth.ok_or("fifth boundary receipt missing")?;
+    let scan_work = WorkMeter::new();
+    let physical = store.scan_physical_observed(
+        authority.governor(),
+        tenant,
+        &ledger.snapshot()?,
+        TraceScan::after_cursor(
+            ScanLimit::new(1)?,
+            fifth.position(),
+            positron_domain::routing::RecordOrdinal::new(0)?,
+        ),
+        &NeverCancelled,
+        &scan_work,
+    )?;
+    assert_eq!(physical.observations().len(), 1);
+    drop(physical);
+    let blocker = ResizeBlocker::new(
+        authority.governor(),
+        tenant,
+        scan_work
+            .work()
+            .checked_add(1)
+            .ok_or("outer capacity work boundary overflow")?,
+    );
+    let failure = match maintainer.maintain(
+        &store,
+        &ledger.snapshot()?,
+        &NeverCancelled,
+        &blocker,
+        &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
+    ) {
+        Ok(_) => return Err("outer capacity growth bypassed resource admission".into()),
+        Err(failure) => failure,
+    };
+    assert!(blocker.armed());
+    assert_eq!(
+        failure.code(),
+        TraceStoreFailureCode::ResourceAdmissionRefused
+    );
+    assert_eq!(
+        authority
+            .governor()
+            .inspect()?
+            .reserve_consumption(ResourceDimension::MemoryBytes),
+        fifth_usage,
+        "a rejected outer-capacity update must retain neither a cursor advance nor governed memory"
+    );
+    let repeated = match maintainer.maintain(
+        &store,
+        &ledger.snapshot()?,
+        &NeverCancelled,
+        &blocker,
+        &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
+    ) {
+        Ok(_) => return Err("repeated outer capacity growth bypassed resource admission".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(
+        repeated.code(),
+        TraceStoreFailureCode::ResourceAdmissionRefused
+    );
+    assert_eq!(
+        authority
+            .governor()
+            .inspect()?
+            .reserve_consumption(ResourceDimension::MemoryBytes),
+        fifth_usage,
+        "repeated rejected growth must keep the governed capacity stable"
+    );
+    blocker.release();
+    let retried = maintainer.maintain(
+        &store,
+        &ledger.snapshot()?,
+        &NeverCancelled,
+        &NeverObserved,
+        &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
+    )?;
+    assert_eq!(retried.applied_observations(), 1);
+    assert_eq!(
+        retried
+            .summary([6; 16])
+            .ok_or("retry publishes the boundary trace")?
+            .observation_count(),
+        1
+    );
     Ok(())
 }
 

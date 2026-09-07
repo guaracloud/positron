@@ -25,8 +25,8 @@ pub use trace_store::{
     SpanObservation, SpanObservationDetails, SpanObservationDetailsInput, SpanObservationVariant,
     SpanResourceMetadata, SpanScopeMetadata, SpanStatus, SpanStatusCode, StoredSpanObservation,
     TraceIncompleteness, TraceQuietPeriod, TraceScan, TraceScanResult, TraceStore,
-    TraceStoreFailure, TraceStoreFailureCode, TraceSummary, TraceSummaryMaintainer,
-    TraceSummaryMaintenance, TraceSummaryTimeProvenance,
+    TraceStoreFailure, TraceStoreFailureCode, TraceSummary, TraceSummaryCoverage,
+    TraceSummaryMaintainer, TraceSummaryMaintenance, TraceSummaryTimeProvenance,
 };
 
 #[cfg(fuzzing)]

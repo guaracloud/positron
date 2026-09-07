@@ -53,3 +53,20 @@ pub(super) fn checked_bytes(
         .and_then(|(capacity, element_bytes)| capacity.checked_mul(element_bytes))
         .ok_or_else(TraceStoreFailure::limit_exceeded)
 }
+
+pub(super) fn append_capacity(length: usize, capacity: usize) -> Result<usize, TraceStoreFailure> {
+    let required = length
+        .checked_add(1)
+        .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+    if required <= capacity {
+        return Ok(capacity);
+    }
+    let geometric = if capacity == 0 {
+        4
+    } else {
+        capacity
+            .checked_mul(2)
+            .ok_or_else(TraceStoreFailure::limit_exceeded)?
+    };
+    Ok(geometric.max(required))
+}
