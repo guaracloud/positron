@@ -954,6 +954,121 @@ fn summary_maintenance_refusal_keeps_the_cursor_and_summary_unpublished()
 }
 
 #[test]
+fn summary_maintenance_retries_after_nested_truncation_budget_refusal() -> Result<(), Box<dyn Error>>
+{
+    let root = TemporaryRoot::new()?;
+    let authority = establish_kernel_authority(PrimaryDataVolume::acquire(
+        root.path(),
+        MountQualification::LocalHost,
+    )?)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x6b; 16])?,
+        CatalogSecret::from_owned(Box::new([0x6c; 32]), Box::new([0x6d; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let shard = VirtualShardId::new(75)?;
+    let scope = SegmentScope::new(tenant, SignalKind::Traces, shard);
+    let ledger = ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        scope,
+        SegmentProtectionKey::from_owned(Box::new([0x6e; 32])),
+    )?;
+    let nested = AttributeOccurrenceSetCandidate::new(
+        AttributeNamespace::Record,
+        "retained".to_owned(),
+        vec![CandidateAttributeValue::array(vec![
+            CandidateAttributeValue::string("before".to_owned()),
+            CandidateAttributeValue::key_value_list(vec![CandidateKeyValue::new(
+                "child".to_owned(),
+                CandidateAttributeValue::array(vec![
+                    CandidateAttributeValue::string("still-before".to_owned()),
+                    CandidateAttributeValue::truncated(
+                        CandidateAttributeValue::string("sanitized".to_owned()),
+                        positron_domain::value::MarkerAction::TruncatedBytes,
+                    ),
+                ]),
+            )]),
+        ])],
+    )
+    .validate(TraceStore::value_limit_profile())?;
+    let trace = [0x6f; 16];
+    let observation = SpanObservation::checked_native(
+        trace,
+        [0x70; 8],
+        None,
+        "nested-truncation".to_owned(),
+        EventTime::missing(),
+        EventTime::missing(),
+        vec![nested],
+        SpanKind::Internal,
+        SamplingDecision::Unknown,
+        positron_policy::PolicyProvenance::new(1, [0x71; 32], Vec::new())?,
+    )?;
+    let store = TraceStore::new();
+    ledger.append(
+        store
+            .prepare_unretained_for_test(
+                preparation_capacity(&authority, tenant)?,
+                &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
+                tenant,
+                shard,
+                StoreBlockIdentity::new([0x72; 16])?,
+                vec![observation],
+            )?
+            .into_store_block(),
+    )?;
+    let physical_work = WorkMeter::new();
+    let physical = store.scan_physical_observed(
+        authority.governor(),
+        tenant,
+        &ledger.snapshot()?,
+        TraceScan::all(ScanLimit::new(1)?),
+        &NeverCancelled,
+        &physical_work,
+    )?;
+    assert_eq!(physical.observations().len(), 1);
+    drop(physical);
+    let traversal_budget = physical_work
+        .work()
+        .checked_add(5)
+        .ok_or("nested truncation traversal allowance overflow")?;
+    let mut maintainer = TraceSummaryMaintainer::new(
+        authority.governor(),
+        scope,
+        TraceQuietPeriod::new(5)?,
+        ScanLimit::new(1)?,
+    )?;
+    let refused = match maintainer.maintain(
+        &store,
+        &ledger.snapshot()?,
+        &NeverCancelled,
+        &WorkBudget::exact(traversal_budget),
+        &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
+    ) {
+        Ok(_) => return Err("nested traversal bypassed the maintenance budget".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(refused.code(), TraceStoreFailureCode::BudgetExhausted);
+    let retried = maintainer.maintain(
+        &store,
+        &ledger.snapshot()?,
+        &NeverCancelled,
+        &NeverObserved,
+        &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
+    )?;
+    assert_eq!(retried.applied_observations(), 1);
+    assert!(
+        retried
+            .summary(trace)
+            .ok_or("retry publishes the nested trace")?
+            .truncated()
+    );
+    Ok(())
+}
+
+#[test]
 fn summary_maintenance_rejects_and_retries_at_the_outer_capacity_boundary()
 -> Result<(), Box<dyn Error>> {
     let root = TemporaryRoot::new()?;
