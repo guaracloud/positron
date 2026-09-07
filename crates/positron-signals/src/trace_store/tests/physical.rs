@@ -883,6 +883,138 @@ fn summary_maintenance_rejects_a_lower_catalog_generation_and_retries_current_st
 }
 
 #[test]
+fn summary_maintenance_retries_every_bounded_work_refusal_without_duplicate_summaries()
+-> Result<(), Box<dyn Error>> {
+    const SWEEP_CEILING: u64 = 64;
+
+    let root = TemporaryRoot::new()?;
+    let authority = establish_kernel_authority(PrimaryDataVolume::acquire(
+        root.path(),
+        MountQualification::LocalHost,
+    )?)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0xcd; 16])?,
+        CatalogSecret::from_owned(Box::new([0xce; 32]), Box::new([0xcf; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let shard = VirtualShardId::new(77)?;
+    let scope = SegmentScope::new(tenant, SignalKind::Traces, shard);
+    let ledger = ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        scope,
+        SegmentProtectionKey::from_owned(Box::new([0xd0; 32])),
+    )?;
+    let trace = [0xd1; 16];
+    let store = TraceStore::new();
+    ledger.append(
+        store
+            .prepare_unretained_for_test(
+                preparation_capacity(&authority, tenant)?,
+                &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
+                tenant,
+                shard,
+                positron_kernel::StoreBlockIdentity::new([0xd2; 16])?,
+                vec![SpanObservation::checked_native(
+                    trace,
+                    [0xd3; 8],
+                    None,
+                    "bounded-retry".to_owned(),
+                    EventTime::missing(),
+                    EventTime::missing(),
+                    Vec::new(),
+                    SpanKind::Internal,
+                    SamplingDecision::Unknown,
+                    positron_policy::PolicyProvenance::new(1, [0xd4; 32], Vec::new())?,
+                )?],
+            )?
+            .into_store_block(),
+    )?;
+    let snapshot = ledger.snapshot()?;
+    let measure = WorkMeter::new();
+    {
+        let mut maintainer = TraceSummaryMaintainer::new(
+            authority.governor(),
+            scope,
+            TraceQuietPeriod::new(5)?,
+            ScanLimit::new(1)?,
+        )?;
+        let completed = maintainer.maintain(
+            &store,
+            &snapshot,
+            &NeverCancelled,
+            &measure,
+            &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
+        )?;
+        assert_eq!(completed.applied_observations(), 1);
+    }
+    let allowances = measure.work().min(SWEEP_CEILING);
+    assert!(
+        allowances > 0,
+        "maintenance must observe bounded public work"
+    );
+    for allowance in 0..allowances {
+        let baseline = authority
+            .governor()
+            .inspect()?
+            .reserve_consumption(ResourceDimension::MemoryBytes);
+        {
+            let mut maintainer = TraceSummaryMaintainer::new(
+                authority.governor(),
+                scope,
+                TraceQuietPeriod::new(5)?,
+                ScanLimit::new(1)?,
+            )?;
+            let bounded = WorkBudget::exact(allowance);
+            let applied = match maintainer.maintain(
+                &store,
+                &snapshot,
+                &NeverCancelled,
+                &bounded,
+                &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
+            ) {
+                Ok(maintenance) => maintenance.applied_observations(),
+                Err(failure) => {
+                    assert_eq!(failure.code(), TraceStoreFailureCode::BudgetExhausted);
+                    let retried = maintainer.maintain(
+                        &store,
+                        &snapshot,
+                        &NeverCancelled,
+                        &NeverObserved,
+                        &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(
+                            100,
+                        ))),
+                    )?;
+                    assert_eq!(
+                        retried
+                            .summary(trace)
+                            .ok_or("retry must preserve one trace summary")?
+                            .observation_count(),
+                        1,
+                        "a bounded refusal must neither skip nor duplicate the physical observation"
+                    );
+                    retried.applied_observations()
+                },
+            };
+            assert!(
+                applied <= 1,
+                "one physical observation cannot be applied twice"
+            );
+        }
+        assert_eq!(
+            authority
+                .governor()
+                .inspect()?
+                .reserve_consumption(ResourceDimension::MemoryBytes),
+            baseline,
+            "dropping a retried maintenance owner must release its governed capacity"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn summary_maintenance_rejects_a_non_trace_scope_at_construction() -> Result<(), Box<dyn Error>> {
     let root = TemporaryRoot::new()?;
     let authority = establish_kernel_authority(PrimaryDataVolume::acquire(
