@@ -793,6 +793,96 @@ fn summary_maintenance_rejects_a_same_generation_snapshot_with_a_different_ident
 }
 
 #[test]
+fn summary_maintenance_rejects_a_lower_catalog_generation_and_retries_current_state()
+-> Result<(), Box<dyn Error>> {
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let shard = VirtualShardId::new(76)?;
+    let scope = SegmentScope::new(tenant, SignalKind::Traces, shard);
+    let current_root = TemporaryRoot::new()?;
+    let current_authority = establish_kernel_authority(PrimaryDataVolume::acquire(
+        current_root.path(),
+        MountQualification::LocalHost,
+    )?)?;
+    let current_catalog = Catalog::open(
+        &current_authority,
+        InstanceId::new([0xc1; 16])?,
+        CatalogSecret::from_owned(Box::new([0xc2; 32]), Box::new([0xc3; 32])),
+    )?;
+    let current_key = SegmentProtectionKey::from_owned(Box::new([0xc4; 32]));
+    let current_ledger = ActiveSegmentLedger::open(
+        &current_authority,
+        &current_catalog,
+        scope,
+        current_key.clone(),
+    )?;
+    let store = TraceStore::new();
+    current_ledger.seal()?;
+    let current_ledger =
+        ActiveSegmentLedger::open(&current_authority, &current_catalog, scope, current_key)?;
+    let current_snapshot = current_ledger.snapshot()?;
+    let stale_root = TemporaryRoot::new()?;
+    let stale_authority = establish_kernel_authority(PrimaryDataVolume::acquire(
+        stale_root.path(),
+        MountQualification::LocalHost,
+    )?)?;
+    let stale_catalog = Catalog::open(
+        &stale_authority,
+        InstanceId::new([0xc9; 16])?,
+        CatalogSecret::from_owned(Box::new([0xca; 32]), Box::new([0xcb; 32])),
+    )?;
+    let stale_ledger = ActiveSegmentLedger::open(
+        &stale_authority,
+        &stale_catalog,
+        scope,
+        SegmentProtectionKey::from_owned(Box::new([0xcc; 32])),
+    )?;
+    let stale_snapshot = stale_ledger.snapshot()?;
+    assert!(
+        current_snapshot.catalog_generation() > stale_snapshot.catalog_generation(),
+        "sealing must advance the authenticated current catalog beyond a fresh catalog"
+    );
+    let mut maintainer = TraceSummaryMaintainer::new(
+        current_authority.governor(),
+        scope,
+        TraceQuietPeriod::new(5)?,
+        ScanLimit::new(1)?,
+    )?;
+    {
+        let current = maintainer.maintain(
+            &store,
+            &current_snapshot,
+            &NeverCancelled,
+            &NeverObserved,
+            &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
+        )?;
+        assert_eq!(current.applied_observations(), 0);
+    }
+    let refusal = match maintainer.maintain(
+        &store,
+        &stale_snapshot,
+        &NeverCancelled,
+        &NeverObserved,
+        &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
+    ) {
+        Ok(_) => {
+            return Err("a lower authenticated catalog generation reused summary state".into());
+        },
+        Err(failure) => failure,
+    };
+    assert_eq!(refusal.code(), TraceStoreFailureCode::StaleGeneration);
+    let retry = maintainer.maintain(
+        &store,
+        &current_snapshot,
+        &NeverCancelled,
+        &NeverObserved,
+        &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(105))),
+    )?;
+    assert_eq!(retry.applied_observations(), 0);
+    assert!(retry.complete());
+    Ok(())
+}
+
+#[test]
 fn summary_maintenance_rejects_a_non_trace_scope_at_construction() -> Result<(), Box<dyn Error>> {
     let root = TemporaryRoot::new()?;
     let authority = establish_kernel_authority(PrimaryDataVolume::acquire(
