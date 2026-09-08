@@ -426,6 +426,28 @@ fn correlation_target_admission_failure_releases_the_already_admitted_log_lease(
 }
 
 #[test]
+fn correlation_sequential_target_admission_failure_releases_the_log_lease()
+-> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("correlation-sequential-target-admission-cleanup")?;
+    let service = fixture.correlation_service(1)?;
+    let baseline = fixture.kernel.authority.governor().inspect()?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | correlate trace | limit 1",
+        super::budget(),
+    )?;
+
+    let failure =
+        with_catalog_publication_fault_after(CatalogPublicationFault::SynchronizeCommit, 1, || {
+            service.execute(query)
+        })
+        .expect_err("sequential target lease admission must report its publication failure");
+    assert_eq!(failure.code(), QueryFailureCode::StoreUnavailable);
+    assert_eq!(fixture.kernel.authority.governor().inspect()?, baseline);
+    Ok(())
+}
+
+#[test]
 fn correlation_requires_a_trace_target_before_either_execution_mode_admits_resources()
 -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("correlation-missing-target")?;
@@ -559,6 +581,125 @@ fn correlation_resume_rejects_a_missing_target_lease_and_releases_the_log_lease(
             .ledger()?
             .snapshot_lease_usage(source_lease, 100)
             .expect_err("failed paired replay must release the source lease")
+            .code(),
+        LedgerFailureCode::SnapshotExpired
+    );
+    Ok(())
+}
+
+#[test]
+fn correlation_resume_without_a_target_service_releases_the_log_lease() -> Result<(), Box<dyn Error>>
+{
+    let fixture = QueryFixture::new("correlation-resume-without-target-service")?;
+    let trace_id = [0x8b; 16];
+    let span_id = [0x8c; 8];
+    fixture.kernel.append_trace(trace_id, span_id, 20, 1)?;
+    fixture
+        .kernel
+        .append_log_with_trace("first", 20, trace_id, span_id, 2)?;
+    fixture.kernel.append_trace([0x8d; 16], [0x8e; 8], 21, 3)?;
+    fixture
+        .kernel
+        .append_log_with_trace("second", 21, [0x8d; 16], [0x8e; 8], 4)?;
+    let initial_service = fixture.correlation_service(1)?;
+    let initial = initial_service
+        .execute_page(initial_service.plan_pipeline(
+            fixture.context,
+            "pipeline:v1 logs | range query_time -100 100 | correlate trace | limit 2",
+            super::budget(),
+        )?)?
+        .collect::<Vec<_>>();
+    let header = initial
+        .iter()
+        .find_map(|event| match event {
+            QueryEvent::Header(header) => Some(header),
+            QueryEvent::Batch(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("paired cursor header missing")?;
+    let source_lease = SnapshotLeaseId::new(header.lease().identity())?;
+    let cursor = initial
+        .iter()
+        .find_map(|event| match event {
+            QueryEvent::Terminal(QueryTerminal::Continued(cursor)) => Some(cursor),
+            QueryEvent::Header(_) | QueryEvent::Batch(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("paired continuation cursor missing")?;
+    let service = zero_work_service(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+    );
+
+    let failure = service
+        .resume(fixture.context, cursor)
+        .expect_err("paired resume must require the original trace target service");
+    assert_eq!(failure.code(), QueryFailureCode::StoreUnavailable);
+    assert_eq!(
+        fixture
+            .kernel
+            .ledger()?
+            .snapshot_lease_usage(source_lease, 100)
+            .expect_err("failed paired resume must release the source lease")
+            .code(),
+        LedgerFailureCode::SnapshotExpired
+    );
+    Ok(())
+}
+
+#[test]
+fn correlation_resume_rejects_a_non_trace_target_service_and_releases_the_log_lease()
+-> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("correlation-resume-wrong-target-service")?;
+    let trace_id = [0x89; 16];
+    let span_id = [0x8a; 8];
+    fixture.kernel.append_trace(trace_id, span_id, 20, 1)?;
+    fixture
+        .kernel
+        .append_log_with_trace("first", 20, trace_id, span_id, 2)?;
+    fixture.kernel.append_trace([0x8b; 16], [0x8c; 8], 21, 3)?;
+    fixture
+        .kernel
+        .append_log_with_trace("second", 21, [0x8b; 16], [0x8c; 8], 4)?;
+    let initial_service = fixture.correlation_service(1)?;
+    let initial = initial_service
+        .execute_page(initial_service.plan_pipeline(
+            fixture.context,
+            "pipeline:v1 logs | range query_time -100 100 | correlate trace | limit 2",
+            super::budget(),
+        )?)?
+        .collect::<Vec<_>>();
+    let header = initial
+        .iter()
+        .find_map(|event| match event {
+            QueryEvent::Header(header) => Some(header),
+            QueryEvent::Batch(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("paired cursor header missing")?;
+    let source_lease = SnapshotLeaseId::new(header.lease().identity())?;
+    let cursor = initial
+        .iter()
+        .find_map(|event| match event {
+            QueryEvent::Terminal(QueryTerminal::Continued(cursor)) => Some(cursor),
+            QueryEvent::Header(_) | QueryEvent::Batch(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("paired continuation cursor missing")?;
+    let service = zero_work_service(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+    )
+    .with_trace_ledger(fixture.kernel.ledger()?);
+
+    let failure = service
+        .resume(fixture.context, cursor)
+        .expect_err("paired resume must reject a Log Store target service");
+    assert_eq!(failure.code(), QueryFailureCode::Unauthorized);
+    assert_eq!(
+        fixture
+            .kernel
+            .ledger()?
+            .snapshot_lease_usage(source_lease, 100)
+            .expect_err("failed paired resume must release the source lease")
             .code(),
         LedgerFailureCode::SnapshotExpired
     );

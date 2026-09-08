@@ -13,6 +13,21 @@ use super::resources::ExecutionResources;
 const MAX_RESUME_CATALOG_RETRIES: u8 = 1;
 
 impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
+    fn fail_after_source_lease(
+        &self,
+        source_lease: SnapshotLeaseId,
+        primary: QueryFailure,
+    ) -> QueryFailure {
+        match self
+            .ledger
+            .release_snapshot_lease(source_lease)
+            .map_err(map_ledger_failure)
+        {
+            Ok(()) => primary,
+            Err(cleanup) => crate::failure::stronger_failure(primary, cleanup),
+        }
+    }
+
     pub fn execute(
         &self,
         query: PlannedQuery<'kernel>,
@@ -89,26 +104,12 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                     match self.current_query_catalog(query.context) {
                         Ok(current) => current,
                         Err(failure) => {
-                            let cleanup = self
-                                .ledger
-                                .release_snapshot_lease(lease.identity())
-                                .map_err(map_ledger_failure);
-                            return Err(match cleanup {
-                                Ok(()) => failure,
-                                Err(cleanup) => crate::failure::stronger_failure(failure, cleanup),
-                            });
+                            return Err(self.fail_after_source_lease(lease.identity(), failure));
                         },
                     };
                 if reauthorized_tenant != tenant {
-                    let cleanup = self
-                        .ledger
-                        .release_snapshot_lease(lease.identity())
-                        .map_err(map_ledger_failure);
                     let failure = QueryFailure::new(QueryFailureCode::AuthorizationChanged);
-                    return Err(match cleanup {
-                        Ok(()) => failure,
-                        Err(cleanup) => crate::failure::stronger_failure(failure, cleanup),
-                    });
+                    return Err(self.fail_after_source_lease(lease.identity(), failure));
                 }
                 match trace_ledger.create_snapshot_lease_for_at_catalog(
                     now,
@@ -118,14 +119,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                     Ok(lease) => Some(lease),
                     Err(failure) => {
                         let primary = map_ledger_failure(failure);
-                        let cleanup = self
-                            .ledger
-                            .release_snapshot_lease(lease.identity())
-                            .map_err(map_ledger_failure);
-                        return Err(match cleanup {
-                            Ok(()) => primary,
-                            Err(cleanup) => crate::failure::stronger_failure(primary, cleanup),
-                        });
+                        return Err(self.fail_after_source_lease(lease.identity(), primary));
                     },
                 }
             },
@@ -219,26 +213,12 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                     match self.current_query_catalog(query.context) {
                         Ok(current) => current,
                         Err(failure) => {
-                            let cleanup = self
-                                .ledger
-                                .release_snapshot_lease(lease.identity())
-                                .map_err(map_ledger_failure);
-                            return Err(match cleanup {
-                                Ok(()) => failure,
-                                Err(cleanup) => crate::failure::stronger_failure(failure, cleanup),
-                            });
+                            return Err(self.fail_after_source_lease(lease.identity(), failure));
                         },
                     };
                 if reauthorized_tenant != tenant {
-                    let cleanup = self
-                        .ledger
-                        .release_snapshot_lease(lease.identity())
-                        .map_err(map_ledger_failure);
                     let failure = QueryFailure::new(QueryFailureCode::AuthorizationChanged);
-                    return Err(match cleanup {
-                        Ok(()) => failure,
-                        Err(cleanup) => crate::failure::stronger_failure(failure, cleanup),
-                    });
+                    return Err(self.fail_after_source_lease(lease.identity(), failure));
                 }
                 match trace_ledger.create_snapshot_lease_for_at_catalog(
                     now_seconds,
@@ -248,14 +228,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                     Ok(lease) => Some(lease),
                     Err(failure) => {
                         let primary = map_ledger_failure(failure);
-                        let cleanup = self
-                            .ledger
-                            .release_snapshot_lease(lease.identity())
-                            .map_err(map_ledger_failure);
-                        return Err(match cleanup {
-                            Ok(()) => primary,
-                            Err(cleanup) => crate::failure::stronger_failure(primary, cleanup),
-                        });
+                        return Err(self.fail_after_source_lease(lease.identity(), primary));
                     },
                 }
             },

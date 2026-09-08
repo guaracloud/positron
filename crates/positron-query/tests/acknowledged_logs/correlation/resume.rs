@@ -360,6 +360,128 @@ fn correlation_resume_requires_the_complete_authenticated_pair_binding()
 }
 
 #[test]
+fn ordinary_cursor_rejects_an_authenticated_paired_binding_and_releases_its_lease()
+-> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("ordinary-cursor-rejects-paired-binding")?;
+    fixture.kernel.append_log("first", 20, 1)?;
+    fixture.kernel.append_log("second", 21, 2)?;
+    let service = fixture.correlation_service(1)?;
+    let initial = service
+        .execute_page(service.plan_pipeline(
+            fixture.context,
+            "pipeline:v1 logs | range query_time -100 100 | limit 2",
+            super::budget(),
+        )?)?
+        .collect::<Vec<_>>();
+    let header = initial
+        .iter()
+        .find_map(|event| match event {
+            QueryEvent::Header(header) => Some(header),
+            QueryEvent::Batch(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("ordinary cursor header missing")?;
+    let source_lease = SnapshotLeaseId::new(header.lease().identity())?;
+    let cursor = initial
+        .iter()
+        .find_map(|event| match event {
+            QueryEvent::Terminal(QueryTerminal::Continued(cursor)) => Some(cursor),
+            QueryEvent::Header(_) | QueryEvent::Batch(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("ordinary continuation cursor missing")?;
+    let pair_binding_bytes = 1 + 32 + 8 + 8 + 16;
+    let pair_binding_start = cursor
+        .as_bytes()
+        .len()
+        .checked_sub(32 + 2 + pair_binding_bytes)
+        .ok_or("current cursor is shorter than its v6 trailer")?;
+    let tampered = super::rewritten_cursor(&fixture.kernel, cursor, |payload| {
+        *payload
+            .get_mut(pair_binding_start)
+            .expect("v6 cursor pair-binding marker is present") = 1;
+    })?;
+
+    let failure = service
+        .resume(fixture.context, &tampered)
+        .expect_err("ordinary replay must not accept paired target metadata");
+    assert_eq!(failure.code(), QueryFailureCode::InvalidCursor);
+    assert_eq!(
+        fixture
+            .kernel
+            .ledger()?
+            .snapshot_lease_usage(source_lease, 100)
+            .expect_err("invalid ordinary replay must release its source lease")
+            .code(),
+        LedgerFailureCode::SnapshotExpired
+    );
+    Ok(())
+}
+
+#[test]
+fn correlation_cursor_rejects_an_invalid_target_lease_identity_and_releases_the_log_lease()
+-> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("correlation-invalid-target-lease-identity")?;
+    fixture.kernel.append_trace([0xb5; 16], [0xb6; 8], 20, 1)?;
+    fixture
+        .kernel
+        .append_log_with_trace("first", 20, [0xb5; 16], [0xb6; 8], 2)?;
+    fixture.kernel.append_trace([0xb7; 16], [0xb8; 8], 21, 3)?;
+    fixture
+        .kernel
+        .append_log_with_trace("second", 21, [0xb7; 16], [0xb8; 8], 4)?;
+    let service = fixture.correlation_service(1)?;
+    let initial = service
+        .execute_page(service.plan_pipeline(
+            fixture.context,
+            "pipeline:v1 logs | range query_time -100 100 | correlate trace | limit 2",
+            super::budget(),
+        )?)?
+        .collect::<Vec<_>>();
+    let header = initial
+        .iter()
+        .find_map(|event| match event {
+            QueryEvent::Header(header) => Some(header),
+            QueryEvent::Batch(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("paired cursor header missing")?;
+    let source_lease = SnapshotLeaseId::new(header.lease().identity())?;
+    let cursor = initial
+        .iter()
+        .find_map(|event| match event {
+            QueryEvent::Terminal(QueryTerminal::Continued(cursor)) => Some(cursor),
+            QueryEvent::Header(_) | QueryEvent::Batch(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("paired continuation cursor missing")?;
+    let pair_binding_bytes = 1 + 32 + 8 + 8 + 16;
+    let pair_binding_start = cursor
+        .as_bytes()
+        .len()
+        .checked_sub(32 + 2 + pair_binding_bytes)
+        .ok_or("paired cursor is shorter than its v6 trailer")?;
+    let target_lease_start = pair_binding_start + 1 + 32 + 8 + 8;
+    let tampered = super::rewritten_cursor(&fixture.kernel, cursor, |payload| {
+        payload
+            .get_mut(target_lease_start..target_lease_start + 16)
+            .expect("paired cursor target lease identity is present")
+            .fill(0);
+    })?;
+
+    let failure = service
+        .resume(fixture.context, &tampered)
+        .expect_err("paired replay must reject an invalid target lease identity");
+    assert_eq!(failure.code(), QueryFailureCode::InvalidCursor);
+    assert_eq!(
+        fixture
+            .kernel
+            .ledger()?
+            .snapshot_lease_usage(source_lease, 100)
+            .expect_err("invalid paired replay must release its source lease")
+            .code(),
+        LedgerFailureCode::SnapshotExpired
+    );
+    Ok(())
+}
+
+#[test]
 fn correlation_resume_releases_both_leases_when_the_target_frontier_binding_changes()
 -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("correlation-target-frontier-binding")?;
