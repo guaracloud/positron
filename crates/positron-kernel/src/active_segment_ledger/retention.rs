@@ -19,7 +19,7 @@ pub(super) fn commit(
     state.require_healthy()?;
     ledger.catalog.refresh_state()?;
     let basis = ledger.catalog.pin()?;
-    let current_policy = basis.log_retention_policy()?;
+    let current_policy = basis.retention_policy(ledger.scope.signal)?;
     if current_policy != evaluation.policy {
         return Err(LedgerFailure::new(LedgerFailureCode::StaleGeneration));
     }

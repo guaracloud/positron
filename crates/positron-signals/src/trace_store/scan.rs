@@ -912,7 +912,7 @@ pub(super) fn resize_capacity(
         .map(|_| ())
 }
 
-struct NeverCancelled;
+pub(super) struct NeverCancelled;
 
 impl ScanCancellation for NeverCancelled {
     fn is_cancelled(&self) -> bool {
@@ -920,7 +920,7 @@ impl ScanCancellation for NeverCancelled {
     }
 }
 
-struct Unobserved;
+pub(super) struct Unobserved;
 
 impl ScanObserver for Unobserved {
     fn observe_work(&self, _units: u64) -> Result<(), ScanObservationFailureCode> {

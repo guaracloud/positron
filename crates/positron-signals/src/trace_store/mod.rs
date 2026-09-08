@@ -1,6 +1,7 @@
 //! Native Trace Signal Store.
 
 mod codec;
+mod compaction;
 mod consolidation;
 mod details;
 mod failure;
@@ -9,6 +10,7 @@ mod fuzzing;
 mod observation;
 mod relationships;
 mod retained;
+mod retention;
 mod scan;
 mod search;
 mod structural;
@@ -18,6 +20,7 @@ mod types;
 #[cfg(test)]
 mod tests;
 
+pub use compaction::TraceCompactionOutcome;
 pub use consolidation::{LogicalSpan, LogicalTraceScanResult, SpanObservationVariant};
 pub use details::{
     SpanAttributeSet, SpanEvent, SpanLink, SpanObservationDetails, SpanObservationDetailsInput,
@@ -32,6 +35,7 @@ pub use relationships::{
     TraceServiceRelationshipSnapshotLimitation, TraceServiceRelationshipTraceIncompleteness,
     TraceServiceRelationships,
 };
+pub use retention::{TraceRetentionBucket, TraceRetentionOutcome, TraceRetentionPolicy};
 pub use scan::{ScannedSpanObservation, TraceIncompleteness, TraceScan, TraceScanResult};
 pub use search::{TraceByIdResult, TraceByIdSummary, TraceByIdSummaryPending, TraceSearch};
 pub use structural::{
@@ -116,6 +120,67 @@ impl TraceStore {
             .finish(bytes)
             .map_err(TraceStoreFailure::kernel)?;
         Ok(PreparedTraceBlock::new(block))
+    }
+
+    /// Enforces authenticated ingest-time retention for one Trace ledger.
+    pub fn enforce_retention<'kernel, 'catalog>(
+        &self,
+        ledger: &positron_kernel::ActiveSegmentLedger<'kernel, 'catalog>,
+        tenant: positron_domain::identity::TenantId,
+        policy: TraceRetentionPolicy,
+    ) -> Result<TraceRetentionOutcome, TraceStoreFailure> {
+        self.enforce_retention_observed(
+            ledger,
+            tenant,
+            policy,
+            &scan::NeverCancelled,
+            &scan::Unobserved,
+        )
+    }
+
+    /// Enforces retention with cooperative cancellation and bounded work
+    /// observation before the kernel publishes the retirement manifest.
+    pub fn enforce_retention_observed<'kernel, 'catalog>(
+        &self,
+        ledger: &positron_kernel::ActiveSegmentLedger<'kernel, 'catalog>,
+        tenant: positron_domain::identity::TenantId,
+        policy: TraceRetentionPolicy,
+        cancellation: &dyn crate::ScanCancellation,
+        observer: &dyn crate::ScanObserver,
+    ) -> Result<TraceRetentionOutcome, TraceStoreFailure> {
+        retention::enforce_retention(ledger, tenant, policy, cancellation, observer)
+    }
+
+    /// Compacts only sealed Trace blocks in one fixed ingest-time bucket.
+    pub fn compact<'kernel, 'catalog>(
+        &self,
+        ledger: &positron_kernel::ActiveSegmentLedger<'kernel, 'catalog>,
+        tenant: positron_domain::identity::TenantId,
+        policy: TraceRetentionPolicy,
+        bucket: TraceRetentionBucket,
+    ) -> Result<TraceCompactionOutcome, TraceStoreFailure> {
+        self.compact_observed(
+            ledger,
+            tenant,
+            policy,
+            bucket,
+            &scan::NeverCancelled,
+            &scan::Unobserved,
+        )
+    }
+
+    /// Compacts a fixed bucket with cooperative cancellation and bounded work
+    /// observation before the kernel publishes its copy-on-write manifest.
+    pub fn compact_observed<'kernel, 'catalog>(
+        &self,
+        ledger: &positron_kernel::ActiveSegmentLedger<'kernel, 'catalog>,
+        tenant: positron_domain::identity::TenantId,
+        policy: TraceRetentionPolicy,
+        bucket: TraceRetentionBucket,
+        cancellation: &dyn crate::ScanCancellation,
+        observer: &dyn crate::ScanObserver,
+    ) -> Result<TraceCompactionOutcome, TraceStoreFailure> {
+        compaction::compact(ledger, tenant, policy, bucket, cancellation, observer)
     }
 
     /// Prepares a retention-ineligible block for deterministic store tests.

@@ -581,7 +581,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             .recovery()
             .reserve(claim)
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
-        let policy = basis.log_retention_policy()?;
+        let policy = basis.retention_policy(self.scope.signal)?;
         if policy.instance() != self.catalog.instance()
             || policy.tenant() != self.scope.tenant
             || policy.signal_kind() != self.scope.signal
