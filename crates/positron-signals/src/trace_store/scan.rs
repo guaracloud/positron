@@ -262,6 +262,7 @@ impl<'kernel> TraceScanResult<'kernel> {
     fn into_trace_by_id(
         self,
         trace_id: [u8; 16],
+        snapshot: &LedgerSnapshot<'_>,
         search: &super::TraceSearch,
         profile: &ValueLimitProfile,
         cancellation: &dyn ScanCancellation,
@@ -269,7 +270,9 @@ impl<'kernel> TraceScanResult<'kernel> {
     ) -> Result<super::TraceByIdResult<'kernel>, TraceStoreFailure> {
         let mut logical = self.into_matching_logical(search, profile, cancellation, observer)?;
         retain_trace_id(&mut logical.spans, trace_id, cancellation, observer)?;
-        Ok(super::TraceByIdResult::from_logical(trace_id, logical))
+        Ok(super::TraceByIdResult::from_logical(
+            trace_id, logical, snapshot,
+        ))
     }
 
     fn into_matching_logical(
@@ -483,6 +486,57 @@ impl super::TraceStore {
         )
     }
 
+    /// Retrieves one trace and binds existing summary facts only when their
+    /// authenticated coverage exactly matches this query snapshot.
+    #[allow(clippy::too_many_arguments)]
+    pub fn trace_by_id_with_summary<'kernel>(
+        &self,
+        governor: ResourceGovernor<'kernel>,
+        tenant: TenantId,
+        snapshot: &LedgerSnapshot<'_>,
+        trace_id: [u8; 16],
+        search: super::TraceSearch,
+        maintenance: &super::TraceSummaryMaintenance<'_, 'kernel>,
+    ) -> Result<super::TraceByIdResult<'kernel>, TraceStoreFailure> {
+        self.trace_by_id_observed_with_summary(
+            governor,
+            tenant,
+            snapshot,
+            trace_id,
+            search,
+            &NeverCancelled,
+            &Unobserved,
+            maintenance,
+        )
+    }
+
+    /// Retrieves one trace with caller-owned cancellation and cumulative
+    /// accounting, then binds only an exactly current existing summary.
+    #[allow(clippy::too_many_arguments)]
+    pub fn trace_by_id_observed_with_summary<'kernel>(
+        &self,
+        governor: ResourceGovernor<'kernel>,
+        tenant: TenantId,
+        snapshot: &LedgerSnapshot<'_>,
+        trace_id: [u8; 16],
+        search: super::TraceSearch,
+        cancellation: &dyn ScanCancellation,
+        observer: &dyn ScanObserver,
+        maintenance: &super::TraceSummaryMaintenance<'_, 'kernel>,
+    ) -> Result<super::TraceByIdResult<'kernel>, TraceStoreFailure> {
+        Ok(self
+            .trace_by_id_observed(
+                governor,
+                tenant,
+                snapshot,
+                trace_id,
+                search,
+                cancellation,
+                observer,
+            )?
+            .with_summary_maintenance(maintenance))
+    }
+
     /// Retrieves one trace with caller-owned cancellation and cumulative budget observation.
     #[allow(clippy::too_many_arguments)]
     pub fn trace_by_id_observed<'kernel>(
@@ -505,7 +559,14 @@ impl super::TraceStore {
             cancellation,
             observer,
         )?
-        .into_trace_by_id(trace_id, &search, &profile, cancellation, observer)
+        .into_trace_by_id(
+            trace_id,
+            snapshot,
+            &search,
+            &profile,
+            cancellation,
+            observer,
+        )
     }
 
     /// Scans the normal consolidated Trace Store view for one authenticated snapshot.

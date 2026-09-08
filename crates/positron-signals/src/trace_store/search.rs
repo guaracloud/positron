@@ -1,14 +1,15 @@
+use positron_domain::routing::CommitPosition;
 use positron_domain::value::{
     AttributeNamespace, NATIVE_VALUE_PAYLOAD_CHUNK_BYTES, NativeValueObserver,
     ObservedValueFailure, ValidatedAttributeValue,
 };
-use positron_kernel::ResourceReservation;
+use positron_kernel::{CatalogGenerationId, LedgerSnapshot, ResourceReservation, SegmentScope};
 
 use crate::{ScanCancellation, ScanObserver};
 
 use super::{
     LogicalSpan, LogicalTraceScanResult, SpanObservation, TraceIncompleteness, TraceScan,
-    TraceStoreFailure,
+    TraceStoreFailure, TraceSummary, TraceSummaryCoverage, TraceSummaryMaintenance,
 };
 
 /// A bounded request for one native Trace Store search operation.
@@ -158,13 +159,52 @@ pub struct TraceByIdResult<'kernel> {
     complete: bool,
     scanned_bytes: u64,
     incompleteness: TraceIncompleteness,
+    scope: SegmentScope,
+    catalog_generation: u64,
+    catalog_identity: CatalogGenerationId,
+    frontier: CommitPosition,
+    summary: TraceByIdSummary,
     _capacity: ResourceReservation<'kernel>,
+}
+
+/// Summary facts bound to the exact authenticated trace query snapshot.
+#[derive(Clone, Debug)]
+pub enum TraceByIdSummary {
+    /// The summary and its complete coverage exactly match this query snapshot.
+    Available {
+        /// The existing Trace Summary facts for this trace.
+        summary: TraceSummary,
+        /// The authenticated summary coverage that proves those facts current.
+        coverage: TraceSummaryCoverage,
+    },
+    /// No current summary facts can truthfully be reported for this query.
+    Pending(TraceByIdSummaryPending),
+}
+
+/// Why a trace-by-ID result cannot expose summary facts as current.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TraceByIdSummaryPending {
+    /// The caller did not provide an existing summary-maintenance result.
+    NoMaintenance,
+    /// The summary covered another tenant, signal, or shard scope.
+    ScopeMismatch,
+    /// The summary belongs to another authenticated catalog generation.
+    CatalogMismatch,
+    /// The summary did not reach this query snapshot's frontier.
+    FrontierMismatch,
+    /// The summary cursor does not end at its claimed complete frontier.
+    CursorMismatch,
+    /// Physical or quiescence maintenance stopped before a complete result.
+    IncompleteCoverage,
+    /// Complete matching maintenance has no summary for this trace.
+    Absent,
 }
 
 impl<'kernel> TraceByIdResult<'kernel> {
     pub(super) fn from_logical(
         trace_id: [u8; 16],
         logical: LogicalTraceScanResult<'kernel>,
+        snapshot: &LedgerSnapshot<'_>,
     ) -> Self {
         let LogicalTraceScanResult {
             spans,
@@ -187,8 +227,50 @@ impl<'kernel> TraceByIdResult<'kernel> {
             complete,
             scanned_bytes,
             incompleteness,
+            scope: snapshot.scope(),
+            catalog_generation: snapshot.catalog_generation(),
+            catalog_identity: snapshot.catalog_identity(),
+            frontier: snapshot.frontier(),
+            summary: TraceByIdSummary::Pending(TraceByIdSummaryPending::NoMaintenance),
             _capacity,
         }
+    }
+
+    pub(super) fn with_summary_maintenance(
+        mut self,
+        maintenance: &TraceSummaryMaintenance<'_, 'kernel>,
+    ) -> Self {
+        let coverage = maintenance.coverage();
+        self.summary = if coverage.scope() != self.scope {
+            TraceByIdSummary::Pending(TraceByIdSummaryPending::ScopeMismatch)
+        } else if coverage.catalog_generation() != self.catalog_generation
+            || coverage.catalog_identity() != self.catalog_identity
+        {
+            TraceByIdSummary::Pending(TraceByIdSummaryPending::CatalogMismatch)
+        } else if coverage.frontier() != self.frontier {
+            TraceByIdSummary::Pending(TraceByIdSummaryPending::FrontierMismatch)
+        } else if !coverage.physical_complete()
+            || !coverage.quiescence_complete()
+            || !maintenance.complete()
+            || !maintenance.quiescence_complete()
+        {
+            TraceByIdSummary::Pending(TraceByIdSummaryPending::IncompleteCoverage)
+        } else if let Some(summary) = maintenance.summary(self.trace_id) {
+            if coverage
+                .applied_cursor()
+                .is_none_or(|(position, _)| position != coverage.frontier())
+            {
+                TraceByIdSummary::Pending(TraceByIdSummaryPending::CursorMismatch)
+            } else {
+                TraceByIdSummary::Available {
+                    summary: summary.clone(),
+                    coverage,
+                }
+            }
+        } else {
+            TraceByIdSummary::Pending(TraceByIdSummaryPending::Absent)
+        };
+        self
     }
 
     #[must_use]
@@ -223,5 +305,11 @@ impl<'kernel> TraceByIdResult<'kernel> {
     #[must_use]
     pub const fn incompleteness(&self) -> TraceIncompleteness {
         self.incompleteness
+    }
+
+    /// Returns either exact-current summary facts or an explicit pending reason.
+    #[must_use]
+    pub const fn summary(&self) -> &TraceByIdSummary {
+        &self.summary
     }
 }

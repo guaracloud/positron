@@ -24,7 +24,7 @@ pub use details::{
 pub use failure::{TraceStoreFailure, TraceStoreFailureCode};
 pub use observation::{EvaluatedSpanObservationInput, SamplingDecision, SpanKind, SpanObservation};
 pub use scan::{ScannedSpanObservation, TraceIncompleteness, TraceScan, TraceScanResult};
-pub use search::{TraceByIdResult, TraceSearch};
+pub use search::{TraceByIdResult, TraceByIdSummary, TraceByIdSummaryPending, TraceSearch};
 pub use summary::{
     TraceQuietPeriod, TraceSummary, TraceSummaryCoverage, TraceSummaryMaintainer,
     TraceSummaryMaintenance, TraceSummaryTimeProvenance,
