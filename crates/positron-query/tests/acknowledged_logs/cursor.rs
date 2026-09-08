@@ -889,7 +889,7 @@ fn resume_clock_failure_is_reported_before_lease_reacquisition() -> Result<(), B
 fn authenticated_cursor_semantics_versions_and_domain_are_fail_closed() -> Result<(), Box<dyn Error>>
 {
     let fixture = CursorFixture::new()?;
-    assert_eq!(fixture.cursor.as_bytes().len(), 4545);
+    assert_eq!(fixture.cursor.as_bytes().len(), 4610);
     for (label, rewrite) in [
         (
             "magic",
@@ -1116,7 +1116,7 @@ fn rewritten_existing_cursor(
     purpose: &[u8],
 ) -> Result<QueryCursor, Box<dyn Error>> {
     let purpose = if purpose == b"query-cursor-v4" {
-        b"query-cursor-v5".as_slice()
+        b"query-cursor-v6".as_slice()
     } else {
         purpose
     };
@@ -1214,9 +1214,9 @@ fn rewritten_source_cursor(
         .digest_query_cursor(b"query-plan-source-v1", &encoding)?;
     payload[123..155].copy_from_slice(&digest);
     let protector = fixture.kernel.ledger()?.control_tokens();
-    let initial = protector.authenticate_query_cursor(b"query-cursor-v5", &payload)?;
+    let initial = protector.authenticate_query_cursor(b"query-cursor-v6", &payload)?;
     payload[8..16].copy_from_slice(&initial.epoch().to_be_bytes());
-    let authentication = protector.authenticate_query_cursor(b"query-cursor-v5", &payload)?;
+    let authentication = protector.authenticate_query_cursor(b"query-cursor-v6", &payload)?;
     payload.extend_from_slice(&authentication.tag());
     Ok(QueryCursor::from_bytes(&payload)?)
 }

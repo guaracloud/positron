@@ -84,22 +84,28 @@ pub(super) fn materialize_page(
     start: usize,
     end: usize,
     memory: &mut crate::memory::QueryMemory,
-) -> Result<Vec<crate::QueryRecord>, QueryFailure> {
+) -> Result<crate::memory::RecordBuffer, QueryFailure> {
     if start > end || end > records.len() {
         return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
     }
-    let mut page = crate::memory::RecordBuffer::allocate(end - start, memory)?;
-    let (records, input_slots, _) = records.into_parts();
+    let mut page =
+        crate::memory::RecordBuffer::allocate(end - start, records.has_correlation(), memory)?;
+    let (records, correlations, input_slots, _) = records.into_parts();
+    let mut correlations = correlations.into_iter().flatten();
     for (index, record) in records.into_iter().enumerate() {
         let dynamic_bytes = record.retained_dynamic_bytes()?;
+        let correlation = correlations.next();
         if (start..end).contains(&index) {
-            page.push_acquired(record, dynamic_bytes)?;
+            page.push_acquired(record, dynamic_bytes, correlation)?;
         } else {
             memory.release(dynamic_bytes)?;
         }
     }
+    if correlations.next().is_some() {
+        return Err(QueryFailure::new(QueryFailureCode::Internal));
+    }
     memory.release(input_slots)?;
-    Ok(page.into_parts().0)
+    Ok(page)
 }
 
 #[cfg(test)]
@@ -111,7 +117,7 @@ mod tests {
     #[test]
     fn materialization_rejects_an_invalid_resume_window_before_allocation() {
         let mut memory = QueryMemory::new(1_024);
-        let records = RecordBuffer::allocate(0, &mut memory).expect("empty input fits");
+        let records = RecordBuffer::allocate(0, false, &mut memory).expect("empty input fits");
         assert_eq!(
             materialize_page(records, 1, 0, &mut memory)
                 .expect_err("resume window cannot run backwards")

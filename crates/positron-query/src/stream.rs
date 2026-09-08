@@ -3,11 +3,11 @@ mod events;
 
 pub(crate) use contract::column_type;
 pub use contract::{
-    QueryHeader, ResultLease, ResultOrdering, ResultSchema, ResultSnapshot, ResultValueType,
-    TailPhase,
+    CorrelationSnapshot, QueryHeader, ResultLease, ResultOrdering, ResultSchema, ResultSnapshot,
+    ResultValueType, TailPhase,
 };
 pub(crate) use events::QueryCounters;
-pub(crate) use events::{BatchMemoryAccount, BatchMemoryClaim};
+pub(crate) use events::{BatchMemoryAccount, BatchMemoryClaim, correlation_outcomes_arc_bytes};
 pub use events::{QueryBatch, QueryEvent, QueryIncomplete, QueryStats, QueryTerminal};
 
 use positron_domain::routing::{CommitPosition, RecordOrdinal};
@@ -37,6 +37,24 @@ pub struct QueryRecord {
     attributes: Vec<AttributeProjection>,
     attribute_retained_bytes: u64,
     replayed: bool,
+}
+
+/// Per-log truth from an explicit Log-to-Trace Correlation source.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CorrelationOutcome {
+    MissingLogTraceId,
+    MissingTraceTarget {
+        trace_id: [u8; 16],
+        span_id: Option<[u8; 8]>,
+    },
+    Matched {
+        trace_id: [u8; 16],
+        span_id: Option<[u8; 8]>,
+    },
+    Ambiguous {
+        trace_id: [u8; 16],
+        span_id: Option<[u8; 8]>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

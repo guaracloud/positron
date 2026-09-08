@@ -81,6 +81,44 @@ pub struct ResultSnapshot {
     frontier: u64,
 }
 
+/// The separately captured source frontiers for one Log-to-Trace correlation.
+/// Reporting them together does not claim an atomic cross-store snapshot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CorrelationSnapshot {
+    logs: ResultSnapshot,
+    traces: ResultSnapshot,
+    trace_lease: ResultLease,
+}
+
+impl CorrelationSnapshot {
+    pub(crate) const fn new(
+        logs: ResultSnapshot,
+        traces: ResultSnapshot,
+        trace_lease: ResultLease,
+    ) -> Self {
+        Self {
+            logs,
+            traces,
+            trace_lease,
+        }
+    }
+
+    #[must_use]
+    pub const fn logs(self) -> ResultSnapshot {
+        self.logs
+    }
+
+    #[must_use]
+    pub const fn traces(self) -> ResultSnapshot {
+        self.traces
+    }
+
+    #[must_use]
+    pub const fn trace_lease(self) -> ResultLease {
+        self.trace_lease
+    }
+}
+
 impl ResultSnapshot {
     pub(crate) const fn new(identity: [u8; 32], generation: u64, frontier: u64) -> Self {
         Self {
@@ -223,6 +261,7 @@ pub struct QueryHeader {
     lease: ResultLease,
     initial_cursor: Option<QueryCursor>,
     tail_phase: Option<TailPhase>,
+    correlation_snapshot: Option<CorrelationSnapshot>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -247,11 +286,19 @@ impl QueryHeader {
             lease,
             initial_cursor,
             tail_phase: None,
+            correlation_snapshot: None,
         })
     }
 
     pub(crate) fn with_tail_phase(mut self, phase: TailPhase) -> Self {
         self.tail_phase = Some(phase);
+        self
+    }
+    pub(crate) const fn with_correlation_snapshot(
+        mut self,
+        correlation_snapshot: CorrelationSnapshot,
+    ) -> Self {
+        self.correlation_snapshot = Some(correlation_snapshot);
         self
     }
     #[must_use]
@@ -281,5 +328,9 @@ impl QueryHeader {
     #[must_use]
     pub const fn tail_phase(&self) -> Option<TailPhase> {
         self.tail_phase
+    }
+    #[must_use]
+    pub const fn correlation_snapshot(&self) -> Option<CorrelationSnapshot> {
+        self.correlation_snapshot
     }
 }

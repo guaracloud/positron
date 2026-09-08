@@ -86,6 +86,7 @@ fn parse_versioned_pipeline(
     let mut aggregate = None;
     let mut ordering = None;
     let mut transform = None;
+    let mut correlation = false;
     let mut limit = None;
     let mut stage_order = 0_u8;
     for &stage in remaining_stages {
@@ -179,6 +180,12 @@ fn parse_versioned_pipeline(
             }
             transform = Some(BodyTransform::Cast(parse_cast_target(target)?));
             stage_order = 2;
+        } else if stage == "correlate trace" {
+            if correlation || stage_order > 2 {
+                return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
+            }
+            correlation = true;
+            stage_order = 2;
         } else if let Some(specification) = stage.strip_prefix("order by ") {
             if ordering.is_some() || aggregate.is_some() || stage_order > 3 {
                 return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
@@ -204,6 +211,9 @@ fn parse_versioned_pipeline(
     )?;
     if let Some(filter) = filter {
         plan = plan.with_filter(filter);
+    }
+    if correlation {
+        plan = plan.with_log_to_trace_correlation();
     }
     if let Some(transform) = transform {
         plan = plan.with_transform(transform);
@@ -337,5 +347,35 @@ mod tests {
         let memory = crate::planning_memory::PlanningMemory::new(1_024);
         let source = "pipeline:v1 logs | range query_time -100 100 | json | logfmt | limit 1";
         assert!(parse_pipeline(source, &memory).is_err());
+    }
+
+    #[test]
+    fn pipeline_correlation_compiles_to_the_explicit_log_to_trace_source() {
+        let memory = crate::planning_memory::PlanningMemory::new(1_024);
+        let plan = parse_pipeline(
+            "pipeline:v1 logs | range query_time -100 100 | correlate trace | limit 1",
+            &memory,
+        )
+        .expect("bounded explicit correlation pipeline parses");
+
+        assert!(plan.is_log_to_trace_correlation());
+    }
+
+    #[test]
+    fn equivalent_sql_and_pipeline_correlation_compile_to_one_logical_plan() {
+        let pipeline_memory = crate::planning_memory::PlanningMemory::new(1_024);
+        let sql_memory = crate::planning_memory::PlanningMemory::new(1_024);
+        let pipeline = parse_pipeline(
+            "pipeline:v1 logs | range query_time -100 100 | correlate trace | limit 1",
+            &pipeline_memory,
+        )
+        .expect("bounded pipeline correlation parses");
+        let sql = parse_sql(
+            "select body from logs correlate trace where query_time >= -100 and query_time < 100 order by query_time asc, commit_position asc limit 1",
+            &sql_memory,
+        )
+        .expect("bounded SQL correlation parses");
+
+        assert_eq!(sql, pipeline);
     }
 }

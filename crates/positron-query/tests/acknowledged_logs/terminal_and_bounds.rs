@@ -924,6 +924,18 @@ impl QueryFixture {
             batch_limit,
         ))
     }
+
+    pub(crate) fn correlation_service(
+        &self,
+        batch_limit: u16,
+    ) -> Result<QueryService<'static, 'static, '_>, Box<dyn Error>> {
+        Ok(super::support::zero_work_service(
+            self.kernel.authority.governor(),
+            self.kernel.ledger()?,
+            batch_limit,
+        )
+        .with_trace_ledger(self.kernel.trace_ledger()?))
+    }
 }
 
 fn budget() -> QueryBudget {

@@ -16,6 +16,8 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         &self,
         mut state: CursorState,
         snapshot: &LedgerSnapshot<'kernel>,
+        trace_snapshot: Option<&LedgerSnapshot<'kernel>>,
+        trace_lease: Option<positron_kernel::SnapshotLeaseId>,
         batch_limit: u16,
         pagination: bool,
         schema: Option<&positron_signals::SchemaCatalog>,
@@ -25,7 +27,12 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         let initially_exhausted = match self.observe_state(&mut state) {
             Ok(exhausted) => exhausted,
             Err(failure) => {
-                return Err(resources.fail_before_stream(self.ledger, &state, failure));
+                return Err(resources.fail_before_stream(
+                    self.ledger,
+                    self.trace_ledger,
+                    &state,
+                    failure,
+                ));
             },
         };
         if initially_exhausted || state.physical_elapsed_wall_seconds >= state.budget.wall_seconds()
@@ -41,13 +48,48 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         let frontier = match crate::execution_state::commit_position(state.frontier) {
             Ok(frontier) => frontier,
             Err(failure) => {
-                return Err(resources.fail_before_stream(self.ledger, &state, failure));
+                return Err(resources.fail_before_stream(
+                    self.ledger,
+                    self.trace_ledger,
+                    &state,
+                    failure,
+                ));
             },
         };
         let header = match initial_header(&self.ledger.control_tokens(), &state, pagination) {
             Ok(header) => header,
             Err(failure) => {
-                return Err(resources.fail_before_stream(self.ledger, &state, failure));
+                return Err(resources.fail_before_stream(
+                    self.ledger,
+                    self.trace_ledger,
+                    &state,
+                    failure,
+                ));
+            },
+        };
+        let header = match (header, trace_snapshot, trace_lease) {
+            (QueryEvent::Header(header), Some(trace_snapshot), Some(trace_lease)) => {
+                let log_snapshot = header.snapshot();
+                QueryEvent::Header(header.with_correlation_snapshot(
+                    crate::CorrelationSnapshot::new(
+                        log_snapshot,
+                        crate::ResultSnapshot::new(
+                            trace_snapshot.catalog_identity().to_bytes(),
+                            trace_snapshot.catalog_generation(),
+                            trace_snapshot.frontier().value(),
+                        ),
+                        crate::ResultLease::new(trace_lease.to_bytes(), state.expiry),
+                    ),
+                ))
+            },
+            (header, None, None) => header,
+            _ => {
+                return Err(resources.fail_before_stream(
+                    self.ledger,
+                    self.trace_ledger,
+                    &state,
+                    QueryFailure::new(QueryFailureCode::Internal),
+                ));
             },
         };
         macro_rules! framed {
@@ -76,6 +118,91 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             state.budget.scanned_bytes(),
             state.physical_decoded_records,
             state.budget.decoded_records(),
+        );
+        let trace_result = if let Some(trace_snapshot) = trace_snapshot {
+            let trace_frontier = framed!(crate::execution_state::commit_position(
+                trace_snapshot.frontier().value(),
+            ));
+            let result = positron_signals::TraceStore::new().scan_observed(
+                self.governor,
+                state.tenant,
+                trace_snapshot,
+                positron_signals::TraceScan::through(scan_limit, trace_frontier)
+                    .with_scanned_bytes(scanned_remaining),
+                &state.cancellation,
+                &observer,
+            );
+            match result {
+                Ok(result) => {
+                    observer.harvest(&mut state);
+                    if !result.complete() {
+                        return self.failed_page(
+                            Some(header),
+                            QueryFailure::budget_exhausted(match result.incompleteness() {
+                                positron_signals::TraceIncompleteness::ScannedBytesLimit => {
+                                    crate::QueryBudgetDimension::ScannedBytes
+                                },
+                                positron_signals::TraceIncompleteness::ResultLimit
+                                | positron_signals::TraceIncompleteness::None => {
+                                    crate::QueryBudgetDimension::DecodedRecords
+                                },
+                            }),
+                            &state,
+                            delivered_before,
+                            resources,
+                        );
+                    }
+                    framed!(memory.acquire(result.retained_size_bytes()));
+                    Some(result)
+                },
+                Err(failure) => {
+                    observer.harvest(&mut state);
+                    return self.failed_page(
+                        Some(header),
+                        crate::execution_support::map_trace_store_failure(failure),
+                        &state,
+                        delivered_before,
+                        resources,
+                    );
+                },
+            }
+        } else {
+            None
+        };
+        let scanned_remaining = framed!(
+            state
+                .budget
+                .scanned_bytes()
+                .checked_sub(state.physical_scanned_bytes)
+                .ok_or_else(|| QueryFailure::budget_exhausted(
+                    crate::QueryBudgetDimension::ScannedBytes
+                ))
+        );
+        let decoded_remaining = framed!(
+            state
+                .budget
+                .decoded_records()
+                .checked_sub(state.physical_decoded_records)
+                .ok_or_else(|| QueryFailure::budget_exhausted(
+                    crate::QueryBudgetDimension::DecodedRecords
+                ))
+        );
+        if decoded_remaining == 0 {
+            return self.failed_page(
+                Some(header),
+                QueryFailure::budget_exhausted(crate::QueryBudgetDimension::DecodedRecords),
+                &state,
+                delivered_before,
+                resources,
+            );
+        }
+        let scan_limit = framed!(
+            usize::try_from(decoded_remaining)
+                .ok()
+                .map(|limit| limit.min(super::scan::MAX_SCAN_RECORDS))
+                .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidBudget))
+                .and_then(|limit| positron_signals::ScanLimit::new(limit)
+                    .map_err(|_| QueryFailure::new(QueryFailureCode::Internal)))
         );
         let (schema_query, schema_filter_used, text_candidate, text_filter_used) =
             framed!(scan_predicates(&state.plan, schema));
@@ -144,8 +271,14 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             &mut state,
             scan_result,
             schema_filter_used,
+            trace_result
+                .as_ref()
+                .map(positron_signals::LogicalTraceScanResult::spans),
             &mut memory,
         ));
+        if let Some(trace_result) = trace_result {
+            framed!(memory.release(trace_result.retained_size_bytes()));
+        }
         state.physical_memory_peak_bytes = state.physical_memory_peak_bytes.max(memory.peak());
         let operator_wall_exhausted = if has_operator_work {
             framed!(self.observe_state(&mut state))
@@ -239,9 +372,14 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             );
         }
         let mut output_state = state.clone();
-        if let Err(failure) =
-            charge_output(self, &mut output_state, &page, &state.cancellation, true)
-        {
+        if let Err(failure) = charge_output(
+            self,
+            &mut output_state,
+            page.as_slice(),
+            page.correlation_outcomes(),
+            &state.cancellation,
+            true,
+        ) {
             preserve_output_attempt(&mut state, &output_state);
             return self.failed_page(Some(header), failure, &state, delivered_before, resources);
         }
@@ -255,7 +393,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 resources,
             );
         }
-        if page.is_empty() {
+        if page.len() == 0 {
             state = output_state;
             let stats = stats_before_current(&state);
             return self.stream(
@@ -285,7 +423,8 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 prior: state.prior_digest,
                 sequence: state.sequence,
                 plan: &state.plan,
-                records: &page,
+                records: page.as_slice(),
+                correlations: page.correlation_outcomes(),
                 cancellation: &digest_cancellation,
                 observer: &mut digest_observer,
             },
@@ -296,7 +435,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         let resume_key = framed!(resume_key_for_page(
             self,
             &mut state,
-            &page,
+            page.as_slice(),
             needs_resume,
             &mut memory,
         ));
@@ -318,12 +457,25 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             .physical_memory_peak_bytes
             .max(state.physical_memory_peak_bytes);
         state = output_state;
-        let batch = QueryEvent::Batch(QueryBatch::new(
+        let (page, correlations, _, _) = page.into_parts();
+        let correlation_reservation = framed!(
+            correlations
+                .as_ref()
+                .map(|outcomes| self.reserve_correlation_memory(state.tenant, outcomes.capacity()))
+                .transpose()
+        );
+        if correlations.is_some() {
+            framed!(memory.acquire(crate::stream::correlation_outcomes_arc_bytes(),));
+            state.physical_memory_peak_bytes = state.physical_memory_peak_bytes.max(memory.peak());
+        }
+        let batch = QueryEvent::Batch(framed!(QueryBatch::new(
             state.sequence,
             page,
+            correlations,
+            correlation_reservation,
             state.prior_digest,
             digest,
-        ));
+        )));
         let mut delivered_state = state.clone();
         delivered_state.prior_digest = digest;
         let batch_stats = stats_with_current(&delivered_state);

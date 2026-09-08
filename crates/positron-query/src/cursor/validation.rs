@@ -1,5 +1,6 @@
 use super::{
     CURRENT_PREFIX_BYTES, CURSOR_BYTES, MAX_PLAN_SOURCE_BYTES, PAYLOAD_BYTES, QueryCursor,
+    V5_CURSOR_BYTES, V5_PAYLOAD_BYTES,
 };
 use crate::{QueryFailure, QueryFailureCode};
 use positron_kernel::ControlTokenFailure;
@@ -50,12 +51,17 @@ pub(super) fn map_protection_failure(failure: ControlTokenFailure) -> QueryFailu
 }
 
 pub(crate) fn source_length(cursor: &QueryCursor) -> Result<u64, QueryFailure> {
-    if cursor.as_bytes().len() != CURSOR_BYTES {
+    let payload_bytes = match cursor.as_bytes().len() {
+        CURSOR_BYTES => PAYLOAD_BYTES,
+        V5_CURSOR_BYTES => V5_PAYLOAD_BYTES,
+        _ => return Ok(0),
+    };
+    if payload_bytes < CURRENT_PREFIX_BYTES + 12 {
         return Ok(0);
     }
     let payload = cursor
         .as_bytes()
-        .get(..PAYLOAD_BYTES)
+        .get(..payload_bytes)
         .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
     let language = payload
         .get(CURRENT_PREFIX_BYTES + 9)

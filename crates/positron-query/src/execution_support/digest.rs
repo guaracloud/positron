@@ -1,4 +1,4 @@
-use crate::{LogicalPlan, QueryFailure, QueryFailureCode, QueryRecord};
+use crate::{CorrelationOutcome, LogicalPlan, QueryFailure, QueryFailureCode, QueryRecord};
 
 #[cfg(test)]
 use super::failure::map_domain_value_failure;
@@ -11,6 +11,7 @@ pub(crate) struct BatchDigestInput<'a, O> {
     pub(crate) sequence: u64,
     pub(crate) plan: &'a LogicalPlan,
     pub(crate) records: &'a [QueryRecord],
+    pub(crate) correlations: Option<&'a [CorrelationOutcome]>,
     pub(crate) cancellation: &'a crate::QueryCancellation,
     pub(crate) observer: &'a mut O,
 }
@@ -30,6 +31,7 @@ pub(crate) fn batch_digest(
         input.sequence,
         input.plan,
         input.records,
+        input.correlations,
         input.cancellation,
         input.observer,
     );
@@ -52,6 +54,7 @@ pub(crate) fn result_digest(
             sequence: 0,
             plan,
             records: std::slice::from_ref(record),
+            correlations: None,
             cancellation,
             observer,
         },
@@ -65,6 +68,7 @@ fn batch_digest_with_acquired_state(
     sequence: u64,
     plan: &LogicalPlan,
     records: &[QueryRecord],
+    correlations: Option<&[CorrelationOutcome]>,
     cancellation: &crate::QueryCancellation,
     observer: &mut impl positron_domain::value::NativeValueObserver<Error = QueryFailure>,
 ) -> Result<[u8; 32], QueryFailure> {
@@ -80,7 +84,11 @@ fn batch_digest_with_acquired_state(
             .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?
             .to_be_bytes(),
     );
-    for record in records {
+    if correlations.is_some_and(|outcomes| outcomes.len() != records.len()) {
+        return Err(QueryFailure::new(QueryFailureCode::Internal));
+    }
+    digest.update(&[u8::from(correlations.is_some())]);
+    for (index, record) in records.iter().enumerate() {
         check_digest_cancellation(cancellation)?;
         let (query_time, position, ordinal) = record.order_key();
         digest.update(&query_time.value().to_be_bytes());
@@ -129,11 +137,47 @@ fn batch_digest_with_acquired_state(
                 update_occurrence_set_digest(&mut digest, value, observer)?;
             }
         }
+        if let Some(outcome) = correlations.and_then(|outcomes| outcomes.get(index)) {
+            update_correlation_digest(&mut digest, *outcome);
+        }
     }
     check_digest_cancellation(cancellation)?;
     digest
         .finalize()
         .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))
+}
+
+fn update_correlation_digest(
+    digest: &mut positron_kernel::QueryResultDigest,
+    outcome: CorrelationOutcome,
+) {
+    match outcome {
+        CorrelationOutcome::MissingLogTraceId => digest.update(&[0]),
+        CorrelationOutcome::MissingTraceTarget { trace_id, span_id } => {
+            digest.update(&[1]);
+            update_correlation_target(digest, trace_id, span_id);
+        },
+        CorrelationOutcome::Matched { trace_id, span_id } => {
+            digest.update(&[2]);
+            update_correlation_target(digest, trace_id, span_id);
+        },
+        CorrelationOutcome::Ambiguous { trace_id, span_id } => {
+            digest.update(&[3]);
+            update_correlation_target(digest, trace_id, span_id);
+        },
+    }
+}
+
+fn update_correlation_target(
+    digest: &mut positron_kernel::QueryResultDigest,
+    trace_id: [u8; 16],
+    span_id: Option<[u8; 8]>,
+) {
+    digest.update(&trace_id);
+    digest.update(&[u8::from(span_id.is_some())]);
+    if let Some(span_id) = span_id {
+        digest.update(&span_id);
+    }
 }
 
 fn update_result_contract_digest(

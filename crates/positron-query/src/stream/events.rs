@@ -2,8 +2,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{QueryBudgetDimension, QueryCursor, QueryFailure, QueryFailureCode};
+use positron_kernel::TransferredResourceReservation;
 
-use super::{QueryHeader, QueryRecord};
+use super::{CorrelationOutcome, QueryHeader, QueryRecord};
 
 #[derive(Debug)]
 pub(crate) struct BatchMemoryAccount {
@@ -66,6 +67,45 @@ pub(crate) struct BatchMemoryClaim {
     bytes: u64,
 }
 
+/// The move-owned correlation result sidecar. Its `Vec` allocation is made
+/// while query memory is still reserved, then shared without copying rows.
+#[derive(Debug)]
+pub(crate) struct CorrelationOutcomes {
+    outcomes: Vec<CorrelationOutcome>,
+    _reservation: TransferredResourceReservation,
+}
+
+impl PartialEq for CorrelationOutcomes {
+    fn eq(&self, other: &Self) -> bool {
+        self.outcomes == other.outcomes
+    }
+}
+
+impl Eq for CorrelationOutcomes {}
+
+impl CorrelationOutcomes {
+    pub(crate) const fn new(
+        outcomes: Vec<CorrelationOutcome>,
+        reservation: TransferredResourceReservation,
+    ) -> Self {
+        Self {
+            outcomes,
+            _reservation: reservation,
+        }
+    }
+
+    pub(crate) fn get(&self, index: usize) -> Option<CorrelationOutcome> {
+        self.outcomes.get(index).copied()
+    }
+}
+
+/// `ArcInner` retains two atomics before its payload. Keeping this separate
+/// makes the ownership-transfer allocation visible to both memory budgets.
+pub(crate) const fn correlation_outcomes_arc_bytes() -> u64 {
+    (std::mem::size_of::<CorrelationOutcomes>()
+        + (2 * std::mem::size_of::<std::sync::atomic::AtomicUsize>())) as u64
+}
+
 impl BatchMemoryClaim {
     pub(crate) fn new(account: Arc<BatchMemoryAccount>, bytes: u64) -> Arc<Self> {
         Arc::new(Self { account, bytes })
@@ -86,6 +126,7 @@ impl Drop for BatchMemoryClaim {
 pub struct QueryBatch {
     sequence: u64,
     records: Arc<[QueryRecord]>,
+    correlations: Option<Arc<CorrelationOutcomes>>,
     prior_digest: [u8; 32],
     digest: [u8; 32],
     claim: Option<Arc<BatchMemoryClaim>>,
@@ -95,16 +136,28 @@ impl QueryBatch {
     pub(crate) fn new(
         sequence: u64,
         records: Vec<QueryRecord>,
+        correlations: Option<Vec<CorrelationOutcome>>,
+        correlation_reservation: Option<TransferredResourceReservation>,
         prior_digest: [u8; 32],
         digest: [u8; 32],
-    ) -> Self {
-        Self {
+    ) -> Result<Self, QueryFailure> {
+        let correlations = match (correlations, correlation_reservation) {
+            (Some(outcomes), Some(reservation)) => {
+                Some(Arc::new(CorrelationOutcomes::new(outcomes, reservation)))
+            },
+            (None, None) => None,
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(QueryFailure::new(QueryFailureCode::Internal));
+            },
+        };
+        Ok(Self {
             sequence,
             records: Arc::from(records.into_boxed_slice()),
+            correlations,
             prior_digest,
             digest,
             claim: None,
-        }
+        })
     }
 
     pub(crate) fn from_shared(
@@ -117,6 +170,7 @@ impl QueryBatch {
         Self {
             sequence,
             records,
+            correlations: None,
             prior_digest,
             digest,
             claim: Some(claim),
@@ -125,6 +179,17 @@ impl QueryBatch {
     #[must_use]
     pub fn records(&self) -> &[QueryRecord] {
         &self.records
+    }
+
+    /// Returns the explicit Log-to-Trace outcome for the row at `index`.
+    ///
+    /// Ordinary Log Store batches have no correlation sidecar and return
+    /// `None` for every index.
+    #[must_use]
+    pub fn correlation_outcome(&self, index: usize) -> Option<CorrelationOutcome> {
+        self.correlations
+            .as_deref()
+            .and_then(|outcomes| outcomes.get(index))
     }
     #[must_use]
     pub const fn sequence(&self) -> u64 {
@@ -145,6 +210,7 @@ impl Clone for QueryBatch {
         Self {
             sequence: self.sequence,
             records: Arc::clone(&self.records),
+            correlations: self.correlations.clone(),
             prior_digest: self.prior_digest,
             digest: self.digest,
             claim: self.claim.clone(),
@@ -156,6 +222,7 @@ impl PartialEq for QueryBatch {
     fn eq(&self, other: &Self) -> bool {
         self.sequence == other.sequence
             && self.records == other.records
+            && self.correlations == other.correlations
             && self.prior_digest == other.prior_digest
             && self.digest == other.digest
     }

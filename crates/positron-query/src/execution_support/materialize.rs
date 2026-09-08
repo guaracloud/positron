@@ -3,13 +3,49 @@ use positron_domain::time::{IngestTimeCandidate, QueryTime};
 use super::transform::apply_transform;
 use crate::{QueryBudgetDimension, QueryFailure, QueryFailureCode, QueryRecord, TemporalAxis};
 
+/// A log row while it is being materialized for the eager executor.
+///
+/// The native correlation key exists only between the Log Store scan and the
+/// correlation operator. It is deliberately not retained in every public
+/// `QueryRecord`; correlation outcomes have their own charged result sidecar.
+pub(crate) struct MaterializedLogRecord {
+    record: QueryRecord,
+    correlation: CorrelationInput,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CorrelationInput {
+    trace_id: Option<[u8; 16]>,
+    span_id: Option<[u8; 8]>,
+}
+
+impl MaterializedLogRecord {
+    pub(crate) fn into_parts(self) -> (QueryRecord, CorrelationInput) {
+        (self.record, self.correlation)
+    }
+
+    pub(crate) fn into_record(self) -> QueryRecord {
+        self.record
+    }
+}
+
+impl CorrelationInput {
+    pub(crate) const fn trace_id(self) -> Option<[u8; 16]> {
+        self.trace_id
+    }
+
+    pub(crate) const fn span_id(self) -> Option<[u8; 8]> {
+        self.span_id
+    }
+}
+
 pub(crate) fn query_record(
     service: &crate::QueryService<'_, '_, '_>,
     state: &mut crate::cursor::CursorState,
     record: &mut positron_signals::ScannedLogRecord,
     predicate_applied: bool,
     memory: &mut crate::memory::QueryMemory,
-) -> Result<Option<QueryRecord>, QueryFailure> {
+) -> Result<Option<MaterializedLogRecord>, QueryFailure> {
     let observed = record.observed_time();
     let ingest_time = record.ingest_time();
     let query_time = QueryTime::for_log(
@@ -149,27 +185,33 @@ pub(crate) fn query_record(
             transformed.release()?;
             (None, 0)
         };
-        Ok(Some(QueryRecord::new(
-            body,
-            body_retained_bytes,
-            crate::stream::QueryRecordTimes {
-                query: query_time,
-                event: event_time,
-                ingest: ingest_time,
-                ordering: ordering_time,
+        Ok(Some(MaterializedLogRecord {
+            record: QueryRecord::new(
+                body,
+                body_retained_bytes,
+                crate::stream::QueryRecordTimes {
+                    query: query_time,
+                    event: event_time,
+                    ingest: ingest_time,
+                    ordering: ordering_time,
+                },
+                record.commit_position(),
+                record.record_ordinal(),
+                crate::stream::QueryRecordSelection {
+                    body: body_selected,
+                    query_time: query_time_selected,
+                    event_time: event_time_selected,
+                    ingest_time: ingest_time_selected,
+                    commit_position: commit_position_selected,
+                    attributes,
+                    attribute_retained_bytes,
+                },
+            ),
+            correlation: CorrelationInput {
+                trace_id: record.metadata().trace_id(),
+                span_id: record.metadata().span_id(),
             },
-            record.commit_position(),
-            record.record_ordinal(),
-            crate::stream::QueryRecordSelection {
-                body: body_selected,
-                query_time: query_time_selected,
-                event_time: event_time_selected,
-                ingest_time: ingest_time_selected,
-                commit_position: commit_position_selected,
-                attributes,
-                attribute_retained_bytes,
-            },
-        )))
+        }))
     })();
     match result {
         Ok(result) => Ok(result),
