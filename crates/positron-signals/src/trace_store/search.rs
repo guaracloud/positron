@@ -169,16 +169,40 @@ pub struct TraceByIdResult<'kernel> {
 
 /// Summary facts bound to the exact authenticated trace query snapshot.
 #[derive(Clone, Debug)]
-pub enum TraceByIdSummary {
-    /// The summary and its complete coverage exactly match this query snapshot.
-    Available {
-        /// The existing Trace Summary facts for this trace.
-        summary: TraceSummary,
-        /// The authenticated summary coverage that proves those facts current.
-        coverage: TraceSummaryCoverage,
-    },
-    /// No current summary facts can truthfully be reported for this query.
-    Pending(TraceByIdSummaryPending),
+pub struct TraceByIdSummary {
+    pending_reason: Option<TraceByIdSummaryPending>,
+    summary: Option<TraceSummary>,
+    coverage: Option<TraceSummaryCoverage>,
+}
+
+impl TraceByIdSummary {
+    const fn from_available(summary: TraceSummary, coverage: TraceSummaryCoverage) -> Self {
+        Self {
+            pending_reason: None,
+            summary: Some(summary),
+            coverage: Some(coverage),
+        }
+    }
+
+    const fn pending(reason: TraceByIdSummaryPending) -> Self {
+        Self {
+            pending_reason: Some(reason),
+            summary: None,
+            coverage: None,
+        }
+    }
+
+    /// Returns exact-current facts and the coverage that proves their currency.
+    #[must_use]
+    pub fn available(&self) -> Option<(&TraceSummary, TraceSummaryCoverage)> {
+        self.summary.as_ref().zip(self.coverage)
+    }
+
+    /// Returns why this query cannot expose current summary facts.
+    #[must_use]
+    pub const fn pending_reason(&self) -> Option<TraceByIdSummaryPending> {
+        self.pending_reason
+    }
 }
 
 /// Why a trace-by-ID result cannot expose summary facts as current.
@@ -231,7 +255,7 @@ impl<'kernel> TraceByIdResult<'kernel> {
             catalog_generation: snapshot.catalog_generation(),
             catalog_identity: snapshot.catalog_identity(),
             frontier: snapshot.frontier(),
-            summary: TraceByIdSummary::Pending(TraceByIdSummaryPending::NoMaintenance),
+            summary: TraceByIdSummary::pending(TraceByIdSummaryPending::NoMaintenance),
             _capacity,
         }
     }
@@ -242,33 +266,30 @@ impl<'kernel> TraceByIdResult<'kernel> {
     ) -> Self {
         let coverage = maintenance.coverage();
         self.summary = if coverage.scope() != self.scope {
-            TraceByIdSummary::Pending(TraceByIdSummaryPending::ScopeMismatch)
+            TraceByIdSummary::pending(TraceByIdSummaryPending::ScopeMismatch)
         } else if coverage.catalog_generation() != self.catalog_generation
             || coverage.catalog_identity() != self.catalog_identity
         {
-            TraceByIdSummary::Pending(TraceByIdSummaryPending::CatalogMismatch)
+            TraceByIdSummary::pending(TraceByIdSummaryPending::CatalogMismatch)
         } else if coverage.frontier() != self.frontier {
-            TraceByIdSummary::Pending(TraceByIdSummaryPending::FrontierMismatch)
+            TraceByIdSummary::pending(TraceByIdSummaryPending::FrontierMismatch)
         } else if !coverage.physical_complete()
             || !coverage.quiescence_complete()
             || !maintenance.complete()
             || !maintenance.quiescence_complete()
         {
-            TraceByIdSummary::Pending(TraceByIdSummaryPending::IncompleteCoverage)
+            TraceByIdSummary::pending(TraceByIdSummaryPending::IncompleteCoverage)
         } else if let Some(summary) = maintenance.summary(self.trace_id) {
             if coverage
                 .applied_cursor()
                 .is_none_or(|(position, _)| position != coverage.frontier())
             {
-                TraceByIdSummary::Pending(TraceByIdSummaryPending::CursorMismatch)
+                TraceByIdSummary::pending(TraceByIdSummaryPending::CursorMismatch)
             } else {
-                TraceByIdSummary::Available {
-                    summary: summary.clone(),
-                    coverage,
-                }
+                TraceByIdSummary::from_available(summary.clone(), coverage)
             }
         } else {
-            TraceByIdSummary::Pending(TraceByIdSummaryPending::Absent)
+            TraceByIdSummary::pending(TraceByIdSummaryPending::Absent)
         };
         self
     }
