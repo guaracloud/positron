@@ -90,6 +90,12 @@ pub struct CorrelationSnapshot {
     trace_lease: ResultLease,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CorrelationTargetSnapshot {
+    traces: ResultSnapshot,
+    trace_lease: ResultLease,
+}
+
 impl CorrelationSnapshot {
     pub(crate) const fn new(
         logs: ResultSnapshot,
@@ -261,7 +267,7 @@ pub struct QueryHeader {
     lease: ResultLease,
     initial_cursor: Option<QueryCursor>,
     tail_phase: Option<TailPhase>,
-    correlation_snapshot: Option<Box<CorrelationSnapshot>>,
+    correlation_target_snapshot: Option<CorrelationTargetSnapshot>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -286,7 +292,7 @@ impl QueryHeader {
             lease,
             initial_cursor,
             tail_phase: None,
-            correlation_snapshot: None,
+            correlation_target_snapshot: None,
         })
     }
 
@@ -298,7 +304,10 @@ impl QueryHeader {
         mut self,
         correlation_snapshot: CorrelationSnapshot,
     ) -> Self {
-        self.correlation_snapshot = Some(Box::new(correlation_snapshot));
+        self.correlation_target_snapshot = Some(CorrelationTargetSnapshot {
+            traces: correlation_snapshot.traces,
+            trace_lease: correlation_snapshot.trace_lease,
+        });
         self
     }
     #[must_use]
@@ -331,6 +340,11 @@ impl QueryHeader {
     }
     #[must_use]
     pub fn correlation_snapshot(&self) -> Option<CorrelationSnapshot> {
-        self.correlation_snapshot.as_deref().copied()
+        self.correlation_target_snapshot
+            .map(|target| CorrelationSnapshot {
+                logs: self.snapshot,
+                traces: target.traces,
+                trace_lease: target.trace_lease,
+            })
     }
 }
