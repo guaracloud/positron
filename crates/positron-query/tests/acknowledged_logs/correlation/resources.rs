@@ -555,6 +555,61 @@ fn correlation_target_admission_retains_failed_source_cleanup_until_later_lease_
 }
 
 #[test]
+fn correlation_sequential_admission_retains_failed_source_cleanup_until_later_lease_activity()
+-> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("correlation-sequential-admission-cleanup-failure")?;
+    let service = fixture.correlation_service(1)?;
+    let baseline = fixture.kernel.authority.governor().inspect()?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | correlate trace | limit 1",
+        super::budget(),
+    )?;
+
+    let failure = with_catalog_publication_fault_sequence_after(
+        &[
+            (CatalogPublicationFault::SynchronizeCommit, 1),
+            (CatalogPublicationFault::SynchronizeCommit, 0),
+        ],
+        || service.execute(query),
+    )
+    .expect_err("sequential target admission and source cleanup failure must be surfaced");
+    assert_eq!(failure.code(), QueryFailureCode::StoreUnavailable);
+    assert!(
+        fixture
+            .kernel
+            .authority
+            .governor()
+            .inspect()?
+            .outstanding_total()
+            > baseline.outstanding_total(),
+        "the failed sequential cleanup must remain bounded in the ledger authority"
+    );
+
+    let recovery_service = fixture.service(1)?;
+    let recovery = recovery_service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        super::budget(),
+    )?;
+    assert_eq!(
+        recovery_service
+            .execute(recovery)
+            .expect_err("the first later admission must drain the pending source release")
+            .code(),
+        QueryFailureCode::StoreUnavailable
+    );
+    let recovered = recovery_service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        super::budget(),
+    )?;
+    drop(recovery_service.execute(recovered)?);
+    assert_eq!(fixture.kernel.authority.governor().inspect()?, baseline);
+    Ok(())
+}
+
+#[test]
 fn correlation_requires_a_trace_target_before_either_execution_mode_admits_resources()
 -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("correlation-missing-target")?;
@@ -932,6 +987,94 @@ fn correlation_target_scan_exhaustion_frames_one_incomplete_terminal_before_log_
                 && incomplete.stats().limiting_budget() == Some(QueryBudgetDimension::DecodedRecords)
                 && incomplete.stats().decoded_records() == 1
     ));
+    Ok(())
+}
+
+#[test]
+fn correlation_target_scan_bytes_exhaustion_frames_one_incomplete_terminal()
+-> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("correlation-target-scan-bytes-exhaustion")?;
+    let trace_id = [0x9d; 16];
+    let span_id = [0x9e; 8];
+    fixture.kernel.append_trace(trace_id, span_id, 20, 1)?;
+    fixture
+        .kernel
+        .append_log_with_trace("accepted", 20, trace_id, span_id, 2)?;
+    let service = fixture.correlation_service(16)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | correlate trace | limit 1",
+        QueryBudget::new(1, 16, 16, 1_048_576, 1_048_576, 60)?,
+    )?;
+
+    let events = service.execute(query)?.collect::<Vec<_>>();
+    assert!(matches!(events.first(), Some(QueryEvent::Header(_))));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, QueryEvent::Batch(_))),
+        "target scan byte exhaustion must not expose a log-only prefix: {events:?}"
+    );
+    assert!(matches!(
+        events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.code() == QueryFailureCode::BudgetExhausted
+                && incomplete.stats().limiting_budget() == Some(QueryBudgetDimension::ScannedBytes)
+    ));
+    Ok(())
+}
+
+#[test]
+fn correlation_target_scan_cancellation_frames_one_terminal_and_releases_both_leases()
+-> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("correlation-target-scan-cancellation")?;
+    let trace_id = [0x9f; 16];
+    let span_id = [0xa0; 8];
+    fixture.kernel.append_trace(trace_id, span_id, 20, 1)?;
+    fixture
+        .kernel
+        .append_log_with_trace("accepted", 20, trace_id, span_id, 2)?;
+    let meter = CancellingOperatorCallMeter::shared_for_stage(
+        positron_query::QueryWorkStage::ScanDecode,
+        1,
+    );
+    let service = QueryService::with_runtime(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+        TestClock::shared(100),
+        Arc::clone(&meter) as Arc<dyn positron_query::QueryWorkMeter>,
+    )
+    .with_trace_ledger(fixture.kernel.trace_ledger()?);
+    let baseline = fixture.kernel.authority.governor().inspect()?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | correlate trace | limit 1",
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?,
+    )?;
+    meter.bind(query.cancellation())?;
+
+    let events = service.execute(query)?.collect::<Vec<_>>();
+    assert!(matches!(events.first(), Some(QueryEvent::Header(_))));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, QueryEvent::Batch(_))),
+        "target scan cancellation must not expose a log-only prefix: {events:?}"
+    );
+    assert!(matches!(
+        events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.code() == QueryFailureCode::Cancelled
+    ));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, QueryEvent::Terminal(_)))
+            .count(),
+        1
+    );
+    assert_eq!(fixture.kernel.authority.governor().inspect()?, baseline);
     Ok(())
 }
 
