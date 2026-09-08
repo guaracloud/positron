@@ -10,6 +10,7 @@ mod observation;
 mod retained;
 mod scan;
 mod search;
+mod structural;
 mod summary;
 mod types;
 
@@ -25,6 +26,10 @@ pub use failure::{TraceStoreFailure, TraceStoreFailureCode};
 pub use observation::{EvaluatedSpanObservationInput, SamplingDecision, SpanKind, SpanObservation};
 pub use scan::{ScannedSpanObservation, TraceIncompleteness, TraceScan, TraceScanResult};
 pub use search::{TraceByIdResult, TraceByIdSummary, TraceByIdSummaryPending, TraceSearch};
+pub use structural::{
+    TraceCriticalPath, TraceCriticalPathFragment, TraceParentRelation, TraceStructure,
+    TraceStructureIncompleteness, TraceStructureSpan,
+};
 pub use summary::{
     TraceQuietPeriod, TraceSummary, TraceSummaryCoverage, TraceSummaryMaintainer,
     TraceSummaryMaintenance, TraceSummaryTimeProvenance,
