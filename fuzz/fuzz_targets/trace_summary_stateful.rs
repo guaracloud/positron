@@ -1,7 +1,7 @@
 #![no_main]
 
 use std::cell::Cell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fs;
 use std::path::PathBuf;
@@ -272,6 +272,7 @@ fn run_once(data: &[u8], root: &std::path::Path) -> Result<(), Box<dyn Error>> {
             &snapshot,
             &expected,
             command[1] & 0x80 != 0,
+            command[2],
         )?;
         if let Some(trace) = reopened_trace {
             let summary = result.summary(trace).ok_or("late trace summary is present")?;
@@ -307,6 +308,7 @@ fn exercise_trace_queries(
     snapshot: &positron_kernel::LedgerSnapshot<'_>,
     expected: &BTreeMap<[u8; 16], u64>,
     cancelled: bool,
+    target_selector: u8,
 ) -> Result<(), Box<dyn Error>> {
     let cancellation = InputCancellation(cancelled);
     let search = store.search_observed(
@@ -323,12 +325,20 @@ fn exercise_trace_queries(
         return Ok(());
     }
     let search = search?;
-    assert!(search
+    assert!(search.complete());
+    let actual = search
         .spans()
         .iter()
-        .all(|span| expected.contains_key(&span.trace_id())));
+        .map(|span| span.trace_id())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(actual, expected.keys().copied().collect());
     drop(search);
-    let trace_id = expected.keys().next().copied().unwrap_or([0x7f; 16]);
+    let target_index = usize::from(target_selector) % expected.len().max(1);
+    let trace_id = expected
+        .keys()
+        .nth(target_index)
+        .copied()
+        .unwrap_or([0x7f; 16]);
     let by_id = store.trace_by_id_observed(
         authority.governor(),
         tenant,
@@ -338,7 +348,18 @@ fn exercise_trace_queries(
         &InputCancellation(false),
         &Unobserved,
     )?;
-    assert!(by_id.spans().iter().all(|span| span.trace_id() == trace_id));
+    assert!(by_id.complete());
+    assert_eq!(
+        by_id.spans().iter().map(|span| span.trace_id()).collect::<BTreeSet<_>>(),
+        expected.contains_key(&trace_id).then_some(trace_id).into_iter().collect()
+    );
+    if expected.len() > 1 {
+        let incomplete = store.search_observed(
+            authority.governor(), tenant, snapshot, TraceSearch::all(ScanLimit::new(1)?),
+            &InputCancellation(false), &Unobserved,
+        )?;
+        assert!(!incomplete.complete());
+    }
     Ok(())
 }
 

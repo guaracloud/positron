@@ -291,20 +291,16 @@ fn retain_trace_id(
     cancellation: &dyn ScanCancellation,
     observer: &dyn ScanObserver,
 ) -> Result<(), TraceStoreFailure> {
-    let mut index = 0_usize;
-    while index < spans.len() {
+    for span in spans.iter_mut() {
+        span.deselect();
+    }
+    for span in spans.iter_mut() {
         observe_selection(cancellation, observer)?;
-        let span = spans
-            .get(index)
-            .ok_or_else(TraceStoreFailure::invalid_input)?;
         if span.trace_id() == trace_id {
-            index = index
-                .checked_add(1)
-                .ok_or_else(TraceStoreFailure::limit_exceeded)?;
-        } else {
-            spans.remove(index);
+            span.select();
         }
     }
+    spans.retain(super::LogicalSpan::selected);
     Ok(())
 }
 
@@ -314,12 +310,11 @@ fn retain_matching_spans(
     cancellation: &dyn ScanCancellation,
     observer: &dyn ScanObserver,
 ) -> Result<(), TraceStoreFailure> {
-    let mut index = 0_usize;
-    while index < spans.len() {
+    for span in spans.iter_mut() {
+        span.deselect();
+    }
+    for span in spans.iter_mut() {
         observe_selection(cancellation, observer)?;
-        let span = spans
-            .get(index)
-            .ok_or_else(TraceStoreFailure::invalid_input)?;
         let mut matched = false;
         for variant in span.variants() {
             observe_selection(cancellation, observer)?;
@@ -329,13 +324,10 @@ fn retain_matching_spans(
             }
         }
         if matched {
-            index = index
-                .checked_add(1)
-                .ok_or_else(TraceStoreFailure::limit_exceeded)?;
-        } else {
-            spans.remove(index);
+            span.select();
         }
     }
+    spans.retain(super::LogicalSpan::selected);
     Ok(())
 }
 
