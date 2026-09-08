@@ -4,6 +4,8 @@ use positron_query::QueryCursor;
 
 use super::support::KernelFixture;
 
+#[path = "correlation/composition.rs"]
+mod composition;
 #[path = "correlation/matching.rs"]
 mod matching;
 #[path = "correlation/resources.rs"]
