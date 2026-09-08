@@ -683,3 +683,91 @@ fn trace_by_id_applies_a_non_matching_native_attribute_predicate() -> Result<(),
     assert!(result.spans().is_empty());
     Ok(())
 }
+
+#[test]
+fn native_predicate_preserves_later_matching_span_order() -> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x51; 16])?,
+        CatalogSecret::from_owned(Box::new([0x52; 32]), Box::new([0x53; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let shard = VirtualShardId::new(51)?;
+    let ledger = ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        SegmentScope::new(tenant, SignalKind::Traces, shard),
+        SegmentProtectionKey::from_owned(Box::new([0x54; 32])),
+    )?;
+    let matching = AttributeOccurrenceSetCandidate::new(
+        AttributeNamespace::Record,
+        "http.status_code".to_owned(),
+        vec![CandidateAttributeValue::signed_integer(200)],
+    )
+    .validate(ValueLimitProfile::release_1_system_maximum())?;
+    let predicate = matching
+        .occurrence(0)
+        .ok_or("missing matching predicate occurrence")?
+        .try_clone()?;
+    let observation = |trace_id, span_id, attributes, name| {
+        SpanObservation::checked_native(
+            trace_id,
+            span_id,
+            None,
+            name,
+            EventTime::missing(),
+            EventTime::missing(),
+            attributes,
+            SpanKind::Internal,
+            SamplingDecision::Unknown,
+            positron_policy::PolicyProvenance::new(1, [0x55; 32], Vec::new())?,
+        )
+    };
+    let store = TraceStore::new();
+    ledger.append(
+        store
+            .prepare_unretained_for_test(
+                preparation_capacity(&authority, tenant)?,
+                &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
+                tenant,
+                shard,
+                StoreBlockIdentity::new([0x56; 16])?,
+                vec![
+                    observation(
+                        [0x43; 16],
+                        [0x26; 8],
+                        vec![matching.clone()],
+                        "later".to_owned(),
+                    )?,
+                    observation([0x42; 16], [0x24; 8], Vec::new(), "non-matching".to_owned())?,
+                    observation([0x43; 16], [0x25; 8], vec![matching], "first".to_owned())?,
+                ],
+            )?
+            .into_store_block(),
+    )?;
+
+    let result = store.search(
+        authority.governor(),
+        tenant,
+        &ledger.snapshot()?,
+        TraceSearch::all(ScanLimit::new(3)?).with_attribute_equals(
+            AttributeNamespace::Record,
+            "http.status_code".to_owned(),
+            predicate,
+        )?,
+    )?;
+
+    assert!(result.complete());
+    assert_eq!(
+        result
+            .spans()
+            .iter()
+            .map(|span| (span.trace_id(), span.span_id()))
+            .collect::<Vec<_>>(),
+        vec![([0x43; 16], [0x25; 8]), ([0x43; 16], [0x26; 8])]
+    );
+    Ok(())
+}

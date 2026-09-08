@@ -1,7 +1,7 @@
 #![no_main]
 
 use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fs;
 use std::path::PathBuf;
@@ -139,6 +139,7 @@ fn run_once(data: &[u8], root: &std::path::Path) -> Result<(), Box<dyn Error>> {
         ScanLimit::new(1)?,
     )?;
     let mut expected = BTreeMap::new();
+    let mut expected_spans = BTreeMap::new();
     let mut next_identity = 1_u8;
     let mut next_ingest_time = 1_000_i64;
 
@@ -164,6 +165,7 @@ fn run_once(data: &[u8], root: &std::path::Path) -> Result<(), Box<dyn Error>> {
                     .ok_or("bounded ingest time overflow")?;
                 let count = expected.entry(trace).or_insert(0_u64);
                 *count = count.checked_add(1).ok_or("bounded observation count overflow")?;
+                record_expected_span(&mut expected_spans, trace, command[2])?;
             },
             2 => {
                 if let Some(trace) = expected.keys().next().copied() {
@@ -199,6 +201,7 @@ fn run_once(data: &[u8], root: &std::path::Path) -> Result<(), Box<dyn Error>> {
                     *count = count
                         .checked_add(1)
                         .ok_or("bounded observation count overflow")?;
+                    record_expected_span(&mut expected_spans, trace, command[2])?;
                     source.store(late_ingest_time, Ordering::Relaxed);
                     reopened_trace = Some(trace);
                 }
@@ -271,6 +274,7 @@ fn run_once(data: &[u8], root: &std::path::Path) -> Result<(), Box<dyn Error>> {
             tenant,
             &snapshot,
             &expected,
+            &expected_spans,
             command[1] & 0x80 != 0,
             command[2],
         )?;
@@ -307,6 +311,7 @@ fn exercise_trace_queries(
     tenant: TenantId,
     snapshot: &positron_kernel::LedgerSnapshot<'_>,
     expected: &BTreeMap<[u8; 16], u64>,
+    expected_spans: &BTreeMap<[u8; 16], BTreeMap<[u8; 8], u64>>,
     cancelled: bool,
     target_selector: u8,
 ) -> Result<(), Box<dyn Error>> {
@@ -329,9 +334,17 @@ fn exercise_trace_queries(
     let actual = search
         .spans()
         .iter()
-        .map(|span| span.trace_id())
-        .collect::<BTreeSet<_>>();
-    assert_eq!(actual, expected.keys().copied().collect());
+        .map(|span| (span.trace_id(), span.span_id(), span.observation_count()))
+        .collect::<Vec<_>>();
+    let expected_search = expected_spans
+        .iter()
+        .flat_map(|(trace_id, spans)| {
+            spans
+                .iter()
+                .map(move |(span_id, count)| (*trace_id, *span_id, *count))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actual, expected_search);
     drop(search);
     let target_index = usize::from(target_selector) % expected.len().max(1);
     let trace_id = expected
@@ -349,17 +362,43 @@ fn exercise_trace_queries(
         &Unobserved,
     )?;
     assert!(by_id.complete());
+    let expected_by_id = expected_spans
+        .get(&trace_id)
+        .into_iter()
+        .flat_map(|spans| {
+            spans
+                .iter()
+                .map(|(span_id, count)| (trace_id, *span_id, *count))
+        })
+        .collect::<Vec<_>>();
     assert_eq!(
-        by_id.spans().iter().map(|span| span.trace_id()).collect::<BTreeSet<_>>(),
-        expected.contains_key(&trace_id).then_some(trace_id).into_iter().collect()
+        by_id
+            .spans()
+            .iter()
+            .map(|span| (span.trace_id(), span.span_id(), span.observation_count()))
+            .collect::<Vec<_>>(),
+        expected_by_id
     );
-    if expected.len() > 1 {
+    if expected.values().copied().sum::<u64>() > 1 {
         let incomplete = store.search_observed(
             authority.governor(), tenant, snapshot, TraceSearch::all(ScanLimit::new(1)?),
             &InputCancellation(false), &Unobserved,
         )?;
         assert!(!incomplete.complete());
     }
+    Ok(())
+}
+
+fn record_expected_span(
+    expected_spans: &mut BTreeMap<[u8; 16], BTreeMap<[u8; 8], u64>>,
+    trace_id: [u8; 16],
+    span_selector: u8,
+) -> Result<(), Box<dyn Error>> {
+    let spans = expected_spans.entry(trace_id).or_default();
+    let count = spans.entry([span_selector.max(1); 8]).or_insert(0_u64);
+    *count = count
+        .checked_add(1)
+        .ok_or("bounded logical span observation count overflow")?;
     Ok(())
 }
 
