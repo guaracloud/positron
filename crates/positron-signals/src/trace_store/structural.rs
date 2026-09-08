@@ -7,6 +7,7 @@ use crate::{ScanCancellation, ScanObserver};
 
 use super::{
     LogicalSpan, SamplingDecision, TraceByIdSummary, TraceIncompleteness, TraceStoreFailure,
+    relationships::{self, TraceServiceRelationships},
 };
 
 /// The direct parent relationship established from a logical span's earliest
@@ -182,6 +183,7 @@ pub struct TraceStructure<'summary> {
     cycles: Vec<[u8; 8]>,
     incompleteness: TraceStructureIncompleteness,
     critical_path: Option<TraceCriticalPath>,
+    service_relationships: TraceServiceRelationships<'summary>,
 }
 
 impl TraceStructure<'_> {
@@ -221,6 +223,12 @@ impl TraceStructure<'_> {
     #[must_use]
     pub fn critical_path(&self) -> Option<&TraceCriticalPath> {
         self.critical_path.as_ref()
+    }
+
+    /// Returns direct parent/child service evidence without inferring missing identities.
+    #[must_use]
+    pub const fn service_relationships(&self) -> &TraceServiceRelationships<'_> {
+        &self.service_relationships
     }
 
     /// Exposes summary facts and exact-snapshot provenance without treating a
@@ -455,7 +463,7 @@ enum CycleState {
 }
 
 pub(super) fn analyze<'summary>(
-    input: StructuralInput<'_, 'summary>,
+    input: StructuralInput<'summary, 'summary>,
     cancellation: &dyn ScanCancellation,
     observer: &dyn ScanObserver,
     capacity: &mut ResourceReservation<'_>,
@@ -483,7 +491,10 @@ pub(super) fn analyze<'summary>(
         .and_then(|bytes| bytes.checked_add(u64::try_from(size_of::<CycleState>()).ok()?))
         .and_then(|bytes| bytes.checked_add(u64::try_from(size_of::<ChildRange>()).ok()?))
         .and_then(|bytes| bytes.checked_add(u64::try_from(size_of::<usize>()).ok()?))
-        .and_then(|bytes| bytes.checked_add(u64::try_from(size_of::<usize>()).ok()?))
+        .and_then(|bytes| {
+            bytes.checked_add(u64::try_from(size_of::<super::TraceServiceRelationship>()).ok()?)
+        })
+        .and_then(|bytes| bytes.checked_add(u64::try_from(size_of::<Option<usize>>()).ok()?))
         .ok_or_else(TraceStoreFailure::limit_exceeded)?;
     let structural_bytes = count
         .checked_mul(per_span_bytes)
@@ -571,6 +582,18 @@ pub(super) fn analyze<'summary>(
 
     incompleteness.ambiguous_roots = roots.len() > 1;
 
+    let mut parent_indexes = reserve(Vec::new(), spans.len())?;
+    for child_index in 0..spans.len() {
+        parent_indexes.push(index.parent_index(child_index)?);
+    }
+    let service_relationships = relationships::collect(
+        spans,
+        &parent_indexes,
+        incompleteness.complete(),
+        cancellation,
+        observer,
+    )?;
+
     let critical_path = if incompleteness.complete() {
         critical_path(spans, &index, &roots, cancellation, observer)?
     } else {
@@ -584,6 +607,7 @@ pub(super) fn analyze<'summary>(
         cycles,
         incompleteness,
         critical_path,
+        service_relationships,
     })
 }
 

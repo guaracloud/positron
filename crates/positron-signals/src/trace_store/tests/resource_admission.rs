@@ -1,4 +1,6 @@
 use super::*;
+use crate::TraceStoreFailure;
+use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
 struct WorkBudget {
@@ -65,6 +67,70 @@ struct CancelAfterWork {
     limit: u64,
     observed: AtomicU64,
     cancelled: Arc<AtomicU64>,
+}
+
+struct ReserveAfterWork<'kernel> {
+    governor: positron_kernel::ResourceGovernor<'kernel>,
+    tenant: TenantId,
+    trigger: u64,
+    memory_capacity_bytes: u64,
+    remaining_bytes: u64,
+    observed: Cell<u64>,
+    held: RefCell<Option<positron_kernel::ResourceReservation<'kernel>>>,
+}
+
+impl<'kernel> ReserveAfterWork<'kernel> {
+    fn new(
+        governor: positron_kernel::ResourceGovernor<'kernel>,
+        tenant: TenantId,
+        trigger: u64,
+        memory_capacity_bytes: u64,
+        remaining_bytes: u64,
+    ) -> Self {
+        Self {
+            governor,
+            tenant,
+            trigger,
+            memory_capacity_bytes,
+            remaining_bytes,
+            observed: Cell::new(0),
+            held: RefCell::new(None),
+        }
+    }
+}
+
+impl ScanObserver for ReserveAfterWork<'_> {
+    fn observe_work(&self, units: u64) -> Result<(), ScanObservationFailureCode> {
+        let current = self.observed.get();
+        let next = current
+            .checked_add(units)
+            .ok_or(ScanObservationFailureCode::BudgetExhausted)?;
+        if current <= self.trigger && next > self.trigger {
+            let used = self
+                .governor
+                .inspect()
+                .map_err(|_| ScanObservationFailureCode::BudgetExhausted)?
+                .usage(ResourceDimension::MemoryBytes);
+            let reserve_bytes = self
+                .memory_capacity_bytes
+                .checked_sub(used)
+                .and_then(|available| available.checked_sub(self.remaining_bytes))
+                .filter(|bytes| *bytes > 0)
+                .ok_or(ScanObservationFailureCode::BudgetExhausted)?;
+            let amounts = ResourceAmounts::only(ResourceDimension::MemoryBytes, reserve_bytes)
+                .map_err(|_| ScanObservationFailureCode::BudgetExhausted)?;
+            let reservation = self
+                .governor
+                .reserve(
+                    WorkClaim::tenant(self.tenant, WorkKind::Ingest, amounts)
+                        .map_err(|_| ScanObservationFailureCode::BudgetExhausted)?,
+                )
+                .map_err(|_| ScanObservationFailureCode::BudgetExhausted)?;
+            *self.held.borrow_mut() = Some(reservation);
+        }
+        self.observed.set(next);
+        Ok(())
+    }
 }
 
 impl ScanObserver for CancelAfterWork {
@@ -655,6 +721,144 @@ fn tight_governor_refuses_logical_consolidation_before_extra_sort_buffers_alloca
     )?;
     assert_eq!(complete.spans().len(), 1);
     assert_eq!(complete.spans()[0].observation_count(), 512);
+    Ok(())
+}
+
+#[test]
+fn service_relationships_refuse_unreserved_high_cardinality_identity_output_without_leaking()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x61; 16])?,
+        CatalogSecret::from_owned(Box::new([0x62; 32]), Box::new([0x63; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let shard = VirtualShardId::new(62)?;
+    let ledger = ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        SegmentScope::new(tenant, SignalKind::Traces, shard),
+        SegmentProtectionKey::from_owned(Box::new([0x64; 32])),
+    )?;
+    let store = TraceStore::new();
+    let service = |name: String| {
+        AttributeOccurrenceSetCandidate::new(
+            AttributeNamespace::Resource,
+            "service.name".to_owned(),
+            vec![CandidateAttributeValue::string(name)],
+        )
+        .validate(ValueLimitProfile::release_1_system_maximum())
+        .map_err(TraceStoreFailure::domain)
+    };
+    let span = |trace_id, span_id, parent_span_id, service_name| {
+        SpanObservation::checked_native(
+            trace_id,
+            span_id,
+            parent_span_id,
+            "relationship-memory".to_owned(),
+            EventTime::received(UnixNanoseconds::new(1), SourceTimeQuality::Usable)
+                .map_err(TraceStoreFailure::domain)?,
+            EventTime::received(UnixNanoseconds::new(2), SourceTimeQuality::Usable)
+                .map_err(TraceStoreFailure::domain)?,
+            vec![service(service_name)?],
+            SpanKind::Internal,
+            SamplingDecision::Sampled,
+            positron_policy::PolicyProvenance::new(1, [0x65; 32], Vec::new())?,
+        )
+    };
+    for batch in 0_u8..8 {
+        let mut observations = Vec::new();
+        for offset in 0_u8..8 {
+            let index = batch * 8 + offset + 1;
+            let suffix = "x".repeat(4_000);
+            observations.push(span(
+                [index; 16],
+                [0x10; 8],
+                None,
+                format!("parent-{index:03}-{suffix}"),
+            )?);
+            observations.push(span(
+                [index; 16],
+                [0x11; 8],
+                Some([0x10; 8]),
+                format!("child-{index:03}-{suffix}"),
+            )?);
+        }
+        ledger.append(
+            store
+                .prepare_unretained_for_test(
+                    preparation_capacity(&authority, tenant)?,
+                    &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(
+                        100 + i64::from(batch),
+                    ))),
+                    tenant,
+                    shard,
+                    StoreBlockIdentity::new([0x70 + batch; 16])?,
+                    observations,
+                )?
+                .into_store_block(),
+        )?;
+    }
+
+    let scan_work = WorkBudget::unlimited();
+    let scanned = store.scan_observed(
+        authority.governor(),
+        tenant,
+        &ledger.snapshot()?,
+        TraceScan::all(ScanLimit::new(128)?),
+        &NeverCancelled,
+        &scan_work,
+    )?;
+    drop(scanned);
+    let before = authority.governor().inspect()?.outstanding_total();
+    let constrained = ReserveAfterWork::new(
+        authority.governor(),
+        tenant,
+        scan_work.work(),
+        5_000_000,
+        262_144,
+    );
+    let refusal = store
+        .service_relationships_observed(
+            authority.governor(),
+            tenant,
+            &ledger.snapshot()?,
+            TraceScan::all(ScanLimit::new(128)?),
+            &NeverCancelled,
+            &constrained,
+        )
+        .expect_err("governor must refuse the aggregate's owned high-cardinality identity output");
+    assert_eq!(
+        refusal.code(),
+        TraceStoreFailureCode::ResourceAdmissionRefused
+    );
+    drop(constrained);
+    assert_eq!(authority.governor().inspect()?.outstanding_total(), before);
+
+    let admissible = ReserveAfterWork::new(
+        authority.governor(),
+        tenant,
+        scan_work.work(),
+        5_000_000,
+        1_048_576,
+    );
+    let relationships = store.service_relationships_observed(
+        authority.governor(),
+        tenant,
+        &ledger.snapshot()?,
+        TraceScan::all(ScanLimit::new(128)?),
+        &NeverCancelled,
+        &admissible,
+    )?;
+    assert_eq!(relationships.pairs().len(), 64);
+    assert!(relationships.relationships_complete());
+    drop(relationships);
+    drop(admissible);
+    assert_eq!(authority.governor().inspect()?.outstanding_total(), before);
+
     Ok(())
 }
 
