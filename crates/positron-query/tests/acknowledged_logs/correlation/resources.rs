@@ -4,7 +4,7 @@ use std::sync::Arc;
 use positron_domain::identity::TenantId;
 use positron_kernel::{
     CatalogPublicationFault, LedgerFailureCode, ResourceDimension, SnapshotLeaseId, WorkClass,
-    with_catalog_publication_fault_after,
+    with_catalog_publication_fault_after, with_catalog_publication_hook_after,
 };
 use positron_query::{
     CorrelationOutcome, QueryBudget, QueryBudgetDimension, QueryEvent, QueryFailureCode,
@@ -12,8 +12,8 @@ use positron_query::{
 };
 
 use super::super::support::{
-    CancellingOperatorCallMeter, KernelFixture, MergeWorkMeter, TestClock, zero_work_clock_service,
-    zero_work_service,
+    CancellingOperatorCallMeter, KernelFixture, MergeWorkMeter, TestClock,
+    publish_lifecycle_at_catalog_for_test, zero_work_clock_service, zero_work_service,
 };
 use super::super::terminal_and_bounds::QueryFixture;
 
@@ -404,6 +404,168 @@ fn correlation_target_release_failure_is_terminal_and_retries_on_drop() -> Resul
 }
 
 #[test]
+fn correlation_target_admission_failure_releases_the_already_admitted_log_lease()
+-> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("correlation-target-admission-cleanup")?;
+    let service = fixture.correlation_service(1)?;
+    let baseline = fixture.kernel.authority.governor().inspect()?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | correlate trace | limit 1",
+        super::budget(),
+    )?;
+
+    let failure =
+        with_catalog_publication_fault_after(CatalogPublicationFault::SynchronizeCommit, 1, || {
+            service.execute_page(query)
+        })
+        .expect_err("target lease admission must report its publication failure");
+    assert_eq!(failure.code(), QueryFailureCode::StoreUnavailable);
+    assert_eq!(fixture.kernel.authority.governor().inspect()?, baseline);
+    Ok(())
+}
+
+#[test]
+fn correlation_requires_a_trace_target_before_either_execution_mode_admits_resources()
+-> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("correlation-missing-target")?;
+    let service = zero_work_service(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+    );
+    let baseline = fixture.kernel.authority.governor().inspect()?;
+    let source = "pipeline:v1 logs | range query_time -100 100 | correlate trace | limit 1";
+
+    let sequential = service.plan_pipeline(fixture.context, source, super::budget())?;
+    assert_eq!(
+        service
+            .execute(sequential)
+            .expect_err("sequential correlation must require a trace target")
+            .code(),
+        QueryFailureCode::StoreUnavailable
+    );
+    let paged = service.plan_pipeline(fixture.context, source, super::budget())?;
+    assert_eq!(
+        service
+            .execute_page(paged)
+            .expect_err("paged correlation must require a trace target")
+            .code(),
+        QueryFailureCode::StoreUnavailable
+    );
+    assert_eq!(fixture.kernel.authority.governor().inspect()?, baseline);
+    Ok(())
+}
+
+#[test]
+fn correlation_resume_rechecks_authorization_after_the_log_marker_is_admitted()
+-> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("correlation-resume-reauthorize")?;
+    let trace_id = [0x91; 16];
+    let span_id = [0x92; 8];
+    fixture.kernel.append_trace(trace_id, span_id, 20, 1)?;
+    fixture
+        .kernel
+        .append_log_with_trace("first", 20, trace_id, span_id, 2)?;
+    fixture.kernel.append_trace([0x93; 16], [0x94; 8], 21, 3)?;
+    fixture
+        .kernel
+        .append_log_with_trace("second", 21, [0x93; 16], [0x94; 8], 4)?;
+    let service = fixture.correlation_service(1)?;
+    let initial = service
+        .execute_page(service.plan_pipeline(
+            fixture.context,
+            "pipeline:v1 logs | range query_time -100 100 | correlate trace | limit 2",
+            super::budget(),
+        )?)?
+        .collect::<Vec<_>>();
+    let cursor = initial
+        .iter()
+        .find_map(|event| match event {
+            QueryEvent::Terminal(QueryTerminal::Continued(cursor)) => Some(cursor),
+            QueryEvent::Header(_) | QueryEvent::Batch(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("paired continuation cursor missing")?;
+
+    let failure = with_catalog_publication_hook_after(
+        0,
+        |catalog| {
+            publish_lifecycle_at_catalog_for_test(catalog, 3, 0xd8)
+                .expect("lifecycle revocation after source marker admission");
+        },
+        || service.resume(fixture.context, cursor),
+    )
+    .expect_err("authorization revocation after source marker admission must reject replay");
+    assert_eq!(failure.code(), QueryFailureCode::AuthorizationChanged);
+    Ok(())
+}
+
+#[test]
+fn correlation_resume_rejects_a_missing_target_lease_and_releases_the_log_lease()
+-> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("correlation-missing-target-lease")?;
+    let trace_id = [0x8d; 16];
+    let span_id = [0x8e; 8];
+    fixture.kernel.append_trace(trace_id, span_id, 20, 1)?;
+    fixture
+        .kernel
+        .append_log_with_trace("first", 20, trace_id, span_id, 2)?;
+    fixture.kernel.append_trace([0x8f; 16], [0x90; 8], 21, 3)?;
+    fixture
+        .kernel
+        .append_log_with_trace("second", 21, [0x8f; 16], [0x90; 8], 4)?;
+    let service = fixture.correlation_service(1)?;
+    let initial = service
+        .execute_page(service.plan_pipeline(
+            fixture.context,
+            "pipeline:v1 logs | range query_time -100 100 | correlate trace | limit 2",
+            super::budget(),
+        )?)?
+        .collect::<Vec<_>>();
+    let header = initial
+        .iter()
+        .find_map(|event| match event {
+            QueryEvent::Header(header) => Some(header),
+            QueryEvent::Batch(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("paired cursor header missing")?;
+    let source_lease = SnapshotLeaseId::new(header.lease().identity())?;
+    let target_lease = SnapshotLeaseId::new(
+        header
+            .correlation_snapshot()
+            .ok_or("paired cursor omitted trace lease")?
+            .trace_lease()
+            .identity(),
+    )?;
+    let cursor = initial
+        .iter()
+        .find_map(|event| match event {
+            QueryEvent::Terminal(QueryTerminal::Continued(cursor)) => Some(cursor),
+            QueryEvent::Header(_) | QueryEvent::Batch(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("paired continuation cursor missing")?;
+    fixture
+        .kernel
+        .trace_ledger()?
+        .release_snapshot_lease(target_lease)?;
+
+    let failure = service
+        .resume(fixture.context, cursor)
+        .expect_err("a missing target lease must fence paired replay");
+    assert_eq!(failure.code(), QueryFailureCode::SnapshotExpired);
+    assert_eq!(
+        fixture
+            .kernel
+            .ledger()?
+            .snapshot_lease_usage(source_lease, 100)
+            .expect_err("failed paired replay must release the source lease")
+            .code(),
+        LedgerFailureCode::SnapshotExpired
+    );
+    Ok(())
+}
+
+#[test]
 fn correlation_outcome_bytes_participate_in_the_public_output_budget() -> Result<(), Box<dyn Error>>
 {
     let matched = QueryFixture::new("correlation-output-matched")?;
@@ -488,6 +650,40 @@ fn correlation_target_scan_consumes_the_same_cumulative_decode_budget_as_the_log
         ),
         "unexpected correlation budget events: {events:?}"
     );
+    Ok(())
+}
+
+#[test]
+fn correlation_target_scan_exhaustion_frames_one_incomplete_terminal_before_log_delivery()
+-> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("correlation-target-scan-exhaustion")?;
+    fixture.kernel.append_trace([0x99; 16], [0x9a; 8], 20, 1)?;
+    fixture.kernel.append_trace([0x9b; 16], [0x9c; 8], 21, 2)?;
+    fixture
+        .kernel
+        .append_log_with_trace("accepted", 20, [0x99; 16], [0x9a; 8], 3)?;
+    let service = fixture.correlation_service(16)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | correlate trace | limit 1",
+        QueryBudget::new(1_048_576, 1, 16, 1_048_576, 1_048_576, 60)?,
+    )?;
+
+    let events = service.execute(query)?.collect::<Vec<_>>();
+    assert!(matches!(events.first(), Some(QueryEvent::Header(_))));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, QueryEvent::Batch(_))),
+        "target scan exhaustion must not expose a log-only prefix: {events:?}"
+    );
+    assert!(matches!(
+        events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.code() == QueryFailureCode::BudgetExhausted
+                && incomplete.stats().limiting_budget() == Some(QueryBudgetDimension::DecodedRecords)
+                && incomplete.stats().decoded_records() == 1
+    ));
     Ok(())
 }
 
