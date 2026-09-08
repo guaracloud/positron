@@ -23,7 +23,7 @@ use positron_policy::{IngestPolicy, NativeTraceCandidate, PolicyReceiver, TraceP
 use positron_signals::{
     EvaluatedSpanObservationInput, SamplingDecision, ScanCancellation, ScanLimit,
     ScanObservationFailureCode, ScanObserver, SpanKind, SpanObservation, SpanObservationDetails,
-    TraceQuietPeriod, TraceStore, TraceStoreFailureCode, TraceSummaryMaintainer,
+    TraceQuietPeriod, TraceSearch, TraceStore, TraceStoreFailureCode, TraceSummaryMaintainer,
 };
 
 #[path = "schema_discovery_query/authority.rs"]
@@ -139,6 +139,7 @@ fn run_once(data: &[u8], root: &std::path::Path) -> Result<(), Box<dyn Error>> {
         ScanLimit::new(1)?,
     )?;
     let mut expected = BTreeMap::new();
+    let mut expected_spans = BTreeMap::new();
     let mut next_identity = 1_u8;
     let mut next_ingest_time = 1_000_i64;
 
@@ -164,6 +165,7 @@ fn run_once(data: &[u8], root: &std::path::Path) -> Result<(), Box<dyn Error>> {
                     .ok_or("bounded ingest time overflow")?;
                 let count = expected.entry(trace).or_insert(0_u64);
                 *count = count.checked_add(1).ok_or("bounded observation count overflow")?;
+                record_expected_span(&mut expected_spans, trace, command[2])?;
             },
             2 => {
                 if let Some(trace) = expected.keys().next().copied() {
@@ -199,6 +201,7 @@ fn run_once(data: &[u8], root: &std::path::Path) -> Result<(), Box<dyn Error>> {
                     *count = count
                         .checked_add(1)
                         .ok_or("bounded observation count overflow")?;
+                    record_expected_span(&mut expected_spans, trace, command[2])?;
                     source.store(late_ingest_time, Ordering::Relaxed);
                     reopened_trace = Some(trace);
                 }
@@ -265,6 +268,16 @@ fn run_once(data: &[u8], root: &std::path::Path) -> Result<(), Box<dyn Error>> {
             &lifecycle_clock,
         )?;
         assert_visible_summary_counts(&result, &expected);
+        exercise_trace_queries(
+            &store,
+            &authority,
+            tenant,
+            &snapshot,
+            &expected,
+            &expected_spans,
+            command[1] & 0x80 != 0,
+            command[2],
+        )?;
         if let Some(trace) = reopened_trace {
             let summary = result.summary(trace).ok_or("late trace summary is present")?;
             assert!(!summary.quiescent(), "a later span reopens a quiescent trace");
@@ -290,6 +303,103 @@ fn run_once(data: &[u8], root: &std::path::Path) -> Result<(), Box<dyn Error>> {
     )?;
     drop(ledger);
     replay_and_assert(&authority, &catalog, scope, key(), &store, &expected)
+}
+
+fn exercise_trace_queries(
+    store: &TraceStore,
+    authority: &positron_kernel::StorageKernelResourceAuthority,
+    tenant: TenantId,
+    snapshot: &positron_kernel::LedgerSnapshot<'_>,
+    expected: &BTreeMap<[u8; 16], u64>,
+    expected_spans: &BTreeMap<[u8; 16], BTreeMap<[u8; 8], u64>>,
+    cancelled: bool,
+    target_selector: u8,
+) -> Result<(), Box<dyn Error>> {
+    let cancellation = InputCancellation(cancelled);
+    let search = store.search_observed(
+        authority.governor(),
+        tenant,
+        snapshot,
+        TraceSearch::all(ScanLimit::new(MAX_OPERATIONS)?),
+        &cancellation,
+        &Unobserved,
+    );
+    if cancelled {
+        let failure = search.expect_err("cancelled trace search unexpectedly succeeded");
+        assert_eq!(failure.code(), TraceStoreFailureCode::Cancelled);
+        return Ok(());
+    }
+    let search = search?;
+    assert!(search.complete());
+    let actual = search
+        .spans()
+        .iter()
+        .map(|span| (span.trace_id(), span.span_id(), span.observation_count()))
+        .collect::<Vec<_>>();
+    let expected_search = expected_spans
+        .iter()
+        .flat_map(|(trace_id, spans)| {
+            spans
+                .iter()
+                .map(move |(span_id, count)| (*trace_id, *span_id, *count))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actual, expected_search);
+    drop(search);
+    let target_index = usize::from(target_selector) % expected.len().max(1);
+    let trace_id = expected
+        .keys()
+        .nth(target_index)
+        .copied()
+        .unwrap_or([0x7f; 16]);
+    let by_id = store.trace_by_id_observed(
+        authority.governor(),
+        tenant,
+        snapshot,
+        trace_id,
+        TraceSearch::all(ScanLimit::new(MAX_OPERATIONS)?),
+        &InputCancellation(false),
+        &Unobserved,
+    )?;
+    assert!(by_id.complete());
+    let expected_by_id = expected_spans
+        .get(&trace_id)
+        .into_iter()
+        .flat_map(|spans| {
+            spans
+                .iter()
+                .map(|(span_id, count)| (trace_id, *span_id, *count))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        by_id
+            .spans()
+            .iter()
+            .map(|span| (span.trace_id(), span.span_id(), span.observation_count()))
+            .collect::<Vec<_>>(),
+        expected_by_id
+    );
+    if expected.values().copied().sum::<u64>() > 1 {
+        let incomplete = store.search_observed(
+            authority.governor(), tenant, snapshot, TraceSearch::all(ScanLimit::new(1)?),
+            &InputCancellation(false), &Unobserved,
+        )?;
+        assert!(!incomplete.complete());
+    }
+    Ok(())
+}
+
+fn record_expected_span(
+    expected_spans: &mut BTreeMap<[u8; 16], BTreeMap<[u8; 8], u64>>,
+    trace_id: [u8; 16],
+    span_selector: u8,
+) -> Result<(), Box<dyn Error>> {
+    let spans = expected_spans.entry(trace_id).or_default();
+    let count = spans.entry([span_selector.max(1); 8]).or_insert(0_u64);
+    *count = count
+        .checked_add(1)
+        .ok_or("bounded logical span observation count overflow")?;
+    Ok(())
 }
 
 fn source_set(source: &AtomicI64, input: u8) {
