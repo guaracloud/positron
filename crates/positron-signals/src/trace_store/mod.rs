@@ -7,6 +7,7 @@ mod failure;
 #[cfg(fuzzing)]
 mod fuzzing;
 mod observation;
+mod relationships;
 mod retained;
 mod scan;
 mod search;
@@ -24,6 +25,9 @@ pub use details::{
 };
 pub use failure::{TraceStoreFailure, TraceStoreFailureCode};
 pub use observation::{EvaluatedSpanObservationInput, SamplingDecision, SpanKind, SpanObservation};
+pub use relationships::{
+    TraceServiceIdentity, TraceServiceRelationship, TraceServiceRelationships,
+};
 pub use scan::{ScannedSpanObservation, TraceIncompleteness, TraceScan, TraceScanResult};
 pub use search::{TraceByIdResult, TraceByIdSummary, TraceByIdSummaryPending, TraceSearch};
 pub use structural::{

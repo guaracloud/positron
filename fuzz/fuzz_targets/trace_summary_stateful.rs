@@ -12,18 +12,21 @@ use libfuzzer_sys::fuzz_target;
 use positron_domain::identity::TenantId;
 use positron_domain::routing::{SignalKind, VirtualShardId};
 use positron_domain::time::{EventTime, SourceTimeQuality, UnixNanoseconds};
-use positron_domain::value::ValueLimitProfile;
+use positron_domain::value::{AttributeNamespace, CandidateAttributeValue, ValueLimitProfile};
 use positron_kernel::{
     ActiveSegmentLedger, Catalog, CatalogSecret, FixedLifecycleClockSource, InstanceId,
     LifecycleClock, LifecycleClockFailure, LifecycleClockSource, ResourceAmounts,
     ResourceDimension, SegmentProtectionKey, SegmentScope, StoreBlockIdentity, WorkClaim, WorkKind,
 };
-use positron_policy::{IngestPolicy, NativeTraceCandidate, PolicyReceiver, TracePolicyEvaluation};
+use positron_policy::{
+    IngestPolicy, NativePolicyAttribute, NativeTraceCandidate, PolicyReceiver,
+    TracePolicyEvaluation,
+};
 use positron_signals::{
     EvaluatedSpanObservationInput, SamplingDecision, ScanCancellation, ScanLimit,
     ScanObservationFailureCode, ScanObserver, SpanKind, SpanObservation, SpanObservationDetails,
-    TraceIncompleteness, TraceParentRelation, TraceQuietPeriod, TraceSearch, TraceStore,
-    TraceStoreFailureCode, TraceSummaryMaintainer,
+    TraceIncompleteness, TraceParentRelation, TraceQuietPeriod, TraceSearch, TraceServiceIdentity,
+    TraceStore, TraceStoreFailureCode, TraceSummaryMaintainer,
 };
 
 #[path = "schema_discovery_query/authority.rs"]
@@ -329,6 +332,17 @@ fn run_once(data: &[u8], root: &std::path::Path) -> Result<(), Box<dyn Error>> {
         next_ingest_time,
     )?;
     expected.insert(fixture_trace, fixture_observation_count);
+    let (service_trace, service_observation_count) = exercise_service_relationship_fixture(
+        &ledger,
+        &authority,
+        &store,
+        &policy,
+        tenant,
+        scope.shard_id(),
+        data[0],
+        next_ingest_time,
+    )?;
+    expected.insert(service_trace, service_observation_count);
     drop(ledger);
     replay_and_assert(&authority, &catalog, scope, key(), &store, &expected)
 }
@@ -875,9 +889,12 @@ fn generated_interval(
     end: i64,
     quality: SourceTimeQuality,
 ) -> Option<(UnixNanoseconds, UnixNanoseconds)> {
-    matches!(quality, SourceTimeQuality::Usable | SourceTimeQuality::Outlier)
-        .then_some((UnixNanoseconds::new(start), UnixNanoseconds::new(end)))
-        .filter(|(start, end)| end >= start)
+    matches!(
+        quality,
+        SourceTimeQuality::Usable | SourceTimeQuality::Outlier
+    )
+    .then_some((UnixNanoseconds::new(start), UnixNanoseconds::new(end)))
+    .filter(|(start, end)| end >= start)
 }
 
 #[derive(Clone, Copy)]
@@ -914,44 +931,188 @@ fn exercise_structural_fixture<'kernel>(
     let second = [0x03; 8];
     let inputs = match case {
         0 => vec![
-            FixtureInput { span_id: root, parent_span_id: None, start: Some(1), end: Some(101), name: 0, sampling },
-            FixtureInput { span_id: first, parent_span_id: Some(root), start: Some(11), end: Some(91), name: 1, sampling },
-            FixtureInput { span_id: second, parent_span_id: Some(first), start: Some(21), end: Some(81), name: 2, sampling },
+            FixtureInput {
+                span_id: root,
+                parent_span_id: None,
+                start: Some(1),
+                end: Some(101),
+                name: 0,
+                sampling,
+            },
+            FixtureInput {
+                span_id: first,
+                parent_span_id: Some(root),
+                start: Some(11),
+                end: Some(91),
+                name: 1,
+                sampling,
+            },
+            FixtureInput {
+                span_id: second,
+                parent_span_id: Some(first),
+                start: Some(21),
+                end: Some(81),
+                name: 2,
+                sampling,
+            },
         ],
         1 => vec![
-            FixtureInput { span_id: root, parent_span_id: None, start: Some(1), end: Some(101), name: 0, sampling },
-            FixtureInput { span_id: first, parent_span_id: Some(root), start: Some(11), end: Some(41), name: 1, sampling },
-            FixtureInput { span_id: second, parent_span_id: Some(root), start: Some(51), end: Some(91), name: 2, sampling },
+            FixtureInput {
+                span_id: root,
+                parent_span_id: None,
+                start: Some(1),
+                end: Some(101),
+                name: 0,
+                sampling,
+            },
+            FixtureInput {
+                span_id: first,
+                parent_span_id: Some(root),
+                start: Some(11),
+                end: Some(41),
+                name: 1,
+                sampling,
+            },
+            FixtureInput {
+                span_id: second,
+                parent_span_id: Some(root),
+                start: Some(51),
+                end: Some(91),
+                name: 2,
+                sampling,
+            },
         ],
         2 => vec![
-            FixtureInput { span_id: root, parent_span_id: None, start: Some(1), end: Some(101), name: 0, sampling },
-            FixtureInput { span_id: first, parent_span_id: Some(root), start: Some(11), end: Some(61), name: 1, sampling },
-            FixtureInput { span_id: second, parent_span_id: Some(root), start: Some(21), end: Some(91), name: 2, sampling },
+            FixtureInput {
+                span_id: root,
+                parent_span_id: None,
+                start: Some(1),
+                end: Some(101),
+                name: 0,
+                sampling,
+            },
+            FixtureInput {
+                span_id: first,
+                parent_span_id: Some(root),
+                start: Some(11),
+                end: Some(61),
+                name: 1,
+                sampling,
+            },
+            FixtureInput {
+                span_id: second,
+                parent_span_id: Some(root),
+                start: Some(21),
+                end: Some(91),
+                name: 2,
+                sampling,
+            },
         ],
         3 => vec![
-            FixtureInput { span_id: root, parent_span_id: None, start: Some(1), end: Some(101), name: 0, sampling },
-            FixtureInput { span_id: first, parent_span_id: Some(root), start: Some(11), end: Some(81), name: 1, sampling },
-            FixtureInput { span_id: second, parent_span_id: Some(root), start: Some(21), end: Some(81), name: 2, sampling },
+            FixtureInput {
+                span_id: root,
+                parent_span_id: None,
+                start: Some(1),
+                end: Some(101),
+                name: 0,
+                sampling,
+            },
+            FixtureInput {
+                span_id: first,
+                parent_span_id: Some(root),
+                start: Some(11),
+                end: Some(81),
+                name: 1,
+                sampling,
+            },
+            FixtureInput {
+                span_id: second,
+                parent_span_id: Some(root),
+                start: Some(21),
+                end: Some(81),
+                name: 2,
+                sampling,
+            },
         ],
-        4 => vec![FixtureInput { span_id: first, parent_span_id: Some([0x09; 8]), start: Some(10), end: Some(20), name: 0, sampling }],
+        4 => vec![FixtureInput {
+            span_id: first,
+            parent_span_id: Some([0x09; 8]),
+            start: Some(10),
+            end: Some(20),
+            name: 0,
+            sampling,
+        }],
         5 => vec![
-            FixtureInput { span_id: first, parent_span_id: Some(second), start: Some(10), end: Some(40), name: 0, sampling },
-            FixtureInput { span_id: second, parent_span_id: Some(first), start: Some(15), end: Some(35), name: 1, sampling },
+            FixtureInput {
+                span_id: first,
+                parent_span_id: Some(second),
+                start: Some(10),
+                end: Some(40),
+                name: 0,
+                sampling,
+            },
+            FixtureInput {
+                span_id: second,
+                parent_span_id: Some(first),
+                start: Some(15),
+                end: Some(35),
+                name: 1,
+                sampling,
+            },
         ],
         6 => vec![
-            FixtureInput { span_id: root, parent_span_id: None, start: Some(1), end: Some(101), name: 0, sampling },
-            FixtureInput { span_id: root, parent_span_id: None, start: Some(1), end: Some(101), name: 1, sampling: SamplingDecision::NotSampled },
+            FixtureInput {
+                span_id: root,
+                parent_span_id: None,
+                start: Some(1),
+                end: Some(101),
+                name: 0,
+                sampling,
+            },
+            FixtureInput {
+                span_id: root,
+                parent_span_id: None,
+                start: Some(1),
+                end: Some(101),
+                name: 1,
+                sampling: SamplingDecision::NotSampled,
+            },
         ],
-        7 => vec![FixtureInput { span_id: root, parent_span_id: None, start: None, end: None, name: 0, sampling }],
+        7 => vec![FixtureInput {
+            span_id: root,
+            parent_span_id: None,
+            start: None,
+            end: None,
+            name: 0,
+            sampling,
+        }],
         _ => vec![
-            FixtureInput { span_id: root, parent_span_id: None, start: Some(1), end: Some(51), name: 0, sampling },
-            FixtureInput { span_id: first, parent_span_id: Some(root), start: Some(11), end: Some(71), name: 1, sampling },
+            FixtureInput {
+                span_id: root,
+                parent_span_id: None,
+                start: Some(1),
+                end: Some(51),
+                name: 0,
+                sampling,
+            },
+            FixtureInput {
+                span_id: first,
+                parent_span_id: Some(root),
+                start: Some(11),
+                end: Some(71),
+                name: 1,
+                sampling,
+            },
         ],
     };
     let mut observations = Vec::new();
     let mut expected_observations = Vec::new();
     for input in inputs {
-        let quality = if case == 7 { SourceTimeQuality::Missing } else { usable_quality };
+        let quality = if case == 7 {
+            SourceTimeQuality::Missing
+        } else {
+            usable_quality
+        };
         let (observation, expected) = fixture_observation(policy, trace_id, input, quality)?;
         observations.push(observation);
         expected_observations.push(expected);
@@ -982,26 +1143,242 @@ fn exercise_structural_fixture<'kernel>(
     assert_eq!(structure.roots(), expected.roots.as_slice());
     assert_eq!(structure.orphans(), expected.orphans.as_slice());
     assert_eq!(structure.cycles(), expected.cycles.as_slice());
-    assert_eq!(structure.incompleteness().missing_parents(), expected.missing_parents);
-    assert_eq!(structure.incompleteness().conflicts(), expected.conflicts);
-    assert_eq!(structure.incompleteness().cycle_members(), expected.cycles.len() as u64);
-    assert_eq!(structure.incompleteness().invalid_durations(), expected.invalid_durations);
-    assert_eq!(structure.incompleteness().temporal_inconsistencies(), expected.temporal_inconsistencies);
     assert_eq!(
-        structure.spans().iter().map(|span| (
-            span.span_id(), span.parent_span_id(), span.relation(), span.sampling(),
-            span.conflicted(), span.cycle_member(),
-        )).collect::<Vec<_>>(),
+        structure.incompleteness().missing_parents(),
+        expected.missing_parents
+    );
+    assert_eq!(structure.incompleteness().conflicts(), expected.conflicts);
+    assert_eq!(
+        structure.incompleteness().cycle_members(),
+        expected.cycles.len() as u64
+    );
+    assert_eq!(
+        structure.incompleteness().invalid_durations(),
+        expected.invalid_durations
+    );
+    assert_eq!(
+        structure.incompleteness().temporal_inconsistencies(),
+        expected.temporal_inconsistencies
+    );
+    assert_eq!(
+        structure
+            .spans()
+            .iter()
+            .map(|span| (
+                span.span_id(),
+                span.parent_span_id(),
+                span.relation(),
+                span.sampling(),
+                span.conflicted(),
+                span.cycle_member(),
+            ))
+            .collect::<Vec<_>>(),
         expected.spans.as_slice(),
     );
     let literal_path = literal_fixture_path(case);
-    assert_eq!(expected_critical_path(&expected), Some(literal_path.clone()));
-    let actual_path = structure.critical_path().map(|path| (
-        path.fragments().iter().map(|fragment| (fragment.span_id(), fragment.start(), fragment.end())).collect::<Vec<_>>(),
-        path.duration_nanos(),
-    ));
+    assert_eq!(
+        expected_critical_path(&expected),
+        Some(literal_path.clone())
+    );
+    let actual_path = structure.critical_path().map(|path| {
+        (
+            path.fragments()
+                .iter()
+                .map(|fragment| (fragment.span_id(), fragment.start(), fragment.end()))
+                .collect::<Vec<_>>(),
+            path.duration_nanos(),
+        )
+    });
     assert_eq!(actual_path, literal_path);
     Ok((trace_id, u64::try_from(expected_observations.len())?))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn exercise_service_relationship_fixture<'kernel>(
+    ledger: &ActiveSegmentLedger<'kernel, '_>,
+    authority: &'kernel positron_kernel::StorageKernelResourceAuthority,
+    store: &TraceStore,
+    policy: &IngestPolicy,
+    tenant: TenantId,
+    shard: VirtualShardId,
+    selector: u8,
+    ingest_time: i64,
+) -> Result<([u8; 16], u64), Box<dyn Error>> {
+    let case = selector % 6;
+    let trace_id = [0xd0_u8.saturating_add(case); 16];
+    let root = [0x01; 8];
+    let child = [0x02; 8];
+    let name = |value: CandidateAttributeValue| {
+        NativePolicyAttribute::new(
+            AttributeNamespace::Resource,
+            "service.name".to_owned(),
+            vec![value],
+        )
+    };
+    let namespace = |value: CandidateAttributeValue| {
+        NativePolicyAttribute::new(
+            AttributeNamespace::Resource,
+            "service.namespace".to_owned(),
+            vec![value],
+        )
+    };
+    let mut root_attributes = vec![name(CandidateAttributeValue::string("checkout".to_owned()))];
+    if selector & 0x01 == 0 {
+        root_attributes.push(namespace(CandidateAttributeValue::string(
+            "storefront".to_owned(),
+        )));
+    }
+    let (child_attributes, expected_child_identity, expected_child_namespace_identity) = match case
+    {
+        0 => (
+            vec![
+                name(CandidateAttributeValue::string("inventory".to_owned())),
+                namespace(CandidateAttributeValue::string("warehouse".to_owned())),
+            ],
+            TraceServiceIdentity::Exact("inventory"),
+            TraceServiceIdentity::Exact("warehouse"),
+        ),
+        1 => (
+            vec![
+                name(CandidateAttributeValue::string("inventory".to_owned())),
+                name(CandidateAttributeValue::string("billing".to_owned())),
+            ],
+            TraceServiceIdentity::Ambiguous,
+            TraceServiceIdentity::Missing,
+        ),
+        2 => (
+            vec![name(CandidateAttributeValue::boolean(true))],
+            TraceServiceIdentity::Invalid,
+            TraceServiceIdentity::Missing,
+        ),
+        3 => (
+            vec![name(CandidateAttributeValue::string(
+                "inventory".to_owned(),
+            ))],
+            TraceServiceIdentity::Exact("inventory"),
+            TraceServiceIdentity::Missing,
+        ),
+        4 => (
+            vec![
+                name(CandidateAttributeValue::string("inventory".to_owned())),
+                namespace(CandidateAttributeValue::boolean(true)),
+            ],
+            TraceServiceIdentity::Exact("inventory"),
+            TraceServiceIdentity::Invalid,
+        ),
+        _ => (
+            vec![
+                name(CandidateAttributeValue::string("inventory".to_owned())),
+                namespace(CandidateAttributeValue::string("one".to_owned())),
+                namespace(CandidateAttributeValue::string("two".to_owned())),
+            ],
+            TraceServiceIdentity::Exact("inventory"),
+            TraceServiceIdentity::Ambiguous,
+        ),
+    };
+    let child_sampling = sampling_decision(selector);
+    let observation = |span_id, parent_span_id, attributes, sampling| {
+        let TracePolicyEvaluation::Accepted(evaluated) = policy.evaluate_trace(
+            NativeTraceCandidate::new(attributes),
+            PolicyReceiver::OtlpGrpc,
+        )?
+        else {
+            return Err("preserving trace policy rejected relationship fixture".into());
+        };
+        Ok::<_, Box<dyn Error>>(SpanObservation::checked_evaluated(
+            ValueLimitProfile::release_1_system_maximum(),
+            EvaluatedSpanObservationInput {
+                trace_id,
+                span_id,
+                parent_span_id,
+                name: format!("service-fixture-{case}"),
+                start_time: EventTime::received(
+                    UnixNanoseconds::new(1),
+                    SourceTimeQuality::Usable,
+                )?,
+                end_time: EventTime::received(UnixNanoseconds::new(2), SourceTimeQuality::Usable)?,
+                kind: SpanKind::Internal,
+                sampling,
+                evaluated: *evaluated,
+                details: SpanObservationDetails::default(),
+            },
+        )?)
+    };
+    let root_observation = observation(root, None, root_attributes, SamplingDecision::Sampled)?;
+    let child_observation = observation(child, Some(root), child_attributes, child_sampling)?;
+    let mut observations = vec![root_observation, child_observation.clone()];
+    let retried = selector & 0x20 != 0;
+    if retried {
+        observations.push(child_observation);
+    }
+    let conflicted = selector & 0x40 != 0;
+    if conflicted {
+        observations.push(observation(
+            child,
+            Some([0x99; 8]),
+            vec![name(CandidateAttributeValue::string("later".to_owned()))],
+            SamplingDecision::Sampled,
+        )?);
+    }
+    append_all(
+        ledger,
+        authority,
+        store,
+        tenant,
+        shard,
+        0xfd,
+        observations,
+        ingest_time,
+    )?;
+    let snapshot = ledger.snapshot()?;
+    let mut trace = store.trace_by_id_observed(
+        authority.governor(),
+        tenant,
+        &snapshot,
+        trace_id,
+        TraceSearch::all(ScanLimit::new(MAX_OPERATIONS.saturating_add(4))?),
+        &InputCancellation(false),
+        &Unobserved,
+    )?;
+    assert!(trace.complete());
+    let child_span = trace
+        .spans()
+        .iter()
+        .find(|span| span.span_id() == child)
+        .ok_or("relationship fixture child is absent")?;
+    assert_eq!(
+        child_span.observation_count(),
+        1 + u64::from(retried) + u64::from(conflicted)
+    );
+    let structure = trace.analyze_structure(&InputCancellation(false), &Unobserved)?;
+    assert_eq!(
+        structure.incompleteness().conflicts(),
+        u64::from(conflicted)
+    );
+    let relationships = structure.service_relationships();
+    assert_eq!(relationships.edges().len(), 1);
+    let edge = relationships
+        .edges()
+        .first()
+        .ok_or("relationship edge is absent")?;
+    assert_eq!(edge.parent_span_id(), root);
+    assert_eq!(edge.child_span_id(), child);
+    assert_eq!(edge.parent_service(), Some("checkout"));
+    assert_eq!(edge.child_identity(), expected_child_identity);
+    assert_eq!(
+        edge.child_service_namespace_identity(),
+        expected_child_namespace_identity
+    );
+    assert_eq!(edge.child_sampling(), child_sampling);
+    let expected_complete = !conflicted
+        && matches!(expected_child_identity, TraceServiceIdentity::Exact(_))
+        && matches!(
+            expected_child_namespace_identity,
+            TraceServiceIdentity::Missing | TraceServiceIdentity::Exact(_)
+        )
+        && child_sampling == SamplingDecision::Sampled;
+    assert_eq!(relationships.complete(), expected_complete);
+    Ok((trace_id, 2 + u64::from(retried) + u64::from(conflicted)))
 }
 
 fn fixture_observation(
@@ -1013,7 +1390,8 @@ fn fixture_observation(
     let TracePolicyEvaluation::Accepted(evaluated) = policy.evaluate_trace(
         NativeTraceCandidate::new(Vec::new()),
         PolicyReceiver::OtlpGrpc,
-    )? else {
+    )?
+    else {
         return Err("preserving trace policy rejected fixture candidate".into());
     };
     let start_time = input
@@ -1026,7 +1404,10 @@ fn fixture_observation(
         .map(|value| generated_event_time(value, quality))
         .transpose()?
         .unwrap_or_else(EventTime::missing);
-    let interval = input.start.zip(input.end).and_then(|(start, end)| generated_interval(start, end, quality));
+    let interval = input
+        .start
+        .zip(input.end)
+        .and_then(|(start, end)| generated_interval(start, end, quality));
     Ok((
         SpanObservation::checked_evaluated(
             ValueLimitProfile::release_1_system_maximum(),
@@ -1061,10 +1442,42 @@ fn literal_fixture_path(
     let first = [0x02; 8];
     let second = [0x03; 8];
     match case {
-        0 => Some((vec![(root, at(1), at(11)), (first, at(11), at(21)), (second, at(21), at(81)), (first, at(81), at(91)), (root, at(91), at(101))], 100)),
-        1 => Some((vec![(root, at(1), at(11)), (first, at(11), at(41)), (root, at(41), at(51)), (second, at(51), at(91)), (root, at(91), at(101))], 100)),
-        2 => Some((vec![(root, at(1), at(21)), (second, at(21), at(91)), (root, at(91), at(101))], 100)),
-        3 => Some((vec![(root, at(1), at(11)), (first, at(11), at(81)), (root, at(81), at(101))], 100)),
+        0 => Some((
+            vec![
+                (root, at(1), at(11)),
+                (first, at(11), at(21)),
+                (second, at(21), at(81)),
+                (first, at(81), at(91)),
+                (root, at(91), at(101)),
+            ],
+            100,
+        )),
+        1 => Some((
+            vec![
+                (root, at(1), at(11)),
+                (first, at(11), at(41)),
+                (root, at(41), at(51)),
+                (second, at(51), at(91)),
+                (root, at(91), at(101)),
+            ],
+            100,
+        )),
+        2 => Some((
+            vec![
+                (root, at(1), at(21)),
+                (second, at(21), at(91)),
+                (root, at(91), at(101)),
+            ],
+            100,
+        )),
+        3 => Some((
+            vec![
+                (root, at(1), at(11)),
+                (first, at(11), at(81)),
+                (root, at(81), at(101)),
+            ],
+            100,
+        )),
         _ => None,
     }
 }

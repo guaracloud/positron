@@ -1,10 +1,99 @@
 use super::super::*;
-use crate::TraceStoreFailure;
+use crate::{TraceServiceIdentity, TraceStoreFailure};
 use std::cell::Cell;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+
+#[test]
+fn service_relationships_use_only_explicit_resource_service_names() -> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x10; 16])?,
+        CatalogSecret::from_owned(Box::new([0x11; 32]), Box::new([0x12; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let shard = VirtualShardId::new(10)?;
+    let ledger = ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        SegmentScope::new(tenant, SignalKind::Traces, shard),
+        SegmentProtectionKey::from_owned(Box::new([0x13; 32])),
+    )?;
+    let observation = |span_id: [u8; 8], parent_span_id: Option<[u8; 8]>, service: &str| {
+        SpanObservation::checked_native(
+            [0x14; 16],
+            span_id,
+            parent_span_id,
+            "operation".to_owned(),
+            EventTime::received(UnixNanoseconds::new(1), SourceTimeQuality::Usable)
+                .map_err(TraceStoreFailure::domain)?,
+            EventTime::received(UnixNanoseconds::new(2), SourceTimeQuality::Usable)
+                .map_err(TraceStoreFailure::domain)?,
+            vec![
+                AttributeOccurrenceSetCandidate::new(
+                    AttributeNamespace::Resource,
+                    "service.name".to_owned(),
+                    vec![CandidateAttributeValue::string(service.to_owned())],
+                )
+                .validate(ValueLimitProfile::release_1_system_maximum())
+                .map_err(TraceStoreFailure::domain)?,
+            ],
+            SpanKind::Internal,
+            SamplingDecision::Sampled,
+            positron_policy::PolicyProvenance::new(1, [0x15; 32], Vec::new())?,
+        )
+    };
+    let store = TraceStore::new();
+    ledger.append(
+        store
+            .prepare_unretained_for_test(
+                preparation_capacity(&authority, tenant)?,
+                &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
+                tenant,
+                shard,
+                StoreBlockIdentity::new([0x16; 16])?,
+                vec![
+                    observation([0x01; 8], None, "checkout")?,
+                    observation([0x02; 8], Some([0x01; 8]), "inventory")?,
+                ],
+            )?
+            .into_store_block(),
+    )?;
+
+    let mut trace = store.trace_by_id(
+        authority.governor(),
+        tenant,
+        &ledger.snapshot()?,
+        [0x14; 16],
+        TraceSearch::all(ScanLimit::new(2)?),
+    )?;
+    let structure = trace.analyze_structure(&NeverCancelled, &NeverObserved)?;
+    let relationships = structure.service_relationships();
+
+    assert!(relationships.complete());
+    assert_eq!(relationships.edges().len(), 1);
+    let edge = &relationships.edges()[0];
+    assert_eq!(edge.parent_span_id(), [0x01; 8]);
+    assert_eq!(edge.child_span_id(), [0x02; 8]);
+    assert_eq!(edge.parent_service(), Some("checkout"));
+    assert_eq!(edge.child_service(), Some("inventory"));
+    assert_eq!(
+        edge.parent_identity(),
+        TraceServiceIdentity::Exact("checkout")
+    );
+    assert_eq!(
+        edge.child_identity(),
+        TraceServiceIdentity::Exact("inventory")
+    );
+    assert_eq!(edge.parent_sampling(), SamplingDecision::Sampled);
+    assert_eq!(edge.child_sampling(), SamplingDecision::Sampled);
+    Ok(())
+}
 
 struct ExhaustAfterWork(Cell<u64>);
 
@@ -136,6 +225,18 @@ fn trace_by_id_analysis_reports_structure_and_a_critical_path() -> Result<(), Bo
     assert!(structure.orphans().is_empty());
     assert!(structure.cycles().is_empty());
     assert_eq!(structure.spans().len(), 3);
+    assert_eq!(structure.service_relationships().edges().len(), 2);
+    assert!(!structure.service_relationships().complete());
+    assert!(
+        structure
+            .service_relationships()
+            .edges()
+            .iter()
+            .all(|edge| {
+                edge.parent_identity() == TraceServiceIdentity::Missing
+                    && edge.child_identity() == TraceServiceIdentity::Missing
+            })
+    );
     let critical_path = structure.critical_path().ok_or("critical path")?;
     assert_eq!(
         critical_path
