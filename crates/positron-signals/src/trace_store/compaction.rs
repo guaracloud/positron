@@ -65,7 +65,13 @@ pub(super) fn compact<'kernel, 'catalog>(
         .prepare_compaction_with_policy(&snapshot, policy.kernel_policy())
         .map_err(TraceStoreFailure::kernel)?;
     let mut inputs = Vec::new();
+    inputs
+        .try_reserve_exact(snapshot.blocks().len())
+        .map_err(|_| TraceStoreFailure::resource_exhausted())?;
     let mut segments = Vec::new();
+    segments
+        .try_reserve_exact(snapshot.blocks().len())
+        .map_err(|_| TraceStoreFailure::resource_exhausted())?;
     for block in snapshot.blocks() {
         super::scan::check_cancel(cancellation)?;
         if block.segment_id() == active {
@@ -112,7 +118,7 @@ pub(super) fn compact<'kernel, 'catalog>(
                     block.segment_id(),
                     block.identity(),
                     block.position(),
-                    block.payload().to_vec(),
+                    clone_payload(block.payload())?,
                     block.content_digest().map_err(TraceStoreFailure::kernel)?,
                     ingest_time,
                 )
@@ -126,10 +132,15 @@ pub(super) fn compact<'kernel, 'catalog>(
             .find(|(segment, _)| *segment == input.source_segment())
             .is_some_and(|(_, complete)| *complete)
     });
-    let input_segments = inputs
-        .iter()
-        .map(CompactionBlock::source_segment)
-        .collect::<std::collections::BTreeSet<_>>();
+    let mut input_segments = Vec::new();
+    input_segments
+        .try_reserve_exact(inputs.len())
+        .map_err(|_| TraceStoreFailure::resource_exhausted())?;
+    for segment in inputs.iter().map(CompactionBlock::source_segment) {
+        if !input_segments.contains(&segment) {
+            input_segments.push(segment);
+        }
+    }
     if input_segments.len() < 2 {
         return Ok(TraceCompactionOutcome {
             bucket,
@@ -148,4 +159,13 @@ pub(super) fn compact<'kernel, 'catalog>(
         output_segments: published.output_segments(),
         input_blocks,
     })
+}
+
+fn clone_payload(payload: &[u8]) -> Result<Vec<u8>, TraceStoreFailure> {
+    let mut clone = Vec::new();
+    clone
+        .try_reserve_exact(payload.len())
+        .map_err(|_| TraceStoreFailure::resource_exhausted())?;
+    clone.extend_from_slice(payload);
+    Ok(clone)
 }

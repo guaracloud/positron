@@ -129,6 +129,7 @@ pub(super) fn enforce_retention<'kernel, 'catalog>(
         .active_segment_id()
         .map_err(TraceStoreFailure::kernel)?;
     for block in evaluation.blocks() {
+        super::scan::check_cancel(cancellation)?;
         if block.segment_id() == active {
             continue;
         }
@@ -154,6 +155,7 @@ pub(super) fn enforce_retention<'kernel, 'catalog>(
             &super::TraceStore::value_limit_profile(),
         )?;
     }
+    super::scan::check_cancel(cancellation)?;
     let reclaimed = evaluation.commit().map_err(TraceStoreFailure::kernel)?;
     Ok(TraceRetentionOutcome {
         evaluated_at: reclaimed.evaluated_at(),

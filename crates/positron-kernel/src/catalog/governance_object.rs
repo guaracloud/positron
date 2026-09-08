@@ -105,7 +105,7 @@ impl CatalogGovernanceObject {
     }
 }
 
-/// Opaque v3/v4 Log retention evidence from one authenticated Catalog snapshot.
+/// Opaque v3/v4 signal retention evidence from one authenticated Catalog snapshot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CatalogLogRetentionPolicy {
     instance: InstanceId,
