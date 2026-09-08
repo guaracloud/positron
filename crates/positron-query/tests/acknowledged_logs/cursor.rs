@@ -1141,6 +1141,38 @@ fn legacy_cursor(fixture: &CursorFixture) -> Result<QueryCursor, Box<dyn Error>>
     Ok(QueryCursor::from_bytes(&payload)?)
 }
 
+fn v5_cursor(fixture: &CursorFixture) -> Result<QueryCursor, Box<dyn Error>> {
+    let cursor_bytes = fixture.cursor.as_bytes();
+    let payload_bytes = cursor_bytes
+        .len()
+        .checked_sub(32)
+        .ok_or("v6 cursor is shorter than its pair binding")?;
+    let mut payload = cursor_bytes
+        .get(..payload_bytes)
+        .ok_or("v6 cursor omitted its payload")?
+        .to_vec();
+    let versions = payload.split_off(
+        payload
+            .len()
+            .checked_sub(2)
+            .ok_or("v6 cursor omitted its versions")?,
+    );
+    payload.truncate(
+        payload
+            .len()
+            .checked_sub(65)
+            .ok_or("v6 cursor omitted its pair binding")?,
+    );
+    payload.extend_from_slice(&versions);
+    payload[..8].copy_from_slice(b"POSQCR05");
+    let protector = fixture.kernel.ledger()?.control_tokens();
+    let initial = protector.authenticate_query_cursor(b"query-cursor-v5", &payload)?;
+    payload[8..16].copy_from_slice(&initial.epoch().to_be_bytes());
+    let authentication = protector.authenticate_query_cursor(b"query-cursor-v5", &payload)?;
+    payload.extend_from_slice(&authentication.tag());
+    Ok(QueryCursor::from_bytes(&payload)?)
+}
+
 #[test]
 fn authenticated_cursor_rejects_unknown_api_and_language_versions() -> Result<(), Box<dyn Error>> {
     let fixture = CursorFixture::new()?;
@@ -1192,6 +1224,45 @@ fn previous_current_cursor_wire_is_rejected_without_downgrade() -> Result<(), Bo
     Ok(())
 }
 
+#[test]
+fn authenticated_v5_cursor_resumes_the_unchanged_normal_plan() -> Result<(), Box<dyn Error>> {
+    let fixture = CursorFixture::new()?;
+    let cursor = v5_cursor(&fixture)?;
+
+    let events = fixture
+        .service()
+        .resume(fixture.context, &cursor)?
+        .collect::<Vec<_>>();
+    assert_eq!(bodies(&events), vec!["second"]);
+    assert!(matches!(
+        events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Complete(_)))
+    ));
+    Ok(())
+}
+
+#[test]
+fn authenticated_v5_cursor_rejects_source_bytes_without_a_declared_language()
+-> Result<(), Box<dyn Error>> {
+    let fixture = CursorFixture::new()?;
+    let baseline = fixture.kernel.authority.governor().inspect()?;
+    let cursor = rewritten_v5_cursor(&fixture, |payload| {
+        let source_language_offset = 348;
+        payload[source_language_offset] = 0;
+    })?;
+
+    assert_eq!(
+        fixture
+            .service()
+            .resume(fixture.context, &cursor)
+            .expect_err("an authenticated v5 source requires its declared language")
+            .code(),
+        QueryFailureCode::InvalidCursor
+    );
+    assert_eq!(fixture.kernel.authority.governor().inspect()?, baseline);
+    Ok(())
+}
+
 fn rewritten_source_cursor(
     fixture: &CursorFixture,
     cursor: &QueryCursor,
@@ -1217,6 +1288,21 @@ fn rewritten_source_cursor(
     let initial = protector.authenticate_query_cursor(b"query-cursor-v6", &payload)?;
     payload[8..16].copy_from_slice(&initial.epoch().to_be_bytes());
     let authentication = protector.authenticate_query_cursor(b"query-cursor-v6", &payload)?;
+    payload.extend_from_slice(&authentication.tag());
+    Ok(QueryCursor::from_bytes(&payload)?)
+}
+
+fn rewritten_v5_cursor(
+    fixture: &CursorFixture,
+    rewrite: impl FnOnce(&mut Vec<u8>),
+) -> Result<QueryCursor, Box<dyn Error>> {
+    let cursor = v5_cursor(fixture)?;
+    let mut payload = cursor.as_bytes()[..cursor.as_bytes().len() - 32].to_vec();
+    rewrite(&mut payload);
+    let protector = fixture.kernel.ledger()?.control_tokens();
+    let initial = protector.authenticate_query_cursor(b"query-cursor-v5", &payload)?;
+    payload[8..16].copy_from_slice(&initial.epoch().to_be_bytes());
+    let authentication = protector.authenticate_query_cursor(b"query-cursor-v5", &payload)?;
     payload.extend_from_slice(&authentication.tag());
     Ok(QueryCursor::from_bytes(&payload)?)
 }
