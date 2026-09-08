@@ -24,10 +24,12 @@ pub use trace_store::{
     SamplingDecision, ScannedSpanObservation, SpanAttributeSet, SpanEvent, SpanKind, SpanLink,
     SpanObservation, SpanObservationDetails, SpanObservationDetailsInput, SpanObservationVariant,
     SpanResourceMetadata, SpanScopeMetadata, SpanStatus, SpanStatusCode, StoredSpanObservation,
-    TraceByIdResult, TraceByIdSummary, TraceByIdSummaryPending, TraceIncompleteness,
-    TraceQuietPeriod, TraceScan, TraceScanResult, TraceSearch, TraceStore, TraceStoreFailure,
-    TraceStoreFailureCode, TraceSummary, TraceSummaryCoverage, TraceSummaryMaintainer,
-    TraceSummaryMaintenance, TraceSummaryTimeProvenance,
+    TraceByIdResult, TraceByIdSummary, TraceByIdSummaryPending, TraceCriticalPath,
+    TraceCriticalPathFragment, TraceIncompleteness, TraceParentRelation, TraceQuietPeriod,
+    TraceScan, TraceScanResult, TraceSearch, TraceStore, TraceStoreFailure, TraceStoreFailureCode,
+    TraceStructure, TraceStructureIncompleteness, TraceStructureSpan, TraceSummary,
+    TraceSummaryCoverage, TraceSummaryMaintainer, TraceSummaryMaintenance,
+    TraceSummaryTimeProvenance,
 };
 
 #[cfg(fuzzing)]

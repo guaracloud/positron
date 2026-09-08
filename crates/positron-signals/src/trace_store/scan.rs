@@ -271,7 +271,10 @@ impl<'kernel> TraceScanResult<'kernel> {
         let mut logical = self.into_matching_logical(search, profile, cancellation, observer)?;
         retain_trace_id(&mut logical.spans, trace_id, cancellation, observer)?;
         Ok(super::TraceByIdResult::from_logical(
-            trace_id, logical, snapshot,
+            trace_id,
+            logical,
+            snapshot,
+            search.filters_spans(),
         ))
     }
 

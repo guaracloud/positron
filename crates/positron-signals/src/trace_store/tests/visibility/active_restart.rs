@@ -668,7 +668,7 @@ fn trace_by_id_applies_a_non_matching_native_attribute_predicate() -> Result<(),
     .ok_or("missing predicate occurrence")?
     .try_clone()?;
 
-    let result = store.trace_by_id(
+    let mut result = store.trace_by_id(
         authority.governor(),
         tenant,
         &ledger.snapshot()?,
@@ -681,6 +681,12 @@ fn trace_by_id_applies_a_non_matching_native_attribute_predicate() -> Result<(),
     )?;
     assert!(result.complete());
     assert!(result.spans().is_empty());
+    let structure = result.analyze_structure(&NeverCancelled, &NeverObserved)?;
+    assert!(!structure.complete());
+    assert!(structure.spans().is_empty());
+    assert!(structure.incompleteness().filtered());
+    assert_eq!(structure.incompleteness().scan(), TraceIncompleteness::None);
+    assert!(structure.critical_path().is_none());
     Ok(())
 }
 

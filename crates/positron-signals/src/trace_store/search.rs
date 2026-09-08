@@ -80,6 +80,10 @@ impl TraceSearch {
         };
         filter.matches(observation, cancellation, observer)
     }
+
+    pub(super) const fn filters_spans(&self) -> bool {
+        self.attribute_equals.is_some()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -159,12 +163,14 @@ pub struct TraceByIdResult<'kernel> {
     complete: bool,
     scanned_bytes: u64,
     incompleteness: TraceIncompleteness,
+    filtered: bool,
     scope: SegmentScope,
     catalog_generation: u64,
     catalog_identity: CatalogGenerationId,
     frontier: CommitPosition,
     summary: TraceByIdSummary,
-    _capacity: ResourceReservation<'kernel>,
+    retained_size_bytes: u64,
+    capacity: ResourceReservation<'kernel>,
 }
 
 /// Summary facts bound to the exact authenticated trace query snapshot.
@@ -229,13 +235,15 @@ impl<'kernel> TraceByIdResult<'kernel> {
         trace_id: [u8; 16],
         logical: LogicalTraceScanResult<'kernel>,
         snapshot: &LedgerSnapshot<'_>,
+        filtered: bool,
     ) -> Self {
         let LogicalTraceScanResult {
             spans,
             complete,
             scanned_bytes,
             scanned_bytes_limited,
-            _capacity,
+            retained_size_bytes,
+            _capacity: capacity,
             ..
         } = logical;
         let incompleteness = if complete {
@@ -251,12 +259,14 @@ impl<'kernel> TraceByIdResult<'kernel> {
             complete,
             scanned_bytes,
             incompleteness,
+            filtered,
             scope: snapshot.scope(),
             catalog_generation: snapshot.catalog_generation(),
             catalog_identity: snapshot.catalog_identity(),
             frontier: snapshot.frontier(),
             summary: TraceByIdSummary::pending(TraceByIdSummaryPending::NoMaintenance),
-            _capacity,
+            retained_size_bytes,
+            capacity,
         }
     }
 
@@ -332,5 +342,36 @@ impl<'kernel> TraceByIdResult<'kernel> {
     #[must_use]
     pub const fn summary(&self) -> &TraceByIdSummary {
         &self.summary
+    }
+
+    /// Analyzes the parent graph visible in this exact query snapshot.
+    ///
+    /// This does not infer that the trace is complete: it only reports whether
+    /// the bounded snapshot graph contains every required parent, a single
+    /// structural representative for every logical span, and valid durations.
+    /// The caller's cancellation and work accounting apply to every graph
+    /// traversal step.
+    pub fn analyze_structure<'result>(
+        &'result mut self,
+        cancellation: &dyn ScanCancellation,
+        observer: &dyn ScanObserver,
+    ) -> Result<super::TraceStructure<'result>, TraceStoreFailure> {
+        let retained_size_bytes = self.retained_size_bytes;
+        let spans = &self.spans;
+        let summary = &self.summary;
+        let incompleteness = self.incompleteness;
+        let filtered = self.filtered;
+        super::structural::analyze(
+            super::structural::StructuralInput {
+                spans,
+                summary,
+                scan: incompleteness,
+                filtered,
+                retained_size_bytes,
+            },
+            cancellation,
+            observer,
+            &mut self.capacity,
+        )
     }
 }

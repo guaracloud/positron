@@ -218,7 +218,7 @@ fn sealed_and_successor_active_segments_have_equivalent_trace_scan_visibility()
                     ([0x11; 16], [0x23; 8], 1, false, vec![("active", 1)]),
                 ]
             );
-            let by_id = store.trace_by_id(
+            let mut by_id = store.trace_by_id(
                 authority.governor(),
                 tenant,
                 snapshot,
@@ -257,6 +257,15 @@ fn sealed_and_successor_active_segments_have_equivalent_trace_scan_visibility()
                     ([0x23; 8], 1, false, vec![("active", 1)]),
                 ]
             );
+            let structure = by_id.analyze_structure(&NeverCancelled, &NeverObserved)?;
+            assert!(!structure.complete());
+            assert_eq!(structure.roots(), &[[0x22; 8]]);
+            assert!(structure.orphans().is_empty());
+            assert!(structure.cycles().is_empty());
+            assert_eq!(structure.incompleteness().conflicts(), 1);
+            assert_eq!(structure.incompleteness().invalid_durations(), 1);
+            assert_eq!(structure.incompleteness().temporal_inconsistencies(), 0);
+            assert!(structure.critical_path().is_none());
             Ok(())
         };
 

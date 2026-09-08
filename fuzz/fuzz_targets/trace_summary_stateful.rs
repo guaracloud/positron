@@ -11,19 +11,19 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use libfuzzer_sys::fuzz_target;
 use positron_domain::identity::TenantId;
 use positron_domain::routing::{SignalKind, VirtualShardId};
-use positron_domain::time::{EventTime, UnixNanoseconds};
+use positron_domain::time::{EventTime, SourceTimeQuality, UnixNanoseconds};
 use positron_domain::value::ValueLimitProfile;
 use positron_kernel::{
     ActiveSegmentLedger, Catalog, CatalogSecret, FixedLifecycleClockSource, InstanceId,
     LifecycleClock, LifecycleClockFailure, LifecycleClockSource, ResourceAmounts,
-    ResourceDimension, SegmentProtectionKey, SegmentScope, StoreBlockIdentity, WorkClaim,
-    WorkKind,
+    ResourceDimension, SegmentProtectionKey, SegmentScope, StoreBlockIdentity, WorkClaim, WorkKind,
 };
 use positron_policy::{IngestPolicy, NativeTraceCandidate, PolicyReceiver, TracePolicyEvaluation};
 use positron_signals::{
     EvaluatedSpanObservationInput, SamplingDecision, ScanCancellation, ScanLimit,
     ScanObservationFailureCode, ScanObserver, SpanKind, SpanObservation, SpanObservationDetails,
-    TraceQuietPeriod, TraceSearch, TraceStore, TraceStoreFailureCode, TraceSummaryMaintainer,
+    TraceIncompleteness, TraceQuietPeriod, TraceSearch, TraceStore, TraceStoreFailureCode,
+    TraceSummaryMaintainer,
 };
 
 #[path = "schema_discovery_query/authority.rs"]
@@ -164,7 +164,9 @@ fn run_once(data: &[u8], root: &std::path::Path) -> Result<(), Box<dyn Error>> {
                     .checked_add(1)
                     .ok_or("bounded ingest time overflow")?;
                 let count = expected.entry(trace).or_insert(0_u64);
-                *count = count.checked_add(1).ok_or("bounded observation count overflow")?;
+                *count = count
+                    .checked_add(1)
+                    .ok_or("bounded observation count overflow")?;
                 record_expected_span(&mut expected_spans, trace, command[2])?;
             },
             2 => {
@@ -219,10 +221,7 @@ fn run_once(data: &[u8], root: &std::path::Path) -> Result<(), Box<dyn Error>> {
                     Ok(_) => panic!("cancelled maintenance unexpectedly succeeded"),
                     Err(failure) => failure,
                 };
-                assert_eq!(
-                    failure.code(),
-                    TraceStoreFailureCode::Cancelled
-                );
+                assert_eq!(failure.code(), TraceStoreFailureCode::Cancelled);
             },
             4 => {
                 source_set(&source, command[1]);
@@ -279,8 +278,13 @@ fn run_once(data: &[u8], root: &std::path::Path) -> Result<(), Box<dyn Error>> {
             command[2],
         )?;
         if let Some(trace) = reopened_trace {
-            let summary = result.summary(trace).ok_or("late trace summary is present")?;
-            assert!(!summary.quiescent(), "a later span reopens a quiescent trace");
+            let summary = result
+                .summary(trace)
+                .ok_or("late trace summary is present")?;
+            assert!(
+                !summary.quiescent(),
+                "a later span reopens a quiescent trace"
+            );
             assert_eq!(
                 summary.observation_count(),
                 *expected
@@ -352,7 +356,7 @@ fn exercise_trace_queries(
         .nth(target_index)
         .copied()
         .unwrap_or([0x7f; 16]);
-    let by_id = store.trace_by_id_observed(
+    let mut by_id = store.trace_by_id_observed(
         authority.governor(),
         tenant,
         snapshot,
@@ -379,14 +383,249 @@ fn exercise_trace_queries(
             .collect::<Vec<_>>(),
         expected_by_id
     );
+    let by_id_complete = by_id.complete();
+    let expected_structure = expected_structure(by_id.spans());
+    let expected_path = expected_critical_path(by_id.spans(), &expected_structure);
+    let structure = by_id.analyze_structure(&InputCancellation(false), &Unobserved)?;
+    assert_eq!(structure.incompleteness().scan(), TraceIncompleteness::None);
+    assert_eq!(structure.roots(), expected_structure.roots);
+    assert_eq!(structure.orphans(), expected_structure.orphans);
+    assert_eq!(structure.cycles(), expected_structure.cycles);
+    assert_eq!(
+        structure.incompleteness().missing_parents(),
+        expected_structure.missing_parents
+    );
+    assert_eq!(
+        structure.incompleteness().conflicts(),
+        expected_structure.conflicts
+    );
+    assert_eq!(
+        structure.incompleteness().cycle_members(),
+        expected_structure.cycles.len() as u64
+    );
+    assert_eq!(
+        structure.incompleteness().invalid_durations(),
+        expected_structure.invalid_durations
+    );
+    assert_eq!(
+        structure.incompleteness().temporal_inconsistencies(),
+        expected_structure.temporal_inconsistencies
+    );
+    assert_eq!(
+        structure.incompleteness().ambiguous_roots(),
+        expected_structure.roots.len() > 1
+    );
+    let expected_complete = by_id_complete
+        && expected_structure.missing_parents == 0
+        && expected_structure.conflicts == 0
+        && expected_structure.cycles.is_empty()
+        && expected_structure.invalid_durations == 0
+        && expected_structure.temporal_inconsistencies == 0
+        && expected_structure.roots.len() <= 1;
+    assert_eq!(structure.complete(), expected_complete);
+    let actual_path = structure.critical_path().map(|path| {
+        (
+            path.fragments()
+                .iter()
+                .map(|fragment| (fragment.span_id(), fragment.start(), fragment.end()))
+                .collect::<Vec<_>>(),
+            path.duration_nanos(),
+        )
+    });
+    assert_eq!(actual_path, expected_path);
     if expected.values().copied().sum::<u64>() > 1 {
         let incomplete = store.search_observed(
-            authority.governor(), tenant, snapshot, TraceSearch::all(ScanLimit::new(1)?),
-            &InputCancellation(false), &Unobserved,
+            authority.governor(),
+            tenant,
+            snapshot,
+            TraceSearch::all(ScanLimit::new(1)?),
+            &InputCancellation(false),
+            &Unobserved,
         )?;
         assert!(!incomplete.complete());
     }
     Ok(())
+}
+
+struct ExpectedStructure {
+    roots: Vec<[u8; 8]>,
+    orphans: Vec<[u8; 8]>,
+    cycles: Vec<[u8; 8]>,
+    missing_parents: u64,
+    conflicts: u64,
+    invalid_durations: u64,
+    temporal_inconsistencies: u64,
+}
+
+type ExpectedNode = (Option<[u8; 8]>, UnixNanoseconds, UnixNanoseconds);
+
+fn expected_structure(spans: &[positron_signals::LogicalSpan]) -> ExpectedStructure {
+    let parents = spans
+        .iter()
+        .filter_map(|span| {
+            span.structural_representative().map(|representative| {
+                (
+                    span.span_id(),
+                    (
+                        representative.observation().parent_span_id(),
+                        interval(representative.observation()),
+                    ),
+                )
+            })
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut expected = ExpectedStructure {
+        roots: Vec::new(),
+        orphans: Vec::new(),
+        cycles: Vec::new(),
+        missing_parents: 0,
+        conflicts: 0,
+        invalid_durations: 0,
+        temporal_inconsistencies: 0,
+    };
+    for span in spans {
+        let Some((parent, child_interval)) = parents.get(&span.span_id()).copied() else {
+            continue;
+        };
+        if span.conflicted() {
+            expected.conflicts = expected.conflicts.saturating_add(1);
+        }
+        if child_interval.is_none() {
+            expected.invalid_durations = expected.invalid_durations.saturating_add(1);
+        }
+        match parent {
+            None => expected.roots.push(span.span_id()),
+            Some(parent) => match parents.get(&parent) {
+                None => {
+                    expected.orphans.push(span.span_id());
+                    expected.missing_parents = expected.missing_parents.saturating_add(1);
+                },
+                Some((_, parent_interval)) => {
+                    if let (Some(parent_interval), Some(child_interval)) =
+                        (*parent_interval, child_interval)
+                        && (child_interval.0 < parent_interval.0
+                            || child_interval.1 > parent_interval.1)
+                    {
+                        expected.temporal_inconsistencies =
+                            expected.temporal_inconsistencies.saturating_add(1);
+                    }
+                },
+            },
+        }
+        if is_cycle_member(span.span_id(), &parents, spans.len()) {
+            expected.cycles.push(span.span_id());
+        }
+    }
+    expected
+}
+
+fn expected_critical_path(
+    spans: &[positron_signals::LogicalSpan],
+    expected: &ExpectedStructure,
+) -> Option<(Vec<([u8; 8], UnixNanoseconds, UnixNanoseconds)>, u64)> {
+    if expected.missing_parents != 0
+        || expected.conflicts != 0
+        || !expected.cycles.is_empty()
+        || expected.invalid_durations != 0
+        || expected.temporal_inconsistencies != 0
+        || expected.roots.len() != 1
+    {
+        return None;
+    }
+    let nodes = spans
+        .iter()
+        .filter_map(|span| {
+            span.structural_representative().and_then(|representative| {
+                interval(representative.observation()).map(|(start, end)| {
+                    (
+                        span.span_id(),
+                        (representative.observation().parent_span_id(), start, end),
+                    )
+                })
+            })
+        })
+        .collect::<BTreeMap<[u8; 8], ExpectedNode>>();
+    let root_id = expected.roots.first().copied()?;
+    let (_, root_start, root_end) = *nodes.get(&root_id)?;
+    let mut fragments = Vec::new();
+    let mut stack = vec![(root_id, root_start, root_end)];
+    while let Some((parent_id, parent_start, cursor)) = stack.last_mut() {
+        let selected = nodes
+            .iter()
+            .filter(|(_, (parent, start, end))| {
+                *parent == Some(*parent_id) && *start < *cursor && *end <= *cursor
+            })
+            .max_by(
+                |(left_id, (_, _, left_end)), (right_id, (_, _, right_end))| {
+                    left_end.cmp(right_end).then_with(|| right_id.cmp(left_id))
+                },
+            )
+            .map(|(id, (_, start, end))| (*id, *start, *end));
+        if let Some((child_id, child_start, child_end)) = selected {
+            if child_end > *cursor {
+                return None;
+            }
+            if child_end < *cursor {
+                fragments.push((*parent_id, child_end, *cursor));
+            }
+            *cursor = child_start;
+            let (_, child_start, child_end) = *nodes.get(&child_id)?;
+            stack.push((child_id, child_start, child_end));
+        } else {
+            if *cursor > *parent_start {
+                fragments.push((*parent_id, *parent_start, *cursor));
+            }
+            let _ = stack.pop();
+        }
+    }
+    fragments.reverse();
+    let duration = fragments.iter().try_fold(0_u64, |total, (_, start, end)| {
+        u64::try_from(i128::from(end.value()) - i128::from(start.value()))
+            .ok()
+            .and_then(|fragment| total.checked_add(fragment))
+    })?;
+    Some((fragments, duration))
+}
+
+fn is_cycle_member(
+    origin: [u8; 8],
+    parents: &BTreeMap<[u8; 8], (Option<[u8; 8]>, Option<(UnixNanoseconds, UnixNanoseconds)>)>,
+    span_count: usize,
+) -> bool {
+    let mut current = Some(origin);
+    for _ in 0..span_count {
+        let Some(span_id) = current else {
+            return false;
+        };
+        let Some((parent, _)) = parents.get(&span_id) else {
+            return false;
+        };
+        current = *parent;
+        if current == Some(origin) {
+            return true;
+        }
+    }
+    false
+}
+
+fn interval(observation: &SpanObservation) -> Option<(UnixNanoseconds, UnixNanoseconds)> {
+    let start = observation.start_time();
+    let end = observation.end_time();
+    matches!(
+        start.quality(),
+        SourceTimeQuality::Usable | SourceTimeQuality::Outlier
+    )
+    .then_some(start.instant())
+    .flatten()
+    .zip(
+        matches!(
+            end.quality(),
+            SourceTimeQuality::Usable | SourceTimeQuality::Outlier
+        )
+        .then_some(end.instant())
+        .flatten(),
+    )
+    .filter(|(start, end)| end >= start)
 }
 
 fn record_expected_span(
@@ -412,11 +651,8 @@ fn source_set(source: &AtomicI64, input: u8) {
 }
 
 fn trace_id(command: &[u8]) -> [u8; 16] {
-    let mut state = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in command {
-        state ^= u64::from(*byte);
-        state = state.wrapping_mul(0x0000_0100_0000_01b3);
-    }
+    let state = 0xcbf2_9ce4_8422_2325_u64
+        .wrapping_mul(u64::from(command.first().copied().unwrap_or_default()).wrapping_add(1));
     let mut trace_id = [0_u8; 16];
     trace_id[..8].copy_from_slice(&state.to_be_bytes());
     trace_id[8..].copy_from_slice(
@@ -444,21 +680,41 @@ fn observation(
     else {
         return Err("preserving trace policy rejected a candidate".into());
     };
+    let start = i64::from(span_selector.max(2));
     Ok(SpanObservation::checked_evaluated(
         ValueLimitProfile::release_1_system_maximum(),
         EvaluatedSpanObservationInput {
             trace_id,
             span_id: [span_selector.max(1); 8],
-            parent_span_id: None,
+            parent_span_id: parent_span_id(span_selector, semantic_selector),
             name: format!("fuzz-span-{semantic_selector}"),
-            start_time: EventTime::missing(),
-            end_time: EventTime::missing(),
+            start_time: EventTime::received(
+                UnixNanoseconds::new(start),
+                SourceTimeQuality::Usable,
+            )?,
+            end_time: EventTime::received(
+                UnixNanoseconds::new(if semantic_selector & 0x80 == 0 {
+                    start.saturating_add(i64::from(semantic_selector & 0x3f))
+                } else {
+                    start.saturating_sub(1)
+                }),
+                SourceTimeQuality::Usable,
+            )?,
             kind: SpanKind::Internal,
             sampling: SamplingDecision::Unknown,
             evaluated: *evaluated,
             details: SpanObservationDetails::default(),
         },
     )?)
+}
+
+fn parent_span_id(span_selector: u8, semantic_selector: u8) -> Option<[u8; 8]> {
+    match semantic_selector & 0x03 {
+        0 => None,
+        1 => Some([span_selector.max(1); 8]),
+        2 => Some([semantic_selector.max(1); 8]),
+        _ => Some([span_selector.wrapping_add(1).max(1); 8]),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -504,8 +760,10 @@ fn assert_visible_summary_counts(
             continue;
         };
         assert!(summary.observation_count() <= *expected_observations);
-        assert!(u64::try_from(summary.logical_span_count())
-            .is_ok_and(|count| count <= summary.observation_count()));
+        assert!(
+            u64::try_from(summary.logical_span_count())
+                .is_ok_and(|count| count <= summary.observation_count())
+        );
         assert!(summary.conflicted_span_count() <= summary.logical_span_count());
     }
 }
@@ -586,7 +844,10 @@ fn replay_and_assert(
             }
         }
     }
-    assert!(completed, "bounded replay did not reach its authenticated frontier");
+    assert!(
+        completed,
+        "bounded replay did not reach its authenticated frontier"
+    );
     assert!(
         quiescence_complete,
         "bounded replay did not refresh quiescence for its authenticated frontier"
@@ -600,7 +861,9 @@ fn replay_and_assert(
         &clock,
     )?;
     for (trace, expected_observations) in expected {
-        let summary = result.summary(*trace).ok_or("replayed trace summary missing")?;
+        let summary = result
+            .summary(*trace)
+            .ok_or("replayed trace summary missing")?;
         assert_eq!(summary.observation_count(), *expected_observations);
         assert!(summary.quiescent());
     }
