@@ -302,7 +302,7 @@ fn retain_trace_id(
                 .checked_add(1)
                 .ok_or_else(TraceStoreFailure::limit_exceeded)?;
         } else {
-            spans.swap_remove(index);
+            spans.remove(index);
         }
     }
     Ok(())
@@ -333,7 +333,7 @@ fn retain_matching_spans(
                 .checked_add(1)
                 .ok_or_else(TraceStoreFailure::limit_exceeded)?;
         } else {
-            spans.swap_remove(index);
+            spans.remove(index);
         }
     }
     Ok(())

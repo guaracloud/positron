@@ -386,6 +386,42 @@ fn trace_by_id_returns_the_committed_active_trace_from_its_snapshot() -> Result<
         SamplingDecision::Sampled,
         positron_policy::PolicyProvenance::new(1, [0x77; 32], Vec::new())?,
     )?;
+    let second_span = SpanObservation::checked_native(
+        [0x12; 16],
+        [0x24; 8],
+        None,
+        "second".to_owned(),
+        EventTime::missing(),
+        EventTime::missing(),
+        Vec::new(),
+        SpanKind::Server,
+        SamplingDecision::Sampled,
+        positron_policy::PolicyProvenance::new(1, [0x77; 32], Vec::new())?,
+    )?;
+    let target_first = SpanObservation::checked_native(
+        [0x13; 16],
+        [0x25; 8],
+        None,
+        "target-first".to_owned(),
+        EventTime::missing(),
+        EventTime::missing(),
+        Vec::new(),
+        SpanKind::Server,
+        SamplingDecision::Sampled,
+        positron_policy::PolicyProvenance::new(1, [0x77; 32], Vec::new())?,
+    )?;
+    let target_second = SpanObservation::checked_native(
+        [0x13; 16],
+        [0x26; 8],
+        None,
+        "target-second".to_owned(),
+        EventTime::missing(),
+        EventTime::missing(),
+        Vec::new(),
+        SpanKind::Server,
+        SamplingDecision::Sampled,
+        positron_policy::PolicyProvenance::new(1, [0x77; 32], Vec::new())?,
+    )?;
     ledger.append(
         store
             .prepare_unretained_for_test(
@@ -394,7 +430,13 @@ fn trace_by_id_returns_the_committed_active_trace_from_its_snapshot() -> Result<
                 tenant,
                 shard,
                 positron_kernel::StoreBlockIdentity::new([0x64; 16])?,
-                vec![observation, conflict],
+                vec![
+                    observation,
+                    conflict,
+                    second_span,
+                    target_first,
+                    target_second,
+                ],
             )?
             .into_store_block(),
     )?;
@@ -405,25 +447,42 @@ fn trace_by_id_returns_the_committed_active_trace_from_its_snapshot() -> Result<
         tenant,
         &snapshot,
         [0x12; 16],
-        TraceSearch::all(ScanLimit::new(2)?),
+        TraceSearch::all(ScanLimit::new(5)?),
     )?;
 
     assert_eq!(trace.trace_id(), [0x12; 16]);
-    assert_eq!(trace.spans().len(), 1);
+    assert_eq!(trace.spans().len(), 2);
     assert_eq!(trace.spans()[0].span_id(), [0x23; 8]);
     assert_eq!(trace.spans()[0].variants().len(), 2);
+    assert_eq!(trace.spans()[1].span_id(), [0x24; 8]);
     assert!(trace.complete());
 
     let search = store.search(
         authority.governor(),
         tenant,
         &snapshot,
-        TraceSearch::all(ScanLimit::new(2)?),
+        TraceSearch::all(ScanLimit::new(5)?),
     )?;
-    assert_eq!(search.spans().len(), 1);
+    assert_eq!(search.spans().len(), 4);
     assert_eq!(search.spans()[0].trace_id(), [0x12; 16]);
     assert_eq!(search.spans()[0].variants().len(), 2);
     assert!(search.complete());
+
+    let target = store.trace_by_id(
+        authority.governor(),
+        tenant,
+        &snapshot,
+        [0x13; 16],
+        TraceSearch::all(ScanLimit::new(5)?),
+    )?;
+    assert_eq!(
+        target
+            .spans()
+            .iter()
+            .map(|span| span.span_id())
+            .collect::<Vec<_>>(),
+        vec![[0x25; 8], [0x26; 8]]
+    );
 
     let filtered = store.search(
         authority.governor(),
