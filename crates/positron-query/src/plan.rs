@@ -253,6 +253,7 @@ impl LogicalPlan {
 
     pub(crate) fn has_advanced_operators(&self) -> bool {
         self.filter.is_some()
+            || self.is_log_to_trace_correlation()
             || self.projection != [ProjectionColumn::Body]
             || self.aggregate.is_some()
             || self.ordering != OrderSpec::ascending(self.axis)
@@ -260,7 +261,7 @@ impl LogicalPlan {
     }
 
     pub(crate) fn tail_incompatible(&self) -> bool {
-        self.aggregate.is_some()
+        self.is_log_to_trace_correlation() || self.aggregate.is_some()
     }
 
     pub(crate) fn has_explicit_ordering(&self) -> bool {

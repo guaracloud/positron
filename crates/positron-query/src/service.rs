@@ -200,6 +200,9 @@ fn parse_versioned_pipeline(
     }
     let (axis, start, end) =
         range.ok_or_else(|| QueryFailure::new(QueryFailureCode::UnsupportedQuery))?;
+    if correlation && aggregate.is_some() {
+        return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
+    }
     let mut plan = plan(
         axis,
         start,

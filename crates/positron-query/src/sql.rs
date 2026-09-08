@@ -53,6 +53,9 @@ impl<'source> Parser<'source> {
             parser.ordering(axis)
         })?;
         let aggregate_selection = matches!(&selection, Selection::Count | Selection::CountBy(_));
+        if correlation.is_some() && aggregate_selection {
+            return Err(unsupported());
+        }
         if ordering.is_none() && !aggregate_selection {
             return Err(unsupported());
         }

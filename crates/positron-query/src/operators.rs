@@ -48,10 +48,12 @@ pub(crate) fn execute<'kernel, 'catalog, 'ledger>(
                 let spans = correlation_spans
                     .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
                 Some(correlation_outcome(
+                    service,
+                    state,
                     correlation.trace_id(),
                     correlation.span_id(),
                     spans,
-                ))
+                )?)
             } else {
                 None
             };
@@ -83,39 +85,58 @@ pub(crate) fn execute<'kernel, 'catalog, 'ledger>(
     Ok(records)
 }
 
-fn correlation_outcome(
+fn correlation_outcome<'kernel, 'catalog, 'ledger>(
+    service: &QueryService<'kernel, 'catalog, 'ledger>,
+    state: &mut CursorState,
     log_trace_id: Option<[u8; 16]>,
     log_span_id: Option<[u8; 8]>,
     spans: &[positron_signals::LogicalSpan],
-) -> crate::CorrelationOutcome {
+) -> Result<crate::CorrelationOutcome, QueryFailure> {
     let Some(trace_id) = log_trace_id else {
-        return crate::CorrelationOutcome::MissingLogTraceId;
+        return Ok(crate::CorrelationOutcome::MissingLogTraceId);
     };
     let mut matched = false;
     for span in spans {
+        charge_correlation_target_work(service, state)?;
         if span.trace_id() == trace_id
             && log_span_id.is_none_or(|span_id| span.span_id() == span_id)
         {
             if span.conflicted() {
-                return crate::CorrelationOutcome::Ambiguous {
+                return Ok(crate::CorrelationOutcome::Ambiguous {
                     trace_id,
                     span_id: log_span_id,
-                };
+                });
             }
             matched = true;
         }
     }
     if matched {
-        crate::CorrelationOutcome::Matched {
+        Ok(crate::CorrelationOutcome::Matched {
             trace_id,
             span_id: log_span_id,
-        }
+        })
     } else {
-        crate::CorrelationOutcome::MissingTraceTarget {
+        Ok(crate::CorrelationOutcome::MissingTraceTarget {
             trace_id,
             span_id: log_span_id,
-        }
+        })
     }
+}
+
+fn charge_correlation_target_work<'kernel, 'catalog, 'ledger>(
+    service: &QueryService<'kernel, 'catalog, 'ledger>,
+    state: &mut CursorState,
+) -> Result<(), QueryFailure> {
+    check_cancellation(state)?;
+    let units = service.work_units(QueryWorkStage::Operators)?;
+    check_cancellation(state)?;
+    charge_work(state, units)?;
+    if exhausted(state) {
+        return Err(QueryFailure::budget_exhausted(
+            QueryBudgetDimension::CpuWorkUnits,
+        ));
+    }
+    check_cancellation(state)
 }
 
 fn sort_records<'kernel, 'catalog, 'ledger>(

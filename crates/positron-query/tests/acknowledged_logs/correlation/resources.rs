@@ -1,4 +1,5 @@
 use std::error::Error;
+use std::sync::Arc;
 
 use positron_domain::identity::TenantId;
 use positron_kernel::{
@@ -7,10 +8,13 @@ use positron_kernel::{
 };
 use positron_query::{
     CorrelationOutcome, QueryBudget, QueryBudgetDimension, QueryEvent, QueryFailureCode,
-    QueryTerminal,
+    QueryService, QueryTerminal,
 };
 
-use super::super::support::{KernelFixture, TestClock, zero_work_clock_service, zero_work_service};
+use super::super::support::{
+    CancellingOperatorCallMeter, KernelFixture, MergeWorkMeter, TestClock, zero_work_clock_service,
+    zero_work_service,
+};
 use super::super::terminal_and_bounds::QueryFixture;
 
 #[test]
@@ -484,6 +488,173 @@ fn correlation_target_scan_consumes_the_same_cumulative_decode_budget_as_the_log
         ),
         "unexpected correlation budget events: {events:?}"
     );
+    Ok(())
+}
+
+#[test]
+fn correlation_target_traversal_charges_cpu_work_before_a_target_heavy_result_is_emitted()
+-> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("correlation-target-cpu-budget")?;
+    let matched_trace = [0xb1; 16];
+    let matched_span = [0xb2; 8];
+    for (trace, span, position) in [
+        ([0xb3; 16], [0xb4; 8], 1),
+        ([0xb5; 16], [0xb6; 8], 2),
+        (matched_trace, matched_span, 3),
+    ] {
+        fixture.kernel.append_trace(trace, span, 20, position)?;
+    }
+    fixture
+        .kernel
+        .append_log_with_trace("accepted", 20, matched_trace, matched_span, 4)?;
+    let service = QueryService::with_runtime(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+        TestClock::shared(100),
+        Arc::new(MergeWorkMeter),
+    )
+    .with_trace_ledger(fixture.kernel.trace_ledger()?);
+    let budget =
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?.with_cpu_work_units(2)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | correlate trace | limit 1",
+        budget,
+    )?;
+
+    let events = service.execute(query)?.collect::<Vec<_>>();
+    assert!(matches!(events.first(), Some(QueryEvent::Header(_))));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, QueryEvent::Batch(_)))
+    );
+    assert!(matches!(
+        events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.code() == QueryFailureCode::BudgetExhausted
+                && incomplete.stats().limiting_budget() == Some(QueryBudgetDimension::CpuWorkUnits)
+    ));
+    Ok(())
+}
+
+#[test]
+fn correlation_target_traversal_rechecks_cancellation_and_releases_query_resources()
+-> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("correlation-target-cancel")?;
+    let matched_trace = [0xc1; 16];
+    let matched_span = [0xc2; 8];
+    for (trace, span, position) in [
+        ([0xc3; 16], [0xc4; 8], 1),
+        ([0xc5; 16], [0xc6; 8], 2),
+        (matched_trace, matched_span, 3),
+    ] {
+        fixture.kernel.append_trace(trace, span, 20, position)?;
+    }
+    fixture
+        .kernel
+        .append_log_with_trace("accepted", 20, matched_trace, matched_span, 4)?;
+    let meter = CancellingOperatorCallMeter::shared(2);
+    let service = QueryService::with_runtime(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+        TestClock::shared(100),
+        Arc::clone(&meter) as Arc<dyn positron_query::QueryWorkMeter>,
+    )
+    .with_trace_ledger(fixture.kernel.trace_ledger()?);
+    let before = fixture
+        .kernel
+        .authority
+        .governor()
+        .inspect()?
+        .outstanding_for(WorkClass::InteractiveQueryTail);
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | correlate trace | limit 1",
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?,
+    )?;
+    meter.bind(query.cancellation())?;
+
+    let events = service.execute(query)?.collect::<Vec<_>>();
+    assert!(matches!(events.first(), Some(QueryEvent::Header(_))));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, QueryEvent::Batch(_)))
+    );
+    assert!(matches!(
+        events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.code() == QueryFailureCode::Cancelled
+    ));
+    assert_eq!(
+        fixture
+            .kernel
+            .authority
+            .governor()
+            .inspect()?
+            .outstanding_for(WorkClass::InteractiveQueryTail),
+        before
+    );
+    Ok(())
+}
+
+#[test]
+fn correlation_rejects_aggregation_until_a_typed_group_outcome_is_specified()
+-> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("correlation-aggregate-admission")?;
+    let service = fixture.correlation_service(16)?;
+    let budget = super::budget();
+    let pipeline = "pipeline:v1 logs | range query_time -100 100 | correlate trace | aggregate count | limit 1";
+    let sql = "SELECT COUNT(*) FROM logs CORRELATE TRACE WHERE query_time >= -100 AND query_time < 100 LIMIT 1";
+
+    assert!(
+        service
+            .plan_pipeline(
+                fixture.context,
+                "pipeline:v1 logs | range query_time -100 100 | correlate trace | limit 1",
+                budget,
+            )
+            .is_ok()
+    );
+    assert!(
+        service
+            .plan_pipeline(
+                fixture.context,
+                "pipeline:v1 logs | range query_time -100 100 | aggregate count | limit 1",
+                budget,
+            )
+            .is_ok()
+    );
+    let pipeline_failure = match service.plan_pipeline(fixture.context, pipeline, budget) {
+        Ok(_) => return Err("aggregation unexpectedly accepted a correlation pipeline".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(pipeline_failure.code(), QueryFailureCode::UnsupportedQuery);
+
+    assert!(service
+        .plan_sql(
+            fixture.context,
+            "SELECT body FROM logs CORRELATE TRACE WHERE query_time >= -100 AND query_time < 100 ORDER BY query_time, commit_position LIMIT 1",
+            budget,
+        )
+        .is_ok());
+    assert!(
+        service
+            .plan_sql(
+                fixture.context,
+                "SELECT COUNT(*) FROM logs WHERE query_time >= -100 AND query_time < 100 LIMIT 1",
+                budget,
+            )
+            .is_ok()
+    );
+    let sql_failure = match service.plan_sql(fixture.context, sql, budget) {
+        Ok(_) => return Err("aggregation unexpectedly accepted correlation SQL".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(sql_failure.code(), QueryFailureCode::UnsupportedQuery);
     Ok(())
 }
 
