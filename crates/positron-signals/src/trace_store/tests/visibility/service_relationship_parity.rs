@@ -43,22 +43,23 @@ fn service_relationships_preserve_native_snapshot_outcomes_across_compaction()
         }
         Ok::<_, TraceStoreFailure>(values)
     };
-    let observation = |span_id, parent_span_id, start, end, name, service, namespace, sampling| {
-        SpanObservation::checked_native(
-            [0x85; 16],
-            span_id,
-            parent_span_id,
-            name,
-            EventTime::received(UnixNanoseconds::new(start), SourceTimeQuality::Usable)
-                .map_err(TraceStoreFailure::domain)?,
-            EventTime::received(UnixNanoseconds::new(end), SourceTimeQuality::Usable)
-                .map_err(TraceStoreFailure::domain)?,
-            attributes(service, namespace)?,
-            SpanKind::Internal,
-            sampling,
-            positron_policy::PolicyProvenance::new(1, [0x86; 32], Vec::new())?,
-        )
-    };
+    let observation =
+        |trace_id, span_id, parent_span_id, start, end, name, service, namespace, sampling| {
+            SpanObservation::checked_native(
+                trace_id,
+                span_id,
+                parent_span_id,
+                name,
+                EventTime::received(UnixNanoseconds::new(start), SourceTimeQuality::Usable)
+                    .map_err(TraceStoreFailure::domain)?,
+                EventTime::received(UnixNanoseconds::new(end), SourceTimeQuality::Usable)
+                    .map_err(TraceStoreFailure::domain)?,
+                attributes(service, namespace)?,
+                SpanKind::Internal,
+                sampling,
+                positron_policy::PolicyProvenance::new(1, [0x86; 32], Vec::new())?,
+            )
+        };
     let store = TraceStore::new();
 
     let first = ActiveSegmentLedger::open_with_retention_time(
@@ -75,16 +76,30 @@ fn service_relationships_preserve_native_snapshot_outcomes_across_compaction()
                     preparation_capacity(&authority, tenant)?,
                     StoreBlockIdentity::new([0x87; 16])?,
                 )?,
-                vec![observation(
-                    [0x11; 8],
-                    None,
-                    1,
-                    90,
-                    "checkout-root".to_owned(),
-                    "checkout",
-                    Some("storefront"),
-                    SamplingDecision::Sampled,
-                )?],
+                vec![
+                    observation(
+                        [0x85; 16],
+                        [0x11; 8],
+                        None,
+                        1,
+                        90,
+                        "checkout-root".to_owned(),
+                        "checkout",
+                        Some("storefront"),
+                        SamplingDecision::Sampled,
+                    )?,
+                    observation(
+                        [0x86; 16],
+                        [0x21; 8],
+                        None,
+                        1,
+                        90,
+                        "checkout-root-second".to_owned(),
+                        "checkout",
+                        Some("storefront"),
+                        SamplingDecision::Sampled,
+                    )?,
+                ],
             )?
             .into_store_block(),
     )?;
@@ -98,6 +113,7 @@ fn service_relationships_preserve_native_snapshot_outcomes_across_compaction()
         key(),
     )?;
     let inventory_call = observation(
+        [0x85; 16],
         [0x12; 8],
         Some([0x11; 8]),
         10,
@@ -114,7 +130,21 @@ fn service_relationships_preserve_native_snapshot_outcomes_across_compaction()
                     preparation_capacity(&authority, tenant)?,
                     StoreBlockIdentity::new([0x88; 16])?,
                 )?,
-                vec![inventory_call.clone(), inventory_call],
+                vec![
+                    inventory_call.clone(),
+                    inventory_call,
+                    observation(
+                        [0x86; 16],
+                        [0x22; 8],
+                        Some([0x21; 8]),
+                        10,
+                        50,
+                        "inventory-call-second".to_owned(),
+                        "inventory",
+                        None,
+                        SamplingDecision::NotSampled,
+                    )?,
+                ],
             )?
             .into_store_block(),
     )?;
@@ -136,6 +166,7 @@ fn service_relationships_preserve_native_snapshot_outcomes_across_compaction()
                 )?,
                 vec![
                     observation(
+                        [0x85; 16],
                         [0x12; 8],
                         Some([0x99; 8]),
                         10,
@@ -146,6 +177,7 @@ fn service_relationships_preserve_native_snapshot_outcomes_across_compaction()
                         SamplingDecision::Sampled,
                     )?,
                     observation(
+                        [0x85; 16],
                         [0x13; 8],
                         Some([0x12; 8]),
                         20,
@@ -162,6 +194,48 @@ fn service_relationships_preserve_native_snapshot_outcomes_across_compaction()
 
     let assert_public_outcomes =
         |snapshot: &positron_kernel::LedgerSnapshot<'_>| -> Result<(), Box<dyn Error>> {
+            let aggregate = store.service_relationships(
+                authority.governor(),
+                tenant,
+                snapshot,
+                TraceScan::all(ScanLimit::new(8)?),
+            )?;
+            assert!(aggregate.snapshot_complete());
+            assert!(!aggregate.relationships_complete());
+            assert_eq!(aggregate.incompleteness().scan(), TraceIncompleteness::None);
+            assert_eq!(aggregate.pairs().len(), 2);
+            let checkout_inventory = aggregate
+                .pairs()
+                .iter()
+                .find(|pair| {
+                    pair.parent_service() == Some("checkout")
+                        && pair.child_service() == Some("inventory")
+                })
+                .ok_or("cross-trace checkout to inventory pair is absent")?;
+            assert_eq!(
+                checkout_inventory.parent_service_namespace(),
+                Some("storefront")
+            );
+            assert_eq!(checkout_inventory.child_service_namespace(), None);
+            assert_eq!(checkout_inventory.edge_count(), 2);
+            assert_eq!(checkout_inventory.trace_ids(), &[[0x85; 16], [0x86; 16]]);
+            assert_eq!(
+                checkout_inventory.parent_sampling_count(SamplingDecision::Sampled),
+                2
+            );
+            assert_eq!(
+                checkout_inventory.child_sampling_count(SamplingDecision::NotSampled),
+                2
+            );
+            assert_eq!(aggregate.incompleteness().traces().len(), 2);
+            let conflict = aggregate
+                .incompleteness()
+                .traces()
+                .iter()
+                .find(|facts| facts.trace_id() == [0x85; 16])
+                .ok_or("conflicted trace incompleteness is absent")?;
+            assert_eq!(conflict.conflicts(), 1);
+            drop(aggregate);
             let mut trace = store.trace_by_id(
                 authority.governor(),
                 tenant,

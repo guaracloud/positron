@@ -26,7 +26,10 @@ pub use details::{
 pub use failure::{TraceStoreFailure, TraceStoreFailureCode};
 pub use observation::{EvaluatedSpanObservationInput, SamplingDecision, SpanKind, SpanObservation};
 pub use relationships::{
-    TraceServiceIdentity, TraceServiceRelationship, TraceServiceRelationships,
+    TraceServiceIdentity, TraceServiceIdentityState, TraceServiceRelationship,
+    TraceServiceRelationshipIncompleteness, TraceServiceRelationshipPair,
+    TraceServiceRelationshipSnapshot, TraceServiceRelationshipTraceIncompleteness,
+    TraceServiceRelationships,
 };
 pub use scan::{ScannedSpanObservation, TraceIncompleteness, TraceScan, TraceScanResult};
 pub use search::{TraceByIdResult, TraceByIdSummary, TraceByIdSummaryPending, TraceSearch};

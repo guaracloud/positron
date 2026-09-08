@@ -5,6 +5,7 @@ mod sealed_segments;
 mod service_relationship_identity;
 mod service_relationship_parity;
 mod service_relationship_resources;
+mod service_relationship_snapshot;
 mod structural;
 mod structural_parity;
 mod summary_binding;

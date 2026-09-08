@@ -182,6 +182,10 @@ pub struct TraceByIdSummary {
 }
 
 impl TraceByIdSummary {
+    pub(super) const fn no_maintenance() -> Self {
+        Self::pending(TraceByIdSummaryPending::NoMaintenance)
+    }
+
     const fn from_available(summary: TraceSummary, coverage: TraceSummaryCoverage) -> Self {
         Self {
             pending_reason: None,

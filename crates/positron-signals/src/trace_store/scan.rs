@@ -489,6 +489,41 @@ impl super::TraceStore {
         )
     }
 
+    /// Derives direct service relationships across one bounded authenticated
+    /// snapshot without reopening a trace-by-ID scan for every trace.
+    pub fn service_relationships<'kernel>(
+        &self,
+        governor: ResourceGovernor<'kernel>,
+        tenant: TenantId,
+        snapshot: &LedgerSnapshot<'_>,
+        scan: TraceScan,
+    ) -> Result<super::TraceServiceRelationshipSnapshot<'kernel>, TraceStoreFailure> {
+        self.service_relationships_observed(
+            governor,
+            tenant,
+            snapshot,
+            scan,
+            &NeverCancelled,
+            &Unobserved,
+        )
+    }
+
+    /// Derives snapshot-wide relationships with caller-owned cancellation and
+    /// cumulative work observation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn service_relationships_observed<'kernel>(
+        &self,
+        governor: ResourceGovernor<'kernel>,
+        tenant: TenantId,
+        snapshot: &LedgerSnapshot<'_>,
+        scan: TraceScan,
+        cancellation: &dyn ScanCancellation,
+        observer: &dyn ScanObserver,
+    ) -> Result<super::TraceServiceRelationshipSnapshot<'kernel>, TraceStoreFailure> {
+        self.scan_observed(governor, tenant, snapshot, scan, cancellation, observer)
+            .and_then(|logical| super::relationships::aggregate(logical, cancellation, observer))
+    }
+
     /// Retrieves one trace and binds existing summary facts only when their
     /// authenticated coverage exactly matches this query snapshot.
     #[allow(clippy::too_many_arguments)]

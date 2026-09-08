@@ -341,8 +341,41 @@ fn run_once(data: &[u8], root: &std::path::Path) -> Result<(), Box<dyn Error>> {
         scope.shard_id(),
         data[0],
         next_ingest_time,
+        0xc0,
     )?;
     expected.insert(service_trace, service_observation_count);
+    let (second_service_trace, second_service_observation_count) =
+        exercise_service_relationship_fixture(
+            &ledger,
+            &authority,
+            &store,
+            &policy,
+            tenant,
+            scope.shard_id(),
+            data[0],
+            next_ingest_time.checked_add(1).ok_or("fixture ingest time overflow")?,
+            0xd0,
+        )?;
+    expected.insert(second_service_trace, second_service_observation_count);
+    let service_snapshot = ledger.snapshot()?;
+    let snapshot_relationships = store.service_relationships_observed(
+        authority.governor(),
+        tenant,
+        &service_snapshot,
+        positron_signals::TraceScan::all(ScanLimit::new(MAX_OPERATIONS.saturating_add(16))?),
+        &InputCancellation(false),
+        &Unobserved,
+    )?;
+    let aggregate = snapshot_relationships
+        .pairs()
+        .iter()
+        .find(|pair| {
+            pair.trace_ids().contains(&service_trace)
+                && pair.trace_ids().contains(&second_service_trace)
+        })
+        .ok_or("cross-trace service pair is absent")?;
+    assert_eq!(aggregate.edge_count(), 2);
+    assert_eq!(aggregate.trace_ids(), &[service_trace, second_service_trace]);
     drop(ledger);
     replay_and_assert(&authority, &catalog, scope, key(), &store, &expected)
 }
@@ -1203,9 +1236,10 @@ fn exercise_service_relationship_fixture<'kernel>(
     shard: VirtualShardId,
     selector: u8,
     ingest_time: i64,
+    trace_prefix: u8,
 ) -> Result<([u8; 16], u64), Box<dyn Error>> {
     let case = selector % 6;
-    let trace_id = [0xd0_u8.saturating_add(case); 16];
+    let trace_id = [trace_prefix.saturating_add(case); 16];
     let root = [0x01; 8];
     let child = [0x02; 8];
     let name = |value: CandidateAttributeValue| {
@@ -1326,7 +1360,7 @@ fn exercise_service_relationship_fixture<'kernel>(
         store,
         tenant,
         shard,
-        0xfd,
+        trace_prefix,
         observations,
         ingest_time,
     )?;
