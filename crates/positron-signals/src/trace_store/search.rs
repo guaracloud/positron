@@ -134,7 +134,8 @@ impl NativeValueObserver for AttributeFilterObserver<'_> {
         super::scan::check_cancel(self.cancellation)?;
         self.observer
             .observe_work(1)
-            .map_err(TraceStoreFailure::observation)
+            .map_err(TraceStoreFailure::observation)?;
+        super::scan::check_cancel(self.cancellation)
     }
 
     fn observe_payload(&mut self, payload: &[u8]) -> Result<(), Self::Error> {

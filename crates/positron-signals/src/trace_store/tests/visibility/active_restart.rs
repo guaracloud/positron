@@ -712,6 +712,7 @@ fn native_predicate_preserves_later_matching_span_order() -> Result<(), Box<dyn 
         .occurrence(0)
         .ok_or("missing matching predicate occurrence")?
         .try_clone()?;
+    let observed_predicate = predicate.try_clone()?;
     let observation = |trace_id, span_id, attributes, name| {
         SpanObservation::checked_native(
             trace_id,
@@ -756,7 +757,7 @@ fn native_predicate_preserves_later_matching_span_order() -> Result<(), Box<dyn 
         TraceSearch::all(ScanLimit::new(3)?).with_attribute_equals(
             AttributeNamespace::Record,
             "http.status_code".to_owned(),
-            predicate,
+            predicate.try_clone()?,
         )?,
     )?;
 
@@ -768,6 +769,79 @@ fn native_predicate_preserves_later_matching_span_order() -> Result<(), Box<dyn 
             .map(|span| (span.trace_id(), span.span_id()))
             .collect::<Vec<_>>(),
         vec![([0x43; 16], [0x25; 8]), ([0x43; 16], [0x26; 8])]
+    );
+
+    let successful_work = WorkMeter::new();
+    let observed = store.search_observed(
+        authority.governor(),
+        tenant,
+        &ledger.snapshot()?,
+        TraceSearch::all(ScanLimit::new(3)?).with_attribute_equals(
+            AttributeNamespace::Record,
+            "http.status_code".to_owned(),
+            observed_predicate,
+        )?,
+        &NeverCancelled,
+        &successful_work,
+    )?;
+    assert_eq!(
+        observed
+            .spans()
+            .iter()
+            .map(|span| (span.trace_id(), span.span_id()))
+            .collect::<Vec<_>>(),
+        vec![([0x43; 16], [0x25; 8]), ([0x43; 16], [0x26; 8])]
+    );
+    let total_work = successful_work.work();
+    assert!(total_work > 0);
+
+    let rejected_budget = ExactWork::new(
+        total_work
+            .checked_sub(1)
+            .ok_or("successful observed search recorded no work")?,
+    );
+    let budget_failure = store
+        .search_observed(
+            authority.governor(),
+            tenant,
+            &ledger.snapshot()?,
+            TraceSearch::all(ScanLimit::new(3)?).with_attribute_equals(
+                AttributeNamespace::Record,
+                "http.status_code".to_owned(),
+                predicate.try_clone()?,
+            )?,
+            &NeverCancelled,
+            &rejected_budget,
+        )
+        .expect_err("rejected-prefix compaction must stay inside the caller work budget");
+    assert_eq!(
+        budget_failure.code(),
+        TraceStoreFailureCode::BudgetExhausted
+    );
+
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let cancellation = SharedCancellation(Arc::clone(&cancelled));
+    let final_charge_cancellation = CancelAtWork {
+        remaining: Cell::new(total_work),
+        cancelled,
+    };
+    let cancellation_failure = store
+        .search_observed(
+            authority.governor(),
+            tenant,
+            &ledger.snapshot()?,
+            TraceSearch::all(ScanLimit::new(3)?).with_attribute_equals(
+                AttributeNamespace::Record,
+                "http.status_code".to_owned(),
+                predicate,
+            )?,
+            &cancellation,
+            &final_charge_cancellation,
+        )
+        .expect_err("cancellation after the final accepted work charge must stop compaction");
+    assert_eq!(
+        cancellation_failure.code(),
+        TraceStoreFailureCode::Cancelled
     );
     Ok(())
 }

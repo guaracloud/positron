@@ -71,7 +71,6 @@ pub struct LogicalSpan {
     variants: Vec<SpanObservationVariant>,
     observation_count: u64,
     structural_variant: usize,
-    selected: bool,
 }
 
 impl LogicalSpan {
@@ -89,7 +88,6 @@ impl LogicalSpan {
             variants,
             observation_count: 1,
             structural_variant: 0,
-            selected: false,
         })
     }
 
@@ -172,18 +170,6 @@ impl LogicalSpan {
         self.variants
             .get(self.structural_variant)
             .map(SpanObservationVariant::observation)
-    }
-
-    pub(crate) fn select(&mut self) {
-        self.selected = true;
-    }
-
-    pub(crate) fn deselect(&mut self) {
-        self.selected = false;
-    }
-
-    pub(crate) const fn selected(&self) -> bool {
-        self.selected
     }
 }
 

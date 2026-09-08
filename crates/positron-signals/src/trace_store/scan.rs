@@ -291,17 +291,10 @@ fn retain_trace_id(
     cancellation: &dyn ScanCancellation,
     observer: &dyn ScanObserver,
 ) -> Result<(), TraceStoreFailure> {
-    for span in spans.iter_mut() {
-        span.deselect();
-    }
-    for span in spans.iter_mut() {
+    retain_stably_observed(spans, cancellation, observer, |span| {
         observe_selection(cancellation, observer)?;
-        if span.trace_id() == trace_id {
-            span.select();
-        }
-    }
-    spans.retain(super::LogicalSpan::selected);
-    Ok(())
+        Ok(span.trace_id() == trace_id)
+    })
 }
 
 fn retain_matching_spans(
@@ -310,24 +303,51 @@ fn retain_matching_spans(
     cancellation: &dyn ScanCancellation,
     observer: &dyn ScanObserver,
 ) -> Result<(), TraceStoreFailure> {
-    for span in spans.iter_mut() {
-        span.deselect();
-    }
-    for span in spans.iter_mut() {
+    retain_stably_observed(spans, cancellation, observer, |span| {
         observe_selection(cancellation, observer)?;
-        let mut matched = false;
         for variant in span.variants() {
             observe_selection(cancellation, observer)?;
             if search.matches(variant.observation().observation(), cancellation, observer)? {
-                matched = true;
-                break;
+                return Ok(true);
             }
         }
-        if matched {
-            span.select();
+        Ok(false)
+    })
+}
+
+fn retain_stably_observed(
+    spans: &mut Vec<super::LogicalSpan>,
+    cancellation: &dyn ScanCancellation,
+    observer: &dyn ScanObserver,
+    mut keep: impl FnMut(&super::LogicalSpan) -> Result<bool, TraceStoreFailure>,
+) -> Result<(), TraceStoreFailure> {
+    let mut next_retained = 0_usize;
+    let original_len = spans.len();
+    for current in 0..original_len {
+        let span = spans
+            .get(current)
+            .ok_or_else(TraceStoreFailure::invalid_input)?;
+        if !keep(span)? {
+            continue;
+        }
+        if next_retained != current {
+            observe_selection(cancellation, observer)?;
+            if next_retained >= spans.len() || current >= spans.len() {
+                return Err(TraceStoreFailure::invalid_input());
+            }
+            spans.swap(next_retained, current);
+        }
+        next_retained = next_retained
+            .checked_add(1)
+            .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+    }
+    while spans.len() > next_retained {
+        observe_selection(cancellation, observer)?;
+        let dropped = spans.pop();
+        if dropped.is_none() {
+            return Err(TraceStoreFailure::invalid_input());
         }
     }
-    spans.retain(super::LogicalSpan::selected);
     Ok(())
 }
 
@@ -338,7 +358,8 @@ fn observe_selection(
     check_cancel(cancellation)?;
     observer
         .observe_work(1)
-        .map_err(TraceStoreFailure::observation)
+        .map_err(TraceStoreFailure::observation)?;
+    check_cancel(cancellation)
 }
 
 /// One authenticated observation with its stable physical commit identity.
