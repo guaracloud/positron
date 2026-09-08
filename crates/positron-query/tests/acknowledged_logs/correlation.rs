@@ -6,6 +6,8 @@ use super::support::KernelFixture;
 
 #[path = "correlation/composition.rs"]
 mod composition;
+#[path = "correlation/cursor_cleanup.rs"]
+mod cursor_cleanup;
 #[path = "correlation/matching.rs"]
 mod matching;
 #[path = "correlation/resources.rs"]

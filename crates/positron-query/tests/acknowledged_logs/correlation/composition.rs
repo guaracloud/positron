@@ -1,9 +1,12 @@
 use std::error::Error;
 
+use positron_domain::value::{AttributeNamespace, CandidateAttributeValue};
 use positron_kernel::{LedgerFailureCode, SnapshotLeaseId};
+use positron_policy::NativeLogAttribute;
 use positron_query::{
     CorrelationOutcome, QueryBudget, QueryBudgetDimension, QueryEvent, QueryTerminal,
 };
+use positron_signals::SchemaPath;
 
 use super::super::support::{TestClock, zero_work_clock_service};
 use super::super::terminal_and_bounds::QueryFixture;
@@ -473,5 +476,76 @@ fn correlation_cursor_charges_sidecar_output_bytes_across_pages_and_releases_bot
             LedgerFailureCode::SnapshotExpired
         );
     }
+    Ok(())
+}
+
+#[test]
+fn schema_backed_attribute_correlation_preserves_selected_trace_outcome()
+-> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("schema-backed-correlation")?;
+    let selected_trace = [0xe1; 16];
+    let selected_span = [0xe2; 8];
+    let excluded_trace = [0xe3; 16];
+    let excluded_span = [0xe4; 8];
+    fixture
+        .kernel
+        .append_trace(selected_trace, selected_span, 20, 1)?;
+    fixture
+        .kernel
+        .append_trace(excluded_trace, excluded_span, 21, 2)?;
+    let path = SchemaPath::root(AttributeNamespace::Record, "service".to_owned())?;
+    let schema = fixture.kernel.append_indexed_attribute_logs_with_trace(
+        vec![
+            (
+                Some(20),
+                vec![NativeLogAttribute::new(
+                    AttributeNamespace::Record,
+                    "service".to_owned(),
+                    vec![CandidateAttributeValue::string("api".to_owned())],
+                )],
+                selected_trace,
+                selected_span,
+            ),
+            (
+                Some(21),
+                vec![NativeLogAttribute::new(
+                    AttributeNamespace::Record,
+                    "service".to_owned(),
+                    vec![CandidateAttributeValue::string("worker".to_owned())],
+                )],
+                excluded_trace,
+                excluded_span,
+            ),
+        ],
+        3,
+        &path,
+    )?;
+    let service = fixture.correlation_service(16)?;
+    let source = r#"pipeline:v1 logs | range query_time -100 100 | filter record["service"] any == string("api") | correlate trace | limit 2"#;
+    let events = service
+        .execute_with_schema(
+            service.plan_pipeline(fixture.context, source, super::budget())?,
+            schema.catalog(),
+        )?
+        .collect::<Vec<_>>();
+    let batch = events
+        .iter()
+        .find_map(|event| match event {
+            QueryEvent::Batch(batch) => Some(batch),
+            QueryEvent::Header(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("schema-backed correlation batch missing")?;
+    assert_eq!(batch.records().len(), 1);
+    assert_eq!(
+        batch.correlation_outcome(0),
+        Some(CorrelationOutcome::Matched {
+            trace_id: selected_trace,
+            span_id: Some(selected_span),
+        })
+    );
+    assert!(matches!(
+        events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Complete(_)))
+    ));
     Ok(())
 }

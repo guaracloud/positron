@@ -24,6 +24,31 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         }
     }
 
+    fn fail_after_unresumed_target_lease(
+        &self,
+        state: &cursor::CursorState,
+        primary: QueryFailure,
+    ) -> QueryFailure {
+        if !state.plan.is_log_to_trace_correlation() {
+            return primary;
+        }
+        let (Some(identity), Some(ledger)) = (state.trace_lease_identity, self.trace_ledger) else {
+            return primary;
+        };
+        if ledger.scope().tenant_id() != state.tenant
+            || ledger.scope().signal_kind() != positron_domain::routing::SignalKind::Traces
+        {
+            return primary;
+        }
+        let Ok(identity) = SnapshotLeaseId::new(identity) else {
+            return primary;
+        };
+        match ledger.release_snapshot_lease(identity) {
+            Ok(()) => primary,
+            Err(cleanup) => crate::failure::stronger_failure(primary, map_ledger_failure(cleanup)),
+        }
+    }
+
     pub fn execute(
         &self,
         query: PlannedQuery<'kernel>,
@@ -294,11 +319,15 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             || lease.snapshot().catalog_generation() != state.catalog_generation
             || lease.snapshot().frontier().value() != state.frontier
         {
+            let primary = self.fail_after_unresumed_target_lease(
+                &state,
+                QueryFailure::new(QueryFailureCode::InvalidCursor),
+            );
             return Err(resources.fail_before_stream(
                 self.ledger,
                 self.trace_ledger,
                 &state,
-                QueryFailure::new(QueryFailureCode::InvalidCursor),
+                primary,
             ));
         }
         let (trace_snapshot, trace_lease_identity, resources) = if state

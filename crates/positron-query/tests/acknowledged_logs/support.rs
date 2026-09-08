@@ -31,6 +31,8 @@ use positron_signals::{
     SpanKind, SpanObservation, SpanObservationDetails, TraceStore,
 };
 
+type IndexedTraceAttributeCandidate = (Option<i64>, Vec<NativeLogAttribute>, [u8; 16], [u8; 8]);
+
 pub struct TestClock(AtomicU64);
 
 impl TestClock {
@@ -1457,6 +1459,55 @@ impl KernelFixture {
         identity: u8,
         indexed_path: &positron_signals::SchemaPath,
     ) -> Result<positron_signals::SchemaSessionStore, Box<dyn Error>> {
+        let candidates = candidates
+            .into_iter()
+            .map(|(event_time, attributes)| {
+                NativeLogCandidate::new(event_time, None, None, attributes, LogMetadata::empty())
+            })
+            .collect();
+        self.append_indexed_log_candidates(candidates, identity, indexed_path)
+    }
+
+    pub fn append_indexed_attribute_logs_with_trace(
+        &self,
+        candidates: Vec<IndexedTraceAttributeCandidate>,
+        identity: u8,
+        indexed_path: &positron_signals::SchemaPath,
+    ) -> Result<positron_signals::SchemaSessionStore, Box<dyn Error>> {
+        let candidates = candidates
+            .into_iter()
+            .map(|(event_time, attributes, trace_id, span_id)| {
+                NativeLogCandidate::new(
+                    event_time,
+                    None,
+                    None,
+                    attributes,
+                    LogMetadata::new(
+                        0,
+                        String::new(),
+                        Some(trace_id),
+                        Some(span_id),
+                        0,
+                        0,
+                        0,
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                        0,
+                        String::new(),
+                    ),
+                )
+            })
+            .collect();
+        self.append_indexed_log_candidates(candidates, identity, indexed_path)
+    }
+
+    fn append_indexed_log_candidates(
+        &self,
+        candidates: Vec<NativeLogCandidate>,
+        identity: u8,
+        indexed_path: &positron_signals::SchemaPath,
+    ) -> Result<positron_signals::SchemaSessionStore, Box<dyn Error>> {
         let schema_budget = positron_signals::SchemaBudget::new(8, 200_000, 8_000, 8_000)?;
         let schema_capacity = self.authority.governor().reserve(WorkClaim::tenant(
             self.tenant,
@@ -1467,9 +1518,7 @@ impl KernelFixture {
             positron_signals::SchemaSessionStore::new(schema_capacity, self.tenant, schema_budget)?;
         let mut records = Vec::new();
         records.try_reserve_exact(candidates.len())?;
-        for (event_time, attributes) in candidates {
-            let candidate =
-                NativeLogCandidate::new(event_time, None, None, attributes, LogMetadata::empty());
+        for candidate in candidates {
             let PolicyEvaluation::Accepted(evaluated) =
                 IngestPolicy::preserving(1)?.evaluate(candidate, PolicyReceiver::OtlpGrpc)?
             else {
