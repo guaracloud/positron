@@ -2,6 +2,133 @@ use super::super::*;
 use crate::{
     TraceServiceIdentityState, TraceServiceRelationshipSnapshotLimitation, TraceStoreFailure,
 };
+use positron_domain::value::{AttributeValueKind, MarkerAction};
+
+#[test]
+fn snapshot_service_relationships_preserve_marker_and_truncation_identity_provenance()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x9a; 16])?,
+        CatalogSecret::from_owned(Box::new([0x9b; 32]), Box::new([0x9c; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let shard = VirtualShardId::new(93)?;
+    let ledger = ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        SegmentScope::new(tenant, SignalKind::Traces, shard),
+        SegmentProtectionKey::from_owned(Box::new([0x9d; 32])),
+    )?;
+    let resource_attribute = |key: &str, value: CandidateAttributeValue| {
+        AttributeOccurrenceSetCandidate::new(
+            AttributeNamespace::Resource,
+            key.to_owned(),
+            vec![value],
+        )
+        .validate(ValueLimitProfile::release_1_system_maximum())
+        .map_err(TraceStoreFailure::domain)
+    };
+    let observation = |trace_id, span_id, parent_span_id, attributes| {
+        SpanObservation::checked_native(
+            trace_id,
+            span_id,
+            parent_span_id,
+            "identity-provenance".to_owned(),
+            EventTime::received(UnixNanoseconds::new(1), SourceTimeQuality::Usable)
+                .map_err(TraceStoreFailure::domain)?,
+            EventTime::received(UnixNanoseconds::new(2), SourceTimeQuality::Usable)
+                .map_err(TraceStoreFailure::domain)?,
+            attributes,
+            SpanKind::Internal,
+            SamplingDecision::Sampled,
+            positron_policy::PolicyProvenance::new(1, [0x9e; 32], Vec::new())?,
+        )
+    };
+    let root_attributes = || {
+        Ok::<_, TraceStoreFailure>(vec![resource_attribute(
+            "service.name",
+            CandidateAttributeValue::string("checkout".to_owned()),
+        )?])
+    };
+    let redacted_attributes = vec![resource_attribute(
+        "service.name",
+        CandidateAttributeValue::redaction_marker(
+            AttributeValueKind::String,
+            MarkerAction::Redacted,
+        ),
+    )?];
+    let truncated_attributes = vec![resource_attribute(
+        "service.name",
+        CandidateAttributeValue::truncated(
+            CandidateAttributeValue::string("sanitized".to_owned()),
+            MarkerAction::TruncatedBytes,
+        ),
+    )?];
+    let redacted_trace = [0xa1; 16];
+    let truncated_trace = [0xa2; 16];
+    let store = TraceStore::new();
+    ledger.append(
+        store
+            .prepare_unretained_for_test(
+                preparation_capacity(&authority, tenant)?,
+                &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
+                tenant,
+                shard,
+                StoreBlockIdentity::new([0x9f; 16])?,
+                vec![
+                    observation(redacted_trace, [0x01; 8], None, root_attributes()?)?,
+                    observation(
+                        redacted_trace,
+                        [0x02; 8],
+                        Some([0x01; 8]),
+                        redacted_attributes,
+                    )?,
+                    observation(truncated_trace, [0x11; 8], None, root_attributes()?)?,
+                    observation(
+                        truncated_trace,
+                        [0x12; 8],
+                        Some([0x11; 8]),
+                        truncated_attributes,
+                    )?,
+                ],
+            )?
+            .into_store_block(),
+    )?;
+
+    let relationships = store.service_relationships(
+        authority.governor(),
+        tenant,
+        &ledger.snapshot()?,
+        TraceScan::all(ScanLimit::new(4)?),
+    )?;
+
+    assert!(relationships.snapshot_complete());
+    assert!(!relationships.relationships_complete());
+    assert_eq!(relationships.pairs().len(), 2);
+    let redacted = relationships
+        .pairs()
+        .iter()
+        .find(|pair| pair.child_identity() == TraceServiceIdentityState::Redacted)
+        .ok_or("missing redacted identity pair")?;
+    assert_eq!(redacted.parent_service(), Some("checkout"));
+    assert_eq!(redacted.child_service(), None);
+    assert_eq!(redacted.edge_count(), 1);
+    assert_eq!(redacted.trace_ids(), &[redacted_trace]);
+    let truncated = relationships
+        .pairs()
+        .iter()
+        .find(|pair| pair.child_identity() == TraceServiceIdentityState::Truncated)
+        .ok_or("missing truncated identity pair")?;
+    assert_eq!(truncated.parent_service(), Some("checkout"));
+    assert_eq!(truncated.child_service(), None);
+    assert_eq!(truncated.edge_count(), 1);
+    assert_eq!(truncated.trace_ids(), &[truncated_trace]);
+    Ok(())
+}
 
 #[test]
 fn snapshot_service_relationships_aggregate_two_traces_with_pair_provenance()

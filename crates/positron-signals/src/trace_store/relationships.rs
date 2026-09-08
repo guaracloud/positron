@@ -7,7 +7,7 @@ use std::{
 
 use positron_domain::{
     routing::{CommitPosition, RecordOrdinal},
-    value::AttributeNamespace,
+    value::{AttributeNamespace, MarkerAction},
 };
 use positron_kernel::{CatalogGenerationId, LedgerSnapshot, ResourceReservation, SegmentScope};
 
@@ -24,7 +24,9 @@ pub enum TraceServiceIdentity<'span> {
     Missing,
     Exact(&'span str),
     Ambiguous,
-    Transformed,
+    Removed,
+    Redacted,
+    Truncated,
     Invalid,
 }
 
@@ -123,7 +125,9 @@ pub enum TraceServiceIdentityState {
     Missing,
     Exact,
     Ambiguous,
-    Transformed,
+    Removed,
+    Redacted,
+    Truncated,
     Invalid,
 }
 
@@ -887,7 +891,9 @@ fn identity_state(identity: TraceServiceIdentity<'_>) -> TraceServiceIdentitySta
         TraceServiceIdentity::Missing => TraceServiceIdentityState::Missing,
         TraceServiceIdentity::Exact(_) => TraceServiceIdentityState::Exact,
         TraceServiceIdentity::Ambiguous => TraceServiceIdentityState::Ambiguous,
-        TraceServiceIdentity::Transformed => TraceServiceIdentityState::Transformed,
+        TraceServiceIdentity::Removed => TraceServiceIdentityState::Removed,
+        TraceServiceIdentity::Redacted => TraceServiceIdentityState::Redacted,
+        TraceServiceIdentity::Truncated => TraceServiceIdentityState::Truncated,
         TraceServiceIdentity::Invalid => TraceServiceIdentityState::Invalid,
     }
 }
@@ -1020,8 +1026,17 @@ fn resource_identity<'span>(
         let Some(value) = attribute.occurrence(0) else {
             return Ok(TraceServiceIdentity::Invalid);
         };
-        if value.is_marker() || value.truncation_action().is_some() {
-            return Ok(TraceServiceIdentity::Transformed);
+        if let Some(action) = value.marker_action() {
+            return Ok(match action {
+                MarkerAction::Removed => TraceServiceIdentity::Removed,
+                MarkerAction::Redacted => TraceServiceIdentity::Redacted,
+                MarkerAction::TruncatedBytes | MarkerAction::TruncatedElements => {
+                    TraceServiceIdentity::Truncated
+                },
+            });
+        }
+        if value.truncation_action().is_some() {
+            return Ok(TraceServiceIdentity::Truncated);
         }
         let Some(value) = value.as_str() else {
             return Ok(TraceServiceIdentity::Invalid);

@@ -67,6 +67,10 @@ fn service_relationships_distinguish_untrusted_identity_states() -> Result<(), B
         AttributeValueKind::String,
         MarkerAction::Redacted,
     ))?];
+    let removed_name_attributes = vec![name(CandidateAttributeValue::redaction_marker(
+        AttributeValueKind::String,
+        MarkerAction::Removed,
+    ))?];
     let truncated_name_attributes = vec![name(CandidateAttributeValue::truncated(
         CandidateAttributeValue::string("sanitized".to_owned()),
         MarkerAction::TruncatedBytes,
@@ -102,10 +106,11 @@ fn service_relationships_distinguish_untrusted_identity_states() -> Result<(), B
                     observation([0x03; 8], Some([0x01; 8]), multi_value_name_attributes)?,
                     observation([0x04; 8], Some([0x01; 8]), non_string_name_attributes)?,
                     observation([0x05; 8], Some([0x01; 8]), marker_name_attributes)?,
-                    observation([0x06; 8], Some([0x01; 8]), truncated_name_attributes)?,
-                    observation([0x07; 8], Some([0x01; 8]), absent_namespace_attributes)?,
-                    observation([0x08; 8], Some([0x01; 8]), invalid_namespace_attributes)?,
-                    observation([0x09; 8], Some([0x01; 8]), ambiguous_namespace_attributes)?,
+                    observation([0x06; 8], Some([0x01; 8]), removed_name_attributes)?,
+                    observation([0x07; 8], Some([0x01; 8]), truncated_name_attributes)?,
+                    observation([0x08; 8], Some([0x01; 8]), absent_namespace_attributes)?,
+                    observation([0x09; 8], Some([0x01; 8]), invalid_namespace_attributes)?,
+                    observation([0x0a; 8], Some([0x01; 8]), ambiguous_namespace_attributes)?,
                 ],
             )?
             .into_store_block(),
@@ -116,13 +121,13 @@ fn service_relationships_distinguish_untrusted_identity_states() -> Result<(), B
         tenant,
         &ledger.snapshot()?,
         [0x95; 16],
-        TraceSearch::all(ScanLimit::new(9)?),
+        TraceSearch::all(ScanLimit::new(10)?),
     )?;
     let structure = trace.analyze_structure(&NeverCancelled, &NeverObserved)?;
     assert!(structure.complete());
     let relationships = structure.service_relationships();
     assert!(!relationships.complete());
-    assert_eq!(relationships.edges().len(), 8);
+    assert_eq!(relationships.edges().len(), 9);
 
     let edge = |child_span_id| {
         relationships
@@ -135,8 +140,9 @@ fn service_relationships_distinguish_untrusted_identity_states() -> Result<(), B
         ([0x02; 8], TraceServiceIdentity::Ambiguous),
         ([0x03; 8], TraceServiceIdentity::Ambiguous),
         ([0x04; 8], TraceServiceIdentity::Invalid),
-        ([0x05; 8], TraceServiceIdentity::Transformed),
-        ([0x06; 8], TraceServiceIdentity::Transformed),
+        ([0x05; 8], TraceServiceIdentity::Redacted),
+        ([0x06; 8], TraceServiceIdentity::Removed),
+        ([0x07; 8], TraceServiceIdentity::Truncated),
     ] {
         let relationship = edge(child_span_id)?;
         assert_eq!(relationship.parent_service(), Some("checkout"));
@@ -145,21 +151,21 @@ fn service_relationships_distinguish_untrusted_identity_states() -> Result<(), B
         assert_eq!(relationship.child_identity(), identity);
     }
 
-    let absent_namespace = edge([0x07; 8])?;
+    let absent_namespace = edge([0x08; 8])?;
     assert_eq!(absent_namespace.child_service(), Some("absent-namespace"));
     assert_eq!(absent_namespace.child_service_namespace(), None);
     assert_eq!(
         absent_namespace.child_service_namespace_identity(),
         TraceServiceIdentity::Missing
     );
-    let invalid_namespace = edge([0x08; 8])?;
+    let invalid_namespace = edge([0x09; 8])?;
     assert_eq!(invalid_namespace.child_service(), Some("invalid-namespace"));
     assert_eq!(invalid_namespace.child_service_namespace(), None);
     assert_eq!(
         invalid_namespace.child_service_namespace_identity(),
         TraceServiceIdentity::Invalid
     );
-    let ambiguous_namespace = edge([0x09; 8])?;
+    let ambiguous_namespace = edge([0x0a; 8])?;
     assert_eq!(
         ambiguous_namespace.child_service(),
         Some("ambiguous-namespace")

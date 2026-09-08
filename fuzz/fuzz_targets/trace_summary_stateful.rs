@@ -19,14 +19,14 @@ use positron_kernel::{
     ResourceDimension, SegmentProtectionKey, SegmentScope, StoreBlockIdentity, WorkClaim, WorkKind,
 };
 use positron_policy::{
-    IngestPolicy, NativePolicyAttribute, NativeTraceCandidate, PolicyReceiver,
-    TracePolicyEvaluation,
+    IngestPolicy, NativePolicyAttribute, NativeTraceCandidate, PolicyAction, PolicyAttributePath,
+    PolicyPredicate, PolicyReceiver, PolicyRule, PolicyTarget, TracePolicyEvaluation,
 };
 use positron_signals::{
     EvaluatedSpanObservationInput, SamplingDecision, ScanCancellation, ScanLimit,
     ScanObservationFailureCode, ScanObserver, SpanKind, SpanObservation, SpanObservationDetails,
     TraceIncompleteness, TraceParentRelation, TraceQuietPeriod, TraceSearch, TraceServiceIdentity,
-    TraceStore, TraceStoreFailureCode, TraceSummaryMaintainer,
+    TraceServiceIdentityState, TraceStore, TraceStoreFailureCode, TraceSummaryMaintainer,
 };
 
 #[path = "schema_discovery_query/authority.rs"]
@@ -37,6 +37,24 @@ const MAX_OPERATIONS: usize = 32;
 const QUIET_PERIOD_NANOS: u64 = 5;
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExpectedServiceIdentity {
+    Missing,
+    Exact(&'static str),
+    Ambiguous,
+    Removed,
+    Redacted,
+    Truncated,
+    Invalid,
+}
+
+struct ServiceRelationshipFixture {
+    trace_id: [u8; 16],
+    observation_count: u64,
+    child_identity: ExpectedServiceIdentity,
+    child_namespace_identity: ExpectedServiceIdentity,
+}
 
 struct FuzzRoot(PathBuf);
 
@@ -332,7 +350,7 @@ fn run_once(data: &[u8], root: &std::path::Path) -> Result<(), Box<dyn Error>> {
         next_ingest_time,
     )?;
     expected.insert(fixture_trace, fixture_observation_count);
-    let (service_trace, service_observation_count) = exercise_service_relationship_fixture(
+    let service_fixture = exercise_service_relationship_fixture(
         &ledger,
         &authority,
         &store,
@@ -343,20 +361,26 @@ fn run_once(data: &[u8], root: &std::path::Path) -> Result<(), Box<dyn Error>> {
         next_ingest_time,
         0xc0,
     )?;
-    expected.insert(service_trace, service_observation_count);
-    let (second_service_trace, second_service_observation_count) =
-        exercise_service_relationship_fixture(
-            &ledger,
-            &authority,
-            &store,
-            &policy,
-            tenant,
-            scope.shard_id(),
-            data[0],
-            next_ingest_time.checked_add(1).ok_or("fixture ingest time overflow")?,
-            0xd0,
-        )?;
-    expected.insert(second_service_trace, second_service_observation_count);
+    expected.insert(service_fixture.trace_id, service_fixture.observation_count);
+    let second_service_fixture = exercise_service_relationship_fixture(
+        &ledger,
+        &authority,
+        &store,
+        &policy,
+        tenant,
+        scope.shard_id(),
+        data[0],
+        next_ingest_time.checked_add(1).ok_or("fixture ingest time overflow")?,
+        0xd0,
+    )?;
+    expected.insert(
+        second_service_fixture.trace_id,
+        second_service_fixture.observation_count,
+    );
+    assert_eq!(
+        service_fixture.child_identity,
+        second_service_fixture.child_identity
+    );
     let service_snapshot = ledger.snapshot()?;
     let snapshot_relationships = store.service_relationships_observed(
         authority.governor(),
@@ -370,12 +394,19 @@ fn run_once(data: &[u8], root: &std::path::Path) -> Result<(), Box<dyn Error>> {
         .pairs()
         .iter()
         .find(|pair| {
-            pair.trace_ids().contains(&service_trace)
-                && pair.trace_ids().contains(&second_service_trace)
+            pair.trace_ids().contains(&service_fixture.trace_id)
+                && pair.trace_ids().contains(&second_service_fixture.trace_id)
         })
         .ok_or("cross-trace service pair is absent")?;
     assert_eq!(aggregate.edge_count(), 2);
-    assert_eq!(aggregate.trace_ids(), &[service_trace, second_service_trace]);
+    assert_eq!(
+        aggregate.child_service_namespace_identity(),
+        expected_service_identity_state(service_fixture.child_namespace_identity)
+    );
+    assert_eq!(
+        aggregate.trace_ids(),
+        &[service_fixture.trace_id, second_service_fixture.trace_id]
+    );
     drop(ledger);
     replay_and_assert(&authority, &catalog, scope, key(), &store, &expected)
 }
@@ -1237,8 +1268,8 @@ fn exercise_service_relationship_fixture<'kernel>(
     selector: u8,
     ingest_time: i64,
     trace_prefix: u8,
-) -> Result<([u8; 16], u64), Box<dyn Error>> {
-    let case = selector % 6;
+) -> Result<ServiceRelationshipFixture, Box<dyn Error>> {
+    let case = selector % 9;
     let trace_id = [trace_prefix.saturating_add(case); 16];
     let root = [0x01; 8];
     let child = [0x02; 8];
@@ -1262,54 +1293,79 @@ fn exercise_service_relationship_fixture<'kernel>(
             "storefront".to_owned(),
         )));
     }
-    let (child_attributes, expected_child_identity, expected_child_namespace_identity) = match case
-    {
+    let (child_attributes, expected_child_identity, expected_child_namespace_identity) = match case {
         0 => (
             vec![
                 name(CandidateAttributeValue::string("inventory".to_owned())),
                 namespace(CandidateAttributeValue::string("warehouse".to_owned())),
             ],
-            TraceServiceIdentity::Exact("inventory"),
-            TraceServiceIdentity::Exact("warehouse"),
+            ExpectedServiceIdentity::Exact("inventory"),
+            ExpectedServiceIdentity::Exact("warehouse"),
         ),
         1 => (
             vec![
                 name(CandidateAttributeValue::string("inventory".to_owned())),
                 name(CandidateAttributeValue::string("billing".to_owned())),
             ],
-            TraceServiceIdentity::Ambiguous,
-            TraceServiceIdentity::Missing,
+            ExpectedServiceIdentity::Ambiguous,
+            ExpectedServiceIdentity::Missing,
         ),
         2 => (
             vec![name(CandidateAttributeValue::boolean(true))],
-            TraceServiceIdentity::Invalid,
-            TraceServiceIdentity::Missing,
+            ExpectedServiceIdentity::Invalid,
+            ExpectedServiceIdentity::Missing,
         ),
         3 => (
             vec![name(CandidateAttributeValue::string(
                 "inventory".to_owned(),
             ))],
-            TraceServiceIdentity::Exact("inventory"),
-            TraceServiceIdentity::Missing,
+            ExpectedServiceIdentity::Exact("inventory"),
+            ExpectedServiceIdentity::Missing,
         ),
         4 => (
             vec![
                 name(CandidateAttributeValue::string("inventory".to_owned())),
                 namespace(CandidateAttributeValue::boolean(true)),
             ],
-            TraceServiceIdentity::Exact("inventory"),
-            TraceServiceIdentity::Invalid,
+            ExpectedServiceIdentity::Exact("inventory"),
+            ExpectedServiceIdentity::Invalid,
         ),
-        _ => (
+        5 => (
             vec![
                 name(CandidateAttributeValue::string("inventory".to_owned())),
                 namespace(CandidateAttributeValue::string("one".to_owned())),
                 namespace(CandidateAttributeValue::string("two".to_owned())),
             ],
-            TraceServiceIdentity::Exact("inventory"),
-            TraceServiceIdentity::Ambiguous,
+            ExpectedServiceIdentity::Exact("inventory"),
+            ExpectedServiceIdentity::Ambiguous,
+        ),
+        6 => (
+            vec![
+                name(CandidateAttributeValue::string("inventory".to_owned())),
+                namespace(CandidateAttributeValue::string("warehouse".to_owned())),
+            ],
+            ExpectedServiceIdentity::Exact("inventory"),
+            ExpectedServiceIdentity::Redacted,
+        ),
+        7 => (
+            vec![
+                name(CandidateAttributeValue::string("inventory".to_owned())),
+                namespace(CandidateAttributeValue::string("warehouse".to_owned())),
+            ],
+            ExpectedServiceIdentity::Exact("inventory"),
+            ExpectedServiceIdentity::Removed,
+        ),
+        _ => (
+            vec![
+                name(CandidateAttributeValue::string("inventory".to_owned())),
+                namespace(CandidateAttributeValue::string("warehouse".to_owned())),
+            ],
+            ExpectedServiceIdentity::Exact("inventory"),
+            ExpectedServiceIdentity::Truncated,
         ),
     };
+    let fixture_policy = transformed_service_identity_policy(case)?;
+    let policy = fixture_policy.as_ref().unwrap_or(policy);
     let child_sampling = sampling_decision(selector);
     let observation = |span_id, parent_span_id, attributes, sampling| {
         let TracePolicyEvaluation::Accepted(evaluated) = policy.evaluate_trace(
@@ -1398,21 +1454,76 @@ fn exercise_service_relationship_fixture<'kernel>(
     assert_eq!(edge.parent_span_id(), root);
     assert_eq!(edge.child_span_id(), child);
     assert_eq!(edge.parent_service(), Some("checkout"));
-    assert_eq!(edge.child_identity(), expected_child_identity);
-    assert_eq!(
+    assert_service_identity(edge.child_identity(), expected_child_identity);
+    assert_service_identity(
         edge.child_service_namespace_identity(),
-        expected_child_namespace_identity
+        expected_child_namespace_identity,
     );
     assert_eq!(edge.child_sampling(), child_sampling);
     let expected_complete = !conflicted
-        && matches!(expected_child_identity, TraceServiceIdentity::Exact(_))
+        && matches!(expected_child_identity, ExpectedServiceIdentity::Exact(_))
         && matches!(
             expected_child_namespace_identity,
-            TraceServiceIdentity::Missing | TraceServiceIdentity::Exact(_)
+            ExpectedServiceIdentity::Missing | ExpectedServiceIdentity::Exact(_)
         )
         && child_sampling == SamplingDecision::Sampled;
     assert_eq!(relationships.complete(), expected_complete);
-    Ok((trace_id, 2 + u64::from(retried) + u64::from(conflicted)))
+    Ok(ServiceRelationshipFixture {
+        trace_id,
+        observation_count: 2 + u64::from(retried) + u64::from(conflicted),
+        child_identity: expected_child_identity,
+        child_namespace_identity: expected_child_namespace_identity,
+    })
+}
+
+fn transformed_service_identity_policy(case: u8) -> Result<Option<IngestPolicy>, Box<dyn Error>> {
+    let path = PolicyAttributePath::new(AttributeNamespace::Resource, "service.namespace")?;
+    let target = PolicyTarget::attribute(path);
+    let action = match case {
+        6 => PolicyAction::Redact(target),
+        7 => PolicyAction::Remove(target),
+        8 => PolicyAction::TruncateBytes(target, 4),
+        _ => return Ok(None),
+    };
+    Ok(Some(IngestPolicy::compile(
+        2,
+        vec![PolicyRule::new(
+            "relationship-identity",
+            vec![PolicyPredicate::service_identity("inventory")?],
+            action,
+        )?],
+    )?))
+}
+
+fn assert_service_identity(
+    actual: TraceServiceIdentity<'_>,
+    expected: ExpectedServiceIdentity,
+) {
+    match expected {
+        ExpectedServiceIdentity::Missing => assert_eq!(actual, TraceServiceIdentity::Missing),
+        ExpectedServiceIdentity::Exact(value) => {
+            assert_eq!(actual, TraceServiceIdentity::Exact(value));
+        },
+        ExpectedServiceIdentity::Ambiguous => assert_eq!(actual, TraceServiceIdentity::Ambiguous),
+        ExpectedServiceIdentity::Removed => assert_eq!(actual, TraceServiceIdentity::Removed),
+        ExpectedServiceIdentity::Redacted => assert_eq!(actual, TraceServiceIdentity::Redacted),
+        ExpectedServiceIdentity::Truncated => assert_eq!(actual, TraceServiceIdentity::Truncated),
+        ExpectedServiceIdentity::Invalid => assert_eq!(actual, TraceServiceIdentity::Invalid),
+    }
+}
+
+fn expected_service_identity_state(
+    identity: ExpectedServiceIdentity,
+) -> TraceServiceIdentityState {
+    match identity {
+        ExpectedServiceIdentity::Missing => TraceServiceIdentityState::Missing,
+        ExpectedServiceIdentity::Exact(_) => TraceServiceIdentityState::Exact,
+        ExpectedServiceIdentity::Ambiguous => TraceServiceIdentityState::Ambiguous,
+        ExpectedServiceIdentity::Removed => TraceServiceIdentityState::Removed,
+        ExpectedServiceIdentity::Redacted => TraceServiceIdentityState::Redacted,
+        ExpectedServiceIdentity::Truncated => TraceServiceIdentityState::Truncated,
+        ExpectedServiceIdentity::Invalid => TraceServiceIdentityState::Invalid,
+    }
 }
 
 fn fixture_observation(
