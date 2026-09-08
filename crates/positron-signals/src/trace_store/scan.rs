@@ -520,8 +520,9 @@ impl super::TraceStore {
         cancellation: &dyn ScanCancellation,
         observer: &dyn ScanObserver,
     ) -> Result<super::TraceServiceRelationshipSnapshot<'kernel>, TraceStoreFailure> {
-        self.scan_observed(governor, tenant, snapshot, scan, cancellation, observer)
-            .and_then(|logical| super::relationships::aggregate(logical, cancellation, observer))
+        let logical =
+            self.scan_observed(governor, tenant, snapshot, scan, cancellation, observer)?;
+        super::relationships::aggregate(logical, snapshot, cancellation, observer)
     }
 
     /// Retrieves one trace and binds existing summary facts only when their

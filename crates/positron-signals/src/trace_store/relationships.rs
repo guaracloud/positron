@@ -1,8 +1,13 @@
-use std::collections::BTreeMap;
-use std::mem::size_of;
+use std::{
+    cell::RefCell,
+    cmp::Ordering,
+    collections::hash_map::RandomState,
+    hash::{BuildHasher, Hash, Hasher},
+    mem::size_of,
+};
 
-use positron_domain::value::AttributeNamespace;
-use positron_kernel::ResourceReservation;
+use positron_domain::{routing::CommitPosition, value::AttributeNamespace};
+use positron_kernel::{CatalogGenerationId, LedgerSnapshot, ResourceReservation, SegmentScope};
 
 use crate::{ScanCancellation, ScanObserver};
 
@@ -111,7 +116,7 @@ pub struct TraceServiceRelationships<'span> {
 }
 
 /// The non-payload identity state retained for an endpoint in a snapshot-wide pair.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum TraceServiceIdentityState {
     Missing,
     Exact,
@@ -262,7 +267,17 @@ pub struct TraceServiceRelationshipSnapshot<'kernel> {
     incompleteness: TraceServiceRelationshipIncompleteness,
     scanned_bytes: u64,
     decoded_observations: u64,
+    scope: SegmentScope,
+    catalog_generation: u64,
+    catalog_identity: CatalogGenerationId,
+    frontier: CommitPosition,
     _capacity: ResourceReservation<'kernel>,
+}
+
+#[derive(Clone, Copy)]
+struct PairIndexSlot {
+    hash: u64,
+    pair_index: usize,
 }
 
 impl TraceServiceRelationshipSnapshot<'_> {
@@ -294,22 +309,31 @@ impl TraceServiceRelationshipSnapshot<'_> {
     pub const fn decoded_observations(&self) -> u64 {
         self.decoded_observations
     }
-}
-
-#[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
-struct PairKey {
-    parent_service: Option<String>,
-    child_service: Option<String>,
-    parent_service_namespace: Option<String>,
-    child_service_namespace: Option<String>,
-    parent_identity: TraceServiceIdentityState,
-    child_identity: TraceServiceIdentityState,
-    parent_namespace_identity: TraceServiceIdentityState,
-    child_namespace_identity: TraceServiceIdentityState,
+    /// Returns the authenticated physical tenant, signal, and shard scope.
+    #[must_use]
+    pub const fn scope(&self) -> SegmentScope {
+        self.scope
+    }
+    /// Returns the immutable catalog generation selected by this snapshot.
+    #[must_use]
+    pub const fn catalog_generation(&self) -> u64 {
+        self.catalog_generation
+    }
+    /// Returns the immutable catalog identity selected by this snapshot.
+    #[must_use]
+    pub const fn catalog_identity(&self) -> CatalogGenerationId {
+        self.catalog_identity
+    }
+    /// Returns the authenticated Durability Frontier selected by this snapshot.
+    #[must_use]
+    pub const fn frontier(&self) -> CommitPosition {
+        self.frontier
+    }
 }
 
 pub(super) fn aggregate<'kernel>(
     logical: LogicalTraceScanResult<'kernel>,
+    snapshot: &LedgerSnapshot<'_>,
     cancellation: &dyn ScanCancellation,
     observer: &dyn ScanObserver,
 ) -> Result<TraceServiceRelationshipSnapshot<'kernel>, TraceStoreFailure> {
@@ -330,22 +354,31 @@ pub(super) fn aggregate<'kernel>(
     } else {
         TraceIncompleteness::ResultLimit
     };
-    let structural_overhead = u64::try_from(spans.len())
-        .map_err(|_| TraceStoreFailure::limit_exceeded())?
-        .checked_mul(
-            u64::try_from(size_of::<TraceServiceRelationshipPair>())
-                .map_err(|_| TraceStoreFailure::limit_exceeded())?,
-        )
+    let pair_slots = vector_slots_bytes::<TraceServiceRelationshipPair>(spans.len())?;
+    let incomplete_slots =
+        vector_slots_bytes::<TraceServiceRelationshipTraceIncompleteness>(spans.len())?;
+    let index_slots = pair_index_slots(spans.len())?;
+    let index_bytes = vector_slots_bytes::<Option<PairIndexSlot>>(index_slots)?;
+    let mut aggregate_retained_size = retained_size_bytes
+        .checked_add(pair_slots)
+        .and_then(|bytes| bytes.checked_add(incomplete_slots))
+        .and_then(|bytes| bytes.checked_add(index_bytes))
         .ok_or_else(TraceStoreFailure::limit_exceeded)?;
-    super::scan::resize_capacity(
-        &mut _capacity,
-        retained_size_bytes
-            .checked_add(structural_overhead)
-            .ok_or_else(TraceStoreFailure::limit_exceeded)?
-            .max(1),
-    )?;
-    let mut pairs = BTreeMap::<PairKey, TraceServiceRelationshipPair>::new();
+    super::scan::resize_capacity(&mut _capacity, aggregate_retained_size.max(1))?;
+    let mut pairs = Vec::new();
+    pairs
+        .try_reserve_exact(spans.len())
+        .map_err(|_| TraceStoreFailure::resource_exhausted())?;
     let mut incomplete_traces = Vec::new();
+    incomplete_traces
+        .try_reserve_exact(spans.len())
+        .map_err(|_| TraceStoreFailure::resource_exhausted())?;
+    let mut index = Vec::new();
+    index
+        .try_reserve_exact(index_slots)
+        .map_err(|_| TraceStoreFailure::resource_exhausted())?;
+    index.resize(index_slots, None);
+    let hasher = RandomState::new();
     let mut start = 0_usize;
     while start < spans.len() {
         observe(cancellation, observer)?;
@@ -374,7 +407,7 @@ pub(super) fn aggregate<'kernel>(
                 summary: &summary,
                 scan,
                 filtered: false,
-                retained_size_bytes,
+                retained_size_bytes: aggregate_retained_size,
             },
             cancellation,
             observer,
@@ -394,26 +427,59 @@ pub(super) fn aggregate<'kernel>(
         }
         for edge in structure.service_relationships().edges() {
             observe(cancellation, observer)?;
-            let key = PairKey::from_edge(edge);
-            if let Some(pair) = pairs.get_mut(&key) {
+            let hash = edge_hash(&hasher, edge);
+            let lookup = find_pair(&index, &pairs, edge, hash, cancellation, observer)?;
+            if let Some(index) = lookup.pair_index {
+                let pair = pairs
+                    .get_mut(index)
+                    .ok_or_else(TraceStoreFailure::invalid_input)?;
                 pair.edge_count = pair
                     .edge_count
                     .checked_add(1)
                     .ok_or_else(TraceStoreFailure::limit_exceeded)?;
                 if pair.trace_ids.last().copied() != Some(trace_id) {
+                    if pair.trace_ids.len() == pair.trace_ids.capacity() {
+                        reserve_aggregate_growth(
+                            &mut _capacity,
+                            u64::try_from(size_of::<[u8; 16]>())
+                                .map_err(|_| TraceStoreFailure::limit_exceeded())?,
+                        )?;
+                        aggregate_retained_size = aggregate_retained_size
+                            .checked_add(
+                                u64::try_from(size_of::<[u8; 16]>())
+                                    .map_err(|_| TraceStoreFailure::limit_exceeded())?,
+                            )
+                            .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+                        pair.trace_ids
+                            .try_reserve_exact(1)
+                            .map_err(|_| TraceStoreFailure::resource_exhausted())?;
+                    }
                     pair.trace_ids.push(trace_id);
                 }
                 pair.record_sampling(edge)?;
             } else {
-                pairs.insert(
-                    key,
-                    TraceServiceRelationshipPair::from_edge(edge, trace_id)?,
-                );
+                let additional = TraceServiceRelationshipPair::owned_heap_bytes(edge)?
+                    .checked_add(
+                        u64::try_from(size_of::<[u8; 16]>())
+                            .map_err(|_| TraceStoreFailure::limit_exceeded())?,
+                    )
+                    .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+                reserve_aggregate_growth(&mut _capacity, additional)?;
+                aggregate_retained_size = aggregate_retained_size
+                    .checked_add(additional)
+                    .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+                let pair_index = pairs.len();
+                pairs.push(TraceServiceRelationshipPair::from_edge(edge, trace_id)?);
+                let slot = index
+                    .get_mut(lookup.slot_index)
+                    .ok_or_else(TraceStoreFailure::invalid_input)?;
+                *slot = Some(PairIndexSlot { hash, pair_index });
             }
         }
         start = end;
     }
-    let pairs = pairs.into_values().collect::<Vec<_>>();
+    sort_pairs_observed(&mut pairs, cancellation, observer)?;
+    super::scan::resize_capacity(&mut _capacity, aggregate_retained_size.max(1))?;
     let relationships_complete = complete && incomplete_traces.is_empty();
     Ok(TraceServiceRelationshipSnapshot {
         pairs,
@@ -425,23 +491,12 @@ pub(super) fn aggregate<'kernel>(
         },
         scanned_bytes,
         decoded_observations,
+        scope: snapshot.scope(),
+        catalog_generation: snapshot.catalog_generation(),
+        catalog_identity: snapshot.catalog_identity(),
+        frontier: snapshot.frontier(),
         _capacity,
     })
-}
-
-impl PairKey {
-    fn from_edge(edge: &TraceServiceRelationship<'_>) -> Self {
-        Self {
-            parent_service: edge.parent_service().map(str::to_owned),
-            child_service: edge.child_service().map(str::to_owned),
-            parent_service_namespace: edge.parent_service_namespace().map(str::to_owned),
-            child_service_namespace: edge.child_service_namespace().map(str::to_owned),
-            parent_identity: identity_state(edge.parent_identity()),
-            child_identity: identity_state(edge.child_identity()),
-            parent_namespace_identity: identity_state(edge.parent_service_namespace_identity()),
-            child_namespace_identity: identity_state(edge.child_service_namespace_identity()),
-        }
-    }
 }
 
 impl TraceServiceRelationshipPair {
@@ -450,10 +505,10 @@ impl TraceServiceRelationshipPair {
         trace_id: [u8; 16],
     ) -> Result<Self, TraceStoreFailure> {
         Ok(Self {
-            parent_service: edge.parent_service().map(str::to_owned),
-            child_service: edge.child_service().map(str::to_owned),
-            parent_service_namespace: edge.parent_service_namespace().map(str::to_owned),
-            child_service_namespace: edge.child_service_namespace().map(str::to_owned),
+            parent_service: clone_identity(edge.parent_service())?,
+            child_service: clone_identity(edge.child_service())?,
+            parent_service_namespace: clone_identity(edge.parent_service_namespace())?,
+            child_service_namespace: clone_identity(edge.child_service_namespace())?,
             parent_identity: identity_state(edge.parent_identity()),
             child_identity: identity_state(edge.child_identity()),
             parent_namespace_identity: identity_state(edge.parent_service_namespace_identity()),
@@ -461,8 +516,84 @@ impl TraceServiceRelationshipPair {
             parent_sampling_counts: sampling_counts(edge.parent_sampling()),
             child_sampling_counts: sampling_counts(edge.child_sampling()),
             edge_count: 1,
-            trace_ids: vec![trace_id],
+            trace_ids: trace_ids(trace_id)?,
         })
+    }
+
+    fn owned_heap_bytes(edge: &TraceServiceRelationship<'_>) -> Result<u64, TraceStoreFailure> {
+        [
+            edge.parent_service(),
+            edge.child_service(),
+            edge.parent_service_namespace(),
+            edge.child_service_namespace(),
+        ]
+        .into_iter()
+        .flatten()
+        .try_fold(0_u64, |bytes, identity| {
+            bytes
+                .checked_add(
+                    u64::try_from(identity.len())
+                        .map_err(|_| TraceStoreFailure::limit_exceeded())?,
+                )
+                .ok_or_else(TraceStoreFailure::limit_exceeded)
+        })
+    }
+
+    fn compare_edge(&self, edge: &TraceServiceRelationship<'_>) -> Ordering {
+        self.parent_service
+            .as_deref()
+            .cmp(&edge.parent_service())
+            .then_with(|| self.child_service.as_deref().cmp(&edge.child_service()))
+            .then_with(|| {
+                self.parent_service_namespace
+                    .as_deref()
+                    .cmp(&edge.parent_service_namespace())
+            })
+            .then_with(|| {
+                self.child_service_namespace
+                    .as_deref()
+                    .cmp(&edge.child_service_namespace())
+            })
+            .then_with(|| {
+                self.parent_identity
+                    .cmp(&identity_state(edge.parent_identity()))
+            })
+            .then_with(|| {
+                self.child_identity
+                    .cmp(&identity_state(edge.child_identity()))
+            })
+            .then_with(|| {
+                self.parent_namespace_identity
+                    .cmp(&identity_state(edge.parent_service_namespace_identity()))
+            })
+            .then_with(|| {
+                self.child_namespace_identity
+                    .cmp(&identity_state(edge.child_service_namespace_identity()))
+            })
+    }
+
+    fn compare_pair(&self, other: &Self) -> Ordering {
+        self.parent_service
+            .cmp(&other.parent_service)
+            .then_with(|| self.child_service.cmp(&other.child_service))
+            .then_with(|| {
+                self.parent_service_namespace
+                    .cmp(&other.parent_service_namespace)
+            })
+            .then_with(|| {
+                self.child_service_namespace
+                    .cmp(&other.child_service_namespace)
+            })
+            .then_with(|| self.parent_identity.cmp(&other.parent_identity))
+            .then_with(|| self.child_identity.cmp(&other.child_identity))
+            .then_with(|| {
+                self.parent_namespace_identity
+                    .cmp(&other.parent_namespace_identity)
+            })
+            .then_with(|| {
+                self.child_namespace_identity
+                    .cmp(&other.child_namespace_identity)
+            })
     }
 
     fn record_sampling(
@@ -472,6 +603,140 @@ impl TraceServiceRelationshipPair {
         record_sampling(&mut self.parent_sampling_counts, edge.parent_sampling())?;
         record_sampling(&mut self.child_sampling_counts, edge.child_sampling())
     }
+}
+
+fn vector_slots_bytes<T>(capacity: usize) -> Result<u64, TraceStoreFailure> {
+    u64::try_from(capacity)
+        .map_err(|_| TraceStoreFailure::limit_exceeded())?
+        .checked_mul(
+            u64::try_from(size_of::<T>()).map_err(|_| TraceStoreFailure::limit_exceeded())?,
+        )
+        .ok_or_else(TraceStoreFailure::limit_exceeded)
+}
+
+struct PairLookup {
+    pair_index: Option<usize>,
+    slot_index: usize,
+}
+
+fn pair_index_slots(pair_count: usize) -> Result<usize, TraceStoreFailure> {
+    if pair_count == 0 {
+        Ok(1)
+    } else {
+        pair_count
+            .checked_mul(2)
+            .and_then(usize::checked_next_power_of_two)
+            .ok_or_else(TraceStoreFailure::limit_exceeded)
+    }
+}
+
+fn edge_hash(hasher: &RandomState, edge: &TraceServiceRelationship<'_>) -> u64 {
+    let mut state = hasher.build_hasher();
+    edge.parent_service().hash(&mut state);
+    edge.child_service().hash(&mut state);
+    edge.parent_service_namespace().hash(&mut state);
+    edge.child_service_namespace().hash(&mut state);
+    identity_state(edge.parent_identity()).hash(&mut state);
+    identity_state(edge.child_identity()).hash(&mut state);
+    identity_state(edge.parent_service_namespace_identity()).hash(&mut state);
+    identity_state(edge.child_service_namespace_identity()).hash(&mut state);
+    state.finish()
+}
+
+fn find_pair(
+    index: &[Option<PairIndexSlot>],
+    pairs: &[TraceServiceRelationshipPair],
+    edge: &TraceServiceRelationship<'_>,
+    hash: u64,
+    cancellation: &dyn ScanCancellation,
+    observer: &dyn ScanObserver,
+) -> Result<PairLookup, TraceStoreFailure> {
+    let mask = index
+        .len()
+        .checked_sub(1)
+        .ok_or_else(TraceStoreFailure::invalid_input)?;
+    let mut slot_index =
+        usize::try_from(hash).map_err(|_| TraceStoreFailure::limit_exceeded())? & mask;
+    for _ in 0..index.len() {
+        observe(cancellation, observer)?;
+        let slot = index
+            .get(slot_index)
+            .ok_or_else(TraceStoreFailure::invalid_input)?;
+        let Some(slot) = slot else {
+            return Ok(PairLookup {
+                pair_index: None,
+                slot_index,
+            });
+        };
+        if slot.hash == hash
+            && pairs
+                .get(slot.pair_index)
+                .ok_or_else(TraceStoreFailure::invalid_input)?
+                .compare_edge(edge)
+                .is_eq()
+        {
+            return Ok(PairLookup {
+                pair_index: Some(slot.pair_index),
+                slot_index,
+            });
+        }
+        slot_index = slot_index
+            .checked_add(1)
+            .ok_or_else(TraceStoreFailure::limit_exceeded)?
+            & mask;
+    }
+    Err(TraceStoreFailure::limit_exceeded())
+}
+
+fn sort_pairs_observed(
+    pairs: &mut [TraceServiceRelationshipPair],
+    cancellation: &dyn ScanCancellation,
+    observer: &dyn ScanObserver,
+) -> Result<(), TraceStoreFailure> {
+    let failure = RefCell::new(None);
+    pairs.sort_by(|left, right| {
+        if failure.borrow().is_none()
+            && let Err(error) = observe(cancellation, observer)
+        {
+            *failure.borrow_mut() = Some(error);
+        }
+        left.compare_pair(right)
+    });
+    failure.into_inner().map_or(Ok(()), Err)
+}
+
+fn reserve_aggregate_growth(
+    capacity: &mut ResourceReservation<'_>,
+    additional: u64,
+) -> Result<(), TraceStoreFailure> {
+    let next = capacity
+        .granted()
+        .get(positron_kernel::ResourceDimension::MemoryBytes)
+        .checked_add(additional)
+        .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+    super::scan::resize_capacity(capacity, next.max(1))
+}
+
+fn clone_identity(identity: Option<&str>) -> Result<Option<String>, TraceStoreFailure> {
+    identity
+        .map(|identity| {
+            let mut owned = String::new();
+            owned
+                .try_reserve_exact(identity.len())
+                .map_err(|_| TraceStoreFailure::resource_exhausted())?;
+            owned.push_str(identity);
+            Ok(owned)
+        })
+        .transpose()
+}
+
+fn trace_ids(trace_id: [u8; 16]) -> Result<Vec<[u8; 16]>, TraceStoreFailure> {
+    let mut trace_ids = Vec::new();
+    trace_ids
+        .try_reserve_exact(1)
+        .map_err(|_| TraceStoreFailure::resource_exhausted())?;
+    trace_ids.push(trace_id);
+    Ok(trace_ids)
 }
 
 fn identity_state(identity: TraceServiceIdentity<'_>) -> TraceServiceIdentityState {

@@ -200,6 +200,13 @@ fn service_relationships_preserve_native_snapshot_outcomes_across_compaction()
                 snapshot,
                 TraceScan::all(ScanLimit::new(8)?),
             )?;
+            assert_eq!(aggregate.scope(), snapshot.scope());
+            assert_eq!(
+                aggregate.catalog_generation(),
+                snapshot.catalog_generation()
+            );
+            assert_eq!(aggregate.catalog_identity(), snapshot.catalog_identity());
+            assert_eq!(aggregate.frontier(), snapshot.frontier());
             assert!(aggregate.snapshot_complete());
             assert!(!aggregate.relationships_complete());
             assert_eq!(aggregate.incompleteness().scan(), TraceIncompleteness::None);
