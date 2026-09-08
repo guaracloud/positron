@@ -506,7 +506,7 @@ fn correlation_sequential_target_admission_failure_releases_the_log_lease()
 }
 
 #[test]
-fn correlation_target_admission_retries_repeated_source_cleanup_failures()
+fn correlation_target_admission_retains_failed_source_cleanup_until_later_lease_activity()
 -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("correlation-target-admission-cleanup-failure")?;
     let service = fixture.correlation_service(1)?;
@@ -521,12 +521,35 @@ fn correlation_target_admission_retries_repeated_source_cleanup_failures()
         &[
             (CatalogPublicationFault::SynchronizeCommit, 1),
             (CatalogPublicationFault::SynchronizeCommit, 0),
-            (CatalogPublicationFault::SynchronizeCommit, 0),
         ],
         || service.execute_page(query),
     )
-    .expect_err("target admission and repeated source cleanup failures must be surfaced");
+    .expect_err("target admission and source cleanup failure must be surfaced");
     assert_eq!(failure.code(), QueryFailureCode::StoreUnavailable);
+
+    let retained = fixture.kernel.authority.governor().inspect()?;
+    assert!(
+        retained.outstanding_total() > baseline.outstanding_total(),
+        "the failed release must retain its bounded durable reservation until the ledger retries it"
+    );
+
+    let recovery_service = fixture.service(1)?;
+    let recovery = recovery_service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        super::budget(),
+    )?;
+    let drain_failure = recovery_service
+        .execute_page(recovery)
+        .expect_err("the first later admission must report the catalog change while draining");
+    assert_eq!(drain_failure.code(), QueryFailureCode::StoreUnavailable);
+
+    let recovered = recovery_service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | limit 1",
+        super::budget(),
+    )?;
+    drop(recovery_service.execute_page(recovered)?);
     assert_eq!(fixture.kernel.authority.governor().inspect()?, baseline);
     Ok(())
 }
