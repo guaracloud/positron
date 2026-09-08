@@ -4,14 +4,18 @@ use positron_query::QueryCursor;
 
 use super::support::KernelFixture;
 
+#[path = "correlation/admission.rs"]
+mod admission;
 #[path = "correlation/composition.rs"]
 mod composition;
 #[path = "correlation/cursor_cleanup.rs"]
 mod cursor_cleanup;
+#[path = "correlation/execution_budget.rs"]
+mod execution_budget;
+#[path = "correlation/lease_cleanup.rs"]
+mod lease_cleanup;
 #[path = "correlation/matching.rs"]
 mod matching;
-#[path = "correlation/resources.rs"]
-mod resources;
 #[path = "correlation/resume.rs"]
 mod resume;
 
