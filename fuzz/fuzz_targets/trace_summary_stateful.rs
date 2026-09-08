@@ -1,7 +1,7 @@
 #![no_main]
 
 use std::cell::Cell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fs;
 use std::path::PathBuf;
@@ -22,8 +22,8 @@ use positron_policy::{IngestPolicy, NativeTraceCandidate, PolicyReceiver, TraceP
 use positron_signals::{
     EvaluatedSpanObservationInput, SamplingDecision, ScanCancellation, ScanLimit,
     ScanObservationFailureCode, ScanObserver, SpanKind, SpanObservation, SpanObservationDetails,
-    TraceIncompleteness, TraceQuietPeriod, TraceSearch, TraceStore, TraceStoreFailureCode,
-    TraceSummaryMaintainer,
+    TraceIncompleteness, TraceParentRelation, TraceQuietPeriod, TraceSearch, TraceStore,
+    TraceStoreFailureCode, TraceSummaryMaintainer,
 };
 
 #[path = "schema_discovery_query/authority.rs"]
@@ -140,6 +140,7 @@ fn run_once(data: &[u8], root: &std::path::Path) -> Result<(), Box<dyn Error>> {
     )?;
     let mut expected = BTreeMap::new();
     let mut expected_spans = BTreeMap::new();
+    let mut expected_observations = BTreeMap::new();
     let mut next_identity = 1_u8;
     let mut next_ingest_time = 1_000_i64;
 
@@ -148,7 +149,8 @@ fn run_once(data: &[u8], root: &std::path::Path) -> Result<(), Box<dyn Error>> {
         match command[0] % 7 {
             0 | 1 => {
                 let trace = trace_id(command);
-                let observation = observation(&policy, trace, command[2], command[3])?;
+                let (observation, expected_observation) =
+                    observation(&policy, trace, command[2], command[3])?;
                 append(
                     &ledger,
                     &authority,
@@ -168,6 +170,10 @@ fn run_once(data: &[u8], root: &std::path::Path) -> Result<(), Box<dyn Error>> {
                     .checked_add(1)
                     .ok_or("bounded observation count overflow")?;
                 record_expected_span(&mut expected_spans, trace, command[2])?;
+                expected_observations
+                    .entry(trace)
+                    .or_insert_with(Vec::new)
+                    .push(expected_observation);
             },
             2 => {
                 if let Some(trace) = expected.keys().next().copied() {
@@ -185,6 +191,8 @@ fn run_once(data: &[u8], root: &std::path::Path) -> Result<(), Box<dyn Error>> {
                     let late_ingest_time = quiescent_at
                         .checked_add(1)
                         .ok_or("bounded late ingest time overflow")?;
+                    let (observation, expected_observation) =
+                        observation(&policy, trace, command[2], command[3])?;
                     append(
                         &ledger,
                         &authority,
@@ -192,7 +200,7 @@ fn run_once(data: &[u8], root: &std::path::Path) -> Result<(), Box<dyn Error>> {
                         tenant,
                         scope.shard_id(),
                         next_identity,
-                        observation(&policy, trace, command[2], command[3])?,
+                        observation,
                         late_ingest_time,
                     )?;
                     next_identity = next_identity.wrapping_add(1).max(1);
@@ -204,6 +212,10 @@ fn run_once(data: &[u8], root: &std::path::Path) -> Result<(), Box<dyn Error>> {
                         .checked_add(1)
                         .ok_or("bounded observation count overflow")?;
                     record_expected_span(&mut expected_spans, trace, command[2])?;
+                    expected_observations
+                        .entry(trace)
+                        .or_insert_with(Vec::new)
+                        .push(expected_observation);
                     source.store(late_ingest_time, Ordering::Relaxed);
                     reopened_trace = Some(trace);
                 }
@@ -274,6 +286,7 @@ fn run_once(data: &[u8], root: &std::path::Path) -> Result<(), Box<dyn Error>> {
             &snapshot,
             &expected,
             &expected_spans,
+            &expected_observations,
             command[1] & 0x80 != 0,
             command[2],
         )?;
@@ -305,6 +318,17 @@ fn run_once(data: &[u8], root: &std::path::Path) -> Result<(), Box<dyn Error>> {
         &lifecycle_clock,
         &expected,
     )?;
+    let (fixture_trace, fixture_observation_count) = exercise_structural_fixture(
+        &ledger,
+        &authority,
+        &store,
+        &policy,
+        tenant,
+        scope.shard_id(),
+        data[0],
+        next_ingest_time,
+    )?;
+    expected.insert(fixture_trace, fixture_observation_count);
     drop(ledger);
     replay_and_assert(&authority, &catalog, scope, key(), &store, &expected)
 }
@@ -316,6 +340,7 @@ fn exercise_trace_queries(
     snapshot: &positron_kernel::LedgerSnapshot<'_>,
     expected: &BTreeMap<[u8; 16], u64>,
     expected_spans: &BTreeMap<[u8; 16], BTreeMap<[u8; 8], u64>>,
+    expected_observations: &BTreeMap<[u8; 16], Vec<ExpectedObservation>>,
     cancelled: bool,
     target_selector: u8,
 ) -> Result<(), Box<dyn Error>> {
@@ -384,13 +409,32 @@ fn exercise_trace_queries(
         expected_by_id
     );
     let by_id_complete = by_id.complete();
-    let expected_structure = expected_structure(by_id.spans());
-    let expected_path = expected_critical_path(by_id.spans(), &expected_structure);
+    let expected_structure = expected_structure(
+        expected_observations
+            .get(&trace_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default(),
+    );
     let structure = by_id.analyze_structure(&InputCancellation(false), &Unobserved)?;
     assert_eq!(structure.incompleteness().scan(), TraceIncompleteness::None);
-    assert_eq!(structure.roots(), expected_structure.roots);
-    assert_eq!(structure.orphans(), expected_structure.orphans);
-    assert_eq!(structure.cycles(), expected_structure.cycles);
+    assert_eq!(structure.roots(), expected_structure.roots.as_slice());
+    assert_eq!(structure.orphans(), expected_structure.orphans.as_slice());
+    assert_eq!(structure.cycles(), expected_structure.cycles.as_slice());
+    assert_eq!(
+        structure
+            .spans()
+            .iter()
+            .map(|span| (
+                span.span_id(),
+                span.parent_span_id(),
+                span.relation(),
+                span.sampling(),
+                span.conflicted(),
+                span.cycle_member(),
+            ))
+            .collect::<Vec<_>>(),
+        expected_structure.spans
+    );
     assert_eq!(
         structure.incompleteness().missing_parents(),
         expected_structure.missing_parents
@@ -423,16 +467,18 @@ fn exercise_trace_queries(
         && expected_structure.temporal_inconsistencies == 0
         && expected_structure.roots.len() <= 1;
     assert_eq!(structure.complete(), expected_complete);
-    let actual_path = structure.critical_path().map(|path| {
-        (
-            path.fragments()
-                .iter()
-                .map(|fragment| (fragment.span_id(), fragment.start(), fragment.end()))
-                .collect::<Vec<_>>(),
-            path.duration_nanos(),
-        )
-    });
-    assert_eq!(actual_path, expected_path);
+    if let Some(expected_path) = expected_critical_path(&expected_structure) {
+        let actual_path = structure.critical_path().map(|path| {
+            (
+                path.fragments()
+                    .iter()
+                    .map(|fragment| (fragment.span_id(), fragment.start(), fragment.end()))
+                    .collect::<Vec<_>>(),
+                path.duration_nanos(),
+            )
+        });
+        assert_eq!(actual_path, expected_path);
+    }
     if expected.values().copied().sum::<u64>() > 1 {
         let incomplete = store.search_observed(
             authority.governor(),
@@ -448,6 +494,8 @@ fn exercise_trace_queries(
 }
 
 struct ExpectedStructure {
+    spans: Vec<ExpectedSpan>,
+    nodes: BTreeMap<[u8; 8], ExpectedNode>,
     roots: Vec<[u8; 8]>,
     orphans: Vec<[u8; 8]>,
     cycles: Vec<[u8; 8]>,
@@ -457,24 +505,55 @@ struct ExpectedStructure {
     temporal_inconsistencies: u64,
 }
 
-type ExpectedNode = (Option<[u8; 8]>, UnixNanoseconds, UnixNanoseconds);
+type ExpectedSpan = (
+    [u8; 8],
+    Option<[u8; 8]>,
+    TraceParentRelation,
+    SamplingDecision,
+    bool,
+    bool,
+);
 
-fn expected_structure(spans: &[positron_signals::LogicalSpan]) -> ExpectedStructure {
-    let parents = spans
-        .iter()
-        .filter_map(|span| {
-            span.structural_representative().map(|representative| {
-                (
-                    span.span_id(),
-                    (
-                        representative.observation().parent_span_id(),
-                        interval(representative.observation()),
-                    ),
-                )
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ExpectedObservation {
+    span_id: [u8; 8],
+    parent_span_id: Option<[u8; 8]>,
+    interval: Option<(UnixNanoseconds, UnixNanoseconds)>,
+    sampling: SamplingDecision,
+    semantic_selector: u8,
+}
+
+#[derive(Clone)]
+struct ExpectedNode {
+    parent_span_id: Option<[u8; 8]>,
+    interval: Option<(UnixNanoseconds, UnixNanoseconds)>,
+    sampling: SamplingDecision,
+    conflicted: bool,
+    semantic_selector: u8,
+}
+
+fn expected_structure(observations: &[ExpectedObservation]) -> ExpectedStructure {
+    let mut nodes = BTreeMap::new();
+    for observation in observations {
+        nodes
+            .entry(observation.span_id)
+            .and_modify(|node: &mut ExpectedNode| {
+                node.conflicted |= node.parent_span_id != observation.parent_span_id
+                    || node.interval != observation.interval
+                    || node.sampling != observation.sampling
+                    || node.semantic_selector != observation.semantic_selector;
             })
-        })
-        .collect::<BTreeMap<_, _>>();
+            .or_insert_with(|| ExpectedNode {
+                parent_span_id: observation.parent_span_id,
+                interval: observation.interval,
+                sampling: observation.sampling,
+                conflicted: false,
+                semantic_selector: observation.semantic_selector,
+            });
+    }
     let mut expected = ExpectedStructure {
+        spans: Vec::new(),
+        nodes: BTreeMap::new(),
         roots: Vec::new(),
         orphans: Vec::new(),
         cycles: Vec::new(),
@@ -483,46 +562,77 @@ fn expected_structure(spans: &[positron_signals::LogicalSpan]) -> ExpectedStruct
         invalid_durations: 0,
         temporal_inconsistencies: 0,
     };
-    for span in spans {
-        let Some((parent, child_interval)) = parents.get(&span.span_id()).copied() else {
-            continue;
+    let cycles = cycle_members(&nodes);
+    for (span_id, node) in &nodes {
+        let relation = match node.parent_span_id {
+            None => {
+                expected.roots.push(*span_id);
+                TraceParentRelation::Root
+            },
+            Some(parent) if nodes.contains_key(&parent) => TraceParentRelation::Child,
+            Some(_) => {
+                expected.orphans.push(*span_id);
+                expected.missing_parents = expected.missing_parents.saturating_add(1);
+                TraceParentRelation::Orphan
+            },
         };
-        if span.conflicted() {
+        let cycle_member = cycles.contains(span_id);
+        if node.conflicted {
             expected.conflicts = expected.conflicts.saturating_add(1);
         }
-        if child_interval.is_none() {
+        if node.interval.is_none() {
             expected.invalid_durations = expected.invalid_durations.saturating_add(1);
         }
-        match parent {
-            None => expected.roots.push(span.span_id()),
-            Some(parent) => match parents.get(&parent) {
-                None => {
-                    expected.orphans.push(span.span_id());
-                    expected.missing_parents = expected.missing_parents.saturating_add(1);
-                },
-                Some((_, parent_interval)) => {
-                    if let (Some(parent_interval), Some(child_interval)) =
-                        (*parent_interval, child_interval)
-                        && (child_interval.0 < parent_interval.0
-                            || child_interval.1 > parent_interval.1)
-                    {
-                        expected.temporal_inconsistencies =
-                            expected.temporal_inconsistencies.saturating_add(1);
-                    }
-                },
-            },
+        if let Some(parent) = node.parent_span_id.and_then(|parent| nodes.get(&parent))
+            && let (Some(parent_interval), Some(child_interval)) = (parent.interval, node.interval)
+            && (child_interval.0 < parent_interval.0 || child_interval.1 > parent_interval.1)
+        {
+            expected.temporal_inconsistencies = expected.temporal_inconsistencies.saturating_add(1);
         }
-        if is_cycle_member(span.span_id(), &parents, spans.len()) {
-            expected.cycles.push(span.span_id());
+        if cycle_member {
+            expected.cycles.push(*span_id);
         }
+        expected.spans.push((
+            *span_id,
+            node.parent_span_id,
+            relation,
+            node.sampling,
+            node.conflicted,
+            cycle_member,
+        ));
     }
+    expected.nodes = nodes;
     expected
 }
 
+fn cycle_members(nodes: &BTreeMap<[u8; 8], ExpectedNode>) -> BTreeSet<[u8; 8]> {
+    let mut cycles = BTreeSet::new();
+    for origin in nodes.keys().copied() {
+        let mut trail = Vec::new();
+        let mut positions = BTreeMap::new();
+        let mut current = Some(origin);
+        while let Some(span_id) = current {
+            let Some(node) = nodes.get(&span_id) else {
+                break;
+            };
+            if let Some(start) = positions.get(&span_id).copied() {
+                cycles.extend(trail.into_iter().skip(start));
+                break;
+            }
+            positions.insert(span_id, trail.len());
+            trail.push(span_id);
+            current = node.parent_span_id;
+        }
+    }
+    cycles
+}
+
 fn expected_critical_path(
-    spans: &[positron_signals::LogicalSpan],
     expected: &ExpectedStructure,
-) -> Option<(Vec<([u8; 8], UnixNanoseconds, UnixNanoseconds)>, u64)> {
+) -> Option<Option<(Vec<([u8; 8], UnixNanoseconds, UnixNanoseconds)>, u64)>> {
+    if expected.nodes.len() > 6 {
+        return None;
+    }
     if expected.missing_parents != 0
         || expected.conflicts != 0
         || !expected.cycles.is_empty()
@@ -530,102 +640,107 @@ fn expected_critical_path(
         || expected.temporal_inconsistencies != 0
         || expected.roots.len() != 1
     {
-        return None;
+        return Some(None);
     }
-    let nodes = spans
-        .iter()
-        .filter_map(|span| {
-            span.structural_representative().and_then(|representative| {
-                interval(representative.observation()).map(|(start, end)| {
-                    (
-                        span.span_id(),
-                        (representative.observation().parent_span_id(), start, end),
-                    )
-                })
-            })
-        })
-        .collect::<BTreeMap<[u8; 8], ExpectedNode>>();
-    let root_id = expected.roots.first().copied()?;
-    let (_, root_start, root_end) = *nodes.get(&root_id)?;
-    let mut fragments = Vec::new();
-    let mut stack = vec![(root_id, root_start, root_end)];
-    while let Some((parent_id, parent_start, cursor)) = stack.last_mut() {
-        let selected = nodes
-            .iter()
-            .filter(|(_, (parent, start, end))| {
-                *parent == Some(*parent_id) && *start < *cursor && *end <= *cursor
-            })
-            .max_by(
-                |(left_id, (_, _, left_end)), (right_id, (_, _, right_end))| {
-                    left_end.cmp(right_end).then_with(|| right_id.cmp(left_id))
-                },
-            )
-            .map(|(id, (_, start, end))| (*id, *start, *end));
-        if let Some((child_id, child_start, child_end)) = selected {
-            if child_end > *cursor {
-                return None;
-            }
-            if child_end < *cursor {
-                fragments.push((*parent_id, child_end, *cursor));
-            }
-            *cursor = child_start;
-            let (_, child_start, child_end) = *nodes.get(&child_id)?;
-            stack.push((child_id, child_start, child_end));
-        } else {
-            if *cursor > *parent_start {
-                fragments.push((*parent_id, *parent_start, *cursor));
-            }
-            let _ = stack.pop();
-        }
-    }
-    fragments.reverse();
+    let root = expected.roots[0];
+    let fragments = reference_fragments(&expected.nodes, root)?;
     let duration = fragments.iter().try_fold(0_u64, |total, (_, start, end)| {
         u64::try_from(i128::from(end.value()) - i128::from(start.value()))
             .ok()
-            .and_then(|fragment| total.checked_add(fragment))
+            .and_then(|part| total.checked_add(part))
     })?;
-    Some((fragments, duration))
+    Some(Some((fragments, duration)))
 }
 
-fn is_cycle_member(
-    origin: [u8; 8],
-    parents: &BTreeMap<[u8; 8], (Option<[u8; 8]>, Option<(UnixNanoseconds, UnixNanoseconds)>)>,
-    span_count: usize,
-) -> bool {
-    let mut current = Some(origin);
-    for _ in 0..span_count {
-        let Some(span_id) = current else {
-            return false;
-        };
-        let Some((parent, _)) = parents.get(&span_id) else {
-            return false;
-        };
-        current = *parent;
-        if current == Some(origin) {
-            return true;
+// This bounded enumerator is deliberately unlike the production backwards walk:
+// it enumerates compatible direct-child schedules, picks the CRISP-preferred
+// schedule by its endpoint ordering, then expands it in chronological order.
+fn reference_fragments(
+    nodes: &BTreeMap<[u8; 8], ExpectedNode>,
+    parent_id: [u8; 8],
+) -> Option<Vec<([u8; 8], UnixNanoseconds, UnixNanoseconds)>> {
+    let (start, end) = nodes.get(&parent_id)?.interval?;
+    let schedule = preferred_schedule(nodes, parent_id, end)?;
+    let mut fragments = Vec::new();
+    let mut cursor = start;
+    for child_id in schedule.iter().rev() {
+        let (child_start, child_end) = nodes.get(child_id)?.interval?;
+        if child_start > cursor {
+            fragments.push((parent_id, cursor, child_start));
+        }
+        fragments.extend(reference_fragments(nodes, *child_id)?);
+        cursor = child_end;
+    }
+    if end > cursor {
+        fragments.push((parent_id, cursor, end));
+    }
+    Some(fragments)
+}
+
+fn preferred_schedule(
+    nodes: &BTreeMap<[u8; 8], ExpectedNode>,
+    parent_id: [u8; 8],
+    cursor: UnixNanoseconds,
+) -> Option<Vec<[u8; 8]>> {
+    let mut schedules = vec![Vec::new()];
+    for (child_id, child) in nodes {
+        let (start, end) = child.interval?;
+        if child.parent_span_id != Some(parent_id) || start >= cursor || end > cursor {
+            continue;
+        }
+        for suffix in preferred_schedule_options(nodes, parent_id, start)? {
+            let mut schedule = Vec::with_capacity(suffix.len().saturating_add(1));
+            schedule.push(*child_id);
+            schedule.extend(suffix);
+            schedules.push(schedule);
         }
     }
-    false
+    schedules
+        .into_iter()
+        .max_by(|left, right| compare_schedules(left, right, nodes))
 }
 
-fn interval(observation: &SpanObservation) -> Option<(UnixNanoseconds, UnixNanoseconds)> {
-    let start = observation.start_time();
-    let end = observation.end_time();
-    matches!(
-        start.quality(),
-        SourceTimeQuality::Usable | SourceTimeQuality::Outlier
-    )
-    .then_some(start.instant())
-    .flatten()
-    .zip(
-        matches!(
-            end.quality(),
-            SourceTimeQuality::Usable | SourceTimeQuality::Outlier
-        )
-        .then_some(end.instant())
-        .flatten(),
-    )
-    .filter(|(start, end)| end >= start)
+fn preferred_schedule_options(
+    nodes: &BTreeMap<[u8; 8], ExpectedNode>,
+    parent_id: [u8; 8],
+    cursor: UnixNanoseconds,
+) -> Option<Vec<Vec<[u8; 8]>>> {
+    let mut schedules = vec![Vec::new()];
+    for (child_id, child) in nodes {
+        let (start, end) = child.interval?;
+        if child.parent_span_id != Some(parent_id) || start >= cursor || end > cursor {
+            continue;
+        }
+        for suffix in preferred_schedule_options(nodes, parent_id, start)? {
+            let mut schedule = Vec::with_capacity(suffix.len().saturating_add(1));
+            schedule.push(*child_id);
+            schedule.extend(suffix);
+            schedules.push(schedule);
+        }
+    }
+    Some(schedules)
+}
+
+fn compare_schedules(
+    left: &[[u8; 8]],
+    right: &[[u8; 8]],
+    nodes: &BTreeMap<[u8; 8], ExpectedNode>,
+) -> std::cmp::Ordering {
+    for (left_id, right_id) in left.iter().zip(right) {
+        let left_end = nodes
+            .get(left_id)
+            .and_then(|node| node.interval)
+            .map(|(_, end)| end);
+        let right_end = nodes
+            .get(right_id)
+            .and_then(|node| node.interval)
+            .map(|(_, end)| end);
+        match left_end.cmp(&right_end).then_with(|| right_id.cmp(left_id)) {
+            std::cmp::Ordering::Equal => {},
+            order => return order,
+        }
+    }
+    left.len().cmp(&right.len())
 }
 
 fn record_expected_span(
@@ -672,7 +787,7 @@ fn observation(
     trace_id: [u8; 16],
     span_selector: u8,
     semantic_selector: u8,
-) -> Result<SpanObservation, Box<dyn Error>> {
+) -> Result<(SpanObservation, ExpectedObservation), Box<dyn Error>> {
     let TracePolicyEvaluation::Accepted(evaluated) = policy.evaluate_trace(
         NativeTraceCandidate::new(Vec::new()),
         PolicyReceiver::OtlpGrpc,
@@ -681,31 +796,277 @@ fn observation(
         return Err("preserving trace policy rejected a candidate".into());
     };
     let start = i64::from(span_selector.max(2));
-    Ok(SpanObservation::checked_evaluated(
+    let end = if semantic_selector & 0x80 == 0 {
+        start.saturating_add(i64::from(semantic_selector & 0x3f))
+    } else {
+        start.saturating_sub(1)
+    };
+    let quality = source_time_quality(semantic_selector);
+    let sampling = sampling_decision(semantic_selector);
+    let start_time = generated_event_time(start, quality)?;
+    let end_time = generated_event_time(end, quality)?;
+    let interval = generated_interval(start, end, quality);
+    let parent_span_id = parent_span_id(span_selector, semantic_selector);
+    let observation = SpanObservation::checked_evaluated(
         ValueLimitProfile::release_1_system_maximum(),
         EvaluatedSpanObservationInput {
             trace_id,
             span_id: [span_selector.max(1); 8],
-            parent_span_id: parent_span_id(span_selector, semantic_selector),
+            parent_span_id,
             name: format!("fuzz-span-{semantic_selector}"),
-            start_time: EventTime::received(
-                UnixNanoseconds::new(start),
-                SourceTimeQuality::Usable,
-            )?,
-            end_time: EventTime::received(
-                UnixNanoseconds::new(if semantic_selector & 0x80 == 0 {
-                    start.saturating_add(i64::from(semantic_selector & 0x3f))
-                } else {
-                    start.saturating_sub(1)
-                }),
-                SourceTimeQuality::Usable,
-            )?,
+            start_time,
+            end_time,
             kind: SpanKind::Internal,
-            sampling: SamplingDecision::Unknown,
+            sampling,
             evaluated: *evaluated,
             details: SpanObservationDetails::default(),
         },
-    )?)
+    )?;
+    Ok((
+        observation,
+        ExpectedObservation {
+            span_id: [span_selector.max(1); 8],
+            parent_span_id,
+            interval,
+            sampling,
+            semantic_selector,
+        },
+    ))
+}
+
+fn source_time_quality(selector: u8) -> SourceTimeQuality {
+    match selector & 0x03 {
+        0 => SourceTimeQuality::Usable,
+        1 => SourceTimeQuality::Outlier,
+        2 => SourceTimeQuality::Missing,
+        _ => SourceTimeQuality::Zero,
+    }
+}
+
+fn sampling_decision(selector: u8) -> SamplingDecision {
+    match selector % 3 {
+        0 => SamplingDecision::Unknown,
+        1 => SamplingDecision::NotSampled,
+        _ => SamplingDecision::Sampled,
+    }
+}
+
+fn generated_event_time(
+    value: i64,
+    quality: SourceTimeQuality,
+) -> Result<EventTime, Box<dyn Error>> {
+    match quality {
+        SourceTimeQuality::Missing => Ok(EventTime::missing()),
+        SourceTimeQuality::Zero => Ok(EventTime::received(
+            UnixNanoseconds::new(0),
+            SourceTimeQuality::Zero,
+        )?),
+        SourceTimeQuality::Usable | SourceTimeQuality::Outlier => {
+            Ok(EventTime::received(UnixNanoseconds::new(value), quality)?)
+        },
+        SourceTimeQuality::Contradictory => {
+            Err("generated source quality is not valid for a trace observation".into())
+        },
+    }
+}
+
+fn generated_interval(
+    start: i64,
+    end: i64,
+    quality: SourceTimeQuality,
+) -> Option<(UnixNanoseconds, UnixNanoseconds)> {
+    matches!(quality, SourceTimeQuality::Usable | SourceTimeQuality::Outlier)
+        .then_some((UnixNanoseconds::new(start), UnixNanoseconds::new(end)))
+        .filter(|(start, end)| end >= start)
+}
+
+#[derive(Clone, Copy)]
+struct FixtureInput {
+    span_id: [u8; 8],
+    parent_span_id: Option<[u8; 8]>,
+    start: Option<i64>,
+    end: Option<i64>,
+    name: u8,
+    sampling: SamplingDecision,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn exercise_structural_fixture<'kernel>(
+    ledger: &ActiveSegmentLedger<'kernel, '_>,
+    authority: &'kernel positron_kernel::StorageKernelResourceAuthority,
+    store: &TraceStore,
+    policy: &IngestPolicy,
+    tenant: TenantId,
+    shard: VirtualShardId,
+    selector: u8,
+    ingest_time: i64,
+) -> Result<([u8; 16], u64), Box<dyn Error>> {
+    let case = selector % 9;
+    let trace_id = [0xe0_u8.saturating_add(case); 16];
+    let sampling = sampling_decision(selector);
+    let usable_quality = if selector & 0x10 == 0 {
+        SourceTimeQuality::Usable
+    } else {
+        SourceTimeQuality::Outlier
+    };
+    let root = [0x01; 8];
+    let first = [0x02; 8];
+    let second = [0x03; 8];
+    let inputs = match case {
+        0 => vec![
+            FixtureInput { span_id: root, parent_span_id: None, start: Some(1), end: Some(101), name: 0, sampling },
+            FixtureInput { span_id: first, parent_span_id: Some(root), start: Some(11), end: Some(91), name: 1, sampling },
+            FixtureInput { span_id: second, parent_span_id: Some(first), start: Some(21), end: Some(81), name: 2, sampling },
+        ],
+        1 => vec![
+            FixtureInput { span_id: root, parent_span_id: None, start: Some(1), end: Some(101), name: 0, sampling },
+            FixtureInput { span_id: first, parent_span_id: Some(root), start: Some(11), end: Some(41), name: 1, sampling },
+            FixtureInput { span_id: second, parent_span_id: Some(root), start: Some(51), end: Some(91), name: 2, sampling },
+        ],
+        2 => vec![
+            FixtureInput { span_id: root, parent_span_id: None, start: Some(1), end: Some(101), name: 0, sampling },
+            FixtureInput { span_id: first, parent_span_id: Some(root), start: Some(11), end: Some(61), name: 1, sampling },
+            FixtureInput { span_id: second, parent_span_id: Some(root), start: Some(21), end: Some(91), name: 2, sampling },
+        ],
+        3 => vec![
+            FixtureInput { span_id: root, parent_span_id: None, start: Some(1), end: Some(101), name: 0, sampling },
+            FixtureInput { span_id: first, parent_span_id: Some(root), start: Some(11), end: Some(81), name: 1, sampling },
+            FixtureInput { span_id: second, parent_span_id: Some(root), start: Some(21), end: Some(81), name: 2, sampling },
+        ],
+        4 => vec![FixtureInput { span_id: first, parent_span_id: Some([0x09; 8]), start: Some(10), end: Some(20), name: 0, sampling }],
+        5 => vec![
+            FixtureInput { span_id: first, parent_span_id: Some(second), start: Some(10), end: Some(40), name: 0, sampling },
+            FixtureInput { span_id: second, parent_span_id: Some(first), start: Some(15), end: Some(35), name: 1, sampling },
+        ],
+        6 => vec![
+            FixtureInput { span_id: root, parent_span_id: None, start: Some(1), end: Some(101), name: 0, sampling },
+            FixtureInput { span_id: root, parent_span_id: None, start: Some(1), end: Some(101), name: 1, sampling: SamplingDecision::NotSampled },
+        ],
+        7 => vec![FixtureInput { span_id: root, parent_span_id: None, start: None, end: None, name: 0, sampling }],
+        _ => vec![
+            FixtureInput { span_id: root, parent_span_id: None, start: Some(1), end: Some(51), name: 0, sampling },
+            FixtureInput { span_id: first, parent_span_id: Some(root), start: Some(11), end: Some(71), name: 1, sampling },
+        ],
+    };
+    let mut observations = Vec::new();
+    let mut expected_observations = Vec::new();
+    for input in inputs {
+        let quality = if case == 7 { SourceTimeQuality::Missing } else { usable_quality };
+        let (observation, expected) = fixture_observation(policy, trace_id, input, quality)?;
+        observations.push(observation);
+        expected_observations.push(expected);
+    }
+    append_all(
+        ledger,
+        authority,
+        store,
+        tenant,
+        shard,
+        0xfe,
+        observations,
+        ingest_time,
+    )?;
+    let snapshot = ledger.snapshot()?;
+    let mut trace = store.trace_by_id_observed(
+        authority.governor(),
+        tenant,
+        &snapshot,
+        trace_id,
+        TraceSearch::all(ScanLimit::new(MAX_OPERATIONS.saturating_add(3))?),
+        &InputCancellation(false),
+        &Unobserved,
+    )?;
+    assert!(trace.complete());
+    let expected = expected_structure(&expected_observations);
+    let structure = trace.analyze_structure(&InputCancellation(false), &Unobserved)?;
+    assert_eq!(structure.roots(), expected.roots.as_slice());
+    assert_eq!(structure.orphans(), expected.orphans.as_slice());
+    assert_eq!(structure.cycles(), expected.cycles.as_slice());
+    assert_eq!(structure.incompleteness().missing_parents(), expected.missing_parents);
+    assert_eq!(structure.incompleteness().conflicts(), expected.conflicts);
+    assert_eq!(structure.incompleteness().cycle_members(), expected.cycles.len() as u64);
+    assert_eq!(structure.incompleteness().invalid_durations(), expected.invalid_durations);
+    assert_eq!(structure.incompleteness().temporal_inconsistencies(), expected.temporal_inconsistencies);
+    assert_eq!(
+        structure.spans().iter().map(|span| (
+            span.span_id(), span.parent_span_id(), span.relation(), span.sampling(),
+            span.conflicted(), span.cycle_member(),
+        )).collect::<Vec<_>>(),
+        expected.spans.as_slice(),
+    );
+    let literal_path = literal_fixture_path(case);
+    assert_eq!(expected_critical_path(&expected), Some(literal_path.clone()));
+    let actual_path = structure.critical_path().map(|path| (
+        path.fragments().iter().map(|fragment| (fragment.span_id(), fragment.start(), fragment.end())).collect::<Vec<_>>(),
+        path.duration_nanos(),
+    ));
+    assert_eq!(actual_path, literal_path);
+    Ok((trace_id, u64::try_from(expected_observations.len())?))
+}
+
+fn fixture_observation(
+    policy: &IngestPolicy,
+    trace_id: [u8; 16],
+    input: FixtureInput,
+    quality: SourceTimeQuality,
+) -> Result<(SpanObservation, ExpectedObservation), Box<dyn Error>> {
+    let TracePolicyEvaluation::Accepted(evaluated) = policy.evaluate_trace(
+        NativeTraceCandidate::new(Vec::new()),
+        PolicyReceiver::OtlpGrpc,
+    )? else {
+        return Err("preserving trace policy rejected fixture candidate".into());
+    };
+    let start_time = input
+        .start
+        .map(|value| generated_event_time(value, quality))
+        .transpose()?
+        .unwrap_or_else(EventTime::missing);
+    let end_time = input
+        .end
+        .map(|value| generated_event_time(value, quality))
+        .transpose()?
+        .unwrap_or_else(EventTime::missing);
+    let interval = input.start.zip(input.end).and_then(|(start, end)| generated_interval(start, end, quality));
+    Ok((
+        SpanObservation::checked_evaluated(
+            ValueLimitProfile::release_1_system_maximum(),
+            EvaluatedSpanObservationInput {
+                trace_id,
+                span_id: input.span_id,
+                parent_span_id: input.parent_span_id,
+                name: format!("fixture-{}", input.name),
+                start_time,
+                end_time,
+                kind: SpanKind::Internal,
+                sampling: input.sampling,
+                evaluated: *evaluated,
+                details: SpanObservationDetails::default(),
+            },
+        )?,
+        ExpectedObservation {
+            span_id: input.span_id,
+            parent_span_id: input.parent_span_id,
+            interval,
+            sampling: input.sampling,
+            semantic_selector: input.name,
+        },
+    ))
+}
+
+fn literal_fixture_path(
+    case: u8,
+) -> Option<(Vec<([u8; 8], UnixNanoseconds, UnixNanoseconds)>, u64)> {
+    let at = |value| UnixNanoseconds::new(value);
+    let root = [0x01; 8];
+    let first = [0x02; 8];
+    let second = [0x03; 8];
+    match case {
+        0 => Some((vec![(root, at(1), at(11)), (first, at(11), at(21)), (second, at(21), at(81)), (first, at(81), at(91)), (root, at(91), at(101))], 100)),
+        1 => Some((vec![(root, at(1), at(11)), (first, at(11), at(41)), (root, at(41), at(51)), (second, at(51), at(91)), (root, at(91), at(101))], 100)),
+        2 => Some((vec![(root, at(1), at(21)), (second, at(21), at(91)), (root, at(91), at(101))], 100)),
+        3 => Some((vec![(root, at(1), at(11)), (first, at(11), at(81)), (root, at(81), at(101))], 100)),
+        _ => None,
+    }
 }
 
 fn parent_span_id(span_selector: u8, semantic_selector: u8) -> Option<[u8; 8]> {
@@ -728,6 +1089,29 @@ fn append<'kernel>(
     observation: SpanObservation,
     ingest_time: i64,
 ) -> Result<(), Box<dyn Error>> {
+    append_all(
+        ledger,
+        authority,
+        store,
+        tenant,
+        shard,
+        identity,
+        vec![observation],
+        ingest_time,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_all<'kernel>(
+    ledger: &ActiveSegmentLedger<'kernel, '_>,
+    authority: &'kernel positron_kernel::StorageKernelResourceAuthority,
+    store: &TraceStore,
+    tenant: TenantId,
+    shard: VirtualShardId,
+    identity: u8,
+    observations: Vec<SpanObservation>,
+    ingest_time: i64,
+) -> Result<(), Box<dyn Error>> {
     let capacity = authority.governor().reserve(WorkClaim::tenant(
         tenant,
         WorkKind::Ingest,
@@ -744,7 +1128,7 @@ fn append<'kernel>(
                 tenant,
                 shard,
                 StoreBlockIdentity::new([identity; 16])?,
-                vec![observation],
+                observations,
             )?
             .into_store_block(),
     )?;

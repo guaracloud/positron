@@ -510,5 +510,33 @@ fn trace_by_id_analysis_surfaces_cycles_conflicts_and_source_time_failures()
         1
     );
     assert!(escaped_structure.critical_path().is_none());
+
+    let long_cycle = [0x8e; 16];
+    let mut long_cycle_observations = Vec::new();
+    for value in 1_u8..=64 {
+        long_cycle_observations.push(observation(
+            long_cycle,
+            [value; 8],
+            Some([if value == 64 { 1 } else { value + 1 }; 8]),
+            1,
+            100,
+            format!("cycle-{value}"),
+        )?);
+    }
+    append(0x8f, 104, long_cycle_observations)?;
+    let mut long_cycle_result = store.trace_by_id(
+        authority.governor(),
+        tenant,
+        &ledger.snapshot()?,
+        long_cycle,
+        TraceSearch::all(ScanLimit::new(1_024)?),
+    )?;
+    let long_cycle_structure =
+        long_cycle_result.analyze_structure(&NeverCancelled, &ExhaustAfterWork::new(10_000))?;
+    assert!(!long_cycle_structure.complete());
+    assert!(long_cycle_structure.roots().is_empty());
+    assert_eq!(long_cycle_structure.cycles().len(), 64);
+    assert_eq!(long_cycle_structure.incompleteness().cycle_members(), 64);
+    assert!(long_cycle_structure.critical_path().is_none());
     Ok(())
 }

@@ -239,6 +239,98 @@ pub(super) struct StructuralInput<'spans, 'summary> {
     pub(super) retained_size_bytes: u64,
 }
 
+#[derive(Clone, Copy)]
+struct SpanIndexEntry {
+    span_id: [u8; 8],
+    parent_index: Option<usize>,
+}
+
+struct SpanIndex {
+    entries: Vec<SpanIndexEntry>,
+}
+
+impl SpanIndex {
+    fn build(
+        spans: &[LogicalSpan],
+        cancellation: &dyn ScanCancellation,
+        observer: &dyn ScanObserver,
+    ) -> Result<Self, TraceStoreFailure> {
+        let mut entries = reserve(Vec::new(), spans.len())?;
+        let mut previous = None;
+        for span in spans {
+            observe(cancellation, observer)?;
+            if previous.is_some_and(|id| id >= span.span_id()) {
+                return Err(TraceStoreFailure::invalid_input());
+            }
+            previous = Some(span.span_id());
+            entries.push(SpanIndexEntry {
+                span_id: span.span_id(),
+                parent_index: None,
+            });
+        }
+        let mut index = Self { entries };
+        for (span_index, span) in spans.iter().enumerate() {
+            observe(cancellation, observer)?;
+            let parent_span_id = representative(span)?.observation().parent_span_id();
+            let parent_index = parent_span_id
+                .map(|parent| index.find(parent, cancellation, observer))
+                .transpose()?
+                .flatten();
+            let entry = index
+                .entries
+                .get_mut(span_index)
+                .ok_or_else(TraceStoreFailure::invalid_input)?;
+            entry.parent_index = parent_index;
+        }
+        Ok(index)
+    }
+
+    fn find(
+        &self,
+        span_id: [u8; 8],
+        cancellation: &dyn ScanCancellation,
+        observer: &dyn ScanObserver,
+    ) -> Result<Option<usize>, TraceStoreFailure> {
+        let mut low = 0_usize;
+        let mut high = self.entries.len();
+        while low < high {
+            observe(cancellation, observer)?;
+            let middle = low
+                .checked_add(high.saturating_sub(low) / 2)
+                .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+            let entry = self
+                .entries
+                .get(middle)
+                .ok_or_else(TraceStoreFailure::invalid_input)?;
+            match entry.span_id.cmp(&span_id) {
+                std::cmp::Ordering::Less => {
+                    low = middle
+                        .checked_add(1)
+                        .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+                },
+                std::cmp::Ordering::Greater => high = middle,
+                std::cmp::Ordering::Equal => return Ok(Some(middle)),
+            }
+        }
+        Ok(None)
+    }
+
+    fn parent_index(&self, index: usize) -> Result<Option<usize>, TraceStoreFailure> {
+        self.entries
+            .get(index)
+            .map(|entry| entry.parent_index)
+            .ok_or_else(TraceStoreFailure::invalid_input)
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum CycleState {
+    Unseen,
+    Visiting,
+    Acyclic,
+    Cycle,
+}
+
 pub(super) fn analyze<'summary>(
     input: StructuralInput<'_, 'summary>,
     cancellation: &dyn ScanCancellation,
@@ -264,6 +356,9 @@ pub(super) fn analyze<'summary>(
             bytes.checked_add(u64::try_from(2 * size_of::<TraceCriticalPathFragment>()).ok()?)
         })
         .and_then(|bytes| bytes.checked_add(u64::try_from(size_of::<CriticalPathFrame>()).ok()?))
+        .and_then(|bytes| bytes.checked_add(u64::try_from(size_of::<SpanIndexEntry>()).ok()?))
+        .and_then(|bytes| bytes.checked_add(u64::try_from(size_of::<CycleState>()).ok()?))
+        .and_then(|bytes| bytes.checked_add(u64::try_from(size_of::<usize>()).ok()?))
         .ok_or_else(TraceStoreFailure::limit_exceeded)?;
     let structural_bytes = count
         .checked_mul(per_span_bytes)
@@ -280,6 +375,8 @@ pub(super) fn analyze<'summary>(
     let mut roots = reserve(Vec::new(), spans.len())?;
     let mut orphans = reserve(Vec::new(), spans.len())?;
     let mut cycles = reserve(Vec::new(), spans.len())?;
+    let index = SpanIndex::build(spans, cancellation, observer)?;
+    let cycle_states = classify_cycles(&index, cancellation, observer)?;
     let mut incompleteness = TraceStructureIncompleteness {
         scan,
         filtered,
@@ -291,7 +388,7 @@ pub(super) fn analyze<'summary>(
         ambiguous_roots: false,
     };
 
-    for (index, span) in spans.iter().enumerate() {
+    for (span_index, span) in spans.iter().enumerate() {
         observe(cancellation, observer)?;
         let observation = representative(span)?;
         let parent_span_id = observation.observation().parent_span_id();
@@ -300,8 +397,8 @@ pub(super) fn analyze<'summary>(
                 roots.push(span.span_id());
                 (TraceParentRelation::Root, None)
             },
-            Some(parent) => match find_span(spans, parent, cancellation, observer)? {
-                Some(index) => (TraceParentRelation::Child, Some(index)),
+            Some(_) => match index.parent_index(span_index)? {
+                Some(parent_index) => (TraceParentRelation::Child, Some(parent_index)),
                 None => {
                     incompleteness.missing_parents = increment(incompleteness.missing_parents)?;
                     orphans.push(span.span_id());
@@ -310,7 +407,9 @@ pub(super) fn analyze<'summary>(
             },
         };
         let cycle_member = relation == TraceParentRelation::Child
-            && is_cycle_member(index, spans, cancellation, observer)?;
+            && cycle_states
+                .get(span_index)
+                .is_some_and(|state| *state == CycleState::Cycle);
         if cycle_member {
             incompleteness.cycle_members = increment(incompleteness.cycle_members)?;
             cycles.push(span.span_id());
@@ -348,7 +447,7 @@ pub(super) fn analyze<'summary>(
     incompleteness.ambiguous_roots = roots.len() > 1;
 
     let critical_path = if incompleteness.complete() {
-        critical_path(spans, &roots, cancellation, observer)?
+        critical_path(spans, &index, &roots, cancellation, observer)?
     } else {
         None
     };
@@ -365,6 +464,7 @@ pub(super) fn analyze<'summary>(
 
 fn critical_path(
     spans: &[LogicalSpan],
+    index: &SpanIndex,
     roots: &[[u8; 8]],
     cancellation: &dyn ScanCancellation,
     observer: &dyn ScanObserver,
@@ -372,7 +472,8 @@ fn critical_path(
     let Some(root_id) = roots.first().copied() else {
         return Ok(None);
     };
-    let root = find_span(spans, root_id, cancellation, observer)?
+    let root = index
+        .find(root_id, cancellation, observer)?
         .ok_or_else(TraceStoreFailure::invalid_input)?;
     let mut fragments = reserve(
         Vec::new(),
@@ -499,49 +600,64 @@ fn append_fragment(
     Ok(())
 }
 
-fn is_cycle_member(
-    origin: usize,
-    spans: &[LogicalSpan],
+fn classify_cycles(
+    index: &SpanIndex,
     cancellation: &dyn ScanCancellation,
     observer: &dyn ScanObserver,
-) -> Result<bool, TraceStoreFailure> {
-    let mut current = Some(origin);
-    for _ in 0..spans.len() {
-        let Some(index) = current else {
-            return Ok(false);
+) -> Result<Vec<CycleState>, TraceStoreFailure> {
+    let mut states = reserve(Vec::new(), index.entries.len())?;
+    let mut trail = reserve(Vec::new(), index.entries.len())?;
+    for _ in &index.entries {
+        states.push(CycleState::Unseen);
+    }
+    for start in 0..index.entries.len() {
+        observe(cancellation, observer)?;
+        if states
+            .get(start)
+            .is_none_or(|state| *state != CycleState::Unseen)
+        {
+            continue;
+        }
+        let mut current = Some(start);
+        let cycle_start = loop {
+            let Some(current_index) = current else {
+                break None;
+            };
+            observe(cancellation, observer)?;
+            let state = *states
+                .get(current_index)
+                .ok_or_else(TraceStoreFailure::invalid_input)?;
+            match state {
+                CycleState::Unseen => {
+                    let slot = states
+                        .get_mut(current_index)
+                        .ok_or_else(TraceStoreFailure::invalid_input)?;
+                    *slot = CycleState::Visiting;
+                    trail.push(current_index);
+                    current = index.parent_index(current_index)?;
+                },
+                CycleState::Visiting => {
+                    break trail
+                        .iter()
+                        .position(|candidate| *candidate == current_index);
+                },
+                CycleState::Acyclic | CycleState::Cycle => break None,
+            }
         };
-        observe(cancellation, observer)?;
-        let parent = representative(
-            spans
-                .get(index)
-                .ok_or_else(TraceStoreFailure::invalid_input)?,
-        )?
-        .observation()
-        .parent_span_id();
-        current = parent
-            .map(|id| find_span(spans, id, cancellation, observer))
-            .transpose()?
-            .flatten();
-        if current == Some(origin) {
-            return Ok(true);
+        for (position, trail_index) in trail.iter().enumerate() {
+            observe(cancellation, observer)?;
+            let state = states
+                .get_mut(*trail_index)
+                .ok_or_else(TraceStoreFailure::invalid_input)?;
+            *state = if cycle_start.is_some_and(|start| position >= start) {
+                CycleState::Cycle
+            } else {
+                CycleState::Acyclic
+            };
         }
+        trail.clear();
     }
-    Ok(false)
-}
-
-fn find_span(
-    spans: &[LogicalSpan],
-    span_id: [u8; 8],
-    cancellation: &dyn ScanCancellation,
-    observer: &dyn ScanObserver,
-) -> Result<Option<usize>, TraceStoreFailure> {
-    for (index, span) in spans.iter().enumerate() {
-        observe(cancellation, observer)?;
-        if span.span_id() == span_id {
-            return Ok(Some(index));
-        }
-    }
-    Ok(None)
+    Ok(states)
 }
 
 fn representative(span: &LogicalSpan) -> Result<&super::ScannedSpanObservation, TraceStoreFailure> {
