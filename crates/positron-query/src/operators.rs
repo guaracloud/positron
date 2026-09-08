@@ -12,10 +12,15 @@ pub(crate) fn execute<'kernel, 'catalog, 'ledger>(
     state: &mut CursorState,
     scanned: positron_signals::LogScanResult<'kernel>,
     predicate_applied: bool,
+    correlation_spans: Option<&[positron_signals::LogicalSpan]>,
     memory: &mut crate::memory::QueryMemory,
 ) -> Result<crate::memory::RecordBuffer, QueryFailure> {
     let operator_count = state.plan.operator_count();
-    let mut records = crate::memory::RecordBuffer::allocate(scanned.records().len(), memory)?;
+    let mut records = crate::memory::RecordBuffer::allocate(
+        scanned.records().len(),
+        state.plan.is_log_to_trace_correlation(),
+        memory,
+    )?;
     let scanned_retained_bytes = scanned.retained_size_bytes();
     let mut transferred_body_bytes = 0_u64;
     for mut record in scanned.into_records() {
@@ -35,13 +40,28 @@ pub(crate) fn execute<'kernel, 'catalog, 'ledger>(
                 ));
             }
         }
-        if let Some(record) = query_record(service, state, &mut record, predicate_applied, memory)?
+        if let Some(materialized) =
+            query_record(service, state, &mut record, predicate_applied, memory)?
         {
+            let (record, correlation) = materialized.into_parts();
+            let correlation = if state.plan.is_log_to_trace_correlation() {
+                let spans = correlation_spans
+                    .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
+                Some(correlation_outcome(
+                    service,
+                    state,
+                    correlation.trace_id(),
+                    correlation.span_id(),
+                    spans,
+                )?)
+            } else {
+                None
+            };
             let dynamic_bytes = record.retained_dynamic_bytes()?;
             transferred_body_bytes = transferred_body_bytes
                 .checked_add(record.body_retained_bytes())
                 .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
-            records.push_acquired(record, dynamic_bytes)?;
+            records.push_acquired(record, dynamic_bytes, correlation)?;
         }
     }
     let released_scan_bytes = if state.plan.transform().is_some() {
@@ -60,15 +80,69 @@ pub(crate) fn execute<'kernel, 'catalog, 'ledger>(
         return aggregate_records(service, state, records, &aggregate, memory);
     }
     check_cancellation(state)?;
-    sort_records(service, state, records.as_mut_slice())?;
+    sort_records(service, state, &mut records)?;
     check_cancellation(state)?;
     Ok(records)
+}
+
+fn correlation_outcome<'kernel, 'catalog, 'ledger>(
+    service: &QueryService<'kernel, 'catalog, 'ledger>,
+    state: &mut CursorState,
+    log_trace_id: Option<[u8; 16]>,
+    log_span_id: Option<[u8; 8]>,
+    spans: &[positron_signals::LogicalSpan],
+) -> Result<crate::CorrelationOutcome, QueryFailure> {
+    let Some(trace_id) = log_trace_id else {
+        return Ok(crate::CorrelationOutcome::MissingLogTraceId);
+    };
+    let mut matched = false;
+    for span in spans {
+        charge_correlation_target_work(service, state)?;
+        if span.trace_id() == trace_id
+            && log_span_id.is_none_or(|span_id| span.span_id() == span_id)
+        {
+            if span.conflicted() {
+                return Ok(crate::CorrelationOutcome::Ambiguous {
+                    trace_id,
+                    span_id: log_span_id,
+                });
+            }
+            matched = true;
+        }
+    }
+    if matched {
+        Ok(crate::CorrelationOutcome::Matched {
+            trace_id,
+            span_id: log_span_id,
+        })
+    } else {
+        Ok(crate::CorrelationOutcome::MissingTraceTarget {
+            trace_id,
+            span_id: log_span_id,
+        })
+    }
+}
+
+fn charge_correlation_target_work<'kernel, 'catalog, 'ledger>(
+    service: &QueryService<'kernel, 'catalog, 'ledger>,
+    state: &mut CursorState,
+) -> Result<(), QueryFailure> {
+    check_cancellation(state)?;
+    let units = service.work_units(QueryWorkStage::Operators)?;
+    check_cancellation(state)?;
+    charge_work(state, units)?;
+    if exhausted(state) {
+        return Err(QueryFailure::budget_exhausted(
+            QueryBudgetDimension::CpuWorkUnits,
+        ));
+    }
+    check_cancellation(state)
 }
 
 fn sort_records<'kernel, 'catalog, 'ledger>(
     service: &QueryService<'kernel, 'catalog, 'ledger>,
     state: &mut CursorState,
-    records: &mut [QueryRecord],
+    records: &mut crate::memory::RecordBuffer,
 ) -> Result<(), QueryFailure> {
     let length = records.len();
     if length < 2 {
@@ -78,7 +152,7 @@ fn sort_records<'kernel, 'catalog, 'ledger>(
         sift_down(service, state, records, root, length)?;
     }
     for end in (1..length).rev() {
-        checked_swap(records, 0, end)?;
+        records.swap(0, end)?;
         sift_down(service, state, records, 0, end)?;
     }
     Ok(())
@@ -87,7 +161,7 @@ fn sort_records<'kernel, 'catalog, 'ledger>(
 fn sift_down<'kernel, 'catalog, 'ledger>(
     service: &QueryService<'kernel, 'catalog, 'ledger>,
     state: &mut CursorState,
-    records: &mut [QueryRecord],
+    records: &mut crate::memory::RecordBuffer,
     mut root: usize,
     end: usize,
 ) -> Result<(), QueryFailure> {
@@ -102,6 +176,7 @@ fn sift_down<'kernel, 'catalog, 'ledger>(
             .checked_add(1)
             .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
         let left_record = records
+            .as_slice()
             .get(left_child)
             .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
         let greater_child = if right_child < end
@@ -110,6 +185,7 @@ fn sift_down<'kernel, 'catalog, 'ledger>(
                 state,
                 left_record,
                 records
+                    .as_slice()
                     .get(right_child)
                     .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?,
             )? == Ordering::Less
@@ -122,16 +198,18 @@ fn sift_down<'kernel, 'catalog, 'ledger>(
             service,
             state,
             records
+                .as_slice()
                 .get(root)
                 .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?,
             records
+                .as_slice()
                 .get(greater_child)
                 .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?,
         )? != Ordering::Less
         {
             return Ok(());
         }
-        checked_swap(records, root, greater_child)?;
+        records.swap(root, greater_child)?;
         root = greater_child;
     }
 }
@@ -153,18 +231,6 @@ fn compare_with_work<'kernel, 'catalog, 'ledger>(
     }
     check_cancellation(state)?;
     Ok(compare_records(left, right, state.plan.ordering()))
-}
-
-fn checked_swap(
-    records: &mut [QueryRecord],
-    left: usize,
-    right: usize,
-) -> Result<(), QueryFailure> {
-    if left >= records.len() || right >= records.len() {
-        return Err(QueryFailure::new(QueryFailureCode::Internal));
-    }
-    records.swap(left, right);
-    Ok(())
 }
 
 fn check_cancellation(state: &CursorState) -> Result<(), QueryFailure> {

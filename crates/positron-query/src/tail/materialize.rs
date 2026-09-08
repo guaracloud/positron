@@ -289,6 +289,7 @@ impl TailSession<'_, '_, '_, '_> {
                     },
                 };
             if let Some(record) = record {
+                let record = record.into_record();
                 transferred_body_bytes = transferred_body_bytes
                     .checked_add(record.body_retained_bytes())
                     .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;

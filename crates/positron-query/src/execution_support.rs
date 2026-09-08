@@ -14,7 +14,9 @@ pub(crate) use accounting::{
     limiting_budget, output_bytes_for_records, preserve_output_attempt,
 };
 pub(crate) use digest::{BatchDigestInput, batch_digest, result_digest};
-pub(crate) use failure::{map_domain_value_failure, map_ledger_failure, map_store_failure};
+pub(crate) use failure::{
+    map_domain_value_failure, map_ledger_failure, map_store_failure, map_trace_store_failure,
+};
 pub(crate) use grouping::aggregate_records;
 pub(crate) use materialize::query_record;
 pub(crate) use ordering::compare_records;

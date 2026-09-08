@@ -1,5 +1,7 @@
 use crate::cursor::CursorState;
-use crate::{QueryBudgetDimension, QueryFailure, QueryFailureCode, QueryRecord};
+use crate::{
+    CorrelationOutcome, QueryBudgetDimension, QueryFailure, QueryFailureCode, QueryRecord,
+};
 
 pub(crate) fn charge_work(
     state: &mut CursorState,
@@ -26,8 +28,8 @@ pub(crate) fn charge_output(
     service: &crate::QueryService<'_, '_, '_>,
     state: &mut CursorState,
     page: &[QueryRecord],
+    correlations: Option<&[CorrelationOutcome]>,
     cancellation: &crate::QueryCancellation,
-    logical_delivery: bool,
 ) -> Result<(), QueryFailure> {
     let rows = u64::try_from(page.len())
         .map_err(|_| QueryFailure::budget_exhausted(QueryBudgetDimension::OutputRows))?;
@@ -35,14 +37,13 @@ pub(crate) fn charge_output(
         .physical_output_rows
         .checked_add(rows)
         .ok_or_else(|| QueryFailure::budget_exhausted(QueryBudgetDimension::OutputRows))?;
-    if logical_delivery {
-        state.output_rows = state
-            .output_rows
-            .checked_add(rows)
-            .ok_or_else(|| QueryFailure::budget_exhausted(QueryBudgetDimension::OutputRows))?;
-    }
+    state.output_rows = state
+        .output_rows
+        .checked_add(rows)
+        .ok_or_else(|| QueryFailure::budget_exhausted(QueryBudgetDimension::OutputRows))?;
     let mut page_bytes = 0_u64;
-    for record in page {
+    validate_correlations(page, correlations)?;
+    for (index, record) in page.iter().enumerate() {
         let mut observer = super::QueryValueObserver::new(
             service,
             &mut state.physical_cpu_work_units,
@@ -50,20 +51,22 @@ pub(crate) fn charge_output(
             cancellation.clone(),
             crate::QueryWorkStage::Output,
         );
+        let correlation_bytes = correlations
+            .and_then(|outcomes| outcomes.get(index))
+            .map_or(0, |outcome| correlation_emitted_size_bytes(*outcome));
         page_bytes = page_bytes
             .checked_add(record_emitted_size_bytes(record, &mut observer)?)
+            .and_then(|bytes| bytes.checked_add(correlation_bytes))
             .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
     }
     state.physical_output_bytes = state
         .physical_output_bytes
         .checked_add(page_bytes)
         .ok_or_else(|| QueryFailure::budget_exhausted(QueryBudgetDimension::OutputBytes))?;
-    if logical_delivery {
-        state.output_bytes = state
-            .output_bytes
-            .checked_add(page_bytes)
-            .ok_or_else(|| QueryFailure::budget_exhausted(QueryBudgetDimension::OutputBytes))?;
-    }
+    state.output_bytes = state
+        .output_bytes
+        .checked_add(page_bytes)
+        .ok_or_else(|| QueryFailure::budget_exhausted(QueryBudgetDimension::OutputBytes))?;
     Ok(())
 }
 
@@ -82,12 +85,14 @@ pub(crate) fn preserve_output_attempt(state: &mut CursorState, output_state: &Cu
 pub(crate) fn output_bytes_for_records(
     service: &crate::QueryService<'_, '_, '_>,
     records: &[QueryRecord],
+    correlations: Option<&[CorrelationOutcome]>,
     cpu_work_units: &mut u64,
     cpu_work_limit: u64,
     cancellation: &crate::QueryCancellation,
 ) -> Result<u64, QueryFailure> {
     let mut output_bytes = 0_u64;
-    for record in records {
+    validate_correlations(records, correlations)?;
+    for (index, record) in records.iter().enumerate() {
         let mut observer = super::QueryValueObserver::new(
             service,
             cpu_work_units,
@@ -95,11 +100,35 @@ pub(crate) fn output_bytes_for_records(
             cancellation.clone(),
             crate::QueryWorkStage::Output,
         );
+        let correlation_bytes = correlations
+            .and_then(|outcomes| outcomes.get(index))
+            .map_or(0, |outcome| correlation_emitted_size_bytes(*outcome));
         output_bytes = output_bytes
             .checked_add(record_emitted_size_bytes(record, &mut observer)?)
+            .and_then(|bytes| bytes.checked_add(correlation_bytes))
             .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
     }
     Ok(output_bytes)
+}
+
+fn validate_correlations(
+    records: &[QueryRecord],
+    correlations: Option<&[CorrelationOutcome]>,
+) -> Result<(), QueryFailure> {
+    if correlations.is_none_or(|outcomes| outcomes.len() == records.len()) {
+        Ok(())
+    } else {
+        Err(QueryFailure::new(QueryFailureCode::Internal))
+    }
+}
+
+fn correlation_emitted_size_bytes(outcome: CorrelationOutcome) -> u64 {
+    match outcome {
+        CorrelationOutcome::MissingLogTraceId => 1,
+        CorrelationOutcome::MissingTraceTarget { span_id, .. }
+        | CorrelationOutcome::Matched { span_id, .. }
+        | CorrelationOutcome::Ambiguous { span_id, .. } => 18 + u64::from(span_id.is_some()) * 8,
+    }
 }
 
 fn record_emitted_size_bytes(
@@ -222,6 +251,10 @@ mod tests {
             sequence: 0,
             prior_digest: [0; 32],
             lease_identity: [5; 16],
+            trace_catalog_identity: None,
+            trace_catalog_generation: None,
+            trace_frontier: None,
+            trace_lease_identity: None,
             expiry: 10,
             budget: QueryBudget::new(10, 10, 10, 10, 10, 10).expect("test budget"),
             scanned_bytes: 0,

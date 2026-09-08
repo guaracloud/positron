@@ -889,7 +889,7 @@ fn resume_clock_failure_is_reported_before_lease_reacquisition() -> Result<(), B
 fn authenticated_cursor_semantics_versions_and_domain_are_fail_closed() -> Result<(), Box<dyn Error>>
 {
     let fixture = CursorFixture::new()?;
-    assert_eq!(fixture.cursor.as_bytes().len(), 4545);
+    assert_eq!(fixture.cursor.as_bytes().len(), 4610);
     for (label, rewrite) in [
         (
             "magic",
@@ -1116,7 +1116,7 @@ fn rewritten_existing_cursor(
     purpose: &[u8],
 ) -> Result<QueryCursor, Box<dyn Error>> {
     let purpose = if purpose == b"query-cursor-v4" {
-        b"query-cursor-v5".as_slice()
+        b"query-cursor-v6".as_slice()
     } else {
         purpose
     };
@@ -1137,6 +1137,38 @@ fn legacy_cursor(fixture: &CursorFixture) -> Result<QueryCursor, Box<dyn Error>>
     let initial = protector.authenticate_query_cursor(b"query-cursor-v1", &payload)?;
     payload[8..16].copy_from_slice(&initial.epoch().to_be_bytes());
     let authentication = protector.authenticate_query_cursor(b"query-cursor-v1", &payload)?;
+    payload.extend_from_slice(&authentication.tag());
+    Ok(QueryCursor::from_bytes(&payload)?)
+}
+
+fn v5_cursor(fixture: &CursorFixture) -> Result<QueryCursor, Box<dyn Error>> {
+    let cursor_bytes = fixture.cursor.as_bytes();
+    let payload_bytes = cursor_bytes
+        .len()
+        .checked_sub(32)
+        .ok_or("v6 cursor is shorter than its pair binding")?;
+    let mut payload = cursor_bytes
+        .get(..payload_bytes)
+        .ok_or("v6 cursor omitted its payload")?
+        .to_vec();
+    let versions = payload.split_off(
+        payload
+            .len()
+            .checked_sub(2)
+            .ok_or("v6 cursor omitted its versions")?,
+    );
+    payload.truncate(
+        payload
+            .len()
+            .checked_sub(65)
+            .ok_or("v6 cursor omitted its pair binding")?,
+    );
+    payload.extend_from_slice(&versions);
+    payload[..8].copy_from_slice(b"POSQCR05");
+    let protector = fixture.kernel.ledger()?.control_tokens();
+    let initial = protector.authenticate_query_cursor(b"query-cursor-v5", &payload)?;
+    payload[8..16].copy_from_slice(&initial.epoch().to_be_bytes());
+    let authentication = protector.authenticate_query_cursor(b"query-cursor-v5", &payload)?;
     payload.extend_from_slice(&authentication.tag());
     Ok(QueryCursor::from_bytes(&payload)?)
 }
@@ -1192,6 +1224,73 @@ fn previous_current_cursor_wire_is_rejected_without_downgrade() -> Result<(), Bo
     Ok(())
 }
 
+#[test]
+fn authenticated_v5_cursor_resumes_the_unchanged_normal_plan() -> Result<(), Box<dyn Error>> {
+    let fixture = CursorFixture::new()?;
+    let cursor = v5_cursor(&fixture)?;
+
+    let events = fixture
+        .service()
+        .resume(fixture.context, &cursor)?
+        .collect::<Vec<_>>();
+    assert_eq!(bodies(&events), vec!["second"]);
+    assert!(matches!(
+        events.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Complete(_)))
+    ));
+    Ok(())
+}
+
+#[test]
+fn authenticated_v5_cursor_rejects_source_bytes_without_a_declared_language()
+-> Result<(), Box<dyn Error>> {
+    let fixture = CursorFixture::new()?;
+    let baseline = fixture.kernel.authority.governor().inspect()?;
+    let cursor = rewritten_v5_cursor(&fixture, |payload| {
+        let source_language_offset = 348;
+        payload[source_language_offset] = 0;
+    })?;
+
+    assert_eq!(
+        fixture
+            .service()
+            .resume(fixture.context, &cursor)
+            .expect_err("an authenticated v5 source requires its declared language")
+            .code(),
+        QueryFailureCode::InvalidCursor
+    );
+    assert_eq!(fixture.kernel.authority.governor().inspect()?, baseline);
+    Ok(())
+}
+
+#[test]
+fn authenticated_v5_cursor_rejects_invalid_declared_source_metadata_before_admission()
+-> Result<(), Box<dyn Error>> {
+    let fixture = CursorFixture::new()?;
+    let baseline = fixture.kernel.authority.governor().inspect()?;
+    for (label, rewrite) in [
+        (
+            "unknown source language",
+            (|payload: &mut Vec<u8>| payload[348] = 3) as fn(&mut Vec<u8>),
+        ),
+        ("source longer than the wire bound", |payload| {
+            payload[349..351].copy_from_slice(&4_097_u16.to_be_bytes())
+        }),
+    ] {
+        let cursor = rewritten_v5_cursor(&fixture, rewrite)?;
+        assert_eq!(
+            fixture
+                .service()
+                .resume(fixture.context, &cursor)
+                .expect_err(label)
+                .code(),
+            QueryFailureCode::InvalidCursor
+        );
+        assert_eq!(fixture.kernel.authority.governor().inspect()?, baseline);
+    }
+    Ok(())
+}
+
 fn rewritten_source_cursor(
     fixture: &CursorFixture,
     cursor: &QueryCursor,
@@ -1213,6 +1312,21 @@ fn rewritten_source_cursor(
         .control_tokens()
         .digest_query_cursor(b"query-plan-source-v1", &encoding)?;
     payload[123..155].copy_from_slice(&digest);
+    let protector = fixture.kernel.ledger()?.control_tokens();
+    let initial = protector.authenticate_query_cursor(b"query-cursor-v6", &payload)?;
+    payload[8..16].copy_from_slice(&initial.epoch().to_be_bytes());
+    let authentication = protector.authenticate_query_cursor(b"query-cursor-v6", &payload)?;
+    payload.extend_from_slice(&authentication.tag());
+    Ok(QueryCursor::from_bytes(&payload)?)
+}
+
+fn rewritten_v5_cursor(
+    fixture: &CursorFixture,
+    rewrite: impl FnOnce(&mut Vec<u8>),
+) -> Result<QueryCursor, Box<dyn Error>> {
+    let cursor = v5_cursor(fixture)?;
+    let mut payload = cursor.as_bytes()[..cursor.as_bytes().len() - 32].to_vec();
+    rewrite(&mut payload);
     let protector = fixture.kernel.ledger()?.control_tokens();
     let initial = protector.authenticate_query_cursor(b"query-cursor-v5", &payload)?;
     payload[8..16].copy_from_slice(&initial.epoch().to_be_bytes());

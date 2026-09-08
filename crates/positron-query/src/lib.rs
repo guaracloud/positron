@@ -45,8 +45,9 @@ pub use runtime::{
     QueryClock, QueryClockFailure, QueryWorkFailure, QueryWorkMeter, QueryWorkStage,
 };
 pub use stream::{
-    QueryBatch, QueryEvent, QueryHeader, QueryIncomplete, QueryRecord, QueryStats, QueryTerminal,
-    ResultLease, ResultOrdering, ResultSchema, ResultSnapshot, ResultValueType, TailPhase,
+    CorrelationOutcome, CorrelationSnapshot, QueryBatch, QueryEvent, QueryHeader, QueryIncomplete,
+    QueryRecord, QueryStats, QueryTerminal, ResultLease, ResultOrdering, ResultSchema,
+    ResultSnapshot, ResultValueType, TailPhase,
 };
 pub use stream_lifecycle::QueryStream;
 pub use tail::{
@@ -92,19 +93,17 @@ pub fn fuzz_query_cursor(data: &[u8]) {
         .expect("fuzz tenant fixture is valid");
     let principal = positron_domain::identity::PrincipalId::from_bytes([1; 16])
         .expect("fuzz principal fixture is valid");
-    let range = TemporalRange::new(-100, 100).expect("fuzz range is ordered");
-    let plan = LogicalPlan::logs(TemporalAxis::QueryTime, range, 1);
     let source = b"pipeline:v1 logs | range query_time -100 100 | limit 1";
     let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 16_384, 60)
         .expect("fuzz budget is valid")
         .with_cpu_work_units(1_024)
         .expect("fuzz CPU budget is valid");
-    let parsed_plan = service::parse_pipeline(
+    let plan = service::parse_pipeline(
         std::str::from_utf8(source).expect("fixture source is UTF-8"),
         &planning_memory::PlanningMemory::new(budget.memory_bytes()),
     )
     .expect("fixture source parses");
-    let plan_digest = parsed_plan
+    let plan_digest = plan
         .canonical_digest(&protector)
         .expect("fixture plan digest is bounded");
     let state = cursor::CursorState {
@@ -122,6 +121,10 @@ pub fn fuzz_query_cursor(data: &[u8]) {
         sequence: 0,
         prior_digest: [0; 32],
         lease_identity: [4; 16],
+        trace_catalog_identity: None,
+        trace_catalog_generation: None,
+        trace_frontier: None,
+        trace_lease_identity: None,
         expiry: 60,
         budget,
         scanned_bytes: 0,
@@ -145,7 +148,8 @@ pub fn fuzz_query_cursor(data: &[u8]) {
         repeated_batch_count: 0,
         cancellation: QueryCancellation::new(),
     };
-    let canonical = cursor::encode(&protector, state).expect("fuzz cursor fixture is valid");
+    let canonical =
+        cursor::encode(&protector, state.clone()).expect("fuzz cursor fixture is valid");
     let decoded = cursor::decode(&protector, &canonical).expect("fixture must authenticate");
     assert_eq!(decoded.principal, principal);
     assert_eq!(decoded.tenant, tenant);
@@ -183,9 +187,35 @@ pub fn fuzz_query_cursor(data: &[u8]) {
         .expect("decoded plan digest is bounded");
     assert_eq!(decoded_digest, decoded.plan_digest);
 
+    let paired_source = b"pipeline:v1 logs | range query_time -100 100 | correlate trace | limit 1";
+    let paired_plan = service::parse_pipeline(
+        std::str::from_utf8(paired_source).expect("paired fixture source is UTF-8"),
+        &planning_memory::PlanningMemory::new(budget.memory_bytes()),
+    )
+    .expect("paired fixture source parses");
+    let mut paired_state = state;
+    paired_state.plan = std::sync::Arc::new(paired_plan);
+    paired_state.source = Some(std::sync::Arc::from(
+        paired_source.to_vec().into_boxed_slice(),
+    ));
+    paired_state.plan_digest = paired_state
+        .plan
+        .canonical_digest(&protector)
+        .expect("paired fixture plan digest is bounded");
+    paired_state.trace_catalog_identity = Some([5; 32]);
+    paired_state.trace_catalog_generation = Some(9);
+    paired_state.trace_frontier = Some(2);
+    paired_state.trace_lease_identity = Some([6; 16]);
+    let paired = cursor::encode(&protector, paired_state).expect("paired fuzz cursor is valid");
+    let paired_decoded = cursor::decode(&protector, &paired).expect("paired cursor authenticates");
+    assert_eq!(paired_decoded.trace_catalog_identity, Some([5; 32]));
+    assert_eq!(paired_decoded.trace_catalog_generation, Some(9));
+    assert_eq!(paired_decoded.trace_frontier, Some(2));
+    assert_eq!(paired_decoded.trace_lease_identity, Some([6; 16]));
+
     if !data.is_empty() {
-        let mut variant = canonical.as_bytes().to_vec();
-        const MUTATION_OFFSETS: [usize; 26] = [
+        let mut variant = paired.as_bytes().to_vec();
+        const MUTATION_OFFSETS: [usize; 31] = [
             16,
             32,
             48,
@@ -210,6 +240,11 @@ pub fn fuzz_query_cursor(data: &[u8]) {
             347,
             348,
             349,
+            cursor::CURRENT_PAIR_BINDING_START,
+            cursor::CURRENT_PAIR_BINDING_START + 1,
+            cursor::CURRENT_PAIR_BINDING_START + 33,
+            cursor::CURRENT_PAIR_BINDING_START + 41,
+            cursor::CURRENT_PAIR_BINDING_START + 49,
             cursor::CURRENT_VERSION_START,
             cursor::CURRENT_VERSION_START + 1,
         ];
@@ -247,6 +282,17 @@ pub fn fuzz_query_cursor(data: &[u8]) {
                 );
                 let _ = execution_state::commit_position(state.frontier);
                 let _ = state.expiry.checked_sub(state.started_at);
+                assert!(
+                    [
+                        state.trace_catalog_identity.is_some(),
+                        state.trace_catalog_generation.is_some(),
+                        state.trace_frontier.is_some(),
+                        state.trace_lease_identity.is_some(),
+                    ]
+                    .windows(2)
+                    .all(|pair| pair[0] == pair[1]),
+                    "paired cursor binding must remain all-present or all-absent"
+                );
             }
         }
     }

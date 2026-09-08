@@ -13,11 +13,48 @@ use super::resources::ExecutionResources;
 const MAX_RESUME_CATALOG_RETRIES: u8 = 1;
 
 impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
+    fn fail_after_source_lease(
+        &self,
+        source_lease: SnapshotLeaseId,
+        primary: QueryFailure,
+    ) -> QueryFailure {
+        match self.ledger.release_snapshot_lease(source_lease) {
+            Ok(()) => primary,
+            Err(cleanup) => crate::failure::stronger_failure(primary, map_ledger_failure(cleanup)),
+        }
+    }
+
+    fn fail_after_unresumed_target_lease(
+        &self,
+        state: &cursor::CursorState,
+        primary: QueryFailure,
+    ) -> QueryFailure {
+        if !state.plan.is_log_to_trace_correlation() {
+            return primary;
+        }
+        let (Some(identity), Some(ledger)) = (state.trace_lease_identity, self.trace_ledger) else {
+            return primary;
+        };
+        if ledger.scope().tenant_id() != state.tenant
+            || ledger.scope().signal_kind() != positron_domain::routing::SignalKind::Traces
+        {
+            return primary;
+        }
+        let Ok(identity) = SnapshotLeaseId::new(identity) else {
+            return primary;
+        };
+        match ledger.release_snapshot_lease(identity) {
+            Ok(()) => primary,
+            Err(cleanup) => crate::failure::stronger_failure(primary, map_ledger_failure(cleanup)),
+        }
+    }
+
     pub fn execute(
         &self,
         query: PlannedQuery<'kernel>,
     ) -> Result<QueryStream<'ledger>, QueryFailure> {
-        self.execute_inner(query, None)
+        let batch_limit = query.plan.limit();
+        self.execute_inner(query, batch_limit, false, None)
     }
 
     /// Executes against one immutable tenant schema view. The view is used
@@ -27,20 +64,33 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         query: PlannedQuery<'kernel>,
         schema: &positron_signals::SchemaCatalog,
     ) -> Result<QueryStream<'ledger>, QueryFailure> {
-        self.execute_inner(query, Some(schema))
+        let batch_limit = query.plan.limit();
+        self.execute_inner(query, batch_limit, false, Some(schema))
     }
 
     fn execute_inner(
         &self,
         query: PlannedQuery<'kernel>,
+        batch_limit: u16,
+        pagination: bool,
         schema: Option<&positron_signals::SchemaCatalog>,
     ) -> Result<QueryStream<'ledger>, QueryFailure> {
+        // Correlation has two authenticated Signal Store sources. Until the
+        // paired-store path admits both snapshots, it must never degrade into
+        // the ordinary Log Store executor and present log-only rows as a
+        // correlation result.
+        if query.plan.is_log_to_trace_correlation() && self.trace_ledger.is_none() {
+            return Err(QueryFailure::new(QueryFailureCode::StoreUnavailable));
+        }
         let (tenant, catalog_identity, _) = self.current_query_catalog(query.context)?;
         if query.cancellation.is_cancelled() {
             return Err(QueryFailure::new(QueryFailureCode::Cancelled));
         }
         if !query.plan.has_total_limit() {
             return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
+        }
+        if pagination && batch_limit == 0 {
+            return Err(QueryFailure::new(QueryFailureCode::InvalidBudget));
         }
         let now = self.observe_planned(&query)?;
         let expiry = query
@@ -52,8 +102,22 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 crate::QueryBudgetDimension::WallSeconds,
             ));
         }
+        let trace_ledger = if query.plan.is_log_to_trace_correlation() {
+            let trace_ledger = self
+                .trace_ledger
+                .ok_or_else(|| QueryFailure::new(QueryFailureCode::StoreUnavailable))?;
+            if trace_ledger.scope().tenant_id() != tenant {
+                return Err(QueryFailure::new(QueryFailureCode::Unauthorized));
+            }
+            if trace_ledger.scope().signal_kind() != positron_domain::routing::SignalKind::Traces {
+                return Err(QueryFailure::new(QueryFailureCode::MalformedPersistentData));
+            }
+            Some(trace_ledger)
+        } else {
+            None
+        };
         // PlannedQuery still owns its admitted CPU reservation while the
-        // immutable lease snapshot is constructed.
+        // separately scoped immutable source snapshots are constructed.
         let lease = self
             .ledger
             .create_snapshot_lease_for_at_catalog(
@@ -62,58 +126,68 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 catalog_identity,
             )
             .map_err(map_ledger_failure)?;
-        let (state, reservation) =
+        let trace_lease = match trace_ledger {
+            Some(trace_ledger) => {
+                let (reauthorized_tenant, trace_catalog_identity, _) =
+                    match self.current_query_catalog(query.context) {
+                        Ok(current) => current,
+                        Err(failure) => {
+                            return Err(self.fail_after_source_lease(lease.identity(), failure));
+                        },
+                    };
+                if reauthorized_tenant != tenant {
+                    let failure = QueryFailure::new(QueryFailureCode::AuthorizationChanged);
+                    return Err(self.fail_after_source_lease(lease.identity(), failure));
+                }
+                match trace_ledger.create_snapshot_lease_for_at_catalog(
+                    now,
+                    remaining_ttl(now, expiry)?,
+                    trace_catalog_identity,
+                ) {
+                    Ok(lease) => Some(lease),
+                    Err(failure) => {
+                        let primary = map_ledger_failure(failure);
+                        return Err(self.fail_after_source_lease(lease.identity(), primary));
+                    },
+                }
+            },
+            None => None,
+        };
+        let (mut state, reservation) =
             initial_state(query, lease.snapshot(), tenant, expiry, lease.identity());
-        let limit = state.plan.limit();
-        let resources = ExecutionResources::new(reservation, lease.identity(), lease.usage());
-        self.run_page(state, lease.snapshot(), limit, false, schema, resources)
+        if let Some(trace_lease) = trace_lease.as_ref() {
+            state.trace_catalog_identity =
+                Some(trace_lease.snapshot().catalog_identity().to_bytes());
+            state.trace_catalog_generation = Some(trace_lease.snapshot().catalog_generation());
+            state.trace_frontier = Some(trace_lease.snapshot().frontier().value());
+            state.trace_lease_identity = Some(trace_lease.identity().to_bytes());
+        }
+        let resources = match trace_lease.as_ref() {
+            Some(trace_lease) => {
+                ExecutionResources::new(reservation, lease.identity(), lease.usage())
+                    .with_target_lease(trace_lease.identity(), trace_lease.usage())
+            },
+            None => ExecutionResources::new(reservation, lease.identity(), lease.usage()),
+        };
+        self.run_page(
+            state,
+            lease.snapshot(),
+            super::page::PageInput {
+                trace_snapshot: trace_lease.as_ref().map(|lease| lease.snapshot()),
+                trace_lease: trace_lease.as_ref().map(|lease| lease.identity()),
+                batch_limit,
+                pagination,
+                schema,
+            },
+            resources,
+        )
     }
 
     pub fn execute_page(
         &self,
         query: PlannedQuery<'kernel>,
     ) -> Result<QueryStream<'ledger>, QueryFailure> {
-        let (tenant, catalog_identity, _) = self.current_query_catalog(query.context)?;
-        if query.cancellation.is_cancelled() {
-            return Err(QueryFailure::new(QueryFailureCode::Cancelled));
-        }
-        if !query.plan.has_total_limit() {
-            return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
-        }
-        if self.batch_limit == 0 {
-            return Err(QueryFailure::new(QueryFailureCode::InvalidBudget));
-        }
-        let now_seconds = self.observe_planned(&query)?;
-        let expiry = query
-            .started_at
-            .checked_add(query.budget.wall_seconds())
-            .ok_or_else(|| QueryFailure::new(QueryFailureCode::InvalidBudget))?;
-        if now_seconds >= expiry {
-            return Err(QueryFailure::budget_exhausted(
-                crate::QueryBudgetDimension::WallSeconds,
-            ));
-        }
-        // PlannedQuery still owns its admitted CPU reservation while the
-        // immutable lease snapshot is constructed.
-        let lease = self
-            .ledger
-            .create_snapshot_lease_for_at_catalog(
-                now_seconds,
-                remaining_ttl(now_seconds, expiry)?,
-                catalog_identity,
-            )
-            .map_err(map_ledger_failure)?;
-        let (state, reservation) =
-            initial_state(query, lease.snapshot(), tenant, expiry, lease.identity());
-        let resources = ExecutionResources::new(reservation, lease.identity(), lease.usage());
-        self.run_page(
-            state,
-            lease.snapshot(),
-            self.batch_limit,
-            true,
-            None,
-            resources,
-        )
+        self.execute_inner(query, self.batch_limit, true, None)
     }
 
     pub fn resume(
@@ -200,37 +274,207 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         let source_length = match cursor::source_length(cursor) {
             Ok(length) => length,
             Err(failure) => {
-                return Err(resources.fail_during_resume_planning(self.ledger, &state, failure));
+                return Err(resources.fail_during_resume_planning(
+                    self.ledger,
+                    self.trace_ledger,
+                    &state,
+                    failure,
+                ));
             },
         };
         let source_reservation = match planning_memory.reserve(source_length) {
             Ok(reservation) => reservation,
             Err(failure) => {
-                return Err(resources.fail_during_resume_planning(self.ledger, &state, failure));
+                return Err(resources.fail_during_resume_planning(
+                    self.ledger,
+                    self.trace_ledger,
+                    &state,
+                    failure,
+                ));
             },
         };
         let decoded = match cursor::decode(&self.ledger.control_tokens(), cursor) {
             Ok(decoded) => decoded,
             Err(failure) => {
-                return Err(resources.fail_during_resume_planning(self.ledger, &state, failure));
+                return Err(resources.fail_during_resume_planning(
+                    self.ledger,
+                    self.trace_ledger,
+                    &state,
+                    failure,
+                ));
             },
         };
         state.source = decoded.source;
         state.language = decoded.language;
         if let Err(failure) = self.reconstruct_plan(&mut state, &planning_memory) {
-            return Err(resources.fail_during_resume_planning(self.ledger, &state, failure));
+            return Err(resources.fail_during_resume_planning(
+                self.ledger,
+                self.trace_ledger,
+                &state,
+                failure,
+            ));
         }
         drop(source_reservation);
         if lease.snapshot().catalog_identity().to_bytes() != state.catalog_identity
             || lease.snapshot().catalog_generation() != state.catalog_generation
             || lease.snapshot().frontier().value() != state.frontier
         {
-            return Err(resources.fail_before_stream(
-                self.ledger,
+            let primary = self.fail_after_unresumed_target_lease(
                 &state,
                 QueryFailure::new(QueryFailureCode::InvalidCursor),
+            );
+            return Err(resources.fail_before_stream(
+                self.ledger,
+                self.trace_ledger,
+                &state,
+                primary,
             ));
         }
+        let (trace_snapshot, trace_lease_identity, resources) = if state
+            .plan
+            .is_log_to_trace_correlation()
+        {
+            let (
+                Some(trace_catalog_identity),
+                Some(trace_catalog_generation),
+                Some(trace_frontier),
+                Some(trace_lease_identity),
+            ) = (
+                state.trace_catalog_identity,
+                state.trace_catalog_generation,
+                state.trace_frontier,
+                state.trace_lease_identity,
+            )
+            else {
+                return Err(resources.fail_before_stream(
+                    self.ledger,
+                    self.trace_ledger,
+                    &state,
+                    QueryFailure::new(QueryFailureCode::InvalidCursor),
+                ));
+            };
+            let trace_ledger = match self.trace_ledger {
+                Some(ledger)
+                    if ledger.scope().tenant_id() == tenant
+                        && ledger.scope().signal_kind()
+                            == positron_domain::routing::SignalKind::Traces =>
+                {
+                    ledger
+                },
+                Some(_) => {
+                    return Err(resources.fail_before_stream(
+                        self.ledger,
+                        self.trace_ledger,
+                        &state,
+                        QueryFailure::new(QueryFailureCode::Unauthorized),
+                    ));
+                },
+                None => {
+                    return Err(resources.fail_before_stream(
+                        self.ledger,
+                        None,
+                        &state,
+                        QueryFailure::new(QueryFailureCode::StoreUnavailable),
+                    ));
+                },
+            };
+            let (_, target_catalog_identity, target_catalog_generation) =
+                match self.current_query_catalog(context) {
+                    Ok(current) => current,
+                    Err(failure) => {
+                        return Err(resources.fail_before_stream(
+                            self.ledger,
+                            self.trace_ledger,
+                            &state,
+                            failure,
+                        ));
+                    },
+                };
+            let target_lease_id = match SnapshotLeaseId::new(trace_lease_identity) {
+                Ok(identity) => identity,
+                Err(_) => {
+                    return Err(resources.fail_before_stream(
+                        self.ledger,
+                        self.trace_ledger,
+                        &state,
+                        QueryFailure::new(QueryFailureCode::InvalidCursor),
+                    ));
+                },
+            };
+            let mut target_lease = match trace_ledger.resume_snapshot_lease_with_marker_at_catalog(
+                target_lease_id,
+                now_seconds,
+                state.sequence,
+                state.prior_digest,
+                target_catalog_identity,
+                target_catalog_generation,
+            ) {
+                Ok(lease) => lease,
+                Err(failure) => {
+                    return Err(resources.fail_before_stream(
+                        self.ledger,
+                        self.trace_ledger,
+                        &state,
+                        map_ledger_failure(failure),
+                    ));
+                },
+            };
+            if target_lease.snapshot().catalog_identity().to_bytes() != trace_catalog_identity
+                || target_lease.snapshot().catalog_generation() != trace_catalog_generation
+                || target_lease.snapshot().frontier().value() != trace_frontier
+            {
+                let primary = match trace_ledger.release_snapshot_lease(target_lease.identity()) {
+                    Ok(()) => QueryFailure::new(QueryFailureCode::InvalidCursor),
+                    Err(failure) => crate::failure::stronger_failure(
+                        QueryFailure::new(QueryFailureCode::InvalidCursor),
+                        map_ledger_failure(failure),
+                    ),
+                };
+                return Err(resources.fail_before_stream(
+                    self.ledger,
+                    self.trace_ledger,
+                    &state,
+                    primary,
+                ));
+            }
+            let target_attempt = match target_lease.take_attempt() {
+                Some(attempt) => attempt,
+                None => {
+                    let primary = match trace_ledger.release_snapshot_lease(target_lease.identity())
+                    {
+                        Ok(()) => QueryFailure::new(QueryFailureCode::Internal),
+                        Err(failure) => crate::failure::stronger_failure(
+                            QueryFailure::new(QueryFailureCode::Internal),
+                            map_ledger_failure(failure),
+                        ),
+                    };
+                    return Err(resources.fail_before_stream(
+                        self.ledger,
+                        self.trace_ledger,
+                        &state,
+                        primary,
+                    ));
+                },
+            };
+            let identity = target_lease.identity();
+            let resources =
+                resources.with_target_attempt(identity, target_lease.usage(), target_attempt);
+            (Some(target_lease), Some(identity), resources)
+        } else {
+            if state.trace_catalog_identity.is_some()
+                || state.trace_catalog_generation.is_some()
+                || state.trace_frontier.is_some()
+                || state.trace_lease_identity.is_some()
+            {
+                return Err(resources.fail_before_stream(
+                    self.ledger,
+                    self.trace_ledger,
+                    &state,
+                    QueryFailure::new(QueryFailureCode::InvalidCursor),
+                ));
+            }
+            (None, None, resources)
+        };
         let mut state = state;
         state.resume_count = lease.resume_count();
         state.repeated_batch_count = lease.repeated_batch_count();
@@ -238,9 +482,13 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         self.run_page(
             state,
             lease.snapshot(),
-            self.batch_limit,
-            true,
-            None,
+            super::page::PageInput {
+                trace_snapshot: trace_snapshot.as_ref().map(|lease| lease.snapshot()),
+                trace_lease: trace_lease_identity,
+                batch_limit: self.batch_limit,
+                pagination: true,
+                schema: None,
+            },
             resources,
         )
     }

@@ -1,4 +1,4 @@
-use crate::{LogicalPlan, QueryFailure, QueryFailureCode, QueryRecord};
+use crate::{CorrelationOutcome, LogicalPlan, QueryFailure, QueryFailureCode, QueryRecord};
 
 #[cfg(test)]
 use super::failure::map_domain_value_failure;
@@ -11,6 +11,7 @@ pub(crate) struct BatchDigestInput<'a, O> {
     pub(crate) sequence: u64,
     pub(crate) plan: &'a LogicalPlan,
     pub(crate) records: &'a [QueryRecord],
+    pub(crate) correlations: Option<&'a [CorrelationOutcome]>,
     pub(crate) cancellation: &'a crate::QueryCancellation,
     pub(crate) observer: &'a mut O,
 }
@@ -24,15 +25,7 @@ pub(crate) fn batch_digest(
     memory: &mut crate::memory::QueryMemory,
 ) -> Result<[u8; 32], QueryFailure> {
     memory.acquire(DIGEST_STATE_BYTES)?;
-    let result = batch_digest_with_acquired_state(
-        protector,
-        input.prior,
-        input.sequence,
-        input.plan,
-        input.records,
-        input.cancellation,
-        input.observer,
-    );
+    let result = batch_digest_with_acquired_state(protector, input);
     memory.release(DIGEST_STATE_BYTES)?;
     result
 }
@@ -52,6 +45,7 @@ pub(crate) fn result_digest(
             sequence: 0,
             plan,
             records: std::slice::from_ref(record),
+            correlations: None,
             cancellation,
             observer,
         },
@@ -61,13 +55,20 @@ pub(crate) fn result_digest(
 
 fn batch_digest_with_acquired_state(
     protector: &positron_kernel::ControlTokenProtector<'_>,
-    prior: [u8; 32],
-    sequence: u64,
-    plan: &LogicalPlan,
-    records: &[QueryRecord],
-    cancellation: &crate::QueryCancellation,
-    observer: &mut impl positron_domain::value::NativeValueObserver<Error = QueryFailure>,
+    input: BatchDigestInput<
+        '_,
+        impl positron_domain::value::NativeValueObserver<Error = QueryFailure>,
+    >,
 ) -> Result<[u8; 32], QueryFailure> {
+    let BatchDigestInput {
+        prior,
+        sequence,
+        plan,
+        records,
+        correlations,
+        cancellation,
+        observer,
+    } = input;
     check_digest_cancellation(cancellation)?;
     let mut digest = protector
         .query_result_digest()
@@ -80,7 +81,11 @@ fn batch_digest_with_acquired_state(
             .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?
             .to_be_bytes(),
     );
-    for record in records {
+    if correlations.is_some_and(|outcomes| outcomes.len() != records.len()) {
+        return Err(QueryFailure::new(QueryFailureCode::Internal));
+    }
+    digest.update(&[u8::from(correlations.is_some())]);
+    for (index, record) in records.iter().enumerate() {
         check_digest_cancellation(cancellation)?;
         let (query_time, position, ordinal) = record.order_key();
         digest.update(&query_time.value().to_be_bytes());
@@ -129,11 +134,47 @@ fn batch_digest_with_acquired_state(
                 update_occurrence_set_digest(&mut digest, value, observer)?;
             }
         }
+        if let Some(outcome) = correlations.and_then(|outcomes| outcomes.get(index)) {
+            update_correlation_digest(&mut digest, *outcome);
+        }
     }
     check_digest_cancellation(cancellation)?;
     digest
         .finalize()
         .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))
+}
+
+fn update_correlation_digest(
+    digest: &mut positron_kernel::QueryResultDigest,
+    outcome: CorrelationOutcome,
+) {
+    match outcome {
+        CorrelationOutcome::MissingLogTraceId => digest.update(&[0]),
+        CorrelationOutcome::MissingTraceTarget { trace_id, span_id } => {
+            digest.update(&[1]);
+            update_correlation_target(digest, trace_id, span_id);
+        },
+        CorrelationOutcome::Matched { trace_id, span_id } => {
+            digest.update(&[2]);
+            update_correlation_target(digest, trace_id, span_id);
+        },
+        CorrelationOutcome::Ambiguous { trace_id, span_id } => {
+            digest.update(&[3]);
+            update_correlation_target(digest, trace_id, span_id);
+        },
+    }
+}
+
+fn update_correlation_target(
+    digest: &mut positron_kernel::QueryResultDigest,
+    trace_id: [u8; 16],
+    span_id: Option<[u8; 8]>,
+) {
+    digest.update(&trace_id);
+    digest.update(&[u8::from(span_id.is_some())]);
+    if let Some(span_id) = span_id {
+        digest.update(&span_id);
+    }
 }
 
 fn update_result_contract_digest(
@@ -308,10 +349,36 @@ const fn order_direction_tag(direction: crate::plan::OrderDirection) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{
-        check_digest_cancellation, map_domain_value_failure, query_time_provenance_tag,
-        result_value_type_tag, source_time_quality_tag,
+        BatchDigestInput, batch_digest, check_digest_cancellation, map_domain_value_failure,
+        query_time_provenance_tag, result_value_type_tag, source_time_quality_tag,
     };
-    use crate::QueryFailureCode;
+    use crate::{
+        CorrelationOutcome, LogicalPlan, QueryCancellation, QueryFailure, QueryFailureCode,
+        QueryRecord, TemporalAxis, TemporalRange,
+    };
+
+    struct NoopObserver;
+
+    impl positron_domain::value::NativeValueObserver for NoopObserver {
+        type Error = QueryFailure;
+
+        fn observe_structure(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn observe_payload(&mut self, _payload: &[u8]) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    fn digest_plan() -> LogicalPlan {
+        LogicalPlan::logs(
+            TemporalAxis::QueryTime,
+            TemporalRange::new(-1, 1).expect("ordered digest range"),
+            1,
+        )
+        .with_log_to_trace_correlation()
+    }
 
     #[test]
     fn typed_digest_vocabulary_and_domain_failures_remain_stable() {
@@ -350,5 +417,49 @@ mod tests {
             map_domain_value_failure(domain_failure).code(),
             QueryFailureCode::Internal
         );
+    }
+
+    #[test]
+    fn batch_digest_rejects_orphaned_or_missing_correlation_outcomes() {
+        let protector = positron_kernel::fuzz_control_token_protector();
+        let plan = digest_plan();
+        let cancellation = QueryCancellation::new();
+        let records = [QueryRecord::count_record(1)];
+        let missing = [];
+        let orphaned = [CorrelationOutcome::MissingLogTraceId];
+
+        for (records, correlations, description) in [
+            (
+                &records[..],
+                &missing[..],
+                "a log row without its correlation outcome",
+            ),
+            (
+                &[][..],
+                &orphaned[..],
+                "a correlation outcome without its log row",
+            ),
+        ] {
+            let mut observer = NoopObserver;
+            let mut memory = crate::memory::QueryMemory::new(512);
+            assert_eq!(
+                batch_digest(
+                    &protector,
+                    BatchDigestInput {
+                        prior: [0; 32],
+                        sequence: 0,
+                        plan: &plan,
+                        records,
+                        correlations: Some(correlations),
+                        cancellation: &cancellation,
+                        observer: &mut observer,
+                    },
+                    &mut memory,
+                )
+                .expect_err(description)
+                .code(),
+                QueryFailureCode::Internal
+            );
+        }
     }
 }

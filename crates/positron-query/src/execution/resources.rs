@@ -13,6 +13,13 @@ pub(crate) struct ExecutionResources {
     lease: SnapshotLeaseId,
     usage_before: SnapshotLeaseUsage,
     attempt: Option<SnapshotLeaseAttempt>,
+    target_lease: Option<TargetLease>,
+}
+
+struct TargetLease {
+    identity: SnapshotLeaseId,
+    usage_before: SnapshotLeaseUsage,
+    attempt: Option<SnapshotLeaseAttempt>,
 }
 
 impl ExecutionResources {
@@ -26,6 +33,7 @@ impl ExecutionResources {
             lease,
             usage_before,
             attempt: None,
+            target_lease: None,
         }
     }
 
@@ -40,12 +48,41 @@ impl ExecutionResources {
             lease,
             usage_before,
             attempt: Some(attempt),
+            target_lease: None,
         }
+    }
+
+    pub(super) fn with_target_lease(
+        mut self,
+        identity: SnapshotLeaseId,
+        usage_before: SnapshotLeaseUsage,
+    ) -> Self {
+        self.target_lease = Some(TargetLease {
+            identity,
+            usage_before,
+            attempt: None,
+        });
+        self
+    }
+
+    pub(super) fn with_target_attempt(
+        mut self,
+        identity: SnapshotLeaseId,
+        usage_before: SnapshotLeaseUsage,
+        attempt: SnapshotLeaseAttempt,
+    ) -> Self {
+        self.target_lease = Some(TargetLease {
+            identity,
+            usage_before,
+            attempt: Some(attempt),
+        });
+        self
     }
 
     pub(super) fn persist_usage(
         &mut self,
         ledger: &ActiveSegmentLedger<'_, '_>,
+        target_ledger: Option<&ActiveSegmentLedger<'_, '_>>,
         state: &crate::cursor::CursorState,
     ) -> Result<(), QueryFailure> {
         let previous = self.usage_before;
@@ -65,21 +102,44 @@ impl ExecutionResources {
             None => ledger.record_snapshot_lease_usage(self.lease, delta),
         }
         .map_err(map_ledger_failure)?;
+        if let Some(target) = self.target_lease.as_mut() {
+            let target_ledger = target_ledger
+                .ok_or_else(|| QueryFailure::new(crate::QueryFailureCode::Internal))?;
+            let delta = SnapshotLeaseUsage::new(0, 0, 0, 0, 0, 0, 0);
+            target.usage_before = match target.attempt.as_ref() {
+                Some(attempt) => target_ledger.record_snapshot_lease_usage_for_attempt(
+                    attempt,
+                    target.usage_before,
+                    delta,
+                ),
+                None => target_ledger.record_snapshot_lease_usage(target.identity, delta),
+            }
+            .map_err(map_ledger_failure)?;
+        }
         Ok(())
     }
 
     pub(super) fn fail_before_stream(
         mut self,
         ledger: &ActiveSegmentLedger<'_, '_>,
+        target_ledger: Option<&ActiveSegmentLedger<'_, '_>>,
         state: &crate::cursor::CursorState,
         primary: QueryFailure,
     ) -> QueryFailure {
-        let usage_failure = self.persist_usage(ledger, state).err();
+        let usage_failure = self.persist_usage(ledger, target_ledger, state).err();
         // An ambiguous usage publication keeps the lease durable and
         // retryable; releasing it here could erase the only authoritative
         // accounting record before the next reconciliation. Once usage is
         // known durable, release is safe and its failure participates in the
         // same strongest-failure selection as every other cleanup path.
+        let target_cleanup = usage_failure.is_none().then(|| {
+            self.target_lease.as_ref().map(|target| {
+                target_ledger
+                    .ok_or_else(|| QueryFailure::new(crate::QueryFailureCode::Internal))?
+                    .release_snapshot_lease(target.identity)
+                    .map_err(map_ledger_failure)
+            })
+        });
         let cleanup = usage_failure.is_none().then(|| {
             ledger
                 .release_snapshot_lease(self.lease)
@@ -88,6 +148,9 @@ impl ExecutionResources {
         drop(self.admission);
         let mut selected = primary;
         if let Some(failure) = usage_failure {
+            selected = crate::failure::stronger_failure(selected, failure);
+        }
+        if let Some(Some(Err(failure))) = target_cleanup {
             selected = crate::failure::stronger_failure(selected, failure);
         }
         if let Some(Err(failure)) = cleanup {
@@ -99,10 +162,11 @@ impl ExecutionResources {
     pub(super) fn fail_during_resume_planning(
         mut self,
         ledger: &ActiveSegmentLedger<'_, '_>,
+        target_ledger: Option<&ActiveSegmentLedger<'_, '_>>,
         state: &crate::cursor::CursorState,
         primary: QueryFailure,
     ) -> QueryFailure {
-        if let Err(failure) = self.persist_usage(ledger, state) {
+        if let Err(failure) = self.persist_usage(ledger, target_ledger, state) {
             return failure;
         }
         drop(self.admission);
@@ -112,6 +176,7 @@ impl ExecutionResources {
     pub(super) fn validate_lease_identity(
         self,
         ledger: &ActiveSegmentLedger<'_, '_>,
+        target_ledger: Option<&ActiveSegmentLedger<'_, '_>>,
         state: &crate::cursor::CursorState,
         expected: [u8; 16],
     ) -> Result<Self, QueryFailure> {
@@ -120,13 +185,24 @@ impl ExecutionResources {
         }
         Err(self.fail_before_stream(
             ledger,
+            target_ledger,
             state,
             QueryFailure::new(crate::QueryFailureCode::Internal),
         ))
     }
 
-    pub(super) fn into_stream(self) -> (TransferredResourceReservation, SnapshotLeaseId) {
-        (self.admission, self.lease)
+    pub(super) fn into_stream(
+        self,
+    ) -> (
+        TransferredResourceReservation,
+        SnapshotLeaseId,
+        Option<SnapshotLeaseId>,
+    ) {
+        (
+            self.admission,
+            self.lease,
+            self.target_lease.map(|target| target.identity),
+        )
     }
 }
 

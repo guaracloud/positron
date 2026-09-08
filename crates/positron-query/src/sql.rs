@@ -31,6 +31,7 @@ impl<'source> Parser<'source> {
         let selection = self.selection()?;
         self.keyword("from")?;
         self.keyword("logs")?;
+        let correlation = self.when("correlate", |parser| parser.keyword("trace"))?;
         self.keyword("where")?;
         let axis = self.identifier()?;
         if self.take()? != ">=" {
@@ -52,6 +53,9 @@ impl<'source> Parser<'source> {
             parser.ordering(axis)
         })?;
         let aggregate_selection = matches!(&selection, Selection::Count | Selection::CountBy(_));
+        if correlation.is_some() && aggregate_selection {
+            return Err(unsupported());
+        }
         if ordering.is_none() && !aggregate_selection {
             return Err(unsupported());
         }
@@ -62,6 +66,9 @@ impl<'source> Parser<'source> {
         }
 
         let mut plan = plan(axis, start, end, limit, &self.memory)?;
+        if correlation.is_some() {
+            plan = plan.with_log_to_trace_correlation();
+        }
         if let Some(filter) = filter {
             plan = plan.with_filter(filter);
         }

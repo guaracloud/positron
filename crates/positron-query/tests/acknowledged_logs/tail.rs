@@ -3814,6 +3814,24 @@ fn tail_rejects_future_knowledge_operators_with_a_typed_failure() -> Result<(), 
 }
 
 #[test]
+fn tail_rejects_log_to_trace_correlation_at_admission() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("tail-correlation-unsupported")?;
+    let service = fixture.correlation_service(16)?;
+    let budget = QueryBudget::new(1_048_576, 16, 4, 1_048_576, 1_048_576, 60)?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | correlate trace | limit all",
+        budget,
+    )?;
+    let failure = match service.tail(query, TailStart::Now) {
+        Ok(_) => return Err("correlation tail unexpectedly succeeded".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(failure.code(), QueryFailureCode::UnsupportedQuery);
+    Ok(())
+}
+
+#[test]
 fn tail_now_rejects_an_explicit_time_ordering() -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("tail-explicit-live-order")?;
     let service = fixture.service(16)?;

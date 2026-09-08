@@ -8,12 +8,26 @@ use support::CanonicalBuffer;
 pub use support::PlannedQuery;
 
 const UNBOUNDED_LIMIT: u16 = u16::MAX;
+const PLAN_VERSION: u8 = 1;
+const EXPLICIT_ORDERING_FLAG: u8 = 1 << 7;
+const PLAN_VERSION_MASK: u8 = !EXPLICIT_ORDERING_FLAG;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TemporalAxis {
     QueryTime,
     EventTime,
     IngestTime,
+}
+
+/// The explicit native signal relationship a bounded logical plan reads.
+///
+/// Correlation is deliberately a source operator, rather than a join: a log
+/// record supplies its intrinsic trace identifier and the Trace Store is read
+/// through its own authenticated snapshot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum QuerySource {
+    Logs,
+    LogToTraceCorrelation,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -129,7 +143,8 @@ impl OrderSpec {
 
 #[derive(Clone, Debug, Eq)]
 pub struct LogicalPlan {
-    version: u8,
+    flags: u8,
+    source: QuerySource,
     axis: TemporalAxis,
     range: TemporalRange,
     limit: u16,
@@ -137,13 +152,13 @@ pub struct LogicalPlan {
     projection: Vec<ProjectionColumn>,
     aggregate: Option<AggregateSpec>,
     ordering: OrderSpec,
-    ordering_explicit: bool,
     transform: Option<BodyTransform>,
 }
 
 impl PartialEq for LogicalPlan {
     fn eq(&self, other: &Self) -> bool {
-        self.version == other.version
+        self.version() == other.version()
+            && self.source == other.source
             && self.axis == other.axis
             && self.range == other.range
             && self.limit == other.limit
@@ -158,7 +173,8 @@ impl PartialEq for LogicalPlan {
 impl LogicalPlan {
     pub(crate) fn logs(axis: TemporalAxis, range: TemporalRange, limit: u16) -> Self {
         Self {
-            version: 1,
+            flags: PLAN_VERSION,
+            source: QuerySource::Logs,
             axis,
             range,
             limit,
@@ -166,7 +182,6 @@ impl LogicalPlan {
             projection: vec![ProjectionColumn::Body],
             aggregate: None,
             ordering: OrderSpec::ascending(axis),
-            ordering_explicit: false,
             transform: None,
         }
     }
@@ -184,7 +199,8 @@ impl LogicalPlan {
         let mut projection = crate::planning_memory::PlanningVec::with_capacity(memory, 1)?;
         projection.push(ProjectionColumn::Body)?;
         let plan = Self {
-            version: 1,
+            flags: PLAN_VERSION,
+            source: QuerySource::Logs,
             axis,
             range,
             limit,
@@ -192,7 +208,6 @@ impl LogicalPlan {
             projection: projection.into_vec(),
             aggregate: None,
             ordering: OrderSpec::ascending(axis),
-            ordering_explicit: false,
             transform: None,
         };
         drop(plan_memory);
@@ -209,12 +224,22 @@ impl LogicalPlan {
 
     #[must_use]
     pub const fn version(&self) -> u8 {
-        self.version
+        self.flags & PLAN_VERSION_MASK
     }
 
     pub(crate) fn with_filter(mut self, filter: FilterPredicate) -> Self {
         self.filter = Some(filter);
         self
+    }
+
+    pub(crate) const fn with_log_to_trace_correlation(mut self) -> Self {
+        self.source = QuerySource::LogToTraceCorrelation;
+        self
+    }
+
+    #[must_use]
+    pub const fn is_log_to_trace_correlation(&self) -> bool {
+        matches!(self.source, QuerySource::LogToTraceCorrelation)
     }
 
     pub(crate) fn with_transform(mut self, transform: BodyTransform) -> Self {
@@ -228,6 +253,7 @@ impl LogicalPlan {
 
     pub(crate) fn has_advanced_operators(&self) -> bool {
         self.filter.is_some()
+            || self.is_log_to_trace_correlation()
             || self.projection != [ProjectionColumn::Body]
             || self.aggregate.is_some()
             || self.ordering != OrderSpec::ascending(self.axis)
@@ -235,11 +261,11 @@ impl LogicalPlan {
     }
 
     pub(crate) fn tail_incompatible(&self) -> bool {
-        self.aggregate.is_some()
+        self.is_log_to_trace_correlation() || self.aggregate.is_some()
     }
 
     pub(crate) fn has_explicit_ordering(&self) -> bool {
-        self.ordering_explicit
+        self.flags & EXPLICIT_ORDERING_FLAG != 0
     }
 
     pub(crate) fn filter(&self) -> Option<&FilterPredicate> {
@@ -351,7 +377,7 @@ impl LogicalPlan {
 
     pub(crate) fn with_explicit_ordering(mut self, ordering: OrderSpec) -> Self {
         self.ordering = ordering;
-        self.ordering_explicit = true;
+        self.flags |= EXPLICIT_ORDERING_FLAG;
         self
     }
 

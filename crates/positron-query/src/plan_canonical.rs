@@ -1,6 +1,6 @@
 use std::fmt::Write as _;
 
-use super::{CanonicalBuffer, FilterPredicate, LogicalPlan};
+use super::{CanonicalBuffer, FilterPredicate, LogicalPlan, QuerySource};
 use positron_kernel::ControlTokenProtector;
 
 impl LogicalPlan {
@@ -16,13 +16,18 @@ impl LogicalPlan {
         write!(
             canonical,
             "plan:v4;version={};axis={:?};range={}..{};limit={};filter=",
-            self.version,
+            self.version(),
             self.axis,
             self.range.start_nanoseconds,
             self.range.end_nanoseconds,
             self.limit,
         )
         .map_err(|_| crate::QueryFailure::new(crate::QueryFailureCode::ResourceExhausted))?;
+        if matches!(self.source, QuerySource::LogToTraceCorrelation) {
+            write!(canonical, ";source=log_to_trace_correlation").map_err(|_| {
+                crate::QueryFailure::new(crate::QueryFailureCode::ResourceExhausted)
+            })?;
+        }
         match self.filter.as_ref() {
             Some(FilterPredicate::BodyEquals(value)) => write!(canonical, "body_equals:{value:?}"),
             Some(FilterPredicate::BodyContains(value)) => {

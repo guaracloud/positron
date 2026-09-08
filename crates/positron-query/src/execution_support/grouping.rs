@@ -186,14 +186,14 @@ pub(crate) fn aggregate_records<'kernel, 'catalog, 'ledger>(
     if aggregate.group_by().is_empty() {
         let count = u64::try_from(records.len())
             .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
-        let (_, slot_bytes, dynamic_bytes) = records.into_parts();
+        let (_, _, slot_bytes, dynamic_bytes) = records.into_parts();
         memory.release(slot_bytes)?;
         memory.release(dynamic_bytes)?;
-        let mut counted = crate::memory::RecordBuffer::allocate(1, memory)?;
-        counted.push_acquired(QueryRecord::count_record(count), 0)?;
+        let mut counted = crate::memory::RecordBuffer::allocate(1, false, memory)?;
+        counted.push_acquired(QueryRecord::count_record(count), 0, None)?;
         return Ok(counted);
     }
-    let (records, record_slots, _) = records.into_parts();
+    let (records, _, record_slots, _) = records.into_parts();
     let group_capacity = records.len().min(MAX_GROUPS);
     let group_slots = u64::try_from(group_capacity)
         .ok()
@@ -247,14 +247,14 @@ pub(crate) fn aggregate_records<'kernel, 'catalog, 'ledger>(
         }
     }
     memory.release(record_slots)?;
-    let mut grouped = crate::memory::RecordBuffer::allocate(groups.len(), memory)?;
+    let mut grouped = crate::memory::RecordBuffer::allocate(groups.len(), false, memory)?;
     for entry in groups {
         if state.cancellation.is_cancelled() {
             return Err(QueryFailure::new(QueryFailureCode::Cancelled));
         }
         let record = entry.key.into_record(entry.count);
         let dynamic_bytes = record.retained_dynamic_bytes()?;
-        grouped.push_acquired(record, dynamic_bytes)?;
+        grouped.push_acquired(record, dynamic_bytes, None)?;
         drop(entry.comparison);
         memory.release(entry.comparison_bytes)?;
         memory.release(key_slots)?;

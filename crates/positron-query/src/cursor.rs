@@ -13,9 +13,11 @@ mod validation;
 pub(crate) use validation::fuzz_reauthenticate;
 pub(crate) use validation::source_length;
 use validation::{Reader, map_protection_failure};
-const MAGIC: [u8; 8] = *b"POSQCR05";
+const MAGIC: [u8; 8] = *b"POSQCR06";
+const V5_MAGIC: [u8; 8] = *b"POSQCR05";
 const LEGACY_MAGIC: [u8; 8] = *b"POSQCR01";
-const CURSOR_PURPOSE: &[u8] = b"query-cursor-v5";
+const CURSOR_PURPOSE: &[u8] = b"query-cursor-v6";
+const V5_CURSOR_PURPOSE: &[u8] = b"query-cursor-v5";
 const LEGACY_CURSOR_PURPOSE: &[u8] = b"query-cursor-v1";
 const API_VERSION: u8 = 1;
 const LANGUAGE_VERSION: u8 = 1;
@@ -27,17 +29,23 @@ const CURRENT_VERSION_BYTES: usize = 2;
 const CURRENT_PREFIX_BYTES: usize = V3_PAYLOAD_BYTES - std::mem::size_of::<u16>();
 const BASE_PAYLOAD_BYTES: usize =
     CURRENT_PREFIX_BYTES + 9 + PLAN_SOURCE_HEADER_BYTES + MAX_PLAN_SOURCE_BYTES;
-const PAYLOAD_BYTES: usize = BASE_PAYLOAD_BYTES + RESULT_RESUME_KEY_BYTES + CURRENT_VERSION_BYTES;
+const V5_PAYLOAD_BYTES: usize =
+    BASE_PAYLOAD_BYTES + RESULT_RESUME_KEY_BYTES + CURRENT_VERSION_BYTES;
+const PAIR_BINDING_BYTES: usize = 1 + 32 + 8 + 8 + 16;
+const PAYLOAD_BYTES: usize = V5_PAYLOAD_BYTES + PAIR_BINDING_BYTES;
 const V1_CURSOR_BYTES: usize = V1_PAYLOAD_BYTES + 32;
 const V3_CURSOR_BYTES: usize = V3_PAYLOAD_BYTES + 32;
 const CURSOR_BYTES: usize = PAYLOAD_BYTES + 32;
+const V5_CURSOR_BYTES: usize = V5_PAYLOAD_BYTES + 32;
 
 #[cfg(fuzzing)]
 pub(crate) const CURRENT_RESUME_KEY_START: usize = BASE_PAYLOAD_BYTES;
 #[cfg(fuzzing)]
 pub(crate) const CURRENT_RESUME_KEY_END: usize = CURRENT_RESUME_KEY_START + RESULT_RESUME_KEY_BYTES;
 #[cfg(fuzzing)]
-pub(crate) const CURRENT_VERSION_START: usize = CURRENT_RESUME_KEY_END;
+pub(crate) const CURRENT_PAIR_BINDING_START: usize = CURRENT_RESUME_KEY_END;
+#[cfg(fuzzing)]
+pub(crate) const CURRENT_VERSION_START: usize = CURRENT_PAIR_BINDING_START + PAIR_BINDING_BYTES;
 #[cfg(fuzzing)]
 pub(crate) const CURRENT_VERSION_END: usize = CURRENT_VERSION_START + CURRENT_VERSION_BYTES;
 #[cfg(fuzzing)]
@@ -64,6 +72,10 @@ pub(crate) struct CursorState {
     pub(crate) sequence: u64,
     pub(crate) prior_digest: [u8; 32],
     pub(crate) lease_identity: [u8; 16],
+    pub(crate) trace_catalog_identity: Option<[u8; 32]>,
+    pub(crate) trace_catalog_generation: Option<u64>,
+    pub(crate) trace_frontier: Option<u64>,
+    pub(crate) trace_lease_identity: Option<[u8; 16]>,
     pub(crate) expiry: u64,
     pub(crate) budget: QueryBudget,
     pub(crate) scanned_bytes: u64,
@@ -167,6 +179,31 @@ pub(crate) fn encode(
         .map(ResultResumeKey::encode)
         .unwrap_or([0; RESULT_RESUME_KEY_BYTES]);
     bytes.extend_from_slice(&encoded_resume_key);
+    match (
+        state.trace_catalog_identity,
+        state.trace_catalog_generation,
+        state.trace_frontier,
+        state.trace_lease_identity,
+    ) {
+        (None, None, None, None) => {
+            bytes.push(0);
+            bytes.resize(
+                bytes
+                    .len()
+                    .checked_add(PAIR_BINDING_BYTES - 1)
+                    .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?,
+                0,
+            );
+        },
+        (Some(identity), Some(generation), Some(frontier), Some(lease)) => {
+            bytes.push(1);
+            bytes.extend_from_slice(&identity);
+            bytes.extend_from_slice(&generation.to_be_bytes());
+            bytes.extend_from_slice(&frontier.to_be_bytes());
+            bytes.extend_from_slice(&lease);
+        },
+        _ => return Err(QueryFailure::new(QueryFailureCode::InvalidCursor)),
+    }
     bytes.push(API_VERSION);
     bytes.push(LANGUAGE_VERSION);
     let authentication = protector
@@ -217,21 +254,30 @@ fn decode_internal(
         .map_err(|_| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
     let authentication = ControlTokenAuthentication::new(epoch, tag)
         .map_err(|_| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
-    let legacy = payload_bytes != PAYLOAD_BYTES;
-    let purpose = if legacy {
-        LEGACY_CURSOR_PURPOSE
-    } else {
-        CURSOR_PURPOSE
+    let version = match payload_bytes {
+        PAYLOAD_BYTES => 6_u8,
+        V5_PAYLOAD_BYTES => 5_u8,
+        V1_PAYLOAD_BYTES | V3_PAYLOAD_BYTES => 0_u8,
+        _ => return Err(QueryFailure::new(QueryFailureCode::InvalidCursor)),
+    };
+    let purpose = match version {
+        6 => CURSOR_PURPOSE,
+        5 => V5_CURSOR_PURPOSE,
+        _ => LEGACY_CURSOR_PURPOSE,
     };
     protector
         .verify_query_cursor(purpose, payload, authentication)
         .map_err(|_| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
-    if legacy {
+    if version == 0 {
         return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
     }
     let mut reader = Reader::new(payload);
     let magic = reader.array::<8>()?;
-    if (legacy && magic != LEGACY_MAGIC) || (!legacy && magic != MAGIC) || reader.u64()? != epoch {
+    if ((version == 6 && magic != MAGIC)
+        || (version == 5 && magic != V5_MAGIC)
+        || (version == 0 && magic != LEGACY_MAGIC))
+        || reader.u64()? != epoch
+    {
         return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
     }
     let principal = PrincipalId::from_bytes(reader.array()?)
@@ -291,7 +337,7 @@ fn decode_internal(
     } else {
         (reader.u64()?, reader.u64()?, reader.u64()?)
     };
-    let (memory_peak_bytes, reduced_pruning) = if payload_bytes == PAYLOAD_BYTES {
+    let (memory_peak_bytes, reduced_pruning) = if matches!(version, 5 | 6) {
         let memory_peak_bytes = reader.u64()?;
         let reduced_pruning = match reader.array::<1>()?[0] {
             0 => false,
@@ -302,7 +348,7 @@ fn decode_internal(
     } else {
         (0, false)
     };
-    let (source, language) = if payload_bytes == PAYLOAD_BYTES {
+    let (source, language) = if matches!(version, 5 | 6) {
         let language = match reader.array::<1>()?[0] {
             0 => None,
             1 => Some(crate::query_service::QueryLanguage::Pipeline),
@@ -346,6 +392,27 @@ fn decode_internal(
         (None, None)
     };
     let resume_key = ResultResumeKey::decode(reader.bytes(RESULT_RESUME_KEY_BYTES)?)?;
+    let (trace_catalog_identity, trace_catalog_generation, trace_frontier, trace_lease_identity) =
+        if version == 6 {
+            match reader.array::<1>()?[0] {
+                0 => {
+                    let reserved = reader.bytes(PAIR_BINDING_BYTES - 1)?;
+                    if reserved.iter().any(|byte| *byte != 0) {
+                        return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
+                    }
+                    (None, None, None, None)
+                },
+                1 => (
+                    Some(reader.array()?),
+                    Some(reader.u64()?),
+                    Some(reader.u64()?),
+                    Some(reader.array()?),
+                ),
+                _ => return Err(QueryFailure::new(QueryFailureCode::InvalidCursor)),
+            }
+        } else {
+            (None, None, None, None)
+        };
     if reader.array::<1>()?[0] != API_VERSION || reader.array::<1>()?[0] != LANGUAGE_VERSION {
         return Err(QueryFailure::new(QueryFailureCode::InvalidCursor));
     }
@@ -367,6 +434,10 @@ fn decode_internal(
         sequence,
         prior_digest,
         lease_identity,
+        trace_catalog_identity,
+        trace_catalog_generation,
+        trace_frontier,
+        trace_lease_identity,
         expiry,
         budget,
         scanned_bytes,

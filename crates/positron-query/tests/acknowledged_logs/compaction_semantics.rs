@@ -1,9 +1,14 @@
+use std::collections::BTreeMap;
 use std::error::Error;
 
 use positron_domain::value::AttributeNamespace;
 use positron_policy::NativeLogAttribute;
-use positron_query::{QueryBudget, QueryEvent, QueryFailureCode, QueryTerminal};
-use positron_signals::{LogRetentionPolicy, LogScan, LogStore, ScanLimit, SchemaPath};
+use positron_query::{
+    CorrelationOutcome, QueryBudget, QueryEvent, QueryFailureCode, QueryTerminal,
+};
+use positron_signals::{
+    LogRetentionPolicy, LogScan, LogStore, ScanLimit, SchemaPath, TraceScan, TraceStore,
+};
 
 use super::terminal_and_bounds::QueryFixture;
 
@@ -88,6 +93,179 @@ fn public_queries_are_equivalent_before_after_and_after_restart() -> Result<(), 
         query(&fixture, regex).map_err(|error| format!("restart regex: {error}"))?,
         before_regex
     );
+    Ok(())
+}
+
+#[test]
+fn correlation_cursor_preserves_its_paired_snapshot_across_log_compaction()
+-> Result<(), Box<dyn Error>> {
+    let mut fixture = QueryFixture::new_compaction("correlation-compaction-snapshot")?;
+    let first_trace = [0x61; 16];
+    let first_span = [0x62; 8];
+    let second_trace = [0x63; 16];
+    let second_span = [0x64; 8];
+    let third_trace = [0x65; 16];
+    let third_span = [0x66; 8];
+    fixture
+        .kernel
+        .append_trace(first_trace, first_span, 20, 1)?;
+    fixture
+        .kernel
+        .append_log_with_trace("first", 20, first_trace, first_span, 2)?;
+    fixture.kernel.seal_and_reopen()?;
+    fixture.kernel.seal_and_reopen_trace()?;
+    fixture
+        .kernel
+        .append_trace(second_trace, second_span, 21, 3)?;
+    fixture
+        .kernel
+        .append_log_with_trace("second", 21, second_trace, second_span, 4)?;
+    fixture.kernel.seal_and_reopen()?;
+    fixture.kernel.seal_and_reopen_trace()?;
+    fixture
+        .kernel
+        .append_trace(third_trace, third_span, 22, 5)?;
+    fixture
+        .kernel
+        .append_log_with_trace("third", 22, third_trace, third_span, 6)?;
+
+    let source = "pipeline:v1 logs | range query_time -100 100 | correlate trace | limit 3";
+    let service = fixture.correlation_service(1)?;
+    let initial = service
+        .execute_page(service.plan_pipeline(fixture.context, source, query_budget())?)?
+        .collect::<Vec<_>>();
+    let initial_header = initial
+        .iter()
+        .find_map(|event| match event {
+            QueryEvent::Header(header) => Some(header.clone()),
+            QueryEvent::Batch(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("initial paired header missing")?;
+    let cursor = initial
+        .iter()
+        .find_map(|event| match event {
+            QueryEvent::Terminal(QueryTerminal::Continued(cursor)) => Some(cursor.clone()),
+            QueryEvent::Header(_) | QueryEvent::Batch(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("initial paired cursor missing")?;
+
+    let store = LogStore::new();
+    let ledger = fixture.kernel.ledger()?;
+    let tenant = ledger.scope().tenant_id();
+    let snapshot = ledger.snapshot()?;
+    let scan = store.scan(
+        fixture.kernel.authority.governor(),
+        tenant,
+        &snapshot,
+        LogScan::all(ScanLimit::new(16)?),
+    )?;
+    let policy = LogRetentionPolicy::from_catalog(&fixture.kernel.catalog_for_test().pin()?)?;
+    let bucket = policy.bucket(
+        tenant,
+        scan.records()
+            .first()
+            .ok_or("compaction source records missing")?
+            .ingest_time(),
+    )?;
+    let compacted = store.compact(ledger, tenant, policy, bucket)?;
+    assert_eq!(compacted.input_segments(), 2);
+    assert_eq!(compacted.output_segments(), 1);
+    drop(scan);
+    drop(snapshot);
+
+    let trace_ledger = fixture.kernel.trace_ledger()?;
+    let trace_snapshot = trace_ledger.snapshot()?;
+    let trace_store = TraceStore::new();
+    let physical = trace_store.scan_physical(
+        fixture.kernel.authority.governor(),
+        tenant,
+        &trace_snapshot,
+        TraceScan::all(ScanLimit::new(16)?),
+    )?;
+    let mut ingest_times = BTreeMap::new();
+    for observation in physical.observations() {
+        ingest_times.insert(
+            observation.commit_position(),
+            observation.stored().ingest_time(),
+        );
+    }
+    drop(physical);
+    let active_trace_segment = trace_ledger.active_segment_id()?;
+    let trace_blocks = trace_snapshot
+        .blocks()
+        .iter()
+        .filter(|block| block.segment_id() != active_trace_segment)
+        .map(|block| {
+            let ingest_time = ingest_times
+                .get(&block.position())
+                .copied()
+                .ok_or("trace compaction input lacks authenticated ingest time")?;
+            Ok(positron_kernel::CompactionBlock::new(
+                trace_snapshot.scope(),
+                block.segment_id(),
+                block.identity(),
+                block.position(),
+                block.payload().to_vec(),
+                block.content_digest()?,
+                ingest_time,
+            )?)
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    let preparation = trace_ledger.prepare_compaction(&trace_snapshot)?;
+    trace_ledger.compact_sealed_with_cancellation(trace_blocks, preparation, || false)?;
+    drop(trace_snapshot);
+
+    let resumed = service
+        .resume(fixture.context, &cursor)?
+        .collect::<Vec<_>>();
+    let resumed_header = resumed
+        .iter()
+        .find_map(|event| match event {
+            QueryEvent::Header(header) => Some(header),
+            QueryEvent::Batch(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("resumed paired header missing")?;
+    assert_eq!(resumed_header.snapshot(), initial_header.snapshot());
+    assert_eq!(
+        resumed_header.correlation_snapshot(),
+        initial_header.correlation_snapshot()
+    );
+    let resumed_batch = resumed
+        .iter()
+        .find_map(|event| match event {
+            QueryEvent::Batch(batch) => Some(batch),
+            QueryEvent::Header(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("resumed correlation batch missing")?;
+    assert_eq!(resumed_batch.records()[0].body_text(), Some("second"));
+    assert_eq!(
+        resumed_batch.correlation_outcome(0),
+        Some(CorrelationOutcome::Matched {
+            trace_id: second_trace,
+            span_id: Some(second_span),
+        })
+    );
+
+    let fresh_service = fixture.correlation_service(16)?;
+    let fresh_plan = fresh_service.plan_pipeline(fixture.context, source, query_budget())?;
+    let fresh = fresh_service.execute(fresh_plan)?.collect::<Vec<_>>();
+    let fresh_bodies = fresh
+        .iter()
+        .filter_map(|event| match event {
+            QueryEvent::Batch(batch) => Some(batch.records()),
+            QueryEvent::Header(_) | QueryEvent::Terminal(_) => None,
+        })
+        .flatten()
+        .filter_map(|record| record.body_text())
+        .collect::<Vec<_>>();
+    assert_eq!(fresh_bodies, ["first", "second", "third"]);
+    assert!(fresh.iter().all(|event| match event {
+        QueryEvent::Batch(batch) => matches!(
+            batch.correlation_outcome(0),
+            Some(CorrelationOutcome::Matched { .. })
+        ),
+        QueryEvent::Header(_) | QueryEvent::Terminal(_) => true,
+    }));
     Ok(())
 }
 

@@ -26,26 +26,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         )
     }
 
-    pub(super) fn failed_page_with_stats(
-        &self,
-        header: Option<QueryEvent>,
-        failure: QueryFailure,
-        state: &CursorState,
-        delivered_before: QueryStats,
-        terminal_stats: QueryStats,
-        resources: ExecutionResources,
-    ) -> Result<QueryStream<'ledger>, QueryFailure> {
-        self.incomplete_page(
-            header,
-            failure,
-            state,
-            delivered_before,
-            terminal_stats,
-            resources,
-        )
-    }
-
-    fn incomplete_page(
+    pub(super) fn incomplete_page(
         &self,
         header: Option<QueryEvent>,
         failure: QueryFailure,
@@ -99,16 +80,49 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
     ) -> Result<QueryStream<'ledger>, QueryFailure> {
         let ledger = self.ledger;
         let mut resources = resources;
-        if let Err(failure) = resources.persist_usage(ledger, state) {
-            return Err(resources.fail_before_stream(ledger, state, failure));
+        if let Err(failure) = resources.persist_usage(ledger, self.trace_ledger, state) {
+            return Err(resources.fail_before_stream(ledger, self.trace_ledger, state, failure));
         }
-        let resources = resources.validate_lease_identity(ledger, state, state.lease_identity)?;
-        let (admission, identity) = resources.into_stream();
+        let resources = resources.validate_lease_identity(
+            ledger,
+            self.trace_ledger,
+            state,
+            state.lease_identity,
+        )?;
+        let (admission, identity, target_identity) = resources.into_stream();
         let cancellation = state.cancellation.clone();
+        let target_ledger = self.trace_ledger;
+        let mut source_identity = Some(identity);
+        let mut target_identity = target_identity;
         let release = Box::new(move || {
-            ledger
-                .release_snapshot_lease(identity)
-                .map_err(map_ledger_failure)
+            let target_failure = match (target_identity, target_ledger) {
+                (Some(identity), Some(ledger)) => match ledger.release_snapshot_lease(identity) {
+                    Ok(()) => {
+                        target_identity = None;
+                        None
+                    },
+                    Err(failure) => Some(map_ledger_failure(failure)),
+                },
+                (Some(_), None) => Some(QueryFailure::new(crate::QueryFailureCode::Internal)),
+                (None, _) => None,
+            };
+            let source_failure = match source_identity {
+                Some(identity) => match ledger.release_snapshot_lease(identity) {
+                    Ok(()) => {
+                        source_identity = None;
+                        None
+                    },
+                    Err(failure) => Some(map_ledger_failure(failure)),
+                },
+                None => None,
+            };
+            match (source_failure, target_failure) {
+                (None, None) => Ok(()),
+                (Some(source), None) | (None, Some(source)) => Err(source),
+                (Some(source), Some(target)) => {
+                    Err(crate::failure::stronger_failure(source, target))
+                },
+            }
         });
         Ok(QueryStream::new_releasing(
             events,

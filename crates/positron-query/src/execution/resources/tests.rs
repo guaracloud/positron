@@ -55,11 +55,11 @@ fn lease_identity_mismatch_releases_every_pre_stream_resource() -> Result<(), Bo
         let expected = SnapshotLeaseId::new([0x99; 16])?;
 
         let state = test_cursor_state(identity.to_bytes());
-        let failure = match resources.validate_lease_identity(&ledger, &state, expected.to_bytes())
-        {
-            Ok(_) => return Err("mismatched stream identity was accepted".into()),
-            Err(failure) => failure,
-        };
+        let failure =
+            match resources.validate_lease_identity(&ledger, None, &state, expected.to_bytes()) {
+                Ok(_) => return Err("mismatched stream identity was accepted".into()),
+                Err(failure) => failure,
+            };
         assert_eq!(failure.code(), QueryFailureCode::Internal);
         assert_eq!(
             ledger
@@ -108,6 +108,7 @@ fn failed_usage_reconciliation_retains_the_durable_lease_for_retry() -> Result<(
 
     let failure = resources.fail_before_stream(
         &ledger,
+        None,
         &state,
         crate::QueryFailure::new(QueryFailureCode::Internal),
     );
@@ -137,6 +138,10 @@ fn test_cursor_state(lease_identity: [u8; 16]) -> CursorState {
         sequence: 0,
         prior_digest: [0; 32],
         lease_identity,
+        trace_catalog_identity: None,
+        trace_catalog_generation: None,
+        trace_frontier: None,
+        trace_lease_identity: None,
         expiry: 200,
         budget: QueryBudget::new(100, 10, 10, 100, 1_000, 100).expect("valid budget"),
         scanned_bytes: 0,

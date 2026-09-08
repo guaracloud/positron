@@ -16,6 +16,7 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
         let bytes = crate::execution_support::output_bytes_for_records(
             self.service,
             &records,
+            None,
             &mut self.cpu_work_units,
             self.query.budget.cpu_work_units(),
             &self.query.cancellation,
@@ -36,6 +37,7 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
                 sequence: self.next_sequence,
                 plan: &self.query.plan,
                 records: &records,
+                correlations: None,
                 cancellation: &self.query.cancellation,
                 observer: &mut digest_observer,
             },

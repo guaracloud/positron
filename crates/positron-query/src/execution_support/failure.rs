@@ -36,6 +36,42 @@ pub(crate) fn map_store_failure(failure: positron_signals::LogStoreFailure) -> Q
     }
 }
 
+pub(crate) fn map_trace_store_failure(
+    failure: positron_signals::TraceStoreFailure,
+) -> QueryFailure {
+    use positron_signals::TraceStoreFailureCode as Trace;
+    match failure.code() {
+        Trace::LimitExceeded => {
+            QueryFailure::budget_exhausted(QueryBudgetDimension::DecodedRecords)
+        },
+        Trace::BudgetExhausted => {
+            QueryFailure::budget_exhausted(QueryBudgetDimension::CpuWorkUnits)
+        },
+        Trace::MalformedBlock
+        | Trace::PhysicalScopeMismatch
+        | Trace::IntegrityCorruption
+        | Trace::AuthenticationFailed
+        | Trace::UnsupportedFormat
+        | Trace::RecoveryRequired => QueryFailure::new(QueryFailureCode::MalformedPersistentData),
+        Trace::InvalidInput => QueryFailure::new(QueryFailureCode::InvalidBudget),
+        Trace::StorageUnavailable
+        | Trace::ConcurrentWriter
+        | Trace::IdempotencyConflict
+        | Trace::StaleGeneration
+        | Trace::ClockUnavailable => QueryFailure::new(QueryFailureCode::StoreUnavailable),
+        Trace::SnapshotExpired => QueryFailure::new(QueryFailureCode::SnapshotExpired),
+        Trace::StaleResumeMarker => QueryFailure::new(QueryFailureCode::InvalidCursor),
+        Trace::StorageExhausted | Trace::ResourceExhausted => {
+            QueryFailure::new(QueryFailureCode::ResourceExhausted)
+        },
+        Trace::ResourceAdmissionRefused => {
+            QueryFailure::new(QueryFailureCode::ResourceAdmissionRefused)
+        },
+        Trace::Cancelled => QueryFailure::new(QueryFailureCode::Cancelled),
+        Trace::Internal => QueryFailure::new(QueryFailureCode::Internal),
+    }
+}
+
 const fn map_store_failure_code(code: positron_signals::LogStoreFailureCode) -> QueryFailureCode {
     match code {
         Store::MalformedBlock => QueryFailureCode::MalformedPersistentData,

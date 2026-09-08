@@ -3,8 +3,8 @@ use std::sync::Arc;
 use positron_domain::identity::Scope;
 use positron_governance::{AuthorizedContext, Identity};
 use positron_kernel::{
-    ActiveSegmentLedger, CatalogGenerationId, ResourceAmounts, ResourceGovernor, WorkClaim,
-    WorkKind,
+    ActiveSegmentLedger, CatalogGenerationId, ResourceAmounts, ResourceDimension, ResourceGovernor,
+    TransferredResourceReservation, WorkClaim, WorkKind,
 };
 
 use crate::{
@@ -22,6 +22,7 @@ pub(crate) enum QueryLanguage {
 pub struct QueryService<'kernel, 'catalog, 'ledger> {
     pub(crate) governor: ResourceGovernor<'kernel>,
     pub(crate) ledger: &'ledger ActiveSegmentLedger<'kernel, 'catalog>,
+    pub(crate) trace_ledger: Option<&'ledger ActiveSegmentLedger<'kernel, 'catalog>>,
     pub(crate) batch_limit: u16,
     pub(crate) clock: Arc<dyn crate::QueryClock>,
     pub(crate) work_meter: Arc<dyn crate::QueryWorkMeter>,
@@ -40,6 +41,17 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             Arc::new(crate::runtime::SystemQueryClock),
             Arc::new(crate::runtime::FixedQueryWorkMeter),
         )
+    }
+
+    /// Adds the separately scoped native Trace Store authority used only by
+    /// explicit Log-to-Trace Correlation plans.
+    #[must_use]
+    pub fn with_trace_ledger(
+        mut self,
+        trace_ledger: &'ledger ActiveSegmentLedger<'kernel, 'catalog>,
+    ) -> Self {
+        self.trace_ledger = Some(trace_ledger);
+        self
     }
 
     pub fn with_clock(
@@ -67,6 +79,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         Self {
             governor,
             ledger,
+            trace_ledger: None,
             batch_limit,
             clock,
             work_meter,
@@ -258,6 +271,24 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             .map_err(|_| QueryFailure::new(QueryFailureCode::InvalidBudget))?;
         self.governor
             .reserve(claim)
+            .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceAdmissionRefused))
+    }
+
+    pub(crate) fn reserve_correlation_memory(
+        &self,
+        tenant: positron_domain::identity::TenantId,
+        capacity: usize,
+    ) -> Result<TransferredResourceReservation, QueryFailure> {
+        let amounts = ResourceAmounts::only(
+            ResourceDimension::MemoryBytes,
+            crate::memory::correlation_retained_bytes(capacity)?,
+        )
+        .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
+        let claim = WorkClaim::tenant(tenant, WorkKind::InteractiveQueryTail, amounts)
+            .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
+        self.governor
+            .reserve(claim)
+            .map(|reservation| reservation.transfer())
             .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceAdmissionRefused))
     }
 

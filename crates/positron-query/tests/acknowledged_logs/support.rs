@@ -8,8 +8,8 @@ use std::sync::{Condvar, Mutex};
 
 use positron_domain::identity::TenantId;
 use positron_domain::routing::{SignalKind, VirtualShardId};
-use positron_domain::time::UnixNanoseconds;
-use positron_domain::value::{CandidateAttributeValue, ValueLimitProfile};
+use positron_domain::time::{EventTime, SourceTimeQuality, UnixNanoseconds};
+use positron_domain::value::{AttributeNamespace, CandidateAttributeValue, ValueLimitProfile};
 use positron_kernel::{
     ActiveSegmentLedger, Catalog, CatalogObject, CatalogProposal, CatalogSecret,
     ControlTokenProtector, DiskObservation, DiskPressureThresholds, FixedLifecycleClockSource,
@@ -22,11 +22,16 @@ use positron_kernel::{
     WorkClaim, WorkKind,
 };
 use positron_policy::{
-    IngestPolicy, LogMetadata, NativeLogAttribute, NativeLogCandidate, PolicyEvaluation,
-    PolicyReceiver,
+    IngestPolicy, LogMetadata, NativeLogAttribute, NativeLogCandidate, NativeTraceCandidate,
+    PolicyEvaluation, PolicyReceiver, TracePolicyEvaluation,
 };
 use positron_runtime::GovernanceTestFixture;
-use positron_signals::{LogRecord, LogStore, SchemaSessionStore};
+use positron_signals::{
+    EvaluatedSpanObservationInput, LogRecord, LogStore, SamplingDecision, SchemaSessionStore,
+    SpanKind, SpanObservation, SpanObservationDetails, TraceStore,
+};
+
+type IndexedTraceAttributeCandidate = (Option<i64>, Vec<NativeLogAttribute>, [u8; 16], [u8; 8]);
 
 pub struct TestClock(AtomicU64);
 
@@ -877,6 +882,7 @@ pub struct KernelFixture {
     retention_enabled: bool,
     catalog: &'static Catalog<'static>,
     ledger: Option<ActiveSegmentLedger<'static, 'static>>,
+    trace_ledger: Option<ActiveSegmentLedger<'static, 'static>>,
     tenant: TenantId,
     shard: VirtualShardId,
     _root: TemporaryRoots,
@@ -936,12 +942,19 @@ impl KernelFixture {
             SegmentScope::new(tenant, SignalKind::Logs, shard),
             SegmentProtectionKey::from_owned(Box::new([0x34; 32])),
         )?;
+        let trace_ledger = ActiveSegmentLedger::open(
+            authority,
+            catalog,
+            SegmentScope::new(tenant, SignalKind::Traces, shard),
+            SegmentProtectionKey::from_owned(Box::new([0x35; 32])),
+        )?;
         Ok(Self {
             authority,
             retention_time,
             retention_enabled: false,
             catalog,
             ledger: Some(ledger),
+            trace_ledger: Some(trace_ledger),
             tenant,
             shard,
             _root: root,
@@ -980,12 +993,20 @@ impl KernelFixture {
             SegmentScope::new(tenant, SignalKind::Logs, shard),
             SegmentProtectionKey::from_owned(Box::new([0x34; 32])),
         )?;
+        let trace_ledger = ActiveSegmentLedger::open_with_retention_time(
+            authority,
+            retention_time,
+            catalog,
+            SegmentScope::new(tenant, SignalKind::Traces, shard),
+            SegmentProtectionKey::from_owned(Box::new([0x35; 32])),
+        )?;
         let fixture = Self {
             authority,
             retention_time,
             retention_enabled: true,
             catalog,
             ledger: Some(ledger),
+            trace_ledger: Some(trace_ledger),
             tenant,
             shard,
             _root: roots,
@@ -998,6 +1019,12 @@ impl KernelFixture {
         self.ledger
             .as_ref()
             .ok_or_else(|| "ledger unavailable".into())
+    }
+
+    pub fn trace_ledger(&self) -> Result<&ActiveSegmentLedger<'static, 'static>, Box<dyn Error>> {
+        self.trace_ledger
+            .as_ref()
+            .ok_or_else(|| "trace ledger unavailable".into())
     }
 
     pub fn publish_lifecycle_for_test(
@@ -1038,6 +1065,28 @@ impl KernelFixture {
         Ok(())
     }
 
+    pub fn seal_and_reopen_trace(&mut self) -> Result<(), Box<dyn Error>> {
+        let ledger = self.trace_ledger.take().ok_or("trace ledger unavailable")?;
+        ledger.seal()?;
+        self.trace_ledger = Some(if self.retention_enabled {
+            ActiveSegmentLedger::open_with_retention_time(
+                self.authority,
+                self.retention_time,
+                self.catalog,
+                SegmentScope::new(self.tenant, SignalKind::Traces, self.shard),
+                SegmentProtectionKey::from_owned(Box::new([0x35; 32])),
+            )?
+        } else {
+            ActiveSegmentLedger::open(
+                self.authority,
+                self.catalog,
+                SegmentScope::new(self.tenant, SignalKind::Traces, self.shard),
+                SegmentProtectionKey::from_owned(Box::new([0x35; 32])),
+            )?
+        });
+        Ok(())
+    }
+
     pub fn reopen_ledger(&mut self) -> Result<(), Box<dyn Error>> {
         let ledger = self.ledger.take().ok_or("ledger unavailable")?;
         drop(ledger);
@@ -1058,6 +1107,32 @@ impl KernelFixture {
                 self.catalog,
                 SegmentScope::new(self.tenant, SignalKind::Logs, self.shard),
                 SegmentProtectionKey::from_owned(Box::new([0x34; 32])),
+                &clock,
+            )?
+        });
+        Ok(())
+    }
+
+    pub fn reopen_trace_ledger(&mut self) -> Result<(), Box<dyn Error>> {
+        let ledger = self.trace_ledger.take().ok_or("trace ledger unavailable")?;
+        drop(ledger);
+        let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(
+            101_000_000_000,
+        )));
+        self.trace_ledger = Some(if self.retention_enabled {
+            ActiveSegmentLedger::open_with_retention_time(
+                self.authority,
+                self.retention_time,
+                self.catalog,
+                SegmentScope::new(self.tenant, SignalKind::Traces, self.shard),
+                SegmentProtectionKey::from_owned(Box::new([0x35; 32])),
+            )?
+        } else {
+            ActiveSegmentLedger::open_with_clock(
+                self.authority,
+                self.catalog,
+                SegmentScope::new(self.tenant, SignalKind::Traces, self.shard),
+                SegmentProtectionKey::from_owned(Box::new([0x35; 32])),
                 &clock,
             )?
         });
@@ -1088,6 +1163,132 @@ impl KernelFixture {
             event_time,
             identity,
         )
+    }
+
+    pub fn append_log_with_trace(
+        &self,
+        body: &str,
+        event_time: i64,
+        trace_id: [u8; 16],
+        span_id: [u8; 8],
+        identity: u8,
+    ) -> Result<(), Box<dyn Error>> {
+        let candidate = NativeLogCandidate::new(
+            Some(event_time),
+            None,
+            Some(CandidateAttributeValue::string(body.to_owned())),
+            vec![],
+            LogMetadata::new(
+                0,
+                String::new(),
+                Some(trace_id),
+                Some(span_id),
+                0,
+                0,
+                0,
+                String::new(),
+                String::new(),
+                String::new(),
+                0,
+                String::new(),
+            ),
+        );
+        let PolicyEvaluation::Accepted(evaluated) =
+            IngestPolicy::preserving(1)?.evaluate(candidate, PolicyReceiver::OtlpGrpc)?
+        else {
+            return Err("preserving policy rejected the correlation log fixture".into());
+        };
+        let record = LogRecord::checked_evaluated(
+            ValueLimitProfile::release_1_system_maximum(),
+            *evaluated,
+        )?;
+        self.append_prepared_logs(vec![record], identity)
+    }
+
+    pub fn append_log_with_trace_id(
+        &self,
+        body: &str,
+        event_time: i64,
+        trace_id: [u8; 16],
+        identity: u8,
+    ) -> Result<(), Box<dyn Error>> {
+        let candidate = NativeLogCandidate::new(
+            Some(event_time),
+            None,
+            Some(CandidateAttributeValue::string(body.to_owned())),
+            vec![],
+            LogMetadata::new(
+                0,
+                String::new(),
+                Some(trace_id),
+                None,
+                0,
+                0,
+                0,
+                String::new(),
+                String::new(),
+                String::new(),
+                0,
+                String::new(),
+            ),
+        );
+        let PolicyEvaluation::Accepted(evaluated) =
+            IngestPolicy::preserving(1)?.evaluate(candidate, PolicyReceiver::OtlpGrpc)?
+        else {
+            return Err("preserving policy rejected the trace-only correlation log fixture".into());
+        };
+        let record = LogRecord::checked_evaluated(
+            ValueLimitProfile::release_1_system_maximum(),
+            *evaluated,
+        )?;
+        self.append_prepared_logs(vec![record], identity)
+    }
+
+    pub fn append_trace(
+        &self,
+        trace_id: [u8; 16],
+        span_id: [u8; 8],
+        event_time: i64,
+        identity: u8,
+    ) -> Result<(), Box<dyn Error>> {
+        let TracePolicyEvaluation::Accepted(evaluated) = IngestPolicy::preserving(1)?
+            .evaluate_trace(NativeTraceCandidate::new(vec![]), PolicyReceiver::OtlpGrpc)?
+        else {
+            return Err("preserving policy rejected the correlation trace fixture".into());
+        };
+        let observation = SpanObservation::checked_evaluated(
+            ValueLimitProfile::release_1_system_maximum(),
+            EvaluatedSpanObservationInput {
+                trace_id,
+                span_id,
+                parent_span_id: None,
+                name: "correlation".to_owned(),
+                start_time: EventTime::received(
+                    UnixNanoseconds::new(event_time),
+                    SourceTimeQuality::Usable,
+                )?,
+                end_time: EventTime::missing(),
+                kind: SpanKind::Internal,
+                sampling: SamplingDecision::Unknown,
+                evaluated: *evaluated,
+                details: SpanObservationDetails::default(),
+            },
+        )?;
+        let capacity = self.authority.governor().reserve(WorkClaim::tenant(
+            self.tenant,
+            WorkKind::Ingest,
+            ResourceAmounts::only(ResourceDimension::MemoryBytes, 1_048_576)?,
+        )?)?;
+        let ledger = self.trace_ledger()?;
+        let block_identity = StoreBlockIdentity::new([identity; 16])?;
+        let preparation = if self.retention_enabled {
+            ledger.begin_store_block(capacity, block_identity)?
+        } else {
+            ledger.begin_store_block_for_test(capacity, block_identity, self.retention_time)?
+        };
+        let block = TraceStore::new().prepare(preparation, vec![observation])?;
+        ledger.append(block.into_store_block())?;
+        Ok(())
     }
 
     pub fn append_log_bodies(
@@ -1139,6 +1340,23 @@ impl KernelFixture {
                 *evaluated,
             )?);
         }
+        self.append_prepared_logs_to(ledger, records, identity)
+    }
+
+    fn append_prepared_logs(
+        &self,
+        records: Vec<LogRecord>,
+        identity: u8,
+    ) -> Result<(), Box<dyn Error>> {
+        self.append_prepared_logs_to(self.ledger()?, records, identity)
+    }
+
+    fn append_prepared_logs_to(
+        &self,
+        ledger: &ActiveSegmentLedger<'static, 'static>,
+        records: Vec<LogRecord>,
+        identity: u8,
+    ) -> Result<(), Box<dyn Error>> {
         let capacity = self.authority.governor().reserve(WorkClaim::tenant(
             self.tenant,
             WorkKind::Ingest,
@@ -1241,6 +1459,55 @@ impl KernelFixture {
         identity: u8,
         indexed_path: &positron_signals::SchemaPath,
     ) -> Result<positron_signals::SchemaSessionStore, Box<dyn Error>> {
+        let candidates = candidates
+            .into_iter()
+            .map(|(event_time, attributes)| {
+                NativeLogCandidate::new(event_time, None, None, attributes, LogMetadata::empty())
+            })
+            .collect();
+        self.append_indexed_log_candidates(candidates, identity, indexed_path)
+    }
+
+    pub fn append_indexed_attribute_logs_with_trace(
+        &self,
+        candidates: Vec<IndexedTraceAttributeCandidate>,
+        identity: u8,
+        indexed_path: &positron_signals::SchemaPath,
+    ) -> Result<positron_signals::SchemaSessionStore, Box<dyn Error>> {
+        let candidates = candidates
+            .into_iter()
+            .map(|(event_time, attributes, trace_id, span_id)| {
+                NativeLogCandidate::new(
+                    event_time,
+                    None,
+                    None,
+                    attributes,
+                    LogMetadata::new(
+                        0,
+                        String::new(),
+                        Some(trace_id),
+                        Some(span_id),
+                        0,
+                        0,
+                        0,
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                        0,
+                        String::new(),
+                    ),
+                )
+            })
+            .collect();
+        self.append_indexed_log_candidates(candidates, identity, indexed_path)
+    }
+
+    fn append_indexed_log_candidates(
+        &self,
+        candidates: Vec<NativeLogCandidate>,
+        identity: u8,
+        indexed_path: &positron_signals::SchemaPath,
+    ) -> Result<positron_signals::SchemaSessionStore, Box<dyn Error>> {
         let schema_budget = positron_signals::SchemaBudget::new(8, 200_000, 8_000, 8_000)?;
         let schema_capacity = self.authority.governor().reserve(WorkClaim::tenant(
             self.tenant,
@@ -1251,9 +1518,7 @@ impl KernelFixture {
             positron_signals::SchemaSessionStore::new(schema_capacity, self.tenant, schema_budget)?;
         let mut records = Vec::new();
         records.try_reserve_exact(candidates.len())?;
-        for (event_time, attributes) in candidates {
-            let candidate =
-                NativeLogCandidate::new(event_time, None, None, attributes, LogMetadata::empty());
+        for candidate in candidates {
             let PolicyEvaluation::Accepted(evaluated) =
                 IngestPolicy::preserving(1)?.evaluate(candidate, PolicyReceiver::OtlpGrpc)?
             else {
@@ -1301,6 +1566,87 @@ impl KernelFixture {
             indexed_path,
         )?;
         schema.commit_query_update(query_update)?;
+        Ok(schema)
+    }
+
+    pub fn append_schema_overflow_log_with_trace(
+        &self,
+        body: &str,
+        event_time: i64,
+        trace_id: [u8; 16],
+        span_id: [u8; 8],
+        identity: u8,
+    ) -> Result<positron_signals::SchemaSessionStore, Box<dyn Error>> {
+        let schema_budget = positron_signals::SchemaBudget::new(8, 200_000, 8_000, 8_000)?;
+        let schema_capacity = self.authority.governor().reserve(WorkClaim::tenant(
+            self.tenant,
+            WorkKind::Ingest,
+            ResourceAmounts::only(ResourceDimension::MemoryBytes, 200_000)?,
+        )?)?;
+        let mut schema =
+            positron_signals::SchemaSessionStore::new(schema_capacity, self.tenant, schema_budget)?;
+        let mut attributes = Vec::new();
+        attributes.try_reserve_exact(9)?;
+        for index in 0..9 {
+            attributes.push(NativeLogAttribute::new(
+                AttributeNamespace::Record,
+                format!("overflow-{index}"),
+                vec![CandidateAttributeValue::string(format!("value-{index}"))],
+            ));
+        }
+        let candidate = NativeLogCandidate::new(
+            Some(event_time),
+            None,
+            Some(CandidateAttributeValue::string(body.to_owned())),
+            attributes,
+            LogMetadata::new(
+                0,
+                String::new(),
+                Some(trace_id),
+                Some(span_id),
+                0,
+                0,
+                0,
+                String::new(),
+                String::new(),
+                String::new(),
+                0,
+                String::new(),
+            ),
+        );
+        let PolicyEvaluation::Accepted(evaluated) =
+            IngestPolicy::preserving(1)?.evaluate(candidate, PolicyReceiver::OtlpGrpc)?
+        else {
+            return Err(
+                "preserving policy rejected the schema-overflow correlation fixture".into(),
+            );
+        };
+        let mut records = vec![LogRecord::checked_evaluated(
+            ValueLimitProfile::release_1_system_maximum(),
+            *evaluated,
+        )?];
+        let delta = schema.stage_group(&mut records)?;
+        let capacity = self.authority.governor().reserve(WorkClaim::tenant(
+            self.tenant,
+            WorkKind::Ingest,
+            ResourceAmounts::only(ResourceDimension::MemoryBytes, 1_048_576)?,
+        )?)?;
+        let block_identity = StoreBlockIdentity::new([identity; 16])?;
+        let preparation = if self.retention_enabled {
+            self.ledger()?.begin_store_block(capacity, block_identity)?
+        } else {
+            self.ledger()?.begin_store_block_for_test(
+                capacity,
+                block_identity,
+                self.retention_time,
+            )?
+        };
+        let block = LogStore::new()
+            .prepare(preparation, records)?
+            .into_store_block();
+        let digest = block.content_digest()?;
+        self.ledger()?.append(block)?;
+        schema.commit(delta, block_identity, digest)?;
         Ok(schema)
     }
 
@@ -1367,6 +1713,16 @@ impl KernelFixture {
             b"not-a-canonical-log-block".to_vec(),
         )?;
         self.ledger()?.append(block)?;
+        Ok(())
+    }
+
+    pub fn append_malformed_trace_block(&self, identity: u8) -> Result<(), Box<dyn Error>> {
+        let block = PreparedStoreBlock::new(
+            SegmentScope::new(self.tenant, SignalKind::Traces, self.shard),
+            StoreBlockIdentity::new([identity; 16])?,
+            b"not-a-canonical-trace-block".to_vec(),
+        )?;
+        self.trace_ledger()?.append(block)?;
         Ok(())
     }
 }
