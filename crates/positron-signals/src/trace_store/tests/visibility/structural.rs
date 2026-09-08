@@ -540,3 +540,87 @@ fn trace_by_id_analysis_surfaces_cycles_conflicts_and_source_time_failures()
     assert!(long_cycle_structure.critical_path().is_none());
     Ok(())
 }
+
+#[test]
+fn trace_by_id_analysis_bounds_complete_deep_critical_path_work() -> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x91; 16])?,
+        CatalogSecret::from_owned(Box::new([0x92; 32]), Box::new([0x93; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let shard = VirtualShardId::new(91)?;
+    let ledger = ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        SegmentScope::new(tenant, SignalKind::Traces, shard),
+        SegmentProtectionKey::from_owned(Box::new([0x94; 32])),
+    )?;
+    let trace_id = [0x95; 16];
+    let mut observations = Vec::new();
+    for value in 1_u8..=64 {
+        observations.push(SpanObservation::checked_native(
+            trace_id,
+            [value; 8],
+            (value > 1).then_some([value - 1; 8]),
+            format!("deep-{value}"),
+            EventTime::received(
+                UnixNanoseconds::new(i64::from(value)),
+                SourceTimeQuality::Usable,
+            )
+            .map_err(TraceStoreFailure::domain)?,
+            EventTime::received(
+                UnixNanoseconds::new(131 - i64::from(value)),
+                SourceTimeQuality::Usable,
+            )
+            .map_err(TraceStoreFailure::domain)?,
+            Vec::new(),
+            SpanKind::Internal,
+            SamplingDecision::Sampled,
+            positron_policy::PolicyProvenance::new(1, [0x96; 32], Vec::new())?,
+        )?);
+    }
+    let store = TraceStore::new();
+    ledger.append(
+        store
+            .prepare_unretained_for_test(
+                preparation_capacity(&authority, tenant)?,
+                &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(200))),
+                tenant,
+                shard,
+                StoreBlockIdentity::new([0x97; 16])?,
+                observations,
+            )?
+            .into_store_block(),
+    )?;
+    let mut trace = store.trace_by_id(
+        authority.governor(),
+        tenant,
+        &ledger.snapshot()?,
+        trace_id,
+        TraceSearch::all(ScanLimit::new(64)?),
+    )?;
+    let structure = trace.analyze_structure(&NeverCancelled, &ExhaustAfterWork::new(2_000))?;
+    assert!(structure.complete());
+    let critical_path = structure.critical_path().ok_or("deep critical path")?;
+    assert_eq!(critical_path.duration_nanos(), 129);
+    assert_eq!(critical_path.fragments().len(), 127);
+    assert_eq!(
+        critical_path
+            .fragments()
+            .first()
+            .map(|fragment| fragment.span_id()),
+        Some([1; 8])
+    );
+    assert_eq!(
+        critical_path
+            .fragments()
+            .last()
+            .map(|fragment| fragment.span_id()),
+        Some([1; 8])
+    );
+    Ok(())
+}

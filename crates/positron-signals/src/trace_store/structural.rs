@@ -323,6 +323,129 @@ impl SpanIndex {
     }
 }
 
+#[derive(Clone, Copy)]
+struct ChildRange {
+    start: usize,
+    end: usize,
+    next: usize,
+}
+
+struct ChildAdjacency {
+    children: Vec<usize>,
+    ranges: Vec<ChildRange>,
+}
+
+impl ChildAdjacency {
+    fn build(
+        spans: &[LogicalSpan],
+        index: &SpanIndex,
+        cancellation: &dyn ScanCancellation,
+        observer: &dyn ScanObserver,
+    ) -> Result<Self, TraceStoreFailure> {
+        let mut ranges = reserve(Vec::new(), spans.len())?;
+        for _ in spans {
+            observe(cancellation, observer)?;
+            ranges.push(ChildRange {
+                start: 0,
+                end: 0,
+                next: 0,
+            });
+        }
+        for span_index in 0..spans.len() {
+            observe(cancellation, observer)?;
+            if let Some(parent_index) = index.parent_index(span_index)? {
+                let range = ranges
+                    .get_mut(parent_index)
+                    .ok_or_else(TraceStoreFailure::invalid_input)?;
+                range.end = range
+                    .end
+                    .checked_add(1)
+                    .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+            }
+        }
+        let mut child_count = 0_usize;
+        for range in &mut ranges {
+            observe(cancellation, observer)?;
+            let count = range.end;
+            range.start = child_count;
+            child_count = child_count
+                .checked_add(count)
+                .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+            range.end = child_count;
+            range.next = range.start;
+        }
+        let mut children = reserve(Vec::new(), child_count)?;
+        for _ in 0..child_count {
+            observe(cancellation, observer)?;
+            children.push(usize::MAX);
+        }
+        for span_index in 0..spans.len() {
+            observe(cancellation, observer)?;
+            if let Some(parent_index) = index.parent_index(span_index)? {
+                let range = ranges
+                    .get_mut(parent_index)
+                    .ok_or_else(TraceStoreFailure::invalid_input)?;
+                let position = range.next;
+                let slot = children
+                    .get_mut(position)
+                    .ok_or_else(TraceStoreFailure::invalid_input)?;
+                *slot = span_index;
+                range.next = range
+                    .next
+                    .checked_add(1)
+                    .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+            }
+        }
+        for range in &mut ranges {
+            observe(cancellation, observer)?;
+            if range.next != range.end {
+                return Err(TraceStoreFailure::invalid_input());
+            }
+            let ordered = children
+                .get_mut(range.start..range.end)
+                .ok_or_else(TraceStoreFailure::invalid_input)?;
+            order_children(ordered, spans, cancellation, observer)?;
+            range.next = range.start;
+        }
+        Ok(Self { children, ranges })
+    }
+
+    fn next_child(
+        &self,
+        parent_index: usize,
+        next: &mut usize,
+        cursor: UnixNanoseconds,
+        spans: &[LogicalSpan],
+        cancellation: &dyn ScanCancellation,
+        observer: &dyn ScanObserver,
+    ) -> Result<Option<usize>, TraceStoreFailure> {
+        let range = self
+            .ranges
+            .get(parent_index)
+            .ok_or_else(TraceStoreFailure::invalid_input)?;
+        while *next < range.end {
+            observe(cancellation, observer)?;
+            let position = *next;
+            *next = next
+                .checked_add(1)
+                .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+            let child_index = *self
+                .children
+                .get(position)
+                .ok_or_else(TraceStoreFailure::invalid_input)?;
+            let child = spans
+                .get(child_index)
+                .ok_or_else(TraceStoreFailure::invalid_input)?;
+            let (start, end) = span_interval(representative(child)?)
+                .ok_or_else(TraceStoreFailure::invalid_input)?;
+            if start < cursor && end <= cursor {
+                return Ok(Some(child_index));
+            }
+        }
+        Ok(None)
+    }
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum CycleState {
     Unseen,
@@ -358,6 +481,8 @@ pub(super) fn analyze<'summary>(
         .and_then(|bytes| bytes.checked_add(u64::try_from(size_of::<CriticalPathFrame>()).ok()?))
         .and_then(|bytes| bytes.checked_add(u64::try_from(size_of::<SpanIndexEntry>()).ok()?))
         .and_then(|bytes| bytes.checked_add(u64::try_from(size_of::<CycleState>()).ok()?))
+        .and_then(|bytes| bytes.checked_add(u64::try_from(size_of::<ChildRange>()).ok()?))
+        .and_then(|bytes| bytes.checked_add(u64::try_from(size_of::<usize>()).ok()?))
         .and_then(|bytes| bytes.checked_add(u64::try_from(size_of::<usize>()).ok()?))
         .ok_or_else(TraceStoreFailure::limit_exceeded)?;
     let structural_bytes = count
@@ -475,6 +600,7 @@ fn critical_path(
     let root = index
         .find(root_id, cancellation, observer)?
         .ok_or_else(TraceStoreFailure::invalid_input)?;
+    let children = ChildAdjacency::build(spans, index, cancellation, observer)?;
     let mut fragments = reserve(
         Vec::new(),
         spans
@@ -483,30 +609,41 @@ fn critical_path(
             .ok_or_else(TraceStoreFailure::limit_exceeded)?,
     )?;
     let mut stack = reserve(Vec::new(), spans.len())?;
-    stack.push(CriticalPathFrame::new(root, spans)?);
-    while let Some(frame) = stack.last_mut() {
-        observe(cancellation, observer)?;
-        let parent = spans
-            .get(frame.span_index)
-            .ok_or_else(TraceStoreFailure::invalid_input)?;
-        let child = latest_child_ending_at_or_before(
-            parent.span_id(),
-            frame.cursor,
-            spans,
-            cancellation,
-            observer,
-        )?;
-        if let Some(child_index) = child {
-            let child_span = spans
-                .get(child_index)
+    stack.push(CriticalPathFrame::new(root, spans, &children)?);
+    while !stack.is_empty() {
+        let next_child = {
+            let frame = stack
+                .last_mut()
                 .ok_or_else(TraceStoreFailure::invalid_input)?;
-            let (child_start, child_end) = span_interval(representative(child_span)?)
+            observe(cancellation, observer)?;
+            let parent = spans
+                .get(frame.span_index)
                 .ok_or_else(TraceStoreFailure::invalid_input)?;
-            append_fragment(&mut fragments, parent.span_id(), child_end, frame.cursor)?;
-            frame.cursor = child_start;
-            stack.push(CriticalPathFrame::new(child_index, spans)?);
+            let parent_span_id = parent.span_id();
+            let child = children.next_child(
+                frame.span_index,
+                &mut frame.next_child,
+                frame.cursor,
+                spans,
+                cancellation,
+                observer,
+            )?;
+            if let Some(child_index) = child {
+                let child_span = spans
+                    .get(child_index)
+                    .ok_or_else(TraceStoreFailure::invalid_input)?;
+                let (child_start, child_end) = span_interval(representative(child_span)?)
+                    .ok_or_else(TraceStoreFailure::invalid_input)?;
+                append_fragment(&mut fragments, parent_span_id, child_end, frame.cursor)?;
+                frame.cursor = child_start;
+            } else {
+                append_fragment(&mut fragments, parent_span_id, frame.start, frame.cursor)?;
+            }
+            child
+        };
+        if let Some(child_index) = next_child {
+            stack.push(CriticalPathFrame::new(child_index, spans, &children)?);
         } else {
-            append_fragment(&mut fragments, parent.span_id(), frame.start, frame.cursor)?;
             let _completed = stack.pop().ok_or_else(TraceStoreFailure::invalid_input)?;
         }
     }
@@ -532,10 +669,15 @@ struct CriticalPathFrame {
     span_index: usize,
     start: UnixNanoseconds,
     cursor: UnixNanoseconds,
+    next_child: usize,
 }
 
 impl CriticalPathFrame {
-    fn new(span_index: usize, spans: &[LogicalSpan]) -> Result<Self, TraceStoreFailure> {
+    fn new(
+        span_index: usize,
+        spans: &[LogicalSpan],
+        children: &ChildAdjacency,
+    ) -> Result<Self, TraceStoreFailure> {
         let span = spans
             .get(span_index)
             .ok_or_else(TraceStoreFailure::invalid_input)?;
@@ -545,40 +687,122 @@ impl CriticalPathFrame {
             span_index,
             start,
             cursor: end,
+            next_child: children
+                .ranges
+                .get(span_index)
+                .map(|range| range.start)
+                .ok_or_else(TraceStoreFailure::invalid_input)?,
         })
     }
 }
 
-fn latest_child_ending_at_or_before(
-    parent_span_id: [u8; 8],
-    cursor: UnixNanoseconds,
+fn order_children(
+    children: &mut [usize],
     spans: &[LogicalSpan],
     cancellation: &dyn ScanCancellation,
     observer: &dyn ScanObserver,
-) -> Result<Option<usize>, TraceStoreFailure> {
-    let mut selected = None;
-    let mut selected_end = None;
-    for (index, span) in spans.iter().enumerate() {
-        observe(cancellation, observer)?;
-        if representative(span)?.observation().parent_span_id() != Some(parent_span_id) {
-            continue;
-        }
-        let (start, end) =
-            span_interval(representative(span)?).ok_or_else(TraceStoreFailure::invalid_input)?;
-        if start < cursor && end <= cursor {
-            let selected_span_id = selected
-                .and_then(|selected| spans.get(selected))
-                .map(LogicalSpan::span_id);
-            if selected_end.is_none_or(|current| end > current)
-                || (selected_end == Some(end)
-                    && selected_span_id.is_none_or(|selected| span.span_id() < selected))
-            {
-                selected = Some(index);
-                selected_end = Some(end);
-            }
-        }
+) -> Result<(), TraceStoreFailure> {
+    let length = children.len();
+    if length < 2 {
+        return Ok(());
     }
-    Ok(selected)
+    let first_parent = length
+        .checked_sub(2)
+        .ok_or_else(TraceStoreFailure::invalid_input)?
+        / 2;
+    for root in (0..=first_parent).rev() {
+        sift_child_heap(children, root, length, spans, cancellation, observer)?;
+    }
+    for end in (1..length).rev() {
+        observe(cancellation, observer)?;
+        children.swap(0, end);
+        sift_child_heap(children, 0, end, spans, cancellation, observer)?;
+    }
+    for index in 0..(length / 2) {
+        observe(cancellation, observer)?;
+        let other = length
+            .checked_sub(1)
+            .and_then(|last| last.checked_sub(index))
+            .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+        children.swap(index, other);
+    }
+    Ok(())
+}
+
+fn sift_child_heap(
+    children: &mut [usize],
+    mut root: usize,
+    end: usize,
+    spans: &[LogicalSpan],
+    cancellation: &dyn ScanCancellation,
+    observer: &dyn ScanObserver,
+) -> Result<(), TraceStoreFailure> {
+    loop {
+        let left = root
+            .checked_mul(2)
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+        if left >= end {
+            return Ok(());
+        }
+        let right = left
+            .checked_add(1)
+            .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+        let mut highest = left;
+        if right < end
+            && child_precedes(
+                *children
+                    .get(right)
+                    .ok_or_else(TraceStoreFailure::invalid_input)?,
+                *children
+                    .get(left)
+                    .ok_or_else(TraceStoreFailure::invalid_input)?,
+                spans,
+                cancellation,
+                observer,
+            )?
+        {
+            highest = right;
+        }
+        if !child_precedes(
+            *children
+                .get(highest)
+                .ok_or_else(TraceStoreFailure::invalid_input)?,
+            *children
+                .get(root)
+                .ok_or_else(TraceStoreFailure::invalid_input)?,
+            spans,
+            cancellation,
+            observer,
+        )? {
+            return Ok(());
+        }
+        observe(cancellation, observer)?;
+        children.swap(root, highest);
+        root = highest;
+    }
+}
+
+fn child_precedes(
+    left: usize,
+    right: usize,
+    spans: &[LogicalSpan],
+    cancellation: &dyn ScanCancellation,
+    observer: &dyn ScanObserver,
+) -> Result<bool, TraceStoreFailure> {
+    observe(cancellation, observer)?;
+    let left_span = spans
+        .get(left)
+        .ok_or_else(TraceStoreFailure::invalid_input)?;
+    let right_span = spans
+        .get(right)
+        .ok_or_else(TraceStoreFailure::invalid_input)?;
+    let (_, left_end) =
+        span_interval(representative(left_span)?).ok_or_else(TraceStoreFailure::invalid_input)?;
+    let (_, right_end) =
+        span_interval(representative(right_span)?).ok_or_else(TraceStoreFailure::invalid_input)?;
+    Ok(left_end > right_end
+        || (left_end == right_end && left_span.span_id() < right_span.span_id()))
 }
 
 fn append_fragment(
