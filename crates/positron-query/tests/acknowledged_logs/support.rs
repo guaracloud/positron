@@ -1203,6 +1203,45 @@ impl KernelFixture {
         self.append_prepared_logs(vec![record], identity)
     }
 
+    pub fn append_log_with_trace_id(
+        &self,
+        body: &str,
+        event_time: i64,
+        trace_id: [u8; 16],
+        identity: u8,
+    ) -> Result<(), Box<dyn Error>> {
+        let candidate = NativeLogCandidate::new(
+            Some(event_time),
+            None,
+            Some(CandidateAttributeValue::string(body.to_owned())),
+            vec![],
+            LogMetadata::new(
+                0,
+                String::new(),
+                Some(trace_id),
+                None,
+                0,
+                0,
+                0,
+                String::new(),
+                String::new(),
+                String::new(),
+                0,
+                String::new(),
+            ),
+        );
+        let PolicyEvaluation::Accepted(evaluated) =
+            IngestPolicy::preserving(1)?.evaluate(candidate, PolicyReceiver::OtlpGrpc)?
+        else {
+            return Err("preserving policy rejected the trace-only correlation log fixture".into());
+        };
+        let record = LogRecord::checked_evaluated(
+            ValueLimitProfile::release_1_system_maximum(),
+            *evaluated,
+        )?;
+        self.append_prepared_logs(vec![record], identity)
+    }
+
     pub fn append_trace(
         &self,
         trace_id: [u8; 16],

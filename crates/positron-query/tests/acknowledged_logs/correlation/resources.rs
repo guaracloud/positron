@@ -13,7 +13,7 @@ use positron_query::{
 };
 
 use super::super::support::{
-    CancellingOperatorCallMeter, KernelFixture, MergeWorkMeter, TestClock,
+    CancellingOperatorCallMeter, FailAfterArmClock, KernelFixture, MergeWorkMeter, TestClock,
     publish_lifecycle_at_catalog_for_test, zero_work_clock_service, zero_work_service,
 };
 use super::super::terminal_and_bounds::QueryFixture;
@@ -480,6 +480,51 @@ fn correlation_target_admission_failure_releases_the_already_admitted_log_lease(
         .expect_err("target lease admission must report its publication failure");
     assert_eq!(failure.code(), QueryFailureCode::StoreUnavailable);
     assert_eq!(fixture.kernel.authority.governor().inspect()?, baseline);
+    Ok(())
+}
+
+#[test]
+fn correlation_pre_stream_clock_failure_releases_both_paired_snapshot_leases()
+-> Result<(), Box<dyn Error>> {
+    for (label, paginated) in [
+        ("correlation-sequential-pre-stream-clock", false),
+        ("correlation-paged-pre-stream-clock", true),
+    ] {
+        let fixture = QueryFixture::new(label)?;
+        let trace_id = [0xc1; 16];
+        let span_id = [0xc2; 8];
+        fixture.kernel.append_trace(trace_id, span_id, 20, 1)?;
+        fixture
+            .kernel
+            .append_log_with_trace("accepted", 20, trace_id, span_id, 2)?;
+        let clock = FailAfterArmClock::shared(1);
+        let service = QueryService::with_runtime(
+            fixture.kernel.authority.governor(),
+            fixture.kernel.ledger()?,
+            1,
+            Arc::clone(&clock) as Arc<dyn positron_query::QueryClock>,
+            Arc::new(MergeWorkMeter),
+        )
+        .with_trace_ledger(fixture.kernel.trace_ledger()?);
+        let baseline = fixture.kernel.authority.governor().inspect()?;
+        let query = service.plan_pipeline(
+            fixture.context,
+            "pipeline:v1 logs | range query_time -100 100 | correlate trace | limit 1",
+            super::budget(),
+        )?;
+
+        // The first armed read admits the paired snapshots. The page's next
+        // read fails before its header can escape, exercising eager cleanup.
+        clock.arm();
+        let failure = if paginated {
+            service.execute_page(query)
+        } else {
+            service.execute(query)
+        }
+        .expect_err("the pre-stream clock failure must remain a typed execution failure");
+        assert_eq!(failure.code(), QueryFailureCode::Internal);
+        assert_eq!(fixture.kernel.authority.governor().inspect()?, baseline);
+    }
     Ok(())
 }
 

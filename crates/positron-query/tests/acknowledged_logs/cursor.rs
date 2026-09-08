@@ -1263,6 +1263,34 @@ fn authenticated_v5_cursor_rejects_source_bytes_without_a_declared_language()
     Ok(())
 }
 
+#[test]
+fn authenticated_v5_cursor_rejects_invalid_declared_source_metadata_before_admission()
+-> Result<(), Box<dyn Error>> {
+    let fixture = CursorFixture::new()?;
+    let baseline = fixture.kernel.authority.governor().inspect()?;
+    for (label, rewrite) in [
+        (
+            "unknown source language",
+            (|payload: &mut Vec<u8>| payload[348] = 3) as fn(&mut Vec<u8>),
+        ),
+        ("source longer than the wire bound", |payload| {
+            payload[349..351].copy_from_slice(&4_097_u16.to_be_bytes())
+        }),
+    ] {
+        let cursor = rewritten_v5_cursor(&fixture, rewrite)?;
+        assert_eq!(
+            fixture
+                .service()
+                .resume(fixture.context, &cursor)
+                .expect_err(label)
+                .code(),
+            QueryFailureCode::InvalidCursor
+        );
+        assert_eq!(fixture.kernel.authority.governor().inspect()?, baseline);
+    }
+    Ok(())
+}
+
 fn rewritten_source_cursor(
     fixture: &CursorFixture,
     cursor: &QueryCursor,

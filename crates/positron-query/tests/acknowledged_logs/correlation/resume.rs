@@ -59,6 +59,130 @@ fn correlation_page_cursor_resumes_against_the_original_paired_frontiers()
 }
 
 #[test]
+fn sql_correlation_page_resume_preserves_paired_provenance_order_and_digest()
+-> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("correlation-sql-page-resume")?;
+    let first_trace = [0x91; 16];
+    let first_span = [0x92; 8];
+    let second_trace = [0x93; 16];
+    let second_span = [0x94; 8];
+    let third_trace = [0x95; 16];
+    let third_span = [0x96; 8];
+    for (trace, span, time, identity, body) in [
+        (first_trace, first_span, 20, 1, "first"),
+        (second_trace, second_span, 21, 3, "second"),
+        (third_trace, third_span, 22, 5, "third"),
+    ] {
+        fixture.kernel.append_trace(trace, span, time, identity)?;
+        fixture
+            .kernel
+            .append_log_with_trace(body, time, trace, span, identity + 1)?;
+    }
+    let service = fixture.correlation_service(1)?;
+    let source = "SELECT body FROM logs CORRELATE TRACE WHERE query_time >= -100 AND query_time < 100 ORDER BY query_time DESC, commit_position DESC LIMIT 3";
+    let first = service
+        .execute_page(service.plan_sql(fixture.context, source, super::budget())?)?
+        .collect::<Vec<_>>();
+    let first_header = first
+        .iter()
+        .find_map(|event| match event {
+            QueryEvent::Header(header) => Some(header),
+            QueryEvent::Batch(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("initial SQL correlation header missing")?;
+    assert!(first_header.correlation_snapshot().is_some());
+    let first_batch = first
+        .iter()
+        .find_map(|event| match event {
+            QueryEvent::Batch(batch) => Some(batch.clone()),
+            QueryEvent::Header(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("initial SQL correlation batch missing")?;
+    assert_eq!(first_batch.records()[0].body_text(), Some("third"));
+    assert_eq!(
+        first_batch.correlation_outcome(0),
+        Some(CorrelationOutcome::Matched {
+            trace_id: third_trace,
+            span_id: Some(third_span),
+        })
+    );
+    let cursor = first
+        .iter()
+        .find_map(|event| match event {
+            QueryEvent::Terminal(QueryTerminal::Continued(cursor)) => Some(cursor.clone()),
+            QueryEvent::Header(_) | QueryEvent::Batch(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("initial SQL correlation cursor missing")?;
+
+    fixture.kernel.append_trace([0x97; 16], [0x98; 8], 23, 7)?;
+    fixture
+        .kernel
+        .append_log_with_trace("later", 23, [0x97; 16], [0x98; 8], 8)?;
+    let resumed = service
+        .resume(fixture.context, &cursor)?
+        .collect::<Vec<_>>();
+    let resumed_header = resumed
+        .iter()
+        .find_map(|event| match event {
+            QueryEvent::Header(header) => Some(header),
+            QueryEvent::Batch(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("resumed SQL correlation header missing")?;
+    assert!(resumed_header.correlation_snapshot().is_some());
+    let resumed_batch = resumed
+        .iter()
+        .find_map(|event| match event {
+            QueryEvent::Batch(batch) => Some(batch.clone()),
+            QueryEvent::Header(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("resumed SQL correlation batch missing")?;
+    assert_eq!(resumed_batch.records()[0].body_text(), Some("second"));
+    assert_eq!(
+        resumed_batch.correlation_outcome(0),
+        Some(CorrelationOutcome::Matched {
+            trace_id: second_trace,
+            span_id: Some(second_span),
+        })
+    );
+    let next_cursor = resumed
+        .iter()
+        .find_map(|event| match event {
+            QueryEvent::Terminal(QueryTerminal::Continued(cursor)) => Some(cursor.clone()),
+            QueryEvent::Header(_) | QueryEvent::Batch(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("resumed SQL correlation cursor missing")?;
+    let replay = service
+        .resume(fixture.context, &cursor)?
+        .collect::<Vec<_>>();
+    let replayed_batch = replay
+        .iter()
+        .find_map(|event| match event {
+            QueryEvent::Batch(batch) => Some(batch),
+            QueryEvent::Header(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("replayed SQL correlation batch missing")?;
+    assert_eq!(replayed_batch, &resumed_batch);
+    assert_eq!(replayed_batch.digest(), resumed_batch.digest());
+
+    let final_page = service
+        .resume(fixture.context, &next_cursor)?
+        .collect::<Vec<_>>();
+    let final_batch = final_page
+        .iter()
+        .find_map(|event| match event {
+            QueryEvent::Batch(batch) => Some(batch),
+            QueryEvent::Header(_) | QueryEvent::Terminal(_) => None,
+        })
+        .ok_or("final SQL correlation batch missing")?;
+    assert_eq!(final_batch.records()[0].body_text(), Some("first"));
+    assert!(matches!(
+        final_page.last(),
+        Some(QueryEvent::Terminal(QueryTerminal::Complete(_)))
+    ));
+    Ok(())
+}
+
+#[test]
 fn correlation_cursor_replays_the_same_paired_batch_after_an_ambiguous_disconnect()
 -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("correlation-cursor-replay")?;
