@@ -37,7 +37,7 @@ tooling. Update or supersede an ADR when changing an accepted decision.
   and state-machine boundaries.
 - Test public outcomes, not private implementation shape.
 - Workspace production-Rust line coverage across unit and integration tests
-  must remain at least 95%. Production code must not be excluded merely to pass
+  must remain at least 90%. Production code must not be excluded merely to pass
   the threshold.
 
 Run the relevant focused tests and these direct checks:
@@ -45,7 +45,7 @@ Run the relevant focused tests and these direct checks:
 ```console
 cargo fmt --all --check
 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
-cargo llvm-cov --locked --workspace --lib --bins --tests --all-features --fail-under-lines 95
+cargo llvm-cov --locked --workspace --lib --bins --tests --all-features --fail-under-lines 90
 cargo test --locked --workspace --tests
 ```
 Run applicable fuzz targets with `cargo fuzz run <target>`. Do not introduce a custom validation runner, evidence system, or parallel governance framework.

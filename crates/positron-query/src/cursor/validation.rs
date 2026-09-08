@@ -139,7 +139,7 @@ mod tests {
         CURRENT_PREFIX_BYTES, CURSOR_BYTES, ControlTokenFailure, QueryCursor, QueryFailureCode,
         map_protection_failure, source_length,
     };
-    use crate::cursor::{CursorState, encode};
+    use crate::cursor::{CursorState, decode, encode};
     use crate::{
         LogicalPlan, QueryBudget, QueryCancellation, TemporalAxis, TemporalRange,
         query_service::QueryLanguage,
@@ -278,5 +278,21 @@ mod tests {
             source_length(&cursor).expect("complete paired cursor preserves its source length"),
             u64::try_from(CORRELATED_SOURCE.len()).expect("test source fits u64")
         );
+    }
+
+    #[test]
+    fn authenticated_v6_cursor_round_trips_the_complete_paired_snapshot_binding() {
+        let protector = positron_kernel::fuzz_control_token_protector();
+        let cursor = encode(&protector, correlated_state(&protector))
+            .expect("complete paired cursor state encodes");
+
+        let decoded = decode(&protector, &cursor)
+            .expect("authenticated v6 cursor decodes its paired snapshot binding");
+        assert_eq!(decoded.source.as_deref(), Some(CORRELATED_SOURCE));
+        assert_eq!(decoded.language, Some(QueryLanguage::Pipeline));
+        assert_eq!(decoded.trace_catalog_identity, Some([5; 32]));
+        assert_eq!(decoded.trace_catalog_generation, Some(9));
+        assert_eq!(decoded.trace_frontier, Some(2));
+        assert_eq!(decoded.trace_lease_identity, Some([6; 16]));
     }
 }
