@@ -4,7 +4,8 @@ use std::sync::Arc;
 use positron_domain::identity::TenantId;
 use positron_kernel::{
     CatalogPublicationFault, LedgerFailureCode, ResourceDimension, SnapshotLeaseId, WorkClass,
-    with_catalog_publication_fault_after, with_catalog_publication_hook_after,
+    with_catalog_publication_fault_after, with_catalog_publication_fault_sequence_after,
+    with_catalog_publication_hook_after,
 };
 use positron_query::{
     CorrelationOutcome, QueryBudget, QueryBudgetDimension, QueryEvent, QueryFailureCode,
@@ -404,6 +405,63 @@ fn correlation_target_release_failure_is_terminal_and_retries_on_drop() -> Resul
 }
 
 #[test]
+fn correlation_source_release_failure_is_terminal_and_retries_on_drop() -> Result<(), Box<dyn Error>>
+{
+    let fixture = QueryFixture::new("correlation-source-release-retry")?;
+    let trace_id = [0x97; 16];
+    let span_id = [0x98; 8];
+    fixture.kernel.append_trace(trace_id, span_id, 20, 1)?;
+    fixture
+        .kernel
+        .append_log_with_trace("accepted", 20, trace_id, span_id, 2)?;
+    let service = fixture.correlation_service(16)?;
+    let mut stream = service.execute_page(service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | correlate trace | limit 1",
+        super::budget(),
+    )?)?;
+    let header = match stream.next() {
+        Some(QueryEvent::Header(header)) => header,
+        Some(QueryEvent::Batch(_) | QueryEvent::Terminal(_)) | None => {
+            return Err("correlation query did not return its paired header".into());
+        },
+    };
+    let source_lease = SnapshotLeaseId::new(header.lease().identity())?;
+    let trace_lease = SnapshotLeaseId::new(
+        header
+            .correlation_snapshot()
+            .ok_or("correlation header omitted the trace lease")?
+            .trace_lease()
+            .identity(),
+    )?;
+    let failure =
+        with_catalog_publication_fault_after(CatalogPublicationFault::SynchronizeCommit, 1, || {
+            stream.cancel()
+        })
+        .expect_err("source release failure must be reported after target release");
+    assert_eq!(failure.code(), QueryFailureCode::StoreUnavailable);
+    assert!(matches!(
+        stream.next(),
+        Some(QueryEvent::Terminal(QueryTerminal::Incomplete(incomplete)))
+            if incomplete.code() == QueryFailureCode::StoreUnavailable
+    ));
+    drop(stream);
+    for (ledger, lease) in [
+        (fixture.kernel.ledger()?, source_lease),
+        (fixture.kernel.trace_ledger()?, trace_lease),
+    ] {
+        assert_eq!(
+            ledger
+                .snapshot_lease_usage(lease, 100)
+                .expect_err("drop must release each paired lease")
+                .code(),
+            LedgerFailureCode::SnapshotExpired
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn correlation_target_admission_failure_releases_the_already_admitted_log_lease()
 -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("correlation-target-admission-cleanup")?;
@@ -442,6 +500,30 @@ fn correlation_sequential_target_admission_failure_releases_the_log_lease()
             service.execute(query)
         })
         .expect_err("sequential target lease admission must report its publication failure");
+    assert_eq!(failure.code(), QueryFailureCode::StoreUnavailable);
+    assert_eq!(fixture.kernel.authority.governor().inspect()?, baseline);
+    Ok(())
+}
+
+#[test]
+fn correlation_target_admission_reports_a_source_cleanup_failure() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("correlation-target-admission-cleanup-failure")?;
+    let service = fixture.correlation_service(1)?;
+    let baseline = fixture.kernel.authority.governor().inspect()?;
+    let query = service.plan_pipeline(
+        fixture.context,
+        "pipeline:v1 logs | range query_time -100 100 | correlate trace | limit 1",
+        super::budget(),
+    )?;
+
+    let failure = with_catalog_publication_fault_sequence_after(
+        &[
+            (CatalogPublicationFault::SynchronizeCommit, 1),
+            (CatalogPublicationFault::SynchronizeCommit, 0),
+        ],
+        || service.execute_page(query),
+    )
+    .expect_err("target admission and source cleanup failures must be surfaced");
     assert_eq!(failure.code(), QueryFailureCode::StoreUnavailable);
     assert_eq!(fixture.kernel.authority.governor().inspect()?, baseline);
     Ok(())

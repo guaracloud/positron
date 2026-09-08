@@ -18,13 +18,18 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         source_lease: SnapshotLeaseId,
         primary: QueryFailure,
     ) -> QueryFailure {
-        match self
-            .ledger
-            .release_snapshot_lease(source_lease)
-            .map_err(map_ledger_failure)
-        {
+        match self.ledger.release_snapshot_lease(source_lease) {
             Ok(()) => primary,
-            Err(cleanup) => crate::failure::stronger_failure(primary, cleanup),
+            Err(first_cleanup) => {
+                let cleanup = map_ledger_failure(first_cleanup);
+                match self.ledger.release_snapshot_lease(source_lease) {
+                    Ok(()) => crate::failure::stronger_failure(primary, cleanup),
+                    Err(retry_cleanup) => crate::failure::stronger_failure(
+                        crate::failure::stronger_failure(primary, cleanup),
+                        map_ledger_failure(retry_cleanup),
+                    ),
+                }
+            },
         }
     }
 
