@@ -484,6 +484,31 @@ fn trace_by_id_returns_the_committed_active_trace_from_its_snapshot() -> Result<
     drop(searched);
     assert!(search_work.work() > selection_start);
 
+    let cumulative = ExactWork::new(search_work.work());
+    let first_cumulative = store.search_observed(
+        authority.governor(),
+        tenant,
+        &snapshot,
+        TraceSearch::all(ScanLimit::new(2)?),
+        &NeverCancelled,
+        &cumulative,
+    )?;
+    drop(first_cumulative);
+    let cumulative_failure = store
+        .search_observed(
+            authority.governor(),
+            tenant,
+            &snapshot,
+            TraceSearch::all(ScanLimit::new(2)?),
+            &NeverCancelled,
+            &cumulative,
+        )
+        .expect_err("one shared observer must bound cumulative searches");
+    assert_eq!(
+        cumulative_failure.code(),
+        TraceStoreFailureCode::BudgetExhausted
+    );
+
     let bounded_selection = ExactWork::new(selection_start);
     let selection_failure = store
         .search_observed(
