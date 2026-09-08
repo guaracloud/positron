@@ -261,7 +261,7 @@ pub struct QueryHeader {
     lease: ResultLease,
     initial_cursor: Option<QueryCursor>,
     tail_phase: Option<TailPhase>,
-    correlation_snapshot: Option<CorrelationSnapshot>,
+    correlation_snapshot: Option<Box<CorrelationSnapshot>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -294,11 +294,11 @@ impl QueryHeader {
         self.tail_phase = Some(phase);
         self
     }
-    pub(crate) const fn with_correlation_snapshot(
+    pub(crate) fn with_correlation_snapshot(
         mut self,
         correlation_snapshot: CorrelationSnapshot,
     ) -> Self {
-        self.correlation_snapshot = Some(correlation_snapshot);
+        self.correlation_snapshot = Some(Box::new(correlation_snapshot));
         self
     }
     #[must_use]
@@ -330,7 +330,7 @@ impl QueryHeader {
         self.tail_phase
     }
     #[must_use]
-    pub const fn correlation_snapshot(&self) -> Option<CorrelationSnapshot> {
-        self.correlation_snapshot
+    pub fn correlation_snapshot(&self) -> Option<CorrelationSnapshot> {
+        self.correlation_snapshot.as_deref().copied()
     }
 }

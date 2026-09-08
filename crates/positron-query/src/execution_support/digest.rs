@@ -25,16 +25,7 @@ pub(crate) fn batch_digest(
     memory: &mut crate::memory::QueryMemory,
 ) -> Result<[u8; 32], QueryFailure> {
     memory.acquire(DIGEST_STATE_BYTES)?;
-    let result = batch_digest_with_acquired_state(
-        protector,
-        input.prior,
-        input.sequence,
-        input.plan,
-        input.records,
-        input.correlations,
-        input.cancellation,
-        input.observer,
-    );
+    let result = batch_digest_with_acquired_state(protector, input);
     memory.release(DIGEST_STATE_BYTES)?;
     result
 }
@@ -64,14 +55,20 @@ pub(crate) fn result_digest(
 
 fn batch_digest_with_acquired_state(
     protector: &positron_kernel::ControlTokenProtector<'_>,
-    prior: [u8; 32],
-    sequence: u64,
-    plan: &LogicalPlan,
-    records: &[QueryRecord],
-    correlations: Option<&[CorrelationOutcome]>,
-    cancellation: &crate::QueryCancellation,
-    observer: &mut impl positron_domain::value::NativeValueObserver<Error = QueryFailure>,
+    input: BatchDigestInput<
+        '_,
+        impl positron_domain::value::NativeValueObserver<Error = QueryFailure>,
+    >,
 ) -> Result<[u8; 32], QueryFailure> {
+    let BatchDigestInput {
+        prior,
+        sequence,
+        plan,
+        records,
+        correlations,
+        cancellation,
+        observer,
+    } = input;
     check_digest_cancellation(cancellation)?;
     let mut digest = protector
         .query_result_digest()

@@ -151,11 +151,13 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         self.run_page(
             state,
             lease.snapshot(),
-            trace_lease.as_ref().map(|lease| lease.snapshot()),
-            trace_lease.as_ref().map(|lease| lease.identity()),
-            limit,
-            false,
-            schema,
+            super::page::PageInput {
+                trace_snapshot: trace_lease.as_ref().map(|lease| lease.snapshot()),
+                trace_lease: trace_lease.as_ref().map(|lease| lease.identity()),
+                batch_limit: limit,
+                pagination: false,
+                schema,
+            },
             resources,
         )
     }
@@ -278,11 +280,13 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         self.run_page(
             state,
             lease.snapshot(),
-            trace_lease.as_ref().map(|lease| lease.snapshot()),
-            trace_lease.as_ref().map(|lease| lease.identity()),
-            self.batch_limit,
-            true,
-            None,
+            super::page::PageInput {
+                trace_snapshot: trace_lease.as_ref().map(|lease| lease.snapshot()),
+                trace_lease: trace_lease.as_ref().map(|lease| lease.identity()),
+                batch_limit: self.batch_limit,
+                pagination: true,
+                schema: None,
+            },
             resources,
         )
     }
@@ -575,11 +579,13 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         self.run_page(
             state,
             lease.snapshot(),
-            trace_snapshot.as_ref().map(|lease| lease.snapshot()),
-            trace_lease_identity,
-            self.batch_limit,
-            true,
-            None,
+            super::page::PageInput {
+                trace_snapshot: trace_snapshot.as_ref().map(|lease| lease.snapshot()),
+                trace_lease: trace_lease_identity,
+                batch_limit: self.batch_limit,
+                pagination: true,
+                schema: None,
+            },
             resources,
         )
     }

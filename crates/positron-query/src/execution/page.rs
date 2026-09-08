@@ -11,18 +11,31 @@ use crate::execution_support::{
 };
 use crate::{QueryBatch, QueryEvent, QueryFailure, QueryFailureCode, QueryService, QueryStream};
 use positron_kernel::LedgerSnapshot;
+
+/// The already-admitted inputs that determine one bounded result page.
+pub(super) struct PageInput<'snapshot, 'kernel, 'schema> {
+    pub(super) trace_snapshot: Option<&'snapshot LedgerSnapshot<'kernel>>,
+    pub(super) trace_lease: Option<positron_kernel::SnapshotLeaseId>,
+    pub(super) batch_limit: u16,
+    pub(super) pagination: bool,
+    pub(super) schema: Option<&'schema positron_signals::SchemaCatalog>,
+}
+
 impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
-    pub(super) fn run_page(
+    pub(super) fn run_page<'snapshot, 'schema>(
         &self,
         mut state: CursorState,
         snapshot: &LedgerSnapshot<'kernel>,
-        trace_snapshot: Option<&LedgerSnapshot<'kernel>>,
-        trace_lease: Option<positron_kernel::SnapshotLeaseId>,
-        batch_limit: u16,
-        pagination: bool,
-        schema: Option<&positron_signals::SchemaCatalog>,
+        input: PageInput<'snapshot, 'kernel, 'schema>,
         resources: ExecutionResources,
     ) -> Result<QueryStream<'ledger>, QueryFailure> {
+        let PageInput {
+            trace_snapshot,
+            trace_lease,
+            batch_limit,
+            pagination,
+            schema,
+        } = input;
         let delivered_before = stats_before_current(&state);
         let initially_exhausted = match self.observe_state(&mut state) {
             Ok(exhausted) => exhausted,
