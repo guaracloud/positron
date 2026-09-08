@@ -11,6 +11,7 @@ use crate::{PlannedQuery, QueryCursor, QueryFailure, QueryFailureCode, QueryServ
 use super::resources::ExecutionResources;
 
 const MAX_RESUME_CATALOG_RETRIES: u8 = 1;
+const SOURCE_LEASE_RELEASE_ATTEMPTS: u8 = 3;
 
 impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
     fn fail_after_source_lease(
@@ -18,19 +19,17 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         source_lease: SnapshotLeaseId,
         primary: QueryFailure,
     ) -> QueryFailure {
-        match self.ledger.release_snapshot_lease(source_lease) {
-            Ok(()) => primary,
-            Err(first_cleanup) => {
-                let cleanup = map_ledger_failure(first_cleanup);
-                match self.ledger.release_snapshot_lease(source_lease) {
-                    Ok(()) => crate::failure::stronger_failure(primary, cleanup),
-                    Err(retry_cleanup) => crate::failure::stronger_failure(
-                        crate::failure::stronger_failure(primary, cleanup),
-                        map_ledger_failure(retry_cleanup),
-                    ),
-                }
-            },
+        let mut strongest = primary;
+        for _ in 0..SOURCE_LEASE_RELEASE_ATTEMPTS {
+            match self.ledger.release_snapshot_lease(source_lease) {
+                Ok(()) => return strongest,
+                Err(cleanup) => {
+                    strongest =
+                        crate::failure::stronger_failure(strongest, map_ledger_failure(cleanup));
+                },
+            }
         }
+        strongest
     }
 
     pub fn execute(

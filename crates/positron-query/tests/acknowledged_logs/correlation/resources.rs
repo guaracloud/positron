@@ -506,7 +506,8 @@ fn correlation_sequential_target_admission_failure_releases_the_log_lease()
 }
 
 #[test]
-fn correlation_target_admission_reports_a_source_cleanup_failure() -> Result<(), Box<dyn Error>> {
+fn correlation_target_admission_retries_repeated_source_cleanup_failures()
+-> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("correlation-target-admission-cleanup-failure")?;
     let service = fixture.correlation_service(1)?;
     let baseline = fixture.kernel.authority.governor().inspect()?;
@@ -520,10 +521,11 @@ fn correlation_target_admission_reports_a_source_cleanup_failure() -> Result<(),
         &[
             (CatalogPublicationFault::SynchronizeCommit, 1),
             (CatalogPublicationFault::SynchronizeCommit, 0),
+            (CatalogPublicationFault::SynchronizeCommit, 0),
         ],
         || service.execute_page(query),
     )
-    .expect_err("target admission and source cleanup failures must be surfaced");
+    .expect_err("target admission and repeated source cleanup failures must be surfaced");
     assert_eq!(failure.code(), QueryFailureCode::StoreUnavailable);
     assert_eq!(fixture.kernel.authority.governor().inspect()?, baseline);
     Ok(())
