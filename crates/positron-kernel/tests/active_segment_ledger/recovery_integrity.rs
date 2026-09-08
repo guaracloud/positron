@@ -120,9 +120,13 @@ fn recovery_rejects_committed_frame_corruption_and_truncation() -> Result<(), Bo
                 .open(&path)?
                 .set_len(length - 1)?;
         } else {
-            let mut file = OpenOptions::new().write(true).open(&path)?;
+            let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
             file.seek(SeekFrom::End(-1))?;
-            file.write_all(&[0xa5])?;
+            let mut byte = [0_u8; 1];
+            file.read_exact(&mut byte)?;
+            byte[0] ^= 1;
+            file.seek(SeekFrom::End(-1))?;
+            file.write_all(&byte)?;
             file.sync_all()?;
         }
 

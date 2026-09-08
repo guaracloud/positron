@@ -858,6 +858,7 @@ fn service_relationships_refuse_unreserved_high_cardinality_identity_output_with
     drop(relationships);
     drop(admissible);
     assert_eq!(authority.governor().inspect()?.outstanding_total(), before);
+
     Ok(())
 }
 

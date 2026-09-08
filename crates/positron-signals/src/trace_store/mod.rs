@@ -28,7 +28,8 @@ pub use observation::{EvaluatedSpanObservationInput, SamplingDecision, SpanKind,
 pub use relationships::{
     TraceServiceIdentity, TraceServiceIdentityState, TraceServiceRelationship,
     TraceServiceRelationshipIncompleteness, TraceServiceRelationshipPair,
-    TraceServiceRelationshipSnapshot, TraceServiceRelationshipTraceIncompleteness,
+    TraceServiceRelationshipSelection, TraceServiceRelationshipSnapshot,
+    TraceServiceRelationshipSnapshotLimitation, TraceServiceRelationshipTraceIncompleteness,
     TraceServiceRelationships,
 };
 pub use scan::{ScannedSpanObservation, TraceIncompleteness, TraceScan, TraceScanResult};

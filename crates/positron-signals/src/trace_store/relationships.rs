@@ -1,19 +1,21 @@
 use std::{
-    cell::RefCell,
     cmp::Ordering,
     collections::hash_map::RandomState,
     hash::{BuildHasher, Hash, Hasher},
     mem::size_of,
 };
 
-use positron_domain::{routing::CommitPosition, value::AttributeNamespace};
+use positron_domain::{
+    routing::{CommitPosition, RecordOrdinal},
+    value::AttributeNamespace,
+};
 use positron_kernel::{CatalogGenerationId, LedgerSnapshot, ResourceReservation, SegmentScope};
 
 use crate::{ScanCancellation, ScanObserver};
 
 use super::{
     LogicalSpan, LogicalTraceScanResult, SamplingDecision, TraceByIdSummary, TraceIncompleteness,
-    TraceStoreFailure,
+    TraceScan, TraceStoreFailure,
 };
 
 /// The authenticated identity state of one service endpoint field.
@@ -247,6 +249,46 @@ pub struct TraceServiceRelationshipIncompleteness {
     traces: Vec<TraceServiceRelationshipTraceIncompleteness>,
 }
 
+/// The exact physical bounds selected for one relationship derivation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TraceServiceRelationshipSelection {
+    after_position: Option<CommitPosition>,
+    after_record: Option<(CommitPosition, RecordOrdinal)>,
+    frontier: CommitPosition,
+}
+
+impl TraceServiceRelationshipSelection {
+    #[must_use]
+    pub const fn after_position(&self) -> Option<CommitPosition> {
+        self.after_position
+    }
+
+    #[must_use]
+    pub const fn after_record(&self) -> Option<(CommitPosition, RecordOrdinal)> {
+        self.after_record
+    }
+
+    /// Returns the inclusive selected upper frontier, resolved against the snapshot.
+    #[must_use]
+    pub const fn frontier(&self) -> CommitPosition {
+        self.frontier
+    }
+
+    fn covers_snapshot(&self, snapshot_frontier: CommitPosition) -> bool {
+        self.after_position.is_none()
+            && self.after_record.is_none()
+            && self.frontier == snapshot_frontier
+    }
+}
+
+/// The explicit reason a relationship result cannot represent its whole snapshot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TraceServiceRelationshipSnapshotLimitation {
+    ResultLimit,
+    ScannedBytesLimit,
+    SelectedRange,
+}
+
 impl TraceServiceRelationshipIncompleteness {
     #[must_use]
     pub const fn scan(&self) -> TraceIncompleteness {
@@ -262,8 +304,11 @@ impl TraceServiceRelationshipIncompleteness {
 #[derive(Debug)]
 pub struct TraceServiceRelationshipSnapshot<'kernel> {
     pairs: Vec<TraceServiceRelationshipPair>,
+    selected_range_complete: bool,
     snapshot_complete: bool,
     relationships_complete: bool,
+    selection: TraceServiceRelationshipSelection,
+    snapshot_limitation: Option<TraceServiceRelationshipSnapshotLimitation>,
     incompleteness: TraceServiceRelationshipIncompleteness,
     scanned_bytes: u64,
     decoded_observations: u64,
@@ -281,7 +326,17 @@ struct PairIndexSlot {
 }
 
 impl TraceServiceRelationshipSnapshot<'_> {
-    /// Whether the bounded scan reached this snapshot's selected frontier.
+    /// Whether the bounded scan exhausted its explicit physical selection.
+    #[must_use]
+    pub const fn selected_range_complete(&self) -> bool {
+        self.selected_range_complete
+    }
+
+    /// Whether the bounded scan exhausted this snapshot's complete physical range.
+    ///
+    /// A successful `after`, `through`, or `between` selection remains false:
+    /// it is complete for its selected range but cannot establish whole-snapshot
+    /// relationship evidence.
     /// This makes no claim that any trace is complete.
     #[must_use]
     pub const fn snapshot_complete(&self) -> bool {
@@ -292,6 +347,15 @@ impl TraceServiceRelationshipSnapshot<'_> {
     #[must_use]
     pub const fn relationships_complete(&self) -> bool {
         self.relationships_complete
+    }
+    #[must_use]
+    pub const fn selection(&self) -> TraceServiceRelationshipSelection {
+        self.selection
+    }
+    /// Returns why the result cannot establish whole-snapshot evidence.
+    #[must_use]
+    pub const fn snapshot_limitation(&self) -> Option<TraceServiceRelationshipSnapshotLimitation> {
+        self.snapshot_limitation
     }
     #[must_use]
     pub fn pairs(&self) -> &[TraceServiceRelationshipPair] {
@@ -334,6 +398,7 @@ impl TraceServiceRelationshipSnapshot<'_> {
 pub(super) fn aggregate<'kernel>(
     logical: LogicalTraceScanResult<'kernel>,
     snapshot: &LedgerSnapshot<'_>,
+    scan: TraceScan,
     cancellation: &dyn ScanCancellation,
     observer: &dyn ScanObserver,
 ) -> Result<TraceServiceRelationshipSnapshot<'kernel>, TraceStoreFailure> {
@@ -347,7 +412,7 @@ pub(super) fn aggregate<'kernel>(
         mut _capacity,
         ..
     } = logical;
-    let scan = if complete {
+    let scan_incompleteness = if complete {
         TraceIncompleteness::None
     } else if scanned_bytes_limited {
         TraceIncompleteness::ScannedBytesLimit
@@ -405,7 +470,7 @@ pub(super) fn aggregate<'kernel>(
             super::structural::StructuralInput {
                 spans: group,
                 summary: &summary,
-                scan,
+                scan: scan_incompleteness,
                 filtered: false,
                 retained_size_bytes: aggregate_retained_size,
             },
@@ -478,15 +543,39 @@ pub(super) fn aggregate<'kernel>(
         }
         start = end;
     }
-    sort_pairs_observed(&mut pairs, cancellation, observer)?;
+    drop(index);
+    aggregate_retained_size = aggregate_retained_size
+        .checked_sub(index_bytes)
+        .ok_or_else(TraceStoreFailure::limit_exceeded)?;
     super::scan::resize_capacity(&mut _capacity, aggregate_retained_size.max(1))?;
-    let relationships_complete = complete && incomplete_traces.is_empty();
+    sort_pairs_observed(&mut pairs, cancellation, observer)?;
+    let selection = TraceServiceRelationshipSelection {
+        after_position: scan.after_position(),
+        after_record: scan.after_record(),
+        frontier: scan.frontier().unwrap_or(snapshot.frontier()),
+    };
+    let snapshot_complete = complete && selection.covers_snapshot(snapshot.frontier());
+    let snapshot_limitation = if !complete {
+        Some(if scanned_bytes_limited {
+            TraceServiceRelationshipSnapshotLimitation::ScannedBytesLimit
+        } else {
+            TraceServiceRelationshipSnapshotLimitation::ResultLimit
+        })
+    } else if !snapshot_complete {
+        Some(TraceServiceRelationshipSnapshotLimitation::SelectedRange)
+    } else {
+        None
+    };
+    let relationships_complete = snapshot_complete && incomplete_traces.is_empty();
     Ok(TraceServiceRelationshipSnapshot {
         pairs,
-        snapshot_complete: complete,
+        selected_range_complete: complete,
+        snapshot_complete,
         relationships_complete,
+        selection,
+        snapshot_limitation,
         incompleteness: TraceServiceRelationshipIncompleteness {
-            scan,
+            scan: scan_incompleteness,
             traces: incomplete_traces,
         },
         scanned_bytes,
@@ -693,16 +782,70 @@ fn sort_pairs_observed(
     cancellation: &dyn ScanCancellation,
     observer: &dyn ScanObserver,
 ) -> Result<(), TraceStoreFailure> {
-    let failure = RefCell::new(None);
-    pairs.sort_by(|left, right| {
-        if failure.borrow().is_none()
-            && let Err(error) = observe(cancellation, observer)
-        {
-            *failure.borrow_mut() = Some(error);
+    let length = pairs.len();
+    let mut root = length / 2;
+    while root > 0 {
+        root = root
+            .checked_sub(1)
+            .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+        sift_pair_down(pairs, root, length, cancellation, observer)?;
+    }
+    let mut end = length;
+    while end > 1 {
+        observe(cancellation, observer)?;
+        end = end
+            .checked_sub(1)
+            .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+        pairs.swap(0, end);
+        sift_pair_down(pairs, 0, end, cancellation, observer)?;
+    }
+    Ok(())
+}
+
+fn sift_pair_down(
+    pairs: &mut [TraceServiceRelationshipPair],
+    mut root: usize,
+    end: usize,
+    cancellation: &dyn ScanCancellation,
+    observer: &dyn ScanObserver,
+) -> Result<(), TraceStoreFailure> {
+    loop {
+        observe(cancellation, observer)?;
+        let left = root
+            .checked_mul(2)
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+        if left >= end {
+            return Ok(());
         }
-        left.compare_pair(right)
-    });
-    failure.into_inner().map_or(Ok(()), Err)
+        let right = left
+            .checked_add(1)
+            .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+        let child = if right < end && compare_pairs(pairs, left, right)?.is_lt() {
+            right
+        } else {
+            left
+        };
+        if !compare_pairs(pairs, root, child)?.is_lt() {
+            return Ok(());
+        }
+        pairs.swap(root, child);
+        root = child;
+    }
+}
+
+fn compare_pairs(
+    pairs: &[TraceServiceRelationshipPair],
+    left: usize,
+    right: usize,
+) -> Result<Ordering, TraceStoreFailure> {
+    let left = pairs
+        .get(left)
+        .ok_or_else(TraceStoreFailure::invalid_input)?;
+    let right = pairs
+        .get(right)
+        .ok_or_else(TraceStoreFailure::invalid_input)?;
+    Ok(left.compare_pair(right))
 }
 
 fn reserve_aggregate_growth(
@@ -903,4 +1046,58 @@ fn observe(
         .observe_work(1)
         .map_err(TraceStoreFailure::observation)?;
     super::scan::check_cancel(cancellation)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::TraceStoreFailureCode;
+
+    struct AlreadyCancelled;
+
+    impl ScanCancellation for AlreadyCancelled {
+        fn is_cancelled(&self) -> bool {
+            true
+        }
+    }
+
+    struct Unobserved;
+
+    impl ScanObserver for Unobserved {
+        fn observe_work(&self, _units: u64) -> Result<(), crate::ScanObservationFailureCode> {
+            Ok(())
+        }
+    }
+
+    fn pair(parent_service: &str) -> TraceServiceRelationshipPair {
+        TraceServiceRelationshipPair {
+            parent_service: Some(parent_service.to_owned()),
+            child_service: None,
+            parent_service_namespace: None,
+            child_service_namespace: None,
+            parent_identity: TraceServiceIdentityState::Exact,
+            child_identity: TraceServiceIdentityState::Missing,
+            parent_namespace_identity: TraceServiceIdentityState::Missing,
+            child_namespace_identity: TraceServiceIdentityState::Missing,
+            parent_sampling_counts: [0; 3],
+            child_sampling_counts: [0; 3],
+            edge_count: 0,
+            trace_ids: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn cancelled_pair_ordering_returns_before_rearranging_pairs() {
+        let mut pairs = vec![pair("zulu"), pair("alpha"), pair("middle")];
+        let failure = sort_pairs_observed(&mut pairs, &AlreadyCancelled, &Unobserved)
+            .expect_err("cancellation must stop ordering before pair mutation");
+        assert_eq!(failure.code(), TraceStoreFailureCode::Cancelled);
+        assert_eq!(
+            pairs
+                .iter()
+                .map(|pair| pair.parent_service())
+                .collect::<Vec<_>>(),
+            vec![Some("zulu"), Some("alpha"), Some("middle")]
+        );
+    }
 }

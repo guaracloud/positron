@@ -1,5 +1,7 @@
 use super::super::*;
-use crate::{TraceServiceIdentityState, TraceStoreFailure};
+use crate::{
+    TraceServiceIdentityState, TraceServiceRelationshipSnapshotLimitation, TraceStoreFailure,
+};
 
 #[test]
 fn snapshot_service_relationships_aggregate_two_traces_with_pair_provenance()
@@ -292,5 +294,161 @@ fn snapshot_service_relationships_aggregate_two_traces_with_pair_provenance()
         .find(|facts| facts.trace_id() == orphan_trace)
         .ok_or("missing orphan trace incompleteness")?;
     assert_eq!(missing.missing_parents(), 1);
+    assert_eq!(missing.conflicts(), 0);
+    assert_eq!(missing.cycle_members(), 0);
+    assert_eq!(missing.invalid_durations(), 0);
+    assert_eq!(missing.temporal_inconsistencies(), 0);
+    assert!(!missing.ambiguous_roots());
+    Ok(())
+}
+
+#[test]
+fn ranged_service_relationships_preserve_selected_evidence_without_claiming_the_snapshot()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0xc1; 16])?,
+        CatalogSecret::from_owned(Box::new([0xc2; 32]), Box::new([0xc3; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let shard = VirtualShardId::new(92)?;
+    let (retention_time, _) =
+        RetentionTimeAuthority::establish_with_manual_elapsed(UnixNanoseconds::new(100));
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        SegmentScope::new(tenant, SignalKind::Traces, shard),
+        SegmentProtectionKey::from_owned(Box::new([0xc4; 32])),
+    )?;
+    let service = |name: &str| {
+        AttributeOccurrenceSetCandidate::new(
+            AttributeNamespace::Resource,
+            "service.name".to_owned(),
+            vec![CandidateAttributeValue::string(name.to_owned())],
+        )
+        .validate(ValueLimitProfile::release_1_system_maximum())
+        .map_err(TraceStoreFailure::domain)
+    };
+    let span = |trace_id, span_id, parent_span_id, service_name| {
+        SpanObservation::checked_native(
+            trace_id,
+            span_id,
+            parent_span_id,
+            "range-fixture".to_owned(),
+            EventTime::received(UnixNanoseconds::new(1), SourceTimeQuality::Usable)
+                .map_err(TraceStoreFailure::domain)?,
+            EventTime::received(UnixNanoseconds::new(2), SourceTimeQuality::Usable)
+                .map_err(TraceStoreFailure::domain)?,
+            vec![service(service_name)?],
+            SpanKind::Internal,
+            SamplingDecision::Sampled,
+            positron_policy::PolicyProvenance::new(1, [0xc5; 32], Vec::new())?,
+        )
+    };
+    let store = TraceStore::new();
+    let append_trace =
+        |trace_id, parent_service, child_service, identity| -> Result<_, Box<dyn Error>> {
+            Ok(ledger.append(
+                store
+                    .prepare(
+                        ledger.begin_store_block(
+                            preparation_capacity(&authority, tenant)?,
+                            StoreBlockIdentity::new([identity; 16])?,
+                        )?,
+                        vec![
+                            span(trace_id, [0x01; 8], None, parent_service)?,
+                            span(trace_id, [0x02; 8], Some([0x01; 8]), child_service)?,
+                        ],
+                    )?
+                    .into_store_block(),
+            )?)
+        };
+    let first = append_trace([0xd1; 16], "checkout", "inventory", 0xd4)?;
+    let second = append_trace([0xd2; 16], "payments", "ledger", 0xd5)?;
+    let third = append_trace([0xd3; 16], "search", "catalog", 0xd6)?;
+    let snapshot = ledger.snapshot()?;
+
+    let after = store.service_relationships(
+        authority.governor(),
+        tenant,
+        &snapshot,
+        TraceScan::after(ScanLimit::new(8)?, first.position()),
+    )?;
+    assert!(after.selected_range_complete());
+    assert!(!after.snapshot_complete());
+    assert!(!after.relationships_complete());
+    assert_eq!(
+        after.snapshot_limitation(),
+        Some(TraceServiceRelationshipSnapshotLimitation::SelectedRange)
+    );
+    assert_eq!(after.selection().after_position(), Some(first.position()));
+    assert_eq!(after.selection().after_record(), None);
+    assert_eq!(after.selection().frontier(), snapshot.frontier());
+    assert!(after.scanned_bytes() > 0);
+    assert!(after.decoded_observations() > 0);
+    assert_eq!(
+        after
+            .pairs()
+            .iter()
+            .map(|pair| (pair.parent_service(), pair.child_service()))
+            .collect::<Vec<_>>(),
+        vec![
+            (Some("payments"), Some("ledger")),
+            (Some("search"), Some("catalog"))
+        ]
+    );
+
+    let through = store.service_relationships(
+        authority.governor(),
+        tenant,
+        &snapshot,
+        TraceScan::through(ScanLimit::new(8)?, second.position()),
+    )?;
+    assert!(through.selected_range_complete());
+    assert!(!through.snapshot_complete());
+    assert!(!through.relationships_complete());
+    assert_eq!(
+        through.snapshot_limitation(),
+        Some(TraceServiceRelationshipSnapshotLimitation::SelectedRange)
+    );
+    assert_eq!(through.selection().after_position(), None);
+    assert_eq!(through.selection().after_record(), None);
+    assert_eq!(through.selection().frontier(), second.position());
+    assert_eq!(
+        through
+            .pairs()
+            .iter()
+            .map(|pair| (pair.parent_service(), pair.child_service()))
+            .collect::<Vec<_>>(),
+        vec![
+            (Some("checkout"), Some("inventory")),
+            (Some("payments"), Some("ledger"))
+        ]
+    );
+
+    let between = store.service_relationships(
+        authority.governor(),
+        tenant,
+        &snapshot,
+        TraceScan::between(ScanLimit::new(8)?, first.position(), second.position()),
+    )?;
+    assert!(between.selected_range_complete());
+    assert!(!between.snapshot_complete());
+    assert!(!between.relationships_complete());
+    assert_eq!(
+        between.snapshot_limitation(),
+        Some(TraceServiceRelationshipSnapshotLimitation::SelectedRange)
+    );
+    assert_eq!(between.selection().after_position(), Some(first.position()));
+    assert_eq!(between.selection().after_record(), None);
+    assert_eq!(between.selection().frontier(), second.position());
+    assert_eq!(between.pairs().len(), 1);
+    assert_eq!(between.pairs()[0].parent_service(), Some("payments"));
+    assert_eq!(between.pairs()[0].child_service(), Some("ledger"));
+    assert_eq!(third.position(), snapshot.frontier());
     Ok(())
 }

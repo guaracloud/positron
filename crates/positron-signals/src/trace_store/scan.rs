@@ -522,7 +522,7 @@ impl super::TraceStore {
     ) -> Result<super::TraceServiceRelationshipSnapshot<'kernel>, TraceStoreFailure> {
         let logical =
             self.scan_observed(governor, tenant, snapshot, scan, cancellation, observer)?;
-        super::relationships::aggregate(logical, snapshot, cancellation, observer)
+        super::relationships::aggregate(logical, snapshot, scan, cancellation, observer)
     }
 
     /// Retrieves one trace and binds existing summary facts only when their
