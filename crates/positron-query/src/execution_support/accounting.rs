@@ -30,7 +30,6 @@ pub(crate) fn charge_output(
     page: &[QueryRecord],
     correlations: Option<&[CorrelationOutcome]>,
     cancellation: &crate::QueryCancellation,
-    logical_delivery: bool,
 ) -> Result<(), QueryFailure> {
     let rows = u64::try_from(page.len())
         .map_err(|_| QueryFailure::budget_exhausted(QueryBudgetDimension::OutputRows))?;
@@ -38,12 +37,10 @@ pub(crate) fn charge_output(
         .physical_output_rows
         .checked_add(rows)
         .ok_or_else(|| QueryFailure::budget_exhausted(QueryBudgetDimension::OutputRows))?;
-    if logical_delivery {
-        state.output_rows = state
-            .output_rows
-            .checked_add(rows)
-            .ok_or_else(|| QueryFailure::budget_exhausted(QueryBudgetDimension::OutputRows))?;
-    }
+    state.output_rows = state
+        .output_rows
+        .checked_add(rows)
+        .ok_or_else(|| QueryFailure::budget_exhausted(QueryBudgetDimension::OutputRows))?;
     let mut page_bytes = 0_u64;
     validate_correlations(page, correlations)?;
     for (index, record) in page.iter().enumerate() {
@@ -66,12 +63,10 @@ pub(crate) fn charge_output(
         .physical_output_bytes
         .checked_add(page_bytes)
         .ok_or_else(|| QueryFailure::budget_exhausted(QueryBudgetDimension::OutputBytes))?;
-    if logical_delivery {
-        state.output_bytes = state
-            .output_bytes
-            .checked_add(page_bytes)
-            .ok_or_else(|| QueryFailure::budget_exhausted(QueryBudgetDimension::OutputBytes))?;
-    }
+    state.output_bytes = state
+        .output_bytes
+        .checked_add(page_bytes)
+        .ok_or_else(|| QueryFailure::budget_exhausted(QueryBudgetDimension::OutputBytes))?;
     Ok(())
 }
 

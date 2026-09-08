@@ -349,10 +349,36 @@ const fn order_direction_tag(direction: crate::plan::OrderDirection) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{
-        check_digest_cancellation, map_domain_value_failure, query_time_provenance_tag,
-        result_value_type_tag, source_time_quality_tag,
+        BatchDigestInput, batch_digest, check_digest_cancellation, map_domain_value_failure,
+        query_time_provenance_tag, result_value_type_tag, source_time_quality_tag,
     };
-    use crate::QueryFailureCode;
+    use crate::{
+        CorrelationOutcome, LogicalPlan, QueryCancellation, QueryFailure, QueryFailureCode,
+        QueryRecord, TemporalAxis, TemporalRange,
+    };
+
+    struct NoopObserver;
+
+    impl positron_domain::value::NativeValueObserver for NoopObserver {
+        type Error = QueryFailure;
+
+        fn observe_structure(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn observe_payload(&mut self, _payload: &[u8]) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    fn digest_plan() -> LogicalPlan {
+        LogicalPlan::logs(
+            TemporalAxis::QueryTime,
+            TemporalRange::new(-1, 1).expect("ordered digest range"),
+            1,
+        )
+        .with_log_to_trace_correlation()
+    }
 
     #[test]
     fn typed_digest_vocabulary_and_domain_failures_remain_stable() {
@@ -391,5 +417,49 @@ mod tests {
             map_domain_value_failure(domain_failure).code(),
             QueryFailureCode::Internal
         );
+    }
+
+    #[test]
+    fn batch_digest_rejects_orphaned_or_missing_correlation_outcomes() {
+        let protector = positron_kernel::fuzz_control_token_protector();
+        let plan = digest_plan();
+        let cancellation = QueryCancellation::new();
+        let records = [QueryRecord::count_record(1)];
+        let missing = [];
+        let orphaned = [CorrelationOutcome::MissingLogTraceId];
+
+        for (records, correlations, description) in [
+            (
+                &records[..],
+                &missing[..],
+                "a log row without its correlation outcome",
+            ),
+            (
+                &[][..],
+                &orphaned[..],
+                "a correlation outcome without its log row",
+            ),
+        ] {
+            let mut observer = NoopObserver;
+            let mut memory = crate::memory::QueryMemory::new(512);
+            assert_eq!(
+                batch_digest(
+                    &protector,
+                    BatchDigestInput {
+                        prior: [0; 32],
+                        sequence: 0,
+                        plan: &plan,
+                        records,
+                        correlations: Some(correlations),
+                        cancellation: &cancellation,
+                        observer: &mut observer,
+                    },
+                    &mut memory,
+                )
+                .expect_err(description)
+                .code(),
+                QueryFailureCode::Internal
+            );
+        }
     }
 }

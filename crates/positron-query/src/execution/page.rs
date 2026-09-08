@@ -364,7 +364,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         state.physical_memory_peak_bytes = state.physical_memory_peak_bytes.max(memory.peak());
         let before_batch = stats_before_current(&state);
         if state.cancellation.is_cancelled() {
-            return self.failed_page_with_stats(
+            return self.incomplete_page(
                 Some(header),
                 QueryFailure::new(QueryFailureCode::Cancelled),
                 &state,
@@ -391,7 +391,6 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             page.as_slice(),
             page.correlation_outcomes(),
             &state.cancellation,
-            true,
         ) {
             preserve_output_attempt(&mut state, &output_state);
             return self.failed_page(Some(header), failure, &state, delivered_before, resources);

@@ -26,26 +26,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         )
     }
 
-    pub(super) fn failed_page_with_stats(
-        &self,
-        header: Option<QueryEvent>,
-        failure: QueryFailure,
-        state: &CursorState,
-        delivered_before: QueryStats,
-        terminal_stats: QueryStats,
-        resources: ExecutionResources,
-    ) -> Result<QueryStream<'ledger>, QueryFailure> {
-        self.incomplete_page(
-            header,
-            failure,
-            state,
-            delivered_before,
-            terminal_stats,
-            resources,
-        )
-    }
-
-    fn incomplete_page(
+    pub(super) fn incomplete_page(
         &self,
         header: Option<QueryEvent>,
         failure: QueryFailure,
