@@ -1,5 +1,5 @@
 use super::super::*;
-use crate::TraceStoreFailure;
+use crate::{TraceServiceIdentityState, TraceStoreFailure};
 
 #[test]
 fn snapshot_service_relationships_aggregate_two_traces_with_pair_provenance()
@@ -114,6 +114,22 @@ fn snapshot_service_relationships_aggregate_two_traces_with_pair_provenance()
     assert_eq!(pair.parent_service_namespace(), Some("storefront"));
     assert_eq!(pair.child_service(), Some("inventory"));
     assert_eq!(pair.child_service_namespace(), Some("warehouse"));
+    assert_eq!(pair.parent_identity(), TraceServiceIdentityState::Exact);
+    assert_eq!(
+        pair.parent_service_namespace_identity(),
+        TraceServiceIdentityState::Exact
+    );
+    assert_eq!(pair.child_identity(), TraceServiceIdentityState::Exact);
+    assert_eq!(
+        pair.child_service_namespace_identity(),
+        TraceServiceIdentityState::Exact
+    );
+    assert_eq!(pair.parent_sampling_count(SamplingDecision::Sampled), 2);
+    assert_eq!(pair.parent_sampling_count(SamplingDecision::NotSampled), 0);
+    assert_eq!(pair.parent_sampling_count(SamplingDecision::Unknown), 0);
+    assert_eq!(pair.child_sampling_count(SamplingDecision::Sampled), 2);
+    assert_eq!(pair.child_sampling_count(SamplingDecision::NotSampled), 0);
+    assert_eq!(pair.child_sampling_count(SamplingDecision::Unknown), 0);
     assert_eq!(pair.edge_count(), 2);
     assert_eq!(pair.trace_ids(), &[first_trace, second_trace]);
     drop(relationships);
