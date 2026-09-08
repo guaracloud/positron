@@ -120,5 +120,22 @@ fn sealed_and_successor_active_segments_have_equivalent_trace_scan_visibility()
             .first()
             .is_some_and(|attribute| attribute.key().len() == SpanObservation::MAX_NAME_BYTES)
     }));
+    drop(result);
+    let logical = store.search(
+        authority.governor(),
+        tenant,
+        &successor.snapshot()?,
+        TraceSearch::all(ScanLimit::new(2)?),
+    )?;
+    assert!(logical.complete());
+    assert_eq!(logical.spans().len(), 2);
+    assert_eq!(
+        logical
+            .spans()
+            .iter()
+            .map(|span| span.span_id())
+            .collect::<Vec<_>>(),
+        vec![[0x22; 8], [0x23; 8]]
+    );
     Ok(())
 }

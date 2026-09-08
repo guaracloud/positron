@@ -28,7 +28,12 @@ impl TraceSearch {
         }
     }
 
-    /// Narrows the search to observations with one exact native attribute value.
+    /// Narrows the search to logical spans having an exact native attribute variant.
+    ///
+    /// The predicate selects a span when any of its authenticated raw variants
+    /// matches. The returned logical span retains every variant, including
+    /// non-matching conflicting evidence, so a native filter never hides a
+    /// conflict from a caller.
     pub fn with_attribute_equals(
         mut self,
         namespace: AttributeNamespace,
@@ -191,6 +196,11 @@ impl<'kernel> TraceByIdResult<'kernel> {
     }
 
     /// Returns logical spans with identical retries consolidated and conflict variants retained.
+    ///
+    /// When the request has an attribute predicate, a span is included if any
+    /// authenticated variant matched; every variant remains visible in the
+    /// returned span. This result does not infer parentage or completeness
+    /// beyond its explicit scan boundary.
     #[must_use]
     pub fn spans(&self) -> &[LogicalSpan] {
         &self.spans

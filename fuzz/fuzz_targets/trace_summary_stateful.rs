@@ -23,7 +23,7 @@ use positron_policy::{IngestPolicy, NativeTraceCandidate, PolicyReceiver, TraceP
 use positron_signals::{
     EvaluatedSpanObservationInput, SamplingDecision, ScanCancellation, ScanLimit,
     ScanObservationFailureCode, ScanObserver, SpanKind, SpanObservation, SpanObservationDetails,
-    TraceQuietPeriod, TraceStore, TraceStoreFailureCode, TraceSummaryMaintainer,
+    TraceQuietPeriod, TraceSearch, TraceStore, TraceStoreFailureCode, TraceSummaryMaintainer,
 };
 
 #[path = "schema_discovery_query/authority.rs"]
@@ -265,6 +265,14 @@ fn run_once(data: &[u8], root: &std::path::Path) -> Result<(), Box<dyn Error>> {
             &lifecycle_clock,
         )?;
         assert_visible_summary_counts(&result, &expected);
+        exercise_trace_queries(
+            &store,
+            &authority,
+            tenant,
+            &snapshot,
+            &expected,
+            command[1] & 0x80 != 0,
+        )?;
         if let Some(trace) = reopened_trace {
             let summary = result.summary(trace).ok_or("late trace summary is present")?;
             assert!(!summary.quiescent(), "a later span reopens a quiescent trace");
@@ -290,6 +298,48 @@ fn run_once(data: &[u8], root: &std::path::Path) -> Result<(), Box<dyn Error>> {
     )?;
     drop(ledger);
     replay_and_assert(&authority, &catalog, scope, key(), &store, &expected)
+}
+
+fn exercise_trace_queries(
+    store: &TraceStore,
+    authority: &positron_kernel::StorageKernelResourceAuthority,
+    tenant: TenantId,
+    snapshot: &positron_kernel::LedgerSnapshot<'_>,
+    expected: &BTreeMap<[u8; 16], u64>,
+    cancelled: bool,
+) -> Result<(), Box<dyn Error>> {
+    let cancellation = InputCancellation(cancelled);
+    let search = store.search_observed(
+        authority.governor(),
+        tenant,
+        snapshot,
+        TraceSearch::all(ScanLimit::new(MAX_OPERATIONS)?),
+        &cancellation,
+        &Unobserved,
+    );
+    if cancelled {
+        let failure = search.expect_err("cancelled trace search unexpectedly succeeded");
+        assert_eq!(failure.code(), TraceStoreFailureCode::Cancelled);
+        return Ok(());
+    }
+    let search = search?;
+    assert!(search
+        .spans()
+        .iter()
+        .all(|span| expected.contains_key(&span.trace_id())));
+    drop(search);
+    let trace_id = expected.keys().next().copied().unwrap_or([0x7f; 16]);
+    let by_id = store.trace_by_id_observed(
+        authority.governor(),
+        tenant,
+        snapshot,
+        trace_id,
+        TraceSearch::all(ScanLimit::new(MAX_OPERATIONS)?),
+        &InputCancellation(false),
+        &Unobserved,
+    )?;
+    assert!(by_id.spans().iter().all(|span| span.trace_id() == trace_id));
+    Ok(())
 }
 
 fn source_set(source: &AtomicI64, input: u8) {

@@ -1,4 +1,80 @@
 use super::super::*;
+use std::cell::Cell;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+
+struct WorkMeter(Cell<u64>);
+
+impl WorkMeter {
+    const fn new() -> Self {
+        Self(Cell::new(0))
+    }
+
+    fn work(&self) -> u64 {
+        self.0.get()
+    }
+}
+
+impl ScanObserver for WorkMeter {
+    fn observe_work(&self, units: u64) -> Result<(), ScanObservationFailureCode> {
+        let next = self
+            .work()
+            .checked_add(units)
+            .ok_or(ScanObservationFailureCode::BudgetExhausted)?;
+        self.0.set(next);
+        Ok(())
+    }
+}
+
+struct ExactWork(Cell<u64>);
+
+impl ExactWork {
+    const fn new(remaining: u64) -> Self {
+        Self(Cell::new(remaining))
+    }
+}
+
+impl ScanObserver for ExactWork {
+    fn observe_work(&self, units: u64) -> Result<(), ScanObservationFailureCode> {
+        let remaining = self
+            .0
+            .get()
+            .checked_sub(units)
+            .ok_or(ScanObservationFailureCode::BudgetExhausted)?;
+        self.0.set(remaining);
+        Ok(())
+    }
+}
+
+struct CancelAtWork {
+    remaining: Cell<u64>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl ScanObserver for CancelAtWork {
+    fn observe_work(&self, units: u64) -> Result<(), ScanObservationFailureCode> {
+        let remaining = self
+            .remaining
+            .get()
+            .checked_sub(units)
+            .ok_or(ScanObservationFailureCode::BudgetExhausted)?;
+        self.remaining.set(remaining);
+        if remaining == 0 {
+            self.cancelled.store(true, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+}
+
+struct SharedCancellation(Arc<AtomicBool>);
+
+impl ScanCancellation for SharedCancellation {
+    fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+}
 
 #[test]
 fn committed_span_is_visible_immediately_from_the_active_segment() -> Result<(), Box<dyn Error>> {
@@ -298,6 +374,18 @@ fn trace_by_id_returns_the_committed_active_trace_from_its_snapshot() -> Result<
         positron_policy::PolicyProvenance::new(1, [0x77; 32], Vec::new())?,
     )?;
     let store = TraceStore::new();
+    let conflict = SpanObservation::checked_native(
+        [0x12; 16],
+        [0x23; 8],
+        None,
+        "checkout-conflict".to_owned(),
+        EventTime::received(UnixNanoseconds::new(10), SourceTimeQuality::Usable)?,
+        EventTime::received(UnixNanoseconds::new(20), SourceTimeQuality::Usable)?,
+        Vec::new(),
+        SpanKind::Server,
+        SamplingDecision::Sampled,
+        positron_policy::PolicyProvenance::new(1, [0x77; 32], Vec::new())?,
+    )?;
     ledger.append(
         store
             .prepare_unretained_for_test(
@@ -306,7 +394,7 @@ fn trace_by_id_returns_the_committed_active_trace_from_its_snapshot() -> Result<
                 tenant,
                 shard,
                 positron_kernel::StoreBlockIdentity::new([0x64; 16])?,
-                vec![observation],
+                vec![observation, conflict],
             )?
             .into_store_block(),
     )?;
@@ -317,29 +405,31 @@ fn trace_by_id_returns_the_committed_active_trace_from_its_snapshot() -> Result<
         tenant,
         &snapshot,
         [0x12; 16],
-        TraceSearch::all(ScanLimit::new(1)?),
+        TraceSearch::all(ScanLimit::new(2)?),
     )?;
 
     assert_eq!(trace.trace_id(), [0x12; 16]);
     assert_eq!(trace.spans().len(), 1);
     assert_eq!(trace.spans()[0].span_id(), [0x23; 8]);
+    assert_eq!(trace.spans()[0].variants().len(), 2);
     assert!(trace.complete());
 
     let search = store.search(
         authority.governor(),
         tenant,
         &snapshot,
-        TraceSearch::all(ScanLimit::new(1)?),
+        TraceSearch::all(ScanLimit::new(2)?),
     )?;
     assert_eq!(search.spans().len(), 1);
     assert_eq!(search.spans()[0].trace_id(), [0x12; 16]);
+    assert_eq!(search.spans()[0].variants().len(), 2);
     assert!(search.complete());
 
     let filtered = store.search(
         authority.governor(),
         tenant,
         &snapshot,
-        TraceSearch::all(ScanLimit::new(1)?).with_attribute_equals(
+        TraceSearch::all(ScanLimit::new(2)?).with_attribute_equals(
             positron_domain::value::AttributeNamespace::Record,
             "http.response.status_code".to_owned(),
             expected,
@@ -347,5 +437,165 @@ fn trace_by_id_returns_the_committed_active_trace_from_its_snapshot() -> Result<
     )?;
     assert_eq!(filtered.spans().len(), 1);
     assert_eq!(filtered.spans()[0].trace_id(), [0x12; 16]);
+    assert_eq!(filtered.spans()[0].variants().len(), 2);
+
+    let non_matching = positron_domain::value::AttributeOccurrenceSetCandidate::new(
+        positron_domain::value::AttributeNamespace::Record,
+        "http.response.status_code".to_owned(),
+        vec![positron_domain::value::CandidateAttributeValue::signed_integer(504)],
+    )
+    .validate(ValueLimitProfile::release_1_system_maximum())?
+    .occurrence(0)
+    .ok_or("missing non-matching occurrence")?
+    .try_clone()?;
+    let absent = store.trace_by_id(
+        authority.governor(),
+        tenant,
+        &snapshot,
+        [0x12; 16],
+        TraceSearch::all(ScanLimit::new(2)?).with_attribute_equals(
+            positron_domain::value::AttributeNamespace::Record,
+            "http.response.status_code".to_owned(),
+            non_matching,
+        )?,
+    )?;
+    assert!(absent.spans().is_empty());
+
+    let scan_work = WorkMeter::new();
+    let scanned = store.scan_observed(
+        authority.governor(),
+        tenant,
+        &snapshot,
+        TraceScan::all(ScanLimit::new(2)?),
+        &NeverCancelled,
+        &scan_work,
+    )?;
+    drop(scanned);
+    let selection_start = scan_work.work();
+    let search_work = WorkMeter::new();
+    let searched = store.search_observed(
+        authority.governor(),
+        tenant,
+        &snapshot,
+        TraceSearch::all(ScanLimit::new(2)?),
+        &NeverCancelled,
+        &search_work,
+    )?;
+    drop(searched);
+    assert!(search_work.work() > selection_start);
+
+    let bounded_selection = ExactWork::new(selection_start);
+    let selection_failure = store
+        .search_observed(
+            authority.governor(),
+            tenant,
+            &snapshot,
+            TraceSearch::all(ScanLimit::new(2)?),
+            &NeverCancelled,
+            &bounded_selection,
+        )
+        .expect_err("selection must charge work after physical scan and consolidation");
+    assert_eq!(
+        selection_failure.code(),
+        TraceStoreFailureCode::BudgetExhausted
+    );
+
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let cancellation = SharedCancellation(Arc::clone(&cancelled));
+    let cancel_after_consolidation = CancelAtWork {
+        remaining: Cell::new(selection_start),
+        cancelled,
+    };
+    let cancellation_failure = store
+        .search_observed(
+            authority.governor(),
+            tenant,
+            &snapshot,
+            TraceSearch::all(ScanLimit::new(2)?),
+            &cancellation,
+            &cancel_after_consolidation,
+        )
+        .expect_err("selection must poll cancellation after consolidation");
+    assert_eq!(
+        cancellation_failure.code(),
+        TraceStoreFailureCode::Cancelled
+    );
+    Ok(())
+}
+
+#[test]
+fn trace_by_id_applies_a_non_matching_native_attribute_predicate() -> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_kernel_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x31; 16])?,
+        CatalogSecret::from_owned(Box::new([0x32; 32]), Box::new([0x33; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let shard = VirtualShardId::new(31)?;
+    let ledger = ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        SegmentScope::new(tenant, SignalKind::Traces, shard),
+        SegmentProtectionKey::from_owned(Box::new([0x34; 32])),
+    )?;
+    let attributes = vec![
+        AttributeOccurrenceSetCandidate::new(
+            AttributeNamespace::Record,
+            "http.status_code".to_owned(),
+            vec![CandidateAttributeValue::signed_integer(200)],
+        )
+        .validate(ValueLimitProfile::release_1_system_maximum())?,
+    ];
+    let observation = SpanObservation::checked_native(
+        [0x35; 16],
+        [0x36; 8],
+        None,
+        "predicate".to_owned(),
+        EventTime::missing(),
+        EventTime::missing(),
+        attributes,
+        SpanKind::Internal,
+        SamplingDecision::Unknown,
+        positron_policy::PolicyProvenance::new(1, [0x37; 32], Vec::new())?,
+    )?;
+    let store = TraceStore::new();
+    ledger.append(
+        store
+            .prepare_unretained_for_test(
+                preparation_capacity(&authority, tenant)?,
+                &LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100))),
+                tenant,
+                shard,
+                StoreBlockIdentity::new([0x38; 16])?,
+                vec![observation],
+            )?
+            .into_store_block(),
+    )?;
+    let expected = AttributeOccurrenceSetCandidate::new(
+        AttributeNamespace::Record,
+        "http.status_code".to_owned(),
+        vec![CandidateAttributeValue::signed_integer(404)],
+    )
+    .validate(ValueLimitProfile::release_1_system_maximum())?
+    .occurrence(0)
+    .ok_or("missing predicate occurrence")?
+    .try_clone()?;
+
+    let result = store.trace_by_id(
+        authority.governor(),
+        tenant,
+        &ledger.snapshot()?,
+        [0x35; 16],
+        TraceSearch::all(ScanLimit::new(1)?).with_attribute_equals(
+            AttributeNamespace::Record,
+            "http.status_code".to_owned(),
+            expected,
+        )?,
+    )?;
+    assert!(result.complete());
+    assert!(result.spans().is_empty());
     Ok(())
 }

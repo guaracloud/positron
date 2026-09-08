@@ -260,44 +260,93 @@ impl<'kernel> TraceScanResult<'kernel> {
     }
 
     fn into_trace_by_id(
-        mut self,
+        self,
         trace_id: [u8; 16],
+        search: &super::TraceSearch,
         profile: &ValueLimitProfile,
         cancellation: &dyn ScanCancellation,
         observer: &dyn ScanObserver,
     ) -> Result<super::TraceByIdResult<'kernel>, TraceStoreFailure> {
-        self.observations
-            .retain(|observation| observation.observation().trace_id() == trace_id);
-        let logical = self.into_logical_spans(profile, cancellation, observer)?;
+        let mut logical = self.into_matching_logical(search, profile, cancellation, observer)?;
+        retain_trace_id(&mut logical.spans, trace_id, cancellation, observer)?;
         Ok(super::TraceByIdResult::from_logical(trace_id, logical))
     }
 
     fn into_matching_logical(
-        mut self,
+        self,
         search: &super::TraceSearch,
         profile: &ValueLimitProfile,
         cancellation: &dyn ScanCancellation,
         observer: &dyn ScanObserver,
     ) -> Result<super::LogicalTraceScanResult<'kernel>, TraceStoreFailure> {
-        let mut index = 0_usize;
-        while index < self.observations.len() {
-            let matched = self
-                .observations
-                .get(index)
-                .ok_or_else(TraceStoreFailure::invalid_input)
-                .and_then(|observation| {
-                    search.matches(observation.observation(), cancellation, observer)
-                })?;
-            if matched {
-                index = index
-                    .checked_add(1)
-                    .ok_or_else(TraceStoreFailure::limit_exceeded)?;
-            } else {
-                self.observations.swap_remove(index);
+        let mut logical = self.into_logical_spans(profile, cancellation, observer)?;
+        retain_matching_spans(&mut logical.spans, search, cancellation, observer)?;
+        Ok(logical)
+    }
+}
+
+fn retain_trace_id(
+    spans: &mut Vec<super::LogicalSpan>,
+    trace_id: [u8; 16],
+    cancellation: &dyn ScanCancellation,
+    observer: &dyn ScanObserver,
+) -> Result<(), TraceStoreFailure> {
+    let mut index = 0_usize;
+    while index < spans.len() {
+        observe_selection(cancellation, observer)?;
+        let span = spans
+            .get(index)
+            .ok_or_else(TraceStoreFailure::invalid_input)?;
+        if span.trace_id() == trace_id {
+            index = index
+                .checked_add(1)
+                .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+        } else {
+            spans.swap_remove(index);
+        }
+    }
+    Ok(())
+}
+
+fn retain_matching_spans(
+    spans: &mut Vec<super::LogicalSpan>,
+    search: &super::TraceSearch,
+    cancellation: &dyn ScanCancellation,
+    observer: &dyn ScanObserver,
+) -> Result<(), TraceStoreFailure> {
+    let mut index = 0_usize;
+    while index < spans.len() {
+        observe_selection(cancellation, observer)?;
+        let span = spans
+            .get(index)
+            .ok_or_else(TraceStoreFailure::invalid_input)?;
+        let mut matched = false;
+        for variant in span.variants() {
+            observe_selection(cancellation, observer)?;
+            if search.matches(variant.observation().observation(), cancellation, observer)? {
+                matched = true;
+                break;
             }
         }
-        self.into_logical_spans(profile, cancellation, observer)
+        if matched {
+            index = index
+                .checked_add(1)
+                .ok_or_else(TraceStoreFailure::limit_exceeded)?;
+        } else {
+            spans.swap_remove(index);
+        }
     }
+    Ok(())
+}
+
+fn observe_selection(
+    cancellation: &dyn ScanCancellation,
+    observer: &dyn ScanObserver,
+) -> Result<(), TraceStoreFailure> {
+    check_cancel(cancellation)?;
+    observer
+        .observe_work(1)
+        .map_err(TraceStoreFailure::observation)
 }
 
 /// One authenticated observation with its stable physical commit identity.
@@ -443,7 +492,7 @@ impl super::TraceStore {
             cancellation,
             observer,
         )?
-        .into_trace_by_id(trace_id, &profile, cancellation, observer)
+        .into_trace_by_id(trace_id, &search, &profile, cancellation, observer)
     }
 
     /// Scans the normal consolidated Trace Store view for one authenticated snapshot.

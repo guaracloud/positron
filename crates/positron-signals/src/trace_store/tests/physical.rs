@@ -2356,6 +2356,19 @@ fn bounded_trace_scan_reports_explicit_result_incompleteness() -> Result<(), Box
         result.incompleteness(),
         super::TraceIncompleteness::ResultLimit
     );
+    drop(result);
+    let bounded_search = store.search(
+        authority.governor(),
+        tenant,
+        &ledger.snapshot()?,
+        TraceSearch::all(ScanLimit::new(1)?),
+    )?;
+    assert_eq!(bounded_search.spans().len(), 1);
+    assert!(!bounded_search.complete());
+    assert_eq!(
+        bounded_search.incompleteness(),
+        super::TraceIncompleteness::ResultLimit
+    );
     let next_result = store.scan(
         authority.governor(),
         tenant,
