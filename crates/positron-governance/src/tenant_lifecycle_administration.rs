@@ -21,6 +21,7 @@ pub struct TenantLifecycleTransition {
     to: TenantLifecycleState,
     generation: ResourceGeneration,
     audit_position: u64,
+    audit_ingest_time_unix_seconds: u64,
 }
 
 impl TenantLifecycleTransition {
@@ -44,6 +45,28 @@ impl TenantLifecycleTransition {
     pub const fn audit_position(self) -> u64 {
         self.audit_position
     }
+    #[must_use]
+    pub const fn audit_ingest_time_unix_seconds(self) -> u64 {
+        self.audit_ingest_time_unix_seconds
+    }
+}
+
+/// Redacted state supplied with an optimistic lifecycle-generation conflict.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TenantLifecycleGenerationConflict {
+    current_generation: ResourceGeneration,
+    current_state: TenantLifecycleState,
+}
+
+impl TenantLifecycleGenerationConflict {
+    #[must_use]
+    pub const fn current_generation(self) -> ResourceGeneration {
+        self.current_generation
+    }
+    #[must_use]
+    pub const fn current_state(self) -> TenantLifecycleState {
+        self.current_state
+    }
 }
 
 /// Closed failures from the narrow lifecycle authority.
@@ -53,7 +76,7 @@ pub enum TenantLifecycleAdministrationFailure {
     UnknownTenant,
     InvalidTransition,
     PurgeCompletionUnavailable,
-    StaleGeneration,
+    StaleGeneration(TenantLifecycleGenerationConflict),
     IdempotencyConflict,
     CapacityExceeded,
     PersistenceUnavailable,
@@ -79,6 +102,7 @@ impl TenantLifecycleAdministration {
         target: TenantLifecycleState,
         expected: ResourceGeneration,
         idempotency: AdministrativeIdempotencyKey,
+        audit_ingest_time_unix_seconds: u64,
     ) -> Result<TenantLifecycleTransition, TenantLifecycleAdministrationFailure> {
         if actor.principal_id() != administrator
             || actor.scope() != Scope::SystemAdministration
@@ -101,6 +125,9 @@ impl TenantLifecycleAdministration {
         )? {
             return Ok(replay);
         }
+        if audit_ingest_time_unix_seconds == 0 {
+            return Err(TenantLifecycleAdministrationFailure::PersistenceUnavailable);
+        }
         let from = governance.lifecycle();
         if target == TenantLifecycleState::Purged {
             return Err(TenantLifecycleAdministrationFailure::PurgeCompletionUnavailable);
@@ -108,11 +135,12 @@ impl TenantLifecycleAdministration {
         TenantLifecycle::from_durable_state(from)
             .transition_to(target)
             .map_err(|_| TenantLifecycleAdministrationFailure::InvalidTransition)?;
-        let generation = next_generation(governance.lifecycle_generation(), expected)?;
+        let generation = next_generation(governance.lifecycle_generation(), from, expected)?;
         let replacement = governance
             .with_lifecycle(target, generation.get())
             .map_err(map_catalog)?;
         let audit = tenant_lifecycle_audit_intent(
+            audit_ingest_time_unix_seconds,
             idempotency,
             actor.principal_id(),
             tenant,
@@ -136,6 +164,7 @@ impl TenantLifecycleAdministration {
             to: target,
             generation,
             audit_position: audit.position(),
+            audit_ingest_time_unix_seconds: audit.ingest_time_unix_seconds(),
         })
     }
 }
@@ -170,6 +199,7 @@ fn replay(
             to: lifecycle.to(),
             generation: lifecycle.generation(),
             audit_position: lifecycle.position(),
+            audit_ingest_time_unix_seconds: lifecycle.ingest_time_unix_seconds(),
         }));
     }
     Ok(None)
@@ -177,10 +207,17 @@ fn replay(
 
 fn next_generation(
     current: u64,
+    current_state: TenantLifecycleState,
     expected: ResourceGeneration,
 ) -> Result<ResourceGeneration, TenantLifecycleAdministrationFailure> {
     if current != expected.get() {
-        return Err(TenantLifecycleAdministrationFailure::StaleGeneration);
+        return Err(TenantLifecycleAdministrationFailure::StaleGeneration(
+            TenantLifecycleGenerationConflict {
+                current_generation: ResourceGeneration::new(current)
+                    .map_err(|_| TenantLifecycleAdministrationFailure::PersistenceUnavailable)?,
+                current_state,
+            },
+        ));
     }
     expected
         .get()
@@ -228,7 +265,7 @@ fn commit(
 fn map_catalog(failure: positron_kernel::CatalogFailure) -> TenantLifecycleAdministrationFailure {
     match failure.code() {
         CatalogFailureCode::StaleGeneration => {
-            TenantLifecycleAdministrationFailure::StaleGeneration
+            TenantLifecycleAdministrationFailure::PersistenceUnavailable
         },
         CatalogFailureCode::IdempotencyConflict => {
             TenantLifecycleAdministrationFailure::IdempotencyConflict

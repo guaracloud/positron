@@ -11,7 +11,9 @@ pub struct QueryCancellation {
 }
 
 impl QueryCancellation {
-    pub(crate) fn new() -> Self {
+    /// Creates an execution-scoped cancellation handle for a bounded query or tail.
+    #[must_use]
+    pub fn new() -> Self {
         Self {
             cancelled: Arc::new(AtomicBool::new(false)),
         }

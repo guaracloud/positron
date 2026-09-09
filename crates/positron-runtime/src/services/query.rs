@@ -77,6 +77,9 @@ pub(super) fn query_events_for_test(
         Ok(query) => query,
         Err(failure) => return Ok(QueryTestOutcome::Failure(failure.code())),
     };
+    let _drain = instance
+        .enter_query_execution(query.cancellation())
+        .map_err(|_| ServiceFailure::Unauthorized)?;
     let schema = services
         .schema_sessions
         .session(instance.tenant, instance.resource_governor())
@@ -194,6 +197,9 @@ pub(super) fn query_log_bodies(
     let query = service
         .plan_pipeline(context, source, budget)
         .map_err(|failure| map_query_failure(&failure))?;
+    let _drain = instance
+        .enter_query_execution(query.cancellation())
+        .map_err(|_| ServiceFailure::Unauthorized)?;
     let schema = services
         .schema_sessions
         .session(instance.tenant, instance.resource_governor())

@@ -88,6 +88,7 @@ pub enum ApiKeyLifecycleAction {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TenantLifecycleAuditEntry {
     position: u64,
+    ingest_time_unix_seconds: u64,
     actor: PrincipalId,
     tenant: TenantId,
     from: TenantLifecycleState,
@@ -489,6 +490,10 @@ impl GovernanceAuditEntry {
             if cursor.take_array::<8>()? != TENANT_LIFECYCLE_MAGIC {
                 return Err(IdentityFailure);
             }
+            let ingest_time_unix_seconds = cursor.take_u64()?;
+            if ingest_time_unix_seconds == 0 {
+                return Err(IdentityFailure);
+            }
             let idempotency_key = AdministrativeIdempotencyKey::new(cursor.take_array()?)
                 .map_err(|_| IdentityFailure)?;
             if idempotency_key.to_bytes() != transaction_id {
@@ -510,6 +515,7 @@ impl GovernanceAuditEntry {
             }
             return Ok(Self::TenantLifecycle(TenantLifecycleAuditEntry {
                 position,
+                ingest_time_unix_seconds,
                 actor,
                 tenant,
                 from,
@@ -527,6 +533,10 @@ impl TenantLifecycleAuditEntry {
     #[must_use]
     pub const fn position(&self) -> u64 {
         self.position
+    }
+    #[must_use]
+    pub const fn ingest_time_unix_seconds(&self) -> u64 {
+        self.ingest_time_unix_seconds
     }
     #[must_use]
     pub const fn actor_id(&self) -> PrincipalId {
@@ -559,6 +569,7 @@ impl TenantLifecycleAuditEntry {
 }
 
 pub(crate) fn tenant_lifecycle_audit_intent(
+    ingest_time_unix_seconds: u64,
     idempotency_key: AdministrativeIdempotencyKey,
     actor: PrincipalId,
     tenant: TenantId,
@@ -567,8 +578,9 @@ pub(crate) fn tenant_lifecycle_audit_intent(
     expected_generation: ResourceGeneration,
     generation: ResourceGeneration,
 ) -> Vec<u8> {
-    let mut intent = Vec::with_capacity(74);
+    let mut intent = Vec::with_capacity(82);
     intent.extend_from_slice(&TENANT_LIFECYCLE_MAGIC);
+    intent.extend_from_slice(&ingest_time_unix_seconds.to_be_bytes());
     intent.extend_from_slice(&idempotency_key.to_bytes());
     intent.extend_from_slice(&actor.to_bytes());
     intent.extend_from_slice(&tenant.to_bytes());

@@ -127,6 +127,7 @@ pub(super) fn outcome(
         value_limit_profile: positron_domain::value::ValueLimitProfile::release_1_system_maximum(),
         admission_group_planner,
         ingest_drain: super::super::types::IngestDrainGate::new(),
+        query_drain: super::super::types::QueryDrainGate::new(),
         tenant_slug: BootstrapRecord::tenant_slug()?,
         administrator: record.administrator,
         integrity_key_fingerprint: record.integrity_fingerprint,

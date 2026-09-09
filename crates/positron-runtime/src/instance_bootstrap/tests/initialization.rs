@@ -153,16 +153,19 @@ fn read_only_transition_is_durable_idempotent_and_preserves_query_access()
     assert_eq!(lifecycle_audit.to(), TenantLifecycleState::ReadOnly);
     assert_eq!(lifecycle_audit.expected_generation().get(), 1);
     assert_eq!(lifecycle_audit.generation().get(), 2);
+    assert!(lifecycle_audit.ingest_time_unix_seconds() > 0);
     assert_eq!(lifecycle_audit.idempotency_key(), idempotency);
+    let replay = instance.transition_tenant_lifecycle(
+        administrator()?,
+        instance.default_tenant_id(),
+        TenantLifecycleState::ReadOnly,
+        ResourceGeneration::new(1)?,
+        idempotency,
+    )?;
+    assert_eq!(replay, transitioned);
     assert_eq!(
-        instance.transition_tenant_lifecycle(
-            administrator()?,
-            instance.default_tenant_id(),
-            TenantLifecycleState::ReadOnly,
-            ResourceGeneration::new(1)?,
-            idempotency,
-        )?,
-        transitioned
+        replay.audit_ingest_time_unix_seconds(),
+        transitioned.audit_ingest_time_unix_seconds(),
     );
     drop(instance);
 
@@ -348,6 +351,11 @@ fn lifecycle_transitions_preserve_the_closed_access_and_retry_contract()
         stale.code(),
         BootstrapFailureCode::TenantLifecycleStaleGeneration
     );
+    let conflict = stale
+        .lifecycle_generation_conflict()
+        .ok_or("stale lifecycle conflict details")?;
+    assert_eq!(conflict.current_generation().get(), 2);
+    assert_eq!(conflict.current_state(), TenantLifecycleState::ReadOnly);
 
     let suspended = transition(TenantLifecycleState::Suspended, 2, [0x75; 16])?;
     assert_eq!(suspended.resource_generation().get(), 3);

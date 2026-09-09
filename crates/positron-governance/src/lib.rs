@@ -42,7 +42,8 @@ pub use policy_administration::{
     ResourceGeneration,
 };
 pub use tenant_lifecycle_administration::{
-    TenantLifecycleAdministration, TenantLifecycleAdministrationFailure, TenantLifecycleTransition,
+    TenantLifecycleAdministration, TenantLifecycleAdministrationFailure,
+    TenantLifecycleGenerationConflict, TenantLifecycleTransition,
 };
 
 const GOVERNANCE_OBJECT_MAGIC: [u8; 8] = *b"POSGOV05";

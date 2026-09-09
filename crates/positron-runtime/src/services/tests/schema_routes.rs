@@ -2,6 +2,8 @@ use std::error::Error;
 use std::sync::{Arc, Mutex, mpsc};
 
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 use positron_domain::lifecycle::TenantLifecycleState;
 use positron_governance::{
     AdministrativeIdempotencyKey, CompatibilityHints, PresentedCredential, RequestedIntent,
@@ -9,11 +11,12 @@ use positron_governance::{
 };
 use positron_ingest::{
     AdmissionGroupOutcome, IngestFailureCode, IngestOutcome, IngestRequestOutcome,
-    NativeLogAdmissionGroups,
+    NativeLogAdmissionGroups, NativeSpanAdmissionGroups,
 };
 use positron_ingest::{LokiPushRequestEncoding, OtlpLogsRequestEncoding};
 use positron_query::{
-    QueryBudget, QueryBudgetDimension, QueryEvent, QueryFailureCode, QueryTerminal,
+    QueryBudget, QueryBudgetDimension, QueryCancellation, QueryEvent, QueryFailureCode,
+    QueryTerminal,
 };
 use prost::Message;
 
@@ -24,6 +27,7 @@ use crate::services::{ReceiverTestBackend, ServiceFailure, ServiceHandle};
 struct BlockingFinalizationBackend {
     entered: mpsc::Sender<()>,
     release: Mutex<mpsc::Receiver<()>>,
+    lifecycle_before_finish: Option<(Arc<crate::InitializedInstance>, String, mpsc::Sender<bool>)>,
 }
 
 impl ReceiverTestBackend for BlockingFinalizationBackend {
@@ -33,6 +37,47 @@ impl ReceiverTestBackend for BlockingFinalizationBackend {
             let _ = receiver.recv();
         }
         IngestRequestOutcome::new(Vec::new())
+    }
+
+    fn handles_traces(&self) -> bool {
+        true
+    }
+
+    fn ingest_traces(&self, _groups: NativeSpanAdmissionGroups<'_>) -> IngestRequestOutcome {
+        let _ = self.entered.send(());
+        if let Ok(receiver) = self.release.lock() {
+            let _ = receiver.recv();
+        }
+        if let Some((instance, ingest_secret, observed)) = &self.lifecycle_before_finish {
+            let admitted = instance
+                .attribute(
+                    PresentedCredential::parse(ingest_secret).expect("fixture credential"),
+                    RequestedIntent::Ingest,
+                    CompatibilityHints::none(),
+                )
+                .is_ok();
+            let _ = observed.send(admitted);
+        }
+        IngestRequestOutcome::new(Vec::new())
+    }
+}
+
+fn trace_request() -> ExportTraceServiceRequest {
+    ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            scope_spans: vec![ScopeSpans {
+                spans: vec![Span {
+                    trace_id: vec![0x70; 16],
+                    span_id: vec![0x71; 8],
+                    name: "lifecycle-drain".to_owned(),
+                    start_time_unix_nano: 1,
+                    end_time_unix_nano: 2,
+                    ..Span::default()
+                }],
+                ..ScopeSpans::default()
+            }],
+            ..ResourceSpans::default()
+        }],
     }
 }
 
@@ -574,6 +619,7 @@ fn read_only_closure_waits_for_entered_ingest_and_rejects_later_admission()
     services.install_receiver_test_backend(Arc::new(BlockingFinalizationBackend {
         entered: entered_tx,
         release: Mutex::new(release_rx),
+        lifecycle_before_finish: None,
     }))?;
     let first_services = services.clone();
     let first_ingest = ingest.clone();
@@ -635,6 +681,77 @@ fn read_only_closure_waits_for_entered_ingest_and_rejects_later_admission()
 }
 
 #[test]
+fn read_only_closure_waits_for_entered_trace_finalization() -> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let (initialized, ingest, _, administrator_secret) = fixture.initialized_with_admin()?;
+    let services = ServiceHandle::new(Arc::clone(&initialized))?;
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let (lifecycle_tx, lifecycle_rx) = mpsc::channel();
+    services.install_receiver_test_backend(Arc::new(BlockingFinalizationBackend {
+        entered: entered_tx,
+        release: Mutex::new(release_rx),
+        lifecycle_before_finish: Some((Arc::clone(&initialized), ingest.clone(), lifecycle_tx)),
+    }))?;
+    let first_services = services.clone();
+    let first_ingest = ingest.clone();
+    let first = std::thread::spawn(move || {
+        first_services.ingest_otlp_traces(&first_ingest, trace_request().encode_to_vec())
+    });
+    entered_rx.recv()?;
+    let (closed_tx, closed_rx) = mpsc::channel();
+    initialized.install_lifecycle_transition_observer(closed_tx)?;
+    let transitioning = Arc::clone(&initialized);
+    let transition = std::thread::spawn(move || {
+        let actor = transitioning
+            .attribute(
+                PresentedCredential::parse(&administrator_secret).map_err(|_| {
+                    crate::BootstrapFailure::new(
+                        crate::BootstrapFailureCode::TenantLifecycleUnauthorized,
+                    )
+                })?,
+                RequestedIntent::SystemAdministration,
+                CompatibilityHints::none(),
+            )
+            .map_err(|_| {
+                crate::BootstrapFailure::new(
+                    crate::BootstrapFailureCode::TenantLifecycleUnauthorized,
+                )
+            })?;
+        transitioning.transition_tenant_lifecycle(
+            actor,
+            transitioning.default_tenant_id(),
+            TenantLifecycleState::ReadOnly,
+            ResourceGeneration::new(1).map_err(|_| {
+                crate::BootstrapFailure::new(crate::BootstrapFailureCode::ResourceUnavailable)
+            })?,
+            AdministrativeIdempotencyKey::new([0x77; 16]).map_err(|_| {
+                crate::BootstrapFailure::new(crate::BootstrapFailureCode::ResourceUnavailable)
+            })?,
+        )
+    });
+    closed_rx.recv()?;
+    assert_eq!(
+        services.ingest_otlp_traces(&ingest, trace_request().encode_to_vec()),
+        Err(ServiceFailure::Unauthorized),
+    );
+    release_tx.send(())?;
+    assert!(first.join().map_err(|_| "trace thread panicked")?.is_ok());
+    assert!(
+        lifecycle_rx.recv()?,
+        "the admitted trace must finish before ReadOnly publishes"
+    );
+    assert_eq!(
+        transition
+            .join()
+            .map_err(|_| "transition thread panicked")??
+            .to(),
+        TenantLifecycleState::ReadOnly
+    );
+    Ok(())
+}
+
+#[test]
 fn rejected_lifecycle_transition_reopens_native_ingest_admission() -> Result<(), Box<dyn Error>> {
     let fixture = Fixture::new()?;
     let (initialized, ingest, _, administrator_secret) = fixture.initialized_with_admin()?;
@@ -662,6 +779,97 @@ fn rejected_lifecycle_transition_reopens_native_ingest_admission() -> Result<(),
             .ingest_otlp_logs(&ingest, request("admission-reopened").encode_to_vec())?
             .accepted_records(),
         1
+    );
+    Ok(())
+}
+
+#[test]
+fn timed_out_lifecycle_drain_reopens_admission_without_publishing() -> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let (initialized, ingest, _, administrator_secret) = fixture.initialized_with_admin()?;
+    let services = ServiceHandle::new(Arc::clone(&initialized))?;
+    let held = initialized.enter_ingest_finalization()?;
+    let actor = initialized.attribute(
+        PresentedCredential::parse(&administrator_secret)?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let failure = initialized
+        .transition_tenant_lifecycle(
+            actor,
+            initialized.default_tenant_id(),
+            TenantLifecycleState::ReadOnly,
+            ResourceGeneration::new(1)?,
+            AdministrativeIdempotencyKey::new([0x7e; 16])?,
+        )
+        .expect_err("a non-completing finalization must time out");
+    assert_eq!(
+        failure.code(),
+        crate::BootstrapFailureCode::ResourceUnavailable
+    );
+    drop(held);
+    assert_eq!(
+        services
+            .ingest_otlp_logs(
+                &ingest,
+                request("admission-reopened-after-timeout").encode_to_vec()
+            )?
+            .accepted_records(),
+        1
+    );
+    Ok(())
+}
+
+#[test]
+fn suspended_transition_cancels_and_drains_an_admitted_query_execution()
+-> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let (initialized, _, _, administrator_secret) = fixture.initialized_with_admin()?;
+    let cancellation = QueryCancellation::new();
+    let admitted = initialized.enter_query_execution(cancellation.clone())?;
+    let (closing_tx, closing_rx) = mpsc::channel();
+    initialized.install_lifecycle_query_transition_observer(closing_tx)?;
+    let transitioning = Arc::clone(&initialized);
+    let transition = std::thread::spawn(move || {
+        let actor = transitioning
+            .attribute(
+                PresentedCredential::parse(&administrator_secret).map_err(|_| {
+                    crate::BootstrapFailure::new(
+                        crate::BootstrapFailureCode::TenantLifecycleUnauthorized,
+                    )
+                })?,
+                RequestedIntent::SystemAdministration,
+                CompatibilityHints::none(),
+            )
+            .map_err(|_| {
+                crate::BootstrapFailure::new(
+                    crate::BootstrapFailureCode::TenantLifecycleUnauthorized,
+                )
+            })?;
+        transitioning.transition_tenant_lifecycle(
+            actor,
+            transitioning.default_tenant_id(),
+            TenantLifecycleState::Suspended,
+            ResourceGeneration::new(1).map_err(|_| {
+                crate::BootstrapFailure::new(crate::BootstrapFailureCode::ResourceUnavailable)
+            })?,
+            AdministrativeIdempotencyKey::new([0x7f; 16]).map_err(|_| {
+                crate::BootstrapFailure::new(crate::BootstrapFailureCode::ResourceUnavailable)
+            })?,
+        )
+    });
+    closing_rx.recv()?;
+    assert!(
+        cancellation.is_cancelled(),
+        "restrictive transition cancels admitted query/tail work"
+    );
+    drop(admitted);
+    assert_eq!(
+        transition
+            .join()
+            .map_err(|_| "transition thread panicked")??
+            .to(),
+        TenantLifecycleState::Suspended
     );
     Ok(())
 }
