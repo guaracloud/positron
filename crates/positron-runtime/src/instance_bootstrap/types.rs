@@ -14,7 +14,7 @@ use zeroize::Zeroizing;
 
 use positron_governance::{
     AdministrativeIdempotencyKey, ApiKeyAdministrationFailure, ApiKeyCreation, AuthorizedContext,
-    ResourceGeneration,
+    ListenerTransportAdministration, ListenerTransportAdministrationFailure, ResourceGeneration,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -280,6 +280,20 @@ impl InitializedInstance {
             )
     }
 
+    /// Records the active explicit plaintext API transport selection through
+    /// the Catalog's single joint governance-audit publication path.
+    pub(crate) fn activate_public_plaintext_api_transport(&self) -> Result<(), BootstrapFailure> {
+        let secret = self
+            .key
+            .catalog_secret(self.instance)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
+        let catalog = Catalog::open(&self._authority, self.instance, secret)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        ListenerTransportAdministration::activate_public_plaintext_api(&catalog, self.instance)
+            .map(|_| ())
+            .map_err(map_listener_transport_failure)
+    }
+
     pub fn create_api_key(
         &self,
         actor: AuthorizedContext,
@@ -450,6 +464,18 @@ fn map_api_key_failure(failure: ApiKeyAdministrationFailure) -> BootstrapFailure
         ApiKeyAdministrationFailure::CredentialUnavailable => {
             BootstrapFailureCode::ApiKeyUnavailable
         },
+    };
+    BootstrapFailure::new(code)
+}
+
+fn map_listener_transport_failure(
+    failure: ListenerTransportAdministrationFailure,
+) -> BootstrapFailure {
+    let code = match failure {
+        ListenerTransportAdministrationFailure::PersistenceUnavailable => {
+            BootstrapFailureCode::CatalogUnavailable
+        },
+        ListenerTransportAdministrationFailure::CorruptState => BootstrapFailureCode::CorruptState,
     };
     BootstrapFailure::new(code)
 }

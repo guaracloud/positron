@@ -54,6 +54,7 @@ fn api_transport_profile_allows_explicit_public_tls_and_plaintext() {
     .expect("public TLS profile resolves");
     assert_eq!(tls.api_bind_address().to_string(), "192.0.2.1:8443");
     assert_eq!(tls.api_transport(), positron_config::ApiTransport::Tls);
+    assert!(tls.security_warnings().is_empty());
     assert_eq!(
         tls.api_tls_certificate_file().as_path().to_str(),
         Some("/secrets/cert.pem")
@@ -70,6 +71,13 @@ fn api_transport_profile_allows_explicit_public_tls_and_plaintext() {
         plaintext.api_transport(),
         positron_config::ApiTransport::PlaintextOptOut
     );
+    assert_eq!(
+        plaintext.security_warnings(),
+        [positron_config::ConfigurationWarning::PublicPlaintextApi]
+    );
+    assert!(plaintext
+        .redacted_reference()
+        .contains("warning = \"public API transport is plaintext\""));
     let unused_server_trust = inputs(
         Some("schema_version = 1\n[listener]\napi_tls_trust_file = \"/secrets/ca.pem\"\n"),
         [],

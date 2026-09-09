@@ -66,6 +66,9 @@ fn run(
     let inputs = ConfigurationInputs::try_new(document.as_deref(), environment, command_line)
         .map_err(|_| LaunchFailure::Configuration)?;
     let effective = resolve(inputs).map_err(|_| LaunchFailure::Configuration)?;
+    for warning in effective.security_warnings() {
+        eprintln!("positron: warning: {}", warning.message());
+    }
     let paths = BootstrapPaths::with_local_key(
         Path::new(effective.data_directory()),
         Path::new(effective.secrets_directory()),
@@ -94,8 +97,13 @@ fn run(
     let host = NativeHost::new(bindings);
     let recovery =
         NativeRecovery::new(Signals::new([SIGINT, SIGTERM]).map_err(|_| LaunchFailure::Signal)?);
+    let configuration = if effective.api_transport() == ApiTransport::PlaintextOptOut {
+        ServeConfiguration::new(paths, arguments.initialization).with_public_plaintext_api_warning()
+    } else {
+        ServeConfiguration::new(paths, arguments.initialization)
+    };
     let process = match ApplicationRuntime::start(
-        ServeConfiguration::new(paths, arguments.initialization),
+        configuration,
         HostInputs::with_recovery(&host, &host, &recovery),
     ) {
         Ok(process) => process,

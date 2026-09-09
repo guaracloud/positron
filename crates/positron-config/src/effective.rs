@@ -7,6 +7,26 @@ use super::{
     setting_index,
 };
 
+/// A bounded, non-secret warning derived from the active effective profile.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConfigurationWarning {
+    /// The API listener accepts unencrypted traffic by explicit operator choice.
+    PublicPlaintextApi,
+}
+
+impl ConfigurationWarning {
+    #[must_use]
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::PublicPlaintextApi => "public API transport is plaintext",
+        }
+    }
+}
+
+const NO_CONFIGURATION_WARNINGS: &[ConfigurationWarning] = &[];
+const PUBLIC_PLAINTEXT_API_WARNING: &[ConfigurationWarning] =
+    &[ConfigurationWarning::PublicPlaintextApi];
+
 #[derive(Clone, Eq, PartialEq)]
 pub struct EffectiveConfiguration {
     pub(crate) schema_version: u16,
@@ -61,6 +81,15 @@ impl EffectiveConfiguration {
     #[must_use]
     pub const fn api_transport(&self) -> ApiTransport {
         self.api_transport
+    }
+
+    /// Returns the visible security consequences of the selected profile.
+    #[must_use]
+    pub const fn security_warnings(&self) -> &'static [ConfigurationWarning] {
+        match self.api_transport {
+            ApiTransport::Tls => NO_CONFIGURATION_WARNINGS,
+            ApiTransport::PlaintextOptOut => PUBLIC_PLAINTEXT_API_WARNING,
+        }
     }
 
     #[must_use]
@@ -132,7 +161,13 @@ impl EffectiveConfiguration {
         rendered.push_str(&self.otlp_http_bind_address.to_string());
         rendered.push_str("\"\nloki_push_bind_address = \"");
         rendered.push_str(&self.loki_push_bind_address.to_string());
-        rendered.push_str("\"\n\n[storage]\ndata_directory = \"");
+        rendered.push('"');
+        if let Some(warning) = self.security_warnings().first() {
+            rendered.push_str("\n\n[warnings]\nwarning = \"");
+            rendered.push_str(warning.message());
+            rendered.push('"');
+        }
+        rendered.push_str("\n\n[storage]\ndata_directory = \"");
         rendered.push_str(&self.data_directory);
         rendered.push_str("\"\nsecrets_directory = \"");
         rendered.push_str(&self.secrets_directory);
@@ -202,6 +237,8 @@ impl Debug for EffectiveConfiguration {
             .field("control_path", &self.control_path)
             .field("operations_bind_address", &self.operations_bind_address)
             .field("api_bind_address", &self.api_bind_address)
+            .field("api_transport", &self.api_transport)
+            .field("security_warnings", &self.security_warnings())
             .field("otlp_grpc_bind_address", &self.otlp_grpc_bind_address)
             .field("otlp_http_bind_address", &self.otlp_http_bind_address)
             .field("loki_push_bind_address", &self.loki_push_bind_address)

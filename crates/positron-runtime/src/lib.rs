@@ -16,7 +16,7 @@ mod tail_fuzz;
 mod tail_fuzz_support;
 mod task;
 
-pub use health::{HealthState, Liveness, ProcessPhase, Readiness};
+pub use health::{HealthState, HealthWarning, Liveness, ProcessPhase, Readiness};
 #[cfg(any(test, feature = "test-support"))]
 pub use instance_bootstrap::GovernanceTestFixture;
 pub use instance_bootstrap::{

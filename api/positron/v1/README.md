@@ -53,8 +53,9 @@ secret is emitted once to stdout; protect that output as credential material.
 Public plaintext requires the server's configuration-file-only
 `listener.api_transport = "plaintext"` opt-out and the client's explicit
 `--allow-plaintext`; it is never an automatic TLS fallback. This sends bearer
-credentials and API data without transport encryption, so the operator must
-retain the configuration warning and audit evidence required by ADR-0030.
+credentials and API data without transport encryption. Positron emits the
+non-secret configuration warning, remains ready with a persistent health
+warning, and records the selected profile once in the governance audit chain.
 
 The client preserves only published failures: `invalid_request`, `authentication_rejected`,
 `stale_generation`, `idempotency_conflict`, `key_unavailable`, and

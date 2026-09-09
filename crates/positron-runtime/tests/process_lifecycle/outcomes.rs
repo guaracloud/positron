@@ -1,6 +1,49 @@
 use super::*;
 
 #[test]
+fn explicit_plaintext_api_transport_stays_ready_with_a_persistent_health_warning()
+-> Result<(), Box<dyn std::error::Error>> {
+    let plaintext_roots = TestRoots::new("plaintext-transport-warning")?;
+    let plaintext_listeners = ObservingListeners::default();
+    let plaintext_tasks = ObservingTasks::default();
+    let plaintext = ApplicationRuntime::start(
+        ServeConfiguration::new(
+            plaintext_roots.bootstrap_paths()?,
+            InitializationMode::InitializeIfEmpty,
+        )
+        .with_public_plaintext_api_warning(),
+        HostInputs::new(&plaintext_listeners, &plaintext_tasks),
+    )?;
+    assert_eq!(plaintext.health().readiness(), Readiness::Ready);
+    assert_eq!(
+        plaintext.health().security_warning(),
+        Some(positron_runtime::HealthWarning::PublicPlaintextApi)
+    );
+    assert_eq!(
+        plaintext.shutdown(ShutdownTrigger::FirstSignal),
+        positron_runtime::ExitOutcome::Graceful
+    );
+
+    let tls_roots = TestRoots::new("tls-transport-warning")?;
+    let tls_listeners = ObservingListeners::default();
+    let tls_tasks = ObservingTasks::default();
+    let tls = ApplicationRuntime::start(
+        ServeConfiguration::new(
+            tls_roots.bootstrap_paths()?,
+            InitializationMode::InitializeIfEmpty,
+        ),
+        HostInputs::new(&tls_listeners, &tls_tasks),
+    )?;
+    assert_eq!(tls.health().readiness(), Readiness::Ready);
+    assert_eq!(tls.health().security_warning(), None);
+    assert_eq!(
+        tls.shutdown(ShutdownTrigger::FirstSignal),
+        positron_runtime::ExitOutcome::Graceful
+    );
+    Ok(())
+}
+
+#[test]
 fn cleanup_failures_never_report_graceful_completion_or_retain_ownership()
 -> Result<(), Box<dyn std::error::Error>> {
     let roots = TestRoots::new("cleanup-faults")?;

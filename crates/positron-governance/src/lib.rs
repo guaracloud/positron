@@ -14,6 +14,7 @@ use positron_domain::identity::{ExternalTenantAlias, PrincipalId, TenantId, Tena
 mod api_key_administration;
 mod audit;
 mod identity;
+mod listener_transport_administration;
 mod policy_administration;
 
 pub use api_key_administration::{
@@ -23,11 +24,16 @@ pub use api_key_administration::{
 pub use audit::{
     ApiKeyLifecycleAction, CatalogRootRotationAuditEntry, CatalogRootRotationStage,
     GovernanceAuditEntry, IngestPolicyActivationAuditEntry, InitialAuditMetadata,
-    InitializationAuditEntry, SchemaCheckpointAuditEntry, schema_checkpoint_audit_intent,
+    InitializationAuditEntry, ListenerTransportAuditEntry, SchemaCheckpointAuditEntry,
+    schema_checkpoint_audit_intent,
 };
 pub use identity::{
     AttributionFailure, AuthorizedContext, CompatibilityHints, GovernanceInspection, Identity,
     IdentityFailure, PresentedCredential, RequestedIntent,
+};
+pub use listener_transport_administration::{
+    ListenerTransportActivation, ListenerTransportAdministration,
+    ListenerTransportAdministrationFailure,
 };
 pub use policy_administration::{
     AdministrativeIdempotencyKey, IngestPolicyActivation, IngestPolicyAdministration,

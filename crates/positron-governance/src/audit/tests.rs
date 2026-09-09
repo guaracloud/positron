@@ -6,8 +6,35 @@ use super::{
 };
 use crate::{
     ApiKeyLifecycleAction, InitialAuditContext, InitialGovernanceIntent, InitialTenantIntent,
-    ResourceGeneration,
+    ListenerTransportAuditEntry, ResourceGeneration,
 };
+
+#[test]
+fn public_plaintext_api_transport_audit_is_redacted_exact_and_strict() {
+    let transaction = [19; 16];
+    let mut intent = b"POSTPT01".to_vec();
+    intent.extend_from_slice(&transaction);
+    let entry = GovernanceAuditEntry::decode_fields(7, transaction, &intent)
+        .expect("plaintext transport audit");
+    let transport = entry
+        .as_listener_transport()
+        .expect("typed transport audit");
+    assert_eq!(entry.action(), "listener.api-transport.plaintext-opt-out");
+    assert_eq!(entry.outcome(), "active");
+    assert_eq!(transport, &ListenerTransportAuditEntry::new(7, transaction));
+    assert!(!format!("{entry:?} {entry}").contains("Bearer"));
+
+    for malformed in [
+        b"POSTPT00".as_slice(),
+        b"POSTPT01".as_slice(),
+        b"POSTPT01\0".as_slice(),
+    ] {
+        assert!(GovernanceAuditEntry::decode_fields(7, transaction, malformed).is_err());
+    }
+    let mut trailing = intent;
+    trailing.push(0);
+    assert!(GovernanceAuditEntry::decode_fields(7, transaction, &trailing).is_err());
+}
 
 #[test]
 fn api_key_lifecycle_audit_is_redacted_exact_and_strict() {

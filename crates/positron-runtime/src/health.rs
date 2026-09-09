@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 /// The one runtime phase that controls admission and shutdown behavior.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -28,10 +28,18 @@ pub enum Liveness {
     Dead,
 }
 
+/// A bounded operator-visible security condition that does not affect readiness.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HealthWarning {
+    /// The API listener is using the explicit plaintext transport opt-out.
+    PublicPlaintextApi,
+}
+
 /// A read-only view of the runtime's single phase authority.
 #[derive(Clone, Debug)]
 pub struct HealthState {
     phase: Arc<AtomicU8>,
+    public_plaintext_api: Arc<AtomicBool>,
 }
 
 impl HealthState {
@@ -57,6 +65,14 @@ impl HealthState {
             Liveness::Live
         }
     }
+
+    /// Returns the active transport warning without changing admission readiness.
+    #[must_use]
+    pub fn security_warning(&self) -> Option<HealthWarning> {
+        self.public_plaintext_api
+            .load(Ordering::Acquire)
+            .then_some(HealthWarning::PublicPlaintextApi)
+    }
 }
 
 pub(crate) struct ProcessState {
@@ -68,6 +84,7 @@ impl ProcessState {
         Self {
             health: HealthState {
                 phase: Arc::new(AtomicU8::new(ProcessPhase::Starting as u8)),
+                public_plaintext_api: Arc::new(AtomicBool::new(false)),
             },
         }
     }
@@ -78,6 +95,12 @@ impl ProcessState {
 
     pub(crate) fn transition(&self, phase: ProcessPhase) {
         self.health.phase.store(phase as u8, Ordering::Release);
+    }
+
+    pub(crate) fn set_public_plaintext_api_warning(&self, enabled: bool) {
+        self.health
+            .public_plaintext_api
+            .store(enabled, Ordering::Release);
     }
 }
 
