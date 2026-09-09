@@ -70,11 +70,7 @@ impl GovernorInner {
             state.lifecycle = GovernorLifecycle::Fenced;
             return Err(internal_failure_at_pressure(class, state.disk_pressure));
         };
-        let Some(tenant_limit) = self
-            .tenant_quotas
-            .get(tenant_index)
-            .map(|quota| quota.limits)
-        else {
+        let Some(tenant_limit) = state.tenant_limits.get(tenant_index).copied() else {
             state.lifecycle = GovernorLifecycle::Fenced;
             return Err(internal_failure_at_pressure(class, state.disk_pressure));
         };

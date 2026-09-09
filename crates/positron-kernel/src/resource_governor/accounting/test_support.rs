@@ -1,12 +1,13 @@
 use super::{AdmissionFailureCode, GovernorConfiguration, GovernorInner, Ordering};
 
 impl GovernorConfiguration {
-    pub(in crate::resource_governor) fn payload_addresses_for_test(&self) -> [usize; 13] {
+    pub(in crate::resource_governor) fn payload_addresses_for_test(&self) -> [usize; 14] {
         [
             self.tenant_quotas.as_ptr() as usize,
             self.tenant_fair_capacities.as_ptr() as usize,
             self.recovery_tenant_shared_fair.as_ptr() as usize,
             self.recovery_tenant_pool_fair.as_ptr() as usize,
+            self.state.tenant_limits.as_ptr() as usize,
             self.state.ordinary_tenant_usage.as_ptr() as usize,
             self.state.recovery_tenant_usage.as_ptr() as usize,
             self.state.recovery_tenant_pool_usage.as_ptr() as usize,
@@ -21,13 +22,14 @@ impl GovernorConfiguration {
 }
 
 impl GovernorInner {
-    pub(in crate::resource_governor) fn payload_addresses_for_test(&self) -> [usize; 13] {
+    pub(in crate::resource_governor) fn payload_addresses_for_test(&self) -> [usize; 14] {
         let state = self.state.lock().expect("test lock is healthy");
         [
             self.tenant_quotas.as_ptr() as usize,
             self.tenant_fair_capacities.as_ptr() as usize,
             self.recovery_tenant_shared_fair.as_ptr() as usize,
             self.recovery_tenant_pool_fair.as_ptr() as usize,
+            state.tenant_limits.as_ptr() as usize,
             state.ordinary_tenant_usage.as_ptr() as usize,
             state.recovery_tenant_usage.as_ptr() as usize,
             state.recovery_tenant_pool_usage.as_ptr() as usize,

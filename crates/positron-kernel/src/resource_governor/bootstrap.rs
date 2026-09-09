@@ -22,6 +22,7 @@ pub(super) enum BootstrapAllocationStage {
     OrdinaryTenantFairCapacities,
     RecoveryTenantSharedFair,
     RecoveryTenantPoolFair,
+    TenantLimits,
     OrdinaryTenantUsage,
     RecoveryTenantUsage,
     RecoveryTenantPoolUsage,
@@ -34,11 +35,12 @@ pub(super) enum BootstrapAllocationStage {
 }
 
 #[cfg(test)]
-pub(super) const CONFIGURATION_ALLOCATION_STAGES: [BootstrapAllocationStage; 13] = [
+pub(super) const CONFIGURATION_ALLOCATION_STAGES: [BootstrapAllocationStage; 14] = [
     BootstrapAllocationStage::ActiveSegmentScopes,
     BootstrapAllocationStage::OrdinaryTenantFairCapacities,
     BootstrapAllocationStage::RecoveryTenantSharedFair,
     BootstrapAllocationStage::RecoveryTenantPoolFair,
+    BootstrapAllocationStage::TenantLimits,
     BootstrapAllocationStage::OrdinaryTenantUsage,
     BootstrapAllocationStage::RecoveryTenantUsage,
     BootstrapAllocationStage::RecoveryTenantPoolUsage,
@@ -187,6 +189,7 @@ fn tenant_payload_bytes(tenant_count: usize) -> Result<usize, GovernorFailure> {
         payload_bytes::<PoolCapacities>(tenant_count)?,
         payload_bytes::<ResourceAmounts>(tenant_count)?,
         payload_bytes::<RecoveryPoolCapacities>(tenant_count)?,
+        payload_bytes::<ResourceAmounts>(tenant_count)?,
         payload_bytes::<ResourceAmounts>(tenant_count)?,
         payload_bytes::<ResourceAmounts>(tenant_count)?,
         payload_bytes::<RecoveryPoolUsage>(tenant_count)?,

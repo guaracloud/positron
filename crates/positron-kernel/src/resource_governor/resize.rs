@@ -157,6 +157,13 @@ impl GovernorInner {
                             pressure: state.disk_pressure,
                             lifecycle: state.lifecycle,
                             tenant_index,
+                            tenant_limit: state
+                                .tenant_limits
+                                .get(tenant_index)
+                                .copied()
+                                .ok_or_else(|| {
+                                    internal_failure_at_pressure(class, state.disk_pressure)
+                                })?,
                         },
                     )
                 })
@@ -292,18 +299,13 @@ impl GovernorInner {
                 pressure: view.pressure,
             },
         )?;
-        let tenant_limit = self
-            .tenant_quotas
-            .get(view.tenant_index)
-            .map(|quota| quota.limits)
-            .ok_or_else(|| internal_failure_at_pressure(class, view.pressure))?;
         refuse_exceeded(
             AdmissionFailureCode::TenantQuotaExceeded,
             LimitingScope::Tenant,
             class,
             view.tenant_without,
             new,
-            tenant_limit,
+            view.tenant_limit,
             view.pressure,
         )?;
         let recovery_shared_limit = self
@@ -351,6 +353,7 @@ struct OrdinaryResizeView {
     pressure: DiskPressureState,
     lifecycle: GovernorLifecycle,
     tenant_index: usize,
+    tenant_limit: ResourceAmounts,
 }
 
 pub(super) fn resize_outcome(old: ResourceAmounts, new: ResourceAmounts) -> ResizeOutcome {

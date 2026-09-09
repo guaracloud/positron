@@ -189,6 +189,34 @@ fn reservation_is_atomic_and_drop_returns_capacity() -> Result<(), Box<dyn std::
 }
 
 #[test]
+fn quota_reduction_rejects_new_growth_without_revoking_existing_reservations()
+-> Result<(), Box<dyn std::error::Error>> {
+    let tenant = tenant(71)?;
+    let capacity = amounts(10);
+    let governor = governor(capacity, capacity, [TenantQuota::new(tenant, 1, capacity)?])?;
+    let existing = governor.reserve(WorkClaim::tenant(
+        tenant,
+        WorkKind::Ingest,
+        ResourceAmounts::only(ResourceDimension::MemoryBytes, 6)?,
+    )?)?;
+
+    governor.update_tenant_quota(tenant, amounts(5))?;
+
+    let failure = governor
+        .reserve(WorkClaim::tenant(
+            tenant,
+            WorkKind::Ingest,
+            ResourceAmounts::only(ResourceDimension::MemoryBytes, 1)?,
+        )?)
+        .expect_err("a quota reduction must stop later growth");
+    assert_eq!(failure.code(), AdmissionFailureCode::TenantQuotaExceeded);
+    assert_eq!(failure.allowed(), 5);
+    assert_eq!(failure.in_use(), 6);
+    drop(existing);
+    Ok(())
+}
+
+#[test]
 fn later_dimension_refusal_leaves_earlier_dimensions_uncharged()
 -> Result<(), Box<dyn std::error::Error>> {
     let tenant = tenant(2)?;

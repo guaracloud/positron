@@ -73,6 +73,19 @@ impl GovernorInner {
             .checked_sub(ordinary_ceiling)
             .ok_or(GovernorFailure::InvalidConfiguration)?;
 
+        let mut tenant_limits = zeroed_tenant_table(
+            layout,
+            required,
+            BootstrapAllocationStage::TenantLimits,
+            fail_at,
+            ResourceAmounts::zero(),
+        )?;
+        for (slot, quota) in tenant_limits.iter_mut().zip(tenant_quotas.iter()) {
+            *slot = quota.limits;
+        }
+        if tenant_limits.len() != tenant_quotas.len() {
+            return Err(GovernorFailure::InvalidConfiguration);
+        }
         let ordinary_tenant_usage = zeroed_tenant_table(
             layout,
             required,
@@ -123,6 +136,7 @@ impl GovernorInner {
             free_slots,
             total_usage: ResourceAmounts::zero(),
             recovery_usage: ResourceAmounts::zero(),
+            tenant_limits,
             ordinary_tenant_usage,
             recovery_tenant_usage,
             recovery_pool_usage: RecoveryPoolUsage::zero(),

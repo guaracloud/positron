@@ -1,3 +1,5 @@
+use positron_domain::identity::TenantId;
+
 use super::*;
 
 impl StorageKernelResourceAuthority {
@@ -178,5 +180,17 @@ impl StorageKernelResourceAuthority {
         Ok(ShutdownReconciliation {
             snapshot: ResourceSnapshot::from_accounting(self.inner.begin_shutdown()?),
         })
+    }
+
+    /// Applies a validated tenant ceiling to future ordinary admission.
+    ///
+    /// Existing reservations retain their capacity. This is what makes a
+    /// quota reduction safe while still stopping further growth immediately.
+    pub fn update_tenant_quota(
+        &self,
+        tenant: TenantId,
+        limits: ResourceAmounts,
+    ) -> Result<(), GovernorFailure> {
+        self.inner.update_tenant_quota(tenant, limits)
     }
 }

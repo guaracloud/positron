@@ -1,4 +1,5 @@
 use positron_domain::identity::{PrincipalId, TenantId, TenantSlug};
+use positron_kernel::CatalogGovernanceObject;
 
 use super::{
     GovernanceIntentFailure, InitialAuditContext, InitialGovernanceIntent, InitialTenantIntent,
@@ -63,4 +64,25 @@ fn tenant_creation_rejects_missing_authority_with_closed_diagnostics() {
     let oversized = intent("Default", vec![8; u16::MAX as usize + 1])
         .expect("constructor accepts bounded-by-publication payload");
     assert!(InitialGovernanceIntent::create_tenant(oversized).is_err());
+}
+
+#[test]
+fn governance_object_preserves_and_updates_the_independent_quota_generation() {
+    let (object, _) = InitialGovernanceIntent::create_tenant(
+        intent("Default tenant", vec![8; 64]).expect("valid intent"),
+    )
+    .expect("encodable intent")
+    .into_parts();
+    let governance = CatalogGovernanceObject::decode(&object).expect("governance object");
+    assert_eq!(governance.quota_generation(), 1);
+    assert_eq!(governance.quota_weight(), 1);
+    assert_eq!(governance.quota_resources(), [10; 11]);
+
+    let updated = governance
+        .with_quota(2, 2, [9; 11])
+        .expect("quota successor");
+    let decoded = CatalogGovernanceObject::decode(&updated).expect("quota successor decodes");
+    assert_eq!(decoded.quota_generation(), 2);
+    assert_eq!(decoded.quota_weight(), 2);
+    assert_eq!(decoded.quota_resources(), [9; 11]);
 }

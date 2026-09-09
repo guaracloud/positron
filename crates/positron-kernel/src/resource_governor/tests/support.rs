@@ -122,6 +122,14 @@ impl TestKernel {
         self.governor().inspect()
     }
 
+    pub fn update_tenant_quota(
+        &self,
+        tenant: positron_domain::identity::TenantId,
+        limits: ResourceAmounts,
+    ) -> Result<(), GovernorFailure> {
+        self.authority.update_tenant_quota(tenant, limits)
+    }
+
     pub fn observe_disk(
         &self,
         observation: DiskObservation,

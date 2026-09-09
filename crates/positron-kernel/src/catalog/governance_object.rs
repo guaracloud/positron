@@ -111,6 +111,10 @@ pub struct CatalogGovernanceObject {
     ingest: Option<CredentialRecord>,
     query: Option<CredentialRecord>,
     retention_seconds: u64,
+    quota_generation: u64,
+    quota_weight: u32,
+    quota_resources: [u64; 11],
+    quota_offset: usize,
     lifecycle: TenantLifecycleState,
     lifecycle_generation: u64,
     credentials: Vec<CatalogCredential>,
@@ -178,6 +182,22 @@ impl CatalogGovernanceObject {
     #[must_use]
     pub const fn lifecycle_generation(&self) -> u64 {
         self.lifecycle_generation
+    }
+
+    /// Returns the independently durable generation for tenant quota mutations.
+    #[must_use]
+    pub const fn quota_generation(&self) -> u64 {
+        self.quota_generation
+    }
+
+    #[must_use]
+    pub const fn quota_weight(&self) -> u32 {
+        self.quota_weight
+    }
+
+    #[must_use]
+    pub const fn quota_resources(&self) -> [u64; 11] {
+        self.quota_resources
     }
 
     /// Returns redacted credential descriptors; secret material is never decoded.
@@ -336,6 +356,41 @@ impl CatalogGovernanceObject {
             encoded.extend_from_slice(&credential.hash);
         }
         Ok(encoded)
+    }
+
+    /// Encodes a successor quota while preserving every other governance authority.
+    pub fn with_quota(
+        &self,
+        quota_generation: u64,
+        quota_weight: u32,
+        quota_resources: [u64; 11],
+    ) -> Result<Vec<u8>, CatalogFailure> {
+        if quota_generation == 0
+            || quota_weight == 0
+            || quota_weight > u32::from(u16::MAX)
+            || quota_resources.contains(&0)
+        {
+            return Err(corrupt());
+        }
+        let generation_end = self.quota_offset.checked_add(8).ok_or_else(corrupt)?;
+        let weight_end = generation_end.checked_add(4).ok_or_else(corrupt)?;
+        let resources_end = weight_end.checked_add(88).ok_or_else(corrupt)?;
+        let mut prefix = self.credential_prefix.clone();
+        prefix
+            .get_mut(self.quota_offset..generation_end)
+            .ok_or_else(corrupt)?
+            .copy_from_slice(&quota_generation.to_be_bytes());
+        prefix
+            .get_mut(generation_end..weight_end)
+            .ok_or_else(corrupt)?
+            .copy_from_slice(&quota_weight.to_be_bytes());
+        let resources = prefix
+            .get_mut(weight_end..resources_end)
+            .ok_or_else(corrupt)?;
+        for (slot, value) in resources.chunks_exact_mut(8).zip(quota_resources) {
+            slot.copy_from_slice(&value.to_be_bytes());
+        }
+        encode_credentials(&prefix, self.credential_generation, &self.credentials)
     }
 }
 
@@ -517,11 +572,19 @@ fn decode(encoded: &[u8]) -> Result<CatalogGovernanceObject, CatalogFailure> {
     cursor.skip_u16_bytes()?;
     cursor.skip_u16_bytes()?;
     let retention_seconds = cursor.take_u64()?;
-    if retention_seconds == 0 || cursor.take_u64()? == 0 || cursor.take_u32()? == 0 {
+    let quota_offset = encoded
+        .len()
+        .checked_sub(cursor.remaining.len())
+        .ok_or_else(corrupt)?;
+    let quota_generation = cursor.take_u64()?;
+    let quota_weight = cursor.take_u32()?;
+    if retention_seconds == 0 || quota_generation == 0 || quota_weight == 0 {
         return Err(corrupt());
     }
-    for _ in 0..11 {
-        if cursor.take_u64()? == 0 {
+    let mut quota_resources = [0_u64; 11];
+    for resource in &mut quota_resources {
+        *resource = cursor.take_u64()?;
+        if *resource == 0 {
             return Err(corrupt());
         }
     }
@@ -644,6 +707,10 @@ fn decode(encoded: &[u8]) -> Result<CatalogGovernanceObject, CatalogFailure> {
         ingest,
         query,
         retention_seconds,
+        quota_generation,
+        quota_weight,
+        quota_resources,
+        quota_offset,
         lifecycle,
         lifecycle_generation,
         credentials,
@@ -748,6 +815,46 @@ fn take_optional_credential(
         1 => cursor.take_credential().map(Some),
         _ => Err(corrupt()),
     }
+}
+
+fn encode_credentials(
+    prefix: &[u8],
+    generation: u64,
+    credentials: &[CatalogCredential],
+) -> Result<Vec<u8>, CatalogFailure> {
+    let bytes = credentials
+        .len()
+        .checked_mul(90)
+        .and_then(|size| {
+            prefix
+                .len()
+                .checked_add(10)
+                .and_then(|total| total.checked_add(size))
+        })
+        .ok_or_else(corrupt)?;
+    let mut encoded = Vec::new();
+    encoded.try_reserve_exact(bytes).map_err(|_| corrupt())?;
+    encoded.extend_from_slice(prefix);
+    encoded.extend_from_slice(&generation.to_be_bytes());
+    encoded.extend_from_slice(
+        &u16::try_from(credentials.len())
+            .map_err(|_| corrupt())?
+            .to_be_bytes(),
+    );
+    for credential in credentials {
+        encoded.extend_from_slice(&credential.principal.to_bytes());
+        encoded.push(credential.scope);
+        encoded.push(u8::from(credential.active));
+        encoded.extend_from_slice(
+            &credential
+                .expires_at_unix_seconds
+                .unwrap_or(0)
+                .to_be_bytes(),
+        );
+        encoded.extend_from_slice(&credential.salt);
+        encoded.extend_from_slice(&credential.hash);
+    }
+    Ok(encoded)
 }
 
 fn is_governance(bytes: &[u8]) -> bool {

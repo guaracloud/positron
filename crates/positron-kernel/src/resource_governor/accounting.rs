@@ -103,6 +103,7 @@ pub(super) struct AccountingState {
     pub(super) free_slots: Vec<u16>,
     pub(super) total_usage: ResourceAmounts,
     pub(super) recovery_usage: ResourceAmounts,
+    pub(super) tenant_limits: Box<[ResourceAmounts]>,
     pub(super) ordinary_tenant_usage: Box<[ResourceAmounts]>,
     pub(super) recovery_tenant_usage: Box<[ResourceAmounts]>,
     pub(super) recovery_pool_usage: RecoveryPoolUsage,
@@ -165,6 +166,28 @@ pub(super) struct AccountingSnapshot {
 }
 
 impl GovernorInner {
+    pub(super) fn update_tenant_quota(
+        &self,
+        tenant: TenantId,
+        limits: ResourceAmounts,
+    ) -> Result<(), GovernorFailure> {
+        if !limits.all_positive() || !limits.is_at_most(self.ordinary_ceiling) {
+            return Err(GovernorFailure::InvalidConfiguration);
+        }
+        let tenant_index = self
+            .tenant_quotas
+            .iter()
+            .position(|quota| quota.tenant == tenant)
+            .ok_or(GovernorFailure::InvalidConfiguration)?;
+        let mut state = self.try_lock_for_control()?;
+        let slot = state
+            .tenant_limits
+            .get_mut(tenant_index)
+            .ok_or(GovernorFailure::InternalFenced)?;
+        *slot = limits;
+        Ok(())
+    }
+
     pub(super) fn tenant_index(
         &self,
         tenant: TenantId,
