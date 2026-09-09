@@ -50,8 +50,11 @@ are never accepted in arguments or environment variables. Mutations require
 `--scope ingest|query|tenant-administration`, while rotate/revoke/scope-inspect
 require `--principal UUID`. `--expires-at N` is optional for create. A new
 secret is emitted once to stdout; protect that output as credential material.
-The current listener admits plaintext only on loopback; public plaintext API admission is not
-available.
+Public plaintext requires the server's configuration-file-only
+`listener.api_transport = "plaintext"` opt-out and the client's explicit
+`--allow-plaintext`; it is never an automatic TLS fallback. This sends bearer
+credentials and API data without transport encryption, so the operator must
+retain the configuration warning and audit evidence required by ADR-0030.
 
 The client preserves only published failures: `invalid_request`, `authentication_rejected`,
 `stale_generation`, `idempotency_conflict`, `key_unavailable`, and

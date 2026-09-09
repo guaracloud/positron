@@ -151,9 +151,6 @@ impl ApiKeyServiceClient {{
                 (format!("https://{{authority}}:{{}}", endpoint.port()), reqwest::blocking::Client::builder().add_root_certificate(certificate).resolve(&server_name, endpoint))
             }},
             super::ApiKeyTransport::PlaintextOptOut {{ endpoint }} => {{
-                if !endpoint.ip().is_loopback() {{
-                    return Err(ApiKeyServiceClientFailure::Transport);
-                }}
                 (format!("http://{{endpoint}}"), reqwest::blocking::Client::builder())
             }},
         }};

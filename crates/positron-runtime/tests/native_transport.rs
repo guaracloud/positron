@@ -428,7 +428,7 @@ fn public_api_binding_requires_tls_or_the_exact_plaintext_opt_out()
     );
     assert!(
         NativeBindings::new_with_api_transport(
-            control,
+            control.clone(),
             loopback,
             public,
             loopback,
@@ -437,6 +437,19 @@ fn public_api_binding_requires_tls_or_the_exact_plaintext_opt_out()
             ApiTransportProfile::tls(certificate, private_key)?,
         )
         .is_ok()
+    );
+    assert!(
+        NativeBindings::new_with_api_transport(
+            control,
+            loopback,
+            public,
+            loopback,
+            loopback,
+            loopback,
+            ApiTransportProfile::plaintext_opt_out(),
+        )
+        .is_ok(),
+        "an explicit plaintext listener profile admits a public API address"
     );
     Ok(())
 }

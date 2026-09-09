@@ -131,15 +131,15 @@ fn generated_api_key_service_client_preserves_only_published_failure_codes()
 }
 
 #[test]
-fn generated_client_refuses_remote_plaintext_before_request_construction() {
+fn generated_client_accepts_explicit_remote_plaintext_before_request_construction() {
     let result = positron_api::api_keys::ApiKeyServiceClient::new(
         positron_api::api_keys::ApiKeyTransport::PlaintextOptOut {
             endpoint: "192.0.2.1:8080".parse().expect("literal socket address"),
         },
     );
     assert!(
-        result.is_err(),
-        "remote plaintext must be refused before a bearer is sent"
+        result.is_ok(),
+        "an explicit client plaintext opt-out constructs the configured transport"
     );
 }
 

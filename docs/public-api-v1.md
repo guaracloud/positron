@@ -18,8 +18,11 @@ original principal with no secret; it never reconstructs or redisplays the origi
 Its stable lifecycle failures distinguish authentication, stale generation, idempotency conflict,
 unavailable key, and unavailable administration; malformed remote errors remain redacted transport
 failures.
-The current listener admits plaintext only on loopback; public plaintext API admission is not
-available.
+Public plaintext requires the server's configuration-file-only
+`listener.api_transport = "plaintext"` opt-out and the client's explicit
+`--allow-plaintext`; it is never an automatic TLS fallback. This sends bearer
+credentials and API data without transport encryption, so the operator must
+retain the configuration warning and audit evidence required by ADR-0030.
 SDK publication and a public query transport remain unavailable.
 
 ## Compatibility and capability behavior

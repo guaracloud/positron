@@ -152,9 +152,6 @@ fn parse(
         if options.contains_key("--trust-file") {
             return Err("--trust-file does not apply to plaintext opt-out");
         }
-        if !endpoint.ip().is_loopback() {
-            return Err("plaintext API endpoint must be loopback");
-        }
         ApiKeyTransport::PlaintextOptOut { endpoint }
     } else {
         ApiKeyTransport::Tls {
@@ -244,7 +241,6 @@ mod tests {
             "list --endpoint 127.0.0.1:8080 --credential-stdin --secret sensitive",
             "list --endpoint 127.0.0.1:8080 --credential-stdin --scope query",
             "list --endpoint 192.0.2.1:8080 --credential-stdin",
-            "list --endpoint 192.0.2.1:8080 --credential-stdin --allow-plaintext",
             "list --endpoint 127.0.0.1:8080",
         ] {
             assert!(parse(command.split_whitespace().map(ToOwned::to_owned)).is_err());
@@ -252,6 +248,14 @@ mod tests {
         assert!(
             parse(
                 "list --endpoint 127.0.0.1:8080 --credential-stdin --allow-plaintext"
+                    .split_whitespace()
+                    .map(ToOwned::to_owned)
+            )
+            .is_ok()
+        );
+        assert!(
+            parse(
+                "list --endpoint 192.0.2.1:8080 --credential-stdin --allow-plaintext"
                     .split_whitespace()
                     .map(ToOwned::to_owned)
             )

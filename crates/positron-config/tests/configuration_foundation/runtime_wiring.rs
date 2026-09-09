@@ -42,7 +42,7 @@ fn runtime_endpoints_and_key_path_are_explicit_typed_configuration() {
 }
 
 #[test]
-fn api_transport_profile_allows_public_tls_and_rejects_public_plaintext() {
+fn api_transport_profile_allows_explicit_public_tls_and_plaintext() {
     let tls = inputs(
         Some(
             "schema_version = 1\n[listener]\napi_bind_address = \"192.0.2.1:8443\"\napi_transport = \"tls\"\napi_tls_certificate_file = \"/secrets/cert.pem\"\napi_tls_private_key_file = \"/secrets/key.pem\"\n",
@@ -64,8 +64,12 @@ fn api_transport_profile_allows_public_tls_and_rejects_public_plaintext() {
         [],
         [],
     )
-    .and_then(resolve);
-    assert!(plaintext.is_err(), "public plaintext is not currently admitted");
+    .and_then(resolve)
+    .expect("explicit public plaintext profile resolves");
+    assert_eq!(
+        plaintext.api_transport(),
+        positron_config::ApiTransport::PlaintextOptOut
+    );
     let unused_server_trust = inputs(
         Some("schema_version = 1\n[listener]\napi_tls_trust_file = \"/secrets/ca.pem\"\n"),
         [],

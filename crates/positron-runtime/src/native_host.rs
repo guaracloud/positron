@@ -45,6 +45,9 @@ impl NativeBindings {
         otlp_http: SocketAddr,
         loki_push: SocketAddr,
     ) -> Result<Self, NativeHostFailure> {
+        if !api.ip().is_loopback() {
+            return Err(NativeHostFailure::InvalidBinding);
+        }
         Self::new_with_api_transport(
             control,
             operations,
@@ -75,9 +78,6 @@ impl NativeBindings {
         ] {
             BoundEndpoint::tcp(role, address).map_err(|_| NativeHostFailure::InvalidBinding)?;
         }
-        if !api.ip().is_loopback() && !api_transport.is_tls() {
-            return Err(NativeHostFailure::InvalidBinding);
-        }
         Ok(Self {
             control,
             operations,
@@ -93,9 +93,6 @@ impl NativeBindings {
         mut self,
         profile: ApiTransportProfile,
     ) -> Result<Self, NativeHostFailure> {
-        if !self.api.ip().is_loopback() && !profile.is_tls() {
-            return Err(NativeHostFailure::InvalidBinding);
-        }
         self.api_transport = profile;
         Ok(self)
     }

@@ -202,12 +202,6 @@ impl Candidate {
                 FailureSource::StorageDataDirectory,
             ));
         }
-        if !self.api_bind_address.ip().is_loopback() && self.api_transport != ApiTransport::Tls {
-            return Err(ConfigurationFailure::new(
-                ConfigurationFailureCode::UnsafeCombination,
-                FailureSource::ListenerApiTransport,
-            ));
-        }
         Ok(EffectiveConfiguration {
             schema_version: self.schema_version,
             log_level: self.log_level,
