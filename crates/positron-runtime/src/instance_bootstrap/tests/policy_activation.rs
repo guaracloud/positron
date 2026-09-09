@@ -6,7 +6,8 @@ use positron_governance::{
 };
 use positron_ingest::{IngestPolicy, PolicyAction, PolicyRule};
 use positron_kernel::{
-    AuditIntent, Catalog, CatalogObject, CatalogProposal, FormatEpoch, TransactionId,
+    AuditIntent, Catalog, CatalogObject, CatalogProposal, FormatEpoch, ResourceAmounts,
+    ResourceDimension, TransactionId, WorkClaim, WorkKind,
 };
 
 use super::super::{InitializationPlan, InstanceBootstrap};
@@ -75,6 +76,53 @@ fn tenant_administrator_can_activate_its_prospective_ingest_policy()
         2,
         "activation affects only subsequently pinned policy snapshots"
     );
+    Ok(())
+}
+
+#[test]
+fn reopened_instance_applies_the_current_durable_quota_before_admission()
+-> Result<(), Box<dyn std::error::Error>> {
+    let roots = Roots::new()?;
+    let paths = roots.paths();
+    let initialized = InstanceBootstrap::initialize(&paths, InitializationPlan::non_interactive())?;
+    let catalog = Catalog::open(
+        &initialized._authority,
+        initialized.instance,
+        initialized.key.catalog_secret(initialized.instance)?,
+    )?;
+    let snapshot = catalog.pin()?;
+    let (_, governance) = snapshot.governance_object()?;
+    let mut objects = Vec::new();
+    for object in snapshot.object_identities() {
+        let bytes = snapshot.object(object)?.ok_or("catalog object")?;
+        if !bytes.starts_with(b"POSGOV") {
+            objects.push(CatalogObject::new(bytes.to_vec())?);
+        }
+    }
+    objects.push(CatalogObject::new(governance.with_quota(2, 1, [1; 11])?)?);
+    catalog.commit(
+        snapshot.identity(),
+        CatalogProposal::new(
+            TransactionId::new([0x73; 16])?,
+            FormatEpoch::CATALOG_V1,
+            objects,
+        )?,
+        None,
+    )?;
+    drop(catalog);
+    drop(initialized);
+
+    let reopened = InstanceBootstrap::reopen(&paths)?;
+    let failure = reopened
+        ._authority
+        .governor()
+        .reserve(WorkClaim::tenant(
+            reopened.tenant,
+            WorkKind::Ingest,
+            ResourceAmounts::only(ResourceDimension::MemoryBytes, 2)?,
+        )?)
+        .expect_err("the persisted quota must limit admission after reopen");
+    assert_eq!(failure.code(), positron_kernel::AdmissionFailureCode::TenantQuotaExceeded);
     Ok(())
 }
 

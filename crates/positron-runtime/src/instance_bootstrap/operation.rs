@@ -4,7 +4,8 @@ use positron_governance::{InitialAuditContext, InitialGovernanceIntent, InitialT
 use positron_kernel::{
     AuditIntent, BootstrapArtifact, BootstrapArtifactAccess, BootstrapKeyCustody,
     BootstrapObjectPurpose, Catalog, CatalogObject, CatalogProposal, FormatEpoch, InstanceId,
-    OwnedPrimaryDataVolume, RetentionTimeAuthority, TransactionId,
+    OwnedPrimaryDataVolume, ResourceAmounts, RetentionTimeAuthority,
+    StorageKernelResourceAuthority, TransactionId,
 };
 use zeroize::Zeroizing;
 
@@ -177,6 +178,7 @@ fn resume(
     };
     open_initial_ledgers(&authority, &retention_time, &catalog, &key, &record)?;
     let current = catalog.pin().map_err(catalog_failure)?;
+    apply_catalog_quota(&authority, &current)?;
     if plan.creates_claim() {
         ensure_claim(&access, &key, &record, api_secret)?;
     }
@@ -251,6 +253,7 @@ pub(super) fn reopen(paths: &BootstrapPaths) -> Result<InitializedInstance, Boot
         open_initial_ledgers(&authority, &retention_time, &catalog, &key, &record)?;
     }
     let current = catalog.pin().map_err(catalog_failure)?;
+    apply_catalog_quota(&authority, &current)?;
     let generation = current.number();
     let audit = current.governance_audit_frontier();
     let claim_available = storage::exists(&access, BootstrapArtifact::Claim)?;
@@ -321,6 +324,19 @@ pub(super) fn claim(paths: &BootstrapPaths) -> Result<BootstrapClaim, BootstrapF
         ingest,
         query,
     })
+}
+
+fn apply_catalog_quota(
+    authority: &StorageKernelResourceAuthority,
+    snapshot: &positron_kernel::CatalogSnapshot,
+) -> Result<(), BootstrapFailure> {
+    let (_, governance) = snapshot.governance_object().map_err(catalog_failure)?;
+    authority
+        .update_tenant_quota(
+            governance.tenant(),
+            ResourceAmounts::new(governance.quota_resources()),
+        )
+        .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))
 }
 
 fn generate_record(key: &BootstrapKeyCustody) -> Result<BootstrapRecord, BootstrapFailure> {
