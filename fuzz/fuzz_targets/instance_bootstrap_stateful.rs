@@ -76,7 +76,10 @@ fn corrupt(path: &Path, selector: usize) {
     }
 }
 
-fn heterogeneous_rotation_entries(data: &[u8]) -> Vec<GovernanceAuditEntry> {
+fn heterogeneous_rotation_entries(
+    data: &[u8],
+    first_position: u64,
+) -> Vec<GovernanceAuditEntry> {
     let mut provider_key_reference = [0_u8; 16];
     let provider_bytes = data.get(..data.len().min(16)).unwrap_or_default();
     provider_key_reference[..provider_bytes.len()].copy_from_slice(provider_bytes);
@@ -105,7 +108,7 @@ fn heterogeneous_rotation_entries(data: &[u8]) -> Vec<GovernanceAuditEntry> {
             intent.extend_from_slice(b"fuzz-sensitive-metadata");
             intent.extend_from_slice(data.get(..data.len().min(24)).unwrap_or_default());
             let entry = positron_governance::fuzz_decode_governance_audit(
-                u64::try_from(index).expect("bounded stage") + 2,
+                first_position + u64::try_from(index).expect("bounded stage"),
                 transaction_id,
                 &intent,
             )
@@ -124,7 +127,7 @@ fuzz_target!(|data: &[u8]| {
         assert_eq!(format!("{response:?}"), "ApiKeyResponse { <redacted> }");
     }
     positron_governance::fuzz_parse_governance(&data[..split], &data[split..]);
-    let rotations = heterogeneous_rotation_entries(data);
+    let rotations = heterogeneous_rotation_entries(data, 2);
     assert_eq!(rotations.len(), 3);
     assert_eq!(
         rotations
@@ -225,13 +228,18 @@ fuzz_target!(|data: &[u8]| {
                     let audit = instance
                         .inspect_governance_for_fixture(authorized)
                         .expect("system administration authorizes governance inspection");
-                    assert_eq!(audit.audit_records().len(), 1);
+                    assert!(!audit.audit_records().is_empty());
+                    let audit_len = audit.audit_records().len();
+                    let next_position = u64::try_from(audit_len)
+                        .expect("bounded audit chain")
+                        + 1;
+                    let rotations = heterogeneous_rotation_entries(data, next_position);
                     let heterogeneous = audit
                         .audit_records()
                         .iter()
                         .chain(rotations.iter())
                         .collect::<Vec<_>>();
-                    assert_eq!(heterogeneous.len(), 4);
+                    assert_eq!(heterogeneous.len(), audit_len + rotations.len());
                     for (index, entry) in heterogeneous.iter().enumerate() {
                         assert_eq!(
                             entry.position(),
