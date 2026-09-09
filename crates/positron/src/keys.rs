@@ -2,7 +2,10 @@ use std::io::{IsTerminal, Read, Write};
 use std::net::SocketAddr;
 use std::process::ExitCode;
 
-use positron_api::api_keys::{ApiKeyRequest, ApiKeyServiceClient, KeyAction, KeyScope};
+use positron_api::api_keys::{
+    ApiKeyRequest, ApiKeyServiceClient, ApiKeyServiceClientFailure, ApiKeyTransport, KeyAction,
+    KeyScope,
+};
 use zeroize::Zeroizing;
 
 pub(super) fn run(arguments: impl Iterator<Item = String>) -> ExitCode {
@@ -16,7 +19,7 @@ pub(super) fn run(arguments: impl Iterator<Item = String>) -> ExitCode {
 }
 
 fn execute(arguments: impl Iterator<Item = String>) -> Result<(), &'static str> {
-    let (endpoint, request) = parse(arguments)?;
+    let (transport, request) = parse(arguments)?;
     let input = std::io::stdin();
     if input.is_terminal() {
         return Err("credential input must be a pipe; terminal input is refused to prevent echo");
@@ -36,10 +39,8 @@ fn execute(arguments: impl Iterator<Item = String>) -> Result<(), &'static str> 
     {
         return Err("invalid credential input");
     }
-    let client = ApiKeyServiceClient::new(endpoint).map_err(|_| "API endpoint unavailable")?;
-    let mut response = client
-        .manage(bearer, &request)
-        .map_err(|_| "API-key request rejected; inspect state before retrying")?;
+    let client = ApiKeyServiceClient::new(transport).map_err(|_| "API endpoint unavailable")?;
+    let mut response = client.manage(bearer, &request).map_err(client_failure)?;
     let mut output = std::io::stdout().lock();
     for key in std::mem::take(&mut response.keys) {
         writeln!(
@@ -67,9 +68,28 @@ fn execute(arguments: impl Iterator<Item = String>) -> Result<(), &'static str> 
     Ok(())
 }
 
+fn client_failure(failure: ApiKeyServiceClientFailure) -> &'static str {
+    match failure {
+        ApiKeyServiceClientFailure::AuthenticationRejected => "authentication rejected",
+        ApiKeyServiceClientFailure::StaleGeneration => {
+            "stale generation; inspect current state before retrying"
+        },
+        ApiKeyServiceClientFailure::IdempotencyConflict => {
+            "idempotency conflict; inspect current state before retrying"
+        },
+        ApiKeyServiceClientFailure::KeyUnavailable => "key unavailable; inspect current state",
+        ApiKeyServiceClientFailure::AdministrationUnavailable => {
+            "administration unavailable; retry with the same idempotency key"
+        },
+        ApiKeyServiceClientFailure::Transport => {
+            "API transport unavailable; inspect state before retrying"
+        },
+    }
+}
+
 fn parse(
     mut arguments: impl Iterator<Item = String>,
-) -> Result<(SocketAddr, ApiKeyRequest), &'static str> {
+) -> Result<(ApiKeyTransport, ApiKeyRequest), &'static str> {
     let action = match arguments.next().as_deref() {
         Some("create") => KeyAction::Create,
         Some("list") => KeyAction::List,
@@ -84,9 +104,14 @@ fn parse(
     };
     let mut options = std::collections::BTreeMap::new();
     let mut credential_stdin = false;
+    let mut allow_plaintext = false;
     while let Some(argument) = arguments.next() {
         if argument == "--credential-stdin" && !credential_stdin {
             credential_stdin = true;
+            continue;
+        }
+        if argument == "--allow-plaintext" && !allow_plaintext {
+            allow_plaintext = true;
             continue;
         }
         if !matches!(
@@ -97,6 +122,8 @@ fn parse(
                 | "--expected-generation"
                 | "--idempotency-key"
                 | "--expires-at"
+                | "--trust-file"
+                | "--server-name"
         ) {
             return Err("unknown key option");
         }
@@ -115,9 +142,26 @@ fn parse(
         .ok_or("--endpoint is required")?
         .parse()
         .map_err(|_| "invalid API endpoint")?;
-    if !endpoint.ip().is_loopback() || endpoint.port() == 0 {
-        return Err("the native API endpoint must be a loopback address");
+    if endpoint.port() == 0 {
+        return Err("invalid API endpoint");
     }
+    let transport = if allow_plaintext {
+        if options.contains_key("--trust-file") {
+            return Err("--trust-file does not apply to plaintext opt-out");
+        }
+        ApiKeyTransport::PlaintextOptOut { endpoint }
+    } else {
+        ApiKeyTransport::Tls {
+            endpoint,
+            server_name: options
+                .remove("--server-name")
+                .ok_or("--server-name is required for TLS")?,
+            trust_file: options
+                .remove("--trust-file")
+                .ok_or("--trust-file is required unless --allow-plaintext is explicit")?
+                .into(),
+        }
+    };
     let request = match action {
         KeyAction::Unspecified => return Err("invalid key command"),
         KeyAction::List => ApiKeyRequest::list(),
@@ -165,12 +209,25 @@ fn parse(
         return Err("option does not apply to this key command");
     }
     request.encode().map_err(|_| "invalid key request")?;
-    Ok((endpoint, request))
+    Ok((transport, request))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use positron_api::api_keys::ApiKeyServiceClientFailure;
+
+    #[test]
+    fn typed_api_failures_preserve_safe_retry_guidance() {
+        assert_eq!(
+            client_failure(ApiKeyServiceClientFailure::IdempotencyConflict),
+            "idempotency conflict; inspect current state before retrying"
+        );
+        assert_eq!(
+            client_failure(ApiKeyServiceClientFailure::AuthenticationRejected),
+            "authentication rejected"
+        );
+    }
     #[test]
     fn key_arguments_reject_secret_options_and_unrelated_mutation_flags() {
         for command in [
@@ -183,11 +240,19 @@ mod tests {
         }
         assert!(
             parse(
-                "list --endpoint 127.0.0.1:8080 --credential-stdin"
+                "list --endpoint 127.0.0.1:8080 --credential-stdin --allow-plaintext"
                     .split_whitespace()
                     .map(ToOwned::to_owned)
             )
             .is_ok()
+        );
+        assert!(
+            parse(
+                "list --endpoint 127.0.0.1:8080 --credential-stdin --trust-file ca.pem"
+                    .split_whitespace()
+                    .map(ToOwned::to_owned)
+            )
+            .is_err()
         );
     }
 }

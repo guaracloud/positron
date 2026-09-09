@@ -55,6 +55,8 @@ pub enum ValueDomain {
     UnsignedIntegerRange(u16, u16),
     /// A socket address with a byte ceiling whose IP must be loopback.
     LoopbackSocketAddress(usize),
+    /// A socket address whose transport policy decides whether public binding is safe.
+    SocketAddress(usize),
     /// An absolute normalized path with a byte ceiling.
     AbsolutePath(usize),
     /// A secret-bearing absolute normalized path with a byte ceiling.
@@ -150,6 +152,10 @@ pub enum Setting {
     ListenerControlPath,
     ListenerOperationsBindAddress,
     ListenerApiBindAddress,
+    ListenerApiTransport,
+    ListenerApiTlsCertificateFile,
+    ListenerApiTlsPrivateKeyFile,
+    ListenerApiTlsTrustFile,
     ListenerOtlpGrpcBindAddress,
     ListenerOtlpHttpBindAddress,
     ListenerLokiPushBindAddress,
@@ -185,6 +191,10 @@ pub const fn setting_definition(setting: Setting) -> SettingDefinition {
         listener_control_path,
         listener_operations_bind_address,
         listener_api_bind_address,
+        listener_api_transport,
+        listener_api_tls_certificate_file,
+        listener_api_tls_private_key_file,
+        listener_api_tls_trust_file,
         listener_otlp_grpc_bind_address,
         listener_otlp_http_bind_address,
         listener_loki_push_bind_address,
@@ -199,6 +209,10 @@ pub const fn setting_definition(setting: Setting) -> SettingDefinition {
         Setting::ListenerControlPath => listener_control_path,
         Setting::ListenerOperationsBindAddress => listener_operations_bind_address,
         Setting::ListenerApiBindAddress => listener_api_bind_address,
+        Setting::ListenerApiTransport => listener_api_transport,
+        Setting::ListenerApiTlsCertificateFile => listener_api_tls_certificate_file,
+        Setting::ListenerApiTlsPrivateKeyFile => listener_api_tls_private_key_file,
+        Setting::ListenerApiTlsTrustFile => listener_api_tls_trust_file,
         Setting::ListenerOtlpGrpcBindAddress => listener_otlp_grpc_bind_address,
         Setting::ListenerOtlpHttpBindAddress => listener_otlp_http_bind_address,
         Setting::ListenerLokiPushBindAddress => listener_loki_push_bind_address,

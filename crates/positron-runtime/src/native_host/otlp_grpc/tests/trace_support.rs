@@ -299,6 +299,7 @@ impl ReceiverHarness {
             listener: NativeListener::Tcp(listener),
             accepting: AtomicBool::new(true),
             control_path: None,
+            api_transport: None,
         });
         let cancellation = TaskCancellation::new();
         let serve_cancellation = cancellation.clone();

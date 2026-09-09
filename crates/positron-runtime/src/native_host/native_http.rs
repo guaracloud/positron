@@ -3,6 +3,7 @@ use std::net::TcpStream;
 use std::time::Duration;
 
 use positron_api::generated::{ApiError, CapabilityResponse};
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::{HealthState, ListenerRole, Liveness, Readiness, ServiceHandle};
 
@@ -34,6 +35,63 @@ pub(super) fn serve_connection(
 
 pub(super) struct ConnectionFailure;
 
+pub(super) fn serve_tls_api_connection<S: Read + Write>(
+    stream: &mut S,
+    health: &HealthState,
+    services: Option<&ServiceHandle>,
+) -> Result<(), ConnectionFailure> {
+    let result = (|| {
+        let head = read_head(stream)?;
+        let response = route_tls_api(stream, head, health, services)?;
+        write_response(stream, response).map_err(|_| Response::empty(500))
+    })();
+    if let Err(response) = result {
+        write_response(stream, response).map_err(|_| ConnectionFailure)?;
+    }
+    Ok(())
+}
+
+fn route_tls_api<S: Read + Write>(
+    stream: &mut S,
+    mut head: RequestHead,
+    _health: &HealthState,
+    services: Option<&ServiceHandle>,
+) -> Result<Response, Response> {
+    match (head.method.as_str(), head.path.as_str()) {
+        ("POST", positron_api::api_keys::HTTP_PATH) => {
+            let services = services.ok_or_else(|| Response::empty(503))?;
+            let bearer = Zeroizing::new(head.bearer.take().ok_or_else(|| {
+                Response::json(401, "{\"code\":\"authentication_rejected\"}".to_owned())
+            })?);
+            let body = read_body(
+                stream,
+                head.content_length,
+                positron_api::api_keys::MAX_REQUEST_BYTES,
+            )?;
+            match services.administer_api_keys(&bearer, &body) {
+                Ok(response) => Ok(Response {
+                    status: 200,
+                    content_type: "application/json",
+                    body: response.encode().map_err(|_| Response::empty(500))?,
+                    retry_after_seconds: None,
+                }),
+                Err((status, code)) => {
+                    Ok(Response::json(status, format!("{{\"code\":\"{code}\"}}")))
+                },
+            }
+        },
+        ("POST", "/v1/capabilities:negotiate") => {
+            let services = services.ok_or_else(|| Response::empty(503))?;
+            let body = read_body(stream, head.content_length, MAX_API_BODY_BYTES)?;
+            Ok(capability_response(services.negotiate_capability(&body)))
+        },
+        (_, positron_api::api_keys::HTTP_PATH | "/v1/capabilities:negotiate") => {
+            Ok(Response::empty(405))
+        },
+        _ => Ok(Response::empty(404)),
+    }
+}
+
 fn serve_checked(
     stream: &mut TcpStream,
     role: ListenerRole,
@@ -48,22 +106,22 @@ fn serve_checked(
 fn route(
     stream: &mut TcpStream,
     role: ListenerRole,
-    head: RequestHead,
+    mut head: RequestHead,
     health: &HealthState,
     services: Option<&ServiceHandle>,
 ) -> Result<Response, Response> {
     match (role, head.method.as_str(), head.path.as_str()) {
         (ListenerRole::Api, "POST", positron_api::api_keys::HTTP_PATH) => {
             let services = services.ok_or_else(|| Response::empty(503))?;
-            let bearer = head.bearer.as_deref().ok_or_else(|| {
+            let bearer = Zeroizing::new(head.bearer.take().ok_or_else(|| {
                 Response::json(401, "{\"code\":\"authentication_rejected\"}".to_owned())
-            })?;
+            })?);
             let body = read_body(
                 stream,
                 head.content_length,
                 positron_api::api_keys::MAX_REQUEST_BYTES,
             )?;
-            match services.administer_api_keys(bearer, &body) {
+            match services.administer_api_keys(&bearer, &body) {
                 Ok(response) => {
                     let body = response.encode().map_err(|_| Response::empty(500))?;
                     Ok(Response {
@@ -127,8 +185,8 @@ pub(super) struct RequestHead {
     pub(super) tenant_hint: Option<String>,
 }
 
-fn read_head(stream: &mut TcpStream) -> Result<RequestHead, Response> {
-    let mut bytes = Vec::with_capacity(512);
+fn read_head<S: Read>(stream: &mut S) -> Result<RequestHead, Response> {
+    let mut bytes = Zeroizing::new(Vec::with_capacity(512));
     let mut byte = [0_u8; 1];
     while !bytes.ends_with(b"\r\n\r\n") {
         if bytes.len() == MAX_HEADER_BYTES {
@@ -197,8 +255,8 @@ fn read_head(stream: &mut TcpStream) -> Result<RequestHead, Response> {
     })
 }
 
-pub(super) fn read_body(
-    stream: &mut TcpStream,
+pub(super) fn read_body<S: Read>(
+    stream: &mut S,
     length: usize,
     maximum: usize,
 ) -> Result<Vec<u8>, Response> {
@@ -260,6 +318,12 @@ pub(super) struct Response {
     retry_after_seconds: Option<u32>,
 }
 
+impl Drop for Response {
+    fn drop(&mut self) {
+        self.body.zeroize();
+    }
+}
+
 impl Response {
     pub(super) fn empty(status: u16) -> Self {
         Self {
@@ -314,7 +378,7 @@ impl Response {
     }
 }
 
-fn write_response(stream: &mut TcpStream, response: Response) -> Result<(), std::io::Error> {
+fn write_response<S: Write>(stream: &mut S, response: Response) -> Result<(), std::io::Error> {
     let reason = match response.status {
         200 => "OK",
         400 => "Bad Request",

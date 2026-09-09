@@ -3,6 +3,7 @@ use positron_runtime::{
     InstanceBootstrap, NativeBindings, NativeHost, ServeConfiguration, ShutdownTrigger,
 };
 use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::process::{Command, Stdio};
 
 #[test]
@@ -144,6 +145,37 @@ fn cli_manages_keys_through_authenticated_running_api_without_redisplay()
     Ok(())
 }
 
+#[test]
+fn cli_reports_a_typed_idempotency_conflict_without_echoing_credentials()
+-> Result<(), Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let endpoint = listener.local_addr()?.to_string();
+    let server = std::thread::spawn(move || -> Result<(), std::io::Error> {
+        let (mut stream, _) = listener.accept()?;
+        let mut request = [0_u8; 4096];
+        let _ = stream.read(&mut request)?;
+        let body = "{\"code\":\"idempotency_conflict\"}";
+        stream.write_all(
+            format!(
+                "HTTP/1.1 409 Conflict\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )?;
+        Ok(())
+    });
+    let output = invoke(&endpoint, "credential-canary", &["list"])?;
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_eq!(
+        stderr,
+        "positron: idempotency conflict; inspect current state before retrying\n"
+    );
+    assert!(!stderr.contains("credential-canary"));
+    server.join().map_err(|_| "server panicked")??;
+    Ok(())
+}
+
 fn raw_status(
     endpoint: &str,
     credentials: &[&str],
@@ -183,7 +215,12 @@ fn invoke(
     let mut child = Command::new(env!("CARGO_BIN_EXE_positron"))
         .arg("key")
         .args(arguments)
-        .args(["--endpoint", endpoint, "--credential-stdin"])
+        .args([
+            "--endpoint",
+            endpoint,
+            "--credential-stdin",
+            "--allow-plaintext",
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

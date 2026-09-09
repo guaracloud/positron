@@ -31,13 +31,97 @@ fn generated_api_key_service_client_uses_the_canonical_http_mapping()
         )?;
         Ok(())
     });
-    let client = positron_api::api_keys::ApiKeyServiceClient::new(endpoint)?;
+    let client = positron_api::api_keys::ApiKeyServiceClient::new(
+        positron_api::api_keys::ApiKeyTransport::PlaintextOptOut { endpoint },
+    )?;
     let response = client.manage("key-material", &ApiKeyRequest::list())?;
     assert_eq!(
         response.principal.as_deref(),
         Some("11111111-1111-1111-1111-111111111111")
     );
     server.join().map_err(|_| "server panicked")??;
+    Ok(())
+}
+
+#[test]
+fn generated_api_key_service_client_preserves_only_published_failure_codes()
+-> Result<(), Box<dyn std::error::Error>> {
+    use positron_api::api_keys::ApiKeyServiceClientFailure;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    fn failure(
+        status: u16,
+        body: &str,
+    ) -> Result<ApiKeyServiceClientFailure, Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let endpoint = listener.local_addr()?;
+        let body = body.to_owned();
+        let server = thread::spawn(move || -> Result<(), std::io::Error> {
+            let (mut stream, _) = listener.accept()?;
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request)?;
+            stream.write_all(format!("HTTP/1.1 {status} Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes())?;
+            Ok(())
+        });
+        let failure = positron_api::api_keys::ApiKeyServiceClient::new(
+            positron_api::api_keys::ApiKeyTransport::PlaintextOptOut { endpoint },
+        )?
+        .manage("key-material", &ApiKeyRequest::list())
+        .expect_err("published failure must remain typed");
+        server.join().map_err(|_| "server panicked")??;
+        Ok(failure)
+    }
+    for (status, body, expected) in [
+        (
+            401,
+            "{\"code\":\"authentication_rejected\"}",
+            ApiKeyServiceClientFailure::AuthenticationRejected,
+        ),
+        (
+            404,
+            "{\"code\":\"key_unavailable\"}",
+            ApiKeyServiceClientFailure::KeyUnavailable,
+        ),
+        (
+            409,
+            "{\"code\":\"stale_generation\"}",
+            ApiKeyServiceClientFailure::StaleGeneration,
+        ),
+        (
+            409,
+            "{\"code\":\"idempotency_conflict\"}",
+            ApiKeyServiceClientFailure::IdempotencyConflict,
+        ),
+        (
+            503,
+            "{\"code\":\"administration_unavailable\"}",
+            ApiKeyServiceClientFailure::AdministrationUnavailable,
+        ),
+        (
+            409,
+            "{\"code\":\"key_unavailable\"}",
+            ApiKeyServiceClientFailure::Transport,
+        ),
+        (
+            500,
+            "{\"detail\":\"secret-canary\"}",
+            ApiKeyServiceClientFailure::Transport,
+        ),
+    ] {
+        assert_eq!(failure(status, body)?, expected);
+    }
+    assert_eq!(
+        failure(
+            503,
+            &format!(
+                "{{\"code\":\"administration_unavailable\",\"detail\":\"{}\"}}",
+                "x".repeat(65_536)
+            )
+        )?,
+        ApiKeyServiceClientFailure::Transport
+    );
     Ok(())
 }
 

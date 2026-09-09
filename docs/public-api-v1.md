@@ -7,12 +7,19 @@ product surface and change together.
 
 The native `api` listener exposes capability negotiation and authenticated
 API-key lifecycle management. The `positron key` CLI uses that listener with
-bearer metadata from a non-terminal stdin pipe. It accepts no credential
+verified TLS by default: its configured server name and protected CA reference bind the HTTPS
+authority separately from the dial address. Plaintext requires the explicit listener and CLI
+opt-out. Bearer metadata comes from a non-terminal stdin pipe. It accepts no credential
 argument or environment variable. See [the canonical API reference](../api/positron/v1/README.md)
 for the create, list, rotate, revoke, and scope-inspect request contract, generation
 preconditions, idempotency semantics, failure codes, and one-time secret output.
 A create retry that completes an authenticated pre-marker preparation returns the
 original principal with no secret; it never reconstructs or redisplays the original secret.
+Its stable lifecycle failures distinguish authentication, stale generation, idempotency conflict,
+unavailable key, and unavailable administration; malformed remote errors remain redacted transport
+failures.
+The current listener admits plaintext only on loopback; public plaintext API admission is not
+available.
 SDK publication and a public query transport remain unavailable.
 
 ## Compatibility and capability behavior

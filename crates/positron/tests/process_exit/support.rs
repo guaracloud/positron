@@ -182,12 +182,23 @@ pub(super) fn process_configuration(
     api_port: u16,
     otlp_http_port: u16,
 ) -> String {
+    let crate_directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let runtime_directory = crate_directory
+        .parent()
+        .unwrap_or(crate_directory)
+        .join("positron-runtime/tests/native_transport/fixtures");
+    let certificate = runtime_directory.join("api-test-cert.pem");
+    let private_key = runtime_directory.join("api-test-key.pem");
+    let trust = runtime_directory.join("api-test-cert.pem");
     format!(
-        "schema_version = 1\n[runtime]\nshutdown_grace_seconds = 2\n[listener]\ncontrol_path = \"{}\"\noperations_bind_address = \"127.0.0.1:{operations_port}\"\napi_bind_address = \"127.0.0.1:{api_port}\"\notlp_http_bind_address = \"127.0.0.1:{otlp_http_port}\"\n[storage]\ndata_directory = \"{}\"\nsecrets_directory = \"{}\"\n[security]\nlocal_key_file = \"{}\"\n",
+        "schema_version = 1\n[runtime]\nshutdown_grace_seconds = 2\n[listener]\ncontrol_path = \"{}\"\noperations_bind_address = \"127.0.0.1:{operations_port}\"\napi_bind_address = \"127.0.0.1:{api_port}\"\napi_transport = \"tls\"\napi_tls_certificate_file = \"{}\"\napi_tls_private_key_file = \"{}\"\napi_tls_trust_file = \"{}\"\notlp_http_bind_address = \"127.0.0.1:{otlp_http_port}\"\n[storage]\ndata_directory = \"{}\"\nsecrets_directory = \"{}\"\n[security]\nlocal_key_file = \"{}\"\n",
         std::path::Path::new("/tmp")
             .join(root.file_name().unwrap_or_default())
             .with_extension("sock")
             .display(),
+        certificate.display(),
+        private_key.display(),
+        trust.display(),
         data.display(),
         secrets.display(),
         secrets.join("local-root-key.v1").display()

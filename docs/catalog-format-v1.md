@@ -71,13 +71,19 @@ The per-transaction `transaction.digest` identity file is synchronized before it
 transaction directory and staging parent on creation and every retry; a pathname alone never
 establishes durable transaction identity.
 
-An API-key create may first write an encrypted, authenticated `prepared.manifest` in that same
+An API-key create or rotation may first write an encrypted, authenticated `prepared.manifest` in that same
 transaction-owned directory. It binds the canonical request digest to the exact commit record,
 prepared audit record, object identities, and immutable transaction digest. The manifest is
 synchronized before the digest and is never a public result. A matching retry may publish it only
 from its exact predecessor and audit frontier after every referenced artifact authenticates; a
 changed request conflicts, while a missing, incomplete, unauthenticated, or advanced record is
 unavailable without mutation. The raw API-key secret is absent from this record.
+
+A V1–V4 governance object becomes canonical V5 only in its first audited API-key lifecycle
+mutation. Migration preserves each actual administrator, ingest, and query principal, scope, and
+salted hash; explicit absent fields represent legacy absence. It never invents credentials,
+reconstructs secrets, changes the first expected credential generation of 1, or adds an external
+alias where V1–V3 had none.
 
 Root rotation derives three bounded Catalog transactions from one Administration transaction and
 publishes stage-tagged Governance Audit Records for `started`, successor `verified`, and

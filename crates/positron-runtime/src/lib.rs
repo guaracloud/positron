@@ -26,7 +26,7 @@ pub use instance_bootstrap::{
 pub use listener::{
     BoundEndpoint, BoundListener, ListenerFactory, ListenerFailure, ListenerRequest, ListenerRole,
 };
-pub use native_host::{NativeBindings, NativeHost, NativeHostFailure};
+pub use native_host::{ApiTransportProfile, NativeBindings, NativeHost, NativeHostFailure};
 pub use process::{
     ApplicationRuntime, CleanupFailure, CleanupPrimary, CleanupRole, DrainingProcess, ExitOutcome,
     HostInputs, InitializationMode, RecoveryAttempt, RecoveryAttemptHost, RecoveryDecision,

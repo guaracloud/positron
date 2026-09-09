@@ -5,6 +5,32 @@ use std::path::Path;
 use super::{Setting, ValueDomain, setting_definition, validate_path};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApiTransport {
+    Tls,
+    PlaintextOptOut,
+}
+
+impl ApiTransport {
+    pub(crate) fn parse(value: &str) -> Result<Self, ConfigurationFailure> {
+        match value {
+            "tls" => Ok(Self::Tls),
+            "plaintext" => Ok(Self::PlaintextOptOut),
+            _ => Err(ConfigurationFailure::unsupported_value(
+                FailureSource::ListenerApiTransport,
+            )),
+        }
+    }
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Tls => "tls",
+            Self::PlaintextOptOut => "plaintext",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LogLevel {
     Error,
     Warn,
@@ -102,6 +128,10 @@ pub enum FailureSource {
     ListenerControlPath,
     ListenerOperationsBindAddress,
     ListenerApiBindAddress,
+    ListenerApiTransport,
+    ListenerApiTlsCertificateFile,
+    ListenerApiTlsPrivateKeyFile,
+    ListenerApiTlsTrustFile,
     ListenerOtlpGrpcBindAddress,
     ListenerOtlpHttpBindAddress,
     ListenerLokiPushBindAddress,

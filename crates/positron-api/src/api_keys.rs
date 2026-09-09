@@ -14,6 +14,18 @@ mod client {
 }
 pub use client::{ApiKeyServiceClient, ApiKeyServiceClientFailure};
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ApiKeyTransport {
+    Tls {
+        endpoint: std::net::SocketAddr,
+        server_name: String,
+        trust_file: std::path::PathBuf,
+    },
+    PlaintextOptOut {
+        endpoint: std::net::SocketAddr,
+    },
+}
+
 pub const HTTP_PATH: &str = "/v1/api-keys:manage";
 pub const MAX_REQUEST_BYTES: usize = 1024;
 pub const MAX_RESPONSE_BYTES: usize = 64 * 1024;

@@ -1599,7 +1599,7 @@ Later audit entries continue from the prior committed hash. Recovery
 never truncates an unrelated committed audit record or allows a chain to
 reference an invisible entry.
 
-For API-key create only, a pre-marker fault retains encrypted
+For API-key create or rotation, a pre-marker fault retains encrypted
 transaction-owned prepared evidence that binds the canonical request to the
 exact generated salted verifier, commit record, and prepared audit entry before
 the immutable transaction digest. The same request may publish that exact

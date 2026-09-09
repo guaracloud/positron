@@ -6,12 +6,14 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use positron_config::{CommandLineOverrides, ConfigurationInputs, EnvironmentOverrides, resolve};
+use positron_config::{
+    ApiTransport, CommandLineOverrides, ConfigurationInputs, EnvironmentOverrides, resolve,
+};
 use positron_kernel::MountQualification;
 use positron_runtime::{
-    ApplicationRuntime, BootstrapPaths, ExitOutcome, HostInputs, InitializationMode,
-    NativeBindings, NativeHost, RecoveryAttempt, RecoveryAttemptHost, RecoveryDecision,
-    ServeConfiguration, ShutdownTrigger,
+    ApiTransportProfile, ApplicationRuntime, BootstrapPaths, ExitOutcome, HostInputs,
+    InitializationMode, NativeBindings, NativeHost, RecoveryAttempt, RecoveryAttemptHost,
+    RecoveryDecision, ServeConfiguration, ShutdownTrigger,
 };
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
@@ -71,13 +73,22 @@ fn run(
         MountQualification::LocalHost,
     )
     .map_err(|_| LaunchFailure::Configuration)?;
-    let bindings = NativeBindings::new(
+    let api_transport = match effective.api_transport() {
+        ApiTransport::Tls => ApiTransportProfile::tls(
+            effective.api_tls_certificate_file().as_path().to_path_buf(),
+            effective.api_tls_private_key_file().as_path().to_path_buf(),
+        ),
+        ApiTransport::PlaintextOptOut => Ok(ApiTransportProfile::plaintext_opt_out()),
+    }
+    .map_err(|_| LaunchFailure::Configuration)?;
+    let bindings = NativeBindings::new_with_api_transport(
         PathBuf::from(effective.control_path()),
         effective.operations_bind_address(),
         effective.api_bind_address(),
         effective.otlp_grpc_bind_address(),
         effective.otlp_http_bind_address(),
         effective.loki_push_bind_address(),
+        api_transport,
     )
     .map_err(|_| LaunchFailure::Configuration)?;
     let host = NativeHost::new(bindings);

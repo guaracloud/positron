@@ -1,4 +1,8 @@
-use positron_governance::{CompatibilityHints, PresentedCredential, RequestedIntent};
+use positron_domain::identity::Scope;
+use positron_governance::{
+    AdministrativeIdempotencyKey, CompatibilityHints, PresentedCredential, RequestedIntent,
+    ResourceGeneration,
+};
 use positron_kernel::{
     BootstrapArtifact, BootstrapObjectPurpose, Catalog, CatalogGovernanceObject, CatalogObject,
     CatalogProposal, FormatEpoch, TransactionId,
@@ -69,6 +73,74 @@ fn legacy_initialized_instance_reopens_and_preserves_its_one_time_admin_claim()
             .is_err()
     );
     assert!(!reopened.claim_available());
+    let listed = reopened.list_api_keys(administrator)?;
+    assert_eq!(
+        listed.len(),
+        1,
+        "legacy system administrator remains managed"
+    );
+    assert_eq!(listed[0].scope(), Scope::SystemAdministration);
+    let second_administrator = reopened
+        .attribute(
+            PresentedCredential::parse(claim.secret())?,
+            RequestedIntent::SystemAdministration,
+            CompatibilityHints::none(),
+        )
+        .map_err(|_| "second legacy administrator attribution")?;
+    let created = reopened.create_api_key(
+        second_administrator,
+        Scope::Query,
+        None,
+        ResourceGeneration::new(1)?,
+        AdministrativeIdempotencyKey::new([0x72; 16])?,
+    )?;
+    assert!(created.secret().is_some());
+    let rotated = reopened.rotate_api_key(
+        second_administrator,
+        created.principal_id(),
+        ResourceGeneration::new(2)?,
+        AdministrativeIdempotencyKey::new([0x73; 16])?,
+    )?;
+    assert!(rotated.secret().is_some());
+    reopened.revoke_api_key(
+        second_administrator,
+        created.principal_id(),
+        ResourceGeneration::new(3)?,
+        AdministrativeIdempotencyKey::new([0x74; 16])?,
+    )?;
+    let post_create_administrator = reopened
+        .attribute(
+            PresentedCredential::parse(claim.secret())?,
+            RequestedIntent::SystemAdministration,
+            CompatibilityHints::none(),
+        )
+        .map_err(|_| "post-create administrator attribution")?;
+    let descriptors = reopened.list_api_keys(post_create_administrator)?;
+    assert_eq!(descriptors.len(), 3);
+    assert!(descriptors.iter().any(|descriptor| {
+        descriptor.principal_id() == created.principal_id() && !descriptor.is_active()
+    }));
+    assert!(descriptors.iter().any(|descriptor| {
+        descriptor.principal_id() == rotated.principal_id()
+            && descriptor.scope() == Scope::Query
+            && descriptor.is_active()
+    }));
+    drop(reopened);
+    let reopened = InstanceBootstrap::reopen(&paths)?;
+    assert_eq!(
+        reopened
+            .list_api_keys(
+                reopened
+                    .attribute(
+                        PresentedCredential::parse(claim.secret())?,
+                        RequestedIntent::SystemAdministration,
+                        CompatibilityHints::none(),
+                    )
+                    .map_err(|_| "post-reopen administrator attribution")?
+            )?
+            .len(),
+        3,
+    );
     Ok(())
 }
 

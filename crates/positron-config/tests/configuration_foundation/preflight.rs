@@ -212,7 +212,7 @@ fn preflight_rejects_adversarial_toml_before_unbounded_parse_allocation() {
     }
 
     let mut many_entries = String::from("schema_version = 1\n[diagnostics]\n");
-    for index in 0..17 {
+    for index in 0..21 {
         many_entries.push_str(&format!("entry_{index} = \"x\"\n"));
     }
     assert_resource_limit(&many_entries);
@@ -233,7 +233,7 @@ fn preflight_rejects_adversarial_toml_before_unbounded_parse_allocation() {
 #[test]
 fn exact_preflight_entry_ceiling_is_not_reclassified_as_a_resource_failure() {
     let mut header_is_sixteenth = String::from("schema_version = 1\n");
-    for index in 0..14 {
+    for index in 0..18 {
         header_is_sixteenth.push_str(&format!("unknown_{index} = 1\n"));
     }
     header_is_sixteenth.push_str("[diagnostics]\n");
@@ -246,7 +246,7 @@ fn exact_preflight_entry_ceiling_is_not_reclassified_as_a_resource_failure() {
     ));
 
     let mut scalar_is_sixteenth = String::from("schema_version = 1\n[diagnostics]\n");
-    for index in 0..14 {
+    for index in 0..18 {
         scalar_is_sixteenth.push_str(&format!("unknown_{index} = 1\n"));
     }
     let scalar_result = inputs(Some(&scalar_is_sixteenth), [], []).and_then(resolve);

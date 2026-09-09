@@ -41,10 +41,19 @@ codes `authentication_rejected` (401), `invalid_request` (400),
 `administration_unavailable` (503).
 
 The native CLI invokes this API using `positron key create|list|rotate|revoke|scope-inspect`.
-Pass `--endpoint 127.0.0.1:PORT --credential-stdin`; supply the bearer through a
-pipe from a secret manager. Terminal input is refused to prevent echo. Secrets
+TLS is the default: pass `--endpoint ADDRESS:PORT --server-name DNS_OR_IP --trust-file CA_PEM
+--credential-stdin`; the server name is verified against the presented certificate and the CA
+reference is read only for that connection. `--allow-plaintext` is an explicit opt-out and cannot
+be combined with a trust reference. Supply the bearer through a pipe from a secret manager. Terminal input is refused to prevent echo. Secrets
 are never accepted in arguments or environment variables. Mutations require
 `--expected-generation N --idempotency-key UUID`; create also requires
 `--scope ingest|query|tenant-administration`, while rotate/revoke/scope-inspect
 require `--principal UUID`. `--expires-at N` is optional for create. A new
 secret is emitted once to stdout; protect that output as credential material.
+The current listener admits plaintext only on loopback; public plaintext API admission is not
+available.
+
+The client preserves only published failures: `authentication_rejected`, `stale_generation`,
+`idempotency_conflict`, `key_unavailable`, and `administration_unavailable`. Malformed,
+oversized, or status-mismatched error responses are a bounded transport failure and do not echo
+their body.

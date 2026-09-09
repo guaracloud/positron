@@ -236,7 +236,7 @@ fn exposes_the_complete_canonical_setting_contract_and_compiled_defaults()
             "listener.api_bind_address",
             SettingKind::String,
             "127.0.0.1:8080",
-            ValueDomain::LoopbackSocketAddress(256),
+            ValueDomain::SocketAddress(256),
             SecrecyClass::Public,
             ProvenancePolicy::NonSecretOverrides,
             MutabilityClass::DrainAndReload,

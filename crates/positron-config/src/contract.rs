@@ -31,13 +31,17 @@ macro_rules! define_settings {
     };
 }
 
-pub(crate) const SETTING_DEFINITIONS: [SettingDefinition; 12] = define_settings! {
+pub(crate) const SETTING_DEFINITIONS: [SettingDefinition; 16] = define_settings! {
     SchemaVersion | "schema_version" | Integer | "1" | ExactUnsignedInteger(1) | Public | ConfigurationFileOnly | ImmutableAfterInitialization;
     DiagnosticsLogLevel | "diagnostics.log_level" | String | "info" | StringEnumeration(&["error", "warn", "info", "debug"]) | Public | NonSecretOverrides | LiveReloadable;
     RuntimeShutdownGraceSeconds | "runtime.shutdown_grace_seconds" | Integer | "30" | UnsignedIntegerRange(1, 3600) | Public | NonSecretOverrides | RestartRequired;
     ListenerControlPath | "listener.control_path" | String | "/var/run/positron/control.sock" | AbsolutePath(256) | Public | NonSecretOverrides | DrainAndReload;
     ListenerOperationsBindAddress | "listener.operations_bind_address" | String | "127.0.0.1:13133" | LoopbackSocketAddress(256) | Public | NonSecretOverrides | DrainAndReload;
-    ListenerApiBindAddress | "listener.api_bind_address" | String | "127.0.0.1:8080" | LoopbackSocketAddress(256) | Public | NonSecretOverrides | DrainAndReload;
+    ListenerApiBindAddress | "listener.api_bind_address" | String | "127.0.0.1:8080" | SocketAddress(256) | Public | NonSecretOverrides | DrainAndReload;
+    ListenerApiTransport | "listener.api_transport" | String | "tls" | StringEnumeration(&["tls", "plaintext"]) | Public | ConfigurationFileOnly | DrainAndReload;
+    ListenerApiTlsCertificateFile | "listener.api_tls_certificate_file" | String | "/var/lib/positron-secrets/api-certificate.pem" | ProtectedAbsolutePath(256) | SecretBearing | ProtectedConfigurationFileOnly | DrainAndReload;
+    ListenerApiTlsPrivateKeyFile | "listener.api_tls_private_key_file" | String | "/var/lib/positron-secrets/api-private-key.pem" | ProtectedAbsolutePath(256) | SecretBearing | ProtectedConfigurationFileOnly | DrainAndReload;
+    ListenerApiTlsTrustFile | "listener.api_tls_trust_file" | String | "/var/lib/positron-secrets/api-trust.pem" | ProtectedAbsolutePath(256) | SecretBearing | ProtectedConfigurationFileOnly | DrainAndReload;
     ListenerOtlpGrpcBindAddress | "listener.otlp_grpc_bind_address" | String | "127.0.0.1:4317" | LoopbackSocketAddress(256) | Public | NonSecretOverrides | DrainAndReload;
     ListenerOtlpHttpBindAddress | "listener.otlp_http_bind_address" | String | "127.0.0.1:4318" | LoopbackSocketAddress(256) | Public | NonSecretOverrides | DrainAndReload;
     ListenerLokiPushBindAddress | "listener.loki_push_bind_address" | String | "127.0.0.1:3100" | LoopbackSocketAddress(256) | Public | NonSecretOverrides | DrainAndReload;
