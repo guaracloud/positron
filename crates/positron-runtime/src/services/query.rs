@@ -200,6 +200,8 @@ pub(super) fn query_log_bodies(
     let _drain = instance
         .enter_query_execution(query.cancellation())
         .map_err(|_| ServiceFailure::Unauthorized)?;
+    #[cfg(test)]
+    services.await_query_execution_test_hook()?;
     let schema = services
         .schema_sessions
         .session(instance.tenant, instance.resource_governor())

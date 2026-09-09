@@ -79,9 +79,9 @@ mod retention_time;
 pub use catalog::{
     AuditIntent, Catalog, CatalogCommit, CatalogCredential, CatalogFailure, CatalogFailureCode,
     CatalogGenerationId, CatalogGovernanceObject, CatalogGovernanceVersion,
-    CatalogLogRetentionPolicy, CatalogObject, CatalogObjectId, CatalogProposal, CatalogRotation,
-    CatalogSecret, CatalogSnapshot, CatalogWrappingKey, FormatEpoch, GovernanceAuditRecord,
-    InstanceId, PreparedTransactionResolution, TransactionId,
+    CatalogLogRetentionPolicy, CatalogObject, CatalogObjectId, CatalogProposal, CatalogReadView,
+    CatalogRotation, CatalogSecret, CatalogSnapshot, CatalogWrappingKey, FormatEpoch,
+    GovernanceAuditRecord, InstanceId, PreparedTransactionResolution, TransactionId,
 };
 #[cfg(feature = "test-support")]
 pub use catalog::{

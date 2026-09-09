@@ -179,6 +179,34 @@ fn read_only_current_snapshot_does_not_require_the_catalog_writer()
 }
 
 #[test]
+fn read_only_view_binds_one_immutable_snapshot_and_audit_chain()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = TemporaryRoot::new()?;
+    let instance = InstanceId::new(id(39))?;
+    let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
+    let authority = establish_catalog_authority(volume)?;
+    let catalog = Catalog::open(&authority, instance, secret())?;
+    let first = catalog.commit(
+        catalog.pin()?.identity(),
+        proposal(40, 10)?,
+        Some(AuditIntent::new(b"first visible audit".to_vec())?),
+    )?;
+
+    let view = Catalog::read_current_view(&authority, instance, secret())?;
+    assert_eq!(view.snapshot().identity(), first.identity());
+    assert_eq!(view.governance_audit_records().len(), 1);
+
+    catalog.commit(
+        catalog.pin()?.identity(),
+        proposal(41, 11)?,
+        Some(AuditIntent::new(b"second visible audit".to_vec())?),
+    )?;
+    assert_eq!(view.snapshot().identity(), first.identity());
+    assert_eq!(view.governance_audit_records().len(), 1);
+    Ok(())
+}
+
+#[test]
 fn interrupted_root_rewrap_restarts_with_predecessor_and_retries_idempotently()
 -> Result<(), Box<dyn std::error::Error>> {
     let root = TemporaryRoot::new()?;

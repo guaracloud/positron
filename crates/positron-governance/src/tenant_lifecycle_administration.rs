@@ -4,8 +4,8 @@ use std::fmt::{Display, Formatter};
 use positron_domain::identity::{PrincipalId, Scope, TenantId};
 use positron_domain::lifecycle::{TenantLifecycle, TenantLifecycleState};
 use positron_kernel::{
-    AuditIntent, Catalog, CatalogFailureCode, CatalogObject, CatalogProposal, CatalogSnapshot,
-    FormatEpoch, TransactionId,
+    AuditIntent, Catalog, CatalogFailureCode, CatalogObject, CatalogProposal, CatalogReadView,
+    CatalogSnapshot, FormatEpoch, GovernanceAuditRecord, TransactionId,
 };
 
 use crate::audit::TenantLifecycleAuditIntent;
@@ -32,7 +32,6 @@ pub struct TenantLifecycleTransitionRequest {
     target: TenantLifecycleState,
     expected: ResourceGeneration,
     idempotency: AdministrativeIdempotencyKey,
-    audit_ingest_time_unix_seconds: u64,
 }
 
 impl TenantLifecycleTransitionRequest {
@@ -43,7 +42,6 @@ impl TenantLifecycleTransitionRequest {
         target: TenantLifecycleState,
         expected: ResourceGeneration,
         idempotency: AdministrativeIdempotencyKey,
-        audit_ingest_time_unix_seconds: u64,
     ) -> Self {
         Self {
             actor,
@@ -51,7 +49,6 @@ impl TenantLifecycleTransitionRequest {
             target,
             expected,
             idempotency,
-            audit_ingest_time_unix_seconds,
         }
     }
 }
@@ -111,6 +108,7 @@ pub enum TenantLifecycleAdministrationFailure {
     StaleGeneration(TenantLifecycleGenerationConflict),
     IdempotencyConflict,
     CapacityExceeded,
+    TimeUnavailable,
     PersistenceUnavailable,
 }
 
@@ -126,22 +124,52 @@ impl Error for TenantLifecycleAdministrationFailure {}
 pub struct TenantLifecycleAdministration;
 
 impl TenantLifecycleAdministration {
-    pub fn transition(
+    /// Resolves an exact committed retry before callers acquire fresh work barriers.
+    pub fn replay(
         catalog: &Catalog<'_>,
         administrator: PrincipalId,
         request: TenantLifecycleTransitionRequest,
-    ) -> Result<TenantLifecycleTransition, TenantLifecycleAdministrationFailure> {
-        if request.actor.principal_id() != administrator
-            || request.actor.scope() != Scope::SystemAdministration
-            || request.actor.tenant_attribution().is_some()
-        {
-            return Err(TenantLifecycleAdministrationFailure::Unauthorized);
-        }
-        let snapshot = catalog.pin().map_err(map_catalog)?;
+    ) -> Result<Option<TenantLifecycleTransition>, TenantLifecycleAdministrationFailure> {
+        validate_request(catalog, administrator, request)?;
+        replay(
+            catalog,
+            request.idempotency,
+            request.actor.principal_id(),
+            request.tenant,
+            request.target,
+            request.expected,
+        )
+    }
+
+    /// Resolves an exact committed retry from one immutable read-only Catalog
+    /// view, before a caller acquires any lifecycle drain or writer lease.
+    pub fn replay_from_view(
+        view: &CatalogReadView,
+        administrator: PrincipalId,
+        request: TenantLifecycleTransitionRequest,
+    ) -> Result<Option<TenantLifecycleTransition>, TenantLifecycleAdministrationFailure> {
+        validate_snapshot(view.snapshot().clone(), administrator, request)?;
+        replay_records(
+            view.governance_audit_records(),
+            request.idempotency,
+            request.actor.principal_id(),
+            request.tenant,
+            request.target,
+            request.expected,
+        )
+    }
+
+    pub fn transition<F>(
+        catalog: &Catalog<'_>,
+        administrator: PrincipalId,
+        request: TenantLifecycleTransitionRequest,
+        audit_time: F,
+    ) -> Result<TenantLifecycleTransition, TenantLifecycleAdministrationFailure>
+    where
+        F: FnOnce() -> Result<u64, TenantLifecycleAdministrationFailure>,
+    {
+        let snapshot = validate_request(catalog, administrator, request)?;
         let (_, governance) = snapshot.governance_object().map_err(map_catalog)?;
-        if governance.tenant() != request.tenant {
-            return Err(TenantLifecycleAdministrationFailure::UnknownTenant);
-        }
         if let Some(replay) = replay(
             catalog,
             request.idempotency,
@@ -152,7 +180,8 @@ impl TenantLifecycleAdministration {
         )? {
             return Ok(replay);
         }
-        if request.audit_ingest_time_unix_seconds == 0 {
+        let audit_ingest_time_unix_seconds = audit_time()?;
+        if audit_ingest_time_unix_seconds == 0 {
             return Err(TenantLifecycleAdministrationFailure::PersistenceUnavailable);
         }
         let from = governance.lifecycle();
@@ -168,7 +197,7 @@ impl TenantLifecycleAdministration {
             .with_lifecycle(request.target, generation.get())
             .map_err(map_catalog)?;
         let audit = TenantLifecycleAuditIntent {
-            ingest_time_unix_seconds: request.audit_ingest_time_unix_seconds,
+            ingest_time_unix_seconds: audit_ingest_time_unix_seconds,
             idempotency_key: request.idempotency,
             actor: request.actor.principal_id(),
             tenant: request.tenant,
@@ -198,6 +227,33 @@ impl TenantLifecycleAdministration {
     }
 }
 
+fn validate_request(
+    catalog: &Catalog<'_>,
+    administrator: PrincipalId,
+    request: TenantLifecycleTransitionRequest,
+) -> Result<CatalogSnapshot, TenantLifecycleAdministrationFailure> {
+    let snapshot = catalog.pin().map_err(map_catalog)?;
+    validate_snapshot(snapshot, administrator, request)
+}
+
+fn validate_snapshot(
+    snapshot: CatalogSnapshot,
+    administrator: PrincipalId,
+    request: TenantLifecycleTransitionRequest,
+) -> Result<CatalogSnapshot, TenantLifecycleAdministrationFailure> {
+    if request.actor.principal_id() != administrator
+        || request.actor.scope() != Scope::SystemAdministration
+        || request.actor.tenant_attribution().is_some()
+    {
+        return Err(TenantLifecycleAdministrationFailure::Unauthorized);
+    }
+    let (_, governance) = snapshot.governance_object().map_err(map_catalog)?;
+    if governance.tenant() != request.tenant {
+        return Err(TenantLifecycleAdministrationFailure::UnknownTenant);
+    }
+    Ok(snapshot)
+}
+
 fn replay(
     catalog: &Catalog<'_>,
     idempotency: AdministrativeIdempotencyKey,
@@ -206,11 +262,23 @@ fn replay(
     target: TenantLifecycleState,
     expected: ResourceGeneration,
 ) -> Result<Option<TenantLifecycleTransition>, TenantLifecycleAdministrationFailure> {
-    for record in catalog.governance_audit_records().map_err(map_catalog)? {
+    let records = catalog.governance_audit_records().map_err(map_catalog)?;
+    replay_records(&records, idempotency, actor, tenant, target, expected)
+}
+
+fn replay_records(
+    records: &[GovernanceAuditRecord],
+    idempotency: AdministrativeIdempotencyKey,
+    actor: PrincipalId,
+    tenant: TenantId,
+    target: TenantLifecycleState,
+    expected: ResourceGeneration,
+) -> Result<Option<TenantLifecycleTransition>, TenantLifecycleAdministrationFailure> {
+    for record in records {
         if record.transaction().to_bytes() != idempotency.to_bytes() {
             continue;
         }
-        let entry = GovernanceAuditEntry::decode(&record)
+        let entry = GovernanceAuditEntry::decode(record)
             .map_err(|_| TenantLifecycleAdministrationFailure::IdempotencyConflict)?;
         let lifecycle = entry
             .as_tenant_lifecycle()

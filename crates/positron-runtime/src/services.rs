@@ -41,6 +41,8 @@ pub struct ServiceHandle {
     shutdown_schema_capacity: Arc<Mutex<Option<TransferredResourceReservation>>>,
     #[cfg(test)]
     receiver_test_backend: Arc<Mutex<Option<Arc<dyn ReceiverTestBackend>>>>,
+    #[cfg(test)]
+    query_execution_test_hook: Arc<Mutex<Option<Arc<dyn QueryExecutionTestHook>>>>,
     // Keep the authority alive until every governed session and admission
     // capability above has released its transferred reservations.
     instance: Arc<InitializedInstance>,
@@ -61,6 +63,13 @@ pub(crate) trait ReceiverTestBackend: Send + Sync {
     ) -> IngestRequestOutcome {
         IngestRequestOutcome::new(Vec::new())
     }
+}
+
+/// Test-only synchronization point immediately after the ordinary query route
+/// has acquired its lifecycle drain permit.
+#[cfg(test)]
+pub(crate) trait QueryExecutionTestHook: Send + Sync {
+    fn after_admission(&self);
 }
 
 impl std::fmt::Debug for ServiceHandle {
@@ -98,6 +107,8 @@ impl ServiceHandle {
             shutdown_schema_capacity: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             receiver_test_backend: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            query_execution_test_hook: Arc::new(Mutex::new(None)),
             instance,
         })
     }
@@ -315,6 +326,31 @@ impl ServiceHandle {
             .receiver_test_backend
             .lock()
             .map_err(|_| ServiceFailure::Internal)? = Some(backend);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_query_execution_test_hook(
+        &self,
+        hook: Arc<dyn QueryExecutionTestHook>,
+    ) -> Result<(), ServiceFailure> {
+        *self
+            .query_execution_test_hook
+            .lock()
+            .map_err(|_| ServiceFailure::Internal)? = Some(hook);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn await_query_execution_test_hook(&self) -> Result<(), ServiceFailure> {
+        let hook = self
+            .query_execution_test_hook
+            .lock()
+            .map_err(|_| ServiceFailure::Internal)?
+            .clone();
+        if let Some(hook) = hook {
+            hook.after_admission();
+        }
         Ok(())
     }
 

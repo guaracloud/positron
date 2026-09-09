@@ -101,6 +101,29 @@ struct CatalogState {
     retained_history_bytes: usize,
 }
 
+/// One immutable, authenticated Catalog generation with its visible audit chain.
+///
+/// This read-only view never acquires the Catalog writer lease. Callers that
+/// intend to publish must still open [`Catalog`] after completing admission
+/// barriers and revalidate against that writer-owned generation.
+#[derive(Clone)]
+pub struct CatalogReadView {
+    snapshot: CatalogSnapshot,
+    audit: Vec<GovernanceAuditRecord>,
+}
+
+impl CatalogReadView {
+    #[must_use]
+    pub const fn snapshot(&self) -> &CatalogSnapshot {
+        &self.snapshot
+    }
+
+    #[must_use]
+    pub fn governance_audit_records(&self) -> &[GovernanceAuditRecord] {
+        &self.audit
+    }
+}
+
 #[derive(Clone)]
 struct TransactionOutcome {
     digest: [u8; 32],
@@ -168,6 +191,16 @@ impl<'authority> Catalog<'authority> {
         instance: InstanceId,
         secret: CatalogSecret,
     ) -> Result<CatalogSnapshot, CatalogFailure> {
+        Ok(Self::read_current_view(authority, instance, secret)?.snapshot)
+    }
+
+    /// Reads the highest complete authenticated generation and its visible
+    /// audit records without acquiring the Catalog writer lease.
+    pub fn read_current_view(
+        authority: &'authority StorageKernelResourceAuthority,
+        instance: InstanceId,
+        secret: CatalogSecret,
+    ) -> Result<CatalogReadView, CatalogFailure> {
         let recovery_claim =
             RecoveryWorkClaim::system(RecoveryWorkKind::Repair, recovery_resource_claim())
                 .map_err(|_| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?;
@@ -183,7 +216,11 @@ impl<'authority> Catalog<'authority> {
             .try_clone()
             .map_err(|_| CatalogFailure::new(CatalogFailureCode::StorageUnavailable))?;
         let storage = CatalogStorage::inspect(&root)?;
-        Ok(recover(&storage, &secret, instance)?.current)
+        let recovered = recover(&storage, &secret, instance)?;
+        Ok(CatalogReadView {
+            snapshot: recovered.current,
+            audit: recovered.audit,
+        })
     }
 
     /// Reports whether an unpublished prepared administrative transaction defers

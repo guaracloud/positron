@@ -9,8 +9,12 @@ use crate::{
 };
 use positron_domain::identity::Scope;
 use positron_domain::lifecycle::TenantLifecycleState;
+#[cfg(feature = "test-support")]
+use positron_domain::time::UnixNanoseconds;
 use positron_governance::{AdministrativeIdempotencyKey, ResourceGeneration};
 use positron_governance::{CompatibilityHints, PresentedCredential, RequestedIntent};
+#[cfg(feature = "test-support")]
+use positron_kernel::RetentionTimeAuthority;
 use positron_kernel::{
     CatalogPublicationFault, MountQualification, PrimaryDataVolume,
     with_catalog_publication_fault_after,
@@ -184,6 +188,52 @@ fn read_only_transition_is_durable_idempotent_and_preserves_query_access()
         RequestedIntent::Query,
         CompatibilityHints::none(),
     )?;
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn committed_lifecycle_retry_returns_its_original_audit_when_fresh_governance_time_fails()
+-> Result<(), Box<dyn Error>> {
+    let roots = Roots::new()?;
+    let paths = roots.paths().map_err(|code| format!("paths: {code:?}"))?;
+    drop(InstanceBootstrap::initialize(
+        &paths,
+        InitializationPlan::non_interactive(),
+    )?);
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let mut instance = InstanceBootstrap::reopen(&paths)?;
+    let administrator = instance.attribute(
+        PresentedCredential::parse(claim.secret())?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let idempotency = AdministrativeIdempotencyKey::new([0x7a; 16])?;
+    let committed = instance.transition_tenant_lifecycle(
+        administrator,
+        instance.default_tenant_id(),
+        TenantLifecycleState::ReadOnly,
+        ResourceGeneration::new(1)?,
+        idempotency,
+    )?;
+    let (retention_time, elapsed) =
+        RetentionTimeAuthority::establish_with_manual_elapsed(UnixNanoseconds::new(i64::MAX));
+    instance.install_retention_time_for_test(retention_time)?;
+    elapsed.advance(1)?;
+
+    let replay = instance.transition_tenant_lifecycle(
+        administrator,
+        instance.default_tenant_id(),
+        TenantLifecycleState::ReadOnly,
+        ResourceGeneration::new(1)?,
+        idempotency,
+    )?;
+
+    assert_eq!(replay, committed);
+    assert_eq!(
+        replay.audit_ingest_time_unix_seconds(),
+        committed.audit_ingest_time_unix_seconds()
+    );
     Ok(())
 }
 
