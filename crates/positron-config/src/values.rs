@@ -131,7 +131,6 @@ pub enum FailureSource {
     ListenerApiTransport,
     ListenerApiTlsCertificateFile,
     ListenerApiTlsPrivateKeyFile,
-    ListenerApiTlsTrustFile,
     ListenerOtlpGrpcBindAddress,
     ListenerOtlpHttpBindAddress,
     ListenerLokiPushBindAddress,

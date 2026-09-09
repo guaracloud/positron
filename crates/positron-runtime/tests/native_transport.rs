@@ -325,6 +325,26 @@ fn configured_tls_api_listener_serves_an_authenticated_administration_request()
         &positron_api::api_keys::ApiKeyRequest::list(),
     )?;
     assert_eq!(response.keys.len(), 3);
+    let wrong_dial_address =
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 2), api.port()));
+    let wrong_dial = positron_api::api_keys::ApiKeyServiceClient::new(
+        positron_api::api_keys::ApiKeyTransport::Tls {
+            endpoint: wrong_dial_address,
+            server_name: "localhost".to_owned(),
+            trust_file: PathBuf::from(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/native_transport/fixtures/api-test-cert.pem"
+            )),
+        },
+    )?
+    .manage(
+        claim.secret(),
+        &positron_api::api_keys::ApiKeyRequest::list(),
+    );
+    assert!(
+        wrong_dial.is_err(),
+        "the client must use the configured dial address"
+    );
     let hostname_mismatch = positron_api::api_keys::ApiKeyServiceClient::new(
         positron_api::api_keys::ApiKeyTransport::Tls {
             endpoint: api,

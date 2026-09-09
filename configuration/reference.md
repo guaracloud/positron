@@ -11,7 +11,10 @@ Precedence: compiled defaults, TOML file, non-secret POSITRON__ overrides, then 
 | `runtime.shutdown_grace_seconds` | integer | `30` | `1..=3600` | public | compiled default, configuration file, environment, command line | restart-required |
 | `listener.control_path` | string | `/var/run/positron/control.sock` | absolute path; at most 256 bytes | public | compiled default, configuration file, environment, command line | drain-and-reload |
 | `listener.operations_bind_address` | string | `127.0.0.1:13133` | loopback socket address; at most 256 bytes | public | compiled default, configuration file, environment, command line | drain-and-reload |
-| `listener.api_bind_address` | string | `127.0.0.1:8080` | loopback socket address; at most 256 bytes | public | compiled default, configuration file, environment, command line | drain-and-reload |
+| `listener.api_bind_address` | string | `127.0.0.1:8080` | socket address; at most 256 bytes; non-loopback requires TLS | public | compiled default, configuration file, environment, command line | drain-and-reload |
+| `listener.api_transport` | string | `tls` | `tls`, `plaintext` | public | compiled default, configuration file | drain-and-reload |
+| `listener.api_tls_certificate_file` | string | `<redacted protected-file reference>` | protected absolute path; at most 256 bytes | secret-bearing (redacted) | compiled default, protected configuration-file reference | drain-and-reload |
+| `listener.api_tls_private_key_file` | string | `<redacted protected-file reference>` | protected absolute path; at most 256 bytes | secret-bearing (redacted) | compiled default, protected configuration-file reference | drain-and-reload |
 | `listener.otlp_grpc_bind_address` | string | `127.0.0.1:4317` | loopback socket address; at most 256 bytes | public | compiled default, configuration file, environment, command line | drain-and-reload |
 | `listener.otlp_http_bind_address` | string | `127.0.0.1:4318` | loopback socket address; at most 256 bytes | public | compiled default, configuration file, environment, command line | drain-and-reload |
 | `listener.loki_push_bind_address` | string | `127.0.0.1:3100` | loopback socket address; at most 256 bytes | public | compiled default, configuration file, environment, command line | drain-and-reload |

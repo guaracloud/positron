@@ -18,14 +18,13 @@ pub struct EffectiveConfiguration {
     pub(crate) api_transport: ApiTransport,
     pub(crate) api_tls_certificate_file: ProtectedFileReference,
     pub(crate) api_tls_private_key_file: ProtectedFileReference,
-    pub(crate) api_tls_trust_file: ProtectedFileReference,
     pub(crate) otlp_grpc_bind_address: SocketAddr,
     pub(crate) otlp_http_bind_address: SocketAddr,
     pub(crate) loki_push_bind_address: SocketAddr,
     pub(crate) data_directory: String,
     pub(crate) secrets_directory: String,
     pub(crate) local_key_file: ProtectedFileReference,
-    pub(crate) sources: [SettingSource; 16],
+    pub(crate) sources: [SettingSource; 15],
 }
 
 impl EffectiveConfiguration {
@@ -72,11 +71,6 @@ impl EffectiveConfiguration {
     #[must_use]
     pub fn api_tls_private_key_file(&self) -> &ProtectedFileReference {
         &self.api_tls_private_key_file
-    }
-
-    #[must_use]
-    pub fn api_tls_trust_file(&self) -> &ProtectedFileReference {
-        &self.api_tls_trust_file
     }
 
     #[must_use]
@@ -129,6 +123,9 @@ impl EffectiveConfiguration {
         rendered.push_str(&self.operations_bind_address.to_string());
         rendered.push_str("\"\napi_bind_address = \"");
         rendered.push_str(&self.api_bind_address.to_string());
+        rendered.push_str("\"\napi_transport = \"");
+        rendered.push_str(self.api_transport.as_str());
+        rendered.push_str("\"\napi_tls_certificate_file = \"<redacted>\"\napi_tls_private_key_file = \"<redacted>");
         rendered.push_str("\"\notlp_grpc_bind_address = \"");
         rendered.push_str(&self.otlp_grpc_bind_address.to_string());
         rendered.push_str("\"\notlp_http_bind_address = \"");
@@ -179,7 +176,6 @@ impl EffectiveConfiguration {
             Setting::ListenerApiTlsPrivateKeyFile => {
                 self.api_tls_private_key_file != other.api_tls_private_key_file
             },
-            Setting::ListenerApiTlsTrustFile => self.api_tls_trust_file != other.api_tls_trust_file,
             Setting::ListenerOtlpGrpcBindAddress => {
                 self.otlp_grpc_bind_address != other.otlp_grpc_bind_address
             },

@@ -104,6 +104,7 @@ fn generate_api_key_client(
 // protobuf descriptor and HTTP mapping. Do not edit.
 use std::io::Read;
 use std::fs;
+use std::net::IpAddr;
 use std::time::Duration;
 
 pub struct ApiKeyServiceClient {{
@@ -113,6 +114,7 @@ pub struct ApiKeyServiceClient {{
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ApiKeyServiceClientFailure {{
+    InvalidRequest,
     AuthenticationRejected,
     StaleGeneration,
     IdempotencyConflict,
@@ -135,12 +137,25 @@ impl ApiKeyServiceClient {{
                 if server_name.is_empty() || server_name.len() > 253 || !server_name.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b':')) {{
                     return Err(ApiKeyServiceClientFailure::Transport);
                 }}
+                let expected_identity = server_name.parse::<IpAddr>();
+                if expected_identity.as_ref().is_ok_and(|identity| *identity != endpoint.ip()) {{
+                    return Err(ApiKeyServiceClientFailure::Transport);
+                }}
+                let authority = match expected_identity {{
+                    Ok(IpAddr::V6(_)) => format!("[{{server_name}}]"),
+                    Ok(IpAddr::V4(_)) | Err(_) => server_name.clone(),
+                }};
                 let trust = fs::read(trust_file).map_err(|_| ApiKeyServiceClientFailure::Transport)?;
                 let certificate = reqwest::Certificate::from_pem(&trust)
                     .map_err(|_| ApiKeyServiceClientFailure::Transport)?;
-                (format!("https://{{server_name}}:{{}}", endpoint.port()), reqwest::blocking::Client::builder().add_root_certificate(certificate))
+                (format!("https://{{authority}}:{{}}", endpoint.port()), reqwest::blocking::Client::builder().add_root_certificate(certificate).resolve(&server_name, endpoint))
             }},
-            super::ApiKeyTransport::PlaintextOptOut {{ endpoint }} => (format!("http://{{endpoint}}"), reqwest::blocking::Client::builder()),
+            super::ApiKeyTransport::PlaintextOptOut {{ endpoint }} => {{
+                if !endpoint.ip().is_loopback() {{
+                    return Err(ApiKeyServiceClientFailure::Transport);
+                }}
+                (format!("http://{{endpoint}}"), reqwest::blocking::Client::builder())
+            }},
         }};
         let client = builder
             .connect_timeout(Duration::from_secs(5))
@@ -179,6 +194,7 @@ impl ApiKeyServiceClient {{
             let code = serde_json::from_slice::<serde_json::Value>(&bytes).ok()
                 .and_then(|value| value.get("code")?.as_str().map(str::to_owned));
             return Err(match (status, code.as_deref()) {{
+                (400, Some("invalid_request")) => ApiKeyServiceClientFailure::InvalidRequest,
                 (401, Some("authentication_rejected")) => ApiKeyServiceClientFailure::AuthenticationRejected,
                 (404, Some("key_unavailable")) => ApiKeyServiceClientFailure::KeyUnavailable,
                 (409, Some("stale_generation")) => ApiKeyServiceClientFailure::StaleGeneration,

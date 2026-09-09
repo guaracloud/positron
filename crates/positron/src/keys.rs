@@ -70,6 +70,9 @@ fn execute(arguments: impl Iterator<Item = String>) -> Result<(), &'static str> 
 
 fn client_failure(failure: ApiKeyServiceClientFailure) -> &'static str {
     match failure {
+        ApiKeyServiceClientFailure::InvalidRequest => {
+            "invalid key request; correct the request before retrying"
+        },
         ApiKeyServiceClientFailure::AuthenticationRejected => "authentication rejected",
         ApiKeyServiceClientFailure::StaleGeneration => {
             "stale generation; inspect current state before retrying"
@@ -149,6 +152,9 @@ fn parse(
         if options.contains_key("--trust-file") {
             return Err("--trust-file does not apply to plaintext opt-out");
         }
+        if !endpoint.ip().is_loopback() {
+            return Err("plaintext API endpoint must be loopback");
+        }
         ApiKeyTransport::PlaintextOptOut { endpoint }
     } else {
         ApiKeyTransport::Tls {
@@ -227,6 +233,10 @@ mod tests {
             client_failure(ApiKeyServiceClientFailure::AuthenticationRejected),
             "authentication rejected"
         );
+        assert_eq!(
+            client_failure(ApiKeyServiceClientFailure::InvalidRequest),
+            "invalid key request; correct the request before retrying"
+        );
     }
     #[test]
     fn key_arguments_reject_secret_options_and_unrelated_mutation_flags() {
@@ -234,6 +244,7 @@ mod tests {
             "list --endpoint 127.0.0.1:8080 --credential-stdin --secret sensitive",
             "list --endpoint 127.0.0.1:8080 --credential-stdin --scope query",
             "list --endpoint 192.0.2.1:8080 --credential-stdin",
+            "list --endpoint 192.0.2.1:8080 --credential-stdin --allow-plaintext",
             "list --endpoint 127.0.0.1:8080",
         ] {
             assert!(parse(command.split_whitespace().map(ToOwned::to_owned)).is_err());

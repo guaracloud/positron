@@ -120,6 +120,11 @@ impl ApiKeyRequest {
         );
         if action == KeyAction::Unspecified
             || self.scope() == Some(KeyScope::Unspecified)
+            || (action == KeyAction::Create
+                && !matches!(
+                    self.scope(),
+                    Some(KeyScope::Ingest | KeyScope::Query | KeyScope::TenantAdministration)
+                ))
             || mutation != self.0.expected_generation.is_some()
             || mutation != self.0.idempotency_key.is_some()
             || self.0.expected_generation == Some(0)

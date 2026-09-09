@@ -112,6 +112,11 @@ fn generated_api_key_service_client_preserves_only_published_failure_codes()
     ] {
         assert_eq!(failure(status, body)?, expected);
     }
+    assert_ne!(
+        failure(400, "{\"code\":\"invalid_request\"}")?,
+        ApiKeyServiceClientFailure::Transport,
+        "published invalid_request must not be erased into a transport failure"
+    );
     assert_eq!(
         failure(
             503,
@@ -123,6 +128,19 @@ fn generated_api_key_service_client_preserves_only_published_failure_codes()
         ApiKeyServiceClientFailure::Transport
     );
     Ok(())
+}
+
+#[test]
+fn generated_client_refuses_remote_plaintext_before_request_construction() {
+    let result = positron_api::api_keys::ApiKeyServiceClient::new(
+        positron_api::api_keys::ApiKeyTransport::PlaintextOptOut {
+            endpoint: "192.0.2.1:8080".parse().expect("literal socket address"),
+        },
+    );
+    assert!(
+        result.is_err(),
+        "remote plaintext must be refused before a bearer is sent"
+    );
 }
 
 #[test]

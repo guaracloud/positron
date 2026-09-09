@@ -80,6 +80,14 @@ fn cli_manages_keys_through_authenticated_running_api_without_redisplay()
         )?,
         400
     );
+    assert_eq!(
+        raw_status(
+            &address,
+            &[claim.secret()],
+            br#"{"action":"create","scope":"system_administration","expected_generation":1,"idempotency_key":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}"#
+        )?,
+        400
+    );
     let first = invoke(&address, claim.secret(), &create)?;
     assert!(first.status.success());
     let first = String::from_utf8(first.stdout)?;
@@ -170,6 +178,37 @@ fn cli_reports_a_typed_idempotency_conflict_without_echoing_credentials()
     assert_eq!(
         stderr,
         "positron: idempotency conflict; inspect current state before retrying\n"
+    );
+    assert!(!stderr.contains("credential-canary"));
+    server.join().map_err(|_| "server panicked")??;
+    Ok(())
+}
+
+#[test]
+fn cli_reports_invalid_request_without_echoing_credentials()
+-> Result<(), Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let endpoint = listener.local_addr()?.to_string();
+    let server = std::thread::spawn(move || -> Result<(), std::io::Error> {
+        let (mut stream, _) = listener.accept()?;
+        let mut request = [0_u8; 4096];
+        let _ = stream.read(&mut request)?;
+        let body = r#"{"code":"invalid_request"}"#;
+        stream.write_all(
+            format!(
+                "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )?;
+        Ok(())
+    });
+    let output = invoke(&endpoint, "credential-canary", &["list"])?;
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_eq!(
+        stderr,
+        "positron: invalid key request; correct the request before retrying\n"
     );
     assert!(!stderr.contains("credential-canary"));
     server.join().map_err(|_| "server panicked")??;

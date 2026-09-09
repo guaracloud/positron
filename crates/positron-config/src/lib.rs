@@ -65,14 +65,13 @@ struct Candidate {
     api_transport: ApiTransport,
     api_tls_certificate_file: ProtectedFileReference,
     api_tls_private_key_file: ProtectedFileReference,
-    api_tls_trust_file: ProtectedFileReference,
     otlp_grpc_bind_address: SocketAddr,
     otlp_http_bind_address: SocketAddr,
     loki_push_bind_address: SocketAddr,
     data_directory: String,
     secrets_directory: String,
     local_key_file: ProtectedFileReference,
-    sources: [SettingSource; 16],
+    sources: [SettingSource; 15],
 }
 
 impl Candidate {
@@ -88,7 +87,6 @@ impl Candidate {
             setting_definition(Setting::ListenerApiTlsCertificateFile).default_value();
         let api_private_key =
             setting_definition(Setting::ListenerApiTlsPrivateKeyFile).default_value();
-        let api_trust = setting_definition(Setting::ListenerApiTlsTrustFile).default_value();
         let otlp_grpc = setting_definition(Setting::ListenerOtlpGrpcBindAddress).default_value();
         let otlp_http = setting_definition(Setting::ListenerOtlpHttpBindAddress).default_value();
         let loki_push = setting_definition(Setting::ListenerLokiPushBindAddress).default_value();
@@ -108,7 +106,6 @@ impl Candidate {
             api_transport: ApiTransport::parse(api_transport)?,
             api_tls_certificate_file: ProtectedFileReference::parse(api_certificate)?,
             api_tls_private_key_file: ProtectedFileReference::parse(api_private_key)?,
-            api_tls_trust_file: ProtectedFileReference::parse(api_trust)?,
             otlp_grpc_bind_address: parse_loopback_address(
                 otlp_grpc,
                 Setting::ListenerOtlpGrpcBindAddress,
@@ -124,7 +121,7 @@ impl Candidate {
             data_directory: checked_path(data, Setting::StorageDataDirectory)?,
             secrets_directory: checked_path(secrets, Setting::StorageSecretsDirectory)?,
             local_key_file: ProtectedFileReference::parse(local_key)?,
-            sources: [SettingSource::CompiledDefault; 16],
+            sources: [SettingSource::CompiledDefault; 15],
         })
     }
 
@@ -169,9 +166,6 @@ impl Candidate {
             Setting::ListenerApiTlsPrivateKeyFile => {
                 self.api_tls_private_key_file = ProtectedFileReference::parse(value)?;
             },
-            Setting::ListenerApiTlsTrustFile => {
-                self.api_tls_trust_file = ProtectedFileReference::parse(value)?;
-            },
             Setting::ListenerOtlpGrpcBindAddress => {
                 self.otlp_grpc_bind_address = parse_loopback_address(value, setting)?;
             },
@@ -208,11 +202,7 @@ impl Candidate {
                 FailureSource::StorageDataDirectory,
             ));
         }
-        if !self.api_bind_address.ip().is_loopback()
-            && self.api_transport != ApiTransport::Tls
-            && self.sources[setting_index(Setting::ListenerApiTransport)]
-                != SettingSource::ConfigurationFile
-        {
+        if !self.api_bind_address.ip().is_loopback() && self.api_transport != ApiTransport::Tls {
             return Err(ConfigurationFailure::new(
                 ConfigurationFailureCode::UnsafeCombination,
                 FailureSource::ListenerApiTransport,
@@ -228,7 +218,6 @@ impl Candidate {
             api_transport: self.api_transport,
             api_tls_certificate_file: self.api_tls_certificate_file,
             api_tls_private_key_file: self.api_tls_private_key_file,
-            api_tls_trust_file: self.api_tls_trust_file,
             otlp_grpc_bind_address: self.otlp_grpc_bind_address,
             otlp_http_bind_address: self.otlp_http_bind_address,
             loki_push_bind_address: self.loki_push_bind_address,
@@ -369,13 +358,12 @@ const fn setting_index(setting: Setting) -> usize {
         Setting::ListenerApiTransport => 6,
         Setting::ListenerApiTlsCertificateFile => 7,
         Setting::ListenerApiTlsPrivateKeyFile => 8,
-        Setting::ListenerApiTlsTrustFile => 9,
-        Setting::ListenerOtlpGrpcBindAddress => 10,
-        Setting::ListenerOtlpHttpBindAddress => 11,
-        Setting::ListenerLokiPushBindAddress => 12,
-        Setting::StorageDataDirectory => 13,
-        Setting::StorageSecretsDirectory => 14,
-        Setting::SecurityLocalKeyFile => 15,
+        Setting::ListenerOtlpGrpcBindAddress => 9,
+        Setting::ListenerOtlpHttpBindAddress => 10,
+        Setting::ListenerLokiPushBindAddress => 11,
+        Setting::StorageDataDirectory => 12,
+        Setting::StorageSecretsDirectory => 13,
+        Setting::SecurityLocalKeyFile => 14,
     }
 }
 
@@ -397,7 +385,6 @@ const fn failure_source(setting: Setting) -> FailureSource {
         Setting::ListenerApiTransport => FailureSource::ListenerApiTransport,
         Setting::ListenerApiTlsCertificateFile => FailureSource::ListenerApiTlsCertificateFile,
         Setting::ListenerApiTlsPrivateKeyFile => FailureSource::ListenerApiTlsPrivateKeyFile,
-        Setting::ListenerApiTlsTrustFile => FailureSource::ListenerApiTlsTrustFile,
         Setting::ListenerOtlpGrpcBindAddress => FailureSource::ListenerOtlpGrpcBindAddress,
         Setting::ListenerOtlpHttpBindAddress => FailureSource::ListenerOtlpHttpBindAddress,
         Setting::ListenerLokiPushBindAddress => FailureSource::ListenerLokiPushBindAddress,
