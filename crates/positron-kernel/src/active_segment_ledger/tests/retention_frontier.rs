@@ -105,6 +105,7 @@ fn install_governance_policy(
                 && !bytes.starts_with(b"POSGOV02")
                 && !bytes.starts_with(b"POSGOV03")
                 && !bytes.starts_with(b"POSGOV04")
+                && !bytes.starts_with(b"POSGOV05")
         })
         .map(|bytes| CatalogObject::new(bytes.to_vec()))
         .collect::<Result<Vec<_>, _>>()?;

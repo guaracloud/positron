@@ -156,6 +156,61 @@ fn initialization_audit_and_non_reuse_survive_idempotent_restart()
 }
 
 #[test]
+fn plaintext_api_transport_activation_is_a_single_redacted_audit_record_across_restart()
+-> Result<(), Box<dyn std::error::Error>> {
+    let roots = Roots::new()?;
+    let paths = roots.paths();
+    drop(InstanceBootstrap::initialize(
+        &paths,
+        InitializationPlan::non_interactive(),
+    )?);
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    instance.activate_public_plaintext_api_transport()?;
+    instance.activate_public_plaintext_api_transport()?;
+    drop(instance);
+
+    let reopened = InstanceBootstrap::reopen(&paths)?;
+    let administrator = reopened.attribute(
+        PresentedCredential::parse(claim.secret())?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let audit = reopened
+        .inspect_governance_for_fixture(administrator)?
+        .audit_records()
+        .to_vec();
+    assert_eq!(audit.len(), 2);
+    let activation = audit[1]
+        .as_listener_transport()
+        .expect("plaintext transport activation audit");
+    assert_eq!(
+        activation.action(),
+        "listener.api-transport.plaintext-opt-out"
+    );
+    assert_eq!(activation.outcome(), "active");
+    assert!(!format!("{activation:?}").contains(claim.secret()));
+    drop(reopened);
+
+    let reopened = InstanceBootstrap::reopen(&paths)?;
+    reopened.activate_public_plaintext_api_transport()?;
+    let administrator = reopened.attribute(
+        PresentedCredential::parse(claim.secret())?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    assert_eq!(
+        reopened
+            .inspect_governance_for_fixture(administrator)?
+            .audit_records()
+            .len(),
+        2,
+        "restart activation must retain the sole selection record"
+    );
+    Ok(())
+}
+
+#[test]
 fn query_authorization_generation_ignores_non_security_catalog_churn()
 -> Result<(), Box<dyn std::error::Error>> {
     let roots = Roots::new()?;

@@ -21,12 +21,16 @@ mod native_http;
 mod otlp_grpc;
 mod otlp_http;
 mod otlp_outcome;
+mod tls;
+
+pub use tls::ApiTransportProfile;
 
 #[derive(Clone, Debug)]
 pub struct NativeBindings {
     control: PathBuf,
     operations: SocketAddr,
     api: SocketAddr,
+    api_transport: ApiTransportProfile,
     otlp_grpc: SocketAddr,
     otlp_http: SocketAddr,
     loki_push: SocketAddr,
@@ -40,6 +44,29 @@ impl NativeBindings {
         otlp_grpc: SocketAddr,
         otlp_http: SocketAddr,
         loki_push: SocketAddr,
+    ) -> Result<Self, NativeHostFailure> {
+        if !api.ip().is_loopback() {
+            return Err(NativeHostFailure::InvalidBinding);
+        }
+        Self::new_with_api_transport(
+            control,
+            operations,
+            api,
+            otlp_grpc,
+            otlp_http,
+            loki_push,
+            ApiTransportProfile::PlaintextOptOut,
+        )
+    }
+
+    pub fn new_with_api_transport(
+        control: PathBuf,
+        operations: SocketAddr,
+        api: SocketAddr,
+        otlp_grpc: SocketAddr,
+        otlp_http: SocketAddr,
+        loki_push: SocketAddr,
+        api_transport: ApiTransportProfile,
     ) -> Result<Self, NativeHostFailure> {
         BoundEndpoint::control(control.clone()).map_err(|_| NativeHostFailure::InvalidBinding)?;
         for (role, address) in [
@@ -55,10 +82,19 @@ impl NativeBindings {
             control,
             operations,
             api,
+            api_transport,
             otlp_grpc,
             otlp_http,
             loki_push,
         })
+    }
+
+    pub fn with_api_transport(
+        mut self,
+        profile: ApiTransportProfile,
+    ) -> Result<Self, NativeHostFailure> {
+        self.api_transport = profile;
+        Ok(self)
     }
 
     fn address(&self, role: ListenerRole) -> Option<SocketAddr> {
@@ -76,6 +112,7 @@ impl NativeBindings {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NativeHostFailure {
     InvalidBinding,
+    InvalidTlsProfile,
 }
 
 impl Display for NativeHostFailure {
@@ -112,6 +149,7 @@ struct Admission {
     listener: NativeListener,
     accepting: AtomicBool,
     control_path: Option<PathBuf>,
+    api_transport: Option<ApiTransportProfile>,
 }
 
 type AdmissionRegistry = Arc<Mutex<Vec<(ListenerRole, Arc<Admission>)>>>;
@@ -221,6 +259,7 @@ impl ListenerFactory for NativeHost {
             listener,
             accepting: AtomicBool::new(true),
             control_path,
+            api_transport: (role == ListenerRole::Api).then(|| self.bindings.api_transport.clone()),
         });
         self.admissions
             .lock()
@@ -380,13 +419,41 @@ fn serve_http(
         };
         match accepted {
             Ok(mut stream) => {
-                match native_http::serve_connection(
-                    &mut stream,
-                    admission.role,
-                    &health,
-                    services.as_ref(),
-                ) {
-                    Ok(()) | Err(_) => {},
+                if stream.set_nonblocking(false).is_err()
+                    || stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .is_err()
+                    || stream
+                        .set_write_timeout(Some(Duration::from_secs(2)))
+                        .is_err()
+                {
+                    continue;
+                }
+                if let Some(profile) = &admission.api_transport {
+                    if profile.is_tls() {
+                        if let Ok(connection) = profile.server_connection() {
+                            let mut tls = rustls::StreamOwned::new(connection, stream);
+                            let _ = native_http::serve_tls_api_connection(
+                                &mut tls,
+                                &health,
+                                services.as_ref(),
+                            );
+                        }
+                    } else {
+                        let _ = native_http::serve_connection(
+                            &mut stream,
+                            admission.role,
+                            &health,
+                            services.as_ref(),
+                        );
+                    }
+                } else {
+                    let _ = native_http::serve_connection(
+                        &mut stream,
+                        admission.role,
+                        &health,
+                        services.as_ref(),
+                    );
                 }
             },
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {

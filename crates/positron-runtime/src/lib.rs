@@ -16,7 +16,7 @@ mod tail_fuzz;
 mod tail_fuzz_support;
 mod task;
 
-pub use health::{HealthState, Liveness, ProcessPhase, Readiness};
+pub use health::{HealthState, HealthWarning, Liveness, ProcessPhase, Readiness};
 #[cfg(any(test, feature = "test-support"))]
 pub use instance_bootstrap::GovernanceTestFixture;
 pub use instance_bootstrap::{
@@ -26,7 +26,7 @@ pub use instance_bootstrap::{
 pub use listener::{
     BoundEndpoint, BoundListener, ListenerFactory, ListenerFailure, ListenerRequest, ListenerRole,
 };
-pub use native_host::{NativeBindings, NativeHost, NativeHostFailure};
+pub use native_host::{ApiTransportProfile, NativeBindings, NativeHost, NativeHostFailure};
 pub use process::{
     ApplicationRuntime, CleanupFailure, CleanupPrimary, CleanupRole, DrainingProcess, ExitOutcome,
     HostInputs, InitializationMode, RecoveryAttempt, RecoveryAttemptHost, RecoveryDecision,

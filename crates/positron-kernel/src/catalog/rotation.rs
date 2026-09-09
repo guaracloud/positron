@@ -64,6 +64,7 @@ impl Catalog<'_> {
             expected,
             self.rotation_proposal(transactions[0])?,
             Some(audits[0].clone()),
+            None,
         )?;
 
         if !self.has_transaction(transactions[1])? {
@@ -115,11 +116,13 @@ impl Catalog<'_> {
             self.pin()?.identity(),
             self.rotation_proposal(transactions[1])?,
             Some(audits[1].clone()),
+            None,
         )?;
         let completed = self.commit_unreserved(
             self.pin()?.identity(),
             self.rotation_proposal(transactions[2])?,
             Some(audits[2].clone()),
+            None,
         )?;
         let mut secret = self
             .secret

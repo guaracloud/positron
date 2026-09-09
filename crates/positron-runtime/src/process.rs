@@ -21,6 +21,7 @@ pub enum InitializationMode {
 pub struct ServeConfiguration {
     paths: BootstrapPaths,
     initialization: InitializationMode,
+    public_plaintext_api_warning: bool,
     admission_group_planner: Option<Arc<dyn positron_ingest::AdmissionGroupPlanner>>,
 }
 
@@ -30,6 +31,7 @@ impl ServeConfiguration {
         Self {
             paths,
             initialization,
+            public_plaintext_api_warning: false,
             admission_group_planner: None,
         }
     }
@@ -42,6 +44,14 @@ impl ServeConfiguration {
         self.admission_group_planner = Some(planner);
         self
     }
+
+    /// Keeps the process ready while making an explicit public plaintext API
+    /// selection continuously visible through its health state.
+    #[must_use]
+    pub const fn with_public_plaintext_api_warning(mut self) -> Self {
+        self.public_plaintext_api_warning = true;
+        self
+    }
 }
 
 impl std::fmt::Debug for ServeConfiguration {
@@ -50,6 +60,10 @@ impl std::fmt::Debug for ServeConfiguration {
             .debug_struct("ServeConfiguration")
             .field("paths", &self.paths)
             .field("initialization", &self.initialization)
+            .field(
+                "public_plaintext_api_warning",
+                &self.public_plaintext_api_warning,
+            )
             .field(
                 "admission_group_planner",
                 &self.admission_group_planner.is_some(),

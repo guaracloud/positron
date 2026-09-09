@@ -242,7 +242,14 @@ pub(super) fn reopen(paths: &BootstrapPaths) -> Result<InitializedInstance, Boot
     if catalog.pin().map_err(catalog_failure)?.number() == 0 {
         return Err(BootstrapFailure::new(BootstrapFailureCode::CorruptState));
     }
-    open_initial_ledgers(&authority, &retention_time, &catalog, &key, &record)?;
+    // Ledger startup may publish unaudited Catalog generations. Preserve the exact
+    // predecessor of a prepared administrative transaction until its owner resolves it.
+    if !catalog
+        .has_prepared_transaction()
+        .map_err(catalog_failure)?
+    {
+        open_initial_ledgers(&authority, &retention_time, &catalog, &key, &record)?;
+    }
     let current = catalog.pin().map_err(catalog_failure)?;
     let generation = current.number();
     let audit = current.governance_audit_frontier();

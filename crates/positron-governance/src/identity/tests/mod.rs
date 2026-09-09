@@ -63,8 +63,32 @@ fn literal_v2_governance_identity_remains_readable_without_query_authority() {
 }
 
 #[test]
-fn current_governance_identity_uses_v4_magic() {
-    assert!(encoded_identity().starts_with(b"POSGOV04"));
+fn initial_governance_identity_publishes_three_redacted_scoped_credentials() {
+    let encoded = encoded_identity();
+    assert!(encoded.starts_with(b"POSGOV05"));
+    let decoded = positron_kernel::CatalogGovernanceObject::decode(&encoded)
+        .expect("initial governance identity is a readable catalog object");
+    assert_eq!(decoded.credentials().len(), 3);
+    assert_eq!(
+        decoded
+            .credentials()
+            .iter()
+            .map(|credential| credential.scope_code())
+            .collect::<Vec<_>>(),
+        vec![4, 1, 2]
+    );
+    assert!(
+        decoded
+            .credentials()
+            .iter()
+            .all(|credential| credential.is_active())
+    );
+    assert!(
+        decoded
+            .credentials()
+            .iter()
+            .all(|credential| credential.expires_at_unix_seconds().is_none())
+    );
 }
 
 #[test]
@@ -77,7 +101,10 @@ fn durable_lifecycle_states_are_decoded_and_query_readability_is_fail_closed() {
         (5, TenantLifecycleState::Purged, false),
     ] {
         let mut encoded = encoded_identity();
-        let lifecycle_byte = encoded.len().checked_sub(5).expect("lifecycle bytes");
+        let lifecycle_byte = encoded
+            .windows(5)
+            .position(|window| window == [1, 4, 0, 1, 1])
+            .expect("lifecycle bytes");
         encoded[lifecycle_byte] = encoding;
         let identity = decode_initial_identity(&encoded).expect("lifecycle identity");
         assert_eq!(identity.lifecycle, expected);
@@ -191,7 +218,10 @@ fn identity_decoder_rejects_colliding_data_plane_principals_and_unknown_lifecycl
     assert!(decode_initial_identity(&query_collision).is_err());
 
     let mut unknown_lifecycle = encoded_identity();
-    let lifecycle_offset = unknown_lifecycle.len().checked_sub(5).expect("lifecycle");
+    let lifecycle_offset = unknown_lifecycle
+        .windows(5)
+        .position(|window| window == [1, 4, 0, 1, 1])
+        .expect("lifecycle");
     unknown_lifecycle[lifecycle_offset] = 9;
     assert!(decode_initial_identity(&unknown_lifecycle).is_err());
 }

@@ -19,7 +19,7 @@ const AUDIT_HASH_DOMAIN: &[u8] = b"positron-governance-audit-record-v1";
 const TRANSACTION_DIGEST_DOMAIN: &[u8] = b"positron-catalog-transaction-v1";
 const OBJECT_SET_DIGEST_DOMAIN: &[u8] = b"positron-catalog-object-set-v1";
 
-#[derive(Clone)]
+#[derive(Clone, Eq, PartialEq)]
 pub(super) struct CommitRecord {
     pub(super) generation: CatalogGenerationId,
     pub(super) number: u64,

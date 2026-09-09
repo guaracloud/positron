@@ -49,6 +49,14 @@ Current storage target:
 cargo +nightly fuzz run primary_data_volume_stateful
 ```
 
+The bounded instance-bootstrap state machine also feeds arbitrary immutable
+governance-object and typed governance-audit bytes through the closed v1-v5
+and API-key lifecycle decoders before exercising bootstrap recovery:
+
+```console
+cargo +nightly fuzz run instance_bootstrap_stateful --sanitizer none -- -runs=1000
+```
+
 The bounded Trace Store Block target feeds untrusted bytes through the native
 tenant-bound codec and logical-span consolidation, including typed values,
 policy provenance, truncation, trailing-byte validation, semantic variant

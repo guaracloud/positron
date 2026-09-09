@@ -1,8 +1,551 @@
 {
   "openapi": "3.1.0",
-  "info": {"title": "Positron API", "version": "v1", "x-positron-schema-digest": "2807ac4ab5ada79d1dac1e9c64e01b57e9e61c22646296dc59a06652fa122036"},
-  "paths": {"/v1/capabilities:negotiate": {"post": {"operationId": "NegotiateCapabilityResponse", "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/CapabilityRequest"}}}}, "responses": {"200": {"description": "Closed capability statement", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/CapabilityResponse"}}}}}}}},
-  "components": {"schemas": {"CapabilityRequest": {"type": "object", "additionalProperties": false, "properties": {"api_major": {"type": "integer", "minimum": 0, "maximum": 4294967295, "x-protobuf-field-number": 1, "deprecated": false}, "capability": {"$ref": "#/components/schemas/Capability", "x-protobuf-field-number": 2, "deprecated": false}}}, "CapabilityResponse": {"type": "object", "additionalProperties": false, "properties": {"api_major": {"type": "integer", "minimum": 0, "maximum": 4294967295, "x-protobuf-field-number": 1, "deprecated": false}, "schema_digest": {"type": "string", "x-protobuf-field-number": 2, "deprecated": false}, "availability": {"$ref": "#/components/schemas/CapabilityAvailability", "x-protobuf-field-number": 3, "deprecated": false}, "refusal": {"$ref": "#/components/schemas/PublicError", "x-protobuf-field-number": 4, "deprecated": false}, "deprecation": {"$ref": "#/components/schemas/DeprecationState", "x-protobuf-field-number": 5, "deprecated": false}, "capability": {"$ref": "#/components/schemas/Capability", "x-protobuf-field-number": 6, "deprecated": false}}}, "PublicError": {"type": "object", "additionalProperties": false, "properties": {"code": {"$ref": "#/components/schemas/PublicErrorCode", "x-protobuf-field-number": 1, "deprecated": false}, "retry_class": {"$ref": "#/components/schemas/RetryClass", "x-protobuf-field-number": 2, "deprecated": false}, "completion_state": {"$ref": "#/components/schemas/CompletionState", "x-protobuf-field-number": 3, "deprecated": false}, "source": {"$ref": "#/components/schemas/FailureSource", "x-protobuf-field-number": 4, "deprecated": false}, "safe_detail": {"$ref": "#/components/schemas/SafeDetail", "x-protobuf-field-number": 5, "deprecated": false}}}, "Capability": {"type": "integer", "enum": [0, 1, 2, 3], "x-enumNames": ["UNSPECIFIED", "CANONICAL_PUBLIC_INTERFACE", "RELEASE_ONE_QUERY", "METRICS"], "x-enumDeprecated": [false, false, false, false]}, "CapabilityAvailability": {"type": "integer", "enum": [0, 1, 2, 3, 4], "x-enumNames": ["UNSPECIFIED", "IMPLEMENTED", "UNAVAILABLE", "UNSUPPORTED", "VERSION_INCOMPATIBLE"], "x-enumDeprecated": [false, false, false, false, false]}, "RetryClass": {"type": "integer", "enum": [0, 1, 2, 3], "x-enumNames": ["UNSPECIFIED", "NEVER", "AFTER_BACKOFF", "AFTER_INPUT_CORRECTION"], "x-enumDeprecated": [false, false, false, false]}, "CompletionState": {"type": "integer", "enum": [0, 1], "x-enumNames": ["UNSPECIFIED", "REJECTED"], "x-enumDeprecated": [false, false]}, "DeprecationState": {"type": "integer", "enum": [0, 1, 2], "x-enumNames": ["UNSPECIFIED", "CURRENT", "DEPRECATED"], "x-enumDeprecated": [false, false, false]}, "PublicErrorCode": {"type": "integer", "enum": [0, 1, 2, 3, 4, 5, 6], "x-enumNames": ["UNSPECIFIED", "UNSUPPORTED_API_VERSION", "CAPABILITY_UNAVAILABLE", "CAPABILITY_UNSUPPORTED", "MALFORMED_REQUEST", "REQUEST_TOO_LARGE", "UNKNOWN_FIELD"], "x-enumDeprecated": [false, false, false, false, false, false, false]}, "FailureSource": {"type": "integer", "enum": [0, 1, 2, 3], "x-enumNames": ["UNSPECIFIED", "CAPABILITY_NEGOTIATION", "GRPC_DECODE", "HTTP_DECODE"], "x-enumDeprecated": [false, false, false, false]}, "SafeDetail": {"type": "integer", "enum": [0, 1, 2, 3, 4, 5, 6], "x-enumNames": ["UNSPECIFIED", "API_MAJOR_UNSUPPORTED", "CAPABILITY_NOT_AVAILABLE", "CAPABILITY_NOT_SUPPORTED", "REQUEST_MALFORMED", "REQUEST_LIMIT_EXCEEDED", "FIELD_NOT_RECOGNIZED"], "x-enumDeprecated": [false, false, false, false, false, false, false]}}},
-  "x-positron-capability-statement": {"canonical_public_interface": "IMPLEMENTED", "release_one_query": "UNAVAILABLE", "metrics": "UNSUPPORTED", "other_api_major": "VERSION_INCOMPATIBLE"},
+  "info": {
+    "title": "Positron API",
+    "version": "v1",
+    "x-positron-schema-digest": "e0231f6e90a0ff3fb5dc9ea1c2231d2da7ce1dfbfed219608aeec97ba19b69c5"
+  },
+  "paths": {
+    "/v1/capabilities:negotiate": {
+      "post": {
+        "operationId": "NegotiateCapabilityResponse",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CapabilityRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Closed capability statement",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CapabilityResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api-keys:manage": {
+      "post": {
+        "operationId": "ManageApiKey",
+        "security": [
+          {
+            "apiKeyBearer": []
+          }
+        ],
+        "x-positron-max-request-bytes": 1024,
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApiKeyRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Redacted result with optional one-time secret",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiKeyResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Closed administrative refusal",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiKeyFailure"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Closed administrative refusal",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiKeyFailure"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Closed administrative refusal",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiKeyFailure"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Closed administrative refusal",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiKeyFailure"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Closed administrative refusal",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiKeyFailure"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "CapabilityRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "api_major": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 4294967295,
+            "x-protobuf-field-number": 1,
+            "deprecated": false
+          },
+          "capability": {
+            "$ref": "#/components/schemas/Capability",
+            "x-protobuf-field-number": 2,
+            "deprecated": false
+          }
+        }
+      },
+      "CapabilityResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "api_major": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 4294967295,
+            "x-protobuf-field-number": 1,
+            "deprecated": false
+          },
+          "schema_digest": {
+            "type": "string",
+            "x-protobuf-field-number": 2,
+            "deprecated": false
+          },
+          "availability": {
+            "$ref": "#/components/schemas/CapabilityAvailability",
+            "x-protobuf-field-number": 3,
+            "deprecated": false
+          },
+          "refusal": {
+            "$ref": "#/components/schemas/PublicError",
+            "x-protobuf-field-number": 4,
+            "deprecated": false
+          },
+          "deprecation": {
+            "$ref": "#/components/schemas/DeprecationState",
+            "x-protobuf-field-number": 5,
+            "deprecated": false
+          },
+          "capability": {
+            "$ref": "#/components/schemas/Capability",
+            "x-protobuf-field-number": 6,
+            "deprecated": false
+          }
+        }
+      },
+      "PublicError": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "$ref": "#/components/schemas/PublicErrorCode",
+            "x-protobuf-field-number": 1,
+            "deprecated": false
+          },
+          "retry_class": {
+            "$ref": "#/components/schemas/RetryClass",
+            "x-protobuf-field-number": 2,
+            "deprecated": false
+          },
+          "completion_state": {
+            "$ref": "#/components/schemas/CompletionState",
+            "x-protobuf-field-number": 3,
+            "deprecated": false
+          },
+          "source": {
+            "$ref": "#/components/schemas/FailureSource",
+            "x-protobuf-field-number": 4,
+            "deprecated": false
+          },
+          "safe_detail": {
+            "$ref": "#/components/schemas/SafeDetail",
+            "x-protobuf-field-number": 5,
+            "deprecated": false
+          }
+        }
+      },
+      "Capability": {
+        "type": "integer",
+        "enum": [
+          0,
+          1,
+          2,
+          3
+        ],
+        "x-enumNames": [
+          "UNSPECIFIED",
+          "CANONICAL_PUBLIC_INTERFACE",
+          "RELEASE_ONE_QUERY",
+          "METRICS"
+        ],
+        "x-enumDeprecated": [
+          false,
+          false,
+          false,
+          false
+        ]
+      },
+      "CapabilityAvailability": {
+        "type": "integer",
+        "enum": [
+          0,
+          1,
+          2,
+          3,
+          4
+        ],
+        "x-enumNames": [
+          "UNSPECIFIED",
+          "IMPLEMENTED",
+          "UNAVAILABLE",
+          "UNSUPPORTED",
+          "VERSION_INCOMPATIBLE"
+        ],
+        "x-enumDeprecated": [
+          false,
+          false,
+          false,
+          false,
+          false
+        ]
+      },
+      "RetryClass": {
+        "type": "integer",
+        "enum": [
+          0,
+          1,
+          2,
+          3
+        ],
+        "x-enumNames": [
+          "UNSPECIFIED",
+          "NEVER",
+          "AFTER_BACKOFF",
+          "AFTER_INPUT_CORRECTION"
+        ],
+        "x-enumDeprecated": [
+          false,
+          false,
+          false,
+          false
+        ]
+      },
+      "CompletionState": {
+        "type": "integer",
+        "enum": [
+          0,
+          1
+        ],
+        "x-enumNames": [
+          "UNSPECIFIED",
+          "REJECTED"
+        ],
+        "x-enumDeprecated": [
+          false,
+          false
+        ]
+      },
+      "DeprecationState": {
+        "type": "integer",
+        "enum": [
+          0,
+          1,
+          2
+        ],
+        "x-enumNames": [
+          "UNSPECIFIED",
+          "CURRENT",
+          "DEPRECATED"
+        ],
+        "x-enumDeprecated": [
+          false,
+          false,
+          false
+        ]
+      },
+      "PublicErrorCode": {
+        "type": "integer",
+        "enum": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6
+        ],
+        "x-enumNames": [
+          "UNSPECIFIED",
+          "UNSUPPORTED_API_VERSION",
+          "CAPABILITY_UNAVAILABLE",
+          "CAPABILITY_UNSUPPORTED",
+          "MALFORMED_REQUEST",
+          "REQUEST_TOO_LARGE",
+          "UNKNOWN_FIELD"
+        ],
+        "x-enumDeprecated": [
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false
+        ]
+      },
+      "FailureSource": {
+        "type": "integer",
+        "enum": [
+          0,
+          1,
+          2,
+          3
+        ],
+        "x-enumNames": [
+          "UNSPECIFIED",
+          "CAPABILITY_NEGOTIATION",
+          "GRPC_DECODE",
+          "HTTP_DECODE"
+        ],
+        "x-enumDeprecated": [
+          false,
+          false,
+          false,
+          false
+        ]
+      },
+      "SafeDetail": {
+        "type": "integer",
+        "enum": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6
+        ],
+        "x-enumNames": [
+          "UNSPECIFIED",
+          "API_MAJOR_UNSUPPORTED",
+          "CAPABILITY_NOT_AVAILABLE",
+          "CAPABILITY_NOT_SUPPORTED",
+          "REQUEST_MALFORMED",
+          "REQUEST_LIMIT_EXCEEDED",
+          "FIELD_NOT_RECOGNIZED"
+        ],
+        "x-enumDeprecated": [
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false
+        ]
+      },
+      "KeyAction": {
+        "type": "string",
+        "enum": [
+          "create",
+          "list",
+          "rotate",
+          "revoke",
+          "scope_inspect"
+        ]
+      },
+      "KeyScope": {
+        "type": "string",
+        "enum": [
+          "ingest",
+          "query",
+          "tenant_administration",
+          "system_administration"
+        ]
+      },
+      "ApiKeyRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "action"
+        ],
+        "properties": {
+          "action": {
+            "$ref": "#/components/schemas/KeyAction"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/KeyScope"
+          },
+          "principal": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "expires_at_unix_seconds": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "expected_generation": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "idempotency_key": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "KeyDescriptor": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "principal",
+          "scope",
+          "active",
+          "expires_at_unix_seconds",
+          "generation"
+        ],
+        "properties": {
+          "principal": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/KeyScope"
+          },
+          "active": {
+            "type": "boolean"
+          },
+          "expires_at_unix_seconds": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "generation": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      },
+      "ApiKeyResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "keys",
+          "principal",
+          "secret"
+        ],
+        "properties": {
+          "keys": {
+            "type": "array",
+            "maxItems": 128,
+            "items": {
+              "$ref": "#/components/schemas/KeyDescriptor"
+            }
+          },
+          "principal": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "secret": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Present only on the first successful create or rotate response. Never redisplayed on retry."
+          }
+        }
+      },
+      "ApiKeyFailure": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "code"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "enum": [
+              "invalid_request",
+              "authentication_rejected",
+              "stale_generation",
+              "idempotency_conflict",
+              "key_unavailable",
+              "administration_unavailable"
+            ]
+          }
+        }
+      }
+    },
+    "securitySchemes": {
+      "apiKeyBearer": {
+        "type": "http",
+        "scheme": "bearer"
+      }
+    }
+  },
+  "x-positron-capability-statement": {
+    "canonical_public_interface": "IMPLEMENTED",
+    "release_one_query": "UNAVAILABLE",
+    "metrics": "UNSUPPORTED",
+    "other_api_major": "VERSION_INCOMPATIBLE"
+  },
   "x-positron-max-request-bytes": 64
 }

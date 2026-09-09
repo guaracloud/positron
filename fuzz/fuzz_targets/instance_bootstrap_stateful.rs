@@ -5,10 +5,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use libfuzzer_sys::fuzz_target;
+use positron_api::api_keys::{ApiKeyRequest, ApiKeyResponse};
 use positron_governance::{
-    CatalogRootRotationStage, CompatibilityHints, GovernanceAuditEntry, PresentedCredential,
-    RequestedIntent,
+    AdministrativeIdempotencyKey, CatalogRootRotationStage, CompatibilityHints,
+    GovernanceAuditEntry, PresentedCredential, RequestedIntent, ResourceGeneration,
 };
+use positron_domain::identity::{PrincipalId, Scope};
 use positron_runtime::{
     BootstrapFailureCode, BootstrapPaths, InitializationPlan, InstanceBootstrap,
 };
@@ -74,7 +76,10 @@ fn corrupt(path: &Path, selector: usize) {
     }
 }
 
-fn heterogeneous_rotation_entries(data: &[u8]) -> Vec<GovernanceAuditEntry> {
+fn heterogeneous_rotation_entries(
+    data: &[u8],
+    first_position: u64,
+) -> Vec<GovernanceAuditEntry> {
     let mut provider_key_reference = [0_u8; 16];
     let provider_bytes = data.get(..data.len().min(16)).unwrap_or_default();
     provider_key_reference[..provider_bytes.len()].copy_from_slice(provider_bytes);
@@ -103,7 +108,7 @@ fn heterogeneous_rotation_entries(data: &[u8]) -> Vec<GovernanceAuditEntry> {
             intent.extend_from_slice(b"fuzz-sensitive-metadata");
             intent.extend_from_slice(data.get(..data.len().min(24)).unwrap_or_default());
             let entry = positron_governance::fuzz_decode_governance_audit(
-                u64::try_from(index).expect("bounded stage") + 2,
+                first_position + u64::try_from(index).expect("bounded stage"),
                 transaction_id,
                 &intent,
             )
@@ -117,8 +122,12 @@ fn heterogeneous_rotation_entries(data: &[u8]) -> Vec<GovernanceAuditEntry> {
 
 fuzz_target!(|data: &[u8]| {
     let split = data.len() / 2;
+    let _ = ApiKeyRequest::decode(data);
+    if let Ok(response) = ApiKeyResponse::decode(data) {
+        assert_eq!(format!("{response:?}"), "ApiKeyResponse { <redacted> }");
+    }
     positron_governance::fuzz_parse_governance(&data[..split], &data[split..]);
-    let rotations = heterogeneous_rotation_entries(data);
+    let rotations = heterogeneous_rotation_entries(data, 2);
     assert_eq!(rotations.len(), 3);
     assert_eq!(
         rotations
@@ -157,8 +166,10 @@ fuzz_target!(|data: &[u8]| {
     let mut integrity = None;
     let mut claim_released = false;
     let mut credential = None;
+    let mut tenant_key: Option<(PrincipalId, String, Scope)> = None;
+    let mut credential_generation = 1_u64;
     for (index, command) in data.iter().copied().enumerate() {
-        match command & 7 {
+        match command & 15 {
             0 | 1 => {
                 if let Ok(instance) =
                     InstanceBootstrap::initialize(&paths, InitializationPlan::non_interactive())
@@ -217,13 +228,18 @@ fuzz_target!(|data: &[u8]| {
                     let audit = instance
                         .inspect_governance_for_fixture(authorized)
                         .expect("system administration authorizes governance inspection");
-                    assert_eq!(audit.audit_records().len(), 1);
+                    assert!(!audit.audit_records().is_empty());
+                    let audit_len = audit.audit_records().len();
+                    let next_position = u64::try_from(audit_len)
+                        .expect("bounded audit chain")
+                        + 1;
+                    let rotations = heterogeneous_rotation_entries(data, next_position);
                     let heterogeneous = audit
                         .audit_records()
                         .iter()
                         .chain(rotations.iter())
                         .collect::<Vec<_>>();
-                    assert_eq!(heterogeneous.len(), 4);
+                    assert_eq!(heterogeneous.len(), audit_len + rotations.len());
                     for (index, entry) in heterogeneous.iter().enumerate() {
                         assert_eq!(
                             entry.position(),
@@ -290,6 +306,177 @@ fuzz_target!(|data: &[u8]| {
                         assert!(other_instance
                             .inspect_governance_for_fixture(context)
                             .is_err());
+                    }
+                }
+            },
+            8 => {
+                if let (Some(root_secret), Ok(instance)) =
+                    (credential.as_deref(), InstanceBootstrap::reopen(&paths))
+                {
+                    let Ok(administrator) = instance.attribute(
+                        PresentedCredential::parse(root_secret)
+                            .expect("claimed credential remains canonical"),
+                        RequestedIntent::SystemAdministration,
+                        CompatibilityHints::none(),
+                    ) else {
+                        continue;
+                    };
+                    let scope = if command & 0x10 == 0 {
+                        Scope::Query
+                    } else {
+                        Scope::Ingest
+                    };
+                    let intent = if scope == Scope::Query {
+                        RequestedIntent::Query
+                    } else {
+                        RequestedIntent::Ingest
+                    };
+                    let idempotency = AdministrativeIdempotencyKey::new([
+                        u8::try_from(index).expect("bounded input") + 1;
+                        16
+                    ])
+                    .expect("nonzero idempotency");
+                    let expected = ResourceGeneration::new(credential_generation)
+                        .expect("bounded generation");
+                    if let Ok(created) = instance.create_api_key(
+                        administrator,
+                        scope,
+                        None,
+                        expected,
+                        idempotency,
+                    ) {
+                        let key_secret = created
+                            .secret()
+                            .expect("new API key is shown exactly once")
+                            .to_owned();
+                        assert_eq!(key_secret.len(), 68);
+                        assert!(!format!("{created:?}").contains(&key_secret));
+                        let attributed = instance.attribute(
+                            PresentedCredential::parse(&key_secret)
+                                .expect("generated API key remains canonical"),
+                            intent,
+                            CompatibilityHints::none(),
+                        );
+                        assert!(attributed.is_ok());
+                        assert!(instance
+                            .attribute(
+                                PresentedCredential::parse(&key_secret)
+                                    .expect("generated API key remains canonical"),
+                                RequestedIntent::SystemAdministration,
+                                CompatibilityHints::none(),
+                            )
+                            .is_err());
+                        let replay = instance.create_api_key(
+                            instance
+                                .attribute(
+                                    PresentedCredential::parse(root_secret)
+                                        .expect("claim syntax"),
+                                    RequestedIntent::SystemAdministration,
+                                    CompatibilityHints::none(),
+                                )
+                                .expect("bootstrap credential remains administrator"),
+                            scope,
+                            None,
+                            expected,
+                            idempotency,
+                        );
+                        if let Ok(replay) = replay {
+                            assert_eq!(replay.principal_id(), created.principal_id());
+                            assert!(replay.secret().is_none());
+                        }
+                        tenant_key = Some((created.principal_id(), key_secret, scope));
+                        credential_generation = credential_generation.saturating_add(1);
+                    }
+                }
+            },
+            9 => {
+                if let (Some(secret), Some((principal, old_secret, scope)), Ok(instance)) = (
+                    credential.as_deref(),
+                    tenant_key.take(),
+                    InstanceBootstrap::reopen(&paths),
+                ) {
+                    let Ok(administrator) = instance.attribute(
+                        PresentedCredential::parse(secret).expect("claim syntax"),
+                        RequestedIntent::SystemAdministration,
+                        CompatibilityHints::none(),
+                    ) else {
+                        tenant_key = Some((principal, old_secret, scope));
+                        continue;
+                    };
+                    let idempotency = AdministrativeIdempotencyKey::new([
+                        u8::try_from(index).expect("bounded input") + 1;
+                        16
+                    ])
+                    .expect("nonzero idempotency");
+                    let expected = ResourceGeneration::new(credential_generation)
+                        .expect("bounded generation");
+                    if let Ok(successor) =
+                        instance.rotate_api_key(administrator, principal, expected, idempotency)
+                    {
+                        let successor_secret = successor
+                            .secret()
+                            .expect("rotated API key is shown exactly once")
+                            .to_owned();
+                        let intent = if scope == Scope::Query {
+                            RequestedIntent::Query
+                        } else {
+                            RequestedIntent::Ingest
+                        };
+                        for presented in [&old_secret, &successor_secret] {
+                            assert!(instance
+                                .attribute(
+                                    PresentedCredential::parse(presented)
+                                        .expect("generated API key remains canonical"),
+                                    intent,
+                                    CompatibilityHints::none(),
+                                )
+                                .is_ok());
+                        }
+                        tenant_key = Some((successor.principal_id(), successor_secret, scope));
+                        credential_generation = credential_generation.saturating_add(1);
+                    } else {
+                        tenant_key = Some((principal, old_secret, scope));
+                    }
+                }
+            },
+            10 => {
+                if let (Some(secret), Some((principal, key_secret, scope)), Ok(instance)) = (
+                    credential.as_deref(),
+                    tenant_key.take(),
+                    InstanceBootstrap::reopen(&paths),
+                ) {
+                    if let Ok(administrator) = instance.attribute(
+                        PresentedCredential::parse(secret).expect("claim syntax"),
+                        RequestedIntent::SystemAdministration,
+                        CompatibilityHints::none(),
+                    ) {
+                        let idempotency = AdministrativeIdempotencyKey::new([
+                            u8::try_from(index).expect("bounded input") + 1;
+                            16
+                        ])
+                        .expect("nonzero idempotency");
+                        let expected = ResourceGeneration::new(credential_generation)
+                            .expect("bounded generation");
+                        if instance
+                            .revoke_api_key(administrator, principal, expected, idempotency)
+                            .is_ok()
+                        {
+                            assert!(instance
+                                .attribute(
+                                    PresentedCredential::parse(&key_secret)
+                                        .expect("generated API key remains canonical"),
+                                    if scope == Scope::Query {
+                                        RequestedIntent::Query
+                                    } else {
+                                        RequestedIntent::Ingest
+                                    },
+                                    CompatibilityHints::none(),
+                                )
+                                .is_err());
+                            credential_generation = credential_generation.saturating_add(1);
+                        } else {
+                            tenant_key = Some((principal, key_secret, scope));
+                        }
                     }
                 }
             },

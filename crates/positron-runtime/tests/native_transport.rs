@@ -12,14 +12,80 @@ use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use positron_kernel::MountQualification;
 use positron_query::QueryBudget;
 use positron_runtime::{
-    ApplicationRuntime, BootstrapPaths, HostInputs, InitializationMode, InstanceBootstrap,
-    NativeBindings, NativeHost, ServeConfiguration, ShutdownTrigger,
+    ApiTransportProfile, ApplicationRuntime, BootstrapPaths, HostInputs, InitializationMode,
+    InstanceBootstrap, NativeBindings, NativeHost, ServeConfiguration, ShutdownTrigger,
 };
 use prost::Message;
 
 #[path = "native_transport/support.rs"]
 mod support;
 use support::*;
+
+#[test]
+fn operations_health_exposes_plaintext_transport_warning_without_degrading_readiness()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _guard = live_test_guard();
+    let plaintext_roots = TestRoots::new("plaintext-health-warning")?;
+    let plaintext_paths = plaintext_roots.paths()?;
+    drop(InstanceBootstrap::initialize(
+        &plaintext_paths,
+        positron_runtime::InitializationPlan::non_interactive(),
+    )?);
+    let plaintext_host = NativeHost::new(bindings(&plaintext_roots, "plaintext-health-warning")?);
+    let plaintext = ApplicationRuntime::start(
+        ServeConfiguration::new(plaintext_paths, InitializationMode::ExistingOnly)
+            .with_public_plaintext_api_warning(),
+        HostInputs::new(&plaintext_host, &plaintext_host),
+    )?;
+    let plaintext_operations = address(
+        &plaintext.bound_endpoints(),
+        positron_runtime::ListenerRole::Operations,
+    )?;
+    let plaintext_health = http(plaintext_operations, "GET", "/health/ready", &[], &[])?;
+    assert_status(plaintext_health.clone(), 200);
+    assert!(plaintext_health.contains("\"status\":\"ready\""));
+    assert!(plaintext_health.contains("\"warnings\":[\"public_plaintext_api\"]"));
+    assert_eq!(
+        plaintext.shutdown(ShutdownTrigger::FirstSignal),
+        positron_runtime::ExitOutcome::Graceful
+    );
+
+    let tls_roots = TestRoots::new("tls-health-warning")?;
+    let tls_paths = tls_roots.paths()?;
+    drop(InstanceBootstrap::initialize(
+        &tls_paths,
+        positron_runtime::InitializationPlan::non_interactive(),
+    )?);
+    let certificate = PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/native_transport/fixtures/api-test-cert.pem"
+    ));
+    let private_key = PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/native_transport/fixtures/api-test-key.pem"
+    ));
+    let tls_host = NativeHost::new(
+        bindings(&tls_roots, "tls-health-warning")?
+            .with_api_transport(ApiTransportProfile::tls(certificate, private_key)?)?,
+    );
+    let tls = ApplicationRuntime::start(
+        ServeConfiguration::new(tls_paths, InitializationMode::ExistingOnly),
+        HostInputs::new(&tls_host, &tls_host),
+    )?;
+    let tls_operations = address(
+        &tls.bound_endpoints(),
+        positron_runtime::ListenerRole::Operations,
+    )?;
+    let tls_health = http(tls_operations, "GET", "/health/ready", &[], &[])?;
+    assert_status(tls_health.clone(), 200);
+    assert!(tls_health.contains("\"status\":\"ready\""));
+    assert!(tls_health.contains("\"warnings\":[]"));
+    assert_eq!(
+        tls.shutdown(ShutdownTrigger::FirstSignal),
+        positron_runtime::ExitOutcome::Graceful
+    );
+    Ok(())
+}
 
 #[test]
 fn loopback_otlp_is_authenticated_durable_and_observable_across_restart()
@@ -278,6 +344,178 @@ fn loopback_transport_enforces_bounded_http_and_typed_statuses()
     assert_eq!(
         process.shutdown(ShutdownTrigger::FirstSignal),
         positron_runtime::ExitOutcome::Graceful
+    );
+    Ok(())
+}
+
+#[test]
+fn configured_tls_api_listener_serves_an_authenticated_administration_request()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _guard = live_test_guard();
+    let roots = TestRoots::new("tls-api")?;
+    let paths = roots.paths()?;
+    drop(InstanceBootstrap::initialize(
+        &paths,
+        positron_runtime::InitializationPlan::non_interactive(),
+    )?);
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let certificate = PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/native_transport/fixtures/api-test-cert.pem"
+    ));
+    let private_key = PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/native_transport/fixtures/api-test-key.pem"
+    ));
+    let host = NativeHost::new(
+        bindings(&roots, "tls-api")?
+            .with_api_transport(ApiTransportProfile::tls(certificate.clone(), private_key)?)?,
+    );
+    let process = ApplicationRuntime::start(
+        ServeConfiguration::new(paths, InitializationMode::ExistingOnly),
+        HostInputs::new(&host, &host),
+    )?;
+    let api = address(
+        &process.bound_endpoints(),
+        positron_runtime::ListenerRole::Api,
+    )?;
+    let response = positron_api::api_keys::ApiKeyServiceClient::new(
+        positron_api::api_keys::ApiKeyTransport::Tls {
+            endpoint: api,
+            server_name: "localhost".to_owned(),
+            trust_file: certificate,
+        },
+    )?
+    .manage(
+        claim.secret(),
+        &positron_api::api_keys::ApiKeyRequest::list(),
+    )?;
+    assert_eq!(response.keys.len(), 3);
+    let wrong_dial_address =
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 2), api.port()));
+    let wrong_dial = positron_api::api_keys::ApiKeyServiceClient::new(
+        positron_api::api_keys::ApiKeyTransport::Tls {
+            endpoint: wrong_dial_address,
+            server_name: "localhost".to_owned(),
+            trust_file: PathBuf::from(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/native_transport/fixtures/api-test-cert.pem"
+            )),
+        },
+    )?
+    .manage(
+        claim.secret(),
+        &positron_api::api_keys::ApiKeyRequest::list(),
+    );
+    assert!(
+        wrong_dial.is_err(),
+        "the client must use the configured dial address"
+    );
+    let hostname_mismatch = positron_api::api_keys::ApiKeyServiceClient::new(
+        positron_api::api_keys::ApiKeyTransport::Tls {
+            endpoint: api,
+            server_name: "not-localhost".to_owned(),
+            trust_file: PathBuf::from(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/native_transport/fixtures/api-test-cert.pem"
+            )),
+        },
+    )?
+    .manage(
+        claim.secret(),
+        &positron_api::api_keys::ApiKeyRequest::list(),
+    );
+    assert!(hostname_mismatch.is_err());
+    let invalid_trust = positron_api::api_keys::ApiKeyServiceClient::new(
+        positron_api::api_keys::ApiKeyTransport::Tls {
+            endpoint: api,
+            server_name: "localhost".to_owned(),
+            trust_file: PathBuf::from(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/native_transport/fixtures/api-test-key.pem"
+            )),
+        },
+    )?
+    .manage(
+        claim.secret(),
+        &positron_api::api_keys::ApiKeyRequest::list(),
+    );
+    assert!(invalid_trust.is_err());
+    assert_eq!(
+        process.shutdown(ShutdownTrigger::FirstSignal),
+        positron_runtime::ExitOutcome::Graceful
+    );
+    Ok(())
+}
+
+#[test]
+fn api_tls_profile_rejects_missing_or_invalid_identity_material() {
+    let missing = ApiTransportProfile::tls(
+        PathBuf::from("/tmp/positron-missing-api-certificate.pem"),
+        PathBuf::from("/tmp/positron-missing-api-key.pem"),
+    );
+    assert!(missing.is_err());
+
+    let certificate = PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/native_transport/fixtures/api-test-cert.pem"
+    ));
+    let invalid_key = PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/native_transport/fixtures/api-test-cert.pem"
+    ));
+    assert!(ApiTransportProfile::tls(certificate, invalid_key).is_err());
+}
+
+#[test]
+fn public_api_binding_requires_tls_or_the_exact_plaintext_opt_out()
+-> Result<(), Box<dyn std::error::Error>> {
+    let control = PathBuf::from("/tmp/positron-public-api.sock");
+    let loopback = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+    let public = "192.0.2.1:8443".parse()?;
+    let certificate = PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/native_transport/fixtures/api-test-cert.pem"
+    ));
+    let private_key = PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/native_transport/fixtures/api-test-key.pem"
+    ));
+    assert!(
+        NativeBindings::new(
+            control.clone(),
+            loopback,
+            public,
+            loopback,
+            loopback,
+            loopback
+        )
+        .is_err()
+    );
+    assert!(
+        NativeBindings::new_with_api_transport(
+            control.clone(),
+            loopback,
+            public,
+            loopback,
+            loopback,
+            loopback,
+            ApiTransportProfile::tls(certificate, private_key)?,
+        )
+        .is_ok()
+    );
+    assert!(
+        NativeBindings::new_with_api_transport(
+            control,
+            loopback,
+            public,
+            loopback,
+            loopback,
+            loopback,
+            ApiTransportProfile::plaintext_opt_out(),
+        )
+        .is_ok(),
+        "an explicit plaintext listener profile admits a public API address"
     );
     Ok(())
 }

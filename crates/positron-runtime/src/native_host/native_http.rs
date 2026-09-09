@@ -3,8 +3,9 @@ use std::net::TcpStream;
 use std::time::Duration;
 
 use positron_api::generated::{ApiError, CapabilityResponse};
+use zeroize::{Zeroize, Zeroizing};
 
-use crate::{HealthState, ListenerRole, Liveness, Readiness, ServiceHandle};
+use crate::{HealthState, HealthWarning, ListenerRole, Liveness, Readiness, ServiceHandle};
 
 const MAX_HEADER_BYTES: usize = 8 * 1024;
 const MAX_API_BODY_BYTES: usize = positron_api::generated::MAX_PUBLIC_REQUEST_BYTES;
@@ -34,6 +35,63 @@ pub(super) fn serve_connection(
 
 pub(super) struct ConnectionFailure;
 
+pub(super) fn serve_tls_api_connection<S: Read + Write>(
+    stream: &mut S,
+    health: &HealthState,
+    services: Option<&ServiceHandle>,
+) -> Result<(), ConnectionFailure> {
+    let result = (|| {
+        let head = read_head(stream)?;
+        let response = route_tls_api(stream, head, health, services)?;
+        write_response(stream, response).map_err(|_| Response::empty(500))
+    })();
+    if let Err(response) = result {
+        write_response(stream, response).map_err(|_| ConnectionFailure)?;
+    }
+    Ok(())
+}
+
+fn route_tls_api<S: Read + Write>(
+    stream: &mut S,
+    mut head: RequestHead,
+    _health: &HealthState,
+    services: Option<&ServiceHandle>,
+) -> Result<Response, Response> {
+    match (head.method.as_str(), head.path.as_str()) {
+        ("POST", positron_api::api_keys::HTTP_PATH) => {
+            let services = services.ok_or_else(|| Response::empty(503))?;
+            let bearer = Zeroizing::new(head.bearer.take().ok_or_else(|| {
+                Response::json(401, "{\"code\":\"authentication_rejected\"}".to_owned())
+            })?);
+            let body = read_body(
+                stream,
+                head.content_length,
+                positron_api::api_keys::MAX_REQUEST_BYTES,
+            )?;
+            match services.administer_api_keys(&bearer, &body) {
+                Ok(response) => Ok(Response {
+                    status: 200,
+                    content_type: "application/json",
+                    body: response.encode().map_err(|_| Response::empty(500))?,
+                    retry_after_seconds: None,
+                }),
+                Err((status, code)) => {
+                    Ok(Response::json(status, format!("{{\"code\":\"{code}\"}}")))
+                },
+            }
+        },
+        ("POST", "/v1/capabilities:negotiate") => {
+            let services = services.ok_or_else(|| Response::empty(503))?;
+            let body = read_body(stream, head.content_length, MAX_API_BODY_BYTES)?;
+            Ok(capability_response(services.negotiate_capability(&body)))
+        },
+        (_, positron_api::api_keys::HTTP_PATH | "/v1/capabilities:negotiate") => {
+            Ok(Response::empty(405))
+        },
+        _ => Ok(Response::empty(404)),
+    }
+}
+
 fn serve_checked(
     stream: &mut TcpStream,
     role: ListenerRole,
@@ -48,17 +106,45 @@ fn serve_checked(
 fn route(
     stream: &mut TcpStream,
     role: ListenerRole,
-    head: RequestHead,
+    mut head: RequestHead,
     health: &HealthState,
     services: Option<&ServiceHandle>,
 ) -> Result<Response, Response> {
     match (role, head.method.as_str(), head.path.as_str()) {
-        (ListenerRole::Operations, "GET", "/health/live") => {
-            Ok(health_response(health.liveness() == Liveness::Live, "live"))
+        (ListenerRole::Api, "POST", positron_api::api_keys::HTTP_PATH) => {
+            let services = services.ok_or_else(|| Response::empty(503))?;
+            let bearer = Zeroizing::new(head.bearer.take().ok_or_else(|| {
+                Response::json(401, "{\"code\":\"authentication_rejected\"}".to_owned())
+            })?);
+            let body = read_body(
+                stream,
+                head.content_length,
+                positron_api::api_keys::MAX_REQUEST_BYTES,
+            )?;
+            match services.administer_api_keys(&bearer, &body) {
+                Ok(response) => {
+                    let body = response.encode().map_err(|_| Response::empty(500))?;
+                    Ok(Response {
+                        status: 200,
+                        content_type: "application/json",
+                        body,
+                        retry_after_seconds: None,
+                    })
+                },
+                Err((status, code)) => {
+                    Ok(Response::json(status, format!("{{\"code\":\"{code}\"}}")))
+                },
+            }
         },
+        (ListenerRole::Operations, "GET", "/health/live") => Ok(health_response(
+            health.liveness() == Liveness::Live,
+            "live",
+            health.security_warning(),
+        )),
         (ListenerRole::Operations, "GET", "/health/ready") => Ok(health_response(
             health.readiness() == Readiness::Ready,
             "ready",
+            health.security_warning(),
         )),
         (ListenerRole::Api, "POST", "/v1/capabilities:negotiate") => {
             let services = services.ok_or_else(|| Response::empty(503))?;
@@ -83,6 +169,7 @@ fn route(
         },
         (ListenerRole::Operations, _, "/health/live" | "/health/ready")
         | (ListenerRole::Api, _, "/v1/capabilities:negotiate")
+        | (ListenerRole::Api, _, positron_api::api_keys::HTTP_PATH)
         | (ListenerRole::OtlpHttp, _, "/v1/logs" | "/v1/traces") => Ok(Response::empty(405)),
         (ListenerRole::LokiPush, _, "/loki/api/v1/push" | "/otlp/v1/logs") => {
             Ok(Response::empty(405))
@@ -101,8 +188,8 @@ pub(super) struct RequestHead {
     pub(super) tenant_hint: Option<String>,
 }
 
-fn read_head(stream: &mut TcpStream) -> Result<RequestHead, Response> {
-    let mut bytes = Vec::with_capacity(512);
+fn read_head<S: Read>(stream: &mut S) -> Result<RequestHead, Response> {
+    let mut bytes = Zeroizing::new(Vec::with_capacity(512));
     let mut byte = [0_u8; 1];
     while !bytes.ends_with(b"\r\n\r\n") {
         if bytes.len() == MAX_HEADER_BYTES {
@@ -123,6 +210,7 @@ fn read_head(stream: &mut TcpStream) -> Result<RequestHead, Response> {
     }
     let mut content_length = None;
     let mut bearer = None;
+    let mut authorization_seen = false;
     let mut content_type = None;
     let mut content_encoding = None;
     let mut tenant_hint = None;
@@ -135,6 +223,10 @@ fn read_head(stream: &mut TcpStream) -> Result<RequestHead, Response> {
             }
             content_length = Some(value.parse().map_err(|_| Response::empty(400))?);
         } else if name.eq_ignore_ascii_case("authorization") {
+            if authorization_seen {
+                return Err(Response::empty(400));
+            }
+            authorization_seen = true;
             bearer = value.strip_prefix("Bearer ").map(ToOwned::to_owned);
         } else if name.eq_ignore_ascii_case("content-type") {
             if content_type.is_some() {
@@ -166,8 +258,8 @@ fn read_head(stream: &mut TcpStream) -> Result<RequestHead, Response> {
     })
 }
 
-pub(super) fn read_body(
-    stream: &mut TcpStream,
+pub(super) fn read_body<S: Read>(
+    stream: &mut S,
     length: usize,
     maximum: usize,
 ) -> Result<Vec<u8>, Response> {
@@ -181,11 +273,21 @@ pub(super) fn read_body(
     Ok(body)
 }
 
-fn health_response(healthy: bool, label: &'static str) -> Response {
+fn health_response(healthy: bool, label: &'static str, warning: Option<HealthWarning>) -> Response {
+    let warnings = match warning {
+        Some(HealthWarning::PublicPlaintextApi) => "[\"public_plaintext_api\"]",
+        None => "[]",
+    };
     if healthy {
-        Response::json(200, format!("{{\"status\":\"{label}\"}}"))
+        Response::json(
+            200,
+            format!("{{\"status\":\"{label}\",\"warnings\":{warnings}}}"),
+        )
     } else {
-        Response::json(503, format!("{{\"status\":\"not_{label}\"}}"))
+        Response::json(
+            503,
+            format!("{{\"status\":\"not_{label}\",\"warnings\":{warnings}}}"),
+        )
     }
 }
 
@@ -227,6 +329,12 @@ pub(super) struct Response {
     content_type: &'static str,
     body: Vec<u8>,
     retry_after_seconds: Option<u32>,
+}
+
+impl Drop for Response {
+    fn drop(&mut self) {
+        self.body.zeroize();
+    }
 }
 
 impl Response {
@@ -283,13 +391,14 @@ impl Response {
     }
 }
 
-fn write_response(stream: &mut TcpStream, response: Response) -> Result<(), std::io::Error> {
+fn write_response<S: Write>(stream: &mut S, response: Response) -> Result<(), std::io::Error> {
     let reason = match response.status {
         200 => "OK",
         400 => "Bad Request",
         401 => "Unauthorized",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        409 => "Conflict",
         413 => "Content Too Large",
         415 => "Unsupported Media Type",
         422 => "Unprocessable Content",

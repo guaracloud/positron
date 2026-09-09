@@ -10,6 +10,51 @@ service CapabilityService {
   rpc Negotiate(CapabilityRequest) returns (CapabilityResponse);
 }
 
+// Authenticated System Administration API. Bearer credentials are transport
+// metadata and are never included in request bodies. Tenant authority is
+// selected only by the server's durable identity, never by a caller hint.
+service ApiKeyService {
+  rpc Manage(ApiKeyRequest) returns (ApiKeyResponse);
+}
+
+message ApiKeyRequest {
+  KeyAction action = 1;
+  optional KeyScope scope = 2;
+  optional string principal = 3;
+  optional uint64 expires_at_unix_seconds = 4;
+  optional uint64 expected_generation = 5;
+  optional string idempotency_key = 6;
+}
+enum KeyAction {
+  KEY_ACTION_UNSPECIFIED = 0;
+  KEY_ACTION_CREATE = 1;
+  KEY_ACTION_LIST = 2;
+  KEY_ACTION_ROTATE = 3;
+  KEY_ACTION_REVOKE = 4;
+  KEY_ACTION_SCOPE_INSPECT = 5;
+}
+enum KeyScope {
+  KEY_SCOPE_UNSPECIFIED = 0;
+  KEY_SCOPE_INGEST = 1;
+  KEY_SCOPE_QUERY = 2;
+  KEY_SCOPE_TENANT_ADMINISTRATION = 3;
+  KEY_SCOPE_SYSTEM_ADMINISTRATION = 4;
+}
+message KeyDescriptor {
+  string principal = 1;
+  KeyScope scope = 2;
+  bool active = 3;
+  optional uint64 expires_at_unix_seconds = 4;
+  uint64 generation = 5;
+}
+message ApiKeyResponse {
+  repeated KeyDescriptor keys = 1;
+  optional string principal = 2;
+  // Present only in the first successful create/rotate response. Idempotent
+  // retries resolve the principal but never reconstruct or redisplay a secret.
+  optional string secret = 3;
+}
+
 message CapabilityRequest {
   uint32 api_major = 1;
   Capability capability = 2;

@@ -3,13 +3,19 @@ use std::fmt::{Display, Formatter};
 use std::path::Path;
 use std::sync::Arc;
 
-use positron_domain::identity::{ExternalTenantAlias, PrincipalId, TenantId, TenantSlug};
+use positron_domain::identity::{ExternalTenantAlias, PrincipalId, Scope, TenantId, TenantSlug};
+use positron_domain::routing::SignalKind;
 use positron_kernel::{
     BootstrapKeyCustody, Catalog, CatalogFailureCode, InstanceBootstrapStorage, InstanceId,
     MountQualification, OwnedPrimaryDataVolume, RetentionTimeAuthority,
     StorageKernelResourceAuthority,
 };
 use zeroize::Zeroizing;
+
+use positron_governance::{
+    AdministrativeIdempotencyKey, ApiKeyAdministrationFailure, ApiKeyCreation, AuthorizedContext,
+    ListenerTransportAdministration, ListenerTransportAdministrationFailure, ResourceGeneration,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BootstrapState {
@@ -34,6 +40,10 @@ pub enum BootstrapFailureCode {
     ClaimUnavailable,
     ClaimDestructionFailed,
     EntropyUnavailable,
+    ApiKeyUnauthorized,
+    ApiKeyStaleGeneration,
+    ApiKeyIdempotencyConflict,
+    ApiKeyUnavailable,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -253,9 +263,133 @@ impl InitializedInstance {
         // Never expose the boot-cached identity as a data-plane authority.
         // Rebuild the immutable view from the current durable Catalog
         // generation for every attribution request.
+        let scope =
+            positron_kernel::SegmentScope::new(self.tenant, SignalKind::Logs, self.logs_shard);
+        let lifecycle_seconds = self
+            .retention_time
+            .governance_time_seconds(scope)
+            .map_err(|_| positron_governance::AttributionFailure)?;
         self.durable_identity()
             .map_err(|_| positron_governance::AttributionFailure)?
-            .attribute(&self.key, credential, intent, hints)
+            .attribute_at(
+                &self.key,
+                credential,
+                intent,
+                hints,
+                Some(lifecycle_seconds),
+            )
+    }
+
+    /// Records the active explicit plaintext API transport selection through
+    /// the Catalog's single joint governance-audit publication path.
+    pub(crate) fn activate_public_plaintext_api_transport(&self) -> Result<(), BootstrapFailure> {
+        let secret = self
+            .key
+            .catalog_secret(self.instance)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
+        let catalog = Catalog::open(&self._authority, self.instance, secret)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        ListenerTransportAdministration::activate_public_plaintext_api(&catalog, self.instance)
+            .map(|_| ())
+            .map_err(map_listener_transport_failure)
+    }
+
+    pub fn create_api_key(
+        &self,
+        actor: AuthorizedContext,
+        scope: Scope,
+        expires_at_unix_seconds: Option<u64>,
+        expected: ResourceGeneration,
+        idempotency: AdministrativeIdempotencyKey,
+    ) -> Result<ApiKeyCreation, BootstrapFailure> {
+        let secret = self
+            .key
+            .catalog_secret(self.instance)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
+        let catalog = Catalog::open(&self._authority, self.instance, secret)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        positron_governance::ApiKeyAdministration::create(
+            &catalog,
+            &self.key,
+            self.administrator,
+            positron_governance::ApiKeyCreateRequest::new(
+                actor,
+                scope,
+                expires_at_unix_seconds,
+                expected,
+                idempotency,
+            ),
+        )
+        .map_err(map_api_key_failure)
+    }
+
+    /// Returns redacted key descriptors for the authorized system operator.
+    pub fn list_api_keys(
+        &self,
+        actor: AuthorizedContext,
+    ) -> Result<Vec<positron_governance::ApiKeyDescriptor>, BootstrapFailure> {
+        let secret = self
+            .key
+            .catalog_secret(self.instance)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
+        let catalog = Catalog::open(&self._authority, self.instance, secret)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        positron_governance::ApiKeyAdministration::list(&catalog, self.administrator, actor)
+            .map_err(map_api_key_failure)
+    }
+
+    /// Creates a successor credential without retiring its predecessor.  The
+    /// caller must explicitly revoke the old key once dependent clients have
+    /// switched, so a failed rollout never loses the only working key.
+    pub fn rotate_api_key(
+        &self,
+        actor: AuthorizedContext,
+        predecessor: PrincipalId,
+        expected: ResourceGeneration,
+        idempotency: AdministrativeIdempotencyKey,
+    ) -> Result<ApiKeyCreation, BootstrapFailure> {
+        let secret = self
+            .key
+            .catalog_secret(self.instance)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
+        let catalog = Catalog::open(&self._authority, self.instance, secret)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        positron_governance::ApiKeyAdministration::rotate(
+            &catalog,
+            &self.key,
+            self.administrator,
+            actor,
+            predecessor,
+            expected,
+            idempotency,
+        )
+        .map_err(map_api_key_failure)
+    }
+
+    /// Immediately disables one tenant credential while retaining its redacted
+    /// descriptor as permanent identity history.
+    pub fn revoke_api_key(
+        &self,
+        actor: AuthorizedContext,
+        principal: PrincipalId,
+        expected: ResourceGeneration,
+        idempotency: AdministrativeIdempotencyKey,
+    ) -> Result<(), BootstrapFailure> {
+        let secret = self
+            .key
+            .catalog_secret(self.instance)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
+        let catalog = Catalog::open(&self._authority, self.instance, secret)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        positron_governance::ApiKeyAdministration::revoke(
+            &catalog,
+            self.administrator,
+            actor,
+            principal,
+            expected,
+            idempotency,
+        )
+        .map_err(map_api_key_failure)
     }
 
     /// Borrows the initialized instance's ordinary resource-admission authority.
@@ -314,6 +448,36 @@ impl InitializedInstance {
     pub const fn claim_available(&self) -> bool {
         self.claim_available
     }
+}
+
+fn map_api_key_failure(failure: ApiKeyAdministrationFailure) -> BootstrapFailure {
+    let code = match failure {
+        ApiKeyAdministrationFailure::CapacityExceeded => BootstrapFailureCode::ResourceUnavailable,
+        ApiKeyAdministrationFailure::PersistenceUnavailable => {
+            BootstrapFailureCode::CatalogUnavailable
+        },
+        ApiKeyAdministrationFailure::Unauthorized => BootstrapFailureCode::ApiKeyUnauthorized,
+        ApiKeyAdministrationFailure::StaleGeneration => BootstrapFailureCode::ApiKeyStaleGeneration,
+        ApiKeyAdministrationFailure::IdempotencyConflict => {
+            BootstrapFailureCode::ApiKeyIdempotencyConflict
+        },
+        ApiKeyAdministrationFailure::CredentialUnavailable => {
+            BootstrapFailureCode::ApiKeyUnavailable
+        },
+    };
+    BootstrapFailure::new(code)
+}
+
+fn map_listener_transport_failure(
+    failure: ListenerTransportAdministrationFailure,
+) -> BootstrapFailure {
+    let code = match failure {
+        ListenerTransportAdministrationFailure::PersistenceUnavailable => {
+            BootstrapFailureCode::CatalogUnavailable
+        },
+        ListenerTransportAdministrationFailure::CorruptState => BootstrapFailureCode::CorruptState,
+    };
+    BootstrapFailure::new(code)
 }
 
 pub struct BootstrapClaim {

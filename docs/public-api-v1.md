@@ -5,8 +5,26 @@ committed Rust types, gRPC and HTTP/JSON mappings, OpenAPI description, Schema
 Digest, JSON Schema, reference documentation, and validation fixtures form one
 product surface and change together.
 
-This surface exposes capability negotiation. It does not yet start a listener,
-publish an SDK, or implement query execution.
+The native `api` listener exposes capability negotiation and authenticated
+API-key lifecycle management. The `positron key` CLI uses that listener with
+verified TLS by default: its configured server name and protected CA reference bind the HTTPS
+authority separately from the dial address. Plaintext requires the explicit listener and CLI
+opt-out. Bearer metadata comes from a non-terminal stdin pipe. It accepts no credential
+argument or environment variable. See [the canonical API reference](../api/positron/v1/README.md)
+for the create, list, rotate, revoke, and scope-inspect request contract, generation
+preconditions, idempotency semantics, failure codes, and one-time secret output.
+A create retry that completes an authenticated pre-marker preparation returns the
+original principal with no secret; it never reconstructs or redisplays the original secret.
+Its stable lifecycle failures distinguish authentication, stale generation, idempotency conflict,
+unavailable key, and unavailable administration; malformed remote errors remain redacted transport
+failures.
+Public plaintext requires the server's configuration-file-only
+`listener.api_transport = "plaintext"` opt-out and the client's explicit
+`--allow-plaintext`; it is never an automatic TLS fallback. This sends bearer
+credentials and API data without transport encryption. Positron emits the
+non-secret configuration warning, remains ready with a persistent health
+warning, and records the selected profile once in the governance audit chain.
+SDK publication and a public query transport remain unavailable.
 
 ## Compatibility and capability behavior
 
@@ -41,4 +59,5 @@ deployed artifact.
 
 Recovery is to correct malformed input, remove unknown fields, stay within the
 published bound, or select an API major and capability reported by the target.
-This interface writes no durable state.
+Read-only capability negotiation writes no durable state. Authenticated API-key lifecycle
+mutations publish one Catalog generation and the matching redacted Governance Audit record.

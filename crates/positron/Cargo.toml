@@ -11,6 +11,8 @@ homepage.workspace = true
 publish = false
 
 [dependencies]
+positron-api = { path = "../positron-api" }
+zeroize = { version = "=1.9.0", default-features = false, features = ["alloc"] }
 positron-config = { path = "../positron-config" }
 positron-kernel = { path = "../positron-kernel" }
 positron-runtime = { path = "../positron-runtime" }

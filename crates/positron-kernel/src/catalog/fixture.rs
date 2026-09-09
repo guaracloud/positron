@@ -66,6 +66,7 @@ impl GovernanceFixtureTarget for Catalog<'_> {
                 || object.starts_with(b"POSGOV02")
                 || object.starts_with(b"POSGOV03")
                 || object.starts_with(b"POSGOV04")
+                || object.starts_with(b"POSGOV05")
             {
                 continue;
             }

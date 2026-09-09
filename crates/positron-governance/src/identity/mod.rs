@@ -38,6 +38,16 @@ struct QueryIdentity {
     hash: [u8; 32],
 }
 
+#[derive(Clone)]
+pub(super) struct CredentialIdentity {
+    pub(super) principal: PrincipalId,
+    pub(super) scope: Scope,
+    pub(super) active: bool,
+    pub(super) expires_at_unix_seconds: Option<u64>,
+    pub(super) salt: [u8; 32],
+    pub(super) hash: [u8; 32],
+}
+
 /// The sole immutable identity view reconstructed from one Catalog Generation.
 #[derive(Clone)]
 pub struct Identity {
@@ -51,6 +61,7 @@ pub struct Identity {
     hash: [u8; 32],
     ingest: Option<IngestIdentity>,
     query: Option<QueryIdentity>,
+    credentials: Vec<CredentialIdentity>,
     lifecycle: TenantLifecycleState,
 }
 
@@ -105,6 +116,20 @@ impl Identity {
         intent: RequestedIntent,
         hints: CompatibilityHints,
     ) -> Result<AuthorizedContext, AttributionFailure> {
+        self.attribute_at(keys, credential, intent, hints, None)
+    }
+
+    /// Attributes a credential against a Storage Kernel lifecycle-clock
+    /// observation. Expiring credentials fail closed if that authority is not
+    /// available; wall-clock values are never accepted here.
+    pub fn attribute_at(
+        &self,
+        keys: &BootstrapKeyCustody,
+        credential: PresentedCredential,
+        intent: RequestedIntent,
+        hints: CompatibilityHints,
+        lifecycle_seconds: Option<u64>,
+    ) -> Result<AuthorizedContext, AttributionFailure> {
         let alias_matches = match (&self.external_alias, &hints.external_alias) {
             (_, None) => true,
             (Some(bound), Some(presented)) => bound == presented,
@@ -116,6 +141,49 @@ impl Identity {
             || !alias_matches
         {
             return Err(AttributionFailure);
+        }
+        if !self.credentials.is_empty() {
+            let scope = match intent {
+                RequestedIntent::Ingest => Scope::Ingest,
+                RequestedIntent::Query => Scope::Query,
+                RequestedIntent::TenantAdministration => Scope::TenantAdministration,
+                RequestedIntent::SystemAdministration => Scope::SystemAdministration,
+            };
+            let mut selected = None;
+            for candidate in &self.credentials {
+                let matches = keys
+                    .verify_salted_secret_hash(
+                        &candidate.salt,
+                        credential.secret(),
+                        &candidate.hash,
+                    )
+                    .map_err(|_| AttributionFailure)?;
+                let unexpired = candidate
+                    .expires_at_unix_seconds
+                    .is_none_or(|expiry| lifecycle_seconds.is_some_and(|now| now < expiry));
+                if matches && candidate.active && unexpired && candidate.scope == scope {
+                    selected = Some(candidate);
+                }
+            }
+            let candidate = selected.ok_or(AttributionFailure)?;
+            if scope == Scope::Ingest && self.lifecycle != TenantLifecycleState::Active {
+                return Err(AttributionFailure);
+            }
+            if scope == Scope::Query && !is_query_readable(self.lifecycle) {
+                return Err(AttributionFailure);
+            }
+            return Ok(AuthorizedContext {
+                principal: candidate.principal,
+                scope,
+                tenant: scope
+                    .is_tenant_scoped()
+                    .then(|| TenantAttribution::new(candidate.principal, scope, self.tenant))
+                    .transpose()
+                    .map_err(|_| AttributionFailure)?,
+                authority: self.instance,
+                generation: self.generation,
+                lifecycle: self.lifecycle,
+            });
         }
         match intent {
             RequestedIntent::SystemAdministration

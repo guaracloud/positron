@@ -1,7 +1,11 @@
-use positron_governance::{CompatibilityHints, PresentedCredential, RequestedIntent};
+use positron_domain::identity::Scope;
+use positron_governance::{
+    AdministrativeIdempotencyKey, CompatibilityHints, PresentedCredential, RequestedIntent,
+    ResourceGeneration,
+};
 use positron_kernel::{
-    BootstrapArtifact, BootstrapObjectPurpose, Catalog, CatalogObject, CatalogProposal,
-    FormatEpoch, TransactionId,
+    BootstrapArtifact, BootstrapObjectPurpose, Catalog, CatalogGovernanceObject, CatalogObject,
+    CatalogProposal, FormatEpoch, TransactionId,
 };
 
 use super::super::codec::{BootstrapRecord, decode_claim, encode_legacy_claim};
@@ -69,6 +73,74 @@ fn legacy_initialized_instance_reopens_and_preserves_its_one_time_admin_claim()
             .is_err()
     );
     assert!(!reopened.claim_available());
+    let listed = reopened.list_api_keys(administrator)?;
+    assert_eq!(
+        listed.len(),
+        1,
+        "legacy system administrator remains managed"
+    );
+    assert_eq!(listed[0].scope(), Scope::SystemAdministration);
+    let second_administrator = reopened
+        .attribute(
+            PresentedCredential::parse(claim.secret())?,
+            RequestedIntent::SystemAdministration,
+            CompatibilityHints::none(),
+        )
+        .map_err(|_| "second legacy administrator attribution")?;
+    let created = reopened.create_api_key(
+        second_administrator,
+        Scope::Query,
+        None,
+        ResourceGeneration::new(1)?,
+        AdministrativeIdempotencyKey::new([0x72; 16])?,
+    )?;
+    assert!(created.secret().is_some());
+    let rotated = reopened.rotate_api_key(
+        second_administrator,
+        created.principal_id(),
+        ResourceGeneration::new(2)?,
+        AdministrativeIdempotencyKey::new([0x73; 16])?,
+    )?;
+    assert!(rotated.secret().is_some());
+    reopened.revoke_api_key(
+        second_administrator,
+        created.principal_id(),
+        ResourceGeneration::new(3)?,
+        AdministrativeIdempotencyKey::new([0x74; 16])?,
+    )?;
+    let post_create_administrator = reopened
+        .attribute(
+            PresentedCredential::parse(claim.secret())?,
+            RequestedIntent::SystemAdministration,
+            CompatibilityHints::none(),
+        )
+        .map_err(|_| "post-create administrator attribution")?;
+    let descriptors = reopened.list_api_keys(post_create_administrator)?;
+    assert_eq!(descriptors.len(), 3);
+    assert!(descriptors.iter().any(|descriptor| {
+        descriptor.principal_id() == created.principal_id() && !descriptor.is_active()
+    }));
+    assert!(descriptors.iter().any(|descriptor| {
+        descriptor.principal_id() == rotated.principal_id()
+            && descriptor.scope() == Scope::Query
+            && descriptor.is_active()
+    }));
+    drop(reopened);
+    let reopened = InstanceBootstrap::reopen(&paths)?;
+    assert_eq!(
+        reopened
+            .list_api_keys(
+                reopened
+                    .attribute(
+                        PresentedCredential::parse(claim.secret())?,
+                        RequestedIntent::SystemAdministration,
+                        CompatibilityHints::none(),
+                    )
+                    .map_err(|_| "post-reopen administrator attribution")?
+            )?
+            .len(),
+        3,
+    );
     Ok(())
 }
 
@@ -133,7 +205,10 @@ fn publish_legacy_governance(
     let mut objects = Vec::new();
     for identity in current.object_identities() {
         let object = current.object(identity)?.ok_or("missing catalog object")?;
-        let plaintext = if object.starts_with(b"POSGOV03") || object.starts_with(b"POSGOV04") {
+        let plaintext = if object.starts_with(b"POSGOV03")
+            || object.starts_with(b"POSGOV04")
+            || object.starts_with(b"POSGOV05")
+        {
             replaced = true;
             legacy_governance(object)?
         } else {
@@ -237,7 +312,21 @@ fn rewrite_pending_replacement_as_v1(
 
 fn legacy_governance(current: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let mut legacy = current.to_vec();
-    if current.starts_with(b"POSGOV04") {
+    if current.starts_with(b"POSGOV05") {
+        let extension = CatalogGovernanceObject::decode(current)?
+            .credentials()
+            .len()
+            .checked_mul(90)
+            .and_then(|bytes| bytes.checked_add(10))
+            .ok_or("credential extension overflow")?;
+        let v4_length = legacy
+            .len()
+            .checked_sub(extension)
+            .ok_or("truncated V5 credential extension")?;
+        legacy.truncate(v4_length);
+        legacy[..8].copy_from_slice(b"POSGOV04");
+    }
+    if legacy.starts_with(b"POSGOV04") {
         let slug_length = usize::from(*current.get(40).ok_or("truncated slug length")?);
         let alias_start = 41usize
             .checked_add(slug_length)

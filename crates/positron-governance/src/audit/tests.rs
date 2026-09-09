@@ -4,7 +4,80 @@ use super::{
     CatalogRootRotationStage, GovernanceAuditEntry, InitializationAuditEntry,
     schema_checkpoint_audit_intent,
 };
-use crate::{InitialAuditContext, InitialGovernanceIntent, InitialTenantIntent};
+use crate::{
+    ApiKeyLifecycleAction, InitialAuditContext, InitialGovernanceIntent, InitialTenantIntent,
+    ListenerTransportAuditEntry, ResourceGeneration,
+};
+
+#[test]
+fn public_plaintext_api_transport_audit_is_redacted_exact_and_strict() {
+    let transaction = [19; 16];
+    let mut intent = b"POSTPT01".to_vec();
+    intent.extend_from_slice(&transaction);
+    let entry = GovernanceAuditEntry::decode_fields(7, transaction, &intent)
+        .expect("plaintext transport audit");
+    let transport = entry
+        .as_listener_transport()
+        .expect("typed transport audit");
+    assert_eq!(entry.action(), "listener.api-transport.plaintext-opt-out");
+    assert_eq!(entry.outcome(), "active");
+    assert_eq!(transport, &ListenerTransportAuditEntry::new(7, transaction));
+    assert!(!format!("{entry:?} {entry}").contains("Bearer"));
+
+    for malformed in [
+        b"POSTPT00".as_slice(),
+        b"POSTPT01".as_slice(),
+        b"POSTPT01\0".as_slice(),
+    ] {
+        assert!(GovernanceAuditEntry::decode_fields(7, transaction, malformed).is_err());
+    }
+    let mut trailing = intent;
+    trailing.push(0);
+    assert!(GovernanceAuditEntry::decode_fields(7, transaction, &trailing).is_err());
+}
+
+#[test]
+fn api_key_lifecycle_audit_is_redacted_exact_and_strict() {
+    let transaction = [9; 16];
+    let mut intent = b"POSKEY01".to_vec();
+    intent.push(2);
+    intent.extend_from_slice(&[1; 16]);
+    intent.extend_from_slice(&[2; 16]);
+    intent.extend_from_slice(&[3; 16]);
+    intent.push(2);
+    intent.extend_from_slice(&77_u64.to_be_bytes());
+    intent.extend_from_slice(&4_u64.to_be_bytes());
+    intent.extend_from_slice(&5_u64.to_be_bytes());
+    intent.extend_from_slice(&transaction);
+    let entry = GovernanceAuditEntry::decode_fields(6, transaction, &intent).expect("audit");
+    let lifecycle = entry.as_api_key_lifecycle().expect("typed lifecycle audit");
+    assert_eq!(entry.action(), "api-key.rotate");
+    assert_eq!(lifecycle.action(), ApiKeyLifecycleAction::Rotate);
+    assert_eq!(lifecycle.actor_id().to_bytes(), [1; 16]);
+    assert_eq!(lifecycle.principal_id().to_bytes(), [2; 16]);
+    assert_eq!(lifecycle.target_principal_id().to_bytes(), [3; 16]);
+    assert_eq!(lifecycle.scope(), positron_domain::identity::Scope::Query);
+    assert_eq!(lifecycle.expires_at_unix_seconds(), Some(77));
+    assert_eq!(
+        lifecycle.expected_generation(),
+        ResourceGeneration::new(4).expect("generation")
+    );
+    assert_eq!(
+        lifecycle.generation(),
+        ResourceGeneration::new(5).expect("generation")
+    );
+    assert_eq!(lifecycle.idempotency_key().to_bytes(), transaction);
+    assert!(!format!("{entry:?}").contains("pos_"));
+
+    for offset in [8, 73, 81] {
+        let mut malformed = intent.clone();
+        malformed[offset] = 0;
+        assert!(GovernanceAuditEntry::decode_fields(6, transaction, &malformed).is_err());
+    }
+    let mut trailing = intent;
+    trailing.push(0);
+    assert!(GovernanceAuditEntry::decode_fields(6, transaction, &trailing).is_err());
+}
 
 fn audit_intent() -> Vec<u8> {
     InitialGovernanceIntent::create_tenant(

@@ -236,9 +236,39 @@ fn exposes_the_complete_canonical_setting_contract_and_compiled_defaults()
             "listener.api_bind_address",
             SettingKind::String,
             "127.0.0.1:8080",
-            ValueDomain::LoopbackSocketAddress(256),
+            ValueDomain::SocketAddress(256),
             SecrecyClass::Public,
             ProvenancePolicy::NonSecretOverrides,
+            MutabilityClass::DrainAndReload,
+        ),
+        (
+            Setting::ListenerApiTransport,
+            "listener.api_transport",
+            SettingKind::String,
+            "tls",
+            ValueDomain::StringEnumeration(&["tls", "plaintext"]),
+            SecrecyClass::Public,
+            ProvenancePolicy::ConfigurationFileOnly,
+            MutabilityClass::DrainAndReload,
+        ),
+        (
+            Setting::ListenerApiTlsCertificateFile,
+            "listener.api_tls_certificate_file",
+            SettingKind::String,
+            "/var/lib/positron-secrets/api-certificate.pem",
+            ValueDomain::ProtectedAbsolutePath(256),
+            SecrecyClass::SecretBearing,
+            ProvenancePolicy::ProtectedConfigurationFileOnly,
+            MutabilityClass::DrainAndReload,
+        ),
+        (
+            Setting::ListenerApiTlsPrivateKeyFile,
+            "listener.api_tls_private_key_file",
+            SettingKind::String,
+            "/var/lib/positron-secrets/api-private-key.pem",
+            ValueDomain::ProtectedAbsolutePath(256),
+            SecrecyClass::SecretBearing,
+            ProvenancePolicy::ProtectedConfigurationFileOnly,
             MutabilityClass::DrainAndReload,
         ),
         (
@@ -355,6 +385,9 @@ fn exposes_the_complete_canonical_setting_contract_and_compiled_defaults()
          [listener]\ncontrol_path = \"/var/run/positron/control.sock\"\n\
          operations_bind_address = \"127.0.0.1:13133\"\n\
          api_bind_address = \"127.0.0.1:8080\"\n\
+         api_transport = \"tls\"\n\
+         api_tls_certificate_file = \"<redacted>\"\n\
+         api_tls_private_key_file = \"<redacted>\"\n\
          otlp_grpc_bind_address = \"127.0.0.1:4317\"\n\
          otlp_http_bind_address = \"127.0.0.1:4318\"\n\
          loki_push_bind_address = \"127.0.0.1:3100\"\n\n\

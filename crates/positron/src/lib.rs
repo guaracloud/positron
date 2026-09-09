@@ -6,15 +6,19 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use positron_config::{CommandLineOverrides, ConfigurationInputs, EnvironmentOverrides, resolve};
+use positron_config::{
+    ApiTransport, CommandLineOverrides, ConfigurationInputs, EnvironmentOverrides, resolve,
+};
 use positron_kernel::MountQualification;
 use positron_runtime::{
-    ApplicationRuntime, BootstrapPaths, ExitOutcome, HostInputs, InitializationMode,
-    NativeBindings, NativeHost, RecoveryAttempt, RecoveryAttemptHost, RecoveryDecision,
-    ServeConfiguration, ShutdownTrigger,
+    ApiTransportProfile, ApplicationRuntime, BootstrapPaths, ExitOutcome, HostInputs,
+    InitializationMode, NativeBindings, NativeHost, RecoveryAttempt, RecoveryAttemptHost,
+    RecoveryDecision, ServeConfiguration, ShutdownTrigger,
 };
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
+
+mod keys;
 
 const EXIT_OK: u8 = 0;
 const EXIT_CONFIGURATION: u8 = 2;
@@ -26,6 +30,11 @@ pub fn run_native(
     arguments: impl IntoIterator<Item = String>,
     environment: impl IntoIterator<Item = (String, String)>,
 ) -> ExitCode {
+    let mut arguments = arguments.into_iter().peekable();
+    if arguments.peek().is_some_and(|argument| argument == "key") {
+        arguments.next();
+        return keys::run(arguments);
+    }
     match run(arguments, environment) {
         Ok(outcome) => exit_code(outcome),
         Err(failure) => {
@@ -57,6 +66,9 @@ fn run(
     let inputs = ConfigurationInputs::try_new(document.as_deref(), environment, command_line)
         .map_err(|_| LaunchFailure::Configuration)?;
     let effective = resolve(inputs).map_err(|_| LaunchFailure::Configuration)?;
+    for warning in effective.security_warnings() {
+        eprintln!("positron: warning: {}", warning.message());
+    }
     let paths = BootstrapPaths::with_local_key(
         Path::new(effective.data_directory()),
         Path::new(effective.secrets_directory()),
@@ -64,20 +76,34 @@ fn run(
         MountQualification::LocalHost,
     )
     .map_err(|_| LaunchFailure::Configuration)?;
-    let bindings = NativeBindings::new(
+    let api_transport = match effective.api_transport() {
+        ApiTransport::Tls => ApiTransportProfile::tls(
+            effective.api_tls_certificate_file().as_path().to_path_buf(),
+            effective.api_tls_private_key_file().as_path().to_path_buf(),
+        ),
+        ApiTransport::PlaintextOptOut => Ok(ApiTransportProfile::plaintext_opt_out()),
+    }
+    .map_err(|_| LaunchFailure::Configuration)?;
+    let bindings = NativeBindings::new_with_api_transport(
         PathBuf::from(effective.control_path()),
         effective.operations_bind_address(),
         effective.api_bind_address(),
         effective.otlp_grpc_bind_address(),
         effective.otlp_http_bind_address(),
         effective.loki_push_bind_address(),
+        api_transport,
     )
     .map_err(|_| LaunchFailure::Configuration)?;
     let host = NativeHost::new(bindings);
     let recovery =
         NativeRecovery::new(Signals::new([SIGINT, SIGTERM]).map_err(|_| LaunchFailure::Signal)?);
+    let configuration = if effective.api_transport() == ApiTransport::PlaintextOptOut {
+        ServeConfiguration::new(paths, arguments.initialization).with_public_plaintext_api_warning()
+    } else {
+        ServeConfiguration::new(paths, arguments.initialization)
+    };
     let process = match ApplicationRuntime::start(
-        ServeConfiguration::new(paths, arguments.initialization),
+        configuration,
         HostInputs::with_recovery(&host, &host, &recovery),
     ) {
         Ok(process) => process,

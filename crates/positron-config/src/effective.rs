@@ -2,10 +2,30 @@ use std::fmt::{Debug, Formatter};
 use std::net::SocketAddr;
 
 use super::{
-    ConfigurationFailure, ConfigurationFailureCode, LogLevel, MutabilityClass,
+    ApiTransport, ConfigurationFailure, ConfigurationFailureCode, LogLevel, MutabilityClass,
     ProtectedFileReference, Setting, SettingSource, contract, failure_source, setting_for_path,
     setting_index,
 };
+
+/// A bounded, non-secret warning derived from the active effective profile.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConfigurationWarning {
+    /// The API listener accepts unencrypted traffic by explicit operator choice.
+    PublicPlaintextApi,
+}
+
+impl ConfigurationWarning {
+    #[must_use]
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::PublicPlaintextApi => "public API transport is plaintext",
+        }
+    }
+}
+
+const NO_CONFIGURATION_WARNINGS: &[ConfigurationWarning] = &[];
+const PUBLIC_PLAINTEXT_API_WARNING: &[ConfigurationWarning] =
+    &[ConfigurationWarning::PublicPlaintextApi];
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct EffectiveConfiguration {
@@ -15,13 +35,16 @@ pub struct EffectiveConfiguration {
     pub(crate) control_path: String,
     pub(crate) operations_bind_address: SocketAddr,
     pub(crate) api_bind_address: SocketAddr,
+    pub(crate) api_transport: ApiTransport,
+    pub(crate) api_tls_certificate_file: ProtectedFileReference,
+    pub(crate) api_tls_private_key_file: ProtectedFileReference,
     pub(crate) otlp_grpc_bind_address: SocketAddr,
     pub(crate) otlp_http_bind_address: SocketAddr,
     pub(crate) loki_push_bind_address: SocketAddr,
     pub(crate) data_directory: String,
     pub(crate) secrets_directory: String,
     pub(crate) local_key_file: ProtectedFileReference,
-    pub(crate) sources: [SettingSource; 12],
+    pub(crate) sources: [SettingSource; 15],
 }
 
 impl EffectiveConfiguration {
@@ -53,6 +76,30 @@ impl EffectiveConfiguration {
     #[must_use]
     pub const fn api_bind_address(&self) -> SocketAddr {
         self.api_bind_address
+    }
+
+    #[must_use]
+    pub const fn api_transport(&self) -> ApiTransport {
+        self.api_transport
+    }
+
+    /// Returns the visible security consequences of the selected profile.
+    #[must_use]
+    pub const fn security_warnings(&self) -> &'static [ConfigurationWarning] {
+        match self.api_transport {
+            ApiTransport::Tls => NO_CONFIGURATION_WARNINGS,
+            ApiTransport::PlaintextOptOut => PUBLIC_PLAINTEXT_API_WARNING,
+        }
+    }
+
+    #[must_use]
+    pub fn api_tls_certificate_file(&self) -> &ProtectedFileReference {
+        &self.api_tls_certificate_file
+    }
+
+    #[must_use]
+    pub fn api_tls_private_key_file(&self) -> &ProtectedFileReference {
+        &self.api_tls_private_key_file
     }
 
     #[must_use]
@@ -105,13 +152,22 @@ impl EffectiveConfiguration {
         rendered.push_str(&self.operations_bind_address.to_string());
         rendered.push_str("\"\napi_bind_address = \"");
         rendered.push_str(&self.api_bind_address.to_string());
+        rendered.push_str("\"\napi_transport = \"");
+        rendered.push_str(self.api_transport.as_str());
+        rendered.push_str("\"\napi_tls_certificate_file = \"<redacted>\"\napi_tls_private_key_file = \"<redacted>");
         rendered.push_str("\"\notlp_grpc_bind_address = \"");
         rendered.push_str(&self.otlp_grpc_bind_address.to_string());
         rendered.push_str("\"\notlp_http_bind_address = \"");
         rendered.push_str(&self.otlp_http_bind_address.to_string());
         rendered.push_str("\"\nloki_push_bind_address = \"");
         rendered.push_str(&self.loki_push_bind_address.to_string());
-        rendered.push_str("\"\n\n[storage]\ndata_directory = \"");
+        rendered.push('"');
+        if let Some(warning) = self.security_warnings().first() {
+            rendered.push_str("\n\n[warnings]\nwarning = \"");
+            rendered.push_str(warning.message());
+            rendered.push('"');
+        }
+        rendered.push_str("\n\n[storage]\ndata_directory = \"");
         rendered.push_str(&self.data_directory);
         rendered.push_str("\"\nsecrets_directory = \"");
         rendered.push_str(&self.secrets_directory);
@@ -148,6 +204,13 @@ impl EffectiveConfiguration {
                 self.operations_bind_address != other.operations_bind_address
             },
             Setting::ListenerApiBindAddress => self.api_bind_address != other.api_bind_address,
+            Setting::ListenerApiTransport => self.api_transport != other.api_transport,
+            Setting::ListenerApiTlsCertificateFile => {
+                self.api_tls_certificate_file != other.api_tls_certificate_file
+            },
+            Setting::ListenerApiTlsPrivateKeyFile => {
+                self.api_tls_private_key_file != other.api_tls_private_key_file
+            },
             Setting::ListenerOtlpGrpcBindAddress => {
                 self.otlp_grpc_bind_address != other.otlp_grpc_bind_address
             },
@@ -174,6 +237,8 @@ impl Debug for EffectiveConfiguration {
             .field("control_path", &self.control_path)
             .field("operations_bind_address", &self.operations_bind_address)
             .field("api_bind_address", &self.api_bind_address)
+            .field("api_transport", &self.api_transport)
+            .field("security_warnings", &self.security_warnings())
             .field("otlp_grpc_bind_address", &self.otlp_grpc_bind_address)
             .field("otlp_http_bind_address", &self.otlp_http_bind_address)
             .field("loki_push_bind_address", &self.loki_push_bind_address)

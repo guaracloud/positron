@@ -23,6 +23,7 @@ pub(super) enum ArtifactKind {
     Object,
     Audit,
     Commit,
+    Prepared,
 }
 
 impl ArtifactKind {
@@ -31,12 +32,13 @@ impl ArtifactKind {
             Self::Object => 1,
             Self::Audit => 2,
             Self::Commit => 3,
+            Self::Prepared => 4,
         }
     }
 
     const fn system_kind(self) -> SystemObjectKind {
         match self {
-            Self::Object | Self::Commit => SystemObjectKind::Catalog,
+            Self::Object | Self::Commit | Self::Prepared => SystemObjectKind::Catalog,
             Self::Audit => SystemObjectKind::GovernanceAudit,
         }
     }

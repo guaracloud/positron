@@ -3,6 +3,8 @@ mod codec;
 mod compatibility;
 mod faults;
 mod identity;
+mod initialization;
 mod policy_activation;
+mod prepared_recovery;
 mod support;
 mod support_failures;

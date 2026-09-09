@@ -3,7 +3,7 @@ mod schema_checkpoint;
 
 use std::fmt::{Display, Formatter};
 
-use positron_domain::identity::{ExternalTenantAlias, PrincipalId, TenantId, TenantSlug};
+use positron_domain::identity::{ExternalTenantAlias, PrincipalId, Scope, TenantId, TenantSlug};
 use positron_kernel::GovernanceAuditRecord;
 
 use crate::identity::IdentityFailure;
@@ -15,6 +15,8 @@ const MAGIC_V1: [u8; 8] = *b"POSAUD01";
 const MAGIC_V2: [u8; 8] = *b"POSAUD02";
 const ROOT_ROTATION_MAGIC: &[u8] = b"catalog-root-rotation-v1\0";
 const POLICY_ACTIVATION_MAGIC: [u8; 8] = *b"POSPOL02";
+const KEY_LIFECYCLE_MAGIC: [u8; 8] = *b"POSKEY01";
+const LISTENER_TRANSPORT_MAGIC: [u8; 8] = *b"POSTPT01";
 
 /// Bounded, non-secret metadata for the initial instance operation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -54,6 +56,71 @@ pub enum GovernanceAuditEntry {
     CatalogRootRotation(CatalogRootRotationAuditEntry),
     IngestPolicyActivation(IngestPolicyActivationAuditEntry),
     SchemaCheckpoint(SchemaCheckpointAuditEntry),
+    ApiKeyLifecycle(ApiKeyLifecycleAuditEntry),
+    ListenerTransport(ListenerTransportAuditEntry),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApiKeyLifecycleAuditEntry {
+    position: u64,
+    action: ApiKeyLifecycleAction,
+    actor: PrincipalId,
+    principal: PrincipalId,
+    target: PrincipalId,
+    scope: Scope,
+    expires_at_unix_seconds: Option<u64>,
+    expected_generation: ResourceGeneration,
+    generation: ResourceGeneration,
+    idempotency_key: AdministrativeIdempotencyKey,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApiKeyLifecycleAction {
+    Create,
+    Rotate,
+    Revoke,
+}
+
+/// Redacted evidence that the active API listener uses the explicit plaintext
+/// transport opt-out.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ListenerTransportAuditEntry {
+    position: u64,
+    instance: [u8; 16],
+}
+
+impl ListenerTransportAuditEntry {
+    #[must_use]
+    pub const fn new(position: u64, instance: [u8; 16]) -> Self {
+        Self { position, instance }
+    }
+
+    #[must_use]
+    pub const fn position(&self) -> u64 {
+        self.position
+    }
+
+    #[must_use]
+    pub const fn instance_id(&self) -> [u8; 16] {
+        self.instance
+    }
+
+    #[must_use]
+    pub const fn action(&self) -> &'static str {
+        "listener.api-transport.plaintext-opt-out"
+    }
+
+    #[must_use]
+    pub const fn outcome(&self) -> &'static str {
+        "active"
+    }
+}
+
+pub(crate) fn plaintext_api_transport_audit_intent(instance: [u8; 16]) -> Vec<u8> {
+    let mut intent = Vec::with_capacity(LISTENER_TRANSPORT_MAGIC.len() + instance.len());
+    intent.extend_from_slice(&LISTENER_TRANSPORT_MAGIC);
+    intent.extend_from_slice(&instance);
+    intent
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -135,6 +202,8 @@ impl GovernanceAuditEntry {
             Self::CatalogRootRotation(entry) => entry.position(),
             Self::IngestPolicyActivation(entry) => entry.position,
             Self::SchemaCheckpoint(entry) => entry.position(),
+            Self::ApiKeyLifecycle(entry) => entry.position,
+            Self::ListenerTransport(entry) => entry.position,
         }
     }
 
@@ -145,6 +214,12 @@ impl GovernanceAuditEntry {
             Self::CatalogRootRotation(entry) => entry.action(),
             Self::IngestPolicyActivation(_) => "ingest-policy.activate",
             Self::SchemaCheckpoint(_) => "schema-checkpoint.replace",
+            Self::ApiKeyLifecycle(entry) => match entry.action {
+                ApiKeyLifecycleAction::Create => "api-key.create",
+                ApiKeyLifecycleAction::Rotate => "api-key.rotate",
+                ApiKeyLifecycleAction::Revoke => "api-key.revoke",
+            },
+            Self::ListenerTransport(entry) => entry.action(),
         }
     }
 
@@ -155,6 +230,8 @@ impl GovernanceAuditEntry {
             Self::CatalogRootRotation(entry) => entry.outcome(),
             Self::IngestPolicyActivation(_) => "succeeded",
             Self::SchemaCheckpoint(_) => "succeeded",
+            Self::ApiKeyLifecycle(_) => "succeeded",
+            Self::ListenerTransport(entry) => entry.outcome(),
         }
     }
 
@@ -164,7 +241,9 @@ impl GovernanceAuditEntry {
             Self::Initialization(entry) => Some(entry),
             Self::CatalogRootRotation(_)
             | Self::IngestPolicyActivation(_)
-            | Self::SchemaCheckpoint(_) => None,
+            | Self::SchemaCheckpoint(_)
+            | Self::ApiKeyLifecycle(_)
+            | Self::ListenerTransport(_) => None,
         }
     }
 
@@ -174,7 +253,9 @@ impl GovernanceAuditEntry {
             Self::CatalogRootRotation(entry) => Some(entry),
             Self::Initialization(_)
             | Self::IngestPolicyActivation(_)
-            | Self::SchemaCheckpoint(_) => None,
+            | Self::SchemaCheckpoint(_)
+            | Self::ApiKeyLifecycle(_)
+            | Self::ListenerTransport(_) => None,
         }
     }
 
@@ -184,7 +265,33 @@ impl GovernanceAuditEntry {
             Self::SchemaCheckpoint(entry) => Some(entry),
             Self::Initialization(_)
             | Self::CatalogRootRotation(_)
-            | Self::IngestPolicyActivation(_) => None,
+            | Self::IngestPolicyActivation(_)
+            | Self::ApiKeyLifecycle(_)
+            | Self::ListenerTransport(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_api_key_lifecycle(&self) -> Option<&ApiKeyLifecycleAuditEntry> {
+        match self {
+            Self::ApiKeyLifecycle(entry) => Some(entry),
+            Self::Initialization(_)
+            | Self::CatalogRootRotation(_)
+            | Self::IngestPolicyActivation(_)
+            | Self::SchemaCheckpoint(_)
+            | Self::ListenerTransport(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_listener_transport(&self) -> Option<&ListenerTransportAuditEntry> {
+        match self {
+            Self::ListenerTransport(entry) => Some(entry),
+            Self::Initialization(_)
+            | Self::CatalogRootRotation(_)
+            | Self::IngestPolicyActivation(_)
+            | Self::SchemaCheckpoint(_)
+            | Self::ApiKeyLifecycle(_) => None,
         }
     }
 
@@ -244,7 +351,150 @@ impl GovernanceAuditEntry {
             return SchemaCheckpointAuditEntry::decode_intent(position, transaction_id, intent)
                 .map(Self::SchemaCheckpoint);
         }
+        if intent.starts_with(&LISTENER_TRANSPORT_MAGIC) {
+            if intent.len() != LISTENER_TRANSPORT_MAGIC.len() + 16
+                || intent.get(..8) != Some(LISTENER_TRANSPORT_MAGIC.as_slice())
+                || intent.get(8..) != Some(transaction_id.as_slice())
+                || transaction_id.iter().all(|byte| *byte == 0)
+            {
+                return Err(IdentityFailure);
+            }
+            return Ok(Self::ListenerTransport(ListenerTransportAuditEntry::new(
+                position,
+                transaction_id,
+            )));
+        }
+        if intent.starts_with(&KEY_LIFECYCLE_MAGIC) {
+            let fields = 9;
+            let action = match *intent.get(8).ok_or(IdentityFailure)? {
+                1 => ApiKeyLifecycleAction::Create,
+                2 => ApiKeyLifecycleAction::Rotate,
+                3 => ApiKeyLifecycleAction::Revoke,
+                _ => return Err(IdentityFailure),
+            };
+            if intent.len() != fields + 89
+                || intent.get(..8) != Some(KEY_LIFECYCLE_MAGIC.as_slice())
+                || intent.get(fields + 73..fields + 89) != Some(transaction_id.as_slice())
+            {
+                return Err(IdentityFailure);
+            }
+            let actor = PrincipalId::from_bytes(
+                intent
+                    .get(fields..fields + 16)
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .ok_or(IdentityFailure)?,
+            )
+            .map_err(|_| IdentityFailure)?;
+            let principal = PrincipalId::from_bytes(
+                intent
+                    .get(fields + 16..fields + 32)
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .ok_or(IdentityFailure)?,
+            )
+            .map_err(|_| IdentityFailure)?;
+            let target = PrincipalId::from_bytes(
+                intent
+                    .get(fields + 32..fields + 48)
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .ok_or(IdentityFailure)?,
+            )
+            .map_err(|_| IdentityFailure)?;
+            let scope = match *intent.get(fields + 48).ok_or(IdentityFailure)? {
+                1 => Scope::Ingest,
+                2 => Scope::Query,
+                3 => Scope::TenantAdministration,
+                _ => return Err(IdentityFailure),
+            };
+            let expires_at_unix_seconds = match intent
+                .get(fields + 49..fields + 57)
+                .and_then(|bytes| bytes.try_into().ok())
+                .map(u64::from_be_bytes)
+                .ok_or(IdentityFailure)?
+            {
+                0 => None,
+                value => Some(value),
+            };
+            let expected_generation = ResourceGeneration::new(
+                intent
+                    .get(fields + 57..fields + 65)
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .map(u64::from_be_bytes)
+                    .ok_or(IdentityFailure)?,
+            )
+            .map_err(|_| IdentityFailure)?;
+            let generation = ResourceGeneration::new(
+                intent
+                    .get(fields + 65..fields + 73)
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .map(u64::from_be_bytes)
+                    .ok_or(IdentityFailure)?,
+            )
+            .map_err(|_| IdentityFailure)?;
+            if expected_generation.get().checked_add(1) != Some(generation.get()) {
+                return Err(IdentityFailure);
+            }
+            return Ok(Self::ApiKeyLifecycle(ApiKeyLifecycleAuditEntry {
+                position,
+                action,
+                actor,
+                principal,
+                target,
+                scope,
+                expires_at_unix_seconds,
+                expected_generation,
+                generation,
+                idempotency_key: AdministrativeIdempotencyKey::new(transaction_id)
+                    .map_err(|_| IdentityFailure)?,
+            }));
+        }
         Err(IdentityFailure)
+    }
+}
+
+impl ApiKeyLifecycleAuditEntry {
+    #[must_use]
+    pub const fn actor_id(&self) -> PrincipalId {
+        self.actor
+    }
+
+    #[must_use]
+    pub const fn principal_id(&self) -> PrincipalId {
+        self.principal
+    }
+
+    #[must_use]
+    pub const fn target_principal_id(&self) -> PrincipalId {
+        self.target
+    }
+
+    #[must_use]
+    pub const fn scope(&self) -> Scope {
+        self.scope
+    }
+
+    #[must_use]
+    pub const fn action(&self) -> ApiKeyLifecycleAction {
+        self.action
+    }
+
+    #[must_use]
+    pub const fn expires_at_unix_seconds(&self) -> Option<u64> {
+        self.expires_at_unix_seconds
+    }
+
+    #[must_use]
+    pub const fn expected_generation(&self) -> ResourceGeneration {
+        self.expected_generation
+    }
+
+    #[must_use]
+    pub const fn generation(&self) -> ResourceGeneration {
+        self.generation
+    }
+
+    #[must_use]
+    pub const fn idempotency_key(&self) -> AdministrativeIdempotencyKey {
+        self.idempotency_key
     }
 }
 

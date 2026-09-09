@@ -47,7 +47,9 @@ impl BoundEndpoint {
     }
 
     pub fn tcp(role: ListenerRole, address: SocketAddr) -> Result<Self, ListenerFailure> {
-        if role == ListenerRole::Control || !address.ip().is_loopback() {
+        if role == ListenerRole::Control
+            || (!address.ip().is_loopback() && role != ListenerRole::Api)
+        {
             return Err(ListenerFailure::InvalidEndpoint);
         }
         Ok(Self::Tcp { role, address })

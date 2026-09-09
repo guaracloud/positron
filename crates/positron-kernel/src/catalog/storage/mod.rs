@@ -8,6 +8,7 @@ use rustix::fs::{self as unix_fs, Dir};
 use crate::OwnedPrimaryDataVolume;
 
 use super::codec::MAX_AUDIT_RECORD_BYTES;
+use super::preparation::{MAX_PREPARED_BYTES, PreparedCommit};
 use super::types::{
     CatalogFailure, CatalogFailureCode, CatalogGenerationId, CatalogObjectId, CatalogSecret,
     CatalogWrappingKey, FormatEpoch, GovernanceAuditRecord, InstanceId, MAX_CATALOG_OBJECT_BYTES,
@@ -26,8 +27,8 @@ mod tests;
 use artifact::{ArtifactKind, open_artifact, protect_artifact, rewrap_artifact_envelope};
 use fault::{CatalogFileEvent, emit_event};
 use io::{
-    entry_exists, open_or_create_directory, read_exact_file, synchronize, synchronize_named_file,
-    write_new_file, write_transaction_file,
+    entry_exists, open_existing_directory, open_or_create_directory, read_exact_file, synchronize,
+    synchronize_named_file, write_new_file, write_transaction_file,
 };
 pub(super) use marker::MARKER_BYTES;
 use marker::{MarkerDecode, decode_marker, encode_marker};
@@ -50,6 +51,10 @@ pub use fault::{
 pub(super) const FRAME_OVERHEAD_BYTES: usize = 315;
 const MAX_COMMIT_FRAME_BYTES: usize = 262_144;
 const MAX_AUDIT_FRAME_BYTES: usize = MAX_AUDIT_RECORD_BYTES + FRAME_OVERHEAD_BYTES;
+const PREPARED_NAME: &str = "prepared.manifest";
+const PREPARED_IDENTITY_BYTES: usize = 32;
+const MAX_PREPARED_FRAME_BYTES: usize =
+    PREPARED_IDENTITY_BYTES + MAX_PREPARED_BYTES + FRAME_OVERHEAD_BYTES;
 pub(super) const MAX_GENERATIONS: usize = 65_536;
 const MAX_GENERATION_DIRECTORY_NAME_BYTES: usize = MAX_GENERATIONS * 128;
 
@@ -65,6 +70,15 @@ pub(super) struct CatalogStorage {
 pub(super) struct MarkerScan {
     pub(super) verified: BTreeMap<CatalogGenerationId, u64>,
     pub(super) authentication_failures: usize,
+}
+
+pub(super) enum PreparedLookup {
+    Absent,
+    Unavailable,
+    Found {
+        transaction: File,
+        prepared: Box<PreparedCommit>,
+    },
 }
 
 impl CatalogStorage {
@@ -277,6 +291,135 @@ impl CatalogStorage {
         synchronize(&directory)?;
         synchronize(&self.staging)?;
         Ok(directory)
+    }
+
+    pub(super) fn prepare_transaction(
+        &self,
+        secret: &CatalogSecret,
+        instance: InstanceId,
+        prepared: &PreparedCommit,
+    ) -> Result<File, CatalogFailure> {
+        let name = hex(&prepared.transaction().0);
+        let directory = open_or_create_directory(&self.staging, &name)?;
+        let encoded = prepared.encode()?;
+        if entry_exists(&directory, PREPARED_NAME)? {
+            if read_prepared(&directory, secret, instance)?.encode()? != encoded {
+                return Err(CatalogFailure::new(CatalogFailureCode::IdempotencyConflict));
+            }
+        } else {
+            if entry_exists(&directory, "transaction.digest")? {
+                return Err(CatalogFailure::new(CatalogFailureCode::IdempotencyConflict));
+            }
+            write_prepared(&directory, secret, instance, &encoded)?;
+            emit_event(CatalogFileEvent::SynchronizePrepared)?;
+            synchronize_named_file(&directory, PREPARED_NAME)?;
+            emit_event(CatalogFileEvent::SynchronizePreparedDirectory)?;
+            synchronize(&directory)?;
+            synchronize(&self.staging)?;
+        }
+        let digest = prepared.record.transaction_digest;
+        if entry_exists(&directory, "transaction.digest")? {
+            let existing = read_exact_file(&directory, "transaction.digest", 32)?;
+            if existing.as_slice() != digest {
+                return Err(CatalogFailure::new(CatalogFailureCode::IdempotencyConflict));
+            }
+        } else {
+            write_new_file(&directory, "transaction.digest", &digest)?;
+        }
+        emit_event(CatalogFileEvent::SynchronizeTransactionDigest)?;
+        synchronize_named_file(&directory, "transaction.digest")?;
+        emit_event(CatalogFileEvent::SynchronizeTransactionDirectory)?;
+        synchronize(&directory)?;
+        synchronize(&self.staging)?;
+        Ok(directory)
+    }
+
+    pub(super) fn has_prepared_transaction(
+        &self,
+        secret: &CatalogSecret,
+        instance: InstanceId,
+        current: CatalogGenerationId,
+    ) -> Result<bool, CatalogFailure> {
+        let markers = self.markers(secret)?;
+        if markers.authentication_failures != 0 {
+            return Err(CatalogFailure::new(
+                CatalogFailureCode::AuthenticationFailed,
+            ));
+        }
+        let mut directory = Dir::read_from(&self.staging)
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::StorageUnavailable))?;
+        let mut entry_count = 0_usize;
+        let mut name_bytes = 0_usize;
+        while let Some(entry) = directory.read() {
+            let entry =
+                entry.map_err(|_| CatalogFailure::new(CatalogFailureCode::StorageUnavailable))?;
+            let name = entry.file_name();
+            if name.to_bytes() == b"." || name.to_bytes() == b".." {
+                continue;
+            }
+            reserve_directory_entry(&mut entry_count, &mut name_bytes, name.to_bytes().len())?;
+            if !is_transaction_directory_name(name.to_bytes()) {
+                continue;
+            }
+            let transaction_name = std::str::from_utf8(name.to_bytes())
+                .map_err(|_| CatalogFailure::new(CatalogFailureCode::IntegrityCorruption))?;
+            let transaction = open_existing_directory(&self.staging, transaction_name)?;
+            if !entry_exists(&transaction, PREPARED_NAME)? {
+                continue;
+            }
+            if !entry_exists(&transaction, "transaction.digest")? {
+                return Ok(true);
+            }
+            let prepared = match read_prepared(&transaction, secret, instance) {
+                Ok(prepared) => prepared,
+                Err(_) => return Ok(true),
+            };
+            if prepared.record.predecessor != current {
+                continue;
+            }
+            let digest = match read_exact_file(&transaction, "transaction.digest", 32) {
+                Ok(digest) => digest,
+                Err(_) => return Ok(true),
+            };
+            if hex(&prepared.transaction().0) != transaction_name
+                || digest.as_slice() != prepared.record.transaction_digest
+                || markers.verified.get(&prepared.record.generation)
+                    != Some(&prepared.record.number)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub(super) fn prepared_transaction(
+        &self,
+        secret: &CatalogSecret,
+        instance: InstanceId,
+        transaction: TransactionId,
+    ) -> Result<PreparedLookup, CatalogFailure> {
+        let name = hex(&transaction.0);
+        if !entry_exists(&self.staging, &name)? {
+            return Ok(PreparedLookup::Absent);
+        }
+        let directory = open_existing_directory(&self.staging, &name)?;
+        if !entry_exists(&directory, PREPARED_NAME)?
+            || !entry_exists(&directory, "transaction.digest")?
+        {
+            return Ok(PreparedLookup::Unavailable);
+        }
+        let prepared = read_prepared(&directory, secret, instance)?;
+        if prepared.transaction() != transaction {
+            return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
+        }
+        let digest = read_exact_file(&directory, "transaction.digest", 32)?;
+        if digest.as_slice() != prepared.record.transaction_digest {
+            return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
+        }
+        Ok(PreparedLookup::Found {
+            transaction: directory,
+            prepared: Box::new(prepared),
+        })
     }
 
     pub(super) fn publish_object(
@@ -574,6 +717,10 @@ impl CatalogStorage {
     }
 }
 
+fn is_transaction_directory_name(name: &[u8]) -> bool {
+    name.len() == 32 && name.iter().all(u8::is_ascii_hexdigit)
+}
+
 fn canonical_marker_prefix(
     secret: &CatalogSecret,
     name: &[u8],
@@ -657,6 +804,59 @@ fn authenticate_existing<T: AsRef<[u8]>>(
     }
     synchronize_existing(directory, name, directory_event)?;
     Ok(true)
+}
+
+fn write_prepared(
+    directory: &File,
+    secret: &CatalogSecret,
+    instance: InstanceId,
+    plaintext: &[u8],
+) -> Result<(), CatalogFailure> {
+    let identity = DataProtection::hash(plaintext)
+        .map_err(|_| CatalogFailure::new(CatalogFailureCode::StorageUnavailable))?;
+    let protected = protect_artifact(
+        secret,
+        instance,
+        ArtifactKind::Prepared,
+        identity,
+        FormatEpoch::CATALOG_V1,
+        plaintext,
+    )?;
+    let capacity = PREPARED_IDENTITY_BYTES
+        .checked_add(protected.len())
+        .filter(|value| *value <= MAX_PREPARED_FRAME_BYTES)
+        .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?;
+    let mut encoded = Vec::with_capacity(capacity);
+    encoded.extend_from_slice(&identity);
+    encoded.extend_from_slice(&protected);
+    emit_event(CatalogFileEvent::WritePrepared)?;
+    write_new_file(directory, PREPARED_NAME, &encoded)
+}
+
+fn read_prepared(
+    directory: &File,
+    secret: &CatalogSecret,
+    instance: InstanceId,
+) -> Result<PreparedCommit, CatalogFailure> {
+    let encoded = read_exact_file(directory, PREPARED_NAME, MAX_PREPARED_FRAME_BYTES)?;
+    let (identity, protected) = encoded
+        .split_first_chunk::<PREPARED_IDENTITY_BYTES>()
+        .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::IntegrityCorruption))?;
+    let plaintext = open_artifact(
+        secret,
+        instance,
+        ArtifactKind::Prepared,
+        *identity,
+        FormatEpoch::CATALOG_V1,
+        protected,
+    )?;
+    if DataProtection::hash(&plaintext)
+        .map_err(|_| CatalogFailure::new(CatalogFailureCode::StorageUnavailable))?
+        != *identity
+    {
+        return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
+    }
+    PreparedCommit::decode(&plaintext)
 }
 
 fn reserve_directory_entry(

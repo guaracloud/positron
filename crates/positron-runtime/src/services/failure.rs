@@ -80,6 +80,10 @@ pub(super) const fn classify_bootstrap_failure_code(
     code: crate::BootstrapFailureCode,
 ) -> ServiceFailure {
     match code {
+        crate::BootstrapFailureCode::ApiKeyUnauthorized => ServiceFailure::Unauthorized,
+        crate::BootstrapFailureCode::ApiKeyStaleGeneration
+        | crate::BootstrapFailureCode::ApiKeyIdempotencyConflict => ServiceFailure::InvalidRequest,
+        crate::BootstrapFailureCode::ApiKeyUnavailable => ServiceFailure::KeyUnavailable,
         crate::BootstrapFailureCode::KeyCustodyUnavailable => ServiceFailure::KeyUnavailable,
         crate::BootstrapFailureCode::ResourceUnavailable => ServiceFailure::CapacityUnavailable,
         crate::BootstrapFailureCode::CorruptState

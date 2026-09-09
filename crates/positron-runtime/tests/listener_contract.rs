@@ -18,12 +18,13 @@ fn public_listener_endpoints_reject_unsafe_shapes() {
         ),
         Err(ListenerFailure::InvalidEndpoint)
     );
-    assert_eq!(
+    assert!(
         BoundEndpoint::tcp(
             ListenerRole::Api,
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 1))
-        ),
-        Err(ListenerFailure::InvalidEndpoint)
+        )
+        .is_ok(),
+        "transport policy later decides whether this API address is safe"
     );
     assert_eq!(
         format!("{}", ListenerFailure::BindUnavailable),

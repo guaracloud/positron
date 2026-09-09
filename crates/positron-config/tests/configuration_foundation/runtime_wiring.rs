@@ -41,6 +41,55 @@ fn runtime_endpoints_and_key_path_are_explicit_typed_configuration() {
     );
 }
 
+#[test]
+fn api_transport_profile_allows_explicit_public_tls_and_plaintext() {
+    let tls = inputs(
+        Some(
+            "schema_version = 1\n[listener]\napi_bind_address = \"192.0.2.1:8443\"\napi_transport = \"tls\"\napi_tls_certificate_file = \"/secrets/cert.pem\"\napi_tls_private_key_file = \"/secrets/key.pem\"\n",
+        ),
+        [],
+        [],
+    )
+    .and_then(resolve)
+    .expect("public TLS profile resolves");
+    assert_eq!(tls.api_bind_address().to_string(), "192.0.2.1:8443");
+    assert_eq!(tls.api_transport(), positron_config::ApiTransport::Tls);
+    assert!(tls.security_warnings().is_empty());
+    assert_eq!(
+        tls.api_tls_certificate_file().as_path().to_str(),
+        Some("/secrets/cert.pem")
+    );
+
+    let plaintext = inputs(
+        Some("schema_version = 1\n[listener]\napi_bind_address = \"192.0.2.1:8080\"\napi_transport = \"plaintext\"\n"),
+        [],
+        [],
+    )
+    .and_then(resolve)
+    .expect("explicit public plaintext profile resolves");
+    assert_eq!(
+        plaintext.api_transport(),
+        positron_config::ApiTransport::PlaintextOptOut
+    );
+    assert_eq!(
+        plaintext.security_warnings(),
+        [positron_config::ConfigurationWarning::PublicPlaintextApi]
+    );
+    assert!(plaintext
+        .redacted_reference()
+        .contains("warning = \"public API transport is plaintext\""));
+    let unused_server_trust = inputs(
+        Some("schema_version = 1\n[listener]\napi_tls_trust_file = \"/secrets/ca.pem\"\n"),
+        [],
+        [],
+    )
+    .and_then(resolve);
+    assert!(
+        unused_server_trust.is_err(),
+        "server configuration must not accept an unused trust file"
+    );
+}
+
 fn assert_document_rejection<T>(
     result: Result<T, ConfigurationFailure>,
     code: ConfigurationFailureCode,
