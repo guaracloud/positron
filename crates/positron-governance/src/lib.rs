@@ -16,6 +16,7 @@ mod audit;
 mod identity;
 mod listener_transport_administration;
 mod policy_administration;
+mod quota_administration;
 mod tenant_lifecycle_administration;
 
 pub use api_key_administration::{
@@ -26,7 +27,7 @@ pub use audit::{
     ApiKeyLifecycleAction, CatalogRootRotationAuditEntry, CatalogRootRotationStage,
     GovernanceAuditEntry, IngestPolicyActivationAuditEntry, InitialAuditMetadata,
     InitializationAuditEntry, ListenerTransportAuditEntry, SchemaCheckpointAuditEntry,
-    schema_checkpoint_audit_intent,
+    TenantQuotaUpdateAuditEntry, schema_checkpoint_audit_intent,
 };
 pub use identity::{
     AttributionFailure, AuthorizedContext, CompatibilityHints, GovernanceInspection, Identity,
@@ -40,6 +41,10 @@ pub use policy_administration::{
     AdministrativeIdempotencyKey, IngestPolicyActivation, IngestPolicyAdministration,
     IngestPolicyServingSnapshot, PolicyAdministrationFailure, PolicyAdministrationFailureCode,
     ResourceGeneration,
+};
+pub use quota_administration::{
+    TenantQuotaAdministration, TenantQuotaAdministrationFailure,
+    TenantQuotaAdministrationFailureCode, TenantQuotaUpdate, TenantQuotaUpdateRequest,
 };
 pub use tenant_lifecycle_administration::{
     TenantLifecycleAdministration, TenantLifecycleAdministrationFailure,

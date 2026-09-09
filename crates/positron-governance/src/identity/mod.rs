@@ -100,6 +100,14 @@ impl Identity {
         }
     }
 
+    pub(super) fn authorize_quota_update(
+        &self,
+        context: AuthorizedContext,
+        tenant: TenantId,
+    ) -> Result<PrincipalId, AttributionFailure> {
+        self.authorize_policy_activation(context, tenant)
+    }
+
     /// Reconstructs the unique initialization identity from a pinned Catalog.
     pub fn open(snapshot: &CatalogSnapshot) -> Result<Self, IdentityFailure> {
         let (_, governance) = snapshot.governance_object().map_err(|_| IdentityFailure)?;

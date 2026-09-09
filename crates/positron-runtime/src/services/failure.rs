@@ -85,11 +85,16 @@ pub(super) const fn classify_bootstrap_failure_code(
         | crate::BootstrapFailureCode::ApiKeyIdempotencyConflict => ServiceFailure::InvalidRequest,
         crate::BootstrapFailureCode::ApiKeyUnavailable => ServiceFailure::KeyUnavailable,
         crate::BootstrapFailureCode::TenantLifecycleUnauthorized => ServiceFailure::Unauthorized,
+        crate::BootstrapFailureCode::TenantQuotaUnauthorized => ServiceFailure::Unauthorized,
         crate::BootstrapFailureCode::TenantLifecycleStaleGeneration
         | crate::BootstrapFailureCode::TenantLifecycleIdempotencyConflict
         | crate::BootstrapFailureCode::TenantLifecycleInvalidTransition
         | crate::BootstrapFailureCode::TenantLifecyclePurgeCompletionUnavailable
         | crate::BootstrapFailureCode::TenantLifecycleUnknownTenant => {
+            ServiceFailure::InvalidRequest
+        },
+        crate::BootstrapFailureCode::TenantQuotaStaleGeneration
+        | crate::BootstrapFailureCode::TenantQuotaIdempotencyConflict => {
             ServiceFailure::InvalidRequest
         },
         crate::BootstrapFailureCode::KeyCustodyUnavailable => ServiceFailure::KeyUnavailable,

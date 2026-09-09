@@ -16,6 +16,7 @@ const MAGIC_V1: [u8; 8] = *b"POSAUD01";
 const MAGIC_V2: [u8; 8] = *b"POSAUD02";
 const ROOT_ROTATION_MAGIC: &[u8] = b"catalog-root-rotation-v1\0";
 const POLICY_ACTIVATION_MAGIC: [u8; 8] = *b"POSPOL02";
+const TENANT_QUOTA_MAGIC: [u8; 8] = *b"POSQUO01";
 const KEY_LIFECYCLE_MAGIC: [u8; 8] = *b"POSKEY01";
 const LISTENER_TRANSPORT_MAGIC: [u8; 8] = *b"POSTPT01";
 const TENANT_LIFECYCLE_MAGIC: [u8; 8] = *b"POSTEN01";
@@ -57,6 +58,7 @@ pub enum GovernanceAuditEntry {
     Initialization(InitializationAuditEntry),
     CatalogRootRotation(CatalogRootRotationAuditEntry),
     IngestPolicyActivation(IngestPolicyActivationAuditEntry),
+    TenantQuotaUpdate(TenantQuotaUpdateAuditEntry),
     SchemaCheckpoint(SchemaCheckpointAuditEntry),
     ApiKeyLifecycle(ApiKeyLifecycleAuditEntry),
     ListenerTransport(ListenerTransportAuditEntry),
@@ -152,6 +154,59 @@ pub struct IngestPolicyActivationAuditEntry {
     request_digest: [u8; 32],
 }
 
+/// Redacted evidence for one durably published tenant quota successor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TenantQuotaUpdateAuditEntry {
+    position: u64,
+    idempotency_key: AdministrativeIdempotencyKey,
+    principal: PrincipalId,
+    tenant: TenantId,
+    expected_generation: ResourceGeneration,
+    generation: ResourceGeneration,
+    weight: u32,
+    resources: [u64; 11],
+    request_digest: [u8; 32],
+}
+
+impl TenantQuotaUpdateAuditEntry {
+    #[must_use]
+    pub const fn position(&self) -> u64 {
+        self.position
+    }
+    #[must_use]
+    pub const fn idempotency_key(&self) -> AdministrativeIdempotencyKey {
+        self.idempotency_key
+    }
+    #[must_use]
+    pub const fn principal_id(&self) -> PrincipalId {
+        self.principal
+    }
+    #[must_use]
+    pub const fn tenant_id(&self) -> TenantId {
+        self.tenant
+    }
+    #[must_use]
+    pub const fn expected_generation(&self) -> ResourceGeneration {
+        self.expected_generation
+    }
+    #[must_use]
+    pub const fn generation(&self) -> ResourceGeneration {
+        self.generation
+    }
+    #[must_use]
+    pub const fn weight(&self) -> u32 {
+        self.weight
+    }
+    #[must_use]
+    pub const fn resources(&self) -> [u64; 11] {
+        self.resources
+    }
+    #[must_use]
+    pub const fn request_digest(&self) -> [u8; 32] {
+        self.request_digest
+    }
+}
+
 impl IngestPolicyActivationAuditEntry {
     #[must_use]
     pub const fn position(&self) -> u64 {
@@ -218,6 +273,7 @@ impl GovernanceAuditEntry {
             Self::Initialization(entry) => entry.position(),
             Self::CatalogRootRotation(entry) => entry.position(),
             Self::IngestPolicyActivation(entry) => entry.position,
+            Self::TenantQuotaUpdate(entry) => entry.position,
             Self::SchemaCheckpoint(entry) => entry.position(),
             Self::ApiKeyLifecycle(entry) => entry.position,
             Self::ListenerTransport(entry) => entry.position,
@@ -231,6 +287,7 @@ impl GovernanceAuditEntry {
             Self::Initialization(entry) => entry.action(),
             Self::CatalogRootRotation(entry) => entry.action(),
             Self::IngestPolicyActivation(_) => "ingest-policy.activate",
+            Self::TenantQuotaUpdate(_) => "tenant-quota.update",
             Self::SchemaCheckpoint(_) => "schema-checkpoint.replace",
             Self::ApiKeyLifecycle(entry) => match entry.action {
                 ApiKeyLifecycleAction::Create => "api-key.create",
@@ -248,6 +305,7 @@ impl GovernanceAuditEntry {
             Self::Initialization(entry) => entry.outcome(),
             Self::CatalogRootRotation(entry) => entry.outcome(),
             Self::IngestPolicyActivation(_) => "succeeded",
+            Self::TenantQuotaUpdate(_) => "succeeded",
             Self::SchemaCheckpoint(_) => "succeeded",
             Self::ApiKeyLifecycle(_) => "succeeded",
             Self::ListenerTransport(entry) => entry.outcome(),
@@ -261,6 +319,7 @@ impl GovernanceAuditEntry {
             Self::Initialization(entry) => Some(entry),
             Self::CatalogRootRotation(_)
             | Self::IngestPolicyActivation(_)
+            | Self::TenantQuotaUpdate(_)
             | Self::SchemaCheckpoint(_)
             | Self::ApiKeyLifecycle(_)
             | Self::ListenerTransport(_)
@@ -274,6 +333,7 @@ impl GovernanceAuditEntry {
             Self::CatalogRootRotation(entry) => Some(entry),
             Self::Initialization(_)
             | Self::IngestPolicyActivation(_)
+            | Self::TenantQuotaUpdate(_)
             | Self::SchemaCheckpoint(_)
             | Self::ApiKeyLifecycle(_)
             | Self::ListenerTransport(_)
@@ -288,6 +348,7 @@ impl GovernanceAuditEntry {
             Self::Initialization(_)
             | Self::CatalogRootRotation(_)
             | Self::IngestPolicyActivation(_)
+            | Self::TenantQuotaUpdate(_)
             | Self::ApiKeyLifecycle(_)
             | Self::ListenerTransport(_)
             | Self::TenantLifecycle(_) => None,
@@ -301,6 +362,7 @@ impl GovernanceAuditEntry {
             Self::Initialization(_)
             | Self::CatalogRootRotation(_)
             | Self::IngestPolicyActivation(_)
+            | Self::TenantQuotaUpdate(_)
             | Self::SchemaCheckpoint(_)
             | Self::ListenerTransport(_)
             | Self::TenantLifecycle(_) => None,
@@ -314,6 +376,7 @@ impl GovernanceAuditEntry {
             Self::Initialization(_)
             | Self::CatalogRootRotation(_)
             | Self::IngestPolicyActivation(_)
+            | Self::TenantQuotaUpdate(_)
             | Self::SchemaCheckpoint(_)
             | Self::ApiKeyLifecycle(_)
             | Self::TenantLifecycle(_) => None,
@@ -327,9 +390,24 @@ impl GovernanceAuditEntry {
             Self::Initialization(_)
             | Self::CatalogRootRotation(_)
             | Self::IngestPolicyActivation(_)
+            | Self::TenantQuotaUpdate(_)
             | Self::SchemaCheckpoint(_)
             | Self::ApiKeyLifecycle(_)
             | Self::ListenerTransport(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_tenant_quota_update(&self) -> Option<&TenantQuotaUpdateAuditEntry> {
+        match self {
+            Self::TenantQuotaUpdate(entry) => Some(entry),
+            Self::Initialization(_)
+            | Self::CatalogRootRotation(_)
+            | Self::IngestPolicyActivation(_)
+            | Self::SchemaCheckpoint(_)
+            | Self::ApiKeyLifecycle(_)
+            | Self::ListenerTransport(_)
+            | Self::TenantLifecycle(_) => None,
         }
     }
 
@@ -384,6 +462,50 @@ impl GovernanceAuditEntry {
                     request_digest,
                 },
             ));
+        }
+        if intent.starts_with(&TENANT_QUOTA_MAGIC) {
+            let mut cursor = Cursor::new(intent);
+            if cursor.take_array::<8>()? != TENANT_QUOTA_MAGIC {
+                return Err(IdentityFailure);
+            }
+            let idempotency_key = AdministrativeIdempotencyKey::new(cursor.take_array()?)
+                .map_err(|_| IdentityFailure)?;
+            if idempotency_key.to_bytes() != transaction_id {
+                return Err(IdentityFailure);
+            }
+            let principal =
+                PrincipalId::from_bytes(cursor.take_array()?).map_err(|_| IdentityFailure)?;
+            let tenant = TenantId::from_bytes(cursor.take_array()?).map_err(|_| IdentityFailure)?;
+            let expected_generation =
+                ResourceGeneration::new(cursor.take_u64()?).map_err(|_| IdentityFailure)?;
+            let generation =
+                ResourceGeneration::new(cursor.take_u64()?).map_err(|_| IdentityFailure)?;
+            let weight = u32::from_be_bytes(cursor.take_array::<4>()?);
+            let mut resources = [0_u64; 11];
+            for resource in &mut resources {
+                *resource = cursor.take_u64()?;
+            }
+            let request_digest = cursor.take_array::<32>()?;
+            if expected_generation.get().checked_add(1) != Some(generation.get())
+                || weight == 0
+                || weight > u32::from(u16::MAX)
+                || resources.contains(&0)
+                || request_digest.iter().all(|byte| *byte == 0)
+                || !cursor.is_empty()
+            {
+                return Err(IdentityFailure);
+            }
+            return Ok(Self::TenantQuotaUpdate(TenantQuotaUpdateAuditEntry {
+                position,
+                idempotency_key,
+                principal,
+                tenant,
+                expected_generation,
+                generation,
+                weight,
+                resources,
+                request_digest,
+            }));
         }
         if intent.starts_with(&schema_checkpoint::MAGIC) {
             return SchemaCheckpointAuditEntry::decode_intent(position, transaction_id, intent)

@@ -369,12 +369,16 @@ pub enum BootstrapFailureCode {
     TenantLifecyclePurgeCompletionUnavailable,
     TenantLifecycleStaleGeneration,
     TenantLifecycleIdempotencyConflict,
+    TenantQuotaUnauthorized,
+    TenantQuotaStaleGeneration,
+    TenantQuotaIdempotencyConflict,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BootstrapFailure {
     code: BootstrapFailureCode,
     lifecycle_generation_conflict: Option<positron_governance::TenantLifecycleGenerationConflict>,
+    quota_generation_conflict: Option<ResourceGeneration>,
 }
 
 impl BootstrapFailure {
@@ -382,6 +386,7 @@ impl BootstrapFailure {
         Self {
             code,
             lifecycle_generation_conflict: None,
+            quota_generation_conflict: None,
         }
     }
 
@@ -391,6 +396,15 @@ impl BootstrapFailure {
         Self {
             code: BootstrapFailureCode::TenantLifecycleStaleGeneration,
             lifecycle_generation_conflict: Some(conflict),
+            quota_generation_conflict: None,
+        }
+    }
+
+    const fn with_quota_generation_conflict(current: ResourceGeneration) -> Self {
+        Self {
+            code: BootstrapFailureCode::TenantQuotaStaleGeneration,
+            lifecycle_generation_conflict: None,
+            quota_generation_conflict: Some(current),
         }
     }
 
@@ -404,6 +418,11 @@ impl BootstrapFailure {
         self,
     ) -> Option<positron_governance::TenantLifecycleGenerationConflict> {
         self.lifecycle_generation_conflict
+    }
+
+    #[must_use]
+    pub const fn quota_generation_conflict(&self) -> Option<ResourceGeneration> {
+        self.quota_generation_conflict
     }
 }
 
@@ -714,6 +733,47 @@ impl InitializedInstance {
         .map_err(map_api_key_failure)
     }
 
+    /// Durably publishes a tenant quota successor and then applies its limits
+    /// to future local admission. Existing reservations are retained by the
+    /// Resource Governor's bounded quota-update contract.
+    pub fn update_tenant_quota(
+        &self,
+        actor: AuthorizedContext,
+        tenant: TenantId,
+        expected: ResourceGeneration,
+        idempotency: AdministrativeIdempotencyKey,
+        weight: u32,
+        resources: [u64; 11],
+    ) -> Result<positron_governance::TenantQuotaUpdate, BootstrapFailure> {
+        let secret = self
+            .key
+            .catalog_secret(self.instance)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
+        let catalog = Catalog::open(&self._authority, self.instance, secret)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        let identity = positron_governance::Identity::open(
+            &catalog
+                .pin()
+                .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?,
+        )
+        .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
+        let update = positron_governance::TenantQuotaAdministration::update(
+            &catalog,
+            &self._authority,
+            &identity,
+            positron_governance::TenantQuotaUpdateRequest::new(
+                actor,
+                tenant,
+                expected,
+                idempotency,
+                weight,
+                resources,
+            ),
+        )
+        .map_err(map_tenant_quota_failure)?;
+        Ok(update)
+    }
+
     /// Publishes one authenticated lifecycle successor for the explicitly named tenant.
     ///
     /// `Purged` is intentionally unavailable here: only the later managed purge
@@ -957,6 +1017,31 @@ fn map_tenant_lifecycle_failure(failure: TenantLifecycleAdministrationFailure) -
         TenantLifecycleAdministrationFailure::CapacityExceeded
         | TenantLifecycleAdministrationFailure::TimeUnavailable
         | TenantLifecycleAdministrationFailure::PersistenceUnavailable => {
+            BootstrapFailureCode::CatalogUnavailable
+        },
+    };
+    BootstrapFailure::new(code)
+}
+
+fn map_tenant_quota_failure(
+    failure: positron_governance::TenantQuotaAdministrationFailure,
+) -> BootstrapFailure {
+    if let Some(current) = failure.current_generation() {
+        return BootstrapFailure::with_quota_generation_conflict(current);
+    }
+    let code = match failure.code() {
+        positron_governance::TenantQuotaAdministrationFailureCode::Unauthorized => {
+            BootstrapFailureCode::TenantQuotaUnauthorized
+        },
+        positron_governance::TenantQuotaAdministrationFailureCode::StaleResourceGeneration => {
+            BootstrapFailureCode::TenantQuotaStaleGeneration
+        },
+        positron_governance::TenantQuotaAdministrationFailureCode::IdempotencyConflict => {
+            BootstrapFailureCode::TenantQuotaIdempotencyConflict
+        },
+        positron_governance::TenantQuotaAdministrationFailureCode::InvalidInput
+        | positron_governance::TenantQuotaAdministrationFailureCode::PersistenceUnavailable
+        | positron_governance::TenantQuotaAdministrationFailureCode::CorruptState => {
             BootstrapFailureCode::CatalogUnavailable
         },
     };
