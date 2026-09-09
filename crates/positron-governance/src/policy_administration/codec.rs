@@ -31,6 +31,8 @@ pub(super) struct Receipt {
 }
 
 pub(super) fn request_digest(
+    key: AdministrativeIdempotencyKey,
+    principal: PrincipalId,
     tenant: TenantId,
     expected: ResourceGeneration,
     generation: ResourceGeneration,
@@ -38,6 +40,8 @@ pub(super) fn request_digest(
 ) -> [u8; 32] {
     let mut hash = Sha256::new();
     hash.update(b"positron.ingest-policy.activate.request.v1\0");
+    hash.update(key.to_bytes());
+    hash.update(principal.to_bytes());
     hash.update(tenant.to_bytes());
     hash.update(expected.0.to_be_bytes());
     hash.update(generation.0.to_be_bytes());
@@ -122,4 +126,44 @@ fn decode_receipt(bytes: &[u8]) -> Result<Receipt, PolicyAdministrationFailure> 
 
 fn corrupt() -> PolicyAdministrationFailure {
     PolicyAdministrationFailure::new(PolicyAdministrationFailureCode::CorruptState)
+}
+
+#[cfg(test)]
+mod tests {
+    use positron_domain::identity::{PrincipalId, TenantId};
+
+    use super::*;
+
+    #[test]
+    fn canonical_activation_digest_binds_the_idempotency_key_and_principal() {
+        let key = AdministrativeIdempotencyKey::new([1; 16]).expect("idempotency key");
+        let principal = PrincipalId::from_bytes([2; 16]).expect("principal");
+        let tenant = TenantId::from_bytes([3; 16]).expect("tenant");
+        let expected = ResourceGeneration::new(7).expect("generation");
+        let generation = ResourceGeneration::new(8).expect("generation");
+        let digest = [4; 32];
+        let canonical = request_digest(key, principal, tenant, expected, generation, digest);
+        assert_ne!(
+            canonical,
+            request_digest(
+                AdministrativeIdempotencyKey::new([5; 16]).expect("other key"),
+                principal,
+                tenant,
+                expected,
+                generation,
+                digest,
+            )
+        );
+        assert_ne!(
+            canonical,
+            request_digest(
+                key,
+                PrincipalId::from_bytes([6; 16]).expect("other principal"),
+                tenant,
+                expected,
+                generation,
+                digest,
+            )
+        );
+    }
 }

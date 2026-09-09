@@ -162,7 +162,14 @@ impl IngestPolicyAdministration {
                 PolicyAdministrationFailureCode::InvalidResourceGeneration,
             ));
         }
-        let request_digest = request_digest(tenant, expected, requested, candidate.digest());
+        let request_digest = request_digest(
+            key,
+            principal,
+            tenant,
+            expected,
+            requested,
+            candidate.digest(),
+        );
         let snapshot = catalog.pin().map_err(map_catalog)?;
         if let Some(receipt) = find_receipt(&snapshot, key)? {
             if receipt.principal != principal

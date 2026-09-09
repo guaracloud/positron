@@ -71,15 +71,33 @@ impl Identity {
         context: AuthorizedContext,
         tenant: TenantId,
     ) -> Result<PrincipalId, AttributionFailure> {
-        if context.principal != self.principal
-            || context.scope != Scope::SystemAdministration
-            || context.tenant.is_some()
-            || context.authority != self.instance
-            || tenant != self.tenant
-        {
+        if context.authority != self.instance || tenant != self.tenant {
             return Err(AttributionFailure);
         }
-        Ok(context.principal)
+        match context.scope {
+            Scope::SystemAdministration
+                if context.principal == self.principal && context.tenant.is_none() =>
+            {
+                Ok(context.principal)
+            },
+            Scope::TenantAdministration
+                if matches!(
+                    self.lifecycle,
+                    TenantLifecycleState::Active | TenantLifecycleState::ReadOnly
+                ) && context.lifecycle == self.lifecycle
+                    && context.tenant.is_some_and(|attribution| {
+                        attribution.principal_id() == context.principal
+                            && attribution.scope() == Scope::TenantAdministration
+                            && attribution.tenant_id() == tenant
+                    }) =>
+            {
+                Ok(context.principal)
+            },
+            Scope::Ingest
+            | Scope::Query
+            | Scope::TenantAdministration
+            | Scope::SystemAdministration => Err(AttributionFailure),
+        }
     }
 
     /// Reconstructs the unique initialization identity from a pinned Catalog.
