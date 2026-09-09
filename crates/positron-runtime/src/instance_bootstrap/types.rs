@@ -160,7 +160,7 @@ fn wait_for_query_drain<'gate>(
 ) -> Result<(std::sync::MutexGuard<'gate, QueryDrainState>, bool), BootstrapFailure> {
     let remaining = deadline
         .checked_duration_since(Instant::now())
-        .ok_or_else(|| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
+        .unwrap_or_default();
     let (state, timed_out) = changed
         .wait_timeout(state, remaining)
         .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
@@ -292,7 +292,7 @@ fn wait_for_lifecycle_drain<'gate>(
 ) -> Result<(std::sync::MutexGuard<'gate, IngestDrainState>, bool), BootstrapFailure> {
     let remaining = deadline
         .checked_duration_since(Instant::now())
-        .ok_or_else(|| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
+        .unwrap_or_default();
     let (state, timed_out) = changed
         .wait_timeout(state, remaining)
         .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
