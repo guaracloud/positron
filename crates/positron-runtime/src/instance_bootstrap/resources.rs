@@ -22,7 +22,9 @@ pub(super) fn establish(
     volume: OwnedPrimaryDataVolume,
     tenant: TenantId,
 ) -> Result<StorageKernelResourceAuthority, BootstrapFailure> {
-    let cardinality = InventoryCardinalityLimits::new(1, 16).map_err(resource_failure)?;
+    const MAX_RUNTIME_TENANTS: usize = 2;
+    let cardinality =
+        InventoryCardinalityLimits::new(MAX_RUNTIME_TENANTS, 16).map_err(resource_failure)?;
     let observed = ObservedResourceEnvironment::observe(
         &volume,
         RegisteredResourceBounds::new([100, 100, 500_000_000, 500_000, 100, 100, 100])
@@ -40,7 +42,7 @@ pub(super) fn establish(
     let raw = add(
         governed,
         cardinality
-            .governor_bootstrap_overhead(1)
+            .governor_bootstrap_overhead(MAX_RUNTIME_TENANTS)
             .map_err(resource_failure)?,
     )?;
     let disk = observed.initial_disk().usable_bytes();
@@ -66,7 +68,7 @@ pub(super) fn establish(
     )
     .map_err(resource_failure)?;
     let recovery =
-        RecoveryPoolCapacities::new(durability, small, small, small, large, small, small)
+        RecoveryPoolCapacities::new(durability, small, uniform(3), small, large, small, small)
             .map_err(resource_failure)?;
     let configuration = ResourceGovernorConfiguration::new(inventory, policy, recovery)
         .map_err(resource_failure)?;

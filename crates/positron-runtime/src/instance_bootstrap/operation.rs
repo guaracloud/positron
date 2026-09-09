@@ -1,6 +1,8 @@
 use positron_domain::identity::{PrincipalId, TenantId};
 use positron_governance::{Identity, IngestPolicyAdministration};
-use positron_governance::{InitialAuditContext, InitialGovernanceIntent, InitialTenantIntent};
+use positron_governance::{
+    InitialAuditContext, InitialGovernanceIntent, InitialTenantIntent, TenantAdministration,
+};
 use positron_kernel::{
     AuditIntent, BootstrapArtifact, BootstrapArtifactAccess, BootstrapKeyCustody,
     BootstrapObjectPurpose, Catalog, CatalogObject, CatalogProposal, FormatEpoch, InstanceId,
@@ -119,7 +121,12 @@ fn resume(
         .protect_instance_integrity_key(record.instance, integrity_secret)
         .map_err(key_failure)?;
     let tenant_key_envelope = key
-        .tenant_key_envelope(record.instance, record.tenant)
+        .provision_tenant_key_envelope(
+            record.instance,
+            record.tenant,
+            key.random_identifier().map_err(key_failure)?,
+            1,
+        )
         .map_err(key_failure)?;
     let before = catalog.pin().map_err(catalog_failure)?;
     let initial = if before.number() == 0 {
@@ -159,14 +166,26 @@ fn resume(
         let governance = InitialGovernanceIntent::create_tenant(tenant_intent)
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
         let (governance_object, audit_intent) = governance.into_parts();
+        let default_policy = positron_ingest::IngestPolicy::preserving(1)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?
+            .activated_object(record.tenant)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
         Some(
             catalog
                 .commit(
                     before.identity(),
                     CatalogProposal::new(
                         record.transaction,
-                        FormatEpoch::CATALOG_V1,
-                        vec![CatalogObject::new(governance_object).map_err(catalog_failure)?],
+                        FormatEpoch::CATALOG_V2,
+                        vec![
+                            CatalogObject::new(governance_object).map_err(catalog_failure)?,
+                            TenantAdministration::initial_registry(record.instance, record.tenant)
+                                .map_err(|_| {
+                                    BootstrapFailure::new(BootstrapFailureCode::CorruptState)
+                                })?,
+                            CatalogObject::new(default_policy.into_bytes())
+                                .map_err(catalog_failure)?,
+                        ],
                     )
                     .map_err(catalog_failure)?,
                     Some(AuditIntent::new(audit_intent).map_err(catalog_failure)?),
@@ -336,7 +355,15 @@ fn apply_catalog_quota(
             governance.tenant(),
             ResourceAmounts::new(governance.quota_resources()),
         )
-        .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))
+        .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
+    for (tenant, resources) in TenantAdministration::registered_tenant_quotas(snapshot)
+        .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?
+    {
+        authority
+            .register_tenant_quota(tenant, ResourceAmounts::new(resources))
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
+    }
+    Ok(())
 }
 
 fn generate_record(key: &BootstrapKeyCustody) -> Result<BootstrapRecord, BootstrapFailure> {

@@ -19,7 +19,7 @@ markers share one 16,777,216-byte recoverability budget. At most 65,536 committe
 Publication refuses a successor before artifact I/O if it would exceed either retained-history
 bound. Recovery applies the identical limits while walking the chain; each individual read is
 separately bounded and the reserved recovery claim covers the canonical worst case.
-Format Epoch `1` is the exact readable and writable set for this format. Zero is not a Format
+Format Epoch `1` is the exact readable and writable set for a V1-only binary. Zero is not a Format
 Epoch. Publication rejects every other nonzero value before admission or artifact I/O, and
 recovery of an authenticated commit carrying any other value is `UnsupportedFormat`.
 
@@ -105,6 +105,11 @@ corruption, unsupported complete format, ambiguity, substitution, or authenticat
 closed; no partially reconstructed generation becomes current.
 
 ## Compatibility and fault matrix
+
+Epoch 1 has one published forward boundary: [Catalog durable format v2](catalog-format-v2.md).
+An Epoch-1 binary rejects a complete Epoch-2 marker before object loading or service admission;
+it never treats a newer tenant-key representation as a legacy envelope. Epoch-2 readers retain
+the exact V1 governance and authenticated legacy tenant-envelope route.
 
 Artifact v3, frame v1, commit/audit codec v1, and marker v1 are the only accepted formats. A complete
 unknown artifact or marker version is `UnsupportedFormat`; truncation and structural corruption are

@@ -18,9 +18,9 @@ use positron_domain::identity::{
     ExternalTenantAlias, PrincipalId, Scope, TenantAttribution, TenantId, TenantSlug,
 };
 use positron_domain::lifecycle::TenantLifecycleState;
-use positron_kernel::{BootstrapKeyCustody, CatalogSnapshot};
+use positron_kernel::{BootstrapKeyCustody, CatalogSnapshot, FormatEpoch};
 
-use crate::GovernanceAuditEntry;
+use crate::{GovernanceAuditEntry, TenantAdministration};
 
 use codec::identity_from_catalog;
 
@@ -63,6 +63,7 @@ pub struct Identity {
     query: Option<QueryIdentity>,
     credentials: Vec<CredentialIdentity>,
     lifecycle: TenantLifecycleState,
+    tenant_key_envelope: Vec<u8>,
 }
 
 impl Identity {
@@ -111,7 +112,24 @@ impl Identity {
     /// Reconstructs the unique initialization identity from a pinned Catalog.
     pub fn open(snapshot: &CatalogSnapshot) -> Result<Self, IdentityFailure> {
         let (_, governance) = snapshot.governance_object().map_err(|_| IdentityFailure)?;
-        identity_from_catalog(governance)
+        let identity = identity_from_catalog(governance)?;
+        if snapshot.format_epoch() == Some(FormatEpoch::CATALOG_V2)
+            && !TenantAdministration::registered_tenant_ids(snapshot)
+                .map_err(|_| IdentityFailure)?
+                .contains(&identity.tenant)
+        {
+            return Err(IdentityFailure);
+        }
+        Ok(identity)
+    }
+
+    /// Returns the opaque tenant KEK envelope only when the requested tenant
+    /// is this immutable identity's authenticated tenant.
+    pub fn tenant_key_envelope(&self, tenant: TenantId) -> Result<&[u8], IdentityFailure> {
+        if tenant != self.tenant || self.tenant_key_envelope.is_empty() {
+            return Err(IdentityFailure);
+        }
+        Ok(&self.tenant_key_envelope)
     }
 
     /// Authenticates and authorizes before a decoder or data-plane admission

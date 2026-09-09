@@ -85,7 +85,14 @@ pub(super) fn ingest_native_batch(
     for group in groups {
         let shard = group.shard();
         let records = group.records();
-        let outcome = ingest_group(instance, &catalog, &policy, schema.clone(), group);
+        let outcome = ingest_group(
+            instance,
+            &identity,
+            &catalog,
+            &policy,
+            schema.clone(),
+            group,
+        );
         outcomes.push(AdmissionGroupOutcome::new(shard, records, outcome));
     }
     drop(catalog);
@@ -161,7 +168,7 @@ fn ingest_native_trace_batch(
     for group in groups {
         let shard = group.shard();
         let records = group.records();
-        let outcome = ingest_trace_group(instance, &catalog, group);
+        let outcome = ingest_trace_group(instance, &identity, &catalog, group);
         outcomes.push(AdmissionGroupOutcome::new(shard, records, outcome));
     }
     drop(catalog);
@@ -174,12 +181,13 @@ fn ingest_native_trace_batch(
 
 fn ingest_trace_group(
     instance: &crate::InitializedInstance,
+    identity: &positron_governance::Identity,
     catalog: &Catalog<'_>,
     group: positron_ingest::NativeSpanAdmissionGroup<'_>,
 ) -> IngestOutcome {
     let shard = group.shard();
     let scope = SegmentScope::new(instance.tenant, SignalKind::Traces, shard);
-    let protection = match instance.key.segment_key(instance.instance, scope) {
+    let protection = match super::tenant_segment_key(instance, identity, scope) {
         Ok(protection) => protection,
         Err(_) => {
             return IngestOutcome::Retryable(IngestFailureCode::StorageUnavailable);
@@ -235,6 +243,7 @@ pub(super) const fn map_ledger_failure_code(code: LedgerFailureCode) -> IngestFa
 
 fn ingest_group(
     instance: &crate::InitializedInstance,
+    identity: &positron_governance::Identity,
     catalog: &Catalog<'_>,
     policy: &positron_ingest::IngestPolicy,
     schema: positron_ingest::TenantSchemaSession,
@@ -242,7 +251,7 @@ fn ingest_group(
 ) -> IngestOutcome {
     let shard = group.shard();
     let scope = SegmentScope::new(instance.tenant, SignalKind::Logs, shard);
-    let Ok(protection) = instance.key.segment_key(instance.instance, scope) else {
+    let Ok(protection) = super::tenant_segment_key(instance, identity, scope) else {
         return IngestOutcome::Retryable(IngestFailureCode::StorageUnavailable);
     };
     let ledger = match ActiveSegmentLedger::open_with_retention_time(

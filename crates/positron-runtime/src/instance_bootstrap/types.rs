@@ -9,13 +9,14 @@ use positron_domain::lifecycle::TenantLifecycleState;
 use positron_domain::routing::SignalKind;
 use positron_kernel::{
     BootstrapKeyCustody, Catalog, CatalogFailureCode, InstanceBootstrapStorage, InstanceId,
-    MountQualification, OwnedPrimaryDataVolume, RetentionTimeAuthority,
+    MountQualification, OwnedPrimaryDataVolume, ResourceAmounts, RetentionTimeAuthority,
     StorageKernelResourceAuthority,
 };
 use zeroize::Zeroizing;
 
 use positron_governance::{
     AdministrativeIdempotencyKey, ApiKeyAdministrationFailure, ApiKeyCreation, AuthorizedContext,
+    CatalogFormatMigration, CatalogFormatMigrationAdministration, CatalogFormatMigrationFailure,
     ListenerTransportAdministration, ListenerTransportAdministrationFailure, ResourceGeneration,
     TenantLifecycleAdministration, TenantLifecycleAdministrationFailure, TenantLifecycleTransition,
     TenantLifecycleTransitionRequest,
@@ -774,6 +775,107 @@ impl InitializedInstance {
         Ok(update)
     }
 
+    /// Atomically publishes a new tenant registry record, then enrolls that
+    /// tenant in the live bounded admission authority.
+    pub fn create_tenant(
+        &self,
+        actor: AuthorizedContext,
+        tenant: TenantId,
+        slug: TenantSlug,
+        display_name: &str,
+        retention_seconds: u64,
+        weight: u32,
+        resources: [u64; 11],
+        expected: ResourceGeneration,
+        idempotency: AdministrativeIdempotencyKey,
+    ) -> Result<positron_governance::TenantCreation, BootstrapFailure> {
+        let request = positron_governance::TenantCreateRequest::new(
+            actor,
+            tenant,
+            slug,
+            display_name,
+            retention_seconds,
+            weight,
+            resources,
+            expected,
+            idempotency,
+        );
+        let secret = self
+            .key
+            .catalog_secret(self.instance)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
+        let preflight = Catalog::read_current_view(&self._authority, self.instance, secret)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        if let Some(replay) = positron_governance::TenantAdministration::replay_from_view(
+            &preflight,
+            self.administrator,
+            request.clone(),
+        )
+        .map_err(map_tenant_administration_failure)?
+        {
+            return Ok(replay);
+        }
+        let mut enrollment = self
+            ._authority
+            .prepare_tenant_enrollment(tenant, ResourceAmounts::new(resources))
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
+        let secret = self
+            .key
+            .catalog_secret(self.instance)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
+        let catalog = Catalog::open(&self._authority, self.instance, secret)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        let created = positron_governance::TenantAdministration::create(
+            &catalog,
+            &self.key,
+            self.instance,
+            self.administrator,
+            request,
+        )
+        .map_err(map_tenant_administration_failure)?;
+        enrollment.activate();
+        Ok(created)
+    }
+
+    /// Publishes the concrete V1-to-V2 Catalog transformation while both
+    /// native data admission gates are closed. Broader upgrade orchestration
+    /// remains outside this narrowly scoped format transition.
+    pub fn migrate_catalog_to_epoch_two(
+        &self,
+        actor: AuthorizedContext,
+        idempotency: AdministrativeIdempotencyKey,
+    ) -> Result<CatalogFormatMigration, BootstrapFailure> {
+        let _ingest_drain = self.ingest_drain.close_and_drain()?;
+        let _query_drain = self.query_drain.cancel_and_drain()?;
+        let secret = self
+            .key
+            .catalog_secret(self.instance)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
+        let catalog = Catalog::open(&self._authority, self.instance, secret)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        CatalogFormatMigrationAdministration::migrate_to_epoch_two(
+            &catalog,
+            self.administrator,
+            actor,
+            idempotency,
+        )
+        .map_err(map_catalog_format_migration_failure)
+    }
+
+    /// Reads the currently authenticated Catalog format without acquiring the
+    /// writer or exposing any Catalog object content.
+    pub fn catalog_format_epoch(
+        &self,
+    ) -> Result<Option<positron_kernel::FormatEpoch>, BootstrapFailure> {
+        let secret = self
+            .key
+            .catalog_secret(self.instance)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
+        Catalog::read_current_snapshot(&self._authority, self.instance, secret)
+            .map(|snapshot| snapshot.format_epoch())
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))
+    }
+
     /// Publishes one authenticated lifecycle successor for the explicitly named tenant.
     ///
     /// `Purged` is intentionally unavailable here: only the later managed purge
@@ -1042,6 +1144,44 @@ fn map_tenant_quota_failure(
         positron_governance::TenantQuotaAdministrationFailureCode::InvalidInput
         | positron_governance::TenantQuotaAdministrationFailureCode::PersistenceUnavailable
         | positron_governance::TenantQuotaAdministrationFailureCode::CorruptState => {
+            BootstrapFailureCode::CatalogUnavailable
+        },
+    };
+    BootstrapFailure::new(code)
+}
+
+fn map_tenant_administration_failure(
+    failure: positron_governance::TenantAdministrationFailure,
+) -> BootstrapFailure {
+    let code = match failure {
+        positron_governance::TenantAdministrationFailure::Unauthorized => {
+            BootstrapFailureCode::ApiKeyUnauthorized
+        },
+        positron_governance::TenantAdministrationFailure::StaleGeneration => {
+            BootstrapFailureCode::ApiKeyStaleGeneration
+        },
+        positron_governance::TenantAdministrationFailure::IdempotencyConflict => {
+            BootstrapFailureCode::ApiKeyIdempotencyConflict
+        },
+        positron_governance::TenantAdministrationFailure::InvalidInput
+        | positron_governance::TenantAdministrationFailure::DuplicateTenant
+        | positron_governance::TenantAdministrationFailure::PersistenceUnavailable => {
+            BootstrapFailureCode::CatalogUnavailable
+        },
+    };
+    BootstrapFailure::new(code)
+}
+
+fn map_catalog_format_migration_failure(
+    failure: CatalogFormatMigrationFailure,
+) -> BootstrapFailure {
+    let code = match failure {
+        CatalogFormatMigrationFailure::Unauthorized => BootstrapFailureCode::ApiKeyUnauthorized,
+        CatalogFormatMigrationFailure::IdempotencyConflict => {
+            BootstrapFailureCode::ApiKeyIdempotencyConflict
+        },
+        CatalogFormatMigrationFailure::InvalidState
+        | CatalogFormatMigrationFailure::PersistenceUnavailable => {
             BootstrapFailureCode::CatalogUnavailable
         },
     };

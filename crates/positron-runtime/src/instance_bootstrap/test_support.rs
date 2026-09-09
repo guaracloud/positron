@@ -51,6 +51,22 @@ impl GovernanceTestFixture {
 }
 
 impl InitializedInstance {
+    /// Derives test-fixture segment protection from the same authenticated
+    /// tenant envelope as ordinary service paths.
+    #[doc(hidden)]
+    pub(crate) fn tenant_segment_key_for_test(
+        &self,
+        scope: SegmentScope,
+    ) -> Result<positron_kernel::SegmentProtectionKey, BootstrapFailure> {
+        let identity = self.durable_identity()?;
+        let envelope = identity
+            .tenant_key_envelope(scope.tenant_id())
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
+        self.key
+            .segment_key_from_tenant_envelope(self.instance, scope, envelope)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))
+    }
+
     /// Completes one Catalog-authorized Log retention pass for integration tests.
     #[doc(hidden)]
     pub fn complete_log_retention_for_test(
@@ -63,10 +79,7 @@ impl InitializedInstance {
         let catalog = Catalog::open(&self._authority, self.instance, secret)
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
         let scope = SegmentScope::new(self.tenant, SignalKind::Logs, self.logs_shard);
-        let protection = self
-            .key
-            .segment_key(self.instance, scope)
-            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
+        let protection = self.tenant_segment_key_for_test(scope)?;
         let ledger = ActiveSegmentLedger::open_with_retention_time(
             &self._authority,
             &self.retention_time,

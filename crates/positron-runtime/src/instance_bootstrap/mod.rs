@@ -2,7 +2,7 @@ mod codec;
 mod operation;
 mod resources;
 mod storage;
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, fuzzing, feature = "test-support"))]
 mod test_support;
 mod types;
 

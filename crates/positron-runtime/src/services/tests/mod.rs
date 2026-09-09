@@ -10,6 +10,7 @@ use super::{
 mod schema_maintenance;
 mod schema_replay_integrity;
 mod schema_routes;
+mod tenant_envelope;
 mod trace_visibility;
 
 #[test]

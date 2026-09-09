@@ -115,6 +115,7 @@ pub struct CatalogGovernanceObject {
     quota_weight: u32,
     quota_resources: [u64; 11],
     quota_offset: usize,
+    tenant_key_envelope: Vec<u8>,
     lifecycle: TenantLifecycleState,
     lifecycle_generation: u64,
     credentials: Vec<CatalogCredential>,
@@ -198,6 +199,14 @@ impl CatalogGovernanceObject {
     #[must_use]
     pub const fn quota_resources(&self) -> [u64; 11] {
         self.quota_resources
+    }
+
+    /// Returns the opaque tenant KEK envelope carried by this authenticated
+    /// governance record. Callers must bind it to the exact instance and
+    /// tenant through Data Protection before using it.
+    #[must_use]
+    pub fn tenant_key_envelope(&self) -> &[u8] {
+        &self.tenant_key_envelope
     }
 
     /// Returns redacted credential descriptors; secret material is never decoded.
@@ -570,7 +579,7 @@ fn decode(encoded: &[u8]) -> Result<CatalogGovernanceObject, CatalogFailure> {
     require_nonzero(cursor.take_array::<32>()?)?;
     require_nonzero(cursor.take_array::<32>()?)?;
     cursor.skip_u16_bytes()?;
-    cursor.skip_u16_bytes()?;
+    let tenant_key_envelope = cursor.take_u16_bytes()?.to_vec();
     let retention_seconds = cursor.take_u64()?;
     let quota_offset = encoded
         .len()
@@ -711,6 +720,7 @@ fn decode(encoded: &[u8]) -> Result<CatalogGovernanceObject, CatalogFailure> {
         quota_weight,
         quota_resources,
         quota_offset,
+        tenant_key_envelope,
         lifecycle,
         lifecycle_generation,
         credentials,
@@ -946,16 +956,20 @@ impl<'encoded> Cursor<'encoded> {
     }
 
     fn skip_u16_bytes(&mut self) -> Result<(), CatalogFailure> {
+        self.take_u16_bytes().map(|_| ())
+    }
+
+    fn take_u16_bytes(&mut self) -> Result<&'encoded [u8], CatalogFailure> {
         let length = usize::from(u16::from_be_bytes(self.take_array()?));
         if length == 0 {
             return Err(corrupt());
         }
-        let (_, remaining) = self
+        let (value, remaining) = self
             .remaining
             .split_at_checked(length)
             .ok_or_else(corrupt)?;
         self.remaining = remaining;
-        Ok(())
+        Ok(value)
     }
 
     const fn is_empty(&self) -> bool {

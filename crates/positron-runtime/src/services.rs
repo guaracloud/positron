@@ -1,15 +1,15 @@
 use std::sync::{Arc, Mutex};
 
 use positron_governance::{
-    AuthorizedContext, CompatibilityHints, IngestPolicyServingSnapshot, PresentedCredential,
-    RequestedIntent,
+    AuthorizedContext, CompatibilityHints, Identity, IngestPolicyServingSnapshot,
+    PresentedCredential, RequestedIntent,
 };
 use positron_ingest::{
     AuthenticatedLokiPushRequest, AuthenticatedOtlpLogsRequest, AuthenticatedOtlpTracesRequest,
     IngestRequestOutcome, LokiPushReceiver, LokiPushRequestEncoding, TenantSchemaRegistry,
     TenantSchemaSession, reserve_log_receiver_transport, reserve_trace_receiver_transport,
 };
-use positron_kernel::TransferredResourceReservation;
+use positron_kernel::{SegmentProtectionKey, SegmentScope, TransferredResourceReservation};
 use positron_query::QueryBudget;
 
 use crate::InitializedInstance;
@@ -22,6 +22,20 @@ mod policy;
 mod query;
 mod schema_bootstrap;
 mod schema_maintenance;
+
+pub(super) fn tenant_segment_key(
+    instance: &InitializedInstance,
+    identity: &Identity,
+    scope: SegmentScope,
+) -> Result<SegmentProtectionKey, ServiceFailure> {
+    let envelope = identity
+        .tenant_key_envelope(scope.tenant_id())
+        .map_err(|_| ServiceFailure::KeyUnavailable)?;
+    instance
+        .key
+        .segment_key_from_tenant_envelope(instance.instance, scope, envelope)
+        .map_err(|_| ServiceFailure::KeyUnavailable)
+}
 
 pub use failure::ServiceFailure;
 #[cfg(test)]

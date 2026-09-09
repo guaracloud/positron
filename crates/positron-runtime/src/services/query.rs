@@ -54,11 +54,13 @@ pub(super) fn query_events_for_test(
             .map_err(|_| ServiceFailure::KeyUnavailable)?,
     )
     .map_err(|failure| classify_catalog_failure_code(failure.code()))?;
+    let snapshot = catalog
+        .pin()
+        .map_err(|failure| classify_catalog_failure_code(failure.code()))?;
+    let identity =
+        positron_governance::Identity::open(&snapshot).map_err(|_| ServiceFailure::CorruptState)?;
     let scope = SegmentScope::new(instance.tenant, SignalKind::Logs, shard);
-    let protection = instance
-        .key
-        .segment_key(instance.instance, scope)
-        .map_err(|_| ServiceFailure::KeyUnavailable)?;
+    let protection = super::tenant_segment_key(instance, &identity, scope)?;
     let ledger = ActiveSegmentLedger::open_with_retention_time(
         &instance._authority,
         &instance.retention_time,
@@ -115,11 +117,13 @@ pub(super) fn resume_query_events_for_test(
             .map_err(|_| ServiceFailure::KeyUnavailable)?,
     )
     .map_err(|failure| classify_catalog_failure_code(failure.code()))?;
+    let snapshot = catalog
+        .pin()
+        .map_err(|failure| classify_catalog_failure_code(failure.code()))?;
+    let identity =
+        positron_governance::Identity::open(&snapshot).map_err(|_| ServiceFailure::CorruptState)?;
     let scope = SegmentScope::new(instance.tenant, SignalKind::Logs, shard);
-    let protection = instance
-        .key
-        .segment_key(instance.instance, scope)
-        .map_err(|_| ServiceFailure::KeyUnavailable)?;
+    let protection = super::tenant_segment_key(instance, &identity, scope)?;
     let ledger = ActiveSegmentLedger::open_with_retention_time(
         &instance._authority,
         &instance.retention_time,
@@ -181,10 +185,7 @@ pub(super) fn query_log_bodies(
         .revalidate_query_context(context)
         .map_err(|_| ServiceFailure::Unauthorized)?;
     let scope = SegmentScope::new(instance.tenant, SignalKind::Logs, shard);
-    let protection = instance
-        .key
-        .segment_key(instance.instance, scope)
-        .map_err(|_| ServiceFailure::KeyUnavailable)?;
+    let protection = super::tenant_segment_key(instance, &identity, scope)?;
     let ledger = ActiveSegmentLedger::open_with_retention_time(
         &instance._authority,
         &instance.retention_time,

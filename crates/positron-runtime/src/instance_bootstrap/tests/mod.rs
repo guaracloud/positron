@@ -2,6 +2,7 @@ mod classification;
 mod codec;
 mod compatibility;
 mod faults;
+mod format_migration;
 mod identity;
 mod initialization;
 mod policy_activation;

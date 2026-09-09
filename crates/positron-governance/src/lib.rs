@@ -13,15 +13,20 @@ use positron_domain::identity::{ExternalTenantAlias, PrincipalId, TenantId, Tena
 
 mod api_key_administration;
 mod audit;
+mod format_migration_administration;
 mod identity;
 mod listener_transport_administration;
 mod policy_administration;
 mod quota_administration;
+mod tenant_administration;
 mod tenant_lifecycle_administration;
 
 pub use api_key_administration::{
     ApiKeyAdministration, ApiKeyAdministrationFailure, ApiKeyCreateRequest, ApiKeyCreation,
     ApiKeyDescriptor,
+};
+pub use format_migration_administration::{
+    CatalogFormatMigration, CatalogFormatMigrationAdministration, CatalogFormatMigrationFailure,
 };
 pub use audit::{
     ApiKeyLifecycleAction, CatalogRootRotationAuditEntry, CatalogRootRotationStage,
@@ -45,6 +50,9 @@ pub use policy_administration::{
 pub use quota_administration::{
     TenantQuotaAdministration, TenantQuotaAdministrationFailure,
     TenantQuotaAdministrationFailureCode, TenantQuotaUpdate, TenantQuotaUpdateRequest,
+};
+pub use tenant_administration::{
+    TenantAdministration, TenantAdministrationFailure, TenantCreateRequest, TenantCreation,
 };
 pub use tenant_lifecycle_administration::{
     TenantLifecycleAdministration, TenantLifecycleAdministrationFailure,

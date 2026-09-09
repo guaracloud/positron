@@ -279,7 +279,7 @@ impl BootstrapKeyCustody {
         envelope: &[u8],
     ) -> Result<SecretKeyBytes, BootstrapKeyFailure> {
         if envelope.get(..8) != Some(TENANT_KEK_ENVELOPE_MAGIC.as_slice()) {
-            return Err(BootstrapKeyFailure::Authentication);
+            return self.resolve_legacy_tenant_key_envelope(instance, tenant, envelope);
         }
         let key_id: [u8; 16] = envelope
             .get(8..24)
@@ -301,6 +301,30 @@ impl BootstrapKeyCustody {
             wrapped,
             tenant_envelope_context(instance, tenant, key_id, key_epoch)?,
             object_context(key_id)?,
+        )
+        .map(|key| key.key)
+        .map_err(map_frame)
+    }
+
+    /// Opens the authenticated tenant envelope emitted by released bootstrap
+    /// generations. It is an explicit compatibility format, never a key
+    /// derivation fallback: malformed or substituted bytes fail closed.
+    fn resolve_legacy_tenant_key_envelope(
+        &self,
+        instance: InstanceId,
+        tenant: TenantId,
+        envelope: &[u8],
+    ) -> Result<SecretKeyBytes, BootstrapKeyFailure> {
+        if envelope.is_empty() {
+            return Err(BootstrapKeyFailure::Authentication);
+        }
+        let system = self.system_kek(instance)?;
+        let object_id = tenant_object_id(tenant)?;
+        DataProtection::unwrap_key_payload(
+            &system,
+            envelope,
+            wrapped_context(instance, BootstrapObjectPurpose::Initialized, object_id)?,
+            object_context(object_id)?,
         )
         .map(|key| key.key)
         .map_err(map_frame)

@@ -1,8 +1,9 @@
 use super::{
     BootstrapKeyCustody, BootstrapKeyFailure, BootstrapKeyIdentity, BootstrapObjectPurpose,
 };
-use crate::InstanceId;
+use crate::{InstanceId, SegmentScope};
 use positron_domain::identity::TenantId;
+use positron_domain::routing::{SignalKind, VirtualShardId};
 
 use super::test_support::SecurityRoot;
 
@@ -102,5 +103,37 @@ fn tenant_kek_envelope_round_trips_only_for_its_bound_authority()
         reopened.resolve_tenant_key_envelope(instance, tenant, &substituted_key_id),
         Err(BootstrapKeyFailure::Authentication)
     ));
+    Ok(())
+}
+
+#[test]
+fn released_tenant_envelope_remains_authenticated_for_segment_reopen()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = SecurityRoot::create()?;
+    let instance = InstanceId::new([0x57; 16])?;
+    let tenant = TenantId::from_bytes([0x58; 16])?;
+    let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(1)?);
+    let key = BootstrapKeyCustody::initialize(&root.path)?;
+    let envelope = key.tenant_key_envelope(instance, tenant)?;
+    assert!(
+        key.segment_key_from_tenant_envelope(instance, scope, &envelope)
+            .is_ok(),
+        "the released authenticated envelope must remain a supported format"
+    );
+    let mut corrupt = envelope.clone();
+    corrupt[0] ^= 1;
+    assert!(matches!(
+        key.segment_key_from_tenant_envelope(instance, scope, &corrupt),
+        Err(BootstrapKeyFailure::Authentication)
+    ));
+    drop(key);
+
+    let reopened = BootstrapKeyCustody::open(&root.path)?;
+    assert!(
+        reopened
+            .segment_key_from_tenant_envelope(instance, scope, &envelope)
+            .is_ok(),
+        "reopening custody must preserve released tenant envelope access"
+    );
     Ok(())
 }
