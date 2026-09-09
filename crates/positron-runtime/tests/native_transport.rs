@@ -22,6 +22,72 @@ mod support;
 use support::*;
 
 #[test]
+fn operations_health_exposes_plaintext_transport_warning_without_degrading_readiness()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _guard = live_test_guard();
+    let plaintext_roots = TestRoots::new("plaintext-health-warning")?;
+    let plaintext_paths = plaintext_roots.paths()?;
+    drop(InstanceBootstrap::initialize(
+        &plaintext_paths,
+        positron_runtime::InitializationPlan::non_interactive(),
+    )?);
+    let plaintext_host = NativeHost::new(bindings(&plaintext_roots, "plaintext-health-warning")?);
+    let plaintext = ApplicationRuntime::start(
+        ServeConfiguration::new(plaintext_paths, InitializationMode::ExistingOnly)
+            .with_public_plaintext_api_warning(),
+        HostInputs::new(&plaintext_host, &plaintext_host),
+    )?;
+    let plaintext_operations = address(
+        &plaintext.bound_endpoints(),
+        positron_runtime::ListenerRole::Operations,
+    )?;
+    let plaintext_health = http(plaintext_operations, "GET", "/health/ready", &[], &[])?;
+    assert_status(plaintext_health.clone(), 200);
+    assert!(plaintext_health.contains("\"status\":\"ready\""));
+    assert!(plaintext_health.contains("\"warnings\":[\"public_plaintext_api\"]"));
+    assert_eq!(
+        plaintext.shutdown(ShutdownTrigger::FirstSignal),
+        positron_runtime::ExitOutcome::Graceful
+    );
+
+    let tls_roots = TestRoots::new("tls-health-warning")?;
+    let tls_paths = tls_roots.paths()?;
+    drop(InstanceBootstrap::initialize(
+        &tls_paths,
+        positron_runtime::InitializationPlan::non_interactive(),
+    )?);
+    let certificate = PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/native_transport/fixtures/api-test-cert.pem"
+    ));
+    let private_key = PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/native_transport/fixtures/api-test-key.pem"
+    ));
+    let tls_host = NativeHost::new(
+        bindings(&tls_roots, "tls-health-warning")?
+            .with_api_transport(ApiTransportProfile::tls(certificate, private_key)?)?,
+    );
+    let tls = ApplicationRuntime::start(
+        ServeConfiguration::new(tls_paths, InitializationMode::ExistingOnly),
+        HostInputs::new(&tls_host, &tls_host),
+    )?;
+    let tls_operations = address(
+        &tls.bound_endpoints(),
+        positron_runtime::ListenerRole::Operations,
+    )?;
+    let tls_health = http(tls_operations, "GET", "/health/ready", &[], &[])?;
+    assert_status(tls_health.clone(), 200);
+    assert!(tls_health.contains("\"status\":\"ready\""));
+    assert!(tls_health.contains("\"warnings\":[]"));
+    assert_eq!(
+        tls.shutdown(ShutdownTrigger::FirstSignal),
+        positron_runtime::ExitOutcome::Graceful
+    );
+    Ok(())
+}
+
+#[test]
 fn loopback_otlp_is_authenticated_durable_and_observable_across_restart()
 -> Result<(), Box<dyn std::error::Error>> {
     let _guard = live_test_guard();

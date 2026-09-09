@@ -5,7 +5,7 @@ use std::time::Duration;
 use positron_api::generated::{ApiError, CapabilityResponse};
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::{HealthState, ListenerRole, Liveness, Readiness, ServiceHandle};
+use crate::{HealthState, HealthWarning, ListenerRole, Liveness, Readiness, ServiceHandle};
 
 const MAX_HEADER_BYTES: usize = 8 * 1024;
 const MAX_API_BODY_BYTES: usize = positron_api::generated::MAX_PUBLIC_REQUEST_BYTES;
@@ -136,12 +136,15 @@ fn route(
                 },
             }
         },
-        (ListenerRole::Operations, "GET", "/health/live") => {
-            Ok(health_response(health.liveness() == Liveness::Live, "live"))
-        },
+        (ListenerRole::Operations, "GET", "/health/live") => Ok(health_response(
+            health.liveness() == Liveness::Live,
+            "live",
+            health.security_warning(),
+        )),
         (ListenerRole::Operations, "GET", "/health/ready") => Ok(health_response(
             health.readiness() == Readiness::Ready,
             "ready",
+            health.security_warning(),
         )),
         (ListenerRole::Api, "POST", "/v1/capabilities:negotiate") => {
             let services = services.ok_or_else(|| Response::empty(503))?;
@@ -270,11 +273,21 @@ pub(super) fn read_body<S: Read>(
     Ok(body)
 }
 
-fn health_response(healthy: bool, label: &'static str) -> Response {
+fn health_response(healthy: bool, label: &'static str, warning: Option<HealthWarning>) -> Response {
+    let warnings = match warning {
+        Some(HealthWarning::PublicPlaintextApi) => "[\"public_plaintext_api\"]",
+        None => "[]",
+    };
     if healthy {
-        Response::json(200, format!("{{\"status\":\"{label}\"}}"))
+        Response::json(
+            200,
+            format!("{{\"status\":\"{label}\",\"warnings\":{warnings}}}"),
+        )
     } else {
-        Response::json(503, format!("{{\"status\":\"not_{label}\"}}"))
+        Response::json(
+            503,
+            format!("{{\"status\":\"not_{label}\",\"warnings\":{warnings}}}"),
+        )
     }
 }
 
