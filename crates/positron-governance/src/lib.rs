@@ -16,6 +16,7 @@ mod audit;
 mod identity;
 mod listener_transport_administration;
 mod policy_administration;
+mod tenant_lifecycle_administration;
 
 pub use api_key_administration::{
     ApiKeyAdministration, ApiKeyAdministrationFailure, ApiKeyCreateRequest, ApiKeyCreation,
@@ -39,6 +40,10 @@ pub use policy_administration::{
     AdministrativeIdempotencyKey, IngestPolicyActivation, IngestPolicyAdministration,
     IngestPolicyServingSnapshot, PolicyAdministrationFailure, PolicyAdministrationFailureCode,
     ResourceGeneration,
+};
+pub use tenant_lifecycle_administration::{
+    TenantLifecycleAdministration, TenantLifecycleAdministrationFailure,
+    TenantLifecycleGenerationConflict, TenantLifecycleTransition, TenantLifecycleTransitionRequest,
 };
 
 const GOVERNANCE_OBJECT_MAGIC: [u8; 8] = *b"POSGOV05";

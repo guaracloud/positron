@@ -1,9 +1,11 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use positron_domain::identity::{ExternalTenantAlias, PrincipalId, Scope, TenantId, TenantSlug};
+use positron_domain::lifecycle::TenantLifecycleState;
 use positron_domain::routing::SignalKind;
 use positron_kernel::{
     BootstrapKeyCustody, Catalog, CatalogFailureCode, InstanceBootstrapStorage, InstanceId,
@@ -15,7 +17,324 @@ use zeroize::Zeroizing;
 use positron_governance::{
     AdministrativeIdempotencyKey, ApiKeyAdministrationFailure, ApiKeyCreation, AuthorizedContext,
     ListenerTransportAdministration, ListenerTransportAdministrationFailure, ResourceGeneration,
+    TenantLifecycleAdministration, TenantLifecycleAdministrationFailure, TenantLifecycleTransition,
+    TenantLifecycleTransitionRequest,
 };
+use positron_query::QueryCancellation;
+
+/// Coordinates the bounded native-ingest finalization with lifecycle closure.
+///
+/// A transition first closes entry, then waits for already-entered ingest work
+/// to finish its final Catalog-serialized validation and publication. New work
+/// observes the closed gate before it can reach the durable append boundary.
+pub(super) struct IngestDrainGate {
+    state: Mutex<IngestDrainState>,
+    changed: Condvar,
+    #[cfg(test)]
+    transition_observer: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+}
+
+const LIFECYCLE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+struct IngestDrainState {
+    lifecycle_transitioning: bool,
+    in_flight: u64,
+}
+
+/// Cancels and drains active query executions before restrictive lifecycle publication.
+pub(super) struct QueryDrainGate {
+    state: Mutex<QueryDrainState>,
+    changed: Condvar,
+    #[cfg(test)]
+    transition_observer: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+}
+
+struct QueryDrainState {
+    closing: bool,
+    next_id: u64,
+    active: Vec<(u64, QueryCancellation)>,
+}
+
+impl QueryDrainGate {
+    pub(super) fn new() -> Self {
+        Self {
+            state: Mutex::new(QueryDrainState {
+                closing: false,
+                next_id: 0,
+                active: Vec::new(),
+            }),
+            changed: Condvar::new(),
+            #[cfg(test)]
+            transition_observer: Mutex::new(None),
+        }
+    }
+
+    fn enter(
+        &self,
+        cancellation: QueryCancellation,
+    ) -> Result<QueryDrainPermit<'_>, BootstrapFailure> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
+        if state.closing {
+            return Err(BootstrapFailure::new(
+                BootstrapFailureCode::ResourceUnavailable,
+            ));
+        }
+        let id = state.next_id;
+        state.next_id = state
+            .next_id
+            .checked_add(1)
+            .ok_or_else(|| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
+        state
+            .active
+            .try_reserve(1)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
+        state.active.push((id, cancellation));
+        Ok(QueryDrainPermit { gate: self, id })
+    }
+
+    fn cancel_and_drain(&self) -> Result<QueryLifecycleDrainPermit<'_>, BootstrapFailure> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
+        let deadline = Instant::now()
+            .checked_add(LIFECYCLE_DRAIN_TIMEOUT)
+            .ok_or_else(|| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
+        while state.closing {
+            let (next, timed_out) = wait_for_query_drain(&self.changed, state, deadline)?;
+            if timed_out {
+                return Err(BootstrapFailure::new(
+                    BootstrapFailureCode::ResourceUnavailable,
+                ));
+            }
+            state = next;
+        }
+        state.closing = true;
+        #[cfg(test)]
+        if let Some(observer) = self
+            .transition_observer
+            .lock()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?
+            .clone()
+        {
+            let _ = observer.send(());
+        }
+        for (_, cancellation) in &state.active {
+            cancellation.cancel();
+        }
+        while !state.active.is_empty() {
+            let (next, timed_out) = wait_for_query_drain(&self.changed, state, deadline)?;
+            state = next;
+            if timed_out {
+                state.closing = false;
+                self.changed.notify_all();
+                return Err(BootstrapFailure::new(
+                    BootstrapFailureCode::ResourceUnavailable,
+                ));
+            }
+        }
+        Ok(QueryLifecycleDrainPermit { gate: self })
+    }
+
+    #[cfg(test)]
+    fn install_transition_observer(
+        &self,
+        observer: std::sync::mpsc::Sender<()>,
+    ) -> Result<(), BootstrapFailure> {
+        *self
+            .transition_observer
+            .lock()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))? =
+            Some(observer);
+        Ok(())
+    }
+}
+
+fn wait_for_query_drain<'gate>(
+    changed: &'gate Condvar,
+    state: std::sync::MutexGuard<'gate, QueryDrainState>,
+    deadline: Instant,
+) -> Result<(std::sync::MutexGuard<'gate, QueryDrainState>, bool), BootstrapFailure> {
+    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+        return Ok((state, true));
+    };
+    let (state, timed_out) = changed
+        .wait_timeout(state, remaining)
+        .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
+    Ok((state, timed_out.timed_out()))
+}
+
+pub(crate) struct QueryDrainPermit<'gate> {
+    gate: &'gate QueryDrainGate,
+    id: u64,
+}
+
+impl Drop for QueryDrainPermit<'_> {
+    fn drop(&mut self) {
+        let mut state = match self.gate.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(index) = state.active.iter().position(|(id, _)| *id == self.id) {
+            state.active.remove(index);
+        }
+        self.gate.changed.notify_all();
+    }
+}
+
+struct QueryLifecycleDrainPermit<'gate> {
+    gate: &'gate QueryDrainGate,
+}
+
+impl Drop for QueryLifecycleDrainPermit<'_> {
+    fn drop(&mut self) {
+        let mut state = match self.gate.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.closing = false;
+        self.gate.changed.notify_all();
+    }
+}
+
+impl IngestDrainGate {
+    pub(super) fn new() -> Self {
+        Self {
+            state: Mutex::new(IngestDrainState {
+                lifecycle_transitioning: false,
+                in_flight: 0,
+            }),
+            changed: Condvar::new(),
+            #[cfg(test)]
+            transition_observer: Mutex::new(None),
+        }
+    }
+
+    fn enter(&self) -> Result<IngestDrainPermit<'_>, BootstrapFailure> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
+        if state.lifecycle_transitioning {
+            return Err(BootstrapFailure::new(
+                BootstrapFailureCode::ResourceUnavailable,
+            ));
+        }
+        state.in_flight = state
+            .in_flight
+            .checked_add(1)
+            .ok_or_else(|| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
+        Ok(IngestDrainPermit { gate: self })
+    }
+
+    fn close_and_drain(&self) -> Result<LifecycleDrainPermit<'_>, BootstrapFailure> {
+        let deadline = Instant::now()
+            .checked_add(LIFECYCLE_DRAIN_TIMEOUT)
+            .ok_or_else(|| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
+        self.close_and_drain_before(deadline)
+    }
+
+    fn close_and_drain_before(
+        &self,
+        deadline: Instant,
+    ) -> Result<LifecycleDrainPermit<'_>, BootstrapFailure> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
+        while state.lifecycle_transitioning {
+            let (next, timed_out) = wait_for_lifecycle_drain(&self.changed, state, deadline)?;
+            if timed_out {
+                return Err(BootstrapFailure::new(
+                    BootstrapFailureCode::ResourceUnavailable,
+                ));
+            }
+            state = next;
+        }
+        state.lifecycle_transitioning = true;
+        #[cfg(test)]
+        if let Some(observer) = self
+            .transition_observer
+            .lock()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?
+            .clone()
+        {
+            let _ = observer.send(());
+        }
+        while state.in_flight != 0 {
+            let (next, timed_out) = wait_for_lifecycle_drain(&self.changed, state, deadline)?;
+            state = next;
+            if timed_out {
+                state.lifecycle_transitioning = false;
+                self.changed.notify_all();
+                return Err(BootstrapFailure::new(
+                    BootstrapFailureCode::ResourceUnavailable,
+                ));
+            }
+        }
+        Ok(LifecycleDrainPermit { gate: self })
+    }
+
+    #[cfg(test)]
+    fn install_transition_observer(
+        &self,
+        observer: std::sync::mpsc::Sender<()>,
+    ) -> Result<(), BootstrapFailure> {
+        *self
+            .transition_observer
+            .lock()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))? =
+            Some(observer);
+        Ok(())
+    }
+}
+
+fn wait_for_lifecycle_drain<'gate>(
+    changed: &'gate Condvar,
+    state: std::sync::MutexGuard<'gate, IngestDrainState>,
+    deadline: Instant,
+) -> Result<(std::sync::MutexGuard<'gate, IngestDrainState>, bool), BootstrapFailure> {
+    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+        return Ok((state, true));
+    };
+    let (state, timed_out) = changed
+        .wait_timeout(state, remaining)
+        .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
+    Ok((state, timed_out.timed_out()))
+}
+
+pub(crate) struct IngestDrainPermit<'gate> {
+    gate: &'gate IngestDrainGate,
+}
+
+impl Drop for IngestDrainPermit<'_> {
+    fn drop(&mut self) {
+        let mut state = match self.gate.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.in_flight = state.in_flight.saturating_sub(1);
+        self.gate.changed.notify_all();
+    }
+}
+
+struct LifecycleDrainPermit<'gate> {
+    gate: &'gate IngestDrainGate,
+}
+
+impl Drop for LifecycleDrainPermit<'_> {
+    fn drop(&mut self) {
+        let mut state = match self.gate.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.lifecycle_transitioning = false;
+        self.gate.changed.notify_all();
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BootstrapState {
@@ -44,21 +363,47 @@ pub enum BootstrapFailureCode {
     ApiKeyStaleGeneration,
     ApiKeyIdempotencyConflict,
     ApiKeyUnavailable,
+    TenantLifecycleUnauthorized,
+    TenantLifecycleUnknownTenant,
+    TenantLifecycleInvalidTransition,
+    TenantLifecyclePurgeCompletionUnavailable,
+    TenantLifecycleStaleGeneration,
+    TenantLifecycleIdempotencyConflict,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BootstrapFailure {
     code: BootstrapFailureCode,
+    lifecycle_generation_conflict: Option<positron_governance::TenantLifecycleGenerationConflict>,
 }
 
 impl BootstrapFailure {
     pub(crate) const fn new(code: BootstrapFailureCode) -> Self {
-        Self { code }
+        Self {
+            code,
+            lifecycle_generation_conflict: None,
+        }
+    }
+
+    const fn with_lifecycle_generation_conflict(
+        conflict: positron_governance::TenantLifecycleGenerationConflict,
+    ) -> Self {
+        Self {
+            code: BootstrapFailureCode::TenantLifecycleStaleGeneration,
+            lifecycle_generation_conflict: Some(conflict),
+        }
     }
 
     #[must_use]
     pub const fn code(self) -> BootstrapFailureCode {
         self.code
+    }
+
+    #[must_use]
+    pub const fn lifecycle_generation_conflict(
+        self,
+    ) -> Option<positron_governance::TenantLifecycleGenerationConflict> {
+        self.lifecycle_generation_conflict
     }
 }
 
@@ -194,6 +539,8 @@ pub struct InitializedInstance {
     pub(crate) ingest_policy: positron_governance::IngestPolicyAdministration,
     pub(crate) value_limit_profile: positron_domain::value::ValueLimitProfile,
     pub(crate) admission_group_planner: Arc<dyn positron_ingest::AdmissionGroupPlanner>,
+    pub(super) ingest_drain: IngestDrainGate,
+    pub(super) query_drain: QueryDrainGate,
     pub(super) tenant_slug: TenantSlug,
     pub(super) administrator: PrincipalId,
     pub(super) integrity_key_fingerprint: [u8; 32],
@@ -215,6 +562,35 @@ impl std::fmt::Debug for InitializedInstance {
 }
 
 impl InitializedInstance {
+    pub(crate) fn enter_ingest_finalization(
+        &self,
+    ) -> Result<IngestDrainPermit<'_>, BootstrapFailure> {
+        self.ingest_drain.enter()
+    }
+
+    pub(crate) fn enter_query_execution(
+        &self,
+        cancellation: QueryCancellation,
+    ) -> Result<QueryDrainPermit<'_>, BootstrapFailure> {
+        self.query_drain.enter(cancellation)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_lifecycle_query_transition_observer(
+        &self,
+        observer: std::sync::mpsc::Sender<()>,
+    ) -> Result<(), BootstrapFailure> {
+        self.query_drain.install_transition_observer(observer)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_lifecycle_transition_observer(
+        &self,
+        observer: std::sync::mpsc::Sender<()>,
+    ) -> Result<(), BootstrapFailure> {
+        self.ingest_drain.install_transition_observer(observer)
+    }
+
     pub(crate) fn durable_identity(
         &self,
     ) -> Result<positron_governance::Identity, BootstrapFailure> {
@@ -244,6 +620,21 @@ impl InitializedInstance {
             })?;
         positron_governance::Identity::open(&snapshot)
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn install_retention_time_for_test(
+        &mut self,
+        retention_time: RetentionTimeAuthority,
+    ) -> Result<(), BootstrapFailure> {
+        self.retention_time = retention_time;
+        let scope =
+            positron_kernel::SegmentScope::new(self.tenant, SignalKind::Logs, self.logs_shard);
+        self.retention_time
+            .governance_time_seconds(scope)
+            .map(|_| ())
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))
     }
 
     pub(crate) fn begin_shutdown(&self) -> Result<(), BootstrapFailure> {
@@ -321,6 +712,81 @@ impl InitializedInstance {
             ),
         )
         .map_err(map_api_key_failure)
+    }
+
+    /// Publishes one authenticated lifecycle successor for the explicitly named tenant.
+    ///
+    /// `Purged` is intentionally unavailable here: only the later managed purge
+    /// authority may complete the verified destructive operation.
+    pub fn transition_tenant_lifecycle(
+        &self,
+        actor: AuthorizedContext,
+        tenant: TenantId,
+        target: TenantLifecycleState,
+        expected: ResourceGeneration,
+        idempotency: AdministrativeIdempotencyKey,
+    ) -> Result<TenantLifecycleTransition, BootstrapFailure> {
+        let secret = self
+            .key
+            .catalog_secret(self.instance)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
+        let request =
+            TenantLifecycleTransitionRequest::new(actor, tenant, target, expected, idempotency);
+        let preflight = Catalog::read_current_view(&self._authority, self.instance, secret)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        if let Some(replay) =
+            TenantLifecycleAdministration::replay_from_view(&preflight, self.administrator, request)
+                .map_err(map_tenant_lifecycle_failure)?
+        {
+            return Ok(replay);
+        }
+        let _drain = self.ingest_drain.close_and_drain()?;
+        let _query_drain = match target {
+            TenantLifecycleState::Suspended | TenantLifecycleState::Purging => {
+                Some(self.query_drain.cancel_and_drain()?)
+            },
+            TenantLifecycleState::Active
+            | TenantLifecycleState::ReadOnly
+            | TenantLifecycleState::Purged => None,
+        };
+        let secret = self
+            .key
+            .catalog_secret(self.instance)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
+        let catalog = Catalog::open(&self._authority, self.instance, secret)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        let audit_scope =
+            positron_kernel::SegmentScope::new(self.tenant, SignalKind::Logs, self.logs_shard);
+        TenantLifecycleAdministration::transition(&catalog, self.administrator, request, || {
+            self.retention_time
+                .governance_time_seconds(audit_scope)
+                .map_err(|_| TenantLifecycleAdministrationFailure::TimeUnavailable)
+        })
+        .map_err(map_tenant_lifecycle_failure)
+    }
+
+    /// Returns decoded audit evidence through the same authenticated Catalog
+    /// reader used by lifecycle integration tests.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn governance_audit_for_test(
+        &self,
+    ) -> Result<Vec<positron_governance::GovernanceAuditEntry>, BootstrapFailure> {
+        let secret = self
+            .key
+            .catalog_secret(self.instance)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
+        let catalog = Catalog::open(&self._authority, self.instance, secret)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        catalog
+            .governance_audit_records()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?
+            .into_iter()
+            .map(|record| {
+                positron_governance::GovernanceAuditEntry::decode(&record)
+                    .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))
+            })
+            .collect()
     }
 
     /// Returns redacted key descriptors for the authorized system operator.
@@ -468,6 +934,35 @@ fn map_api_key_failure(failure: ApiKeyAdministrationFailure) -> BootstrapFailure
     BootstrapFailure::new(code)
 }
 
+fn map_tenant_lifecycle_failure(failure: TenantLifecycleAdministrationFailure) -> BootstrapFailure {
+    let code = match failure {
+        TenantLifecycleAdministrationFailure::Unauthorized => {
+            BootstrapFailureCode::TenantLifecycleUnauthorized
+        },
+        TenantLifecycleAdministrationFailure::UnknownTenant => {
+            BootstrapFailureCode::TenantLifecycleUnknownTenant
+        },
+        TenantLifecycleAdministrationFailure::InvalidTransition => {
+            BootstrapFailureCode::TenantLifecycleInvalidTransition
+        },
+        TenantLifecycleAdministrationFailure::PurgeCompletionUnavailable => {
+            BootstrapFailureCode::TenantLifecyclePurgeCompletionUnavailable
+        },
+        TenantLifecycleAdministrationFailure::StaleGeneration(conflict) => {
+            return BootstrapFailure::with_lifecycle_generation_conflict(conflict);
+        },
+        TenantLifecycleAdministrationFailure::IdempotencyConflict => {
+            BootstrapFailureCode::TenantLifecycleIdempotencyConflict
+        },
+        TenantLifecycleAdministrationFailure::CapacityExceeded
+        | TenantLifecycleAdministrationFailure::TimeUnavailable
+        | TenantLifecycleAdministrationFailure::PersistenceUnavailable => {
+            BootstrapFailureCode::CatalogUnavailable
+        },
+    };
+    BootstrapFailure::new(code)
+}
+
 fn map_listener_transport_failure(
     failure: ListenerTransportAdministrationFailure,
 ) -> BootstrapFailure {
@@ -522,5 +1017,26 @@ impl BootstrapClaim {
 impl std::fmt::Debug for BootstrapClaim {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("BootstrapClaim { <redacted> }")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn elapsed_lifecycle_drain_deadline_restores_admission() {
+        let gate = IngestDrainGate::new();
+        let held = gate.enter().expect("initial admission");
+
+        let failure = match gate.close_and_drain_before(Instant::now()) {
+            Ok(_) => panic!("an already elapsed deadline cannot publish a lifecycle closure"),
+            Err(failure) => failure,
+        };
+        assert_eq!(failure.code(), BootstrapFailureCode::ResourceUnavailable);
+
+        let later = gate.enter().expect("failed drain reopens admission");
+        drop(later);
+        drop(held);
     }
 }

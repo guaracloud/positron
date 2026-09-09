@@ -1,12 +1,17 @@
 use std::error::Error;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, mpsc};
 
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 use positron_domain::lifecycle::TenantLifecycleState;
-use positron_governance::{CompatibilityHints, PresentedCredential, RequestedIntent};
+use positron_governance::{
+    AdministrativeIdempotencyKey, CompatibilityHints, PresentedCredential, RequestedIntent,
+    ResourceGeneration,
+};
 use positron_ingest::{
     AdmissionGroupOutcome, IngestFailureCode, IngestOutcome, IngestRequestOutcome,
-    NativeLogAdmissionGroups,
+    NativeLogAdmissionGroups, NativeSpanAdmissionGroups,
 };
 use positron_ingest::{LokiPushRequestEncoding, OtlpLogsRequestEncoding};
 use positron_query::{
@@ -16,7 +21,78 @@ use prost::Message;
 
 use super::super::query::QueryTestOutcome;
 use super::schema_maintenance::{Fixture, request};
-use crate::services::{ReceiverTestBackend, ServiceFailure, ServiceHandle};
+use crate::services::{QueryExecutionTestHook, ReceiverTestBackend, ServiceFailure, ServiceHandle};
+
+struct BlockingFinalizationBackend {
+    entered: mpsc::Sender<()>,
+    release: Mutex<mpsc::Receiver<()>>,
+    lifecycle_before_finish: Option<(Arc<crate::InitializedInstance>, String, mpsc::Sender<bool>)>,
+}
+
+impl ReceiverTestBackend for BlockingFinalizationBackend {
+    fn ingest(&self, _groups: NativeLogAdmissionGroups<'_>) -> IngestRequestOutcome {
+        let _ = self.entered.send(());
+        if let Ok(receiver) = self.release.lock() {
+            let _ = receiver.recv();
+        }
+        IngestRequestOutcome::new(Vec::new())
+    }
+
+    fn handles_traces(&self) -> bool {
+        true
+    }
+
+    fn ingest_traces(&self, _groups: NativeSpanAdmissionGroups<'_>) -> IngestRequestOutcome {
+        let _ = self.entered.send(());
+        if let Ok(receiver) = self.release.lock() {
+            let _ = receiver.recv();
+        }
+        if let Some((instance, ingest_secret, observed)) = &self.lifecycle_before_finish {
+            let admitted = instance
+                .attribute(
+                    PresentedCredential::parse(ingest_secret).expect("fixture credential"),
+                    RequestedIntent::Ingest,
+                    CompatibilityHints::none(),
+                )
+                .is_ok();
+            let _ = observed.send(admitted);
+        }
+        IngestRequestOutcome::new(Vec::new())
+    }
+}
+
+struct BlockingQueryExecution {
+    progress: mpsc::Sender<&'static str>,
+    release: Mutex<mpsc::Receiver<()>>,
+}
+
+impl QueryExecutionTestHook for BlockingQueryExecution {
+    fn after_admission(&self) {
+        let _ = self.progress.send("admitted");
+        if let Ok(receiver) = self.release.lock() {
+            let _ = receiver.recv();
+        }
+    }
+}
+
+fn trace_request() -> ExportTraceServiceRequest {
+    ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            scope_spans: vec![ScopeSpans {
+                spans: vec![Span {
+                    trace_id: vec![0x70; 16],
+                    span_id: vec![0x71; 8],
+                    name: "lifecycle-drain".to_owned(),
+                    start_time_unix_nano: 1,
+                    end_time_unix_nano: 2,
+                    ..Span::default()
+                }],
+                ..ScopeSpans::default()
+            }],
+            ..ResourceSpans::default()
+        }],
+    }
+}
 
 #[test]
 fn real_otlp_and_loki_routes_share_one_live_schema_session() -> Result<(), Box<dyn Error>> {
@@ -423,7 +499,7 @@ fn checked_query_resume_revalidates_every_durable_tenant_lifecycle_state()
             .inspect()?
             .outstanding_for(positron_kernel::WorkClass::InteractiveQueryTail);
         let resumed = services.resume_query_events_for_test(context, &cursor, 1)?;
-        if ingest_allowed {
+        if query_allowed {
             match resumed {
                 QueryTestOutcome::Events(_) => {},
                 QueryTestOutcome::Failure(code) => {
@@ -441,7 +517,7 @@ fn checked_query_resume_revalidates_every_durable_tenant_lifecycle_state()
             .resource_governor()
             .inspect()?
             .outstanding_for(positron_kernel::WorkClass::InteractiveQueryTail);
-        if ingest_allowed {
+        if query_allowed {
             assert_eq!(after, 0, "{state} completion did not release query work");
         } else {
             assert_eq!(
@@ -450,6 +526,481 @@ fn checked_query_resume_revalidates_every_durable_tenant_lifecycle_state()
             );
         }
     }
+    Ok(())
+}
+
+#[test]
+fn durable_lifecycle_transition_drains_admitted_ingest_and_revalidates_query_cursor()
+-> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let (initialized, ingest, query_secret, administrator_secret) =
+        fixture.initialized_with_admin()?;
+    let services = ServiceHandle::new(Arc::clone(&initialized))?;
+    for body in ["first", "second"] {
+        assert_eq!(
+            services
+                .ingest_otlp_logs(&ingest, request(body).encode_to_vec())?
+                .accepted_records(),
+            1
+        );
+    }
+    let query_context = initialized.attribute(
+        PresentedCredential::parse(&query_secret)?,
+        RequestedIntent::Query,
+        CompatibilityHints::none(),
+    )?;
+    let events = match services.query_events_for_test(
+        query_context,
+        "logs | range query_time 0 100 | limit 2",
+        QueryBudget::new(1_000_000, 100, 100, 1_000_000, 1_000_000, 60)?.with_cpu_work_units(16)?,
+        Some(1),
+    )? {
+        QueryTestOutcome::Events(events) => events,
+        QueryTestOutcome::Failure(code) => {
+            return Err(format!("initial query failed: {code:?}").into());
+        },
+    };
+    let cursor = match events.last() {
+        Some(QueryEvent::Terminal(QueryTerminal::Continued(cursor))) => cursor.clone(),
+        _ => return Err("initial query did not produce a cursor".into()),
+    };
+    let ingest_context = services.authorize_logs(&ingest)?;
+    let reservation = services.admit_logs(ingest_context)?.take()?;
+    let administrator = || {
+        initialized.attribute(
+            PresentedCredential::parse(&administrator_secret)
+                .expect("fixture administrator syntax"),
+            RequestedIntent::SystemAdministration,
+            CompatibilityHints::none(),
+        )
+    };
+
+    let read_only = initialized.transition_tenant_lifecycle(
+        administrator()?,
+        initialized.default_tenant_id(),
+        TenantLifecycleState::ReadOnly,
+        ResourceGeneration::new(1)?,
+        AdministrativeIdempotencyKey::new([0x73; 16])?,
+    )?;
+    assert_eq!(read_only.to(), TenantLifecycleState::ReadOnly);
+    assert_eq!(
+        services.ingest_decoded_otlp_logs(ingest_context, request("must-not-append"), reservation),
+        Err(ServiceFailure::Unauthorized),
+        "the final Catalog-writer check drains pre-admitted ingest before ReadOnly publishes"
+    );
+    let resumed = services.resume_query_events_for_test(query_context, &cursor, 1)?;
+    assert!(
+        matches!(resumed, QueryTestOutcome::Events(_)),
+        "ReadOnly preserves bounded cursor resume: {resumed:?}"
+    );
+
+    let suspended = initialized.transition_tenant_lifecycle(
+        administrator()?,
+        initialized.default_tenant_id(),
+        TenantLifecycleState::Suspended,
+        read_only.resource_generation(),
+        AdministrativeIdempotencyKey::new([0x74; 16])?,
+    )?;
+    assert_eq!(suspended.to(), TenantLifecycleState::Suspended);
+    let before = initialized
+        .resource_governor()
+        .inspect()?
+        .outstanding_for(positron_kernel::WorkClass::InteractiveQueryTail);
+    assert_eq!(
+        services.resume_query_events_for_test(query_context, &cursor, 1)?,
+        QueryTestOutcome::Failure(QueryFailureCode::Unauthorized)
+    );
+    let after = initialized
+        .resource_governor()
+        .inspect()?
+        .outstanding_for(positron_kernel::WorkClass::InteractiveQueryTail);
+    assert_eq!(
+        after, before,
+        "a suspended cursor cannot admit or leak query work"
+    );
+    Ok(())
+}
+
+#[test]
+fn read_only_closure_waits_for_entered_ingest_and_rejects_later_admission()
+-> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let (initialized, ingest, _, administrator_secret) = fixture.initialized_with_admin()?;
+    let services = ServiceHandle::new(Arc::clone(&initialized))?;
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    services.install_receiver_test_backend(Arc::new(BlockingFinalizationBackend {
+        entered: entered_tx,
+        release: Mutex::new(release_rx),
+        lifecycle_before_finish: None,
+    }))?;
+    let first_services = services.clone();
+    let first_ingest = ingest.clone();
+    let first = std::thread::spawn(move || {
+        first_services.ingest_otlp_logs(&first_ingest, request("draining").encode_to_vec())
+    });
+    entered_rx.recv()?;
+
+    let (closed_tx, closed_rx) = mpsc::channel();
+    initialized.install_lifecycle_transition_observer(closed_tx)?;
+    let transitioning = Arc::clone(&initialized);
+    let transition = std::thread::spawn(move || {
+        let actor = transitioning
+            .attribute(
+                PresentedCredential::parse(&administrator_secret).map_err(|_| {
+                    crate::BootstrapFailure::new(
+                        crate::BootstrapFailureCode::TenantLifecycleUnauthorized,
+                    )
+                })?,
+                RequestedIntent::SystemAdministration,
+                CompatibilityHints::none(),
+            )
+            .map_err(|_| {
+                crate::BootstrapFailure::new(
+                    crate::BootstrapFailureCode::TenantLifecycleUnauthorized,
+                )
+            })?;
+        let expected_generation = ResourceGeneration::new(1).map_err(|_| {
+            crate::BootstrapFailure::new(crate::BootstrapFailureCode::ResourceUnavailable)
+        })?;
+        let idempotency_key = AdministrativeIdempotencyKey::new([0x76; 16]).map_err(|_| {
+            crate::BootstrapFailure::new(crate::BootstrapFailureCode::ResourceUnavailable)
+        })?;
+        transitioning.transition_tenant_lifecycle(
+            actor,
+            transitioning.default_tenant_id(),
+            TenantLifecycleState::ReadOnly,
+            expected_generation,
+            idempotency_key,
+        )
+    });
+    closed_rx.recv()?;
+    assert_eq!(
+        services.ingest_otlp_logs(&ingest, request("must-not-admit").encode_to_vec()),
+        Err(ServiceFailure::Unauthorized),
+        "closure rejects later native admission while the entered finalization drains"
+    );
+    release_tx.send(())?;
+    assert!(first.join().map_err(|_| "ingest thread panicked")?.is_ok());
+    let transition = transition
+        .join()
+        .map_err(|_| "transition thread panicked")??;
+    assert_eq!(transition.to(), TenantLifecycleState::ReadOnly);
+    assert_eq!(
+        services.ingest_otlp_logs(&ingest, request("closed").encode_to_vec()),
+        Err(ServiceFailure::Unauthorized)
+    );
+    Ok(())
+}
+
+#[test]
+fn read_only_closure_waits_for_entered_trace_finalization() -> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let (initialized, ingest, _, administrator_secret) = fixture.initialized_with_admin()?;
+    let services = ServiceHandle::new(Arc::clone(&initialized))?;
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let (lifecycle_tx, lifecycle_rx) = mpsc::channel();
+    services.install_receiver_test_backend(Arc::new(BlockingFinalizationBackend {
+        entered: entered_tx,
+        release: Mutex::new(release_rx),
+        lifecycle_before_finish: Some((Arc::clone(&initialized), ingest.clone(), lifecycle_tx)),
+    }))?;
+    let first_services = services.clone();
+    let first_ingest = ingest.clone();
+    let first = std::thread::spawn(move || {
+        first_services.ingest_otlp_traces(&first_ingest, trace_request().encode_to_vec())
+    });
+    entered_rx.recv()?;
+    let (closed_tx, closed_rx) = mpsc::channel();
+    initialized.install_lifecycle_transition_observer(closed_tx)?;
+    let transitioning = Arc::clone(&initialized);
+    let transition = std::thread::spawn(move || {
+        let actor = transitioning
+            .attribute(
+                PresentedCredential::parse(&administrator_secret).map_err(|_| {
+                    crate::BootstrapFailure::new(
+                        crate::BootstrapFailureCode::TenantLifecycleUnauthorized,
+                    )
+                })?,
+                RequestedIntent::SystemAdministration,
+                CompatibilityHints::none(),
+            )
+            .map_err(|_| {
+                crate::BootstrapFailure::new(
+                    crate::BootstrapFailureCode::TenantLifecycleUnauthorized,
+                )
+            })?;
+        transitioning.transition_tenant_lifecycle(
+            actor,
+            transitioning.default_tenant_id(),
+            TenantLifecycleState::ReadOnly,
+            ResourceGeneration::new(1).map_err(|_| {
+                crate::BootstrapFailure::new(crate::BootstrapFailureCode::ResourceUnavailable)
+            })?,
+            AdministrativeIdempotencyKey::new([0x77; 16]).map_err(|_| {
+                crate::BootstrapFailure::new(crate::BootstrapFailureCode::ResourceUnavailable)
+            })?,
+        )
+    });
+    closed_rx.recv()?;
+    assert_eq!(
+        services.ingest_otlp_traces(&ingest, trace_request().encode_to_vec()),
+        Err(ServiceFailure::Unauthorized),
+    );
+    release_tx.send(())?;
+    assert!(first.join().map_err(|_| "trace thread panicked")?.is_ok());
+    assert!(
+        lifecycle_rx.recv()?,
+        "the admitted trace must finish before ReadOnly publishes"
+    );
+    assert_eq!(
+        transition
+            .join()
+            .map_err(|_| "transition thread panicked")??
+            .to(),
+        TenantLifecycleState::ReadOnly
+    );
+    Ok(())
+}
+
+#[test]
+fn rejected_lifecycle_transition_reopens_native_ingest_admission() -> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let (initialized, ingest, _, administrator_secret) = fixture.initialized_with_admin()?;
+    let services = ServiceHandle::new(Arc::clone(&initialized))?;
+    let actor = initialized.attribute(
+        PresentedCredential::parse(&administrator_secret)?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let rejected = initialized
+        .transition_tenant_lifecycle(
+            actor,
+            initialized.default_tenant_id(),
+            TenantLifecycleState::Active,
+            ResourceGeneration::new(1)?,
+            AdministrativeIdempotencyKey::new([0x7d; 16])?,
+        )
+        .expect_err("the closed lifecycle graph rejects a no-op transition");
+    assert_eq!(
+        rejected.code(),
+        crate::BootstrapFailureCode::TenantLifecycleInvalidTransition
+    );
+    assert_eq!(
+        services
+            .ingest_otlp_logs(&ingest, request("admission-reopened").encode_to_vec())?
+            .accepted_records(),
+        1
+    );
+    Ok(())
+}
+
+#[test]
+fn committed_active_retry_does_not_close_fresh_active_ingest_admission()
+-> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let (initialized, ingest, _, administrator_secret) = fixture.initialized_with_admin()?;
+    let services = ServiceHandle::new(Arc::clone(&initialized))?;
+    let actor = || {
+        initialized.attribute(
+            PresentedCredential::parse(&administrator_secret).expect("fixture credential"),
+            RequestedIntent::SystemAdministration,
+            CompatibilityHints::none(),
+        )
+    };
+    initialized.transition_tenant_lifecycle(
+        actor()?,
+        initialized.default_tenant_id(),
+        TenantLifecycleState::ReadOnly,
+        ResourceGeneration::new(1)?,
+        AdministrativeIdempotencyKey::new([0x81; 16])?,
+    )?;
+    let request_key = AdministrativeIdempotencyKey::new([0x82; 16])?;
+    let committed = initialized.transition_tenant_lifecycle(
+        actor()?,
+        initialized.default_tenant_id(),
+        TenantLifecycleState::Active,
+        ResourceGeneration::new(2)?,
+        request_key,
+    )?;
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    services.install_receiver_test_backend(Arc::new(BlockingFinalizationBackend {
+        entered: entered_tx,
+        release: Mutex::new(release_rx),
+        lifecycle_before_finish: None,
+    }))?;
+    let active_services = services.clone();
+    let active_ingest = ingest.clone();
+    let active_request = std::thread::spawn(move || {
+        active_services.ingest_otlp_logs(&active_ingest, request("active-retry").encode_to_vec())
+    });
+    entered_rx.recv()?;
+    let (closed_tx, closed_rx) = mpsc::channel();
+    initialized.install_lifecycle_transition_observer(closed_tx)?;
+
+    let replay = initialized.transition_tenant_lifecycle(
+        actor()?,
+        initialized.default_tenant_id(),
+        TenantLifecycleState::Active,
+        ResourceGeneration::new(2)?,
+        request_key,
+    )?;
+
+    assert_eq!(replay, committed);
+    assert!(
+        closed_rx.try_recv().is_err(),
+        "an exact committed retry must not close fresh admission"
+    );
+    release_tx.send(())?;
+    assert!(
+        active_request
+            .join()
+            .map_err(|_| "ingest thread panicked")?
+            .is_ok()
+    );
+    Ok(())
+}
+
+#[test]
+fn timed_out_lifecycle_drain_reopens_admission_without_publishing() -> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let (initialized, ingest, _, administrator_secret) = fixture.initialized_with_admin()?;
+    let services = ServiceHandle::new(Arc::clone(&initialized))?;
+    let held = initialized.enter_ingest_finalization()?;
+    let actor = initialized.attribute(
+        PresentedCredential::parse(&administrator_secret)?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let failure = initialized
+        .transition_tenant_lifecycle(
+            actor,
+            initialized.default_tenant_id(),
+            TenantLifecycleState::ReadOnly,
+            ResourceGeneration::new(1)?,
+            AdministrativeIdempotencyKey::new([0x7e; 16])?,
+        )
+        .expect_err("a non-completing finalization must time out");
+    assert_eq!(
+        failure.code(),
+        crate::BootstrapFailureCode::ResourceUnavailable
+    );
+    drop(held);
+    assert_eq!(
+        services
+            .ingest_otlp_logs(
+                &ingest,
+                request("admission-reopened-after-timeout").encode_to_vec()
+            )?
+            .accepted_records(),
+        1
+    );
+    Ok(())
+}
+
+#[test]
+fn suspended_transition_cancels_and_drains_actual_query_route_before_publication()
+-> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let (initialized, ingest, query_secret, administrator_secret) =
+        fixture.initialized_with_admin()?;
+    let services = ServiceHandle::new(Arc::clone(&initialized))?;
+    assert_eq!(
+        services
+            .ingest_otlp_logs(&ingest, request("query-drain").encode_to_vec())?
+            .accepted_records(),
+        1
+    );
+    let before = initialized
+        .resource_governor()
+        .inspect()?
+        .outstanding_for(positron_kernel::WorkClass::InteractiveQueryTail);
+    let (progress_tx, progress_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    services.install_query_execution_test_hook(Arc::new(BlockingQueryExecution {
+        progress: progress_tx.clone(),
+        release: Mutex::new(release_rx),
+    }))?;
+    let querying_services = services.clone();
+    let query = std::thread::spawn(move || {
+        let result = querying_services.query_log_bodies(
+            &query_secret,
+            "logs | range query_time 0 100 | limit 2",
+            QueryBudget::new(1_000_000, 100, 100, 1_000_000, 1_000_000, 60)
+                .expect("fixed query budget")
+                .with_cpu_work_units(16)
+                .expect("fixed query work"),
+        );
+        let _ = progress_tx.send("returned");
+        result
+    });
+    if progress_rx.recv()? != "admitted" {
+        return Err(format!(
+            "query route returned before lifecycle admission: {:?}",
+            query.join().map_err(|_| "query thread panicked")?
+        )
+        .into());
+    }
+    let (closing_tx, closing_rx) = mpsc::channel();
+    initialized.install_lifecycle_query_transition_observer(closing_tx)?;
+    let transitioning = Arc::clone(&initialized);
+    let (completed_tx, completed_rx) = mpsc::channel();
+    let transition = std::thread::spawn(move || {
+        let result = (|| {
+            let actor = transitioning
+                .attribute(
+                    PresentedCredential::parse(&administrator_secret).map_err(|_| {
+                        crate::BootstrapFailure::new(
+                            crate::BootstrapFailureCode::TenantLifecycleUnauthorized,
+                        )
+                    })?,
+                    RequestedIntent::SystemAdministration,
+                    CompatibilityHints::none(),
+                )
+                .map_err(|_| {
+                    crate::BootstrapFailure::new(
+                        crate::BootstrapFailureCode::TenantLifecycleUnauthorized,
+                    )
+                })?;
+            transitioning.transition_tenant_lifecycle(
+                actor,
+                transitioning.default_tenant_id(),
+                TenantLifecycleState::Suspended,
+                ResourceGeneration::new(1).map_err(|_| {
+                    crate::BootstrapFailure::new(crate::BootstrapFailureCode::ResourceUnavailable)
+                })?,
+                AdministrativeIdempotencyKey::new([0x7f; 16]).map_err(|_| {
+                    crate::BootstrapFailure::new(crate::BootstrapFailureCode::ResourceUnavailable)
+                })?,
+            )
+        })();
+        let _ = completed_tx.send(result);
+    });
+    closing_rx.recv()?;
+    assert!(
+        completed_rx.try_recv().is_err(),
+        "restrictive transition must wait for the admitted route to unwind"
+    );
+    release_tx.send(())?;
+    assert_eq!(
+        query.join().map_err(|_| "query thread panicked")?,
+        Err(ServiceFailure::Cancelled),
+        "the ordinary query route observes lifecycle cancellation"
+    );
+    assert_eq!(completed_rx.recv()??.to(), TenantLifecycleState::Suspended);
+    transition
+        .join()
+        .map_err(|_| "transition thread panicked")?;
+    let after = initialized
+        .resource_governor()
+        .inspect()?
+        .outstanding_for(positron_kernel::WorkClass::InteractiveQueryTail);
+    assert_eq!(
+        after, before,
+        "cancelled query route released its query work"
+    );
     Ok(())
 }
 

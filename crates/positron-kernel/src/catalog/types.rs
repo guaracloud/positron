@@ -252,11 +252,12 @@ impl GovernanceFixtureObject {
     #[doc(hidden)]
     pub fn with_lifecycle(&self, lifecycle: TenantLifecycleState) -> Result<Self, CatalogFailure> {
         let mut plaintext = self.plaintext.clone();
-        let lifecycle_end = if plaintext.starts_with(b"POSGOV05") {
-            CatalogGovernanceObject::decode(&plaintext)?.fixture_lifecycle_end()?
-        } else {
-            plaintext.len()
-        };
+        let lifecycle_end =
+            if plaintext.starts_with(b"POSGOV05") || plaintext.starts_with(b"POSGOV06") {
+                CatalogGovernanceObject::decode(&plaintext)?.fixture_lifecycle_end()?
+            } else {
+                plaintext.len()
+            };
         let start = lifecycle_end
             .checked_sub(5)
             .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::IntegrityCorruption))?;

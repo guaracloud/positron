@@ -11,7 +11,9 @@ pub struct QueryCancellation {
 }
 
 impl QueryCancellation {
-    pub(crate) fn new() -> Self {
+    /// Creates an execution-scoped cancellation handle for a bounded query or tail.
+    #[must_use]
+    pub fn new() -> Self {
         Self {
             cancelled: Arc::new(AtomicBool::new(false)),
         }
@@ -24,6 +26,12 @@ impl QueryCancellation {
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
+    }
+}
+
+impl Default for QueryCancellation {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
