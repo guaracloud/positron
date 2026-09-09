@@ -872,6 +872,11 @@ checksum = "05c8b63e8d9609db387f0324918f81d68fe27748f084ef092fb35954d0539a85"
 [[package]]
 name = "positron-api"
 version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "zeroize",
+]
 
 [[package]]
 name = "positron-darwin-acl"

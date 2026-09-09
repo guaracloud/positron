@@ -1599,6 +1599,17 @@ Later audit entries continue from the prior committed hash. Recovery
 never truncates an unrelated committed audit record or allows a chain to
 reference an invisible entry.
 
+For API-key create only, a pre-marker fault retains encrypted
+transaction-owned prepared evidence that binds the canonical request to the
+exact generated salted verifier, commit record, and prepared audit entry before
+the immutable transaction digest. The same request may publish that exact
+predecessor after artifact verification. A changed request conflicts; a missing,
+unauthenticated, incomplete, or advanced predecessor is unavailable without
+mutation. The raw API-key secret is never part of prepared evidence and is not
+recovered or redisplayed. Startup postpones only its unaudited ledger
+publications while that evidence exists so the owning retry has this resolution
+point.
+
 Governance-sensitive tenant, principal, policy, quota, retention,
 configuration, key, repository, and lifecycle mutations cannot publish
 without their bound audit entry. Catalog state and governance evidence

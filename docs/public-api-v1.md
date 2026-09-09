@@ -5,8 +5,15 @@ committed Rust types, gRPC and HTTP/JSON mappings, OpenAPI description, Schema
 Digest, JSON Schema, reference documentation, and validation fixtures form one
 product surface and change together.
 
-This surface exposes capability negotiation. It does not yet start a listener,
-publish an SDK, or implement query execution.
+The native `api` listener exposes capability negotiation and authenticated
+API-key lifecycle management. The `positron key` CLI uses that listener with
+bearer metadata from a non-terminal stdin pipe. It accepts no credential
+argument or environment variable. See [the canonical API reference](../api/positron/v1/README.md)
+for the create, list, rotate, revoke, and scope-inspect request contract, generation
+preconditions, idempotency semantics, failure codes, and one-time secret output.
+A create retry that completes an authenticated pre-marker preparation returns the
+original principal with no secret; it never reconstructs or redisplays the original secret.
+SDK publication and a public query transport remain unavailable.
 
 ## Compatibility and capability behavior
 

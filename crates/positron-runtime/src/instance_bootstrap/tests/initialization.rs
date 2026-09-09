@@ -4,22 +4,27 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use positron_governance::{CompatibilityHints, PresentedCredential, RequestedIntent};
-use positron_kernel::{MountQualification, PrimaryDataVolume};
-use positron_runtime::{
+use crate::{
     BootstrapFailureCode, BootstrapPaths, BootstrapState, InitializationPlan, InstanceBootstrap,
+};
+use positron_domain::identity::Scope;
+use positron_governance::{AdministrativeIdempotencyKey, ResourceGeneration};
+use positron_governance::{CompatibilityHints, PresentedCredential, RequestedIntent};
+use positron_kernel::{
+    CatalogPublicationFault, MountQualification, PrimaryDataVolume,
+    with_catalog_publication_fault_after,
 };
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
 
-struct Roots {
+pub(super) struct Roots {
     parent: PathBuf,
-    data: PathBuf,
+    pub(super) data: PathBuf,
     secrets: PathBuf,
 }
 
 impl Roots {
-    fn new() -> Result<Self, std::io::Error> {
+    pub(super) fn new() -> Result<Self, std::io::Error> {
         let sequence = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
         let parent = std::env::temp_dir().join(format!(
             "positron-instance-bootstrap-test-{}-{sequence}",
@@ -38,7 +43,7 @@ impl Roots {
         })
     }
 
-    fn paths(&self) -> Result<BootstrapPaths, BootstrapFailureCode> {
+    pub(super) fn paths(&self) -> Result<BootstrapPaths, BootstrapFailureCode> {
         BootstrapPaths::new(&self.data, &self.secrets, MountQualification::LocalHost)
             .map_err(|failure| failure.code())
     }
@@ -84,6 +89,355 @@ fn reopened_identity_authenticates_the_hash_only_administrator_without_impersona
         )
         .expect_err("a system administrator cannot impersonate a tenant principal");
     assert_eq!(rejected.to_string(), "credential or authority was rejected");
+    Ok(())
+}
+
+#[test]
+fn administrator_creates_a_one_time_tenant_administration_key_that_survives_reopen()
+-> Result<(), Box<dyn Error>> {
+    let roots = Roots::new()?;
+    let paths = roots.paths().map_err(|code| format!("paths: {code:?}"))?;
+    let initialized = InstanceBootstrap::initialize(&paths, InitializationPlan::non_interactive())?;
+    drop(initialized);
+    let bootstrap = InstanceBootstrap::claim(&paths)?;
+    let initialized = InstanceBootstrap::reopen(&paths)?;
+    let administrator = initialized.attribute(
+        PresentedCredential::parse(bootstrap.secret())?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let created = initialized
+        .create_api_key(
+            administrator,
+            Scope::TenantAdministration,
+            None,
+            ResourceGeneration::new(1)?,
+            AdministrativeIdempotencyKey::new([42; 16])?,
+        )
+        .expect("administrator key creation commits");
+    let secret = created.secret().ok_or("creation secret")?.to_owned();
+    assert!(!format!("{created:?}").contains(&secret));
+    drop(initialized);
+
+    let reopened = InstanceBootstrap::reopen(&paths).expect("created key state reopens");
+    let authorized = reopened
+        .attribute(
+            PresentedCredential::parse(&secret)?,
+            RequestedIntent::TenantAdministration,
+            CompatibilityHints::none(),
+        )
+        .expect("created tenant administrator attributes");
+    assert_eq!(authorized.scope(), Scope::TenantAdministration);
+    assert_eq!(
+        authorized
+            .tenant_attribution()
+            .map(|tenant| tenant.tenant_id()),
+        Some(reopened.default_tenant_id())
+    );
+    reopened
+        .governance_fixture_for_test()
+        .expect("the current V5 governance object remains available to integration fixtures");
+    Ok(())
+}
+
+#[test]
+fn tenant_key_rotation_keeps_both_credentials_live_until_explicit_revocation()
+-> Result<(), Box<dyn Error>> {
+    let roots = Roots::new()?;
+    let paths = roots.paths().map_err(|code| format!("paths: {code:?}"))?;
+    drop(InstanceBootstrap::initialize(
+        &paths,
+        InitializationPlan::non_interactive(),
+    )?);
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    let administrator = instance.attribute(
+        PresentedCredential::parse(claim.secret())?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let first = instance.create_api_key(
+        administrator,
+        Scope::Query,
+        None,
+        ResourceGeneration::new(1)?,
+        AdministrativeIdempotencyKey::new([43; 16])?,
+    )?;
+    let first_secret = first.secret().ok_or("first key secret")?.to_owned();
+    let successor = instance.rotate_api_key(
+        administrator,
+        first.principal_id(),
+        ResourceGeneration::new(2)?,
+        AdministrativeIdempotencyKey::new([44; 16])?,
+    )?;
+    let successor_secret = successor.secret().ok_or("successor secret")?.to_owned();
+    let rotation_replay = instance.rotate_api_key(
+        administrator,
+        first.principal_id(),
+        ResourceGeneration::new(2)?,
+        AdministrativeIdempotencyKey::new([44; 16])?,
+    )?;
+    assert_eq!(rotation_replay.principal_id(), successor.principal_id());
+    assert!(rotation_replay.secret().is_none());
+
+    let descriptors = instance.list_api_keys(administrator)?;
+    assert!(descriptors.iter().any(|descriptor| {
+        descriptor.principal_id() == first.principal_id()
+            && descriptor.scope() == Scope::Query
+            && descriptor.is_active()
+    }));
+    assert!(!format!("{descriptors:?}").contains(&first_secret));
+
+    for secret in [&first_secret, &successor_secret] {
+        instance.attribute(
+            PresentedCredential::parse(secret)?,
+            RequestedIntent::Query,
+            CompatibilityHints::none(),
+        )?;
+    }
+    instance.revoke_api_key(
+        administrator,
+        first.principal_id(),
+        ResourceGeneration::new(3)?,
+        AdministrativeIdempotencyKey::new([45; 16])?,
+    )?;
+    instance.revoke_api_key(
+        administrator,
+        first.principal_id(),
+        ResourceGeneration::new(3)?,
+        AdministrativeIdempotencyKey::new([45; 16])?,
+    )?;
+    let revoke_conflict = instance
+        .revoke_api_key(
+            administrator,
+            successor.principal_id(),
+            ResourceGeneration::new(3)?,
+            AdministrativeIdempotencyKey::new([45; 16])?,
+        )
+        .expect_err("idempotency cannot bind a different revoked credential");
+    assert_eq!(
+        revoke_conflict.code(),
+        BootstrapFailureCode::ApiKeyIdempotencyConflict
+    );
+    let descriptors = instance.list_api_keys(administrator)?;
+    assert!(descriptors.iter().any(|descriptor| {
+        descriptor.principal_id() == first.principal_id() && !descriptor.is_active()
+    }));
+    assert!(
+        instance
+            .attribute(
+                PresentedCredential::parse(&first_secret)?,
+                RequestedIntent::Query,
+                CompatibilityHints::none(),
+            )
+            .is_err()
+    );
+    instance.attribute(
+        PresentedCredential::parse(&successor_secret)?,
+        RequestedIntent::Query,
+        CompatibilityHints::none(),
+    )?;
+    Ok(())
+}
+
+#[test]
+fn expired_tenant_key_is_rejected_using_the_lifecycle_clock() -> Result<(), Box<dyn Error>> {
+    let roots = Roots::new()?;
+    let paths = roots.paths().map_err(|code| format!("paths: {code:?}"))?;
+    drop(InstanceBootstrap::initialize(
+        &paths,
+        InitializationPlan::non_interactive(),
+    )?);
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    let administrator = instance.attribute(
+        PresentedCredential::parse(claim.secret())?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let expired = instance.create_api_key(
+        administrator,
+        Scope::Query,
+        Some(1),
+        ResourceGeneration::new(1)?,
+        AdministrativeIdempotencyKey::new([46; 16])?,
+    )?;
+    let expired_secret = expired.secret().ok_or("expiry secret")?.to_owned();
+    drop(instance);
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    assert!(
+        instance
+            .attribute(
+                PresentedCredential::parse(&expired_secret)?,
+                RequestedIntent::Query,
+                CompatibilityHints::none(),
+            )
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn identical_api_key_create_retry_resolves_the_original_redacted_result()
+-> Result<(), Box<dyn Error>> {
+    let roots = Roots::new()?;
+    let paths = roots.paths().map_err(|code| format!("paths: {code:?}"))?;
+    drop(InstanceBootstrap::initialize(
+        &paths,
+        InitializationPlan::non_interactive(),
+    )?);
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    let administrator = || {
+        instance.attribute(
+            PresentedCredential::parse(claim.secret()).expect("claim syntax"),
+            RequestedIntent::SystemAdministration,
+            CompatibilityHints::none(),
+        )
+    };
+    let idempotency = AdministrativeIdempotencyKey::new([47; 16])?;
+    let first = instance.create_api_key(
+        administrator()?,
+        Scope::Ingest,
+        None,
+        ResourceGeneration::new(1)?,
+        idempotency,
+    )?;
+    let replay = instance.create_api_key(
+        administrator()?,
+        Scope::Ingest,
+        None,
+        ResourceGeneration::new(1)?,
+        idempotency,
+    )?;
+    assert_eq!(replay.principal_id(), first.principal_id());
+    assert!(replay.secret().is_none());
+    Ok(())
+}
+
+#[test]
+fn api_key_create_rejects_stale_generation_and_mismatched_idempotency_reuse()
+-> Result<(), Box<dyn Error>> {
+    let roots = Roots::new()?;
+    let paths = roots.paths().map_err(|code| format!("paths: {code:?}"))?;
+    drop(InstanceBootstrap::initialize(
+        &paths,
+        InitializationPlan::non_interactive(),
+    )?);
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    let administrator = || {
+        instance.attribute(
+            PresentedCredential::parse(claim.secret()).expect("claim syntax"),
+            RequestedIntent::SystemAdministration,
+            CompatibilityHints::none(),
+        )
+    };
+    let idempotency = AdministrativeIdempotencyKey::new([48; 16])?;
+    instance.create_api_key(
+        administrator()?,
+        Scope::Ingest,
+        None,
+        ResourceGeneration::new(1)?,
+        idempotency,
+    )?;
+    let descriptors_before_failure = instance.list_api_keys(administrator()?)?;
+    let mismatch = instance
+        .create_api_key(
+            administrator()?,
+            Scope::Query,
+            None,
+            ResourceGeneration::new(1)?,
+            idempotency,
+        )
+        .expect_err("idempotency key cannot bind a different scope");
+    assert_eq!(
+        mismatch.code(),
+        BootstrapFailureCode::ApiKeyIdempotencyConflict
+    );
+    let stale = instance
+        .create_api_key(
+            administrator()?,
+            Scope::Query,
+            None,
+            ResourceGeneration::new(1)?,
+            AdministrativeIdempotencyKey::new([49; 16])?,
+        )
+        .expect_err("new mutation cannot overwrite a stale credential generation");
+    assert_eq!(stale.code(), BootstrapFailureCode::ApiKeyStaleGeneration);
+    assert_eq!(
+        instance.list_api_keys(administrator()?)?,
+        descriptors_before_failure,
+        "failed lifecycle mutations must not publish a partial credential set"
+    );
+    Ok(())
+}
+
+#[test]
+fn ambiguous_api_key_publication_recovers_one_consistent_idempotent_outcome()
+-> Result<(), Box<dyn Error>> {
+    let roots = Roots::new()?;
+    let paths = roots.paths().map_err(|code| format!("paths: {code:?}"))?;
+    drop(InstanceBootstrap::initialize(
+        &paths,
+        InitializationPlan::non_interactive(),
+    )?);
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    let administrator = || {
+        instance.attribute(
+            PresentedCredential::parse(claim.secret()).expect("claim syntax"),
+            RequestedIntent::SystemAdministration,
+            CompatibilityHints::none(),
+        )
+    };
+    let idempotency = AdministrativeIdempotencyKey::new([50; 16])?;
+    let before = instance.list_api_keys(administrator()?)?;
+    let failed = with_catalog_publication_fault_after(
+        CatalogPublicationFault::SynchronizeGenerationDirectory,
+        0,
+        || {
+            instance.create_api_key(
+                administrator().expect("administrator"),
+                Scope::Query,
+                None,
+                ResourceGeneration::new(1).expect("generation"),
+                idempotency,
+            )
+        },
+    )
+    .expect_err("catalog publication fault must reject the lifecycle mutation");
+    assert_eq!(failed.code(), BootstrapFailureCode::CatalogUnavailable);
+    drop(instance);
+    let recovered = InstanceBootstrap::reopen(&paths)?;
+    let administrator = || {
+        recovered.attribute(
+            PresentedCredential::parse(claim.secret()).expect("claim syntax"),
+            RequestedIntent::SystemAdministration,
+            CompatibilityHints::none(),
+        )
+    };
+    let after = recovered.list_api_keys(administrator()?)?;
+    assert!(
+        after == before || after.len() == before.len() + 1,
+        "recovery must expose either the predecessor or the one complete successor"
+    );
+    let retried = recovered.create_api_key(
+        administrator()?,
+        Scope::Query,
+        None,
+        ResourceGeneration::new(1)?,
+        idempotency,
+    )?;
+    assert_eq!(
+        retried.secret().is_some(),
+        after == before,
+        "only an unpublished mutation may create and show a new secret on retry"
+    );
+    assert_eq!(
+        recovered.list_api_keys(administrator()?)?.len(),
+        before.len() + 1
+    );
     Ok(())
 }
 

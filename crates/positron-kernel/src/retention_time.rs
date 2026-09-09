@@ -223,6 +223,15 @@ impl RetentionTimeAuthority {
             .and_then(|value| u64::try_from(value).ok())
             .ok_or(LifecycleClockFailure::OutOfRange)
     }
+
+    /// Returns the persisted lifecycle-clock observation used by governed
+    /// expiry decisions for one already-established scope.
+    pub fn governance_time_seconds(
+        &self,
+        scope: SegmentScope,
+    ) -> Result<u64, LifecycleClockFailure> {
+        self.lease_time(scope)
+    }
 }
 
 fn advance(

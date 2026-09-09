@@ -53,6 +53,31 @@ fn route(
     services: Option<&ServiceHandle>,
 ) -> Result<Response, Response> {
     match (role, head.method.as_str(), head.path.as_str()) {
+        (ListenerRole::Api, "POST", positron_api::api_keys::HTTP_PATH) => {
+            let services = services.ok_or_else(|| Response::empty(503))?;
+            let bearer = head.bearer.as_deref().ok_or_else(|| {
+                Response::json(401, "{\"code\":\"authentication_rejected\"}".to_owned())
+            })?;
+            let body = read_body(
+                stream,
+                head.content_length,
+                positron_api::api_keys::MAX_REQUEST_BYTES,
+            )?;
+            match services.administer_api_keys(bearer, &body) {
+                Ok(response) => {
+                    let body = response.encode().map_err(|_| Response::empty(500))?;
+                    Ok(Response {
+                        status: 200,
+                        content_type: "application/json",
+                        body,
+                        retry_after_seconds: None,
+                    })
+                },
+                Err((status, code)) => {
+                    Ok(Response::json(status, format!("{{\"code\":\"{code}\"}}")))
+                },
+            }
+        },
         (ListenerRole::Operations, "GET", "/health/live") => {
             Ok(health_response(health.liveness() == Liveness::Live, "live"))
         },
@@ -83,6 +108,7 @@ fn route(
         },
         (ListenerRole::Operations, _, "/health/live" | "/health/ready")
         | (ListenerRole::Api, _, "/v1/capabilities:negotiate")
+        | (ListenerRole::Api, _, positron_api::api_keys::HTTP_PATH)
         | (ListenerRole::OtlpHttp, _, "/v1/logs" | "/v1/traces") => Ok(Response::empty(405)),
         (ListenerRole::LokiPush, _, "/loki/api/v1/push" | "/otlp/v1/logs") => {
             Ok(Response::empty(405))
@@ -123,6 +149,7 @@ fn read_head(stream: &mut TcpStream) -> Result<RequestHead, Response> {
     }
     let mut content_length = None;
     let mut bearer = None;
+    let mut authorization_seen = false;
     let mut content_type = None;
     let mut content_encoding = None;
     let mut tenant_hint = None;
@@ -135,6 +162,10 @@ fn read_head(stream: &mut TcpStream) -> Result<RequestHead, Response> {
             }
             content_length = Some(value.parse().map_err(|_| Response::empty(400))?);
         } else if name.eq_ignore_ascii_case("authorization") {
+            if authorization_seen {
+                return Err(Response::empty(400));
+            }
+            authorization_seen = true;
             bearer = value.strip_prefix("Bearer ").map(ToOwned::to_owned);
         } else if name.eq_ignore_ascii_case("content-type") {
             if content_type.is_some() {
@@ -290,6 +321,7 @@ fn write_response(stream: &mut TcpStream, response: Response) -> Result<(), std:
         401 => "Unauthorized",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        409 => "Conflict",
         413 => "Content Too Large",
         415 => "Unsupported Media Type",
         422 => "Unprocessable Content",

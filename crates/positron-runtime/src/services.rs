@@ -14,6 +14,7 @@ use positron_query::QueryBudget;
 
 use crate::InitializedInstance;
 
+mod api_keys;
 mod failure;
 mod ingest;
 mod otlp;

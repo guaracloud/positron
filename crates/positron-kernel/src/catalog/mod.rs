@@ -6,6 +6,7 @@ mod codec;
 mod fixture;
 mod governance_object;
 mod inspection;
+mod preparation;
 mod recovery;
 mod rotation;
 mod storage;
@@ -24,9 +25,10 @@ use codec::{
     CommitRecord, encode_commit, generation_identity, object_set_digest, prepare_audit,
     snapshot_from_record, transaction_digest,
 };
+use preparation::PreparedCommit;
 use recovery::load_snapshot;
 use recovery::recover;
-use storage::CatalogStorage;
+use storage::{CatalogStorage, PreparedLookup};
 
 use crate::data_protection::ControlTokenProtector;
 use crate::resource_governor::CatalogWriterLease;
@@ -35,7 +37,7 @@ use crate::{RecoveryWorkClaim, RecoveryWorkKind, StorageKernelResourceAuthority}
 #[cfg(feature = "test-support")]
 pub use fixture::GovernanceFixtureTarget;
 pub use governance_object::{
-    CatalogGovernanceObject, CatalogGovernanceVersion, CatalogLogRetentionPolicy,
+    CatalogCredential, CatalogGovernanceObject, CatalogGovernanceVersion, CatalogLogRetentionPolicy,
 };
 #[cfg(feature = "test-support")]
 pub use storage::{
@@ -104,6 +106,13 @@ struct TransactionOutcome {
     digest: [u8; 32],
     record: CommitRecord,
     audit: Option<GovernanceAuditRecord>,
+}
+
+/// Resolution of a transaction-owned, unpublished administrative proposal.
+pub enum PreparedTransactionResolution {
+    Absent,
+    Resumed(CatalogCommit),
+    Unavailable,
 }
 
 impl std::fmt::Debug for Catalog<'_> {
@@ -177,6 +186,21 @@ impl<'authority> Catalog<'authority> {
         Ok(recover(&storage, &secret, instance)?.current)
     }
 
+    /// Reports whether an unpublished prepared administrative transaction defers
+    /// startup publications until its owner resolves it or it fails closed.
+    pub fn has_prepared_transaction(&self) -> Result<bool, CatalogFailure> {
+        let _operation = self
+            .operation
+            .lock()
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
+        let secret = self
+            .secret
+            .lock()
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
+        self.storage
+            .has_prepared_transaction(&secret, self.instance)
+    }
+
     /// Pins the complete currently published immutable generation.
     pub fn pin(&self) -> Result<CatalogSnapshot, CatalogFailure> {
         self.state
@@ -210,7 +234,7 @@ impl<'authority> Catalog<'authority> {
                 .operation
                 .lock()
                 .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
-            self.commit_unreserved(expected, proposal, audit)
+            self.commit_unreserved(expected, proposal, audit, None)
         };
         drop(_reservation);
         #[cfg(any(test, feature = "test-support"))]
@@ -223,11 +247,163 @@ impl<'authority> Catalog<'authority> {
         result
     }
 
+    /// Publishes an administrative proposal whose retry identity is fixed before
+    /// entropy-derived proposal contents are generated.
+    pub fn commit_prepared(
+        &self,
+        expected: CatalogGenerationId,
+        proposal: CatalogProposal,
+        audit: AuditIntent,
+        request_digest: [u8; 32],
+    ) -> Result<CatalogCommit, CatalogFailure> {
+        let durability_claim = RecoveryWorkClaim::system(
+            RecoveryWorkKind::DurabilityCompletion,
+            commit_resource_claim(&proposal, Some(&audit))?,
+        )
+        .map_err(|_| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?;
+        let _reservation = self
+            .authority
+            .recovery()
+            .reserve(durability_claim)
+            .map_err(CatalogFailure::admission)?;
+        let result = {
+            let _operation = self
+                .operation
+                .lock()
+                .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
+            self.commit_unreserved(expected, proposal, Some(audit), Some(request_digest))
+        };
+        drop(_reservation);
+        result
+    }
+
+    /// Resolves an unpublished administrative transaction without accepting a
+    /// replacement proposal for its transaction identity.
+    pub fn resume_prepared(
+        &self,
+        transaction: TransactionId,
+        request_digest: [u8; 32],
+    ) -> Result<PreparedTransactionResolution, CatalogFailure> {
+        let _operation = self
+            .operation
+            .lock()
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
+        let secret = self
+            .secret
+            .lock()
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
+        let recovered = recover(&self.storage, &secret, self.instance)?;
+        if recovered.current.number() > state.current.number() {
+            *state = recovered;
+        }
+        match self
+            .storage
+            .prepared_transaction(&secret, self.instance, transaction)?
+        {
+            PreparedLookup::Absent => Ok(PreparedTransactionResolution::Absent),
+            PreparedLookup::Unavailable => Ok(PreparedTransactionResolution::Unavailable),
+            PreparedLookup::Found {
+                transaction,
+                prepared,
+            } => {
+                if prepared.request_digest != request_digest {
+                    return Err(CatalogFailure::new(CatalogFailureCode::IdempotencyConflict));
+                }
+                let audit_frontier = state.current.0.audit_frontier;
+                if prepared.record.predecessor != state.current.identity()
+                    || prepared.record.number
+                        != state
+                            .current
+                            .number()
+                            .checked_add(1)
+                            .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?
+                    || prepared.audit.position
+                        != audit_frontier
+                            .position
+                            .checked_add(1)
+                            .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?
+                    || prepared.audit.predecessor_hash != audit_frontier.hash
+                {
+                    return Ok(PreparedTransactionResolution::Unavailable);
+                }
+                for object in &prepared.record.objects {
+                    self.storage.read_object(
+                        &secret,
+                        self.instance,
+                        *object,
+                        prepared.record.format_epoch,
+                    )?;
+                }
+                if self.storage.read_audit(
+                    &secret,
+                    self.instance,
+                    prepared.audit.position,
+                    prepared.audit.hash,
+                )? != prepared.encoded_audit
+                {
+                    return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
+                }
+                let additional_history_bytes =
+                    retained_artifact_bytes(prepared.encoded_commit.len())?
+                        .checked_add(storage::MARKER_BYTES)
+                        .and_then(|bytes| {
+                            bytes.checked_add(
+                                retained_artifact_bytes(prepared.encoded_audit.len()).ok()?,
+                            )
+                        })
+                        .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?;
+                reserve_history(
+                    state.retained_history_bytes,
+                    additional_history_bytes,
+                    prepared.record.number,
+                )?;
+                self.storage.publish_commit(
+                    &transaction,
+                    &secret,
+                    self.instance,
+                    prepared.record.generation,
+                    &prepared.encoded_commit,
+                )?;
+                self.storage.publish_marker(
+                    &transaction,
+                    &secret,
+                    prepared.record.number,
+                    prepared.record.generation,
+                )?;
+                let snapshot =
+                    load_snapshot(&self.storage, &secret, self.instance, &prepared.record)?;
+                state.audit.push(prepared.audit.clone());
+                state.transactions.insert(
+                    prepared.record.transaction,
+                    TransactionOutcome {
+                        digest: prepared.record.transaction_digest,
+                        record: prepared.record.clone(),
+                        audit: Some(prepared.audit.clone()),
+                    },
+                );
+                state.current = snapshot.clone();
+                state.retained_history_bytes = state
+                    .retained_history_bytes
+                    .checked_add(additional_history_bytes)
+                    .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?;
+                Ok(PreparedTransactionResolution::Resumed(CatalogCommit {
+                    snapshot,
+                    audit: Some(prepared.audit),
+                }))
+            },
+        }
+    }
+
     fn commit_unreserved(
         &self,
         expected: CatalogGenerationId,
         proposal: CatalogProposal,
         audit: Option<AuditIntent>,
+        prepared_request: Option<[u8; 32]>,
     ) -> Result<CatalogCommit, CatalogFailure> {
         let mut state = self
             .state
@@ -324,9 +500,25 @@ impl<'authority> Catalog<'authority> {
             additional_history_bytes,
             number,
         )?;
-        let transaction = self
-            .storage
-            .open_transaction(proposal.transaction, digest)?;
+        let transaction = match prepared_request {
+            Some(request_digest) => {
+                let (audit, encoded_audit) = prepared_audit
+                    .as_ref()
+                    .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::InvalidInput))?;
+                let prepared = PreparedCommit::new(
+                    request_digest,
+                    record.clone(),
+                    encoded_commit.clone(),
+                    audit.clone(),
+                    encoded_audit.clone(),
+                )?;
+                self.storage
+                    .prepare_transaction(&secret, self.instance, &prepared)?
+            },
+            None => self
+                .storage
+                .open_transaction(proposal.transaction, digest)?,
+        };
 
         let mut objects = BTreeMap::new();
         for object in proposal.objects {

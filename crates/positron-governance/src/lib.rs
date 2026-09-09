@@ -11,14 +11,19 @@ use std::fmt::{Display, Formatter};
 
 use positron_domain::identity::{ExternalTenantAlias, PrincipalId, TenantId, TenantSlug};
 
+mod api_key_administration;
 mod audit;
 mod identity;
 mod policy_administration;
 
+pub use api_key_administration::{
+    ApiKeyAdministration, ApiKeyAdministrationFailure, ApiKeyCreateRequest, ApiKeyCreation,
+    ApiKeyDescriptor,
+};
 pub use audit::{
-    CatalogRootRotationAuditEntry, CatalogRootRotationStage, GovernanceAuditEntry,
-    IngestPolicyActivationAuditEntry, InitialAuditMetadata, InitializationAuditEntry,
-    SchemaCheckpointAuditEntry, schema_checkpoint_audit_intent,
+    ApiKeyLifecycleAction, CatalogRootRotationAuditEntry, CatalogRootRotationStage,
+    GovernanceAuditEntry, IngestPolicyActivationAuditEntry, InitialAuditMetadata,
+    InitializationAuditEntry, SchemaCheckpointAuditEntry, schema_checkpoint_audit_intent,
 };
 pub use identity::{
     AttributionFailure, AuthorizedContext, CompatibilityHints, GovernanceInspection, Identity,
@@ -30,7 +35,7 @@ pub use policy_administration::{
     ResourceGeneration,
 };
 
-const GOVERNANCE_OBJECT_MAGIC: [u8; 8] = *b"POSGOV04";
+const GOVERNANCE_OBJECT_MAGIC: [u8; 8] = *b"POSGOV05";
 const GOVERNANCE_AUDIT_MAGIC: [u8; 8] = *b"POSAUD02";
 const DEFAULT_EXTERNAL_TENANT_ALIAS: &str = "trace-external";
 
@@ -307,6 +312,25 @@ impl InitialGovernanceIntent {
         // Active lifecycle, system-administration scope, policy generation 1,
         // and independent local-key recovery required.
         object.extend_from_slice(&[1, 4, 0, 1, 1]);
+        object.extend_from_slice(&1_u64.to_be_bytes());
+        object.extend_from_slice(&3_u16.to_be_bytes());
+        for (credential_principal, scope, salt, hash) in [
+            (principal, 4_u8, api_key_salt, api_key_hash),
+            (
+                ingest_principal,
+                1,
+                ingest_api_key_salt,
+                ingest_api_key_hash,
+            ),
+            (query_principal, 2, query_api_key_salt, query_api_key_hash),
+        ] {
+            object.extend_from_slice(&credential_principal.to_bytes());
+            object.push(scope);
+            object.push(1);
+            object.extend_from_slice(&0_u64.to_be_bytes());
+            object.extend_from_slice(&salt);
+            object.extend_from_slice(&hash);
+        }
         let mut audit = Vec::with_capacity(160);
         audit.extend_from_slice(&GOVERNANCE_AUDIT_MAGIC);
         audit.extend_from_slice(&audit_context.ingest_time_unix_seconds.to_be_bytes());
@@ -350,7 +374,11 @@ impl Error for GovernanceIntentFailure {}
 #[cfg(fuzzing)]
 pub fn fuzz_parse_governance(identity: &[u8], audit: &[u8]) {
     let _ = identity::codec::decode_initial_identity(identity);
-    let _ = audit::InitializationAuditEntry::decode_intent(1, audit);
+    let mut transaction = [0_u8; 16];
+    if let Some(suffix) = audit.get(audit.len().saturating_sub(16)..) {
+        transaction[..suffix.len()].copy_from_slice(suffix);
+    }
+    let _ = GovernanceAuditEntry::decode_fields(1, transaction, audit);
 }
 
 /// Exercises the closed heterogeneous audit decoder with arbitrary fields in

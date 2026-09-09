@@ -1,6 +1,8 @@
 use std::fmt::Formatter;
 use std::sync::Arc;
 
+#[cfg(feature = "test-support")]
+use super::governance_object::CatalogGovernanceObject;
 use crate::data_protection::{DataProtection, SecretKeyBytes};
 #[cfg(feature = "test-support")]
 use positron_domain::lifecycle::TenantLifecycleState;
@@ -250,12 +252,16 @@ impl GovernanceFixtureObject {
     #[doc(hidden)]
     pub fn with_lifecycle(&self, lifecycle: TenantLifecycleState) -> Result<Self, CatalogFailure> {
         let mut plaintext = self.plaintext.clone();
-        let start = plaintext
-            .len()
+        let lifecycle_end = if plaintext.starts_with(b"POSGOV05") {
+            CatalogGovernanceObject::decode(&plaintext)?.fixture_lifecycle_end()?
+        } else {
+            plaintext.len()
+        };
+        let start = lifecycle_end
             .checked_sub(5)
             .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::IntegrityCorruption))?;
         let suffix = plaintext
-            .get_mut(start..)
+            .get_mut(start..lifecycle_end)
             .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::IntegrityCorruption))?;
         let lifecycle_byte = suffix
             .first_mut()

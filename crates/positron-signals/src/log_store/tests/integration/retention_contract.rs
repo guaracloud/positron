@@ -242,8 +242,10 @@ fn retention_refuses_a_policy_removed_from_the_current_catalog_before_mutation()
         .object_identities()
         .filter_map(|identity| {
             let bytes = basis.object(identity).ok().flatten()?;
-            (!bytes.starts_with(b"POSGOV03") && !bytes.starts_with(b"POSGOV04"))
-                .then(|| CatalogObject::new(bytes.to_vec()).ok())?
+            (!bytes.starts_with(b"POSGOV03")
+                && !bytes.starts_with(b"POSGOV04")
+                && !bytes.starts_with(b"POSGOV05"))
+            .then(|| CatalogObject::new(bytes.to_vec()).ok())?
         })
         .collect::<Vec<_>>();
     catalog.commit(
@@ -297,8 +299,10 @@ fn retention_refuses_a_stale_policy_after_valid_governance_replacement()
         .object_identities()
         .filter_map(|identity| {
             let bytes = basis.object(identity).ok().flatten()?;
-            (!bytes.starts_with(b"POSGOV03") && !bytes.starts_with(b"POSGOV04"))
-                .then(|| CatalogObject::new(bytes.to_vec()).ok())?
+            (!bytes.starts_with(b"POSGOV03")
+                && !bytes.starts_with(b"POSGOV04")
+                && !bytes.starts_with(b"POSGOV05"))
+            .then(|| CatalogObject::new(bytes.to_vec()).ok())?
         })
         .collect::<Vec<_>>();
     objects.push(CatalogObject::new(governance_fixture(

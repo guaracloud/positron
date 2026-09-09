@@ -8,3 +8,6 @@
 
 /// V1 wire and in-memory interface types.
 pub mod generated;
+
+/// V1 API-key administration wire types and bounded client encoding.
+pub mod api_keys;

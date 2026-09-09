@@ -1,7 +1,7 @@
 use positron_governance::{CompatibilityHints, PresentedCredential, RequestedIntent};
 use positron_kernel::{
-    BootstrapArtifact, BootstrapObjectPurpose, Catalog, CatalogObject, CatalogProposal,
-    FormatEpoch, TransactionId,
+    BootstrapArtifact, BootstrapObjectPurpose, Catalog, CatalogGovernanceObject, CatalogObject,
+    CatalogProposal, FormatEpoch, TransactionId,
 };
 
 use super::super::codec::{BootstrapRecord, decode_claim, encode_legacy_claim};
@@ -133,7 +133,10 @@ fn publish_legacy_governance(
     let mut objects = Vec::new();
     for identity in current.object_identities() {
         let object = current.object(identity)?.ok_or("missing catalog object")?;
-        let plaintext = if object.starts_with(b"POSGOV03") || object.starts_with(b"POSGOV04") {
+        let plaintext = if object.starts_with(b"POSGOV03")
+            || object.starts_with(b"POSGOV04")
+            || object.starts_with(b"POSGOV05")
+        {
             replaced = true;
             legacy_governance(object)?
         } else {
@@ -237,7 +240,21 @@ fn rewrite_pending_replacement_as_v1(
 
 fn legacy_governance(current: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let mut legacy = current.to_vec();
-    if current.starts_with(b"POSGOV04") {
+    if current.starts_with(b"POSGOV05") {
+        let extension = CatalogGovernanceObject::decode(current)?
+            .credentials()
+            .len()
+            .checked_mul(90)
+            .and_then(|bytes| bytes.checked_add(10))
+            .ok_or("credential extension overflow")?;
+        let v4_length = legacy
+            .len()
+            .checked_sub(extension)
+            .ok_or("truncated V5 credential extension")?;
+        legacy.truncate(v4_length);
+        legacy[..8].copy_from_slice(b"POSGOV04");
+    }
+    if legacy.starts_with(b"POSGOV04") {
         let slug_length = usize::from(*current.get(40).ok_or("truncated slug length")?);
         let alias_start = 41usize
             .checked_add(slug_length)

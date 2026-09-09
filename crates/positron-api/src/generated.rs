@@ -100,7 +100,7 @@ impl SchemaDigest {
     /// Returns the digest embedded by deterministic generation.
     #[must_use]
     pub const fn canonical() -> Self {
-        Self("2807ac4ab5ada79d1dac1e9c64e01b57e9e61c22646296dc59a06652fa122036")
+        Self(env!("POSITRON_API_SCHEMA_DIGEST"))
     }
 
     /// Returns the lowercase hexadecimal digest value.

@@ -16,6 +16,8 @@ use positron_runtime::{
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
+mod keys;
+
 const EXIT_OK: u8 = 0;
 const EXIT_CONFIGURATION: u8 = 2;
 const EXIT_STARTUP: u8 = 3;
@@ -26,6 +28,11 @@ pub fn run_native(
     arguments: impl IntoIterator<Item = String>,
     environment: impl IntoIterator<Item = (String, String)>,
 ) -> ExitCode {
+    let mut arguments = arguments.into_iter().peekable();
+    if arguments.peek().is_some_and(|argument| argument == "key") {
+        arguments.next();
+        return keys::run(arguments);
+    }
     match run(arguments, environment) {
         Ok(outcome) => exit_code(outcome),
         Err(failure) => {

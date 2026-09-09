@@ -903,6 +903,7 @@ pub fn publish_lifecycle_at_catalog_for_test(
                 || bytes.starts_with(b"POSGOV02")
                 || bytes.starts_with(b"POSGOV03")
                 || bytes.starts_with(b"POSGOV04")
+                || bytes.starts_with(b"POSGOV05")
             {
                 let offset = bytes.len().checked_sub(5).ok_or("identity too short")?;
                 bytes[offset] = state;
