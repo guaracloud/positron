@@ -66,6 +66,8 @@ fn live_http_trace_export_accepts_protobuf_and_persists_before_response()
             content_type: Some(ResponseEncoding::Protobuf.content_type().to_owned()),
             content_encoding: None,
             tenant_hint: None,
+            forwarded_for: None,
+            forwarded_actor: None,
         },
         &services,
     )
@@ -467,6 +469,8 @@ fn receive_http_with_declared_length(
             content_type: Some(content_type.to_owned()),
             content_encoding: content_encoding.map(str::to_owned),
             tenant_hint: None,
+            forwarded_for: None,
+            forwarded_actor: None,
         },
         services,
     );
@@ -498,6 +502,8 @@ pub(super) fn receive_http_with_tenant(
             content_type: Some(content_type.to_owned()),
             content_encoding: content_encoding.map(str::to_owned),
             tenant_hint: tenant_hint.map(str::to_owned),
+            forwarded_for: None,
+            forwarded_actor: None,
         },
         services,
     );

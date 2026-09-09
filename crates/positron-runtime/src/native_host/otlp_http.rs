@@ -1,8 +1,8 @@
 use std::net::TcpStream;
 
-use positron_governance::CompatibilityHints;
 use positron_ingest::{OtlpRequestEncoding, OtlpTracesRequestEncoding};
 
+use super::TrustedProxy;
 use super::native_http::{RequestHead, Response, read_body};
 use crate::ServiceHandle;
 
@@ -27,9 +27,26 @@ pub(crate) use response::{RpcStatus, success, trace_success};
 #[path = "otlp_http/tests/mod.rs"]
 mod tests;
 
+#[cfg(test)]
 pub(super) fn receive(
     stream: &mut TcpStream,
     head: RequestHead,
+    services: &ServiceHandle,
+) -> Result<Response, Response> {
+    receive_from(
+        stream,
+        head,
+        std::net::SocketAddr::from(([0, 0, 0, 0], 0)),
+        None,
+        services,
+    )
+}
+
+pub(super) fn receive_from(
+    stream: &mut TcpStream,
+    head: RequestHead,
+    peer: std::net::SocketAddr,
+    trusted_proxy: Option<TrustedProxy>,
     services: &ServiceHandle,
 ) -> Result<Response, Response> {
     let (request_encoding, response_encoding) = request_encoding(
@@ -37,6 +54,14 @@ pub(super) fn receive(
         head.content_encoding.as_deref(),
         OtlpHttpSignal::Logs,
     )?;
+    let hints = head.compatibility_hints(peer, trusted_proxy).map_err(|_| {
+        failure(
+            401,
+            UNAUTHENTICATED,
+            "OTLP Logs request authentication was rejected",
+            response_encoding,
+        )
+    })?;
     let bearer = head.bearer.ok_or_else(|| {
         failure(
             401,
@@ -45,20 +70,6 @@ pub(super) fn receive(
             response_encoding,
         )
     })?;
-    let hints = head
-        .tenant_hint
-        .as_deref()
-        .map(CompatibilityHints::external_tenant_alias)
-        .transpose()
-        .map_err(|_| {
-            failure(
-                401,
-                UNAUTHENTICATED,
-                "OTLP Logs request authentication was rejected",
-                response_encoding,
-            )
-        })?
-        .unwrap_or_else(CompatibilityHints::none);
     let context = services
         .authorize_logs_with_hints(&bearer, hints)
         .map_err(|_| {
@@ -108,9 +119,26 @@ pub(super) fn receive(
     Ok(ingest_response(result, response_encoding))
 }
 
+#[cfg(test)]
 pub(super) fn receive_traces(
     stream: &mut TcpStream,
     head: RequestHead,
+    services: &ServiceHandle,
+) -> Result<Response, Response> {
+    receive_traces_from(
+        stream,
+        head,
+        std::net::SocketAddr::from(([0, 0, 0, 0], 0)),
+        None,
+        services,
+    )
+}
+
+pub(super) fn receive_traces_from(
+    stream: &mut TcpStream,
+    head: RequestHead,
+    peer: std::net::SocketAddr,
+    trusted_proxy: Option<TrustedProxy>,
     services: &ServiceHandle,
 ) -> Result<Response, Response> {
     let (request_encoding, response_encoding) = request_encoding(
@@ -118,6 +146,14 @@ pub(super) fn receive_traces(
         head.content_encoding.as_deref(),
         OtlpHttpSignal::Traces,
     )?;
+    let hints = head.compatibility_hints(peer, trusted_proxy).map_err(|_| {
+        failure(
+            401,
+            UNAUTHENTICATED,
+            "OTLP Traces request authentication was rejected",
+            response_encoding,
+        )
+    })?;
     let bearer = head.bearer.ok_or_else(|| {
         failure(
             401,
@@ -126,20 +162,6 @@ pub(super) fn receive_traces(
             response_encoding,
         )
     })?;
-    let hints = head
-        .tenant_hint
-        .as_deref()
-        .map(CompatibilityHints::external_tenant_alias)
-        .transpose()
-        .map_err(|_| {
-            failure(
-                401,
-                UNAUTHENTICATED,
-                "OTLP Traces request authentication was rejected",
-                response_encoding,
-            )
-        })?
-        .unwrap_or_else(CompatibilityHints::none);
     let context = services
         .authorize_traces_with_hints(&bearer, hints)
         .map_err(|_| {

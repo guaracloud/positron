@@ -1,6 +1,6 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
-use std::net::{SocketAddr, TcpListener};
+use std::net::{IpAddr, SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -25,6 +25,37 @@ mod tls;
 
 pub use tls::ApiTransportProfile;
 
+/// A fixed deployment fact for one reverse proxy that may supply forwarded
+/// actor metadata. It never delegates credential authority to that metadata.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TrustedProxy {
+    peer: IpAddr,
+    fixed_hops: u8,
+}
+
+impl TrustedProxy {
+    pub fn exact_peer(peer: IpAddr, fixed_hops: u8) -> Result<Self, NativeHostFailure> {
+        if fixed_hops == 0 {
+            return Err(NativeHostFailure::InvalidBinding);
+        }
+        Ok(Self { peer, fixed_hops })
+    }
+
+    fn validates(self, peer: SocketAddr, forwarded_for: Option<&str>) -> bool {
+        if peer.ip() != self.peer {
+            return false;
+        }
+        forwarded_for.is_some_and(|chain| {
+            let mut hops = chain.split(',').map(str::trim);
+            let expected = hops
+                .by_ref()
+                .take(usize::from(self.fixed_hops))
+                .all(|hop| hop.parse::<IpAddr>().is_ok());
+            expected && hops.next().is_none()
+        })
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct NativeBindings {
     control: PathBuf,
@@ -34,6 +65,7 @@ pub struct NativeBindings {
     otlp_grpc: SocketAddr,
     otlp_http: SocketAddr,
     loki_push: SocketAddr,
+    trusted_proxy: Option<TrustedProxy>,
 }
 
 impl NativeBindings {
@@ -86,6 +118,7 @@ impl NativeBindings {
             otlp_grpc,
             otlp_http,
             loki_push,
+            trusted_proxy: None,
         })
     }
 
@@ -95,6 +128,12 @@ impl NativeBindings {
     ) -> Result<Self, NativeHostFailure> {
         self.api_transport = profile;
         Ok(self)
+    }
+
+    #[must_use]
+    pub fn with_trusted_proxy(mut self, trusted_proxy: TrustedProxy) -> Self {
+        self.trusted_proxy = Some(trusted_proxy);
+        self
     }
 
     fn address(&self, role: ListenerRole) -> Option<SocketAddr> {
@@ -150,6 +189,7 @@ struct Admission {
     accepting: AtomicBool,
     control_path: Option<PathBuf>,
     api_transport: Option<ApiTransportProfile>,
+    trusted_proxy: Option<TrustedProxy>,
 }
 
 type AdmissionRegistry = Arc<Mutex<Vec<(ListenerRole, Arc<Admission>)>>>;
@@ -260,6 +300,7 @@ impl ListenerFactory for NativeHost {
             accepting: AtomicBool::new(true),
             control_path,
             api_transport: (role == ListenerRole::Api).then(|| self.bindings.api_transport.clone()),
+            trusted_proxy: self.bindings.trusted_proxy,
         });
         self.admissions
             .lock()
@@ -401,7 +442,7 @@ fn serve_http(
 ) {
     while admission.accepting.load(Ordering::Acquire) && !cancellation.is_cancelled() {
         let accepted = match &admission.listener {
-            NativeListener::Tcp(listener) => listener.accept().map(|(stream, _)| stream),
+            NativeListener::Tcp(listener) => listener.accept(),
             #[cfg(unix)]
             NativeListener::Unix(listener) => match listener.accept() {
                 Ok((mut stream, _)) => {
@@ -418,7 +459,7 @@ fn serve_http(
             },
         };
         match accepted {
-            Ok(mut stream) => {
+            Ok((mut stream, peer)) => {
                 if stream.set_nonblocking(false).is_err()
                     || stream
                         .set_read_timeout(Some(Duration::from_secs(2)))
@@ -443,6 +484,8 @@ fn serve_http(
                         let _ = native_http::serve_connection(
                             &mut stream,
                             admission.role,
+                            peer,
+                            admission.trusted_proxy,
                             &health,
                             services.as_ref(),
                         );
@@ -451,6 +494,8 @@ fn serve_http(
                     let _ = native_http::serve_connection(
                         &mut stream,
                         admission.role,
+                        peer,
+                        admission.trusted_proxy,
                         &health,
                         services.as_ref(),
                     );

@@ -121,6 +121,7 @@ fn durable_lifecycle_states_are_decoded_and_query_readability_is_fail_closed() {
             authority: identity.instance,
             generation: identity.generation,
             lifecycle: expected,
+            proxy_actor: None,
         };
         assert_eq!(context.tenant_lifecycle(), expected);
         assert_eq!(identity.validate_query_context(context).is_ok(), readable);
@@ -282,6 +283,13 @@ fn credential_and_alias_parsers_are_bounded_canonical_and_redacted() {
         );
     }
     assert!(CompatibilityHints::external_tenant_alias("tenant_1.example").is_ok());
+    let proxied = CompatibilityHints::trusted_proxy(None, Some("proxy-user-42"))
+        .expect("bounded proxy evidence");
+    assert!(proxied.proxy_actor.is_some());
+    assert!(!format!("{proxied:?}").contains("proxy-user-42"));
+    for rejected in ["", "contains space", &"x".repeat(129)] {
+        assert!(CompatibilityHints::trusted_proxy(None, Some(rejected)).is_err());
+    }
     let oversized = "a".repeat(129);
     for alias in ["", "bad alias", oversized.as_str()] {
         assert!(CompatibilityHints::external_tenant_alias(alias).is_err());
@@ -305,6 +313,7 @@ fn governance_inspection_rejects_forged_and_data_plane_contexts_with_one_shape()
             authority: identity.instance,
             generation: 0,
             lifecycle: TenantLifecycleState::Active,
+            proxy_actor: None,
         },
         AuthorizedContext {
             principal: identity.principal,
@@ -320,6 +329,7 @@ fn governance_inspection_rejects_forged_and_data_plane_contexts_with_one_shape()
             authority: identity.instance,
             generation: 0,
             lifecycle: TenantLifecycleState::Active,
+            proxy_actor: None,
         },
         AuthorizedContext {
             principal: identity.principal,
@@ -328,6 +338,7 @@ fn governance_inspection_rejects_forged_and_data_plane_contexts_with_one_shape()
             authority: [99; 16],
             generation: 0,
             lifecycle: TenantLifecycleState::Active,
+            proxy_actor: None,
         },
         AuthorizedContext {
             principal: PrincipalId::from_bytes([99; 16]).expect("forged principal"),
@@ -336,6 +347,7 @@ fn governance_inspection_rejects_forged_and_data_plane_contexts_with_one_shape()
             authority: identity.instance,
             generation: 0,
             lifecycle: TenantLifecycleState::Active,
+            proxy_actor: None,
         },
     ] {
         assert_eq!(

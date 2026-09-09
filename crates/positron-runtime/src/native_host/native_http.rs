@@ -3,8 +3,10 @@ use std::net::TcpStream;
 use std::time::Duration;
 
 use positron_api::generated::{ApiError, CapabilityResponse};
+use positron_governance::CompatibilityHints;
 use zeroize::{Zeroize, Zeroizing};
 
+use super::TrustedProxy;
 use crate::{HealthState, HealthWarning, ListenerRole, Liveness, Readiness, ServiceHandle};
 
 const MAX_HEADER_BYTES: usize = 8 * 1024;
@@ -13,6 +15,8 @@ const MAX_API_BODY_BYTES: usize = positron_api::generated::MAX_PUBLIC_REQUEST_BY
 pub(super) fn serve_connection(
     stream: &mut TcpStream,
     role: ListenerRole,
+    peer: std::net::SocketAddr,
+    trusted_proxy: Option<TrustedProxy>,
     health: &HealthState,
     services: Option<&ServiceHandle>,
 ) -> Result<(), ConnectionFailure> {
@@ -26,7 +30,7 @@ pub(super) fn serve_connection(
     {
         return Err(ConnectionFailure);
     }
-    let result = serve_checked(stream, role, health, services);
+    let result = serve_checked(stream, role, peer, trusted_proxy, health, services);
     if let Err(response) = result {
         write_response(stream, response).map_err(|_| ConnectionFailure)?;
     }
@@ -95,17 +99,21 @@ fn route_tls_api<S: Read + Write>(
 fn serve_checked(
     stream: &mut TcpStream,
     role: ListenerRole,
+    peer: std::net::SocketAddr,
+    trusted_proxy: Option<TrustedProxy>,
     health: &HealthState,
     services: Option<&ServiceHandle>,
 ) -> Result<(), Response> {
     let head = read_head(stream)?;
-    let response = route(stream, role, head, health, services)?;
+    let response = route(stream, role, peer, trusted_proxy, head, health, services)?;
     write_response(stream, response).map_err(|_| Response::empty(500))
 }
 
 fn route(
     stream: &mut TcpStream,
     role: ListenerRole,
+    peer: std::net::SocketAddr,
+    trusted_proxy: Option<TrustedProxy>,
     mut head: RequestHead,
     health: &HealthState,
     services: Option<&ServiceHandle>,
@@ -153,19 +161,19 @@ fn route(
         },
         (ListenerRole::OtlpHttp, "POST", "/v1/logs") => {
             let services = services.ok_or_else(|| Response::empty(503))?;
-            super::otlp_http::receive(stream, head, services)
+            super::otlp_http::receive_from(stream, head, peer, trusted_proxy, services)
         },
         (ListenerRole::OtlpHttp, "POST", "/v1/traces") => {
             let services = services.ok_or_else(|| Response::empty(503))?;
-            super::otlp_http::receive_traces(stream, head, services)
+            super::otlp_http::receive_traces_from(stream, head, peer, trusted_proxy, services)
         },
         (ListenerRole::LokiPush, "POST", "/loki/api/v1/push") => {
             let services = services.ok_or_else(|| Response::empty(503))?;
-            super::loki_http::receive_push(stream, head, services)
+            super::loki_http::receive_push(stream, head, peer, trusted_proxy, services)
         },
         (ListenerRole::LokiPush, "POST", "/otlp/v1/logs") => {
             let services = services.ok_or_else(|| Response::empty(503))?;
-            super::otlp_http::receive(stream, head, services)
+            super::otlp_http::receive_from(stream, head, peer, trusted_proxy, services)
         },
         (ListenerRole::Operations, _, "/health/live" | "/health/ready")
         | (ListenerRole::Api, _, "/v1/capabilities:negotiate")
@@ -186,6 +194,37 @@ pub(super) struct RequestHead {
     pub(super) content_type: Option<String>,
     pub(super) content_encoding: Option<String>,
     pub(super) tenant_hint: Option<String>,
+    pub(super) forwarded_for: Option<String>,
+    pub(super) forwarded_actor: Option<String>,
+}
+
+impl RequestHead {
+    pub(super) fn compatibility_hints(
+        &self,
+        peer: std::net::SocketAddr,
+        trusted_proxy: Option<TrustedProxy>,
+    ) -> Result<CompatibilityHints, ()> {
+        let forwarded = self.forwarded_for.is_some() || self.forwarded_actor.is_some();
+        match trusted_proxy {
+            Some(policy) if forwarded => {
+                if !policy.validates(peer, self.forwarded_for.as_deref()) {
+                    return Err(());
+                }
+                CompatibilityHints::trusted_proxy(
+                    self.tenant_hint.as_deref(),
+                    self.forwarded_actor.as_deref(),
+                )
+                .map_err(|_| ())
+            },
+            Some(_) | None => self
+                .tenant_hint
+                .as_deref()
+                .map(CompatibilityHints::external_tenant_alias)
+                .transpose()
+                .map_err(|_| ())
+                .map(|hints| hints.unwrap_or_else(CompatibilityHints::none)),
+        }
+    }
 }
 
 fn read_head<S: Read>(stream: &mut S) -> Result<RequestHead, Response> {
@@ -214,6 +253,8 @@ fn read_head<S: Read>(stream: &mut S) -> Result<RequestHead, Response> {
     let mut content_type = None;
     let mut content_encoding = None;
     let mut tenant_hint = None;
+    let mut forwarded_for = None;
+    let mut forwarded_actor = None;
     for line in lines.filter(|line| !line.is_empty()) {
         let (name, value) = line.split_once(':').ok_or_else(|| Response::empty(400))?;
         let value = value.trim();
@@ -243,6 +284,18 @@ fn read_head<S: Read>(stream: &mut S) -> Result<RequestHead, Response> {
                 return Err(Response::empty(400));
             }
             tenant_hint = Some(value.to_owned());
+        } else if name.eq_ignore_ascii_case("x-forwarded-for") {
+            if forwarded_for.is_some() {
+                return Err(Response::empty(400));
+            }
+            forwarded_for = Some(value.to_owned());
+        } else if name.eq_ignore_ascii_case("x-forwarded-user")
+            || name.eq_ignore_ascii_case("x-forwarded-service")
+        {
+            if forwarded_actor.is_some() {
+                return Err(Response::empty(400));
+            }
+            forwarded_actor = Some(value.to_owned());
         } else if name.eq_ignore_ascii_case("transfer-encoding") {
             return Err(Response::empty(400));
         }
@@ -255,6 +308,8 @@ fn read_head<S: Read>(stream: &mut S) -> Result<RequestHead, Response> {
         content_type,
         content_encoding,
         tenant_hint,
+        forwarded_for,
+        forwarded_actor,
     })
 }
 

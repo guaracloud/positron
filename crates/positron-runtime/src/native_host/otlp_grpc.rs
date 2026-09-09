@@ -19,8 +19,8 @@ use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 use tower::util::MapResponseLayer;
 
-use super::Admission;
 use super::otlp_outcome::{OtlpFailure, OtlpSignal};
+use super::{Admission, TrustedProxy};
 use crate::{ServiceFailure, ServiceHandle, TaskCancellation};
 
 const MAX_MESSAGE_BYTES: usize = 1_048_576;
@@ -57,6 +57,7 @@ pub(super) fn serve(
         let incoming = TcpListenerStream::new(listener);
         let authentication = services.clone();
         let trace_authentication = services.clone();
+        let trusted_proxy = admission.trusted_proxy;
         let receiver = OtlpLogsServer::new(OtlpLogsGrpc {
             services: services.clone(),
             blocking: blocking_handle.clone(),
@@ -65,7 +66,7 @@ pub(super) fn serve(
         .max_decoding_message_size(MAX_MESSAGE_BYTES);
         let receiver = MapResponseLayer::new(map_decode_failure).named_layer(receiver);
         let receiver = InterceptedService::new(receiver, move |request| {
-            authenticate(request, &authentication)
+            authenticate(request, &authentication, trusted_proxy)
         });
         let trace_receiver = OtlpTracesServer::new(OtlpTracesGrpc {
             services,
@@ -75,7 +76,7 @@ pub(super) fn serve(
         let trace_receiver =
             MapResponseLayer::new(map_trace_decode_failure).named_layer(trace_receiver);
         let trace_receiver = InterceptedService::new(trace_receiver, move |request| {
-            authenticate_traces(request, &trace_authentication)
+            authenticate_traces(request, &trace_authentication, trusted_proxy)
         });
         let graceful_admission = Arc::clone(&admission);
         let serving = Server::builder()
@@ -140,22 +141,15 @@ async fn wait_for(cancellation: TaskCancellation) {
     }
 }
 
-fn authenticate(mut request: Request<()>, services: &ServiceHandle) -> Result<Request<()>, Status> {
-    let bearer = request
-        .metadata()
-        .get("authorization")
-        .and_then(|value| value.to_str().ok())
+fn authenticate(
+    mut request: Request<()>,
+    services: &ServiceHandle,
+    trusted_proxy: Option<TrustedProxy>,
+) -> Result<Request<()>, Status> {
+    let bearer = unique_metadata(&request, "authorization", authentication_rejected)?
         .and_then(|value| value.strip_prefix("Bearer "))
         .ok_or_else(authentication_rejected)?;
-    let hints = request
-        .metadata()
-        .get("x-scope-orgid")
-        .map(|value| value.to_str().map_err(|_| authentication_rejected()))
-        .transpose()?
-        .map(CompatibilityHints::external_tenant_alias)
-        .transpose()
-        .map_err(|_| authentication_rejected())?
-        .unwrap_or_else(CompatibilityHints::none);
+    let hints = proxy_hints(&request, trusted_proxy, authentication_rejected)?;
     let context = services
         .authorize_logs_with_hints(bearer, hints)
         .map_err(|_| authentication_rejected())?;
@@ -172,22 +166,12 @@ fn authentication_rejected() -> Status {
 fn authenticate_traces(
     mut request: Request<()>,
     services: &ServiceHandle,
+    trusted_proxy: Option<TrustedProxy>,
 ) -> Result<Request<()>, Status> {
-    let bearer = request
-        .metadata()
-        .get("authorization")
-        .and_then(|value| value.to_str().ok())
+    let bearer = unique_metadata(&request, "authorization", trace_authentication_rejected)?
         .and_then(|value| value.strip_prefix("Bearer "))
         .ok_or_else(trace_authentication_rejected)?;
-    let hints = request
-        .metadata()
-        .get("x-scope-orgid")
-        .map(|value| value.to_str().map_err(|_| trace_authentication_rejected()))
-        .transpose()?
-        .map(CompatibilityHints::external_tenant_alias)
-        .transpose()
-        .map_err(|_| trace_authentication_rejected())?
-        .unwrap_or_else(CompatibilityHints::none);
+    let hints = proxy_hints(&request, trusted_proxy, trace_authentication_rejected)?;
     let context = services
         .authorize_traces_with_hints(bearer, hints)
         .map_err(|_| trace_authentication_rejected())?;
@@ -201,6 +185,50 @@ fn authenticate_traces(
 
 fn trace_authentication_rejected() -> Status {
     status_from_failure(OtlpSignal::Traces.authentication_rejected())
+}
+
+fn unique_metadata<'request>(
+    request: &'request Request<()>,
+    name: &str,
+    rejected: fn() -> Status,
+) -> Result<Option<&'request str>, Status> {
+    let mut values = request.metadata().get_all(name).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(rejected());
+    }
+    value.to_str().map(Some).map_err(|_| rejected())
+}
+
+fn proxy_hints(
+    request: &Request<()>,
+    trusted_proxy: Option<TrustedProxy>,
+    rejected: fn() -> Status,
+) -> Result<CompatibilityHints, Status> {
+    let external_alias = unique_metadata(request, "x-scope-orgid", rejected)?;
+    let forwarded_for = unique_metadata(request, "x-forwarded-for", rejected)?;
+    let forwarded_user = unique_metadata(request, "x-forwarded-user", rejected)?;
+    let forwarded_service = unique_metadata(request, "x-forwarded-service", rejected)?;
+    if forwarded_user.is_some() && forwarded_service.is_some() {
+        return Err(rejected());
+    }
+    let actor = forwarded_user.or(forwarded_service);
+    if (forwarded_for.is_some() || actor.is_some())
+        && let Some(policy) = trusted_proxy
+    {
+        let peer = request.remote_addr().ok_or_else(rejected)?;
+        if !policy.validates(peer, forwarded_for) {
+            return Err(rejected());
+        }
+        return CompatibilityHints::trusted_proxy(external_alias, actor).map_err(|_| rejected());
+    }
+    external_alias
+        .map(CompatibilityHints::external_tenant_alias)
+        .transpose()
+        .map_err(|_| rejected())
+        .map(|hints| hints.unwrap_or_else(CompatibilityHints::none))
 }
 
 #[derive(Clone, Debug)]

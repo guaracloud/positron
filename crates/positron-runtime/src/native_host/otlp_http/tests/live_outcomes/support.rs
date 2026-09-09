@@ -205,6 +205,8 @@ impl HttpHarness {
                 content_type: Some(content_type.to_owned()),
                 content_encoding: content_encoding.map(str::to_owned),
                 tenant_hint: tenant_hint.map(str::to_owned),
+                forwarded_for: None,
+                forwarded_actor: None,
             },
             &self.services,
         );

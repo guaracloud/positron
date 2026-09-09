@@ -5,6 +5,7 @@ use positron_domain::identity::{
     ExternalTenantAlias, PrincipalId, Scope, TenantAttribution, TenantId, TenantSlug,
 };
 use positron_domain::lifecycle::TenantLifecycleState;
+use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::GovernanceAuditEntry;
@@ -63,6 +64,7 @@ pub enum RequestedIntent {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompatibilityHints {
     pub(super) external_alias: Option<ExternalTenantAlias>,
+    pub(super) proxy_actor: Option<ProxyActorContext>,
     #[cfg(fuzzing)]
     untrusted_proxy_actor: bool,
     #[cfg(fuzzing)]
@@ -74,6 +76,7 @@ impl CompatibilityHints {
     pub const fn none() -> Self {
         Self {
             external_alias: None,
+            proxy_actor: None,
             #[cfg(fuzzing)]
             untrusted_proxy_actor: false,
             #[cfg(fuzzing)]
@@ -87,6 +90,28 @@ impl CompatibilityHints {
         let alias = ExternalTenantAlias::parse(alias).map_err(|_| AttributionFailure)?;
         Ok(Self {
             external_alias: Some(alias),
+            proxy_actor: None,
+            #[cfg(fuzzing)]
+            untrusted_proxy_actor: false,
+            #[cfg(fuzzing)]
+            tenant_claims: Vec::new(),
+        })
+    }
+
+    /// Preserves bounded, trusted-proxy actor evidence while keeping the
+    /// credential-derived Principal, Scope, and Tenant authoritative.
+    pub fn trusted_proxy(
+        external_alias: Option<&str>,
+        actor: Option<&str>,
+    ) -> Result<Self, AttributionFailure> {
+        let external_alias = external_alias
+            .map(ExternalTenantAlias::parse)
+            .transpose()
+            .map_err(|_| AttributionFailure)?;
+        let proxy_actor = actor.map(ProxyActorContext::new).transpose()?;
+        Ok(Self {
+            external_alias,
+            proxy_actor,
             #[cfg(fuzzing)]
             untrusted_proxy_actor: false,
             #[cfg(fuzzing)]
@@ -112,6 +137,7 @@ impl CompatibilityHints {
         }
         Self {
             external_alias: None,
+            proxy_actor: None,
             untrusted_proxy_actor: source.first().is_none_or(|byte| byte & 1 != 0),
             tenant_claims,
         }
@@ -129,6 +155,30 @@ impl CompatibilityHints {
     }
 }
 
+/// A one-way digest of a proxy-supplied user or service identifier. The raw
+/// forwarded value is never retained in the authorization context.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct ProxyActorContext {
+    digest: [u8; 32],
+}
+
+impl ProxyActorContext {
+    fn new(actor: &str) -> Result<Self, AttributionFailure> {
+        if !(1..=128).contains(&actor.len()) || !actor.as_bytes().iter().all(u8::is_ascii_graphic) {
+            return Err(AttributionFailure);
+        }
+        Ok(Self {
+            digest: Sha256::digest(actor.as_bytes()).into(),
+        })
+    }
+}
+
+impl std::fmt::Debug for ProxyActorContext {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ProxyActorContext { <redacted> }")
+    }
+}
+
 /// An authenticated context. Tenant data contexts can only contain a checked
 /// [`TenantAttribution`]; a system administrator has no tenant authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -139,6 +189,7 @@ pub struct AuthorizedContext {
     pub(super) authority: [u8; 16],
     pub(super) generation: u64,
     pub(super) lifecycle: TenantLifecycleState,
+    pub(super) proxy_actor: Option<ProxyActorContext>,
 }
 
 impl AuthorizedContext {
@@ -165,6 +216,13 @@ impl AuthorizedContext {
     #[must_use]
     pub const fn tenant_lifecycle(self) -> TenantLifecycleState {
         self.lifecycle
+    }
+
+    /// Returns only the presence of redacted proxy-actor evidence. It cannot
+    /// alter this context's Principal, Scope, or Tenant Attribution.
+    #[must_use]
+    pub const fn has_proxy_actor_context(self) -> bool {
+        self.proxy_actor.is_some()
     }
 }
 

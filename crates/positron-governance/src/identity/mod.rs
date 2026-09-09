@@ -183,6 +183,7 @@ impl Identity {
                 authority: self.instance,
                 generation: self.generation,
                 lifecycle: self.lifecycle,
+                proxy_actor: hints.proxy_actor,
             });
         }
         match intent {
@@ -198,6 +199,7 @@ impl Identity {
                     authority: self.instance,
                     generation: self.generation,
                     lifecycle: self.lifecycle,
+                    proxy_actor: hints.proxy_actor,
                 })
             },
             RequestedIntent::Ingest => {
@@ -221,6 +223,7 @@ impl Identity {
                     authority: self.instance,
                     generation: self.generation,
                     lifecycle: self.lifecycle,
+                    proxy_actor: hints.proxy_actor,
                 })
             },
             RequestedIntent::Query => {
@@ -244,6 +247,7 @@ impl Identity {
                     authority: self.instance,
                     generation: self.generation,
                     lifecycle: self.lifecycle,
+                    proxy_actor: hints.proxy_actor,
                 })
             },
             RequestedIntent::TenantAdministration | RequestedIntent::SystemAdministration => {
