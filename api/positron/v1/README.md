@@ -53,7 +53,8 @@ secret is emitted once to stdout; protect that output as credential material.
 The current listener admits plaintext only on loopback; public plaintext API admission is not
 available.
 
-The client preserves only published failures: `authentication_rejected`, `stale_generation`,
-`idempotency_conflict`, `key_unavailable`, and `administration_unavailable`. Malformed,
+The client preserves only published failures: `invalid_request`, `authentication_rejected`,
+`stale_generation`, `idempotency_conflict`, `key_unavailable`, and
+`administration_unavailable`. Malformed,
 oversized, or status-mismatched error responses are a bounded transport failure and do not echo
 their body.
