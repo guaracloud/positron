@@ -193,4 +193,27 @@ impl StorageKernelResourceAuthority {
     ) -> Result<(), GovernorFailure> {
         self.inner.update_tenant_quota(tenant, limits)
     }
+
+    /// Enrolls a Catalog-created tenant in the governor's preallocated
+    /// administrative capacity.
+    pub fn register_tenant_quota(
+        &self,
+        tenant: TenantId,
+        limits: ResourceAmounts,
+    ) -> Result<(), GovernorFailure> {
+        self.inner.register_tenant_quota(tenant, limits)
+    }
+
+    pub fn prepare_tenant_enrollment(
+        &self,
+        tenant: TenantId,
+        limits: ResourceAmounts,
+    ) -> Result<PendingTenantEnrollment<'_>, GovernorFailure> {
+        self.inner.prepare_tenant_quota(tenant, limits)?;
+        Ok(PendingTenantEnrollment {
+            authority: self,
+            tenant,
+            active: false,
+        })
+    }
 }

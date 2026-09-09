@@ -132,7 +132,7 @@ impl GovernorInner {
                                 state.ordinary_tenant_usage.get(index).copied().ok_or_else(
                                     || internal_failure_at_pressure(class, state.disk_pressure),
                                 )?;
-                            let quota = self.tenant_quotas.get(index).ok_or_else(|| {
+                            let quota = state.tenant_quotas.get(index).ok_or_else(|| {
                                 internal_failure_at_pressure(class, state.disk_pressure)
                             })?;
                             let combined_without =
@@ -157,13 +157,15 @@ impl GovernorInner {
                     .and_then(|()| {
                         let scope_capacity = if let Some(index) = tenant_index {
                             (
-                                self.recovery_tenant_shared_fair
+                                state
+                                    .recovery_tenant_shared_fair
                                     .get(index)
                                     .copied()
                                     .ok_or_else(|| {
                                         internal_failure_at_pressure(class, state.disk_pressure)
                                     })?,
-                                self.recovery_tenant_pool_fair
+                                state
+                                    .recovery_tenant_pool_fair
                                     .get(index)
                                     .map(|pools| pools.get(kind))
                                     .ok_or_else(|| {
@@ -176,7 +178,7 @@ impl GovernorInner {
                         } else {
                             (
                                 self.recovery_shared_capacity,
-                                self.recovery_system_pool_capacities.get(kind),
+                                state.recovery_system_pool_capacities.get(kind),
                                 ordinary_usage,
                             )
                         };

@@ -524,9 +524,14 @@ fn closed_internal_helpers_cover_invalid_inputs_without_fabricating_authority() 
 #[test]
 fn corrupted_ordinary_admission_fences_at_every_mutable_boundary() {
     for corruption in 0..10 {
-        let (mut governor, tenant) = established();
+        let (governor, tenant) = established();
         if corruption == 9 {
-            governor.inner.recovery_tenant_shared_fair = Box::new([]);
+            governor
+                .inner
+                .state
+                .lock()
+                .expect("test lock is healthy")
+                .recovery_tenant_shared_fair = Vec::new();
         } else {
             let mut state = governor.inner.state.lock().expect("test lock is healthy");
             match corruption {

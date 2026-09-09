@@ -156,9 +156,22 @@ impl GovernorInner {
                             recovery_tenant_shared_usage: recovery_shared_usage,
                             pressure: state.disk_pressure,
                             lifecycle: state.lifecycle,
-                            tenant_index,
                             tenant_limit: state
                                 .tenant_limits
+                                .get(tenant_index)
+                                .copied()
+                                .ok_or_else(|| {
+                                    internal_failure_at_pressure(class, state.disk_pressure)
+                                })?,
+                            recovery_shared_limit: state
+                                .recovery_tenant_shared_fair
+                                .get(tenant_index)
+                                .copied()
+                                .ok_or_else(|| {
+                                    internal_failure_at_pressure(class, state.disk_pressure)
+                                })?,
+                            tenant_capacity: state
+                                .tenant_fair_capacities
                                 .get(tenant_index)
                                 .copied()
                                 .ok_or_else(|| {
@@ -308,11 +321,7 @@ impl GovernorInner {
             view.tenant_limit,
             view.pressure,
         )?;
-        let recovery_shared_limit = self
-            .recovery_tenant_shared_fair
-            .get(view.tenant_index)
-            .copied()
-            .ok_or_else(|| internal_failure_at_pressure(class, view.pressure))?;
+        let recovery_shared_limit = view.recovery_shared_limit;
         refuse_tenant_recovery_shared_fair_share(
             class,
             view.tenant_without,
@@ -322,11 +331,7 @@ impl GovernorInner {
             view.pressure,
         )?;
         let shared = pressure_eligibility(view.pressure, class, new)?;
-        let tenant_capacity = self
-            .tenant_fair_capacities
-            .get(view.tenant_index)
-            .copied()
-            .ok_or_else(|| internal_failure_at_pressure(class, view.pressure))?;
+        let tenant_capacity = view.tenant_capacity;
         plan_pool_charge(
             class,
             new,
@@ -352,8 +357,9 @@ struct OrdinaryResizeView {
     recovery_tenant_shared_usage: ResourceAmounts,
     pressure: DiskPressureState,
     lifecycle: GovernorLifecycle,
-    tenant_index: usize,
     tenant_limit: ResourceAmounts,
+    recovery_shared_limit: ResourceAmounts,
+    tenant_capacity: super::policy::PoolCapacities,
 }
 
 pub(super) fn resize_outcome(old: ResourceAmounts, new: ResourceAmounts) -> ResizeOutcome {

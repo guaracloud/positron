@@ -145,6 +145,29 @@ pub struct StorageKernelResourceAuthority {
     snapshot_barrier: RwLock<()>,
 }
 
+/// A capacity-admitted tenant that cannot receive work until its durable
+/// governance transaction has committed.
+pub struct PendingTenantEnrollment<'authority> {
+    authority: &'authority StorageKernelResourceAuthority,
+    tenant: positron_domain::identity::TenantId,
+    active: bool,
+}
+
+impl PendingTenantEnrollment<'_> {
+    pub fn activate(&mut self) {
+        self.authority.inner.activate_tenant_quota(self.tenant);
+        self.active = true;
+    }
+}
+
+impl Drop for PendingTenantEnrollment<'_> {
+    fn drop(&mut self) {
+        if !self.active {
+            self.authority.inner.rollback_tenant_quota(self.tenant);
+        }
+    }
+}
+
 type ActiveSegmentScopes = [Option<[u8; 22]>; MAX_TENANT_QUOTAS];
 
 pub(crate) struct CatalogWriterLease<'authority> {
@@ -287,7 +310,7 @@ impl ResourceGovernorConfiguration {
             return Err(GovernorFailure::PolicyCardinalityExceeded);
         }
         let layout = BootstrapInventoryLayout::new(
-            policy.tenant_quotas.len(),
+            inventory.cardinality.max_tenant_quotas,
             inventory.cardinality.max_outstanding_reservations,
         )?;
         let bootstrap_overhead = layout.overhead();

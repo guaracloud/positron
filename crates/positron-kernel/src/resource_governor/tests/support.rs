@@ -130,6 +130,22 @@ impl TestKernel {
         self.authority.update_tenant_quota(tenant, limits)
     }
 
+    pub fn enroll_tenant(
+        &self,
+        tenant: positron_domain::identity::TenantId,
+        limits: ResourceAmounts,
+    ) -> Result<(), GovernorFailure> {
+        self.authority.register_tenant_quota(tenant, limits)
+    }
+
+    pub fn prepare_tenant(
+        &self,
+        tenant: positron_domain::identity::TenantId,
+        limits: ResourceAmounts,
+    ) -> Result<positron_kernel::PendingTenantEnrollment<'_>, GovernorFailure> {
+        self.authority.prepare_tenant_enrollment(tenant, limits)
+    }
+
     pub fn observe_disk(
         &self,
         observation: DiskObservation,

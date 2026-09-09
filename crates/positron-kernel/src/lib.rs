@@ -130,12 +130,12 @@ pub use resource_governor::{
     DiskPressureState, DiskPressureThresholds, EstablishmentFailure, ExistingCapacityDisposition,
     GovernorFailure, GovernorLifecycle, GovernorPolicy, InventoryCardinalityLimits, LimitingScope,
     MAX_OUTSTANDING_RESERVATIONS, MAX_TENANT_QUOTAS, ObservedResourceEnvironment, OperatorLimits,
-    OrdinaryPool, OrdinaryPoolPolicy, RESOURCE_DIMENSION_COUNT, RecoveryAuthority,
-    RecoveryInterruption, RecoveryPoolCapacities, RecoveryReserve, RecoveryScope,
-    RecoveryWorkClaim, RecoveryWorkKind, RegisteredResourceBounds, ReleaseOutcome, ResizeFailure,
-    ResizeFailureCode, ResizeOutcome, ResourceAmounts, ResourceDimension, ResourceGovernor,
-    ResourceGovernorConfiguration, ResourceInventory, ResourceReservation, ResourceSnapshot,
-    ShutdownReconciliation, StorageKernelResourceAuthority, TenantQuota,
+    OrdinaryPool, OrdinaryPoolPolicy, PendingTenantEnrollment, RESOURCE_DIMENSION_COUNT,
+    RecoveryAuthority, RecoveryInterruption, RecoveryPoolCapacities, RecoveryReserve,
+    RecoveryScope, RecoveryWorkClaim, RecoveryWorkKind, RegisteredResourceBounds, ReleaseOutcome,
+    ResizeFailure, ResizeFailureCode, ResizeOutcome, ResourceAmounts, ResourceDimension,
+    ResourceGovernor, ResourceGovernorConfiguration, ResourceInventory, ResourceReservation,
+    ResourceSnapshot, ShutdownReconciliation, StorageKernelResourceAuthority, TenantQuota,
     TransferredResourceReservation, WorkClaim, WorkClass, WorkKind,
 };
 

@@ -39,7 +39,7 @@ impl GovernorInner {
         let tenant_index = match claim.scope {
             RecoveryScope::System => None,
             RecoveryScope::Tenant(tenant) => Some(
-                self.tenant_index(tenant, class)
+                Self::tenant_index(state, tenant, class)
                     .map_err(|failure| failure.at_pressure(state.disk_pressure))?,
             ),
         };
@@ -85,7 +85,7 @@ impl GovernorInner {
                 state.lifecycle = GovernorLifecycle::Fenced;
                 return Err(internal_failure_at_pressure(class, state.disk_pressure));
             };
-            let Some(quota) = self.tenant_quotas.get(index) else {
+            let Some(quota) = state.tenant_quotas.get(index) else {
                 state.lifecycle = GovernorLifecycle::Fenced;
                 return Err(internal_failure_at_pressure(class, state.disk_pressure));
             };
@@ -107,12 +107,12 @@ impl GovernorInner {
             None
         };
         let scope = if let Some(index) = tenant_index {
-            let shared = self
+            let shared = state
                 .recovery_tenant_shared_fair
                 .get(index)
                 .copied()
                 .ok_or_else(|| internal_failure_at_pressure(class, state.disk_pressure))?;
-            let protected = self
+            let protected = state
                 .recovery_tenant_pool_fair
                 .get(index)
                 .map(|pools| pools.get(claim.kind))
@@ -131,7 +131,7 @@ impl GovernorInner {
         } else {
             (
                 self.recovery_shared_capacity,
-                self.recovery_system_pool_capacities.get(claim.kind),
+                state.recovery_system_pool_capacities.get(claim.kind),
                 state.recovery_system_pool_usage,
                 ordinary_usage,
             )

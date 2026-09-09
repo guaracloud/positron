@@ -37,15 +37,10 @@ pub(super) struct GovernorInner {
     pub(super) total_ceiling: ResourceAmounts,
     pub(super) ordinary_ceiling: ResourceAmounts,
     pub(super) recovery_reserve: ResourceAmounts,
-    pub(super) tenant_quotas: Box<[TenantQuota]>,
     pub(super) maximum_outstanding: u32,
     pub(super) pool_capacities: PoolCapacities,
-    pub(super) tenant_fair_capacities: Box<[PoolCapacities]>,
     pub(super) recovery_pool_capacities: RecoveryPoolCapacities,
     pub(super) recovery_shared_capacity: ResourceAmounts,
-    pub(super) recovery_tenant_shared_fair: Box<[ResourceAmounts]>,
-    pub(super) recovery_tenant_pool_fair: Box<[RecoveryPoolCapacities]>,
-    pub(super) recovery_system_pool_capacities: RecoveryPoolCapacities,
     pub(super) disk_thresholds: DiskPressureThresholds,
     pub(super) state: Mutex<AccountingState>,
     pub(super) drop_ledger: Arc<super::ledger::DropLedger>,
@@ -67,15 +62,10 @@ pub(super) struct GovernorConfiguration {
     total_ceiling: ResourceAmounts,
     ordinary_ceiling: ResourceAmounts,
     recovery_reserve: ResourceAmounts,
-    tenant_quotas: Box<[TenantQuota]>,
     maximum_outstanding: u32,
     pool_capacities: PoolCapacities,
-    tenant_fair_capacities: Box<[PoolCapacities]>,
     recovery_pool_capacities: RecoveryPoolCapacities,
     recovery_shared_capacity: ResourceAmounts,
-    recovery_tenant_shared_fair: Box<[ResourceAmounts]>,
-    recovery_tenant_pool_fair: Box<[RecoveryPoolCapacities]>,
-    recovery_system_pool_capacities: RecoveryPoolCapacities,
     disk_thresholds: DiskPressureThresholds,
     state: AccountingState,
     slot_signals: Box<[AtomicU8]>,
@@ -98,6 +88,15 @@ pub(super) struct GovernorSetupInput {
 }
 
 pub(super) struct AccountingState {
+    pub(super) pending_tenant: Option<TenantId>,
+    /// Active tenant topology and its derived capacity partition are changed
+    /// together while this accounting lock is held. Reservation indices remain
+    /// stable because enrollment only appends a new tenant.
+    pub(super) tenant_quotas: Vec<TenantQuota>,
+    pub(super) tenant_fair_capacities: Vec<PoolCapacities>,
+    pub(super) recovery_tenant_shared_fair: Vec<ResourceAmounts>,
+    pub(super) recovery_tenant_pool_fair: Vec<RecoveryPoolCapacities>,
+    pub(super) recovery_system_pool_capacities: RecoveryPoolCapacities,
     pub(super) rejection_counts: [u64; AdmissionFailureCode::COUNT],
     pub(super) grant_records: Box<[Option<GrantRecord>]>,
     pub(super) free_slots: Vec<u16>,
@@ -174,12 +173,12 @@ impl GovernorInner {
         if !limits.all_positive() || !limits.is_at_most(self.ordinary_ceiling) {
             return Err(GovernorFailure::InvalidConfiguration);
         }
-        let tenant_index = self
+        let mut state = self.try_lock_for_control()?;
+        let tenant_index = state
             .tenant_quotas
             .iter()
             .position(|quota| quota.tenant == tenant)
             .ok_or(GovernorFailure::InvalidConfiguration)?;
-        let mut state = self.try_lock_for_control()?;
         let slot = state
             .tenant_limits
             .get_mut(tenant_index)
@@ -188,14 +187,148 @@ impl GovernorInner {
         Ok(())
     }
 
-    pub(super) fn tenant_index(
+    pub(super) fn register_tenant_quota(
         &self,
+        tenant: TenantId,
+        limits: ResourceAmounts,
+    ) -> Result<(), GovernorFailure> {
+        self.enroll_tenant_quota(tenant, limits, false)
+    }
+
+    pub(super) fn prepare_tenant_quota(
+        &self,
+        tenant: TenantId,
+        limits: ResourceAmounts,
+    ) -> Result<(), GovernorFailure> {
+        self.enroll_tenant_quota(tenant, limits, true)
+    }
+
+    fn enroll_tenant_quota(
+        &self,
+        tenant: TenantId,
+        limits: ResourceAmounts,
+        pending: bool,
+    ) -> Result<(), GovernorFailure> {
+        if !limits.all_positive() || !limits.is_at_most(self.ordinary_ceiling) {
+            return Err(GovernorFailure::InvalidConfiguration);
+        }
+        let mut state = self.try_lock_for_control()?;
+        if pending && state.pending_tenant.is_some() {
+            return Err(GovernorFailure::GovernorContended {
+                pressure: state.disk_pressure,
+            });
+        }
+        if state
+            .tenant_quotas
+            .iter()
+            .any(|quota| quota.tenant == tenant)
+        {
+            return Err(GovernorFailure::InvalidConfiguration);
+        }
+        let slot = state.tenant_quotas.len();
+        if slot >= state.tenant_limits.len() {
+            return Err(GovernorFailure::InvalidConfiguration);
+        }
+        let quota = TenantQuota::new(tenant, 1, limits)?;
+        let mut successor = state.tenant_quotas.clone();
+        successor.try_reserve(1).map_err(|_| {
+            GovernorFailure::GovernorBootstrapInventoryUnavailable {
+                required: self.bootstrap_overhead,
+            }
+        })?;
+        successor.push(quota);
+        let total_weight = total_weight(&successor)?;
+        let mut ordinary = Vec::new();
+        ordinary.try_reserve_exact(successor.len()).map_err(|_| {
+            GovernorFailure::GovernorBootstrapInventoryUnavailable {
+                required: self.bootstrap_overhead,
+            }
+        })?;
+        let tenant_fair =
+            ordinary_capacities(&successor, self.pool_capacities, total_weight, ordinary)?;
+        validate_system_recovery_progress(&successor, self.recovery_pool_capacities)?;
+        let mut shared = Vec::new();
+        shared.try_reserve_exact(successor.len()).map_err(|_| {
+            GovernorFailure::GovernorBootstrapInventoryUnavailable {
+                required: self.bootstrap_overhead,
+            }
+        })?;
+        let recovery_shared = amount_capacities(
+            &successor,
+            self.recovery_shared_capacity,
+            total_weight,
+            shared,
+        )?;
+        let mut pools = Vec::new();
+        pools.try_reserve_exact(successor.len()).map_err(|_| {
+            GovernorFailure::GovernorBootstrapInventoryUnavailable {
+                required: self.bootstrap_overhead,
+            }
+        })?;
+        let recovery_fair = recovery_fair_capacities(
+            &successor,
+            self.recovery_pool_capacities,
+            total_weight,
+            pools,
+        )?;
+        let recovery_system =
+            system_recovery_capacities(self.recovery_pool_capacities, &recovery_fair)?;
+        validate_progress(&successor, &tenant_fair, self.maximum_outstanding)?;
+        let limit = state
+            .tenant_limits
+            .get_mut(slot)
+            .ok_or(GovernorFailure::InternalFenced)?;
+        *limit = limits;
+        state.tenant_quotas = successor;
+        state.tenant_fair_capacities = tenant_fair;
+        state.recovery_tenant_shared_fair = recovery_shared;
+        state.recovery_tenant_pool_fair = recovery_fair;
+        state.recovery_system_pool_capacities = recovery_system;
+        if pending {
+            state.pending_tenant = Some(tenant);
+        }
+        Ok(())
+    }
+    pub(super) fn activate_tenant_quota(&self, tenant: TenantId) {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if state.pending_tenant == Some(tenant) {
+            state.pending_tenant = None;
+        }
+    }
+    pub(super) fn rollback_tenant_quota(&self, tenant: TenantId) {
+        let Ok(mut state) = self.try_lock_for_control() else {
+            return;
+        };
+        if state.pending_tenant != Some(tenant)
+            || state
+                .tenant_quotas
+                .last()
+                .is_none_or(|quota| quota.tenant != tenant)
+        {
+            return;
+        }
+        state.tenant_quotas.pop();
+        state.tenant_fair_capacities.pop();
+        state.recovery_tenant_shared_fair.pop();
+        state.recovery_tenant_pool_fair.pop();
+        state.pending_tenant = None;
+        let index = state.tenant_quotas.len();
+        if let Some(limit) = state.tenant_limits.get_mut(index) {
+            *limit = ResourceAmounts::zero();
+        }
+    }
+    pub(super) fn tenant_index(
+        state: &AccountingState,
         tenant: TenantId,
         class: WorkClass,
     ) -> Result<usize, AdmissionFailure> {
-        self.tenant_quotas
+        state
+            .tenant_quotas
             .iter()
-            .position(|quota| quota.tenant == tenant)
+            .position(|quota| quota.tenant == tenant && state.pending_tenant != Some(tenant))
             .ok_or_else(|| {
                 failure(
                     AdmissionFailureCode::UnregisteredTenant,

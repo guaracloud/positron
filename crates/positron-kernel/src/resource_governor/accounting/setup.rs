@@ -83,9 +83,6 @@ impl GovernorInner {
         for (slot, quota) in tenant_limits.iter_mut().zip(tenant_quotas.iter()) {
             *slot = quota.limits;
         }
-        if tenant_limits.len() != tenant_quotas.len() {
-            return Err(GovernorFailure::InvalidConfiguration);
-        }
         let ordinary_tenant_usage = zeroed_tenant_table(
             layout,
             required,
@@ -131,6 +128,12 @@ impl GovernorInner {
         } = ledger;
         let initial_pressure = disk_thresholds.initial(initial_disk);
         let state = AccountingState {
+            pending_tenant: None,
+            tenant_quotas: tenant_quotas.into_vec(),
+            tenant_fair_capacities,
+            recovery_tenant_shared_fair,
+            recovery_tenant_pool_fair,
+            recovery_system_pool_capacities,
             rejection_counts: [0; AdmissionFailureCode::COUNT],
             grant_records: records,
             free_slots,
@@ -162,15 +165,10 @@ impl GovernorInner {
             total_ceiling,
             ordinary_ceiling,
             recovery_reserve,
-            tenant_quotas,
             maximum_outstanding,
             pool_capacities,
-            tenant_fair_capacities: into_boxed_exact(tenant_fair_capacities, required)?,
             recovery_pool_capacities,
             recovery_shared_capacity,
-            recovery_tenant_shared_fair: into_boxed_exact(recovery_tenant_shared_fair, required)?,
-            recovery_tenant_pool_fair: into_boxed_exact(recovery_tenant_pool_fair, required)?,
-            recovery_system_pool_capacities,
             disk_thresholds,
             state,
             slot_signals: signals,
@@ -192,15 +190,10 @@ impl GovernorInner {
             total_ceiling: configuration.total_ceiling,
             ordinary_ceiling: configuration.ordinary_ceiling,
             recovery_reserve: configuration.recovery_reserve,
-            tenant_quotas: configuration.tenant_quotas,
             maximum_outstanding: configuration.maximum_outstanding,
             pool_capacities: configuration.pool_capacities,
-            tenant_fair_capacities: configuration.tenant_fair_capacities,
             recovery_pool_capacities: configuration.recovery_pool_capacities,
             recovery_shared_capacity: configuration.recovery_shared_capacity,
-            recovery_tenant_shared_fair: configuration.recovery_tenant_shared_fair,
-            recovery_tenant_pool_fair: configuration.recovery_tenant_pool_fair,
-            recovery_system_pool_capacities: configuration.recovery_system_pool_capacities,
             disk_thresholds: configuration.disk_thresholds,
             state: Mutex::new(configuration.state),
             drop_ledger: Arc::new(super::super::ledger::DropLedger::new(
