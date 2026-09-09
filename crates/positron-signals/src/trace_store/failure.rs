@@ -130,6 +130,42 @@ impl TraceStoreFailure {
         }
     }
 
+    pub(super) const fn catalog(failure: positron_kernel::CatalogFailure) -> Self {
+        let code = match failure.code() {
+            positron_kernel::CatalogFailureCode::InvalidInput => {
+                TraceStoreFailureCode::InvalidInput
+            },
+            positron_kernel::CatalogFailureCode::LimitExceeded => {
+                TraceStoreFailureCode::LimitExceeded
+            },
+            positron_kernel::CatalogFailureCode::StaleGeneration => {
+                TraceStoreFailureCode::StaleGeneration
+            },
+            positron_kernel::CatalogFailureCode::IdempotencyConflict => {
+                TraceStoreFailureCode::IdempotencyConflict
+            },
+            positron_kernel::CatalogFailureCode::StorageUnavailable => {
+                TraceStoreFailureCode::StorageUnavailable
+            },
+            positron_kernel::CatalogFailureCode::IntegrityCorruption => {
+                TraceStoreFailureCode::IntegrityCorruption
+            },
+            positron_kernel::CatalogFailureCode::AuthenticationFailed => {
+                TraceStoreFailureCode::AuthenticationFailed
+            },
+            positron_kernel::CatalogFailureCode::ConcurrentWriter => {
+                TraceStoreFailureCode::ConcurrentWriter
+            },
+            positron_kernel::CatalogFailureCode::ResourceAdmissionRefused => {
+                TraceStoreFailureCode::ResourceAdmissionRefused
+            },
+            positron_kernel::CatalogFailureCode::UnsupportedFormat => {
+                TraceStoreFailureCode::UnsupportedFormat
+            },
+        };
+        Self::rejected(code)
+    }
+
     #[must_use]
     pub const fn code(&self) -> TraceStoreFailureCode {
         self.code

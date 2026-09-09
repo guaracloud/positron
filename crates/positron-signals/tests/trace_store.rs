@@ -5,14 +5,19 @@ use positron_domain::value::{
     AttributeNamespace, ByteLimit, CandidateAttributeValue, DynamicValueLimits, RecordLimits,
     ValueLimitProfile, ValueLimitProfileCandidate, ValueLimitSet,
 };
+use positron_governance::{InitialAuditContext, InitialGovernanceIntent, InitialTenantIntent};
 use positron_kernel::{
-    ActiveSegmentLedger, Catalog, CatalogSecret, DiskPressureThresholds, GovernorPolicy,
-    InstanceId, InventoryCardinalityLimits, MountQualification, ObservedResourceEnvironment,
-    OperatorLimits, OrdinaryPoolPolicy, OwnedPrimaryDataVolume, PrimaryDataVolume,
-    RecoveryPoolCapacities, RecoveryReserve, RegisteredResourceBounds, ResourceAmounts,
-    ResourceDimension, ResourceGovernorConfiguration, ResourceInventory, RetentionTimeAuthority,
-    SegmentProtectionKey, SegmentScope, StorageKernelResourceAuthority, TenantQuota, WorkClaim,
-    WorkKind,
+    ActiveSegmentLedger, Catalog, CatalogSecret, DiskPressureThresholds, FixedLifecycleClockSource,
+    GovernorPolicy, InstanceId, InventoryCardinalityLimits, LifecycleClock, MountQualification,
+    ObservedResourceEnvironment, OperatorLimits, OrdinaryPoolPolicy, OwnedPrimaryDataVolume,
+    PrimaryDataVolume, RecoveryPoolCapacities, RecoveryReserve, RegisteredResourceBounds,
+    ResourceAmounts, ResourceDimension, ResourceGovernorConfiguration, ResourceInventory,
+    RetentionTimeAuthority, SegmentProtectionKey, SegmentScope, StorageKernelResourceAuthority,
+    TenantQuota, WorkClaim, WorkKind,
+};
+use positron_kernel::{
+    CatalogObject, CatalogProposal, CatalogPublicationFault, FormatEpoch, TransactionId,
+    with_catalog_publication_fault_after,
 };
 use positron_policy::{
     IngestPolicy, NativePolicyAttribute, NativeTraceCandidate, PolicyReceiver,
@@ -21,14 +26,55 @@ use positron_policy::{
 use positron_signals::{
     EvaluatedSpanObservationInput, SamplingDecision, ScanLimit, SpanAttributeSet, SpanEvent,
     SpanKind, SpanLink, SpanObservation, SpanObservationDetails, SpanObservationDetailsInput,
-    SpanResourceMetadata, SpanScopeMetadata, SpanStatus, SpanStatusCode, TraceScan, TraceStore,
+    SpanResourceMetadata, SpanScopeMetadata, SpanStatus, SpanStatusCode, TraceQuietPeriod,
+    TraceRetentionPolicy, TraceScan, TraceStore, TraceStoreFailureCode, TraceSummaryMaintainer,
 };
+use positron_signals::{ScanCancellation, ScanObservationFailureCode, ScanObserver};
+
+#[path = "trace_store/lifecycle.rs"]
+mod lifecycle;
+
+#[test]
+fn public_trace_store_exposes_retention_and_compaction_lifecycle() {
+    let store = TraceStore::new();
+    let _compact = TraceStore::compact;
+    let _compact_observed = TraceStore::compact_observed;
+    let _retention = TraceStore::enforce_retention;
+    let _retention_observed = TraceStore::enforce_retention_observed;
+    let _policy = positron_signals::TraceRetentionPolicy::from_catalog;
+    let _bucket = positron_signals::TraceRetentionBucket::signal_kind;
+    let _outcome = positron_signals::TraceCompactionOutcome::input_segments;
+    let _ = store;
+}
+
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
+
+struct NeverCancelled;
+
+impl ScanCancellation for NeverCancelled {
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+}
+
+struct CancelAfterInitialPoll(AtomicBool);
+
+impl CancelAfterInitialPoll {
+    fn new() -> Self {
+        Self(AtomicBool::new(false))
+    }
+}
+
+impl ScanCancellation for CancelAfterInitialPoll {
+    fn is_cancelled(&self) -> bool {
+        self.0.swap(true, Ordering::AcqRel)
+    }
+}
 
 #[test]
 fn public_trace_store_seam_commits_and_reads_a_native_observation() -> Result<(), Box<dyn Error>> {
@@ -592,6 +638,75 @@ fn add(left: ResourceAmounts, right: ResourceAmounts) -> Result<ResourceAmounts,
         value(ResourceDimension::FileDescriptors)?,
         value(ResourceDimension::DiskHeadroomBytes)?,
     ]))
+}
+
+fn trace_observation(span_id: [u8; 8], name: &str) -> Result<SpanObservation, Box<dyn Error>> {
+    let TracePolicyEvaluation::Accepted(evaluated) = IngestPolicy::preserving(1)?.evaluate_trace(
+        NativeTraceCandidate::new(Vec::new()),
+        PolicyReceiver::OtlpGrpc,
+    )?
+    else {
+        return Err("preserving trace policy rejected fixture".into());
+    };
+    Ok(SpanObservation::checked_evaluated(
+        ValueLimitProfile::release_1_system_maximum(),
+        EvaluatedSpanObservationInput {
+            trace_id: [0x79; 16],
+            span_id,
+            parent_span_id: None,
+            name: name.to_owned(),
+            start_time: EventTime::received(UnixNanoseconds::new(10), SourceTimeQuality::Usable)?,
+            end_time: EventTime::received(UnixNanoseconds::new(20), SourceTimeQuality::Usable)?,
+            kind: SpanKind::Server,
+            sampling: SamplingDecision::Sampled,
+            evaluated: *evaluated,
+            details: SpanObservationDetails::default(),
+        },
+    )?)
+}
+
+fn install_trace_retention(
+    catalog: &Catalog<'_>,
+    instance: InstanceId,
+    tenant: TenantId,
+    seconds: u64,
+) -> Result<(), Box<dyn Error>> {
+    let intent = InitialTenantIntent::new(
+        instance.to_bytes(),
+        tenant,
+        positron_domain::identity::TenantSlug::parse_canonical("trace-retention")?,
+        "Trace retention",
+        positron_domain::identity::PrincipalId::from_bytes([0x81; 16])?,
+        [0x82; 32],
+        [0x83; 32],
+        positron_domain::identity::PrincipalId::from_bytes([0x84; 16])?,
+        [0x85; 32],
+        [0x86; 32],
+        positron_domain::identity::PrincipalId::from_bytes([0x87; 16])?,
+        [0x88; 32],
+        [0x89; 32],
+        [0x8a; 32],
+        [0x8b; 32],
+        vec![1],
+        vec![2],
+        seconds,
+        1,
+        1,
+        [1; 11],
+        InitialAuditContext::new(1, [0x8c; 16], true)?,
+    )?;
+    let (governance, audit) = InitialGovernanceIntent::create_tenant(intent)?.into_parts();
+    let basis = catalog.pin()?;
+    catalog.commit(
+        basis.identity(),
+        CatalogProposal::new(
+            TransactionId::new([0x8d; 16])?,
+            FormatEpoch::CATALOG_V1,
+            vec![CatalogObject::new(governance)?],
+        )?,
+        Some(positron_kernel::AuditIntent::new(audit)?),
+    )?;
+    Ok(())
 }
 
 fn profile_with_key_limit(key_path_bytes: u32) -> ValueLimitProfile {

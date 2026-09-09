@@ -105,11 +105,12 @@ impl CatalogGovernanceObject {
     }
 }
 
-/// Opaque v3/v4 Log retention evidence from one authenticated Catalog snapshot.
+/// Opaque v3/v4 signal retention evidence from one authenticated Catalog snapshot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CatalogLogRetentionPolicy {
     instance: InstanceId,
     tenant: TenantId,
+    signal: SignalKind,
     retention_seconds: NonZeroU64,
     object: CatalogObjectId,
 }
@@ -127,7 +128,7 @@ impl CatalogLogRetentionPolicy {
 
     #[must_use]
     pub const fn signal_kind(&self) -> SignalKind {
-        SignalKind::Logs
+        self.signal
     }
 
     #[must_use]
@@ -156,6 +157,17 @@ impl CatalogSnapshot {
 
     /// Derives exact current Log-retention evidence from this authenticated snapshot.
     pub fn log_retention_policy(&self) -> Result<CatalogLogRetentionPolicy, CatalogFailure> {
+        self.retention_policy(SignalKind::Logs)
+    }
+
+    /// Derives retention evidence scoped to one implemented physical signal.
+    pub fn retention_policy(
+        &self,
+        signal: SignalKind,
+    ) -> Result<CatalogLogRetentionPolicy, CatalogFailure> {
+        if !matches!(signal, SignalKind::Logs | SignalKind::Traces) {
+            return Err(CatalogFailure::new(CatalogFailureCode::UnsupportedFormat));
+        }
         let (object, governance) = self.governance_object()?;
         if !matches!(
             governance.version,
@@ -169,6 +181,7 @@ impl CatalogSnapshot {
         Ok(CatalogLogRetentionPolicy {
             instance: InstanceId::new(governance.instance)?,
             tenant: governance.tenant,
+            signal,
             retention_seconds,
             object,
         })

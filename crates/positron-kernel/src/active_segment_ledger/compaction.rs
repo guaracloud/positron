@@ -54,7 +54,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         self.catalog.refresh_state()?;
         let basis = self.catalog.pin()?;
         let basis_is_stale = match expected_policy {
-            Some(expected) => basis.log_retention_policy()? != expected,
+            Some(expected) => basis.retention_policy(expected.signal_kind())? != expected,
             None => {
                 basis.identity() != snapshot.catalog_identity()
                     || basis.number() != snapshot.catalog_generation()
@@ -176,7 +176,9 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         self.catalog.refresh_state()?;
         let basis = self.catalog.pin()?;
         let catalog_is_stale = match preparation.retention_policy {
-            Some(expected_policy) => basis.log_retention_policy()? != expected_policy,
+            Some(expected_policy) => {
+                basis.retention_policy(expected_policy.signal_kind())? != expected_policy
+            },
             None => {
                 basis.identity() != preparation.catalog_identity
                     || basis.number() != preparation.catalog_generation
