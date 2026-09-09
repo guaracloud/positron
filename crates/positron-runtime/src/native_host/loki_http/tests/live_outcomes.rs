@@ -142,6 +142,7 @@ impl ReceiverHarness {
             accepting: AtomicBool::new(true),
             control_path: None,
             api_transport: None,
+            trusted_proxy: None,
         });
         let cancellation = TaskCancellation::new();
         let serve_cancellation = cancellation.clone();

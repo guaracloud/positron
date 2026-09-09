@@ -14,6 +14,7 @@ use positron_query::QueryBudget;
 use positron_runtime::{
     ApiTransportProfile, ApplicationRuntime, BootstrapPaths, HostInputs, InitializationMode,
     InstanceBootstrap, NativeBindings, NativeHost, ServeConfiguration, ShutdownTrigger,
+    TrustedProxy,
 };
 use prost::Message;
 
@@ -128,6 +129,18 @@ fn loopback_otlp_is_authenticated_durable_and_observable_across_restart()
         &[0xff],
     )?;
     assert_status(unauthorized, 401);
+    let untrusted_forwarded_identity = http(
+        otlp,
+        "POST",
+        "/v1/logs",
+        &[
+            ("Content-Type", "application/x-protobuf"),
+            ("X-Forwarded-User", "forged-tenant-user"),
+            ("X-Forwarded-Authorization", "Bearer pos_forged"),
+        ],
+        &[0xff],
+    )?;
+    assert_status(untrusted_forwarded_identity, 401);
     let body = otlp_body("durable-loopback");
     let authorization = format!(
         "Bearer {}",
@@ -178,6 +191,171 @@ fn loopback_otlp_is_authenticated_durable_and_observable_across_restart()
         positron_runtime::ExitOutcome::Graceful
     ));
     assert!(!ingest_secret.is_empty());
+    Ok(())
+}
+
+#[test]
+fn configured_proxy_metadata_requires_the_exact_peer_and_fixed_hop_before_ingest()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _guard = live_test_guard();
+    let roots = TestRoots::new("trusted-proxy-attribution")?;
+    let paths = roots.paths()?;
+    drop(InstanceBootstrap::initialize(
+        &paths,
+        positron_runtime::InitializationPlan::non_interactive(),
+    )?);
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let authorization = format!(
+        "Bearer {}",
+        claim.ingest_secret().ok_or("ingest secret missing")?
+    );
+    let query_secret = claim
+        .query_secret()
+        .ok_or("query secret missing")?
+        .to_owned();
+    let policy = TrustedProxy::exact_peer(Ipv4Addr::LOCALHOST.into(), 1)?;
+    let host = NativeHost::new(bindings(&roots, "trusted-proxy")?.with_trusted_proxy(policy));
+    let process = ApplicationRuntime::start(
+        ServeConfiguration::new(paths.clone(), InitializationMode::ExistingOnly),
+        HostInputs::new(&host, &host),
+    )?;
+    let otlp = address(
+        &process.bound_endpoints(),
+        positron_runtime::ListenerRole::OtlpHttp,
+    )?;
+
+    let body = otlp_body("trusted-proxy-attribution");
+    let accepted = http(
+        otlp,
+        "POST",
+        "/v1/logs",
+        &[
+            ("Authorization", &authorization),
+            ("Content-Type", "application/x-protobuf"),
+            ("X-Forwarded-For", "198.51.100.24"),
+            ("X-Forwarded-User", "proxied-operator"),
+            ("X-Forwarded-Authorization", "Bearer pos_forged"),
+        ],
+        &body,
+    )?;
+    assert_status(accepted, 200);
+
+    let wrong_hops = http(
+        otlp,
+        "POST",
+        "/v1/logs",
+        &[
+            ("Authorization", &authorization),
+            ("Content-Type", "application/x-protobuf"),
+            ("X-Forwarded-For", "198.51.100.24, 198.51.100.25"),
+            ("X-Forwarded-User", "proxied-operator"),
+        ],
+        &[0xff],
+    )?;
+    assert_status(wrong_hops, 401);
+
+    let duplicate_forwarded_for = http(
+        otlp,
+        "POST",
+        "/v1/logs",
+        &[
+            ("Authorization", &authorization),
+            ("Content-Type", "application/x-protobuf"),
+            ("X-Forwarded-For", "198.51.100.24"),
+            ("X-Forwarded-For", "198.51.100.25"),
+        ],
+        &[0xff],
+    )?;
+    assert_status(duplicate_forwarded_for, 400);
+
+    let conflicting_forwarded_actor = http(
+        otlp,
+        "POST",
+        "/v1/logs",
+        &[
+            ("Authorization", &authorization),
+            ("Content-Type", "application/x-protobuf"),
+            ("X-Forwarded-For", "198.51.100.24"),
+            ("X-Forwarded-User", "proxied-user"),
+            ("X-Forwarded-Service", "proxied-service"),
+        ],
+        &[0xff],
+    )?;
+    assert_status(conflicting_forwarded_actor, 400);
+
+    assert_eq!(
+        process.shutdown(ShutdownTrigger::FirstSignal),
+        positron_runtime::ExitOutcome::Graceful
+    );
+
+    let wrong_peer = TrustedProxy::exact_peer(Ipv4Addr::new(127, 0, 0, 2).into(), 1)?;
+    let wrong_peer_host =
+        NativeHost::new(bindings(&roots, "wrong-trusted-proxy")?.with_trusted_proxy(wrong_peer));
+    let wrong_peer_process = ApplicationRuntime::start(
+        ServeConfiguration::new(paths.clone(), InitializationMode::ExistingOnly),
+        HostInputs::new(&wrong_peer_host, &wrong_peer_host),
+    )?;
+    let wrong_peer_otlp = address(
+        &wrong_peer_process.bound_endpoints(),
+        positron_runtime::ListenerRole::OtlpHttp,
+    )?;
+    let rejected_peer = http(
+        wrong_peer_otlp,
+        "POST",
+        "/v1/logs",
+        &[
+            ("Authorization", &authorization),
+            ("Content-Type", "application/x-protobuf"),
+            ("X-Forwarded-For", "198.51.100.24"),
+            ("X-Forwarded-User", "proxied-operator"),
+        ],
+        &[0xff],
+    )?;
+    assert_status(rejected_peer, 401);
+    assert_eq!(
+        wrong_peer_process.shutdown(ShutdownTrigger::FirstSignal),
+        positron_runtime::ExitOutcome::Graceful
+    );
+
+    let unconfigured_host = NativeHost::new(bindings(&roots, "unconfigured-proxy")?);
+    let unconfigured_process = ApplicationRuntime::start(
+        ServeConfiguration::new(paths, InitializationMode::ExistingOnly),
+        HostInputs::new(&unconfigured_host, &unconfigured_host),
+    )?;
+    let unconfigured_otlp = address(
+        &unconfigured_process.bound_endpoints(),
+        positron_runtime::ListenerRole::OtlpHttp,
+    )?;
+    let unconfigured = http(
+        unconfigured_otlp,
+        "POST",
+        "/v1/logs",
+        &[
+            ("Authorization", &authorization),
+            ("Content-Type", "application/x-protobuf"),
+            ("X-Forwarded-For", "198.51.100.24"),
+            ("X-Forwarded-User", "forged-user"),
+            ("X-Forwarded-Authorization", "Bearer pos_forged"),
+        ],
+        &otlp_body("unconfigured-forwarded-http"),
+    )?;
+    assert_status(unconfigured, 200);
+    assert_eq!(
+        unconfigured_process
+            .services()
+            .ok_or("serving process omitted services")?
+            .query_log_bodies(
+                &query_secret,
+                "logs | range query_time 0 100 | limit 16",
+                QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?
+                    .with_cpu_work_units(15)?,
+            )?,
+        ["trusted-proxy-attribution", "unconfigured-forwarded-http"]
+    );
+    assert_eq!(
+        unconfigured_process.shutdown(ShutdownTrigger::FirstSignal),
+        positron_runtime::ExitOutcome::Graceful
+    );
     Ok(())
 }
 
@@ -526,6 +704,7 @@ fn native_bindings_reject_unsafe_and_colliding_endpoints() -> Result<(), Box<dyn
     let _guard = live_test_guard();
     let loopback = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
     let wildcard = "0.0.0.0:1".parse()?;
+    assert!(TrustedProxy::exact_peer(Ipv4Addr::LOCALHOST.into(), 0).is_err());
     assert!(
         NativeBindings::new(
             PathBuf::from("relative.sock"),

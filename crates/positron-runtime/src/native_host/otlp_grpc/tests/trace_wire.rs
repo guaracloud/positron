@@ -1,6 +1,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use opentelemetry_proto::tonic::collector::logs::v1::{
+    ExportLogsServiceRequest, logs_service_client::LogsServiceClient,
+};
 use opentelemetry_proto::tonic::collector::trace::v1::trace_service_client::TraceServiceClient;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
 use positron_domain::value::AttributeNamespace;
@@ -142,6 +145,113 @@ async fn trace_grpc_authentication_and_tenant_attribution_fail_closed()
     assert_eq!(conflict.code(), Code::Unauthenticated);
     assert_eq!(
         conflict.message(),
+        "OTLP Traces request authentication was rejected"
+    );
+    assert_eq!(backend.calls(), 0);
+    assert_eq!(harness.snapshot()?, baseline);
+
+    drop(client);
+    harness.finish()?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn trace_grpc_rejects_conflicting_tenant_hints_before_admission()
+-> Result<(), Box<dyn std::error::Error>> {
+    let backend = Arc::new(ScriptedBackend::new([]));
+    let harness = ReceiverHarness::start(backend.clone())?;
+    let baseline = harness.snapshot()?;
+    let mut client = tokio::time::timeout(
+        Duration::from_secs(2),
+        TraceServiceClient::connect(format!("http://{}", harness.endpoint)),
+    )
+    .await??;
+
+    let mut request = harness.authorize_trace(trace_request(0x72))?;
+    request
+        .metadata_mut()
+        .append("x-scope-orgid", "trace-external".parse()?);
+    request
+        .metadata_mut()
+        .append("x-scope-orgid", "other-tenant".parse()?);
+    let rejected = tokio::time::timeout(Duration::from_secs(2), client.export(request))
+        .await?
+        .expect_err("conflicting tenant hints must fail before admission");
+    assert_eq!(rejected.code(), Code::Unauthenticated);
+    assert_eq!(
+        rejected.message(),
+        "OTLP Traces request authentication was rejected"
+    );
+    assert_eq!(backend.calls(), 0);
+    assert_eq!(harness.snapshot()?, baseline);
+
+    drop(client);
+    harness.finish()?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn logs_grpc_rejects_conflicting_tenant_hints_before_admission()
+-> Result<(), Box<dyn std::error::Error>> {
+    let backend = Arc::new(ScriptedBackend::new([]));
+    let harness = ReceiverHarness::start(backend.clone())?;
+    let baseline = harness.snapshot()?;
+    let mut client = tokio::time::timeout(
+        Duration::from_secs(2),
+        LogsServiceClient::connect(format!("http://{}", harness.endpoint)),
+    )
+    .await??;
+
+    let mut request = tonic::Request::new(ExportLogsServiceRequest::default());
+    request.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", harness.bearer).parse()?,
+    );
+    request
+        .metadata_mut()
+        .append("x-scope-orgid", "trace-external".parse()?);
+    request
+        .metadata_mut()
+        .append("x-scope-orgid", "other-tenant".parse()?);
+    let rejected = tokio::time::timeout(Duration::from_secs(2), client.export(request))
+        .await?
+        .expect_err("conflicting tenant hints must fail before admission");
+    assert_eq!(rejected.code(), Code::Unauthenticated);
+    assert_eq!(
+        rejected.message(),
+        "OTLP Logs request authentication was rejected"
+    );
+    assert_eq!(backend.calls(), 0);
+    assert_eq!(harness.snapshot()?, baseline);
+
+    drop(client);
+    harness.finish()?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn trace_grpc_rejects_duplicate_bearer_credentials_before_admission()
+-> Result<(), Box<dyn std::error::Error>> {
+    let backend = Arc::new(ScriptedBackend::new([]));
+    let harness = ReceiverHarness::start(backend.clone())?;
+    let baseline = harness.snapshot()?;
+    let mut client = tokio::time::timeout(
+        Duration::from_secs(2),
+        TraceServiceClient::connect(format!("http://{}", harness.endpoint)),
+    )
+    .await??;
+
+    let mut request = harness.authorize_trace(trace_request(0x73))?;
+    request.metadata_mut().append(
+        "authorization",
+        "Bearer pos_0000000000000000000000000000000000000000000000000000000000000000".parse()?,
+    );
+    let rejected = tokio::time::timeout(Duration::from_secs(2), client.export(request))
+        .await?
+        .expect_err("multiple bearer credentials must fail before admission");
+    assert_eq!(rejected.code(), Code::Unauthenticated);
+    assert_eq!(
+        rejected.message(),
         "OTLP Traces request authentication was rejected"
     );
     assert_eq!(backend.calls(), 0);

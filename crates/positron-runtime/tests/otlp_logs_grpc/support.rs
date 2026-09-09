@@ -117,6 +117,44 @@ impl LiveGrpcHarness {
         Self::start_with(label, std::convert::identity)
     }
 
+    pub(super) fn start_with_bindings(
+        label: &str,
+        configure: impl FnOnce(NativeBindings) -> NativeBindings,
+    ) -> Result<Self, TestError> {
+        let roots = TestRoots::new(label)?;
+        let paths = roots.paths()?;
+        drop(InstanceBootstrap::initialize(
+            &paths,
+            positron_runtime::InitializationPlan::non_interactive(),
+        )?);
+        let claim = InstanceBootstrap::claim(&paths)?;
+        let bearer = claim
+            .ingest_secret()
+            .ok_or("ingest secret missing")?
+            .to_owned();
+        let query_secret = claim
+            .query_secret()
+            .ok_or("query secret missing")?
+            .to_owned();
+        let configured = configure(bindings(&roots, label)?);
+        let host = positron_runtime::NativeHost::new(configured);
+        let process = ApplicationRuntime::start(
+            ServeConfiguration::new(paths, InitializationMode::ExistingOnly),
+            HostInputs::new(&host, &host),
+        )?;
+        let endpoint = address(
+            &process.bound_endpoints(),
+            positron_runtime::ListenerRole::OtlpGrpc,
+        )?;
+        Ok(Self {
+            process: Some(process),
+            endpoint,
+            bearer,
+            query_secret,
+            _roots: roots,
+        })
+    }
+
     pub(super) fn start_with(
         label: &str,
         configure: impl FnOnce(ServeConfiguration) -> ServeConfiguration,

@@ -1,8 +1,8 @@
 use std::net::TcpStream;
 
-use positron_governance::CompatibilityHints;
 use positron_ingest::{IngestFailureCode, IngestOutcome, LokiPushRequestEncoding};
 
+use super::TrustedProxy;
 use super::native_http::{RequestHead, Response, read_body};
 use crate::{ServiceFailure, ServiceHandle};
 
@@ -13,22 +13,20 @@ mod tests;
 pub(super) fn receive_push(
     stream: &mut TcpStream,
     head: RequestHead,
+    peer: std::net::SocketAddr,
+    trusted_proxy: Option<TrustedProxy>,
     services: &ServiceHandle,
 ) -> Result<Response, Response> {
     let encoding = request_encoding(
         head.content_type.as_deref(),
         head.content_encoding.as_deref(),
     )?;
+    let hints = head
+        .compatibility_hints(peer, trusted_proxy)
+        .map_err(|_| failure(401, "Loki Push authentication was rejected"))?;
     let bearer = head
         .bearer
         .ok_or_else(|| failure(401, "Loki Push authentication was rejected"))?;
-    let hints = head
-        .tenant_hint
-        .as_deref()
-        .map(CompatibilityHints::external_tenant_alias)
-        .transpose()
-        .map_err(|_| failure(401, "Loki Push authentication was rejected"))?
-        .unwrap_or_else(CompatibilityHints::none);
     let context = services
         .authorize_logs_with_hints(&bearer, hints)
         .map_err(|_| failure(401, "Loki Push authentication was rejected"))?;

@@ -107,6 +107,8 @@ fn authenticated_http_log_marker_survives_ack_and_runtime_reopen() -> Result<(),
             content_type: Some(ResponseEncoding::Protobuf.content_type().to_owned()),
             content_encoding: None,
             tenant_hint: None,
+            forwarded_for: None,
+            forwarded_actor: None,
         },
         &services,
     )
@@ -219,6 +221,8 @@ fn authenticated_http_log_attribute_marker_reports_insufficient_governor_headroo
             content_type: Some(ResponseEncoding::Protobuf.content_type().to_owned()),
             content_encoding: None,
             tenant_hint: None,
+            forwarded_for: None,
+            forwarded_actor: None,
         },
         &services,
     )
@@ -265,6 +269,8 @@ fn authenticated_http_log_attribute_marker_reports_insufficient_governor_headroo
             content_type: Some(ResponseEncoding::Protobuf.content_type().to_owned()),
             content_encoding: None,
             tenant_hint: None,
+            forwarded_for: None,
+            forwarded_actor: None,
         },
         &services,
     )
@@ -353,6 +359,8 @@ fn authenticated_http_trace_marker_survives_ack_and_runtime_reopen() -> Result<(
             content_type: Some(ResponseEncoding::Protobuf.content_type().to_owned()),
             content_encoding: None,
             tenant_hint: None,
+            forwarded_for: None,
+            forwarded_actor: None,
         },
         &services,
     )
@@ -402,6 +410,8 @@ fn authenticated_http_trace_marker_survives_ack_and_runtime_reopen() -> Result<(
             content_type: Some(ResponseEncoding::Protobuf.content_type().to_owned()),
             content_encoding: None,
             tenant_hint: None,
+            forwarded_for: None,
+            forwarded_actor: None,
         },
         &services,
     )

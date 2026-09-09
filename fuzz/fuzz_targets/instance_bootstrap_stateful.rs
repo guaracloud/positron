@@ -358,6 +358,16 @@ fuzz_target!(|data: &[u8]| {
                             CompatibilityHints::none(),
                         );
                         assert!(attributed.is_ok());
+                        let confused_deputy = instance.attribute(
+                            PresentedCredential::parse(&key_secret)
+                                .expect("generated API key remains canonical"),
+                            intent,
+                            CompatibilityHints::fuzz_adversarial(&data[index..]),
+                        );
+                        assert!(
+                            confused_deputy.is_err(),
+                            "untrusted proxy or nested tenant claims cannot change a valid tenant key"
+                        );
                         assert!(instance
                             .attribute(
                                 PresentedCredential::parse(&key_secret)

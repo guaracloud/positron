@@ -14,23 +14,55 @@ use crate::{
 };
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
+const MAX_ROOT_COLLISION_RETRIES: u64 = 64;
 
 pub(super) struct TemporaryRoot(PathBuf);
 
 impl TemporaryRoot {
     pub(super) fn new() -> Result<Self, std::io::Error> {
         let sequence = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
+        Self::new_from_sequence(sequence)
+    }
+
+    fn new_from_sequence(sequence: u64) -> Result<Self, std::io::Error> {
+        for offset in 0..MAX_ROOT_COLLISION_RETRIES {
+            let candidate = sequence.saturating_add(offset);
+            let path = Self::path_for(candidate);
+            match fs::create_dir(&path) {
+                Ok(()) => return Ok(Self(path)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {},
+                Err(error) => return Err(error),
+            }
+        }
+        Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists))
+    }
+
+    fn path_for(sequence: u64) -> PathBuf {
+        std::env::temp_dir().join(format!(
             "positron-active-ledger-unit-test-{}-{sequence}",
             std::process::id()
-        ));
-        fs::create_dir(&path)?;
-        Ok(Self(path))
+        ))
     }
 
     pub(super) fn path(&self) -> &Path {
         &self.0
     }
+}
+
+#[test]
+fn temporary_root_skips_a_stale_process_sequence() -> Result<(), std::io::Error> {
+    let sequence = loop {
+        let candidate = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
+        if !TemporaryRoot::path_for(candidate).exists() {
+            break candidate;
+        }
+    };
+    let stale = TemporaryRoot::path_for(sequence);
+    fs::create_dir(&stale)?;
+    let root = TemporaryRoot::new_from_sequence(sequence)?;
+    assert_ne!(root.path(), stale);
+    drop(root);
+    fs::remove_dir(stale)
 }
 
 impl Drop for TemporaryRoot {
