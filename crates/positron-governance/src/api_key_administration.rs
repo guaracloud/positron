@@ -289,7 +289,6 @@ impl ApiKeyAdministration {
         )? {
             return Ok(replay);
         }
-        let generation = next_generation(governance.credential_generation(), expected)?;
         let predecessor = governance
             .credentials()
             .iter()
@@ -299,6 +298,52 @@ impl ApiKeyAdministration {
                     && credential.scope_code() != 4
             })
             .ok_or(ApiKeyAdministrationFailure::CredentialUnavailable)?;
+        let request_digest = rotate_request_digest(
+            idempotency,
+            actor.principal_id(),
+            predecessor.principal(),
+            predecessor.scope_code(),
+            predecessor.expires_at_unix_seconds(),
+            expected,
+        )?;
+        match catalog
+            .resume_prepared(
+                TransactionId::new(idempotency.to_bytes()).map_err(map_catalog)?,
+                request_digest,
+            )
+            .map_err(map_catalog)?
+        {
+            PreparedTransactionResolution::Absent => {},
+            PreparedTransactionResolution::Unavailable => {
+                return Err(ApiKeyAdministrationFailure::PersistenceUnavailable);
+            },
+            PreparedTransactionResolution::Resumed(commit) => {
+                let audit = commit
+                    .governance_audit_record()
+                    .ok_or(ApiKeyAdministrationFailure::PersistenceUnavailable)?;
+                let entry = crate::GovernanceAuditEntry::decode(audit)
+                    .map_err(|_| ApiKeyAdministrationFailure::PersistenceUnavailable)?;
+                let lifecycle = entry
+                    .as_api_key_lifecycle()
+                    .ok_or(ApiKeyAdministrationFailure::PersistenceUnavailable)?;
+                if lifecycle.action() != ApiKeyLifecycleAction::Rotate
+                    || lifecycle.actor_id() != actor.principal_id()
+                    || lifecycle.target_principal_id() != predecessor.principal()
+                    || lifecycle.scope()
+                        != scope_from_code(predecessor.scope_code())
+                            .ok_or(ApiKeyAdministrationFailure::PersistenceUnavailable)?
+                    || lifecycle.expires_at_unix_seconds() != predecessor.expires_at_unix_seconds()
+                    || lifecycle.expected_generation() != expected
+                {
+                    return Err(ApiKeyAdministrationFailure::IdempotencyConflict);
+                }
+                return Ok(ApiKeyCreation {
+                    principal: lifecycle.principal_id(),
+                    secret: None,
+                });
+            },
+        }
+        let generation = next_generation(governance.credential_generation(), expected)?;
         let mut credentials = credentials_with_capacity(governance.credentials())?;
         let CredentialMaterial {
             principal,
@@ -337,7 +382,7 @@ impl ApiKeyAdministration {
                     .map_err(|_| ApiKeyAdministrationFailure::PersistenceUnavailable)?,
                 action: ApiKeyLifecycleAction::Rotate,
             },
-            None,
+            Some(request_digest),
         )?;
         Ok(ApiKeyCreation {
             principal,
@@ -550,13 +595,14 @@ fn credential_material(
     let raw_secret = key
         .random_secret()
         .map_err(|_| ApiKeyAdministrationFailure::PersistenceUnavailable)?;
+    let raw_secret = Zeroizing::new(*raw_secret);
     let hash = key
-        .salted_secret_hash(salt.as_ref(), raw_secret.as_ref())
+        .salted_secret_hash(salt.as_ref(), &raw_secret)
         .map_err(|_| ApiKeyAdministrationFailure::PersistenceUnavailable)?;
     Ok(CredentialMaterial {
         principal,
         salt: *salt,
-        raw_secret: *raw_secret,
+        raw_secret,
         hash,
     })
 }
@@ -585,10 +631,35 @@ fn create_request_digest(
     Ok(digest.finalize().into())
 }
 
+fn rotate_request_digest(
+    idempotency: AdministrativeIdempotencyKey,
+    actor: PrincipalId,
+    predecessor: PrincipalId,
+    scope: u8,
+    expires_at_unix_seconds: Option<u64>,
+    expected: ResourceGeneration,
+) -> Result<[u8; 32], ApiKeyAdministrationFailure> {
+    let mut digest = Sha256::new();
+    digest.update(b"positron-api-key-rotate-request-v1");
+    digest.update(idempotency.to_bytes());
+    digest.update(actor.to_bytes());
+    digest.update(predecessor.to_bytes());
+    digest.update([scope]);
+    match expires_at_unix_seconds {
+        Some(value) => {
+            digest.update([1]);
+            digest.update(value.to_be_bytes());
+        },
+        None => digest.update([0]),
+    }
+    digest.update(expected.get().to_be_bytes());
+    Ok(digest.finalize().into())
+}
+
 struct CredentialMaterial {
     principal: PrincipalId,
     salt: [u8; 32],
-    raw_secret: [u8; 32],
+    raw_secret: Zeroizing<[u8; 32]>,
     hash: [u8; 32],
 }
 

@@ -338,6 +338,7 @@ impl CatalogStorage {
         &self,
         secret: &CatalogSecret,
         instance: InstanceId,
+        current: CatalogGenerationId,
     ) -> Result<bool, CatalogFailure> {
         let markers = self.markers(secret)?;
         if markers.authentication_failures != 0 {
@@ -373,6 +374,9 @@ impl CatalogStorage {
                 Ok(prepared) => prepared,
                 Err(_) => return Ok(true),
             };
+            if prepared.record.predecessor != current {
+                continue;
+            }
             let digest = match read_exact_file(&transaction, "transaction.digest", 32) {
                 Ok(digest) => digest,
                 Err(_) => return Ok(true),

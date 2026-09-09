@@ -197,8 +197,12 @@ impl<'authority> Catalog<'authority> {
             .secret
             .lock()
             .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
         self.storage
-            .has_prepared_transaction(&secret, self.instance)
+            .has_prepared_transaction(&secret, self.instance, state.current.identity())
     }
 
     /// Pins the complete currently published immutable generation.

@@ -48,4 +48,5 @@ deployed artifact.
 
 Recovery is to correct malformed input, remove unknown fields, stay within the
 published bound, or select an API major and capability reported by the target.
-This interface writes no durable state.
+Read-only capability negotiation writes no durable state. Authenticated API-key lifecycle
+mutations publish one Catalog generation and the matching redacted Governance Audit record.

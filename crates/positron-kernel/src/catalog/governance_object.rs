@@ -183,7 +183,7 @@ impl CatalogGovernanceObject {
     }
 
     #[cfg(feature = "test-support")]
-    pub(crate) fn fixture_lifecycle_end(&self) -> Result<usize, CatalogFailure> {
+    pub fn fixture_lifecycle_end(&self) -> Result<usize, CatalogFailure> {
         if self.version != CatalogGovernanceVersion::V5 {
             return Err(corrupt());
         }

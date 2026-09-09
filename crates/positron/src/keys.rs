@@ -1,11 +1,8 @@
 use std::io::{IsTerminal, Read, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::net::SocketAddr;
 use std::process::ExitCode;
-use std::time::Duration;
 
-use positron_api::api_keys::{
-    ApiKeyRequest, ApiKeyResponse, HTTP_PATH, KeyAction, KeyScope, MAX_RESPONSE_BYTES,
-};
+use positron_api::api_keys::{ApiKeyRequest, ApiKeyServiceClient, KeyAction, KeyScope};
 use zeroize::Zeroizing;
 
 pub(super) fn run(arguments: impl Iterator<Item = String>) -> ExitCode {
@@ -39,7 +36,10 @@ fn execute(arguments: impl Iterator<Item = String>) -> Result<(), &'static str> 
     {
         return Err("invalid credential input");
     }
-    let mut response = send(endpoint, bearer, &request)?;
+    let client = ApiKeyServiceClient::new(endpoint).map_err(|_| "API endpoint unavailable")?;
+    let mut response = client
+        .manage(bearer, &request)
+        .map_err(|_| "API-key request rejected; inspect state before retrying")?;
     let mut output = std::io::stdout().lock();
     for key in std::mem::take(&mut response.keys) {
         writeln!(
@@ -166,55 +166,6 @@ fn parse(
     }
     request.encode().map_err(|_| "invalid key request")?;
     Ok((endpoint, request))
-}
-
-fn send(
-    endpoint: SocketAddr,
-    bearer: &str,
-    request: &ApiKeyRequest,
-) -> Result<ApiKeyResponse, &'static str> {
-    let body = request.encode().map_err(|_| "invalid key request")?;
-    let mut stream = TcpStream::connect_timeout(&endpoint, Duration::from_secs(5))
-        .map_err(|_| "API endpoint unavailable")?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .map_err(|_| "API transport unavailable")?;
-    stream
-        .set_write_timeout(Some(Duration::from_secs(5)))
-        .map_err(|_| "API transport unavailable")?;
-    let header = Zeroizing::new(format!(
-        "POST {HTTP_PATH} HTTP/1.1\r\nHost: {endpoint}\r\nAuthorization: Bearer {bearer}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    ));
-    stream
-        .write_all(header.as_bytes())
-        .and_then(|()| stream.write_all(&body))
-        .map_err(|_| "API request transmission failed; inspect state before retrying")?;
-    let mut bytes = Zeroizing::new(Vec::new());
-    stream
-        .take((MAX_RESPONSE_BYTES + 8193) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|_| "API response unavailable; retry with the same idempotency key")?;
-    if bytes.len() > MAX_RESPONSE_BYTES + 8192 {
-        return Err("API response too large");
-    }
-    let split = bytes
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .ok_or("invalid API response")?;
-    let head = std::str::from_utf8(bytes.get(..split).ok_or("invalid API response")?)
-        .map_err(|_| "invalid API response")?;
-    if !head.starts_with("HTTP/1.1 200 ") {
-        return Err(if head.starts_with("HTTP/1.1 401 ") {
-            "authentication rejected"
-        } else if head.starts_with("HTTP/1.1 409 ") {
-            "generation or idempotency conflict; inspect current state"
-        } else {
-            "API-key request rejected"
-        });
-    }
-    ApiKeyResponse::decode(bytes.get(split + 4..).ok_or("invalid API response")?)
-        .map_err(|_| "invalid API response")
 }
 
 #[cfg(test)]

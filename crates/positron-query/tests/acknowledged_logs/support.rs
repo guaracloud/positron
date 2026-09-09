@@ -11,15 +11,15 @@ use positron_domain::routing::{SignalKind, VirtualShardId};
 use positron_domain::time::{EventTime, SourceTimeQuality, UnixNanoseconds};
 use positron_domain::value::{AttributeNamespace, CandidateAttributeValue, ValueLimitProfile};
 use positron_kernel::{
-    ActiveSegmentLedger, Catalog, CatalogObject, CatalogProposal, CatalogSecret,
-    ControlTokenProtector, DiskObservation, DiskPressureThresholds, FixedLifecycleClockSource,
-    FormatEpoch, GovernanceFixtureObject, GovernanceFixtureTarget, GovernorFailure, GovernorPolicy,
-    InstanceId, InventoryCardinalityLimits, LifecycleClock, MountQualification,
-    ObservedResourceEnvironment, OperatorLimits, OrdinaryPoolPolicy, PreparedStoreBlock,
-    PrimaryDataVolume, RecoveryPoolCapacities, RecoveryReserve, ResourceAmounts, ResourceDimension,
-    ResourceGovernorConfiguration, ResourceInventory, RetentionTimeAuthority, SegmentProtectionKey,
-    SegmentScope, StorageKernelResourceAuthority, StoreBlockIdentity, TenantQuota, TransactionId,
-    WorkClaim, WorkKind,
+    ActiveSegmentLedger, Catalog, CatalogGovernanceObject, CatalogObject, CatalogProposal,
+    CatalogSecret, ControlTokenProtector, DiskObservation, DiskPressureThresholds,
+    FixedLifecycleClockSource, FormatEpoch, GovernanceFixtureObject, GovernanceFixtureTarget,
+    GovernorFailure, GovernorPolicy, InstanceId, InventoryCardinalityLimits, LifecycleClock,
+    MountQualification, ObservedResourceEnvironment, OperatorLimits, OrdinaryPoolPolicy,
+    PreparedStoreBlock, PrimaryDataVolume, RecoveryPoolCapacities, RecoveryReserve,
+    ResourceAmounts, ResourceDimension, ResourceGovernorConfiguration, ResourceInventory,
+    RetentionTimeAuthority, SegmentProtectionKey, SegmentScope, StorageKernelResourceAuthority,
+    StoreBlockIdentity, TenantQuota, TransactionId, WorkClaim, WorkKind,
 };
 use positron_policy::{
     IngestPolicy, LogMetadata, NativeLogAttribute, NativeLogCandidate, NativeTraceCandidate,
@@ -905,7 +905,12 @@ pub fn publish_lifecycle_at_catalog_for_test(
                 || bytes.starts_with(b"POSGOV04")
                 || bytes.starts_with(b"POSGOV05")
             {
-                let offset = bytes.len().checked_sub(5).ok_or("identity too short")?;
+                let lifecycle_end = if bytes.starts_with(b"POSGOV05") {
+                    CatalogGovernanceObject::decode(&bytes)?.fixture_lifecycle_end()?
+                } else {
+                    bytes.len()
+                };
+                let offset = lifecycle_end.checked_sub(5).ok_or("identity too short")?;
                 bytes[offset] = state;
             }
             CatalogObject::new(bytes).map_err(|failure| -> Box<dyn Error> { Box::new(failure) })

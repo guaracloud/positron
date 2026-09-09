@@ -9,6 +9,11 @@ pub mod protobuf {
 }
 pub use protobuf::{ApiKeyResponse, KeyAction, KeyDescriptor, KeyScope};
 
+mod client {
+    include!(concat!(env!("OUT_DIR"), "/api_key_service_client.rs"));
+}
+pub use client::{ApiKeyServiceClient, ApiKeyServiceClientFailure};
+
 pub const HTTP_PATH: &str = "/v1/api-keys:manage";
 pub const MAX_REQUEST_BYTES: usize = 1024;
 pub const MAX_RESPONSE_BYTES: usize = 64 * 1024;

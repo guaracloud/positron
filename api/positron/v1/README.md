@@ -5,13 +5,14 @@ ADR-0028. The committed Rust v1 types, HTTP/JSON route map, OpenAPI document,
 Schema Digest, reference documentation, and validation fixtures are part of
 the same product surface and must change together.
 
-`positron-api/build.rs` generates Protobuf messages and fixed enums directly
-from this schema using locked `prost-build 0.14.3` and
+`positron-api/build.rs` generates Protobuf messages, fixed enums, and the Rust
+`ApiKeyServiceClient` directly from this schema using locked `prost-build 0.14.3` and
 `protoc-bin-vendored 3.2.0`. Ordinary Cargo builds regenerate the output in
 `OUT_DIR`; no globally installed compiler is required. API-key HTTP clients
-and the runtime service use those generated messages through bounded JSON
-adapters. The API listener serves HTTP/JSON; generated Protobuf bindings are
-available as wire types, while a gRPC administration listener is not exposed.
+and the runtime service use those generated messages and client through the
+bounded JSON adapter named by the canonical HTTP mapping. The API listener
+serves HTTP/JSON; generated Protobuf bindings are available as wire types,
+while a gRPC administration listener is not exposed.
 The build also derives the embedded Schema Digest from the exact Protobuf
 source bytes; contract tests compare it with the committed map, OpenAPI,
 fixtures, and digest artifact so stale public artifacts fail the tests.

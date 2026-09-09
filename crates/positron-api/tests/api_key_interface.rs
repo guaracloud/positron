@@ -1,6 +1,47 @@
 use positron_api::api_keys::{ApiKeyRequest, KeyAction, KeyScope};
 
 #[test]
+fn generated_api_key_service_client_uses_the_canonical_http_mapping()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let endpoint = listener.local_addr()?;
+    let server = thread::spawn(move || -> Result<(), std::io::Error> {
+        let (mut stream, _) = listener.accept()?;
+        let mut request = [0_u8; 4096];
+        let length = stream.read(&mut request)?;
+        let request = &request[..length];
+        let request = String::from_utf8_lossy(request);
+        assert!(request.starts_with("POST /v1/api-keys:manage HTTP/1.1\r\n"));
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer key-material\r\n")
+        );
+        let body = "{\"keys\":[],\"principal\":\"11111111-1111-1111-1111-111111111111\"}";
+        stream.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )?;
+        Ok(())
+    });
+    let client = positron_api::api_keys::ApiKeyServiceClient::new(endpoint)?;
+    let response = client.manage("key-material", &ApiKeyRequest::list())?;
+    assert_eq!(
+        response.principal.as_deref(),
+        Some("11111111-1111-1111-1111-111111111111")
+    );
+    server.join().map_err(|_| "server panicked")??;
+    Ok(())
+}
+
+#[test]
 fn prost_generated_key_messages_share_the_http_contract() -> Result<(), Box<dyn std::error::Error>>
 {
     use positron_api::api_keys::protobuf;

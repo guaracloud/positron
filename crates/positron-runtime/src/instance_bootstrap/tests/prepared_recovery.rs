@@ -100,6 +100,70 @@ fn pre_marker_api_key_create_retry_resumes_the_prepared_credential_without_a_sec
 }
 
 #[test]
+fn pre_marker_api_key_rotation_retry_resumes_the_prepared_successor_without_a_secret()
+-> Result<(), Box<dyn Error>> {
+    let roots = Roots::new()?;
+    let paths = roots.paths().map_err(|code| format!("paths: {code:?}"))?;
+    drop(InstanceBootstrap::initialize(
+        &paths,
+        InitializationPlan::non_interactive(),
+    )?);
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    let administrator = || {
+        instance.attribute(
+            PresentedCredential::parse(claim.secret()).expect("claim syntax"),
+            RequestedIntent::SystemAdministration,
+            CompatibilityHints::none(),
+        )
+    };
+    let predecessor = instance.create_api_key(
+        administrator()?,
+        Scope::Query,
+        None,
+        ResourceGeneration::new(1)?,
+        AdministrativeIdempotencyKey::new([54; 16])?,
+    )?;
+    let idempotency = AdministrativeIdempotencyKey::new([55; 16])?;
+    let failed =
+        with_catalog_publication_fault_after(CatalogPublicationFault::SynchronizeCommit, 0, || {
+            instance.rotate_api_key(
+                administrator().expect("administrator"),
+                predecessor.principal_id(),
+                ResourceGeneration::new(2).expect("generation"),
+                idempotency,
+            )
+        })
+        .expect_err("pre-marker rotation must not acknowledge a successor");
+    assert_eq!(failed.code(), BootstrapFailureCode::CatalogUnavailable);
+    drop(instance);
+
+    let recovered = InstanceBootstrap::reopen(&paths)?;
+    let administrator = recovered.attribute(
+        PresentedCredential::parse(claim.secret()).expect("claim syntax"),
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let resumed = recovered.rotate_api_key(
+        administrator,
+        predecessor.principal_id(),
+        ResourceGeneration::new(2)?,
+        idempotency,
+    )?;
+    assert!(resumed.secret().is_none());
+    let administrator = recovered.attribute(
+        PresentedCredential::parse(claim.secret()).expect("claim syntax"),
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let descriptors = recovered.list_api_keys(administrator)?;
+    assert!(descriptors.iter().any(|descriptor| {
+        descriptor.principal_id() == resumed.principal_id() && descriptor.is_active()
+    }));
+    Ok(())
+}
+
+#[test]
 fn incomplete_prepared_api_key_record_fails_closed_without_mutation() -> Result<(), Box<dyn Error>>
 {
     let roots = Roots::new()?;
@@ -285,5 +349,11 @@ fn advanced_catalog_refuses_prepared_api_key_recovery_without_mutation()
         .expect_err("an advanced Catalog predecessor cannot publish a stale prepared proposal");
     assert_eq!(rejected.code(), BootstrapFailureCode::CatalogUnavailable);
     assert_eq!(recovered.list_api_keys(administrator()?)?, before_retry);
+    drop(recovered);
+    let normally_reopened = InstanceBootstrap::reopen(&paths)?;
+    assert!(
+        normally_reopened.catalog_generation() > 1,
+        "an advanced prepared record does not suppress later normal startup"
+    );
     Ok(())
 }
