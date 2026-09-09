@@ -29,6 +29,12 @@ impl QueryCancellation {
     }
 }
 
+impl Default for QueryCancellation {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl positron_signals::ScanCancellation for QueryCancellation {
     fn is_cancelled(&self) -> bool {
         self.is_cancelled()

@@ -8,7 +8,7 @@ use positron_kernel::{
     FormatEpoch, TransactionId,
 };
 
-use crate::audit::tenant_lifecycle_audit_intent;
+use crate::audit::TenantLifecycleAuditIntent;
 use crate::{
     AdministrativeIdempotencyKey, AuthorizedContext, GovernanceAuditEntry, ResourceGeneration,
 };
@@ -22,6 +22,38 @@ pub struct TenantLifecycleTransition {
     generation: ResourceGeneration,
     audit_position: u64,
     audit_ingest_time_unix_seconds: u64,
+}
+
+/// One authenticated, generation-checked lifecycle publication request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TenantLifecycleTransitionRequest {
+    actor: AuthorizedContext,
+    tenant: TenantId,
+    target: TenantLifecycleState,
+    expected: ResourceGeneration,
+    idempotency: AdministrativeIdempotencyKey,
+    audit_ingest_time_unix_seconds: u64,
+}
+
+impl TenantLifecycleTransitionRequest {
+    #[must_use]
+    pub const fn new(
+        actor: AuthorizedContext,
+        tenant: TenantId,
+        target: TenantLifecycleState,
+        expected: ResourceGeneration,
+        idempotency: AdministrativeIdempotencyKey,
+        audit_ingest_time_unix_seconds: u64,
+    ) -> Self {
+        Self {
+            actor,
+            tenant,
+            target,
+            expected,
+            idempotency,
+            audit_ingest_time_unix_seconds,
+        }
+    }
 }
 
 impl TenantLifecycleTransition {
@@ -97,59 +129,56 @@ impl TenantLifecycleAdministration {
     pub fn transition(
         catalog: &Catalog<'_>,
         administrator: PrincipalId,
-        actor: AuthorizedContext,
-        tenant: TenantId,
-        target: TenantLifecycleState,
-        expected: ResourceGeneration,
-        idempotency: AdministrativeIdempotencyKey,
-        audit_ingest_time_unix_seconds: u64,
+        request: TenantLifecycleTransitionRequest,
     ) -> Result<TenantLifecycleTransition, TenantLifecycleAdministrationFailure> {
-        if actor.principal_id() != administrator
-            || actor.scope() != Scope::SystemAdministration
-            || actor.tenant_attribution().is_some()
+        if request.actor.principal_id() != administrator
+            || request.actor.scope() != Scope::SystemAdministration
+            || request.actor.tenant_attribution().is_some()
         {
             return Err(TenantLifecycleAdministrationFailure::Unauthorized);
         }
         let snapshot = catalog.pin().map_err(map_catalog)?;
         let (_, governance) = snapshot.governance_object().map_err(map_catalog)?;
-        if governance.tenant() != tenant {
+        if governance.tenant() != request.tenant {
             return Err(TenantLifecycleAdministrationFailure::UnknownTenant);
         }
         if let Some(replay) = replay(
             catalog,
-            idempotency,
-            actor.principal_id(),
-            tenant,
-            target,
-            expected,
+            request.idempotency,
+            request.actor.principal_id(),
+            request.tenant,
+            request.target,
+            request.expected,
         )? {
             return Ok(replay);
         }
-        if audit_ingest_time_unix_seconds == 0 {
+        if request.audit_ingest_time_unix_seconds == 0 {
             return Err(TenantLifecycleAdministrationFailure::PersistenceUnavailable);
         }
         let from = governance.lifecycle();
-        if target == TenantLifecycleState::Purged {
+        if request.target == TenantLifecycleState::Purged {
             return Err(TenantLifecycleAdministrationFailure::PurgeCompletionUnavailable);
         }
         TenantLifecycle::from_durable_state(from)
-            .transition_to(target)
+            .transition_to(request.target)
             .map_err(|_| TenantLifecycleAdministrationFailure::InvalidTransition)?;
-        let generation = next_generation(governance.lifecycle_generation(), from, expected)?;
+        let generation =
+            next_generation(governance.lifecycle_generation(), from, request.expected)?;
         let replacement = governance
-            .with_lifecycle(target, generation.get())
+            .with_lifecycle(request.target, generation.get())
             .map_err(map_catalog)?;
-        let audit = tenant_lifecycle_audit_intent(
-            audit_ingest_time_unix_seconds,
-            idempotency,
-            actor.principal_id(),
-            tenant,
+        let audit = TenantLifecycleAuditIntent {
+            ingest_time_unix_seconds: request.audit_ingest_time_unix_seconds,
+            idempotency_key: request.idempotency,
+            actor: request.actor.principal_id(),
+            tenant: request.tenant,
             from,
-            target,
-            expected,
+            to: request.target,
+            expected_generation: request.expected,
             generation,
-        );
-        let commit = commit(catalog, &snapshot, replacement, idempotency, audit)?;
+        }
+        .encode();
+        let commit = commit(catalog, &snapshot, replacement, request.idempotency, audit)?;
         let record = commit
             .governance_audit_record()
             .ok_or(TenantLifecycleAdministrationFailure::PersistenceUnavailable)?;
@@ -159,9 +188,9 @@ impl TenantLifecycleAdministration {
             .as_tenant_lifecycle()
             .ok_or(TenantLifecycleAdministrationFailure::PersistenceUnavailable)?;
         Ok(TenantLifecycleTransition {
-            tenant,
+            tenant: request.tenant,
             from,
-            to: target,
+            to: request.target,
             generation,
             audit_position: audit.position(),
             audit_ingest_time_unix_seconds: audit.ingest_time_unix_seconds(),

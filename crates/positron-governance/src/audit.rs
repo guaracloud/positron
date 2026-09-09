@@ -568,27 +568,31 @@ impl TenantLifecycleAuditEntry {
     }
 }
 
-pub(crate) fn tenant_lifecycle_audit_intent(
-    ingest_time_unix_seconds: u64,
-    idempotency_key: AdministrativeIdempotencyKey,
-    actor: PrincipalId,
-    tenant: TenantId,
-    from: TenantLifecycleState,
-    to: TenantLifecycleState,
-    expected_generation: ResourceGeneration,
-    generation: ResourceGeneration,
-) -> Vec<u8> {
-    let mut intent = Vec::with_capacity(82);
-    intent.extend_from_slice(&TENANT_LIFECYCLE_MAGIC);
-    intent.extend_from_slice(&ingest_time_unix_seconds.to_be_bytes());
-    intent.extend_from_slice(&idempotency_key.to_bytes());
-    intent.extend_from_slice(&actor.to_bytes());
-    intent.extend_from_slice(&tenant.to_bytes());
-    intent.push(lifecycle_state_code(from));
-    intent.push(lifecycle_state_code(to));
-    intent.extend_from_slice(&expected_generation.get().to_be_bytes());
-    intent.extend_from_slice(&generation.get().to_be_bytes());
-    intent
+pub(crate) struct TenantLifecycleAuditIntent {
+    pub(crate) ingest_time_unix_seconds: u64,
+    pub(crate) idempotency_key: AdministrativeIdempotencyKey,
+    pub(crate) actor: PrincipalId,
+    pub(crate) tenant: TenantId,
+    pub(crate) from: TenantLifecycleState,
+    pub(crate) to: TenantLifecycleState,
+    pub(crate) expected_generation: ResourceGeneration,
+    pub(crate) generation: ResourceGeneration,
+}
+
+impl TenantLifecycleAuditIntent {
+    pub(crate) fn encode(self) -> Vec<u8> {
+        let mut intent = Vec::with_capacity(82);
+        intent.extend_from_slice(&TENANT_LIFECYCLE_MAGIC);
+        intent.extend_from_slice(&self.ingest_time_unix_seconds.to_be_bytes());
+        intent.extend_from_slice(&self.idempotency_key.to_bytes());
+        intent.extend_from_slice(&self.actor.to_bytes());
+        intent.extend_from_slice(&self.tenant.to_bytes());
+        intent.push(lifecycle_state_code(self.from));
+        intent.push(lifecycle_state_code(self.to));
+        intent.extend_from_slice(&self.expected_generation.get().to_be_bytes());
+        intent.extend_from_slice(&self.generation.get().to_be_bytes());
+        intent
+    }
 }
 
 const fn lifecycle_state_code(state: TenantLifecycleState) -> u8 {

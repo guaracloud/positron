@@ -18,6 +18,7 @@ use positron_governance::{
     AdministrativeIdempotencyKey, ApiKeyAdministrationFailure, ApiKeyCreation, AuthorizedContext,
     ListenerTransportAdministration, ListenerTransportAdministrationFailure, ResourceGeneration,
     TenantLifecycleAdministration, TenantLifecycleAdministrationFailure, TenantLifecycleTransition,
+    TenantLifecycleTransitionRequest,
 };
 use positron_query::QueryCancellation;
 
@@ -727,12 +728,14 @@ impl InitializedInstance {
         TenantLifecycleAdministration::transition(
             &catalog,
             self.administrator,
-            actor,
-            tenant,
-            target,
-            expected,
-            idempotency,
-            audit_ingest_time_unix_seconds,
+            TenantLifecycleTransitionRequest::new(
+                actor,
+                tenant,
+                target,
+                expected,
+                idempotency,
+                audit_ingest_time_unix_seconds,
+            ),
         )
         .map_err(map_tenant_lifecycle_failure)
     }
