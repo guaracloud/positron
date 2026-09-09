@@ -4,6 +4,7 @@ mod schema_checkpoint;
 use std::fmt::{Display, Formatter};
 
 use positron_domain::identity::{ExternalTenantAlias, PrincipalId, Scope, TenantId, TenantSlug};
+use positron_domain::lifecycle::TenantLifecycleState;
 use positron_kernel::GovernanceAuditRecord;
 
 use crate::identity::IdentityFailure;
@@ -17,6 +18,7 @@ const ROOT_ROTATION_MAGIC: &[u8] = b"catalog-root-rotation-v1\0";
 const POLICY_ACTIVATION_MAGIC: [u8; 8] = *b"POSPOL02";
 const KEY_LIFECYCLE_MAGIC: [u8; 8] = *b"POSKEY01";
 const LISTENER_TRANSPORT_MAGIC: [u8; 8] = *b"POSTPT01";
+const TENANT_LIFECYCLE_MAGIC: [u8; 8] = *b"POSTEN01";
 
 /// Bounded, non-secret metadata for the initial instance operation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -58,6 +60,7 @@ pub enum GovernanceAuditEntry {
     SchemaCheckpoint(SchemaCheckpointAuditEntry),
     ApiKeyLifecycle(ApiKeyLifecycleAuditEntry),
     ListenerTransport(ListenerTransportAuditEntry),
+    TenantLifecycle(TenantLifecycleAuditEntry),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -79,6 +82,19 @@ pub enum ApiKeyLifecycleAction {
     Create,
     Rotate,
     Revoke,
+}
+
+/// Redacted evidence for one durable tenant lifecycle transition.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TenantLifecycleAuditEntry {
+    position: u64,
+    actor: PrincipalId,
+    tenant: TenantId,
+    from: TenantLifecycleState,
+    to: TenantLifecycleState,
+    expected_generation: ResourceGeneration,
+    generation: ResourceGeneration,
+    idempotency_key: AdministrativeIdempotencyKey,
 }
 
 /// Redacted evidence that the active API listener uses the explicit plaintext
@@ -204,6 +220,7 @@ impl GovernanceAuditEntry {
             Self::SchemaCheckpoint(entry) => entry.position(),
             Self::ApiKeyLifecycle(entry) => entry.position,
             Self::ListenerTransport(entry) => entry.position,
+            Self::TenantLifecycle(entry) => entry.position,
         }
     }
 
@@ -220,6 +237,7 @@ impl GovernanceAuditEntry {
                 ApiKeyLifecycleAction::Revoke => "api-key.revoke",
             },
             Self::ListenerTransport(entry) => entry.action(),
+            Self::TenantLifecycle(_) => "tenant.lifecycle.transition",
         }
     }
 
@@ -232,6 +250,7 @@ impl GovernanceAuditEntry {
             Self::SchemaCheckpoint(_) => "succeeded",
             Self::ApiKeyLifecycle(_) => "succeeded",
             Self::ListenerTransport(entry) => entry.outcome(),
+            Self::TenantLifecycle(_) => "succeeded",
         }
     }
 
@@ -243,7 +262,8 @@ impl GovernanceAuditEntry {
             | Self::IngestPolicyActivation(_)
             | Self::SchemaCheckpoint(_)
             | Self::ApiKeyLifecycle(_)
-            | Self::ListenerTransport(_) => None,
+            | Self::ListenerTransport(_)
+            | Self::TenantLifecycle(_) => None,
         }
     }
 
@@ -255,7 +275,8 @@ impl GovernanceAuditEntry {
             | Self::IngestPolicyActivation(_)
             | Self::SchemaCheckpoint(_)
             | Self::ApiKeyLifecycle(_)
-            | Self::ListenerTransport(_) => None,
+            | Self::ListenerTransport(_)
+            | Self::TenantLifecycle(_) => None,
         }
     }
 
@@ -267,7 +288,8 @@ impl GovernanceAuditEntry {
             | Self::CatalogRootRotation(_)
             | Self::IngestPolicyActivation(_)
             | Self::ApiKeyLifecycle(_)
-            | Self::ListenerTransport(_) => None,
+            | Self::ListenerTransport(_)
+            | Self::TenantLifecycle(_) => None,
         }
     }
 
@@ -279,7 +301,8 @@ impl GovernanceAuditEntry {
             | Self::CatalogRootRotation(_)
             | Self::IngestPolicyActivation(_)
             | Self::SchemaCheckpoint(_)
-            | Self::ListenerTransport(_) => None,
+            | Self::ListenerTransport(_)
+            | Self::TenantLifecycle(_) => None,
         }
     }
 
@@ -291,7 +314,21 @@ impl GovernanceAuditEntry {
             | Self::CatalogRootRotation(_)
             | Self::IngestPolicyActivation(_)
             | Self::SchemaCheckpoint(_)
-            | Self::ApiKeyLifecycle(_) => None,
+            | Self::ApiKeyLifecycle(_)
+            | Self::TenantLifecycle(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_tenant_lifecycle(&self) -> Option<&TenantLifecycleAuditEntry> {
+        match self {
+            Self::TenantLifecycle(entry) => Some(entry),
+            Self::Initialization(_)
+            | Self::CatalogRootRotation(_)
+            | Self::IngestPolicyActivation(_)
+            | Self::SchemaCheckpoint(_)
+            | Self::ApiKeyLifecycle(_)
+            | Self::ListenerTransport(_) => None,
         }
     }
 
@@ -447,7 +484,119 @@ impl GovernanceAuditEntry {
                     .map_err(|_| IdentityFailure)?,
             }));
         }
+        if intent.starts_with(&TENANT_LIFECYCLE_MAGIC) {
+            let mut cursor = Cursor::new(intent);
+            if cursor.take_array::<8>()? != TENANT_LIFECYCLE_MAGIC {
+                return Err(IdentityFailure);
+            }
+            let idempotency_key = AdministrativeIdempotencyKey::new(cursor.take_array()?)
+                .map_err(|_| IdentityFailure)?;
+            if idempotency_key.to_bytes() != transaction_id {
+                return Err(IdentityFailure);
+            }
+            let actor =
+                PrincipalId::from_bytes(cursor.take_array()?).map_err(|_| IdentityFailure)?;
+            let tenant = TenantId::from_bytes(cursor.take_array()?).map_err(|_| IdentityFailure)?;
+            let from = lifecycle_state(cursor.take_u8()?)?;
+            let to = lifecycle_state(cursor.take_u8()?)?;
+            let expected_generation =
+                ResourceGeneration::new(cursor.take_u64()?).map_err(|_| IdentityFailure)?;
+            let generation =
+                ResourceGeneration::new(cursor.take_u64()?).map_err(|_| IdentityFailure)?;
+            if expected_generation.get().checked_add(1) != Some(generation.get())
+                || !cursor.is_empty()
+            {
+                return Err(IdentityFailure);
+            }
+            return Ok(Self::TenantLifecycle(TenantLifecycleAuditEntry {
+                position,
+                actor,
+                tenant,
+                from,
+                to,
+                expected_generation,
+                generation,
+                idempotency_key,
+            }));
+        }
         Err(IdentityFailure)
+    }
+}
+
+impl TenantLifecycleAuditEntry {
+    #[must_use]
+    pub const fn position(&self) -> u64 {
+        self.position
+    }
+    #[must_use]
+    pub const fn actor_id(&self) -> PrincipalId {
+        self.actor
+    }
+    #[must_use]
+    pub const fn tenant_id(&self) -> TenantId {
+        self.tenant
+    }
+    #[must_use]
+    pub const fn from(&self) -> TenantLifecycleState {
+        self.from
+    }
+    #[must_use]
+    pub const fn to(&self) -> TenantLifecycleState {
+        self.to
+    }
+    #[must_use]
+    pub const fn expected_generation(&self) -> ResourceGeneration {
+        self.expected_generation
+    }
+    #[must_use]
+    pub const fn generation(&self) -> ResourceGeneration {
+        self.generation
+    }
+    #[must_use]
+    pub const fn idempotency_key(&self) -> AdministrativeIdempotencyKey {
+        self.idempotency_key
+    }
+}
+
+pub(crate) fn tenant_lifecycle_audit_intent(
+    idempotency_key: AdministrativeIdempotencyKey,
+    actor: PrincipalId,
+    tenant: TenantId,
+    from: TenantLifecycleState,
+    to: TenantLifecycleState,
+    expected_generation: ResourceGeneration,
+    generation: ResourceGeneration,
+) -> Vec<u8> {
+    let mut intent = Vec::with_capacity(74);
+    intent.extend_from_slice(&TENANT_LIFECYCLE_MAGIC);
+    intent.extend_from_slice(&idempotency_key.to_bytes());
+    intent.extend_from_slice(&actor.to_bytes());
+    intent.extend_from_slice(&tenant.to_bytes());
+    intent.push(lifecycle_state_code(from));
+    intent.push(lifecycle_state_code(to));
+    intent.extend_from_slice(&expected_generation.get().to_be_bytes());
+    intent.extend_from_slice(&generation.get().to_be_bytes());
+    intent
+}
+
+const fn lifecycle_state_code(state: TenantLifecycleState) -> u8 {
+    match state {
+        TenantLifecycleState::Active => 1,
+        TenantLifecycleState::ReadOnly => 2,
+        TenantLifecycleState::Suspended => 3,
+        TenantLifecycleState::Purging => 4,
+        TenantLifecycleState::Purged => 5,
+    }
+}
+
+const fn lifecycle_state(code: u8) -> Result<TenantLifecycleState, IdentityFailure> {
+    match code {
+        1 => Ok(TenantLifecycleState::Active),
+        2 => Ok(TenantLifecycleState::ReadOnly),
+        3 => Ok(TenantLifecycleState::Suspended),
+        4 => Ok(TenantLifecycleState::Purging),
+        5 => Ok(TenantLifecycleState::Purged),
+        _ => Err(IdentityFailure),
     }
 }
 

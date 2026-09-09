@@ -904,12 +904,14 @@ pub fn publish_lifecycle_at_catalog_for_test(
                 || bytes.starts_with(b"POSGOV03")
                 || bytes.starts_with(b"POSGOV04")
                 || bytes.starts_with(b"POSGOV05")
+                || bytes.starts_with(b"POSGOV06")
             {
-                let lifecycle_end = if bytes.starts_with(b"POSGOV05") {
-                    CatalogGovernanceObject::decode(&bytes)?.fixture_lifecycle_end()?
-                } else {
-                    bytes.len()
-                };
+                let lifecycle_end =
+                    if bytes.starts_with(b"POSGOV05") || bytes.starts_with(b"POSGOV06") {
+                        CatalogGovernanceObject::decode(&bytes)?.fixture_lifecycle_end()?
+                    } else {
+                        bytes.len()
+                    };
                 let offset = lifecycle_end.checked_sub(5).ok_or("identity too short")?;
                 bytes[offset] = state;
             }

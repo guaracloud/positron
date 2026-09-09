@@ -80,10 +80,12 @@ changed request conflicts, while a missing, incomplete, unauthenticated, or adva
 unavailable without mutation. The raw API-key secret is absent from this record.
 
 A V1–V4 governance object becomes canonical V5 only in its first audited API-key lifecycle
+mutation. A V1–V5 governance object becomes canonical V6 on its first audited tenant-lifecycle
 mutation. Migration preserves each actual administrator, ingest, and query principal, scope, and
 salted hash; explicit absent fields represent legacy absence. It never invents credentials,
 reconstructs secrets, changes the first expected credential generation of 1, or adds an external
-alias where V1–V3 had none.
+alias where V1–V3 had none. V6 adds an independently incremented tenant-lifecycle generation;
+credential mutations preserve it and lifecycle mutations preserve credential generation and hashes.
 
 Root rotation derives three bounded Catalog transactions from one Administration transaction and
 publishes stage-tagged Governance Audit Records for `started`, successor `verified`, and

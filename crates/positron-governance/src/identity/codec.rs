@@ -52,7 +52,9 @@ pub(super) fn identity_from_catalog(
         .collect::<Result<Vec<_>, IdentityFailure>>()?;
     Ok(Identity {
         instance: decoded.instance(),
-        generation: 0,
+        // Credential changes, rather than lifecycle or ordinary Catalog
+        // changes, invalidate contexts and cursor authorization bindings.
+        generation: decoded.credential_generation(),
         principal: decoded.principal(),
         tenant: decoded.tenant(),
         tenant_slug: decoded.tenant_slug(),

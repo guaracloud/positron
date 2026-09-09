@@ -11,6 +11,7 @@ const MAGIC_V2: [u8; 8] = *b"POSGOV02";
 const MAGIC_V3: [u8; 8] = *b"POSGOV03";
 const MAGIC_V4: [u8; 8] = *b"POSGOV04";
 const MAGIC_V5: [u8; 8] = *b"POSGOV05";
+const MAGIC_V6: [u8; 8] = *b"POSGOV06";
 const MAX_CREDENTIALS: usize = 128;
 const MAX_RETENTION_SECONDS: u64 = i64::MAX as u64 / 1_000_000_000;
 
@@ -21,6 +22,7 @@ pub enum CatalogGovernanceVersion {
     V3,
     V4,
     V5,
+    V6,
 }
 
 #[derive(Clone)]
@@ -110,6 +112,7 @@ pub struct CatalogGovernanceObject {
     query: Option<CredentialRecord>,
     retention_seconds: u64,
     lifecycle: TenantLifecycleState,
+    lifecycle_generation: u64,
     credentials: Vec<CatalogCredential>,
     credential_generation: u64,
     credential_prefix: Vec<u8>,
@@ -171,6 +174,12 @@ impl CatalogGovernanceObject {
         self.lifecycle
     }
 
+    /// Returns the independently durable generation for tenant lifecycle mutations.
+    #[must_use]
+    pub const fn lifecycle_generation(&self) -> u64 {
+        self.lifecycle_generation
+    }
+
     /// Returns redacted credential descriptors; secret material is never decoded.
     #[must_use]
     pub fn credentials(&self) -> &[CatalogCredential] {
@@ -184,10 +193,16 @@ impl CatalogGovernanceObject {
 
     #[cfg(feature = "test-support")]
     pub fn fixture_lifecycle_end(&self) -> Result<usize, CatalogFailure> {
-        if self.version != CatalogGovernanceVersion::V5 {
+        if !matches!(
+            self.version,
+            CatalogGovernanceVersion::V5 | CatalogGovernanceVersion::V6
+        ) {
             return Err(corrupt());
         }
-        Ok(self.credential_prefix.len())
+        self.credential_prefix
+            .len()
+            .checked_sub(usize::from(self.version == CatalogGovernanceVersion::V6) * 8)
+            .ok_or_else(corrupt)
     }
 
     /// Encodes a successor credential set while preserving all non-credential
@@ -213,11 +228,22 @@ impl CatalogGovernanceObject {
         {
             return Err(corrupt());
         }
+        let mut prefix = self.credential_prefix.clone();
+        if self.version != CatalogGovernanceVersion::V6 {
+            let lifecycle_end = prefix.len();
+            prefix
+                .get_mut(..8)
+                .ok_or_else(corrupt)?
+                .copy_from_slice(&MAGIC_V6);
+            prefix.try_reserve_exact(8).map_err(|_| corrupt())?;
+            prefix.extend_from_slice(&self.lifecycle_generation.to_be_bytes());
+            debug_assert_eq!(prefix.len(), lifecycle_end + 8);
+        }
         let bytes = credentials
             .len()
             .checked_mul(90)
             .and_then(|size| {
-                self.credential_prefix
+                prefix
                     .len()
                     .checked_add(10)
                     .and_then(|prefix| prefix.checked_add(size))
@@ -225,8 +251,72 @@ impl CatalogGovernanceObject {
             .ok_or_else(corrupt)?;
         let mut encoded = Vec::new();
         encoded.try_reserve_exact(bytes).map_err(|_| corrupt())?;
-        encoded.extend_from_slice(&self.credential_prefix);
+        encoded.extend_from_slice(&prefix);
         encoded.extend_from_slice(&generation.to_be_bytes());
+        encoded.extend_from_slice(
+            &u16::try_from(credentials.len())
+                .map_err(|_| corrupt())?
+                .to_be_bytes(),
+        );
+        for credential in credentials {
+            encoded.extend_from_slice(&credential.principal.to_bytes());
+            encoded.push(credential.scope);
+            encoded.push(u8::from(credential.active));
+            encoded.extend_from_slice(
+                &credential
+                    .expires_at_unix_seconds
+                    .unwrap_or(0)
+                    .to_be_bytes(),
+            );
+            encoded.extend_from_slice(&credential.salt);
+            encoded.extend_from_slice(&credential.hash);
+        }
+        Ok(encoded)
+    }
+
+    /// Encodes a successor lifecycle while preserving every non-lifecycle authority.
+    pub fn with_lifecycle(
+        &self,
+        lifecycle: TenantLifecycleState,
+        lifecycle_generation: u64,
+    ) -> Result<Vec<u8>, CatalogFailure> {
+        if lifecycle_generation == 0 {
+            return Err(corrupt());
+        }
+        let mut prefix = self.credential_prefix.clone();
+        let lifecycle_end = prefix.len();
+        if self.version != CatalogGovernanceVersion::V6 {
+            prefix
+                .get_mut(..8)
+                .ok_or_else(corrupt)?
+                .copy_from_slice(&MAGIC_V6);
+            prefix.try_reserve_exact(8).map_err(|_| corrupt())?;
+            prefix.extend_from_slice(&lifecycle_generation.to_be_bytes());
+        } else {
+            let generation_start = lifecycle_end.checked_sub(8).ok_or_else(corrupt)?;
+            prefix
+                .get_mut(generation_start..lifecycle_end)
+                .ok_or_else(corrupt)?
+                .copy_from_slice(&lifecycle_generation.to_be_bytes());
+            let state_start = generation_start.checked_sub(5).ok_or_else(corrupt)?;
+            let state = prefix.get_mut(state_start).ok_or_else(corrupt)?;
+            *state = lifecycle_code(lifecycle);
+        }
+        if self.version != CatalogGovernanceVersion::V6 {
+            let state_start = lifecycle_end.checked_sub(5).ok_or_else(corrupt)?;
+            let state = prefix.get_mut(state_start).ok_or_else(corrupt)?;
+            *state = lifecycle_code(lifecycle);
+        }
+        let credentials = self.credentials.clone();
+        let bytes = prefix
+            .len()
+            .checked_add(10)
+            .and_then(|size| size.checked_add(credentials.len().checked_mul(90)?))
+            .ok_or_else(corrupt)?;
+        let mut encoded = Vec::new();
+        encoded.try_reserve_exact(bytes).map_err(|_| corrupt())?;
+        encoded.extend_from_slice(&prefix);
+        encoded.extend_from_slice(&self.credential_generation.to_be_bytes());
         encoded.extend_from_slice(
             &u16::try_from(credentials.len())
                 .map_err(|_| corrupt())?
@@ -318,6 +408,7 @@ impl CatalogSnapshot {
             CatalogGovernanceVersion::V3
                 | CatalogGovernanceVersion::V4
                 | CatalogGovernanceVersion::V5
+                | CatalogGovernanceVersion::V6
         ) {
             return Err(CatalogFailure::new(CatalogFailureCode::UnsupportedFormat));
         }
@@ -342,6 +433,7 @@ fn decode(encoded: &[u8]) -> Result<CatalogGovernanceObject, CatalogFailure> {
         MAGIC_V3 => CatalogGovernanceVersion::V3,
         MAGIC_V4 => CatalogGovernanceVersion::V4,
         MAGIC_V5 => CatalogGovernanceVersion::V5,
+        MAGIC_V6 => CatalogGovernanceVersion::V6,
         _ => return Err(corrupt()),
     };
     let instance = cursor.take_array::<16>()?;
@@ -357,7 +449,7 @@ fn decode(encoded: &[u8]) -> Result<CatalogGovernanceObject, CatalogFailure> {
             ),
             _ => return Err(corrupt()),
         },
-        CatalogGovernanceVersion::V5 => match cursor.take_u8()? {
+        CatalogGovernanceVersion::V5 | CatalogGovernanceVersion::V6 => match cursor.take_u8()? {
             1 => (
                 Some(ExternalTenantAlias::parse(cursor.take_text_u8(128)?).map_err(|_| corrupt())?),
                 false,
@@ -387,6 +479,7 @@ fn decode(encoded: &[u8]) -> Result<CatalogGovernanceObject, CatalogFailure> {
             | CatalogGovernanceVersion::V3
             | CatalogGovernanceVersion::V4
             | CatalogGovernanceVersion::V5
+            | CatalogGovernanceVersion::V6
     ) {
         Some(cursor.take_credential()?)
     } else {
@@ -402,7 +495,10 @@ fn decode(encoded: &[u8]) -> Result<CatalogGovernanceObject, CatalogFailure> {
         take_optional_credential(&mut cursor)?
     } else if matches!(
         version,
-        CatalogGovernanceVersion::V3 | CatalogGovernanceVersion::V4 | CatalogGovernanceVersion::V5
+        CatalogGovernanceVersion::V3
+            | CatalogGovernanceVersion::V4
+            | CatalogGovernanceVersion::V5
+            | CatalogGovernanceVersion::V6
     ) {
         Some(cursor.take_credential()?)
     } else {
@@ -437,7 +533,19 @@ fn decode(encoded: &[u8]) -> Result<CatalogGovernanceObject, CatalogFailure> {
         [5, 4, 0, 1, 1] => TenantLifecycleState::Purged,
         _ => return Err(corrupt()),
     };
-    let credential_prefix = if version == CatalogGovernanceVersion::V5 {
+    let lifecycle_generation = if version == CatalogGovernanceVersion::V6 {
+        let generation = cursor.take_u64()?;
+        if generation == 0 {
+            return Err(corrupt());
+        }
+        generation
+    } else {
+        1
+    };
+    let credential_prefix = if matches!(
+        version,
+        CatalogGovernanceVersion::V5 | CatalogGovernanceVersion::V6
+    ) {
         encoded
             .get(
                 ..encoded
@@ -450,7 +558,10 @@ fn decode(encoded: &[u8]) -> Result<CatalogGovernanceObject, CatalogFailure> {
     } else {
         legacy_v5_prefix(encoded, version)?
     };
-    let credential_generation = if version == CatalogGovernanceVersion::V5 {
+    let credential_generation = if matches!(
+        version,
+        CatalogGovernanceVersion::V5 | CatalogGovernanceVersion::V6
+    ) {
         let generation = cursor.take_u64()?;
         if generation == 0 {
             return Err(corrupt());
@@ -459,7 +570,10 @@ fn decode(encoded: &[u8]) -> Result<CatalogGovernanceObject, CatalogFailure> {
     } else {
         1
     };
-    let credentials = if matches!(version, CatalogGovernanceVersion::V5) {
+    let credentials = if matches!(
+        version,
+        CatalogGovernanceVersion::V5 | CatalogGovernanceVersion::V6
+    ) {
         let count = usize::from(cursor.take_u16()?);
         if !(1..=MAX_CREDENTIALS).contains(&count) {
             return Err(corrupt());
@@ -531,6 +645,7 @@ fn decode(encoded: &[u8]) -> Result<CatalogGovernanceObject, CatalogFailure> {
         query,
         retention_seconds,
         lifecycle,
+        lifecycle_generation,
         credentials,
         credential_generation,
         credential_prefix,
@@ -641,6 +756,17 @@ fn is_governance(bytes: &[u8]) -> bool {
         || bytes.starts_with(&MAGIC_V3)
         || bytes.starts_with(&MAGIC_V4)
         || bytes.starts_with(&MAGIC_V5)
+        || bytes.starts_with(&MAGIC_V6)
+}
+
+const fn lifecycle_code(lifecycle: TenantLifecycleState) -> u8 {
+    match lifecycle {
+        TenantLifecycleState::Active => 1,
+        TenantLifecycleState::ReadOnly => 2,
+        TenantLifecycleState::Suspended => 3,
+        TenantLifecycleState::Purging => 4,
+        TenantLifecycleState::Purged => 5,
+    }
 }
 
 fn require_nonzero<const N: usize>(bytes: [u8; N]) -> Result<(), CatalogFailure> {
@@ -733,6 +859,7 @@ impl<'encoded> Cursor<'encoded> {
 #[cfg(test)]
 mod tests {
     use super::{CatalogFailureCode, CatalogGovernanceObject, CatalogGovernanceVersion};
+    use positron_domain::lifecycle::TenantLifecycleState;
 
     #[test]
     fn current_governance_object_requires_an_external_alias() {
@@ -745,7 +872,7 @@ mod tests {
     }
 
     #[test]
-    fn released_governance_versions_preserve_actual_credentials_through_v5_successor() {
+    fn released_governance_versions_preserve_actual_credentials_through_v6_successor() {
         for (version, expected_credentials) in [
             (CatalogGovernanceVersion::V1, 1_usize),
             (CatalogGovernanceVersion::V2, 2),
@@ -759,13 +886,41 @@ mod tests {
             let expected = decoded.credentials().to_vec();
             let successor = decoded
                 .with_credentials(2, &expected)
-                .expect("first lifecycle mutation canonically upgrades the record");
-            assert!(successor.starts_with(b"POSGOV05"));
+                .expect("first credential mutation canonically upgrades the record");
+            assert!(successor.starts_with(b"POSGOV06"));
             let migrated = CatalogGovernanceObject::decode(&successor)
                 .expect("canonical successor remains readable");
             assert_eq!(migrated.credential_generation(), 2);
+            assert_eq!(migrated.lifecycle_generation(), 1);
             assert_eq!(migrated.credentials(), expected.as_slice());
         }
+    }
+
+    #[test]
+    fn v5_lifecycle_successor_preserves_credentials_and_advances_only_lifecycle_generation() {
+        let mut v5 = valid_v4_object(true);
+        v5[..8].copy_from_slice(b"POSGOV05");
+        v5.extend_from_slice(&1_u64.to_be_bytes());
+        v5.extend_from_slice(&3_u16.to_be_bytes());
+        for (principal, scope) in [([3; 16], 4_u8), ([6; 16], 1), ([9; 16], 2)] {
+            v5.extend_from_slice(&principal);
+            v5.push(scope);
+            v5.push(1);
+            v5.extend_from_slice(&0_u64.to_be_bytes());
+            v5.extend_from_slice(&[31; 32]);
+            v5.extend_from_slice(&[32; 32]);
+        }
+        let decoded = CatalogGovernanceObject::decode(&v5).expect("v5 record remains readable");
+        let credentials = decoded.credentials().to_vec();
+        let successor = decoded
+            .with_lifecycle(TenantLifecycleState::ReadOnly, 2)
+            .expect("lifecycle successor encodes");
+        assert!(successor.starts_with(b"POSGOV06"));
+        let decoded = CatalogGovernanceObject::decode(&successor).expect("v6 record decodes");
+        assert_eq!(decoded.lifecycle(), TenantLifecycleState::ReadOnly);
+        assert_eq!(decoded.lifecycle_generation(), 2);
+        assert_eq!(decoded.credential_generation(), 1);
+        assert_eq!(decoded.credentials(), credentials.as_slice());
     }
 
     #[test]

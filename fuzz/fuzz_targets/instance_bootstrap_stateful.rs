@@ -11,6 +11,7 @@ use positron_governance::{
     GovernanceAuditEntry, PresentedCredential, RequestedIntent, ResourceGeneration,
 };
 use positron_domain::identity::{PrincipalId, Scope};
+use positron_domain::lifecycle::TenantLifecycleState;
 use positron_runtime::{
     BootstrapFailureCode, BootstrapPaths, InitializationPlan, InstanceBootstrap,
 };
@@ -168,6 +169,7 @@ fuzz_target!(|data: &[u8]| {
     let mut credential = None;
     let mut tenant_key: Option<(PrincipalId, String, Scope)> = None;
     let mut credential_generation = 1_u64;
+    let mut lifecycle_generation = 1_u64;
     for (index, command) in data.iter().copied().enumerate() {
         match command & 15 {
             0 | 1 => {
@@ -486,6 +488,77 @@ fuzz_target!(|data: &[u8]| {
                             credential_generation = credential_generation.saturating_add(1);
                         } else {
                             tenant_key = Some((principal, key_secret, scope));
+                        }
+                    }
+                }
+            },
+            11 => {
+                if let (Some(root_secret), Ok(instance)) =
+                    (credential.as_deref(), InstanceBootstrap::reopen(&paths))
+                {
+                    let Ok(administrator) = instance.attribute(
+                        PresentedCredential::parse(root_secret)
+                            .expect("claimed credential remains canonical"),
+                        RequestedIntent::SystemAdministration,
+                        CompatibilityHints::none(),
+                    ) else {
+                        continue;
+                    };
+                    let target = match (command >> 4) & 7 {
+                        0 => TenantLifecycleState::Active,
+                        1 => TenantLifecycleState::ReadOnly,
+                        2 => TenantLifecycleState::Suspended,
+                        3 => TenantLifecycleState::Purging,
+                        _ => TenantLifecycleState::Purged,
+                    };
+                    let idempotency = AdministrativeIdempotencyKey::new([
+                        u8::try_from(index).expect("bounded input") + 1;
+                        16
+                    ])
+                    .expect("nonzero idempotency");
+                    let expected = ResourceGeneration::new(lifecycle_generation)
+                        .expect("bounded lifecycle generation");
+                    if let Ok(transition) = instance.transition_tenant_lifecycle(
+                        administrator,
+                        instance.default_tenant_id(),
+                        target,
+                        expected,
+                        idempotency,
+                    ) {
+                        assert_eq!(transition.to(), target);
+                        assert_eq!(transition.resource_generation().get(), lifecycle_generation + 1);
+                        let replay = instance.transition_tenant_lifecycle(
+                            instance
+                                .attribute(
+                                    PresentedCredential::parse(root_secret)
+                                        .expect("claim syntax"),
+                                    RequestedIntent::SystemAdministration,
+                                    CompatibilityHints::none(),
+                                )
+                                .expect("bootstrap credential remains administrator"),
+                            instance.default_tenant_id(),
+                            target,
+                            expected,
+                            idempotency,
+                        );
+                        assert_eq!(replay.expect("exact lifecycle retry"), transition);
+                        lifecycle_generation = lifecycle_generation.saturating_add(1);
+                        if let Some((_, key_secret, scope)) = tenant_key.as_ref() {
+                            let intent = if *scope == Scope::Query {
+                                RequestedIntent::Query
+                            } else {
+                                RequestedIntent::Ingest
+                            };
+                            let attributed = instance.attribute(
+                                PresentedCredential::parse(key_secret)
+                                    .expect("generated API key remains canonical"),
+                                intent,
+                                CompatibilityHints::none(),
+                            );
+                            let allowed = target == TenantLifecycleState::Active
+                                || (target == TenantLifecycleState::ReadOnly
+                                    && *scope == Scope::Query);
+                            assert_eq!(attributed.is_ok(), allowed);
                         }
                     }
                 }

@@ -46,6 +46,17 @@ impl TenantLifecycle {
         self.state
     }
 
+    /// Rehydrates a durable lifecycle state so its next transition remains checked.
+    #[must_use]
+    pub const fn from_durable_state(state: TenantLifecycleState) -> Self {
+        Self { state }
+    }
+
+    /// Checks one requested lifecycle successor against the closed transition graph.
+    pub fn transition_to(self, target: TenantLifecycleState) -> Result<Self, DomainFailure> {
+        self.transition(target)
+    }
+
     /// Moves a reversible state to ReadOnly.
     pub fn to_read_only(self) -> Result<Self, DomainFailure> {
         self.transition(TenantLifecycleState::ReadOnly)

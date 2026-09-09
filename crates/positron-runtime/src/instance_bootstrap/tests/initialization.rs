@@ -8,6 +8,7 @@ use crate::{
     BootstrapFailureCode, BootstrapPaths, BootstrapState, InitializationPlan, InstanceBootstrap,
 };
 use positron_domain::identity::Scope;
+use positron_domain::lifecycle::TenantLifecycleState;
 use positron_governance::{AdministrativeIdempotencyKey, ResourceGeneration};
 use positron_governance::{CompatibilityHints, PresentedCredential, RequestedIntent};
 use positron_kernel::{
@@ -89,6 +90,321 @@ fn reopened_identity_authenticates_the_hash_only_administrator_without_impersona
         )
         .expect_err("a system administrator cannot impersonate a tenant principal");
     assert_eq!(rejected.to_string(), "credential or authority was rejected");
+    Ok(())
+}
+
+#[test]
+fn read_only_transition_is_durable_idempotent_and_preserves_query_access()
+-> Result<(), Box<dyn Error>> {
+    let roots = Roots::new()?;
+    let paths = roots.paths().map_err(|code| format!("paths: {code:?}"))?;
+    drop(InstanceBootstrap::initialize(
+        &paths,
+        InitializationPlan::non_interactive(),
+    )?);
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    let administrator = || {
+        instance.attribute(
+            PresentedCredential::parse(claim.secret()).expect("claim syntax"),
+            RequestedIntent::SystemAdministration,
+            CompatibilityHints::none(),
+        )
+    };
+    let ingest = instance.create_api_key(
+        administrator()?,
+        Scope::Ingest,
+        None,
+        ResourceGeneration::new(1)?,
+        AdministrativeIdempotencyKey::new([0x70; 16])?,
+    )?;
+    let query = instance.create_api_key(
+        administrator()?,
+        Scope::Query,
+        None,
+        ResourceGeneration::new(2)?,
+        AdministrativeIdempotencyKey::new([0x71; 16])?,
+    )?;
+    let ingest_secret = ingest.secret().ok_or("ingest secret")?.to_owned();
+    let query_secret = query.secret().ok_or("query secret")?.to_owned();
+    let idempotency = AdministrativeIdempotencyKey::new([0x72; 16])?;
+
+    let transitioned = instance.transition_tenant_lifecycle(
+        administrator()?,
+        instance.default_tenant_id(),
+        TenantLifecycleState::ReadOnly,
+        ResourceGeneration::new(1)?,
+        idempotency,
+    )?;
+    assert_eq!(transitioned.from(), TenantLifecycleState::Active);
+    assert_eq!(transitioned.to(), TenantLifecycleState::ReadOnly);
+    assert_eq!(transitioned.resource_generation().get(), 2);
+    let audit = instance
+        .governance_audit_for_test()?
+        .into_iter()
+        .find(|record| record.position() == transitioned.audit_position())
+        .ok_or("lifecycle audit record")?;
+    let lifecycle_audit = audit
+        .as_tenant_lifecycle()
+        .ok_or("lifecycle audit meaning")?;
+    assert_eq!(audit.action(), "tenant.lifecycle.transition");
+    assert_eq!(lifecycle_audit.tenant_id(), instance.default_tenant_id());
+    assert_eq!(lifecycle_audit.from(), TenantLifecycleState::Active);
+    assert_eq!(lifecycle_audit.to(), TenantLifecycleState::ReadOnly);
+    assert_eq!(lifecycle_audit.expected_generation().get(), 1);
+    assert_eq!(lifecycle_audit.generation().get(), 2);
+    assert_eq!(lifecycle_audit.idempotency_key(), idempotency);
+    assert_eq!(
+        instance.transition_tenant_lifecycle(
+            administrator()?,
+            instance.default_tenant_id(),
+            TenantLifecycleState::ReadOnly,
+            ResourceGeneration::new(1)?,
+            idempotency,
+        )?,
+        transitioned
+    );
+    drop(instance);
+
+    let reopened = InstanceBootstrap::reopen(&paths)?;
+    assert!(
+        reopened
+            .attribute(
+                PresentedCredential::parse(&ingest_secret)?,
+                RequestedIntent::Ingest,
+                CompatibilityHints::none(),
+            )
+            .is_err()
+    );
+    reopened.attribute(
+        PresentedCredential::parse(&query_secret)?,
+        RequestedIntent::Query,
+        CompatibilityHints::none(),
+    )?;
+    Ok(())
+}
+
+#[test]
+fn retention_pass_continues_from_the_v6_governance_record_in_read_only_and_suspended()
+-> Result<(), Box<dyn Error>> {
+    let roots = Roots::new()?;
+    let paths = roots.paths().map_err(|code| format!("paths: {code:?}"))?;
+    drop(InstanceBootstrap::initialize(
+        &paths,
+        InitializationPlan::non_interactive(),
+    )?);
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    let administrator = || {
+        instance.attribute(
+            PresentedCredential::parse(claim.secret()).expect("claim syntax"),
+            RequestedIntent::SystemAdministration,
+            CompatibilityHints::none(),
+        )
+    };
+    let retention_pass = || -> Result<(), Box<dyn Error>> {
+        let result = instance.complete_log_retention_for_test()?;
+        assert!(result.evaluated_at().value() > 0);
+        Ok(())
+    };
+
+    instance.transition_tenant_lifecycle(
+        administrator()?,
+        instance.default_tenant_id(),
+        TenantLifecycleState::ReadOnly,
+        ResourceGeneration::new(1)?,
+        AdministrativeIdempotencyKey::new([0x7a; 16])?,
+    )?;
+    retention_pass()?;
+    instance.transition_tenant_lifecycle(
+        administrator()?,
+        instance.default_tenant_id(),
+        TenantLifecycleState::Suspended,
+        ResourceGeneration::new(2)?,
+        AdministrativeIdempotencyKey::new([0x7b; 16])?,
+    )?;
+    retention_pass()?;
+    Ok(())
+}
+
+#[test]
+fn lifecycle_publication_fault_recovers_to_one_idempotent_audited_successor()
+-> Result<(), Box<dyn Error>> {
+    let roots = Roots::new()?;
+    let paths = roots.paths().map_err(|code| format!("paths: {code:?}"))?;
+    drop(InstanceBootstrap::initialize(
+        &paths,
+        InitializationPlan::non_interactive(),
+    )?);
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    let idempotency = AdministrativeIdempotencyKey::new([0x75; 16])?;
+    let administrator = || {
+        instance.attribute(
+            PresentedCredential::parse(claim.secret()).expect("claim syntax"),
+            RequestedIntent::SystemAdministration,
+            CompatibilityHints::none(),
+        )
+    };
+    let failed = with_catalog_publication_fault_after(
+        CatalogPublicationFault::SynchronizeGenerationDirectory,
+        0,
+        || {
+            instance.transition_tenant_lifecycle(
+                administrator().expect("administrator"),
+                instance.default_tenant_id(),
+                TenantLifecycleState::ReadOnly,
+                ResourceGeneration::new(1).expect("lifecycle generation"),
+                idempotency,
+            )
+        },
+    )
+    .expect_err("ambiguous lifecycle publication cannot acknowledge a partial result");
+    assert_eq!(failed.code(), BootstrapFailureCode::CatalogUnavailable);
+    drop(instance);
+
+    let recovered = InstanceBootstrap::reopen(&paths)?;
+    let administrator = || {
+        recovered.attribute(
+            PresentedCredential::parse(claim.secret()).expect("claim syntax"),
+            RequestedIntent::SystemAdministration,
+            CompatibilityHints::none(),
+        )
+    };
+    let transition = recovered.transition_tenant_lifecycle(
+        administrator()?,
+        recovered.default_tenant_id(),
+        TenantLifecycleState::ReadOnly,
+        ResourceGeneration::new(1)?,
+        idempotency,
+    )?;
+    assert_eq!(transition.to(), TenantLifecycleState::ReadOnly);
+    assert_eq!(transition.resource_generation().get(), 2);
+    assert_eq!(
+        recovered.transition_tenant_lifecycle(
+            administrator()?,
+            recovered.default_tenant_id(),
+            TenantLifecycleState::ReadOnly,
+            ResourceGeneration::new(1)?,
+            idempotency,
+        )?,
+        transition
+    );
+    Ok(())
+}
+
+#[test]
+fn lifecycle_transitions_preserve_the_closed_access_and_retry_contract()
+-> Result<(), Box<dyn Error>> {
+    let roots = Roots::new()?;
+    let paths = roots.paths().map_err(|code| format!("paths: {code:?}"))?;
+    drop(InstanceBootstrap::initialize(
+        &paths,
+        InitializationPlan::non_interactive(),
+    )?);
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    let administrator = || {
+        instance.attribute(
+            PresentedCredential::parse(claim.secret()).expect("claim syntax"),
+            RequestedIntent::SystemAdministration,
+            CompatibilityHints::none(),
+        )
+    };
+    let transition = |target, expected, idempotency| {
+        instance.transition_tenant_lifecycle(
+            administrator().expect("administrator"),
+            instance.default_tenant_id(),
+            target,
+            ResourceGeneration::new(expected).expect("generation"),
+            AdministrativeIdempotencyKey::new(idempotency).expect("idempotency"),
+        )
+    };
+    let read_only = transition(TenantLifecycleState::ReadOnly, 1, [0x73; 16])?;
+    assert_eq!(read_only.resource_generation().get(), 2);
+    assert!(
+        instance
+            .attribute(
+                PresentedCredential::parse(claim.ingest_secret().ok_or("ingest credential")?)?,
+                RequestedIntent::Ingest,
+                CompatibilityHints::none(),
+            )
+            .is_err()
+    );
+    instance.attribute(
+        PresentedCredential::parse(claim.query_secret().ok_or("query credential")?)?,
+        RequestedIntent::Query,
+        CompatibilityHints::none(),
+    )?;
+    let mismatch = transition(TenantLifecycleState::Suspended, 1, [0x73; 16])
+        .expect_err("one idempotency key cannot select a different lifecycle target");
+    assert_eq!(
+        mismatch.code(),
+        BootstrapFailureCode::TenantLifecycleIdempotencyConflict
+    );
+    let stale = transition(TenantLifecycleState::Suspended, 1, [0x74; 16])
+        .expect_err("a new request cannot replace the lifecycle successor");
+    assert_eq!(
+        stale.code(),
+        BootstrapFailureCode::TenantLifecycleStaleGeneration
+    );
+
+    let suspended = transition(TenantLifecycleState::Suspended, 2, [0x75; 16])?;
+    assert_eq!(suspended.resource_generation().get(), 3);
+    assert!(
+        instance
+            .attribute(
+                PresentedCredential::parse(claim.query_secret().ok_or("query credential")?)?,
+                RequestedIntent::Query,
+                CompatibilityHints::none(),
+            )
+            .is_err()
+    );
+    administrator()?;
+    let active = transition(TenantLifecycleState::Active, 3, [0x76; 16])?;
+    assert_eq!(active.resource_generation().get(), 4);
+    instance.attribute(
+        PresentedCredential::parse(claim.ingest_secret().ok_or("ingest credential")?)?,
+        RequestedIntent::Ingest,
+        CompatibilityHints::none(),
+    )?;
+    let purging = transition(TenantLifecycleState::Purging, 4, [0x77; 16])?;
+    assert_eq!(purging.resource_generation().get(), 5);
+    assert!(
+        instance
+            .attribute(
+                PresentedCredential::parse(claim.query_secret().ok_or("query credential")?)?,
+                RequestedIntent::Query,
+                CompatibilityHints::none(),
+            )
+            .is_err()
+    );
+    let completion = transition(TenantLifecycleState::Purged, 5, [0x78; 16])
+        .expect_err("only the later verified managed-purge authority may complete purge");
+    assert_eq!(
+        completion.code(),
+        BootstrapFailureCode::TenantLifecyclePurgeCompletionUnavailable
+    );
+    let reversal = transition(TenantLifecycleState::Active, 5, [0x79; 16])
+        .expect_err("purging remains one-way");
+    assert_eq!(
+        reversal.code(),
+        BootstrapFailureCode::TenantLifecycleInvalidTransition
+    );
+    drop(instance);
+
+    let reopened = InstanceBootstrap::reopen(&paths)?;
+    assert_eq!(reopened.default_tenant_id(), purging.tenant_id());
+    assert_eq!(reopened.default_tenant_slug().as_str(), "default");
+    assert!(
+        reopened
+            .attribute(
+                PresentedCredential::parse(claim.ingest_secret().ok_or("ingest credential")?)?,
+                RequestedIntent::Ingest,
+                CompatibilityHints::none(),
+            )
+            .is_err()
+    );
     Ok(())
 }
 

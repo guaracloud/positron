@@ -1,4 +1,5 @@
 use positron_domain::identity::Scope;
+use positron_domain::lifecycle::TenantLifecycleState;
 use positron_governance::{
     AdministrativeIdempotencyKey, CompatibilityHints, PresentedCredential, RequestedIntent,
     ResourceGeneration,
@@ -145,6 +146,46 @@ fn legacy_initialized_instance_reopens_and_preserves_its_one_time_admin_claim()
 }
 
 #[test]
+fn v6_lifecycle_governance_rewrites_to_a_released_reader_and_reopens()
+-> Result<(), Box<dyn std::error::Error>> {
+    let roots = Roots::new()?;
+    let paths = roots.paths();
+    drop(InstanceBootstrap::initialize(
+        &paths,
+        InitializationPlan::non_interactive(),
+    )?);
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let initialized = InstanceBootstrap::reopen(&paths)?;
+    let administrator = initialized.attribute(
+        PresentedCredential::parse(claim.secret())?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    initialized.transition_tenant_lifecycle(
+        administrator,
+        initialized.default_tenant_id(),
+        TenantLifecycleState::ReadOnly,
+        ResourceGeneration::new(1)?,
+        AdministrativeIdempotencyKey::new([0x7c; 16])?,
+    )?;
+    publish_legacy_governance(&initialized)?;
+    drop(initialized);
+
+    let reopened = InstanceBootstrap::reopen(&paths)?;
+    assert_eq!(reopened.default_tenant_slug().as_str(), "default");
+    assert!(
+        reopened
+            .attribute(
+                PresentedCredential::parse(claim.ingest_secret().ok_or("ingest secret")?)?,
+                RequestedIntent::Ingest,
+                CompatibilityHints::none(),
+            )
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
 fn legacy_pending_before_catalog_commit_migrates_to_v3_and_claims_fresh_data_authorities()
 -> Result<(), Box<dyn std::error::Error>> {
     let roots = Roots::new()?;
@@ -208,6 +249,7 @@ fn publish_legacy_governance(
         let plaintext = if object.starts_with(b"POSGOV03")
             || object.starts_with(b"POSGOV04")
             || object.starts_with(b"POSGOV05")
+            || object.starts_with(b"POSGOV06")
         {
             replaced = true;
             legacy_governance(object)?
@@ -312,7 +354,28 @@ fn rewrite_pending_replacement_as_v1(
 
 fn legacy_governance(current: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let mut legacy = current.to_vec();
-    if current.starts_with(b"POSGOV05") {
+    if legacy.starts_with(b"POSGOV06") {
+        let credential_extension = CatalogGovernanceObject::decode(&legacy)?
+            .credentials()
+            .len()
+            .checked_mul(90)
+            .and_then(|bytes| bytes.checked_add(10))
+            .ok_or("credential extension overflow")?;
+        let generation_start = legacy
+            .len()
+            .checked_sub(credential_extension)
+            .and_then(|start| start.checked_sub(8))
+            .ok_or("truncated V6 lifecycle generation")?;
+        let suffix = legacy.split_off(
+            generation_start
+                .checked_add(8)
+                .ok_or("lifecycle generation overflow")?,
+        );
+        legacy.truncate(generation_start);
+        legacy.extend_from_slice(&suffix);
+        legacy[..8].copy_from_slice(b"POSGOV05");
+    }
+    if legacy.starts_with(b"POSGOV05") {
         let extension = CatalogGovernanceObject::decode(current)?
             .credentials()
             .len()

@@ -18,7 +18,7 @@ use positron_domain::identity::{
     ExternalTenantAlias, PrincipalId, Scope, TenantAttribution, TenantId, TenantSlug,
 };
 use positron_domain::lifecycle::TenantLifecycleState;
-use positron_kernel::{BootstrapKeyCustody, CatalogObjectId, CatalogSnapshot};
+use positron_kernel::{BootstrapKeyCustody, CatalogSnapshot};
 
 use crate::GovernanceAuditEntry;
 
@@ -84,27 +84,8 @@ impl Identity {
 
     /// Reconstructs the unique initialization identity from a pinned Catalog.
     pub fn open(snapshot: &CatalogSnapshot) -> Result<Self, IdentityFailure> {
-        Self::open_with_object(snapshot).map(|(identity, _)| identity)
-    }
-
-    fn open_with_object(
-        snapshot: &CatalogSnapshot,
-    ) -> Result<(Self, CatalogObjectId), IdentityFailure> {
-        let (object_id, governance) = snapshot.governance_object().map_err(|_| IdentityFailure)?;
-        let mut decoded = identity_from_catalog(governance)?;
-        // Lease, query-marker, and other catalog objects may advance the
-        // catalog generation without changing authorization. Bind query
-        // revalidation to this immutable governance object instead, so a
-        // reconnect after ordinary catalog churn remains authorized while
-        // replacing the identity object still changes the binding.
-        let object_bytes = object_id.to_bytes();
-        decoded.generation = object_bytes
-            .get(..8)
-            .and_then(|bytes| bytes.try_into().ok())
-            .map(u64::from_be_bytes)
-            .unwrap_or(1)
-            .max(1);
-        Ok((decoded, object_id))
+        let (_, governance) = snapshot.governance_object().map_err(|_| IdentityFailure)?;
+        identity_from_catalog(governance)
     }
 
     /// Authenticates and authorizes before a decoder or data-plane admission
@@ -257,7 +238,8 @@ impl Identity {
     }
 
     /// Revalidates a previously attributed query context against this
-    /// generation-pinned identity and its current durable lifecycle state.
+    /// credential-generation-pinned identity and its current durable lifecycle
+    /// state.
     ///
     /// This is intentionally the same constant-shape failure as attribution:
     /// a caller cannot learn whether a tenant was suspended, purged, or merely
@@ -277,7 +259,6 @@ impl Identity {
             || tenant.tenant_id() != self.tenant
             || context.authority != self.instance
             || context.generation != self.generation
-            || context.lifecycle != self.lifecycle
             || !is_query_readable(self.lifecycle)
         {
             return Err(AttributionFailure);

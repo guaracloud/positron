@@ -1,5 +1,9 @@
 use positron_domain::lifecycle::TenantLifecycleState;
-use positron_kernel::{Catalog, GovernanceFixtureObject, GovernanceFixtureTarget};
+use positron_domain::routing::SignalKind;
+use positron_kernel::{
+    ActiveSegmentLedger, Catalog, GovernanceFixtureObject, GovernanceFixtureTarget,
+    RetentionReclamation, SegmentScope,
+};
 
 use super::types::{BootstrapFailure, BootstrapFailureCode, InitializedInstance};
 
@@ -47,6 +51,36 @@ impl GovernanceTestFixture {
 }
 
 impl InitializedInstance {
+    /// Completes one Catalog-authorized Log retention pass for integration tests.
+    #[doc(hidden)]
+    pub fn complete_log_retention_for_test(
+        &self,
+    ) -> Result<RetentionReclamation, BootstrapFailure> {
+        let secret = self
+            .key
+            .catalog_secret(self.instance)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
+        let catalog = Catalog::open(&self._authority, self.instance, secret)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        let scope = SegmentScope::new(self.tenant, SignalKind::Logs, self.logs_shard);
+        let protection = self
+            .key
+            .segment_key(self.instance, scope)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
+        let ledger = ActiveSegmentLedger::open_with_retention_time(
+            &self._authority,
+            &self.retention_time,
+            &catalog,
+            scope,
+            protection,
+        )
+        .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        ledger
+            .begin_retention()
+            .and_then(|evaluation| evaluation.commit())
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))
+    }
+
     /// Returns a typed governed fixture capability for external integration
     /// tests. The authenticated Catalog object never crosses this boundary.
     #[doc(hidden)]
@@ -69,7 +103,8 @@ impl InitializedInstance {
                     || object.starts_with(b"POSGOV02")
                     || object.starts_with(b"POSGOV03")
                     || object.starts_with(b"POSGOV04")
-                    || object.starts_with(b"POSGOV05"))
+                    || object.starts_with(b"POSGOV05")
+                    || object.starts_with(b"POSGOV06"))
             {
                 return GovernanceTestFixture::new(object);
             }

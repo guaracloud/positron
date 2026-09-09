@@ -62,7 +62,8 @@ fn retention_replacement(
             let bytes = basis.object(identity).ok().flatten()?;
             (!bytes.starts_with(b"POSGOV03")
                 && !bytes.starts_with(b"POSGOV04")
-                && !bytes.starts_with(b"POSGOV05"))
+                && !bytes.starts_with(b"POSGOV05")
+                && !bytes.starts_with(b"POSGOV06"))
             .then(|| CatalogObject::new(bytes.to_vec()).ok())?
         })
         .collect::<Vec<_>>();
