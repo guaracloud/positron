@@ -17,12 +17,16 @@ use super::security_directory::FreshInitializationRootProof;
 use super::{LocalKeyFailure, VerifiedLocalKey};
 
 const ENVELOPE_MAGIC: [u8; 8] = *b"POSBOOT1";
+const TENANT_KEK_ENVELOPE_MAGIC: [u8; 8] = *b"POSTKE01";
+const TENANT_KEK_ENVELOPE_HEADER_BYTES: usize = 32;
 const ENVELOPE_BYTES_LIMIT: u32 = 1_048_960;
 const ENVELOPE_HEADER_BYTES: usize = 49;
 
 mod derivation;
 mod directory;
-use derivation::{derive_child, object_context, tenant_object_id, wrapped_context};
+use derivation::{
+    derive_child, object_context, tenant_envelope_context, tenant_object_id, wrapped_context,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BootstrapObjectPurpose {
@@ -200,6 +204,27 @@ impl BootstrapKeyCustody {
             .map(SegmentProtectionKey::from_owned)
     }
 
+    /// Resolves one Catalog-carried tenant KEK envelope before deriving the
+    /// wrapping key for an active segment. The envelope is authenticated to
+    /// the exact instance, tenant, key identifier, and key epoch.
+    pub fn segment_key_from_tenant_envelope(
+        &self,
+        instance: InstanceId,
+        scope: SegmentScope,
+        envelope: &[u8],
+    ) -> Result<SegmentProtectionKey, BootstrapKeyFailure> {
+        let tenant = self.resolve_tenant_key_envelope(instance, scope.tenant_id(), envelope)?;
+        let mut context = Zeroizing::new(Vec::with_capacity(23));
+        context.extend_from_slice(&scope.tenant_id().to_bytes());
+        context.push(match scope.signal_kind() {
+            positron_domain::routing::SignalKind::Logs => 1,
+            positron_domain::routing::SignalKind::Traces => 2,
+        });
+        context.extend_from_slice(&scope.shard_id().value().to_be_bytes());
+        derive_child(&tenant, instance, b"active-segment-wrapping-kek", &context)
+            .map(SegmentProtectionKey::from_owned)
+    }
+
     pub fn tenant_key_envelope(
         &self,
         instance: InstanceId,
@@ -215,6 +240,69 @@ impl BootstrapKeyCustody {
             &object_key,
             wrapped_context(instance, BootstrapObjectPurpose::Initialized, object_id)?,
         )
+        .map_err(map_frame)
+    }
+
+    /// Provisions a fresh random tenant KEK and emits only its authenticated
+    /// opaque envelope. Plaintext key material remains inside Data Protection.
+    pub fn provision_tenant_key_envelope(
+        &self,
+        instance: InstanceId,
+        tenant: TenantId,
+        key_id: [u8; 16],
+        key_epoch: u64,
+    ) -> Result<Vec<u8>, BootstrapKeyFailure> {
+        if key_id.iter().all(|byte| *byte == 0) || key_epoch == 0 {
+            return Err(BootstrapKeyFailure::InvalidInput);
+        }
+        let system = self.system_kek(instance)?;
+        let object = ObjectDataKey::generate(object_context(key_id)?).map_err(map_frame)?;
+        let wrapped = DataProtection::wrap_key_payload(
+            &system,
+            &object,
+            tenant_envelope_context(instance, tenant, key_id, key_epoch)?,
+        )
+        .map_err(map_frame)?;
+        let mut encoded =
+            Vec::with_capacity(TENANT_KEK_ENVELOPE_HEADER_BYTES.saturating_add(wrapped.len()));
+        encoded.extend_from_slice(&TENANT_KEK_ENVELOPE_MAGIC);
+        encoded.extend_from_slice(&key_id);
+        encoded.extend_from_slice(&key_epoch.to_be_bytes());
+        encoded.extend_from_slice(&wrapped);
+        Ok(encoded)
+    }
+
+    pub(super) fn resolve_tenant_key_envelope(
+        &self,
+        instance: InstanceId,
+        tenant: TenantId,
+        envelope: &[u8],
+    ) -> Result<SecretKeyBytes, BootstrapKeyFailure> {
+        if envelope.get(..8) != Some(TENANT_KEK_ENVELOPE_MAGIC.as_slice()) {
+            return Err(BootstrapKeyFailure::Authentication);
+        }
+        let key_id: [u8; 16] = envelope
+            .get(8..24)
+            .and_then(|value| value.try_into().ok())
+            .ok_or(BootstrapKeyFailure::Authentication)?;
+        let key_epoch = envelope
+            .get(24..32)
+            .and_then(|value| value.try_into().ok())
+            .map(u64::from_be_bytes)
+            .filter(|value| *value != 0)
+            .ok_or(BootstrapKeyFailure::Authentication)?;
+        let wrapped = envelope
+            .get(TENANT_KEK_ENVELOPE_HEADER_BYTES..)
+            .filter(|value| !value.is_empty())
+            .ok_or(BootstrapKeyFailure::Authentication)?;
+        let system = self.system_kek(instance)?;
+        DataProtection::unwrap_key_payload(
+            &system,
+            wrapped,
+            tenant_envelope_context(instance, tenant, key_id, key_epoch)?,
+            object_context(key_id)?,
+        )
+        .map(|key| key.key)
         .map_err(map_frame)
     }
 
