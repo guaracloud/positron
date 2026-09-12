@@ -79,8 +79,9 @@ pub(super) fn query_events_for_test(
         Ok(query) => query,
         Err(failure) => return Ok(QueryTestOutcome::Failure(failure.code())),
     };
+    let tenant = super::context_tenant(context)?;
     let _drain = instance
-        .enter_query_execution(query.cancellation())
+        .enter_query_execution_for(tenant, query.cancellation())
         .map_err(|_| ServiceFailure::Unauthorized)?;
     let schema = services
         .schema_sessions
@@ -184,7 +185,8 @@ pub(super) fn query_log_bodies(
     identity
         .revalidate_query_context(context)
         .map_err(|_| ServiceFailure::Unauthorized)?;
-    let scope = SegmentScope::new(instance.tenant, SignalKind::Logs, shard);
+    let tenant = super::context_tenant(context)?;
+    let scope = SegmentScope::new(tenant, SignalKind::Logs, shard);
     let protection = super::tenant_segment_key(instance, &identity, scope)?;
     let ledger = ActiveSegmentLedger::open_with_retention_time(
         &instance._authority,
@@ -199,16 +201,16 @@ pub(super) fn query_log_bodies(
         .plan_pipeline(context, source, budget)
         .map_err(|failure| map_query_failure(&failure))?;
     let _drain = instance
-        .enter_query_execution(query.cancellation())
+        .enter_query_execution_for(tenant, query.cancellation())
         .map_err(|_| ServiceFailure::Unauthorized)?;
     #[cfg(test)]
     services.await_query_execution_test_hook()?;
     let schema = services
         .schema_sessions
-        .session(instance.tenant, instance.resource_governor())
+        .session(tenant, instance.resource_governor())
         .map_err(|_| ServiceFailure::CapacityUnavailable)?;
     let events = schema
-        .with_catalog_view(instance.tenant, |catalog| {
+        .with_catalog_view(tenant, |catalog| {
             service.execute_with_schema(query, catalog)
         })
         .map_err(schema_bootstrap::classify_replay_failure)?

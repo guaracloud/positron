@@ -2,6 +2,7 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 
 use positron_domain::identity::{PrincipalId, Scope, TenantId, TenantSlug};
+use positron_domain::lifecycle::TenantLifecycleState;
 use positron_kernel::{
     AuditIntent, BootstrapKeyCustody, Catalog, CatalogFailureCode, CatalogObject, CatalogProposal,
     CatalogReadView, CatalogSnapshot, PreparedTransactionResolution, TransactionId,
@@ -9,9 +10,11 @@ use positron_kernel::{
 use positron_policy::IngestPolicy;
 use sha2::{Digest, Sha256};
 
+use crate::tenant_quota_record::{
+    TENANT_RECORD_V2_MAGIC, is_tenant_record, tenant_record_metadata,
+};
 use crate::{AdministrativeIdempotencyKey, AuthorizedContext, ResourceGeneration};
 
-const TENANT_RECORD_MAGIC: [u8; 8] = *b"POSTNR01";
 const TENANT_RECEIPT_MAGIC: [u8; 8] = *b"POSTRR01";
 const TENANT_AUDIT_MAGIC: [u8; 8] = *b"POSTNA01";
 const TENANT_REGISTRY_V1_MAGIC: [u8; 8] = *b"POSTRG01";
@@ -57,7 +60,6 @@ pub struct TenantCreateRequest {
     retention_seconds: u64,
     weight: u32,
     resources: [u64; 11],
-    expected: ResourceGeneration,
     idempotency: AdministrativeIdempotencyKey,
 }
 
@@ -71,7 +73,6 @@ impl TenantCreateRequest {
         retention_seconds: u64,
         weight: u32,
         resources: [u64; 11],
-        expected: ResourceGeneration,
         idempotency: AdministrativeIdempotencyKey,
     ) -> Self {
         Self {
@@ -82,7 +83,6 @@ impl TenantCreateRequest {
             retention_seconds,
             weight,
             resources,
-            expected,
             idempotency,
         }
     }
@@ -121,7 +121,7 @@ impl TenantAdministration {
                 .map_err(map_catalog)?
                 .ok_or(TenantAdministrationFailure::PersistenceUnavailable)?;
             if is_tenant_record(bytes) {
-                let record = tenant_record(bytes)?;
+                let record = tenant_record_metadata(bytes)?;
                 quotas.push((record.tenant, record.resources));
             }
         }
@@ -164,7 +164,7 @@ impl TenantAdministration {
                 .map_err(map_catalog)?
                 .ok_or(TenantAdministrationFailure::PersistenceUnavailable)?;
             if is_tenant_record(bytes) {
-                let record = tenant_record(bytes)?;
+                let record = tenant_record_metadata(bytes)?;
                 if !registry.tenants.contains(&record.tenant) {
                     registry.tenants.push(record.tenant);
                 }
@@ -199,7 +199,7 @@ impl TenantAdministration {
                 .map_err(map_catalog)?
                 .ok_or(TenantAdministrationFailure::PersistenceUnavailable)?;
             if is_tenant_record(bytes) {
-                let record = tenant_record(bytes)?;
+                let record = tenant_record_metadata(bytes)?;
                 if states.contains(&record.tenant) {
                     return Err(TenantAdministrationFailure::PersistenceUnavailable);
                 }
@@ -215,6 +215,71 @@ impl TenantAdministration {
             return Err(TenantAdministrationFailure::PersistenceUnavailable);
         }
         Ok(registry.tenants)
+    }
+
+    /// Reconstructs each registered tenant's durable lifecycle. The default
+    /// lifecycle lives in POSGOV; every secondary lifecycle lives in its
+    /// canonical POSTNR record.
+    pub(crate) fn registered_tenant_lifecycles(
+        snapshot: &CatalogSnapshot,
+    ) -> Result<Vec<(TenantId, TenantLifecycleState)>, TenantAdministrationFailure> {
+        let registered = Self::registered_tenant_ids(snapshot)?;
+        let (_, governance) = snapshot.governance_object().map_err(map_catalog)?;
+        let mut lifecycles = vec![(governance.tenant(), governance.lifecycle())];
+        for identity in snapshot.object_identities() {
+            let bytes = snapshot
+                .object(identity)
+                .map_err(map_catalog)?
+                .ok_or(TenantAdministrationFailure::PersistenceUnavailable)?;
+            if !is_tenant_record(bytes) {
+                continue;
+            }
+            let record = tenant_record_metadata(bytes)?;
+            if record.tenant == governance.tenant()
+                || !registered.contains(&record.tenant)
+                || lifecycles
+                    .iter()
+                    .any(|(tenant, _)| *tenant == record.tenant)
+            {
+                return Err(TenantAdministrationFailure::PersistenceUnavailable);
+            }
+            lifecycles.push((record.tenant, record.lifecycle));
+        }
+        if lifecycles.len() != registered.len() {
+            return Err(TenantAdministrationFailure::PersistenceUnavailable);
+        }
+        Ok(lifecycles)
+    }
+
+    /// Reconstructs only the non-default tenant envelopes whose immutable
+    /// membership and durable tenant records agree in this Catalog generation.
+    pub fn registered_tenant_key_envelopes(
+        snapshot: &CatalogSnapshot,
+    ) -> Result<Vec<(TenantId, Vec<u8>)>, TenantAdministrationFailure> {
+        let tenants = Self::registered_tenant_ids(snapshot)?;
+        let (_, governance) = snapshot.governance_object().map_err(map_catalog)?;
+        let mut envelopes = Vec::new();
+        for identity in snapshot.object_identities() {
+            let bytes = snapshot
+                .object(identity)
+                .map_err(map_catalog)?
+                .ok_or(TenantAdministrationFailure::PersistenceUnavailable)?;
+            if !is_tenant_record(bytes) {
+                continue;
+            }
+            let record = tenant_record_metadata(bytes)?;
+            if record.tenant == governance.tenant()
+                || !tenants.contains(&record.tenant)
+                || envelopes.iter().any(|(tenant, _)| *tenant == record.tenant)
+            {
+                return Err(TenantAdministrationFailure::PersistenceUnavailable);
+            }
+            envelopes.push((record.tenant, record.envelope));
+        }
+        if envelopes.len().checked_add(1) != Some(tenants.len()) {
+            return Err(TenantAdministrationFailure::PersistenceUnavailable);
+        }
+        Ok(envelopes)
     }
 
     /// Resolves an exact committed retry from an authenticated read view before
@@ -255,13 +320,19 @@ impl TenantAdministration {
         if let Some(replay) = replay_snapshot(&snapshot, &request)? {
             return Ok(replay);
         }
+        let mut registry =
+            registry(&snapshot)?.ok_or(TenantAdministrationFailure::PersistenceUnavailable)?;
         let digest = request_digest(&request);
         let transaction =
             TransactionId::new(request.idempotency.to_bytes()).map_err(map_catalog)?;
-        match catalog
-            .resume_prepared(transaction, digest)
-            .map_err(map_catalog)?
-        {
+        let prepared = match catalog.resume_prepared(transaction, digest) {
+            Ok(prepared) => prepared,
+            Err(failure) if failure.code() == CatalogFailureCode::IdempotencyConflict => catalog
+                .resume_prepared(transaction, legacy_request_digest(&request, registry.generation))
+                .map_err(map_catalog)?,
+            Err(failure) => return Err(map_catalog(failure)),
+        };
+        match prepared {
             PreparedTransactionResolution::Absent => {},
             PreparedTransactionResolution::Unavailable => {
                 return Err(TenantAdministrationFailure::PersistenceUnavailable);
@@ -279,14 +350,9 @@ impl TenantAdministration {
                 });
             },
         }
-        let mut registry =
-            registry(&snapshot)?.ok_or(TenantAdministrationFailure::PersistenceUnavailable)?;
-        if registry.generation != request.expected {
-            return Err(TenantAdministrationFailure::StaleGeneration);
-        }
         let generation = ResourceGeneration::new(
-            request
-                .expected
+            registry
+                .generation
                 .get()
                 .checked_add(1)
                 .ok_or(TenantAdministrationFailure::InvalidInput)?,
@@ -302,7 +368,7 @@ impl TenantAdministration {
                 continue;
             }
             if is_tenant_record(bytes) {
-                let record = tenant_record(bytes)?;
+                let record = tenant_record_metadata(bytes)?;
                 if record.tenant == request.tenant || record.slug == request.slug.as_str() {
                     return Err(TenantAdministrationFailure::DuplicateTenant);
                 }
@@ -330,7 +396,7 @@ impl TenantAdministration {
             .map_err(|_| TenantAdministrationFailure::PersistenceUnavailable)?;
         objects.push(CatalogObject::new(policy.into_bytes()).map_err(map_catalog)?);
         objects.push(
-            CatalogObject::new(encode_receipt(&request, generation, digest))
+            CatalogObject::new(encode_receipt(&request, registry.generation, generation, digest))
                 .map_err(map_catalog)?,
         );
         let commit = catalog
@@ -344,7 +410,7 @@ impl TenantAdministration {
                     objects,
                 )
                 .map_err(map_catalog)?,
-                AuditIntent::new(encode_audit(&request, generation, digest))
+                AuditIntent::new(encode_audit(&request, registry.generation, generation, digest))
                     .map_err(map_catalog)?,
                 digest,
             )
@@ -454,75 +520,6 @@ fn registry_object(
     CatalogObject::new(encoded).map_err(map_catalog)
 }
 
-fn is_tenant_record(bytes: &[u8]) -> bool {
-    bytes.starts_with(&TENANT_RECORD_MAGIC)
-}
-struct TenantRecord<'a> {
-    tenant: TenantId,
-    slug: &'a str,
-    resources: [u64; 11],
-}
-fn tenant_record(bytes: &[u8]) -> Result<TenantRecord<'_>, TenantAdministrationFailure> {
-    let start = 24;
-    let end = start + 16;
-    let raw: [u8; 16] = bytes
-        .get(start..end)
-        .ok_or(TenantAdministrationFailure::PersistenceUnavailable)?
-        .try_into()
-        .map_err(|_| TenantAdministrationFailure::PersistenceUnavailable)?;
-    let tenant = TenantId::from_bytes(raw)
-        .map_err(|_| TenantAdministrationFailure::PersistenceUnavailable)?;
-    let slug_length = usize::from(
-        *bytes
-            .get(end)
-            .ok_or(TenantAdministrationFailure::PersistenceUnavailable)?,
-    );
-    let slug = std::str::from_utf8(
-        bytes
-            .get(end + 1..end + 1 + slug_length)
-            .ok_or(TenantAdministrationFailure::PersistenceUnavailable)?,
-    )
-    .map_err(|_| TenantAdministrationFailure::PersistenceUnavailable)?;
-    let display_start = end
-        .checked_add(1)
-        .and_then(|value| value.checked_add(slug_length))
-        .ok_or(TenantAdministrationFailure::PersistenceUnavailable)?;
-    let display_length = usize::from(
-        *bytes
-            .get(display_start)
-            .ok_or(TenantAdministrationFailure::PersistenceUnavailable)?,
-    );
-    let quota_start = display_start
-        .checked_add(1)
-        .and_then(|value| value.checked_add(display_length))
-        .and_then(|value| value.checked_add(8 + 8 + 4))
-        .ok_or(TenantAdministrationFailure::PersistenceUnavailable)?;
-    let mut resources = [0_u64; 11];
-    for (index, resource) in resources.iter_mut().enumerate() {
-        let offset = quota_start
-            .checked_add(
-                index
-                    .checked_mul(8)
-                    .ok_or(TenantAdministrationFailure::PersistenceUnavailable)?,
-            )
-            .ok_or(TenantAdministrationFailure::PersistenceUnavailable)?;
-        *resource = u64::from_be_bytes(
-            bytes
-                .get(offset..offset + 8)
-                .ok_or(TenantAdministrationFailure::PersistenceUnavailable)?
-                .try_into()
-                .map_err(|_| TenantAdministrationFailure::PersistenceUnavailable)?,
-        );
-    }
-    if resources.contains(&0) {
-        return Err(TenantAdministrationFailure::PersistenceUnavailable);
-    }
-    Ok(TenantRecord {
-        tenant,
-        slug,
-        resources,
-    })
-}
 fn encode_record(
     instance: positron_kernel::InstanceId,
     request: &TenantCreateRequest,
@@ -533,9 +530,9 @@ fn encode_record(
     let envelope_len =
         u16::try_from(envelope.len()).map_err(|_| TenantAdministrationFailure::InvalidInput)?;
     let mut encoded = Vec::with_capacity(
-        8 + 16 + 16 + 1 + slug.len() + 1 + display.len() + 8 + 4 + 88 + 1 + 2 + envelope.len(),
+        8 + 16 + 16 + 1 + slug.len() + 1 + display.len() + 8 + 4 + 88 + 1 + 8 + 2 + envelope.len(),
     );
-    encoded.extend_from_slice(&TENANT_RECORD_MAGIC);
+    encoded.extend_from_slice(&TENANT_RECORD_V2_MAGIC);
     encoded.extend_from_slice(&instance.to_bytes());
     encoded.extend_from_slice(&request.tenant.to_bytes());
     encoded.push(u8::try_from(slug.len()).map_err(|_| TenantAdministrationFailure::InvalidInput)?);
@@ -549,13 +546,16 @@ fn encode_record(
     for value in request.resources {
         encoded.extend_from_slice(&value.to_be_bytes());
     }
-    // Active lifecycle and initial policy generation are durable tenant state.
+    // Active lifecycle, policy generation, and independent lifecycle generation
+    // are durable tenant state.
     encoded.push(1);
+    encoded.extend_from_slice(&1_u64.to_be_bytes());
     encoded.extend_from_slice(&1_u64.to_be_bytes());
     encoded.extend_from_slice(&envelope_len.to_be_bytes());
     encoded.extend_from_slice(envelope);
     Ok(encoded)
 }
+
 fn validate_request(
     administrator: PrincipalId,
     request: &TenantCreateRequest,
@@ -584,27 +584,37 @@ fn replay_snapshot(
     let Some(receipt) = receipt_for(snapshot, request.idempotency)? else {
         return Ok(None);
     };
-    let generation = ResourceGeneration::new(
-        request
-            .expected
-            .get()
-            .checked_add(1)
-            .ok_or(TenantAdministrationFailure::InvalidInput)?,
-    )
-    .map_err(|_| TenantAdministrationFailure::InvalidInput)?;
-    if receipt.actor != request.actor.principal_id()
-        || receipt.tenant != request.tenant
-        || receipt.expected != request.expected
-        || receipt.generation != generation
-        || receipt.digest != request_digest(request)
-    {
-        return Err(TenantAdministrationFailure::IdempotencyConflict);
-    }
+    replay_receipt(
+        &receipt,
+        request.actor.principal_id(),
+        request.tenant,
+        request_digest(request),
+        legacy_request_digest(request, receipt.expected),
+    )?;
     Ok(Some(TenantCreation {
         tenant: receipt.tenant,
         generation: receipt.generation,
         audit_position: receipt.audit_position,
     }))
+}
+
+fn replay_receipt(
+    receipt: &Receipt,
+    actor: PrincipalId,
+    tenant: TenantId,
+    canonical_digest: [u8; 32],
+    legacy_digest: [u8; 32],
+) -> Result<(), TenantAdministrationFailure> {
+    if receipt.expected.get().checked_add(1) != Some(receipt.generation.get()) {
+        return Err(TenantAdministrationFailure::PersistenceUnavailable);
+    }
+    if receipt.actor != actor
+        || receipt.tenant != tenant
+        || (receipt.digest != canonical_digest && receipt.digest != legacy_digest)
+    {
+        return Err(TenantAdministrationFailure::IdempotencyConflict);
+    }
+    Ok(())
 }
 struct Receipt {
     actor: PrincipalId,
@@ -616,6 +626,7 @@ struct Receipt {
 }
 fn encode_receipt(
     request: &TenantCreateRequest,
+    prior_generation: ResourceGeneration,
     generation: ResourceGeneration,
     digest: [u8; 32],
 ) -> Vec<u8> {
@@ -624,7 +635,7 @@ fn encode_receipt(
     encoded.extend_from_slice(&request.idempotency.to_bytes());
     encoded.extend_from_slice(&request.actor.principal_id().to_bytes());
     encoded.extend_from_slice(&request.tenant.to_bytes());
-    encoded.extend_from_slice(&request.expected.get().to_be_bytes());
+    encoded.extend_from_slice(&prior_generation.get().to_be_bytes());
     encoded.extend_from_slice(&generation.get().to_be_bytes());
     encoded.extend_from_slice(&digest);
     encoded.extend_from_slice(&0_u64.to_be_bytes());
@@ -639,37 +650,47 @@ fn receipt_for(
             .object(identity)
             .map_err(map_catalog)?
             .ok_or(TenantAdministrationFailure::PersistenceUnavailable)?;
-        if bytes.starts_with(&TENANT_RECEIPT_MAGIC)
-            && bytes.len() == 112
-            && bytes.get(8..24) == Some(key.to_bytes().as_slice())
-        {
-            let actor = principal_at(bytes, 24)?;
-            let tenant = tenant_at(bytes, 40)?;
-            let expected = generation_at(bytes, 56)?;
-            let generation = generation_at(bytes, 64)?;
-            let digest: [u8; 32] = bytes
-                .get(72..104)
-                .ok_or(TenantAdministrationFailure::PersistenceUnavailable)?
-                .try_into()
-                .map_err(|_| TenantAdministrationFailure::PersistenceUnavailable)?;
-            let audit_position = u64::from_be_bytes(
-                bytes
-                    .get(104..112)
-                    .ok_or(TenantAdministrationFailure::PersistenceUnavailable)?
-                    .try_into()
-                    .map_err(|_| TenantAdministrationFailure::PersistenceUnavailable)?,
-            );
-            return Ok(Some(Receipt {
-                actor,
-                tenant,
-                expected,
-                generation,
-                digest,
-                audit_position,
-            }));
+        if let Some(receipt) = decode_receipt(bytes, key)? {
+            return Ok(Some(receipt));
         }
     }
     Ok(None)
+}
+
+fn decode_receipt(
+    bytes: &[u8],
+    key: AdministrativeIdempotencyKey,
+) -> Result<Option<Receipt>, TenantAdministrationFailure> {
+    if !bytes.starts_with(&TENANT_RECEIPT_MAGIC) {
+        return Ok(None);
+    }
+    if bytes.len() != 112 || bytes.get(8..24) != Some(key.to_bytes().as_slice()) {
+        return Err(TenantAdministrationFailure::PersistenceUnavailable);
+    }
+    let actor = principal_at(bytes, 24)?;
+    let tenant = tenant_at(bytes, 40)?;
+    let expected = generation_at(bytes, 56)?;
+    let generation = generation_at(bytes, 64)?;
+    let digest: [u8; 32] = bytes
+        .get(72..104)
+        .ok_or(TenantAdministrationFailure::PersistenceUnavailable)?
+        .try_into()
+        .map_err(|_| TenantAdministrationFailure::PersistenceUnavailable)?;
+    let audit_position = u64::from_be_bytes(
+        bytes
+            .get(104..112)
+            .ok_or(TenantAdministrationFailure::PersistenceUnavailable)?
+            .try_into()
+            .map_err(|_| TenantAdministrationFailure::PersistenceUnavailable)?,
+    );
+    Ok(Some(Receipt {
+        actor,
+        tenant,
+        expected,
+        generation,
+        digest,
+        audit_position,
+    }))
 }
 fn principal_at(bytes: &[u8], at: usize) -> Result<PrincipalId, TenantAdministrationFailure> {
     PrincipalId::from_bytes(
@@ -715,12 +736,34 @@ fn request_digest(request: &TenantCreateRequest) -> [u8; 32] {
     for resource in request.resources {
         hasher.update(resource.to_be_bytes());
     }
-    hasher.update(request.expected.get().to_be_bytes());
+    hasher.update(request.idempotency.to_bytes());
+    hasher.finalize().into()
+}
+
+/// Verifies receipts and prepared transactions created by the retired
+/// creation precondition without making that precondition part of the current
+/// request contract.
+fn legacy_request_digest(
+    request: &TenantCreateRequest,
+    expected: ResourceGeneration,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(request.actor.principal_id().to_bytes());
+    hasher.update(request.tenant.to_bytes());
+    hasher.update(request.slug.as_str().as_bytes());
+    hasher.update(request.display_name.as_bytes());
+    hasher.update(request.retention_seconds.to_be_bytes());
+    hasher.update(request.weight.to_be_bytes());
+    for resource in request.resources {
+        hasher.update(resource.to_be_bytes());
+    }
+    hasher.update(expected.get().to_be_bytes());
     hasher.update(request.idempotency.to_bytes());
     hasher.finalize().into()
 }
 fn encode_audit(
     request: &TenantCreateRequest,
+    prior_generation: ResourceGeneration,
     generation: ResourceGeneration,
     digest: [u8; 32],
 ) -> Vec<u8> {
@@ -729,7 +772,7 @@ fn encode_audit(
     audit.extend_from_slice(&request.idempotency.to_bytes());
     audit.extend_from_slice(&request.actor.principal_id().to_bytes());
     audit.extend_from_slice(&request.tenant.to_bytes());
-    audit.extend_from_slice(&request.expected.get().to_be_bytes());
+    audit.extend_from_slice(&prior_generation.get().to_be_bytes());
     audit.extend_from_slice(&generation.get().to_be_bytes());
     audit.extend_from_slice(&digest);
     audit
@@ -738,5 +781,69 @@ fn map_catalog(failure: positron_kernel::CatalogFailure) -> TenantAdministration
     match failure.code() {
         CatalogFailureCode::IdempotencyConflict => TenantAdministrationFailure::IdempotencyConflict,
         _ => TenantAdministrationFailure::PersistenceUnavailable,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn literal_v1_creation_receipt_replays_without_the_retired_precondition() {
+        let actor = PrincipalId::from_bytes([0x41; 16]).expect("principal");
+        let tenant = TenantId::from_bytes([0x42; 16]).expect("tenant");
+        let key = AdministrativeIdempotencyKey::new([0x43; 16]).expect("idempotency");
+        let expected = ResourceGeneration::new(7).expect("prior generation");
+        let generation = ResourceGeneration::new(8).expect("successor generation");
+        let legacy = digest(actor, tenant, "legacy", "Legacy tenant", key, Some(expected));
+        let canonical = digest(actor, tenant, "legacy", "Legacy tenant", key, None);
+
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(&TENANT_RECEIPT_MAGIC);
+        encoded.extend_from_slice(&key.to_bytes());
+        encoded.extend_from_slice(&actor.to_bytes());
+        encoded.extend_from_slice(&tenant.to_bytes());
+        encoded.extend_from_slice(&expected.get().to_be_bytes());
+        encoded.extend_from_slice(&generation.get().to_be_bytes());
+        encoded.extend_from_slice(&legacy);
+        encoded.extend_from_slice(&17_u64.to_be_bytes());
+
+        let receipt = decode_receipt(&encoded, key)
+            .expect("historical receipt decodes")
+            .expect("matching receipt");
+        assert_eq!(receipt.generation, generation);
+        assert_eq!(receipt.audit_position, 17);
+        assert!(replay_receipt(&receipt, actor, tenant, canonical, legacy).is_ok());
+
+        let changed_legacy = digest(actor, tenant, "legacy", "Changed tenant", key, Some(expected));
+        assert_eq!(
+            replay_receipt(&receipt, actor, tenant, canonical, changed_legacy),
+            Err(TenantAdministrationFailure::IdempotencyConflict)
+        );
+    }
+
+    fn digest(
+        actor: PrincipalId,
+        tenant: TenantId,
+        slug: &str,
+        display_name: &str,
+        key: AdministrativeIdempotencyKey,
+        expected: Option<ResourceGeneration>,
+    ) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(actor.to_bytes());
+        hasher.update(tenant.to_bytes());
+        hasher.update(slug.as_bytes());
+        hasher.update(display_name.as_bytes());
+        hasher.update(2_592_000_u64.to_be_bytes());
+        hasher.update(1_u32.to_be_bytes());
+        for resource in [1_u64; 11] {
+            hasher.update(resource.to_be_bytes());
+        }
+        if let Some(expected) = expected {
+            hasher.update(expected.get().to_be_bytes());
+        }
+        hasher.update(key.to_bytes());
+        hasher.finalize().into()
     }
 }

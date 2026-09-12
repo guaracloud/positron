@@ -188,7 +188,6 @@ fn epoch_two_prepared_tenant_creation_restarts_without_downgrade() -> Result<(),
             2_592_000,
             1,
             [1; 11],
-            ResourceGeneration::new(1).expect("generation"),
             key,
         )
     })
@@ -215,7 +214,6 @@ fn epoch_two_prepared_tenant_creation_restarts_without_downgrade() -> Result<(),
         2_592_000,
         1,
         [1; 11],
-        ResourceGeneration::new(1)?,
         key,
     );
     assert!(changed.is_err());
@@ -232,7 +230,6 @@ fn epoch_two_prepared_tenant_creation_restarts_without_downgrade() -> Result<(),
         2_592_000,
         1,
         [1; 11],
-        ResourceGeneration::new(1)?,
         key,
     )?;
     assert_eq!(resumed.tenant_id(), tenant);

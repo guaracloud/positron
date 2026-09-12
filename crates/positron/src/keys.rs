@@ -166,14 +166,22 @@ fn parse(
                 .into(),
         }
     };
+    let target_tenant = options.remove("--target-tenant");
     let request = match action {
         KeyAction::Unspecified => return Err("invalid key command"),
-        KeyAction::List => ApiKeyRequest::list(),
-        KeyAction::ScopeInspect => ApiKeyRequest::inspect(
-            options
+        KeyAction::List => match target_tenant {
+            Some(tenant) => ApiKeyRequest::list_for_tenant(tenant),
+            None => ApiKeyRequest::list(),
+        },
+        KeyAction::ScopeInspect => {
+            let principal = options
                 .remove("--principal")
-                .ok_or("--principal is required")?,
-        ),
+                .ok_or("--principal is required")?;
+            match target_tenant {
+                Some(tenant) => ApiKeyRequest::inspect_for_tenant(principal, tenant),
+                None => ApiKeyRequest::inspect(principal),
+            }
+        },
         KeyAction::Create | KeyAction::Rotate | KeyAction::Revoke => {
             let expected = options
                 .remove("--expected-generation")
@@ -195,7 +203,7 @@ fn parse(
                     .map(|value| value.parse())
                     .transpose()
                     .map_err(|_| "invalid expiry")?;
-                if let Some(target_tenant) = options.remove("--target-tenant") {
+                if let Some(target_tenant) = target_tenant {
                     ApiKeyRequest::create_for_tenant(
                         scope,
                         target_tenant,
@@ -207,14 +215,19 @@ fn parse(
                     ApiKeyRequest::create(scope, expiry, expected, idempotency)
                 }
             } else {
-                ApiKeyRequest::mutation(
-                    action,
-                    options
-                        .remove("--principal")
-                        .ok_or("--principal is required")?,
-                    expected,
-                    idempotency,
-                )
+                let principal = options
+                    .remove("--principal")
+                    .ok_or("--principal is required")?;
+                match target_tenant {
+                    Some(tenant) => ApiKeyRequest::mutation_for_tenant(
+                        action,
+                        principal,
+                        tenant,
+                        expected,
+                        idempotency,
+                    ),
+                    None => ApiKeyRequest::mutation(action, principal, expected, idempotency),
+                }
                 .map_err(|_| "invalid mutation")?
             }
         },
@@ -251,7 +264,6 @@ mod tests {
         for command in [
             "list --endpoint 127.0.0.1:8080 --credential-stdin --secret sensitive",
             "list --endpoint 127.0.0.1:8080 --credential-stdin --scope query",
-            "list --endpoint 127.0.0.1:8080 --credential-stdin --target-tenant 22222222-2222-2222-2222-222222222222",
             "list --endpoint 192.0.2.1:8080 --credential-stdin",
             "list --endpoint 127.0.0.1:8080",
         ] {
@@ -294,6 +306,30 @@ mod tests {
 
         assert_eq!(
             request.target_tenant(),
+            Some("22222222-2222-2222-2222-222222222222")
+        );
+    }
+
+    #[test]
+    fn key_lifecycle_parses_an_explicit_administrative_target_tenant() {
+        let (_, list) = parse(
+            "list --endpoint 127.0.0.1:8080 --credential-stdin --allow-plaintext --target-tenant 22222222-2222-2222-2222-222222222222"
+                .split_whitespace()
+                .map(ToOwned::to_owned),
+        )
+        .expect("target tenant list parses");
+        assert_eq!(
+            list.target_tenant(),
+            Some("22222222-2222-2222-2222-222222222222")
+        );
+        let (_, rotate) = parse(
+            "rotate --endpoint 127.0.0.1:8080 --credential-stdin --allow-plaintext --target-tenant 22222222-2222-2222-2222-222222222222 --principal 33333333-3333-3333-3333-333333333333 --expected-generation 2 --idempotency-key 01010101-0101-0101-0101-010101010101"
+                .split_whitespace()
+                .map(ToOwned::to_owned),
+        )
+        .expect("target tenant rotation parses");
+        assert_eq!(
+            rotate.target_tenant(),
             Some("22222222-2222-2222-2222-222222222222")
         );
     }

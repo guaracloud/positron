@@ -99,6 +99,16 @@ fn tenant_quota_checked_decode_validates_once_and_exposes_all_runtime_parts() {
 }
 
 #[test]
+fn tenant_quota_decode_uses_the_exported_canonical_request_bound() {
+    let mut body = br#"{"tenant":"22222222-2222-2222-2222-222222222222","expected_generation":1,"idempotency_key":"01010101-0101-0101-0101-010101010101","weight":7,"memory_bytes":11,"queue_slots":12,"task_slots":13,"buffer_cache_bytes":14,"batch_items":15,"lease_slots":16,"retry_slots":17,"io_permits":18,"cpu_work_units":19,"file_descriptors":20,"disk_headroom_bytes":21}"#.to_vec();
+    assert!(body.len() < positron_api::tenant_quotas::MAX_REQUEST_BYTES);
+    body.resize(positron_api::tenant_quotas::MAX_REQUEST_BYTES, b' ');
+    assert!(TenantQuotaUpdateRequest::decode(&body).is_ok());
+    body.push(b' ');
+    assert!(TenantQuotaUpdateRequest::decode(&body).is_err());
+}
+
+#[test]
 fn tenant_quota_client_preserves_only_published_failure_codes()
 -> Result<(), Box<dyn std::error::Error>> {
     use positron_api::tenant_quotas::TenantQuotaServiceClientFailure as Failure;

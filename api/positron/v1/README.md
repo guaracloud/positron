@@ -26,8 +26,9 @@ introduce SDK publication or a deferred product capability.
 `POST /v1/api-keys:manage`. The body is limited to 1024 bytes; responses are
 limited to 64 KiB. JSON uses snake_case action and scope names. Unknown fields,
 duplicate fields, malformed identifiers, and action-inapplicable fields are
-rejected. Authorization is `Bearer` metadata. `target_tenant` is an optional,
-create-only control-plane target selected by a System Administration principal;
+rejected. Authorization is `Bearer` metadata. `target_tenant` is an optional
+control-plane target for an API-key lifecycle action selected by a System
+Administration principal;
 it never chooses or impersonates data-plane authority. Only System
 Administration may manage keys.
 
@@ -36,7 +37,8 @@ optional `expires_at_unix_seconds` measured against the persisted Lifecycle
 Clock. It may name `target_tenant` to provision a tenant-bound principal for
 that immutable Tenant ID; otherwise it retains the authenticated legacy
 administrative create behavior. Rotate and revoke require `principal`, `expected_generation`, and
-`idempotency_key`. List has no other fields; scope_inspect requires `principal`.
+`idempotency_key`; list and scope_inspect may also name `target_tenant`, while
+scope_inspect requires `principal`.
 Identifiers use canonical lowercase UUID text. List returns only redacted
 descriptors. A create or rotate retry returns the original principal without a
 secret; a lost first secret requires a new rotation. HTTP failures use stable
@@ -52,8 +54,9 @@ be combined with a trust reference. Supply the bearer through a pipe from a secr
 are never accepted in arguments or environment variables. Mutations require
 `--expected-generation N --idempotency-key UUID`; create also requires
 `--scope ingest|query|tenant-administration` and accepts optional
-`--target-tenant UUID`, while rotate/revoke/scope-inspect
-require `--principal UUID`. `--expires-at N` is optional for create. A new
+`--target-tenant UUID`; the same target is accepted for list, rotate, revoke,
+and scope-inspect, while rotate/revoke/scope-inspect require `--principal UUID`.
+`--expires-at N` is optional for create. A new
 secret is emitted once to stdout; protect that output as credential material.
 Public plaintext requires the server's configuration-file-only
 `listener.api_transport = "plaintext"` opt-out and the client's explicit

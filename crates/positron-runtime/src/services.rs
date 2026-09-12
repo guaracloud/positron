@@ -1,8 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use positron_governance::{
-    AuthorizedContext, CompatibilityHints, Identity, IngestPolicyServingSnapshot,
-    PresentedCredential, RequestedIntent,
+    AuthorizedContext, CompatibilityHints, Identity, PresentedCredential, RequestedIntent,
 };
 use positron_ingest::{
     AuthenticatedLokiPushRequest, AuthenticatedOtlpLogsRequest, AuthenticatedOtlpTracesRequest,
@@ -22,6 +21,7 @@ mod policy;
 mod query;
 mod schema_bootstrap;
 mod schema_maintenance;
+pub(crate) mod tenant_quotas;
 
 pub(super) fn tenant_segment_key(
     instance: &InitializedInstance,
@@ -37,6 +37,15 @@ pub(super) fn tenant_segment_key(
         .map_err(|_| ServiceFailure::KeyUnavailable)
 }
 
+pub(super) fn context_tenant(
+    context: positron_governance::AuthorizedContext,
+) -> Result<positron_domain::identity::TenantId, ServiceFailure> {
+    context
+        .tenant_attribution()
+        .map(|attribution| attribution.tenant_id())
+        .ok_or(ServiceFailure::Unauthorized)
+}
+
 pub use failure::ServiceFailure;
 #[cfg(test)]
 use failure::map_query_failure_code;
@@ -50,7 +59,6 @@ mod tests;
 
 #[derive(Clone)]
 pub struct ServiceHandle {
-    ingest_policy: IngestPolicyServingSnapshot,
     schema_sessions: TenantSchemaRegistry,
     shutdown_schema_capacity: Arc<Mutex<Option<TransferredResourceReservation>>>,
     #[cfg(test)]
@@ -102,7 +110,6 @@ impl ServiceHandle {
         instance: Arc<InitializedInstance>,
         cancellation: Option<&crate::TaskCancellation>,
     ) -> Result<Self, ServiceFailure> {
-        let ingest_policy = instance.ingest_policy.serving();
         let fallback = crate::TaskCancellation::new();
         let cancellation = cancellation.unwrap_or(&fallback);
         let recovered = schema_bootstrap::recover(&instance, cancellation)?;
@@ -116,7 +123,6 @@ impl ServiceHandle {
             schema_maintenance::publish_quiescent_checkpoint(&instance, checkpoint)?;
         }
         Ok(Self {
-            ingest_policy,
             schema_sessions: recovered.registry,
             shutdown_schema_capacity: Arc::new(Mutex::new(None)),
             #[cfg(test)]

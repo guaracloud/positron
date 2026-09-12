@@ -5,12 +5,12 @@ pub use crate::api_keys::protobuf::{
     TenantQuotaUpdateRequest as WireRequest, TenantQuotaUpdateResponse,
 };
 
-pub const HTTP_PATH: &str = "/v1/tenant-quotas:update";
-
 mod client {
     include!(concat!(env!("OUT_DIR"), "/tenant_quota_service_client.rs"));
 }
-pub use client::{TenantQuotaServiceClient, TenantQuotaServiceClientFailure};
+pub use client::{MAX_REQUEST_BYTES, TenantQuotaServiceClient, TenantQuotaServiceClientFailure};
+
+pub const HTTP_PATH: &str = "/v1/tenant-quotas:update";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TenantQuotaWireFailure;

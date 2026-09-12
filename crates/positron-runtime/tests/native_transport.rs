@@ -9,6 +9,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, any_value};
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+use positron_domain::identity::{TenantId, TenantSlug};
+use positron_governance::{
+    AdministrativeIdempotencyKey, CompatibilityHints, PresentedCredential, RequestedIntent,
+    ResourceGeneration,
+};
 use positron_kernel::MountQualification;
 use positron_query::QueryBudget;
 use positron_runtime::{
@@ -619,6 +624,334 @@ fn configured_tls_api_listener_serves_an_authenticated_administration_request()
         &positron_api::api_keys::ApiKeyRequest::list(),
     );
     assert!(invalid_trust.is_err());
+    assert_eq!(
+        process.shutdown(ShutdownTrigger::FirstSignal),
+        positron_runtime::ExitOutcome::Graceful
+    );
+    Ok(())
+}
+
+#[test]
+fn api_client_manages_a_tenant_bound_key_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
+    let _guard = live_test_guard();
+    let roots = TestRoots::new("tenant-key-client")?;
+    let paths = roots.paths()?;
+    drop(InstanceBootstrap::initialize(
+        &paths,
+        positron_runtime::InitializationPlan::non_interactive(),
+    )?);
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let initialized = InstanceBootstrap::reopen(&paths)?;
+    let system = initialized.attribute(
+        PresentedCredential::parse(claim.secret())?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let tenant = TenantId::from_bytes([0x88; 16])?;
+    initialized
+        .create_tenant(
+            system,
+            tenant,
+            TenantSlug::parse_canonical("client-key-tenant")?,
+            "Client key tenant",
+            2_592_000,
+            1,
+            [
+                32_000_000, 32, 32, 5_000_000, 2_048, 32, 32, 32, 32, 32, 2_000_000,
+            ],
+            ResourceGeneration::new(1)?,
+            AdministrativeIdempotencyKey::new([0x89; 16])?,
+        )
+        .map_err(|failure| format!("tenant creation: {failure:?}"))?;
+    drop(initialized);
+
+    let host = NativeHost::new(bindings(&roots, "tenant-key-client")?);
+    let process = ApplicationRuntime::start(
+        ServeConfiguration::new(paths, InitializationMode::ExistingOnly),
+        HostInputs::new(&host, &host),
+    )?;
+    let api = address(
+        &process.bound_endpoints(),
+        positron_runtime::ListenerRole::Api,
+    )?;
+    let client = positron_api::api_keys::ApiKeyServiceClient::new(
+        positron_api::api_keys::ApiKeyTransport::PlaintextOptOut { endpoint: api },
+    )?;
+    let target = positron_api::api_keys::ApiKeyRequest::create_for_tenant(
+        positron_api::api_keys::KeyScope::Ingest,
+        tenant.to_canonical_text(),
+        None,
+        1,
+        "88888888-8888-8888-8888-88888888888a".to_owned(),
+    );
+    let mut created = client
+        .manage(claim.secret(), &target)
+        .map_err(|failure| format!("target create: {failure:?}"))?;
+    let principal = created.principal.clone().ok_or("created principal")?;
+    let secret = created.secret.take().ok_or("one-time tenant secret")?;
+    let replay = client
+        .manage(claim.secret(), &target)
+        .map_err(|failure| format!("target replay: {failure:?}"))?;
+    assert_eq!(replay.principal.as_deref(), Some(principal.as_str()));
+    assert!(
+        replay.secret.is_none(),
+        "replay must never redisplay a secret"
+    );
+    assert!(
+        client
+            .manage(
+                claim.secret(),
+                &positron_api::api_keys::ApiKeyRequest::create_for_tenant(
+                    positron_api::api_keys::KeyScope::Query,
+                    "99999999-9999-9999-9999-999999999999".to_owned(),
+                    None,
+                    1,
+                    "99999999-9999-9999-9999-99999999999a".to_owned(),
+                ),
+            )
+            .is_err(),
+        "an unknown tenant must not create an orphan credential"
+    );
+    let default_created = client
+        .manage(
+            claim.secret(),
+            &positron_api::api_keys::ApiKeyRequest::create(
+                positron_api::api_keys::KeyScope::TenantAdministration,
+                None,
+                1,
+                "88888888-8888-8888-8888-88888888888b".to_owned(),
+            ),
+        )
+        .map_err(|failure| format!("legacy default create: {failure:?}"))?;
+    assert!(
+        default_created.secret.is_some(),
+        "omitting target_tenant retains the default credential lifecycle"
+    );
+    let replay_after_unrelated_mutation = client
+        .manage(claim.secret(), &target)
+        .map_err(|failure| format!("target replay after mutation: {failure:?}"))?;
+    assert_eq!(
+        replay_after_unrelated_mutation.principal.as_deref(),
+        Some(principal.as_str())
+    );
+    assert!(
+        replay_after_unrelated_mutation.secret.is_none(),
+        "an exact retry after unrelated mutation must not redisplay the tenant secret"
+    );
+    let listed = client
+        .manage(
+            claim.secret(),
+            &positron_api::api_keys::ApiKeyRequest::list_for_tenant(tenant.to_canonical_text()),
+        )
+        .map_err(|failure| format!("target list: {failure:?}"))?;
+    assert_eq!(listed.keys.len(), 1);
+    assert_eq!(listed.keys[0].principal, principal);
+    assert!(listed.keys[0].active);
+    assert_eq!(listed.keys[0].generation, 2);
+    let rotation = positron_api::api_keys::ApiKeyRequest::mutation_for_tenant(
+        positron_api::api_keys::KeyAction::Rotate,
+        principal.clone(),
+        tenant.to_canonical_text(),
+        2,
+        "88888888-8888-8888-8888-88888888888c".to_owned(),
+    )?;
+    let mut rotated = client
+        .manage(claim.secret(), &rotation)
+        .map_err(|failure| format!("target rotate: {failure:?}"))?;
+    let successor = rotated.principal.clone().ok_or("rotated principal")?;
+    let successor_secret = rotated.secret.take().ok_or("rotated secret")?;
+    let rotation_replay = client
+        .manage(claim.secret(), &rotation)
+        .map_err(|failure| format!("target rotation replay: {failure:?}"))?;
+    assert_eq!(rotation_replay.principal.as_deref(), Some(successor.as_str()));
+    assert!(rotation_replay.secret.is_none());
+    client
+        .manage(
+            claim.secret(),
+            &positron_api::api_keys::ApiKeyRequest::mutation_for_tenant(
+                positron_api::api_keys::KeyAction::Revoke,
+                principal.clone(),
+                tenant.to_canonical_text(),
+                3,
+                "88888888-8888-8888-8888-88888888888d".to_owned(),
+            )?,
+        )
+        .map_err(|failure| format!("target revoke: {failure:?}"))?;
+    let after_revoke = client
+        .manage(
+            claim.secret(),
+            &positron_api::api_keys::ApiKeyRequest::list_for_tenant(tenant.to_canonical_text()),
+        )
+        .map_err(|failure| format!("target list after revoke: {failure:?}"))?;
+    assert_eq!(after_revoke.keys.len(), 2);
+    assert!(after_revoke.keys.iter().any(|key| {
+        key.principal == principal && !key.active && key.generation == 4
+    }));
+    assert!(after_revoke.keys.iter().any(|key| {
+        key.principal == successor && key.active && key.generation == 4
+    }));
+    assert_status(
+        http(
+            address(
+                &process.bound_endpoints(),
+                positron_runtime::ListenerRole::OtlpHttp,
+            )?,
+            "POST",
+            "/v1/logs",
+            &[
+                ("Authorization", &format!("Bearer {secret}")),
+                ("Content-Type", "application/x-protobuf"),
+            ],
+            &otlp_body("tenant-key-revoked"),
+        )?,
+        401,
+    );
+    assert_status(
+        http(
+            address(
+                &process.bound_endpoints(),
+                positron_runtime::ListenerRole::OtlpHttp,
+            )?,
+            "POST",
+            "/v1/logs",
+            &[
+                ("Authorization", &format!("Bearer {successor_secret}")),
+                ("Content-Type", "application/x-protobuf"),
+            ],
+            &otlp_body("tenant-key-client"),
+        )?,
+        200,
+    );
+    assert_eq!(
+        process.shutdown(ShutdownTrigger::FirstSignal),
+        positron_runtime::ExitOutcome::Graceful
+    );
+    Ok(())
+}
+
+#[test]
+fn tenant_quota_client_updates_a_bound_tenant_with_replay_and_redacted_stale_details()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _guard = live_test_guard();
+    let roots = TestRoots::new("tenant-quota-client")?;
+    let paths = roots.paths()?;
+    drop(InstanceBootstrap::initialize(
+        &paths,
+        positron_runtime::InitializationPlan::non_interactive(),
+    )?);
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let initialized = InstanceBootstrap::reopen(&paths)?;
+    let system = initialized.attribute(
+        PresentedCredential::parse(claim.secret())?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let tenant = TenantId::from_bytes([0x98; 16])?;
+    initialized.create_tenant(
+        system,
+        tenant,
+        TenantSlug::parse_canonical("client-quota-tenant")?,
+        "Client quota tenant",
+        2_592_000,
+        1,
+        [
+            32_000_000, 32, 32, 5_000_000, 2_048, 32, 32, 32, 32, 32, 2_000_000,
+        ],
+        ResourceGeneration::new(1)?,
+        AdministrativeIdempotencyKey::new([0x99; 16])?,
+    )?;
+    let administrator = initialized.create_api_key_for_tenant(
+        system,
+        tenant,
+        positron_domain::identity::Scope::TenantAdministration,
+        None,
+        ResourceGeneration::new(1)?,
+        AdministrativeIdempotencyKey::new([0x9a; 16])?,
+    )?;
+    let administrator_secret = administrator
+        .secret()
+        .ok_or("tenant administration secret")?
+        .to_owned();
+    drop(initialized);
+
+    let host = NativeHost::new(bindings(&roots, "tenant-quota-client")?);
+    let process = ApplicationRuntime::start(
+        ServeConfiguration::new(paths, InitializationMode::ExistingOnly),
+        HostInputs::new(&host, &host),
+    )?;
+    let api = address(
+        &process.bound_endpoints(),
+        positron_runtime::ListenerRole::Api,
+    )?;
+    let client = positron_api::tenant_quotas::TenantQuotaServiceClient::new(
+        positron_api::tenant_quotas::TenantQuotaTransport::PlaintextOptOut { endpoint: api },
+    )?;
+    let resources = positron_api::tenant_quotas::TenantQuotaResources {
+        memory_bytes: 3,
+        queue_slots: 3,
+        task_slots: 3,
+        buffer_cache_bytes: 3,
+        batch_items: 3,
+        lease_slots: 3,
+        retry_slots: 3,
+        io_permits: 3,
+        cpu_work_units: 3,
+        file_descriptors: 3,
+        disk_headroom_bytes: 3,
+    };
+    let request = positron_api::tenant_quotas::TenantQuotaUpdateRequest::new(
+        tenant.to_canonical_text(),
+        1,
+        "98989898-9898-9898-9898-98989898989a".to_owned(),
+        1,
+        resources,
+    );
+    let created = client
+        .update(&administrator_secret, &request)
+        .map_err(|failure| format!("quota update: {failure:?}"))?;
+    assert_eq!(created.resource_generation, 2);
+    assert_eq!(
+        client
+            .update(&administrator_secret, &request)
+            .map_err(|failure| format!("quota replay: {failure:?}"))?
+            .resource_generation,
+        2
+    );
+    assert!(matches!(
+        client.update(
+            &administrator_secret,
+            &positron_api::tenant_quotas::TenantQuotaUpdateRequest::new(
+                tenant.to_canonical_text(),
+                1,
+                "98989898-9898-9898-9898-98989898989a".to_owned(),
+                1,
+                positron_api::tenant_quotas::TenantQuotaResources {
+                    memory_bytes: 4,
+                    ..resources
+                },
+            ),
+        ),
+        Err(positron_api::tenant_quotas::TenantQuotaServiceClientFailure::IdempotencyConflict)
+    ));
+    assert!(matches!(
+        client.update(
+            &administrator_secret,
+            &positron_api::tenant_quotas::TenantQuotaUpdateRequest::new(
+                tenant.to_canonical_text(),
+                1,
+                "98989898-9898-9898-9898-98989898989b".to_owned(),
+                1,
+                positron_api::tenant_quotas::TenantQuotaResources {
+                    memory_bytes: 4,
+                    ..resources
+                },
+            ),
+        ),
+        Err(positron_api::tenant_quotas::TenantQuotaServiceClientFailure::StaleGeneration {
+            resource_generation: 2,
+            ref semantic_diff,
+        }) if semantic_diff == "memory_bytes"
+    ));
     assert_eq!(
         process.shutdown(ShutdownTrigger::FirstSignal),
         positron_runtime::ExitOutcome::Graceful

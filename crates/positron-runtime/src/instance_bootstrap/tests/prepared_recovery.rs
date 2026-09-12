@@ -2,12 +2,315 @@ use std::error::Error;
 use std::fs;
 
 use crate::{BootstrapFailureCode, InitializationPlan, InstanceBootstrap};
-use positron_domain::identity::Scope;
+use positron_domain::identity::{Scope, TenantId, TenantSlug};
 use positron_governance::{AdministrativeIdempotencyKey, ResourceGeneration};
 use positron_governance::{CompatibilityHints, PresentedCredential, RequestedIntent};
-use positron_kernel::{CatalogPublicationFault, with_catalog_publication_fault_after};
+use positron_kernel::{
+    Catalog, CatalogPublicationFault, ResourceAmounts, ResourceDimension, WorkClaim, WorkKind,
+    with_catalog_publication_fault_after,
+};
 
 use super::initialization::Roots;
+
+#[test]
+fn pre_marker_tenant_creation_is_invisible_then_resumes_its_prepared_envelope()
+-> Result<(), Box<dyn Error>> {
+    let roots = Roots::new()?;
+    let paths = roots.paths().map_err(|code| format!("paths: {code:?}"))?;
+    drop(InstanceBootstrap::initialize(
+        &paths,
+        InitializationPlan::non_interactive(),
+    )?);
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    let administrator = || {
+        instance.attribute(
+            PresentedCredential::parse(claim.secret()).expect("claim syntax"),
+            RequestedIntent::SystemAdministration,
+            CompatibilityHints::none(),
+        )
+    };
+    let tenant = TenantId::from_bytes([0x61; 16])?;
+    let idempotency = AdministrativeIdempotencyKey::new([0x62; 16])?;
+    let predecessor = instance.catalog_generation();
+    let audit_before = instance.governance_audit_for_test()?;
+    let failed =
+        with_catalog_publication_fault_after(CatalogPublicationFault::SynchronizeCommit, 0, || {
+            instance.create_tenant(
+                administrator().expect("administrator"),
+                tenant,
+                TenantSlug::parse_canonical("prepared-tenant").expect("tenant slug"),
+                "Prepared tenant",
+                2_592_000,
+                1,
+                [1; 11],
+                idempotency,
+            )
+        })
+        .expect_err("pre-marker tenant creation must not acknowledge a tenant");
+    assert_eq!(failed.code(), BootstrapFailureCode::CatalogUnavailable);
+    assert_eq!(instance.catalog_generation(), predecessor);
+    assert_eq!(instance.governance_audit_for_test()?, audit_before);
+    assert!(
+        instance
+            ._authority
+            .governor()
+            .reserve(WorkClaim::tenant(
+                tenant,
+                WorkKind::Ingest,
+                ResourceAmounts::only(ResourceDimension::MemoryBytes, 1)?,
+            )?)
+            .is_err(),
+        "a failed creation must not leave live tenant admission"
+    );
+    let prepared_manifest = roots
+        .data
+        .join("catalog/staging/62626262626262626262626262626262/prepared.manifest");
+    let staged_envelope_commit = fs::read(&prepared_manifest)?;
+    assert!(
+        !staged_envelope_commit.is_empty(),
+        "the failed creation retains encrypted transaction-owned evidence"
+    );
+    drop(instance);
+
+    let recovered = InstanceBootstrap::reopen(&paths)?;
+    let administrator = || {
+        recovered.attribute(
+            PresentedCredential::parse(claim.secret()).expect("claim syntax"),
+            RequestedIntent::SystemAdministration,
+            CompatibilityHints::none(),
+        )
+    };
+    let changed = recovered
+        .create_tenant(
+            administrator()?,
+            tenant,
+            TenantSlug::parse_canonical("prepared-tenant")?,
+            "Changed tenant",
+            2_592_000,
+            1,
+            [1; 11],
+            idempotency,
+        )
+        .expect_err("a changed request must not claim the prepared tenant transaction");
+    assert_eq!(
+        changed.code(),
+        BootstrapFailureCode::ApiKeyIdempotencyConflict
+    );
+    assert_eq!(recovered.catalog_generation(), predecessor);
+    assert_eq!(recovered.governance_audit_for_test()?, audit_before);
+
+    let resumed = recovered.create_tenant(
+        administrator()?,
+        tenant,
+        TenantSlug::parse_canonical("prepared-tenant")?,
+        "Prepared tenant",
+        2_592_000,
+        1,
+        [1; 11],
+        idempotency,
+    )?;
+    assert_eq!(resumed.tenant_id(), tenant);
+    assert_ne!(resumed.audit_position(), 0);
+    assert_eq!(
+        fs::read(&prepared_manifest)?,
+        staged_envelope_commit,
+        "the retry must publish the exact staged envelope proposal without replacement entropy"
+    );
+    let catalog = Catalog::open(
+        &recovered._authority,
+        recovered.instance,
+        recovered.key.catalog_secret(recovered.instance)?,
+    )?;
+    let snapshot = catalog.pin()?;
+    assert!(snapshot.number() > predecessor);
+    assert!(
+        snapshot.object_identities().into_iter().any(|identity| {
+            snapshot
+                .object(identity)
+                .ok()
+                .flatten()
+                .is_some_and(|object| {
+                    object.starts_with(b"POSTNR02")
+                        && object.windows(8).any(|window| window == b"POSTKE01")
+                })
+        }),
+        "the resumed catalog generation contains the tenant's staged KEK envelope"
+    );
+    let admission = recovered._authority.governor().reserve(WorkClaim::tenant(
+        tenant,
+        WorkKind::Ingest,
+        ResourceAmounts::only(ResourceDimension::MemoryBytes, 1)?,
+    )?)?;
+    drop(admission);
+    Ok(())
+}
+
+#[test]
+fn tenant_scoped_actor_cannot_claim_a_prepared_tenant_creation_idempotency_key()
+-> Result<(), Box<dyn Error>> {
+    let roots = Roots::new()?;
+    let paths = roots.paths().map_err(|code| format!("paths: {code:?}"))?;
+    drop(InstanceBootstrap::initialize(
+        &paths,
+        InitializationPlan::non_interactive(),
+    )?);
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    let administrator = || {
+        instance.attribute(
+            PresentedCredential::parse(claim.secret()).expect("claim syntax"),
+            RequestedIntent::SystemAdministration,
+            CompatibilityHints::none(),
+        )
+    };
+    let query_key = instance.create_api_key(
+        administrator()?,
+        Scope::Query,
+        None,
+        ResourceGeneration::new(1)?,
+        AdministrativeIdempotencyKey::new([0x63; 16])?,
+    )?;
+    let query_secret = query_key.secret().ok_or("one-time query key")?.to_owned();
+    let tenant = TenantId::from_bytes([0x64; 16])?;
+    let idempotency = AdministrativeIdempotencyKey::new([0x65; 16])?;
+    with_catalog_publication_fault_after(CatalogPublicationFault::SynchronizeCommit, 0, || {
+        instance.create_tenant(
+            administrator().expect("administrator"),
+            tenant,
+            TenantSlug::parse_canonical("actor-bound-tenant").expect("tenant slug"),
+            "Actor-bound tenant",
+            2_592_000,
+            1,
+            [1; 11],
+            idempotency,
+        )
+    })
+    .expect_err("pre-marker tenant creation must leave a prepared transaction");
+    drop(instance);
+
+    let recovered = InstanceBootstrap::reopen(&paths)?;
+    let query_actor = recovered.attribute(
+        PresentedCredential::parse(&query_secret)?,
+        RequestedIntent::Query,
+        CompatibilityHints::none(),
+    )?;
+    let before = recovered.catalog_generation();
+    let audit_before = recovered.governance_audit_for_test()?;
+    let rejected = recovered
+        .create_tenant(
+            query_actor,
+            tenant,
+            TenantSlug::parse_canonical("actor-bound-tenant")?,
+            "Actor-bound tenant",
+            2_592_000,
+            1,
+            [1; 11],
+            idempotency,
+        )
+        .expect_err("a changed actor must not resolve another administrator's transaction");
+    assert_eq!(rejected.code(), BootstrapFailureCode::ApiKeyUnauthorized);
+    assert_eq!(recovered.catalog_generation(), before);
+    assert_eq!(recovered.governance_audit_for_test()?, audit_before);
+
+    let administrator = recovered.attribute(
+        PresentedCredential::parse(claim.secret())?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let resumed = recovered.create_tenant(
+        administrator,
+        tenant,
+        TenantSlug::parse_canonical("actor-bound-tenant")?,
+        "Actor-bound tenant",
+        2_592_000,
+        1,
+        [1; 11],
+        idempotency,
+    )?;
+    assert_eq!(resumed.tenant_id(), tenant);
+    Ok(())
+}
+
+#[test]
+fn advanced_catalog_refuses_prepared_tenant_creation_without_live_admission()
+-> Result<(), Box<dyn Error>> {
+    let roots = Roots::new()?;
+    let paths = roots.paths().map_err(|code| format!("paths: {code:?}"))?;
+    drop(InstanceBootstrap::initialize(
+        &paths,
+        InitializationPlan::non_interactive(),
+    )?);
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    let administrator = || {
+        instance.attribute(
+            PresentedCredential::parse(claim.secret()).expect("claim syntax"),
+            RequestedIntent::SystemAdministration,
+            CompatibilityHints::none(),
+        )
+    };
+    let tenant = TenantId::from_bytes([0x66; 16])?;
+    let idempotency = AdministrativeIdempotencyKey::new([0x67; 16])?;
+    with_catalog_publication_fault_after(CatalogPublicationFault::SynchronizeCommit, 0, || {
+        instance.create_tenant(
+            administrator().expect("administrator"),
+            tenant,
+            TenantSlug::parse_canonical("advanced-tenant").expect("tenant slug"),
+            "Advanced tenant",
+            2_592_000,
+            1,
+            [1; 11],
+            idempotency,
+        )
+    })
+    .expect_err("pre-marker tenant creation must leave a prepared transaction");
+    drop(instance);
+
+    let recovered = InstanceBootstrap::reopen(&paths)?;
+    let administrator = || {
+        recovered.attribute(
+            PresentedCredential::parse(claim.secret()).expect("claim syntax"),
+            RequestedIntent::SystemAdministration,
+            CompatibilityHints::none(),
+        )
+    };
+    recovered.create_api_key(
+        administrator()?,
+        Scope::Query,
+        None,
+        ResourceGeneration::new(1)?,
+        AdministrativeIdempotencyKey::new([0x68; 16])?,
+    )?;
+    let audit_before_retry = recovered.governance_audit_for_test()?;
+    let rejected = recovered
+        .create_tenant(
+            administrator()?,
+            tenant,
+            TenantSlug::parse_canonical("advanced-tenant")?,
+            "Advanced tenant",
+            2_592_000,
+            1,
+            [1; 11],
+            idempotency,
+        )
+        .expect_err("an advanced predecessor must not publish a stale tenant proposal");
+    assert_eq!(rejected.code(), BootstrapFailureCode::CatalogUnavailable);
+    assert_eq!(recovered.governance_audit_for_test()?, audit_before_retry);
+    assert!(
+        recovered
+            ._authority
+            .governor()
+            .reserve(WorkClaim::tenant(
+                tenant,
+                WorkKind::Ingest,
+                ResourceAmounts::only(ResourceDimension::MemoryBytes, 1)?,
+            )?)
+            .is_err(),
+        "an unavailable prepared retry must not activate tenant admission"
+    );
+    Ok(())
+}
 
 #[test]
 fn pre_marker_api_key_create_retry_resumes_the_prepared_credential_without_a_secret()

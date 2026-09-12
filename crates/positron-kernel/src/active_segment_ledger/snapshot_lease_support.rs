@@ -2,9 +2,7 @@ use std::collections::BTreeSet;
 
 use positron_domain::routing::CommitPosition;
 
-use crate::catalog::{
-    CatalogFailureCode, CatalogObject, CatalogProposal, FormatEpoch, TransactionId,
-};
+use crate::catalog::{CatalogFailureCode, CatalogObject, CatalogProposal, TransactionId};
 use crate::data_protection::DataProtection;
 
 use super::super::format::SegmentState;
@@ -12,8 +10,8 @@ use super::super::recovery::RecoveryMode;
 use super::super::snapshot_lease_codec::decode;
 use super::super::snapshot_lease_record::{LeaseRecord, SnapshotLeaseId};
 use super::super::{
-    ActiveSegmentLedger, CommittedBlock, FORMAT_EPOCH, LedgerFailure, LedgerFailureCode,
-    LedgerSnapshot, SegmentScope, map_frame_failure,
+    ActiveSegmentLedger, CommittedBlock, LedgerFailure, LedgerFailureCode, LedgerSnapshot,
+    SegmentScope, map_frame_failure,
 };
 
 fn rollback_lease_reservation(
@@ -418,7 +416,13 @@ fn publish_many_with_expected_catalog_inner(
     let transaction = TransactionId::new(fresh_identity()?.to_bytes())?;
     match catalog.commit(
         expected_catalog,
-        CatalogProposal::new(transaction, FormatEpoch::new(FORMAT_EPOCH)?, objects)?,
+        CatalogProposal::new(
+            transaction,
+            basis
+                .format_epoch()
+                .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?,
+            objects,
+        )?,
         None,
     ) {
         Ok(commit) => Ok(commit.snapshot().clone()),

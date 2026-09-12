@@ -38,7 +38,6 @@ fn configured_three_tenant_capacity_serves_the_third_tenant_after_reopen()
         system,
         [0x71; 16],
         "capacity-second",
-        1,
         [0x81; 16],
     )?;
     let system = initialized.attribute(
@@ -51,7 +50,6 @@ fn configured_three_tenant_capacity_serves_the_third_tenant_after_reopen()
         system,
         [0x72; 16],
         "capacity-third",
-        2,
         [0x82; 16],
     )?;
     let system = initialized.attribute(
@@ -115,7 +113,6 @@ fn full_capacity_rejects_before_publication_and_lower_reopen_fails_closed()
         system,
         [0x91; 16],
         "capacity-admitted",
-        1,
         [0xa1; 16],
     )?;
     let system = initialized.attribute(
@@ -132,7 +129,6 @@ fn full_capacity_rejects_before_publication_and_lower_reopen_fails_closed()
             2_592_000,
             1,
             resources::initial_tenant_quota(),
-            ResourceGeneration::new(2)?,
             AdministrativeIdempotencyKey::new([0xa2; 16])?,
         )
         .expect_err("a full configured governor must reject before publication");
@@ -167,7 +163,6 @@ fn create_tenant(
     system: positron_governance::AuthorizedContext,
     tenant_bytes: [u8; 16],
     slug: &str,
-    expected_generation: u64,
     idempotency: [u8; 16],
 ) -> Result<TenantId, Box<dyn std::error::Error>> {
     let tenant = TenantId::from_bytes(tenant_bytes)?;
@@ -180,7 +175,6 @@ fn create_tenant(
             2_592_000,
             1,
             resources::initial_tenant_quota(),
-            ResourceGeneration::new(expected_generation)?,
             AdministrativeIdempotencyKey::new(idempotency)?,
         )
         .map_err(|failure| format!("tenant creation: {failure:?}"))?;

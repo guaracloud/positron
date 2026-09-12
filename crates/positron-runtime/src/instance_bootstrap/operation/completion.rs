@@ -1,3 +1,4 @@
+use positron_domain::identity::TenantId;
 use positron_domain::routing::{SignalKind, VirtualShardId};
 use positron_governance::{GovernanceAuditEntry, Identity};
 use positron_kernel::{
@@ -21,10 +22,16 @@ pub(super) fn open_initial_ledgers(
 ) -> Result<(), BootstrapFailure> {
     let shard = VirtualShardId::new(1)
         .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
+    let snapshot = catalog.pin().map_err(catalog_failure)?;
+    let identity = Identity::open(&snapshot)
+        .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
+    let envelope = identity
+        .tenant_key_envelope(record.tenant)
+        .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
     for signal in [SignalKind::Logs, SignalKind::Traces] {
         let scope = SegmentScope::new(record.tenant, signal, shard);
         let protection = key
-            .segment_key(record.instance, scope)
+            .segment_key_from_tenant_envelope(record.instance, scope, envelope)
             .map_err(key_failure)?;
         let ledger = match signal {
             SignalKind::Logs => ActiveSegmentLedger::open_with_retention_time(
@@ -104,7 +111,8 @@ pub(super) fn outcome(
     generation: u64,
     audit_frontier: u64,
     claim_available: bool,
-    ingest_policy: positron_governance::IngestPolicyAdministration,
+    registered_tenants: Vec<TenantId>,
+    max_registered_tenants: u16,
 ) -> Result<InitializedInstance, BootstrapFailure> {
     let logs_shard = VirtualShardId::new(1)
         .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
@@ -123,11 +131,12 @@ pub(super) fn outcome(
         instance: record.instance,
         tenant: record.tenant,
         logs_shard,
-        ingest_policy,
         value_limit_profile: positron_domain::value::ValueLimitProfile::release_1_system_maximum(),
         admission_group_planner,
-        ingest_drain: super::super::types::IngestDrainGate::new(),
-        query_drain: super::super::types::QueryDrainGate::new(),
+        tenant_drains: super::super::types::TenantDrainRegistry::establish(
+            &registered_tenants,
+            max_registered_tenants,
+        )?,
         tenant_slug: BootstrapRecord::tenant_slug()?,
         administrator: record.administrator,
         integrity_key_fingerprint: record.integrity_fingerprint,

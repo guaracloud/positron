@@ -1,5 +1,5 @@
 use positron_domain::identity::{PrincipalId, TenantId};
-use positron_governance::{Identity, IngestPolicyAdministration};
+use positron_governance::Identity;
 use positron_governance::{
     InitialAuditContext, InitialGovernanceIntent, InitialTenantIntent, TenantAdministration,
 };
@@ -200,6 +200,8 @@ fn resume(
     open_initial_ledgers(&authority, &retention_time, &catalog, &key, &record)?;
     let current = catalog.pin().map_err(catalog_failure)?;
     apply_catalog_quota(&authority, &current)?;
+    let registered_tenants = TenantAdministration::registered_tenant_ids(&current)
+        .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
     if plan.creates_claim() {
         ensure_claim(&access, &key, &record, api_secret)?;
     }
@@ -227,8 +229,6 @@ fn resume(
     let identity = Identity::open(&current)
         .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
     let audit_records = governance_audit_records(&catalog)?;
-    let ingest_policy = IngestPolicyAdministration::open(&catalog, record.tenant)
-        .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
     drop(catalog);
     outcome(
         &record,
@@ -240,7 +240,8 @@ fn resume(
         generation,
         audit,
         claim_available,
-        ingest_policy,
+        registered_tenants,
+        max_registered_tenants,
     )
 }
 
@@ -278,14 +279,14 @@ pub(super) fn reopen(
     }
     let current = catalog.pin().map_err(catalog_failure)?;
     apply_catalog_quota(&authority, &current)?;
+    let registered_tenants = TenantAdministration::registered_tenant_ids(&current)
+        .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
     let generation = current.number();
     let audit = current.governance_audit_frontier();
     let claim_available = storage::exists(&access, BootstrapArtifact::Claim)?;
     let identity = Identity::open(&current)
         .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
     let audit_records = governance_audit_records(&catalog)?;
-    let ingest_policy = IngestPolicyAdministration::open(&catalog, record.tenant)
-        .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
     drop(catalog);
     outcome(
         &record,
@@ -297,7 +298,8 @@ pub(super) fn reopen(
         generation,
         audit,
         claim_available,
-        ingest_policy,
+        registered_tenants,
+        max_registered_tenants,
     )
 }
 

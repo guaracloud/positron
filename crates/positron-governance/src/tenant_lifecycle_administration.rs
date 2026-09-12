@@ -5,12 +5,16 @@ use positron_domain::identity::{PrincipalId, Scope, TenantId};
 use positron_domain::lifecycle::{TenantLifecycle, TenantLifecycleState};
 use positron_kernel::{
     AuditIntent, Catalog, CatalogFailureCode, CatalogObject, CatalogProposal, CatalogReadView,
-    CatalogSnapshot, FormatEpoch, GovernanceAuditRecord, TransactionId,
+    CatalogSnapshot, GovernanceAuditRecord, TransactionId,
 };
 
 use crate::audit::TenantLifecycleAuditIntent;
+use crate::tenant_quota_record::{
+    TenantLifecycleRecord, replace_tenant_lifecycle_record, tenant_lifecycle_record,
+};
 use crate::{
     AdministrativeIdempotencyKey, AuthorizedContext, GovernanceAuditEntry, ResourceGeneration,
+    TenantAdministration,
 };
 
 /// The result of one durably published tenant lifecycle transition.
@@ -180,6 +184,9 @@ impl TenantLifecycleAdministration {
         )? {
             return Ok(replay);
         }
+        if request.tenant != governance.tenant() {
+            return transition_secondary(catalog, &snapshot, request, audit_time);
+        }
         let audit_ingest_time_unix_seconds = audit_time()?;
         if audit_ingest_time_unix_seconds == 0 {
             return Err(TenantLifecycleAdministrationFailure::PersistenceUnavailable);
@@ -227,6 +234,84 @@ impl TenantLifecycleAdministration {
     }
 }
 
+fn transition_secondary<F>(
+    catalog: &Catalog<'_>,
+    snapshot: &CatalogSnapshot,
+    request: TenantLifecycleTransitionRequest,
+    audit_time: F,
+) -> Result<TenantLifecycleTransition, TenantLifecycleAdministrationFailure>
+where
+    F: FnOnce() -> Result<u64, TenantLifecycleAdministrationFailure>,
+{
+    let current = tenant_lifecycle_record(snapshot, request.tenant)
+        .map_err(map_tenant_record_failure)?
+        .ok_or(TenantLifecycleAdministrationFailure::UnknownTenant)?;
+    let audit_ingest_time_unix_seconds = audit_time()?;
+    if audit_ingest_time_unix_seconds == 0 {
+        return Err(TenantLifecycleAdministrationFailure::PersistenceUnavailable);
+    }
+    if request.target == TenantLifecycleState::Purged {
+        return Err(TenantLifecycleAdministrationFailure::PurgeCompletionUnavailable);
+    }
+    TenantLifecycle::from_durable_state(current.state)
+        .transition_to(request.target)
+        .map_err(|_| TenantLifecycleAdministrationFailure::InvalidTransition)?;
+    let generation = next_generation(current.generation.get(), current.state, request.expected)?;
+    let objects = replace_tenant_lifecycle_record(
+        snapshot,
+        request.tenant,
+        TenantLifecycleRecord {
+            generation,
+            state: request.target,
+        },
+    )
+    .map_err(map_tenant_record_failure)?;
+    let audit = TenantLifecycleAuditIntent {
+        ingest_time_unix_seconds: audit_ingest_time_unix_seconds,
+        idempotency_key: request.idempotency,
+        actor: request.actor.principal_id(),
+        tenant: request.tenant,
+        from: current.state,
+        to: request.target,
+        expected_generation: request.expected,
+        generation,
+    }
+    .encode();
+    let commit = commit_objects(catalog, snapshot, objects, request.idempotency, audit)?;
+    transition_from_commit(
+        commit,
+        request.tenant,
+        current.state,
+        request.target,
+        generation,
+    )
+}
+
+fn transition_from_commit(
+    commit: positron_kernel::CatalogCommit,
+    tenant: TenantId,
+    from: TenantLifecycleState,
+    to: TenantLifecycleState,
+    generation: ResourceGeneration,
+) -> Result<TenantLifecycleTransition, TenantLifecycleAdministrationFailure> {
+    let record = commit
+        .governance_audit_record()
+        .ok_or(TenantLifecycleAdministrationFailure::PersistenceUnavailable)?;
+    let entry = GovernanceAuditEntry::decode(record)
+        .map_err(|_| TenantLifecycleAdministrationFailure::PersistenceUnavailable)?;
+    let audit = entry
+        .as_tenant_lifecycle()
+        .ok_or(TenantLifecycleAdministrationFailure::PersistenceUnavailable)?;
+    Ok(TenantLifecycleTransition {
+        tenant,
+        from,
+        to,
+        generation,
+        audit_position: audit.position(),
+        audit_ingest_time_unix_seconds: audit.ingest_time_unix_seconds(),
+    })
+}
+
 fn validate_request(
     catalog: &Catalog<'_>,
     administrator: PrincipalId,
@@ -248,7 +333,11 @@ fn validate_snapshot(
         return Err(TenantLifecycleAdministrationFailure::Unauthorized);
     }
     let (_, governance) = snapshot.governance_object().map_err(map_catalog)?;
-    if governance.tenant() != request.tenant {
+    if governance.tenant() != request.tenant
+        && !TenantAdministration::registered_tenant_ids(&snapshot)
+            .map_err(map_tenant_record_failure)?
+            .contains(&request.tenant)
+    {
         return Err(TenantLifecycleAdministrationFailure::UnknownTenant);
     }
     Ok(snapshot)
@@ -344,9 +433,21 @@ fn commit(
         }
     }
     objects.push(CatalogObject::new(replacement).map_err(map_catalog)?);
+    commit_objects(catalog, snapshot, objects, idempotency, audit)
+}
+
+fn commit_objects(
+    catalog: &Catalog<'_>,
+    snapshot: &CatalogSnapshot,
+    objects: Vec<CatalogObject>,
+    idempotency: AdministrativeIdempotencyKey,
+    audit: Vec<u8>,
+) -> Result<positron_kernel::CatalogCommit, TenantLifecycleAdministrationFailure> {
     let proposal = CatalogProposal::new(
         TransactionId::new(idempotency.to_bytes()).map_err(map_catalog)?,
-        FormatEpoch::CATALOG_V1,
+        snapshot
+            .format_epoch()
+            .ok_or(TenantLifecycleAdministrationFailure::PersistenceUnavailable)?,
         objects,
     )
     .map_err(map_catalog)?;
@@ -357,6 +458,23 @@ fn commit(
             Some(AuditIntent::new(audit).map_err(map_catalog)?),
         )
         .map_err(map_catalog)
+}
+
+fn map_tenant_record_failure(
+    failure: crate::TenantAdministrationFailure,
+) -> TenantLifecycleAdministrationFailure {
+    match failure {
+        crate::TenantAdministrationFailure::Unauthorized => {
+            TenantLifecycleAdministrationFailure::UnknownTenant
+        },
+        crate::TenantAdministrationFailure::InvalidInput
+        | crate::TenantAdministrationFailure::DuplicateTenant
+        | crate::TenantAdministrationFailure::StaleGeneration
+        | crate::TenantAdministrationFailure::IdempotencyConflict
+        | crate::TenantAdministrationFailure::PersistenceUnavailable => {
+            TenantLifecycleAdministrationFailure::PersistenceUnavailable
+        },
+    }
 }
 
 fn map_catalog(failure: positron_kernel::CatalogFailure) -> TenantLifecycleAdministrationFailure {

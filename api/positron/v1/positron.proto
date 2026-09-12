@@ -53,7 +53,7 @@ message ApiKeyRequest {
   optional uint64 expected_generation = 5;
   optional string idempotency_key = 6;
   // An explicit control-plane target for System Administration credential
-  // provisioning. It never participates in data-plane attribution.
+  // lifecycle control. It never participates in data-plane attribution.
   optional string target_tenant = 7;
 }
 enum KeyAction {

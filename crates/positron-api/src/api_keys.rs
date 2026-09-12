@@ -71,13 +71,26 @@ impl ApiKeyRequest {
         })
     }
     pub fn list() -> Self {
+        Self::list_with_target(None)
+    }
+    pub fn list_for_tenant(target_tenant: String) -> Self {
+        Self::list_with_target(Some(target_tenant))
+    }
+    fn list_with_target(target_tenant: Option<String>) -> Self {
         Self(protobuf::ApiKeyRequest {
             action: KeyAction::List.into(),
+            target_tenant,
             ..Default::default()
         })
     }
     pub fn inspect(principal: String) -> Self {
-        let mut request = Self::list();
+        Self::inspect_with_target(principal, None)
+    }
+    pub fn inspect_for_tenant(principal: String, target_tenant: String) -> Self {
+        Self::inspect_with_target(principal, Some(target_tenant))
+    }
+    fn inspect_with_target(principal: String, target_tenant: Option<String>) -> Self {
+        let mut request = Self::list_with_target(target_tenant);
         request.0.action = KeyAction::ScopeInspect.into();
         request.0.principal = Some(principal);
         request
@@ -91,11 +104,33 @@ impl ApiKeyRequest {
         if !matches!(action, KeyAction::Rotate | KeyAction::Revoke) {
             return Err(KeyWireFailure);
         }
+        Self::mutation_with_target(action, principal, None, expected, idempotency)
+    }
+    pub fn mutation_for_tenant(
+        action: KeyAction,
+        principal: String,
+        target_tenant: String,
+        expected: u64,
+        idempotency: String,
+    ) -> Result<Self, KeyWireFailure> {
+        Self::mutation_with_target(action, principal, Some(target_tenant), expected, idempotency)
+    }
+    fn mutation_with_target(
+        action: KeyAction,
+        principal: String,
+        target_tenant: Option<String>,
+        expected: u64,
+        idempotency: String,
+    ) -> Result<Self, KeyWireFailure> {
+        if !matches!(action, KeyAction::Rotate | KeyAction::Revoke) {
+            return Err(KeyWireFailure);
+        }
         Ok(Self(protobuf::ApiKeyRequest {
             action: action.into(),
             principal: Some(principal),
             expected_generation: Some(expected),
             idempotency_key: Some(idempotency),
+            target_tenant,
             ..Default::default()
         }))
     }
@@ -170,7 +205,6 @@ impl ApiKeyRequest {
                 KeyAction::Rotate | KeyAction::Revoke | KeyAction::ScopeInspect
             ) != self.0.principal.is_some()
             || (action == KeyAction::Create) != self.0.scope.is_some()
-            || (action != KeyAction::Create && self.0.target_tenant.is_some())
             || (action != KeyAction::Create && self.0.expires_at_unix_seconds.is_some())
             || self.0.expires_at_unix_seconds == Some(0)
         {

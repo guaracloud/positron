@@ -20,19 +20,20 @@ mod policy_administration;
 mod quota_administration;
 mod tenant_administration;
 mod tenant_lifecycle_administration;
+mod tenant_quota_record;
 
 pub use api_key_administration::{
     ApiKeyAdministration, ApiKeyAdministrationFailure, ApiKeyCreateRequest, ApiKeyCreation,
     ApiKeyDescriptor,
-};
-pub use format_migration_administration::{
-    CatalogFormatMigration, CatalogFormatMigrationAdministration, CatalogFormatMigrationFailure,
 };
 pub use audit::{
     ApiKeyLifecycleAction, CatalogRootRotationAuditEntry, CatalogRootRotationStage,
     GovernanceAuditEntry, IngestPolicyActivationAuditEntry, InitialAuditMetadata,
     InitializationAuditEntry, ListenerTransportAuditEntry, SchemaCheckpointAuditEntry,
     TenantQuotaUpdateAuditEntry, schema_checkpoint_audit_intent,
+};
+pub use format_migration_administration::{
+    CatalogFormatMigration, CatalogFormatMigrationAdministration, CatalogFormatMigrationFailure,
 };
 pub use identity::{
     AttributionFailure, AuthorizedContext, CompatibilityHints, GovernanceInspection, Identity,
@@ -49,7 +50,8 @@ pub use policy_administration::{
 };
 pub use quota_administration::{
     TenantQuotaAdministration, TenantQuotaAdministrationFailure,
-    TenantQuotaAdministrationFailureCode, TenantQuotaUpdate, TenantQuotaUpdateRequest,
+    TenantQuotaAdministrationFailureCode, TenantQuotaGenerationConflict, TenantQuotaUpdate,
+    TenantQuotaUpdateRequest,
 };
 pub use tenant_administration::{
     TenantAdministration, TenantAdministrationFailure, TenantCreateRequest, TenantCreation,

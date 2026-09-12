@@ -1,11 +1,10 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
-use positron_domain::identity::{PrincipalId, Scope};
+use positron_domain::identity::{PrincipalId, Scope, TenantId};
 use positron_kernel::{
     AuditIntent, BootstrapKeyCustody, Catalog, CatalogCredential, CatalogFailureCode,
-    CatalogObject, CatalogProposal, CatalogSnapshot, FormatEpoch, PreparedTransactionResolution,
-    TransactionId,
+    CatalogObject, CatalogProposal, CatalogSnapshot, PreparedTransactionResolution, TransactionId,
 };
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
@@ -13,7 +12,15 @@ use zeroize::Zeroizing;
 use crate::audit::ApiKeyLifecycleAuditEntry;
 use crate::{
     AdministrativeIdempotencyKey, ApiKeyLifecycleAction, AuthorizedContext, ResourceGeneration,
+    TenantAdministration,
 };
+
+const TENANT_KEYRING_MAGIC: [u8; 8] = *b"POSTKC01";
+
+pub(crate) struct TenantCredentialIdentity {
+    pub(crate) tenant: TenantId,
+    pub(crate) credentials: Vec<CatalogCredential>,
+}
 
 /// One secret-safe result from a newly created or rotated API key.
 pub struct ApiKeyCreation {
@@ -125,6 +132,164 @@ impl Error for ApiKeyAdministrationFailure {}
 pub struct ApiKeyAdministration;
 
 impl ApiKeyAdministration {
+    /// Creates a tenant-bound credential through the same salted-hash,
+    /// Catalog-serialized API-key lifecycle authority as default-tenant keys.
+    pub fn create_for_tenant(
+        catalog: &Catalog<'_>,
+        key: &BootstrapKeyCustody,
+        administrator: PrincipalId,
+        actor: AuthorizedContext,
+        tenant: TenantId,
+        scope: Scope,
+        expires_at_unix_seconds: Option<u64>,
+        expected: ResourceGeneration,
+        idempotency: AdministrativeIdempotencyKey,
+    ) -> Result<ApiKeyCreation, ApiKeyAdministrationFailure> {
+        if !authorizes(administrator, actor) || !scope.is_tenant_scoped() {
+            return Err(ApiKeyAdministrationFailure::Unauthorized);
+        }
+        let snapshot = catalog.pin().map_err(map_catalog)?;
+        let (_, governance) = snapshot.governance_object().map_err(map_catalog)?;
+        if governance.tenant() == tenant {
+            return Self::create(
+                catalog,
+                key,
+                administrator,
+                ApiKeyCreateRequest::new(
+                    actor,
+                    scope,
+                    expires_at_unix_seconds,
+                    expected,
+                    idempotency,
+                ),
+            );
+        }
+        if !TenantAdministration::registered_tenant_ids(&snapshot)
+            .map_err(|_| ApiKeyAdministrationFailure::CredentialUnavailable)?
+            .contains(&tenant)
+        {
+            return Err(ApiKeyAdministrationFailure::CredentialUnavailable);
+        }
+        let request_digest = tenant_create_request_digest(
+            idempotency,
+            actor.principal_id(),
+            tenant,
+            scope,
+            expires_at_unix_seconds,
+            expected,
+        )?;
+        if let Some(replay) = replay_tenant_creation(
+            catalog,
+            &snapshot,
+            tenant,
+            idempotency,
+            actor.principal_id(),
+            scope,
+            expires_at_unix_seconds,
+            expected,
+        )? {
+            return Ok(replay);
+        }
+        match catalog
+            .resume_prepared(
+                TransactionId::new(idempotency.to_bytes()).map_err(map_catalog)?,
+                request_digest,
+            )
+            .map_err(map_catalog)?
+        {
+            PreparedTransactionResolution::Absent => {},
+            PreparedTransactionResolution::Unavailable => {
+                return Err(ApiKeyAdministrationFailure::PersistenceUnavailable);
+            },
+            PreparedTransactionResolution::Resumed(_) => {
+                return tenant_key_replay(
+                    catalog,
+                    tenant,
+                    idempotency,
+                    actor.principal_id(),
+                    scope,
+                    expires_at_unix_seconds,
+                    expected,
+                );
+            },
+        }
+        let keyring = tenant_keyring(&snapshot, tenant)?;
+        let generation = ResourceGeneration::new(keyring.generation)
+            .map_err(|_| ApiKeyAdministrationFailure::PersistenceUnavailable)?;
+        if generation != expected {
+            return Err(ApiKeyAdministrationFailure::StaleGeneration);
+        }
+        let next = generation
+            .get()
+            .checked_add(1)
+            .ok_or(ApiKeyAdministrationFailure::PersistenceUnavailable)?;
+        let CredentialMaterial {
+            principal,
+            salt,
+            raw_secret,
+            hash,
+        } = credential_material(key)?;
+        let scope_code = scope_code(scope).ok_or(ApiKeyAdministrationFailure::Unauthorized)?;
+        let mut credentials = credentials_with_capacity(&keyring.credentials)?;
+        credentials.push(
+            CatalogCredential::new(
+                principal,
+                scope_code,
+                true,
+                expires_at_unix_seconds,
+                salt,
+                hash,
+            )
+            .map_err(map_catalog)?,
+        );
+        let replacement = encode_tenant_keyring(tenant, next, &credentials)?;
+        let commit = commit_tenant_keyring(
+            catalog,
+            &snapshot,
+            tenant,
+            replacement,
+            MutationAudit {
+                idempotency,
+                actor: actor.principal_id(),
+                principal,
+                target: principal,
+                scope: scope_code,
+                expires_at_unix_seconds,
+                expected,
+                generation: ResourceGeneration::new(next)
+                    .map_err(|_| ApiKeyAdministrationFailure::PersistenceUnavailable)?,
+                action: ApiKeyLifecycleAction::Create,
+            },
+            request_digest,
+        )?;
+        let _ = commit;
+        Ok(ApiKeyCreation {
+            principal,
+            secret: Some(Zeroizing::new(format_secret(&raw_secret))),
+        })
+    }
+
+    pub(crate) fn tenant_credential_identities(
+        snapshot: &CatalogSnapshot,
+    ) -> Result<Vec<TenantCredentialIdentity>, ApiKeyAdministrationFailure> {
+        let registered = TenantAdministration::registered_tenant_ids(snapshot)
+            .map_err(|_| ApiKeyAdministrationFailure::PersistenceUnavailable)?;
+        let (_, governance) = snapshot.governance_object().map_err(map_catalog)?;
+        let mut identities = Vec::new();
+        for tenant in registered {
+            if let Some(keyring) = find_tenant_keyring(snapshot, tenant)? {
+                if tenant == governance.tenant() {
+                    return Err(ApiKeyAdministrationFailure::PersistenceUnavailable);
+                }
+                identities.push(TenantCredentialIdentity {
+                    tenant,
+                    credentials: keyring.credentials,
+                });
+            }
+        }
+        Ok(identities)
+    }
+
     pub fn list(
         catalog: &Catalog<'_>,
         administrator: PrincipalId,
@@ -153,6 +318,27 @@ impl ApiKeyAdministration {
             });
         }
         Ok(descriptors)
+    }
+
+    /// Lists redacted credentials bound to one explicit tenant. The default
+    /// tenant continues to use the sole POSGOV credential authority.
+    pub fn list_for_tenant(
+        catalog: &Catalog<'_>,
+        administrator: PrincipalId,
+        actor: AuthorizedContext,
+        tenant: TenantId,
+    ) -> Result<Vec<ApiKeyDescriptor>, ApiKeyAdministrationFailure> {
+        if !authorizes(administrator, actor) {
+            return Err(ApiKeyAdministrationFailure::Unauthorized);
+        }
+        let snapshot = catalog.pin().map_err(map_catalog)?;
+        let (_, governance) = snapshot.governance_object().map_err(map_catalog)?;
+        if governance.tenant() == tenant {
+            return Self::list(catalog, administrator, actor);
+        }
+        ensure_registered_tenant(&snapshot, tenant)?;
+        let keyring = tenant_keyring(&snapshot, tenant)?;
+        descriptors(&keyring.credentials, keyring.generation)
     }
 
     pub fn create(
@@ -446,12 +632,269 @@ impl ApiKeyAdministration {
             None,
         )
     }
+
+    /// Creates a successor in the named secondary tenant's keyring. The
+    /// predecessor remains active until a separately idempotent revoke.
+    pub fn rotate_for_tenant(
+        catalog: &Catalog<'_>,
+        key: &BootstrapKeyCustody,
+        administrator: PrincipalId,
+        actor: AuthorizedContext,
+        tenant: TenantId,
+        predecessor: PrincipalId,
+        expected: ResourceGeneration,
+        idempotency: AdministrativeIdempotencyKey,
+    ) -> Result<ApiKeyCreation, ApiKeyAdministrationFailure> {
+        if !authorizes(administrator, actor) {
+            return Err(ApiKeyAdministrationFailure::Unauthorized);
+        }
+        let snapshot = catalog.pin().map_err(map_catalog)?;
+        let (_, governance) = snapshot.governance_object().map_err(map_catalog)?;
+        if governance.tenant() == tenant {
+            return Self::rotate(
+                catalog,
+                key,
+                administrator,
+                actor,
+                predecessor,
+                expected,
+                idempotency,
+            );
+        }
+        ensure_registered_tenant(&snapshot, tenant)?;
+        let keyring = tenant_keyring(&snapshot, tenant)?;
+        if let Some(replay) = replay_tenant_rotation(
+            catalog,
+            &keyring,
+            idempotency,
+            actor.principal_id(),
+            predecessor,
+            expected,
+        )? {
+            return Ok(replay);
+        }
+        let predecessor = active_tenant_credential(&keyring, predecessor)?;
+        let request_digest = tenant_rotate_request_digest(
+            idempotency,
+            actor.principal_id(),
+            tenant,
+            predecessor.principal(),
+            predecessor.scope_code(),
+            predecessor.expires_at_unix_seconds(),
+            expected,
+        );
+        match catalog
+            .resume_prepared(
+                TransactionId::new(idempotency.to_bytes()).map_err(map_catalog)?,
+                request_digest,
+            )
+            .map_err(map_catalog)?
+        {
+            PreparedTransactionResolution::Absent => {},
+            PreparedTransactionResolution::Unavailable => {
+                return Err(ApiKeyAdministrationFailure::PersistenceUnavailable);
+            },
+            PreparedTransactionResolution::Resumed(_) => {
+                return tenant_key_rotation_replay(
+                    catalog,
+                    tenant,
+                    idempotency,
+                    actor.principal_id(),
+                    predecessor.principal(),
+                    expected,
+                );
+            },
+        }
+        let generation = next_generation(keyring.generation, expected)?;
+        let CredentialMaterial {
+            principal,
+            salt,
+            raw_secret,
+            hash,
+        } = credential_material(key)?;
+        let mut credentials = credentials_with_capacity(&keyring.credentials)?;
+        credentials.push(
+            CatalogCredential::new(
+                principal,
+                predecessor.scope_code(),
+                true,
+                predecessor.expires_at_unix_seconds(),
+                salt,
+                hash,
+            )
+            .map_err(map_catalog)?,
+        );
+        commit_tenant_keyring(
+            catalog,
+            &snapshot,
+            tenant,
+            encode_tenant_keyring(tenant, generation, &credentials)?,
+            MutationAudit {
+                idempotency,
+                actor: actor.principal_id(),
+                principal,
+                target: predecessor.principal(),
+                scope: predecessor.scope_code(),
+                expires_at_unix_seconds: predecessor.expires_at_unix_seconds(),
+                expected,
+                generation: ResourceGeneration::new(generation)
+                    .map_err(|_| ApiKeyAdministrationFailure::PersistenceUnavailable)?,
+                action: ApiKeyLifecycleAction::Rotate,
+            },
+            request_digest,
+        )?;
+        Ok(ApiKeyCreation {
+            principal,
+            secret: Some(Zeroizing::new(format_secret(&raw_secret))),
+        })
+    }
+
+    /// Revokes one named secondary-tenant credential while retaining its
+    /// redacted descriptor and replay result.
+    pub fn revoke_for_tenant(
+        catalog: &Catalog<'_>,
+        administrator: PrincipalId,
+        actor: AuthorizedContext,
+        tenant: TenantId,
+        principal: PrincipalId,
+        expected: ResourceGeneration,
+        idempotency: AdministrativeIdempotencyKey,
+    ) -> Result<(), ApiKeyAdministrationFailure> {
+        if !authorizes(administrator, actor) {
+            return Err(ApiKeyAdministrationFailure::Unauthorized);
+        }
+        let snapshot = catalog.pin().map_err(map_catalog)?;
+        let (_, governance) = snapshot.governance_object().map_err(map_catalog)?;
+        if governance.tenant() == tenant {
+            return Self::revoke(
+                catalog,
+                administrator,
+                actor,
+                principal,
+                expected,
+                idempotency,
+            );
+        }
+        ensure_registered_tenant(&snapshot, tenant)?;
+        let keyring = tenant_keyring(&snapshot, tenant)?;
+        if replay_tenant_revocation(
+            catalog,
+            &keyring,
+            idempotency,
+            actor.principal_id(),
+            principal,
+            expected,
+        )? {
+            return Ok(());
+        }
+        let index = keyring
+            .credentials
+            .iter()
+            .position(|credential| {
+                credential.principal() == principal
+                    && credential.is_active()
+                    && credential.scope_code() != 4
+            })
+            .ok_or(ApiKeyAdministrationFailure::CredentialUnavailable)?;
+        let scope = keyring.credentials[index].scope_code();
+        let expires_at_unix_seconds = keyring.credentials[index].expires_at_unix_seconds();
+        let request_digest = tenant_revoke_request_digest(
+            idempotency,
+            actor.principal_id(),
+            tenant,
+            principal,
+            scope,
+            expires_at_unix_seconds,
+            expected,
+        );
+        match catalog
+            .resume_prepared(
+                TransactionId::new(idempotency.to_bytes()).map_err(map_catalog)?,
+                request_digest,
+            )
+            .map_err(map_catalog)?
+        {
+            PreparedTransactionResolution::Absent => {},
+            PreparedTransactionResolution::Unavailable => {
+                return Err(ApiKeyAdministrationFailure::PersistenceUnavailable);
+            },
+            PreparedTransactionResolution::Resumed(_) => {
+                return tenant_key_revocation_replay(
+                    catalog,
+                    tenant,
+                    idempotency,
+                    actor.principal_id(),
+                    principal,
+                    expected,
+                );
+            },
+        }
+        let generation = next_generation(keyring.generation, expected)?;
+        let mut credentials = keyring.credentials;
+        credentials[index] = credentials[index].with_active(false);
+        commit_tenant_keyring(
+            catalog,
+            &snapshot,
+            tenant,
+            encode_tenant_keyring(tenant, generation, &credentials)?,
+            MutationAudit {
+                idempotency,
+                actor: actor.principal_id(),
+                principal,
+                target: principal,
+                scope,
+                expires_at_unix_seconds,
+                expected,
+                generation: ResourceGeneration::new(generation)
+                    .map_err(|_| ApiKeyAdministrationFailure::PersistenceUnavailable)?,
+                action: ApiKeyLifecycleAction::Revoke,
+            },
+            request_digest,
+        )
+    }
 }
 
 fn authorizes(administrator: PrincipalId, actor: AuthorizedContext) -> bool {
     actor.principal_id() == administrator
         && actor.scope() == Scope::SystemAdministration
         && actor.tenant_attribution().is_none()
+}
+
+fn ensure_registered_tenant(
+    snapshot: &CatalogSnapshot,
+    tenant: TenantId,
+) -> Result<(), ApiKeyAdministrationFailure> {
+    if TenantAdministration::registered_tenant_ids(snapshot)
+        .map_err(|_| ApiKeyAdministrationFailure::CredentialUnavailable)?
+        .contains(&tenant)
+    {
+        Ok(())
+    } else {
+        Err(ApiKeyAdministrationFailure::CredentialUnavailable)
+    }
+}
+
+fn descriptors(
+    credentials: &[CatalogCredential],
+    generation: u64,
+) -> Result<Vec<ApiKeyDescriptor>, ApiKeyAdministrationFailure> {
+    let generation = ResourceGeneration::new(generation)
+        .map_err(|_| ApiKeyAdministrationFailure::PersistenceUnavailable)?;
+    let mut descriptors = Vec::new();
+    descriptors
+        .try_reserve_exact(credentials.len())
+        .map_err(|_| ApiKeyAdministrationFailure::CapacityExceeded)?;
+    for credential in credentials {
+        descriptors.push(ApiKeyDescriptor {
+            principal: credential.principal(),
+            scope: scope_from_code(credential.scope_code())
+                .ok_or(ApiKeyAdministrationFailure::PersistenceUnavailable)?,
+            active: credential.is_active(),
+            expires_at_unix_seconds: credential.expires_at_unix_seconds(),
+            generation,
+        });
+    }
+    Ok(descriptors)
 }
 
 fn next_generation(
@@ -542,6 +985,34 @@ fn replay_rotation(
     }))
 }
 
+fn replay_tenant_rotation(
+    catalog: &Catalog<'_>,
+    keyring: &TenantKeyring,
+    idempotency: AdministrativeIdempotencyKey,
+    actor: PrincipalId,
+    predecessor: PrincipalId,
+    expected: ResourceGeneration,
+) -> Result<Option<ApiKeyCreation>, ApiKeyAdministrationFailure> {
+    let Some(lifecycle) = replay_entry(catalog, idempotency)? else {
+        return Ok(None);
+    };
+    if lifecycle.action() != ApiKeyLifecycleAction::Rotate
+        || lifecycle.actor_id() != actor
+        || lifecycle.target_principal_id() != predecessor
+        || lifecycle.expected_generation() != expected
+        || !keyring
+            .credentials
+            .iter()
+            .any(|credential| credential.principal() == lifecycle.principal_id())
+    {
+        return Err(ApiKeyAdministrationFailure::IdempotencyConflict);
+    }
+    Ok(Some(ApiKeyCreation {
+        principal: lifecycle.principal_id(),
+        secret: None,
+    }))
+}
+
 fn replay_revocation(
     catalog: &Catalog<'_>,
     idempotency: AdministrativeIdempotencyKey,
@@ -556,6 +1027,31 @@ fn replay_revocation(
         || lifecycle.actor_id() != actor
         || lifecycle.target_principal_id() != principal
         || lifecycle.expected_generation() != expected
+    {
+        return Err(ApiKeyAdministrationFailure::IdempotencyConflict);
+    }
+    Ok(true)
+}
+
+fn replay_tenant_revocation(
+    catalog: &Catalog<'_>,
+    keyring: &TenantKeyring,
+    idempotency: AdministrativeIdempotencyKey,
+    actor: PrincipalId,
+    principal: PrincipalId,
+    expected: ResourceGeneration,
+) -> Result<bool, ApiKeyAdministrationFailure> {
+    let Some(lifecycle) = replay_entry(catalog, idempotency)? else {
+        return Ok(false);
+    };
+    if lifecycle.action() != ApiKeyLifecycleAction::Revoke
+        || lifecycle.actor_id() != actor
+        || lifecycle.target_principal_id() != principal
+        || lifecycle.expected_generation() != expected
+        || !keyring
+            .credentials
+            .iter()
+            .any(|credential| credential.principal() == principal && !credential.is_active())
     {
         return Err(ApiKeyAdministrationFailure::IdempotencyConflict);
     }
@@ -579,6 +1075,405 @@ fn replay_entry(
         matching = Some(lifecycle.clone());
     }
     Ok(matching)
+}
+
+fn tenant_key_rotation_replay(
+    catalog: &Catalog<'_>,
+    tenant: TenantId,
+    idempotency: AdministrativeIdempotencyKey,
+    actor: PrincipalId,
+    predecessor: PrincipalId,
+    expected: ResourceGeneration,
+) -> Result<ApiKeyCreation, ApiKeyAdministrationFailure> {
+    let snapshot = catalog.pin().map_err(map_catalog)?;
+    let keyring = tenant_keyring(&snapshot, tenant)?;
+    replay_tenant_rotation(catalog, &keyring, idempotency, actor, predecessor, expected)?
+        .ok_or(ApiKeyAdministrationFailure::IdempotencyConflict)
+}
+
+fn tenant_key_revocation_replay(
+    catalog: &Catalog<'_>,
+    tenant: TenantId,
+    idempotency: AdministrativeIdempotencyKey,
+    actor: PrincipalId,
+    principal: PrincipalId,
+    expected: ResourceGeneration,
+) -> Result<(), ApiKeyAdministrationFailure> {
+    let snapshot = catalog.pin().map_err(map_catalog)?;
+    let keyring = tenant_keyring(&snapshot, tenant)?;
+    if replay_tenant_revocation(catalog, &keyring, idempotency, actor, principal, expected)? {
+        Ok(())
+    } else {
+        Err(ApiKeyAdministrationFailure::IdempotencyConflict)
+    }
+}
+
+fn active_tenant_credential(
+    keyring: &TenantKeyring,
+    principal: PrincipalId,
+) -> Result<&CatalogCredential, ApiKeyAdministrationFailure> {
+    keyring
+        .credentials
+        .iter()
+        .find(|credential| {
+            credential.principal() == principal
+                && credential.is_active()
+                && credential.scope_code() != 4
+        })
+        .ok_or(ApiKeyAdministrationFailure::CredentialUnavailable)
+}
+
+struct TenantKeyring {
+    generation: u64,
+    credentials: Vec<CatalogCredential>,
+}
+
+fn tenant_keyring(
+    snapshot: &CatalogSnapshot,
+    tenant: TenantId,
+) -> Result<TenantKeyring, ApiKeyAdministrationFailure> {
+    Ok(
+        find_tenant_keyring(snapshot, tenant)?.unwrap_or(TenantKeyring {
+            generation: 1,
+            credentials: Vec::new(),
+        }),
+    )
+}
+
+fn find_tenant_keyring(
+    snapshot: &CatalogSnapshot,
+    tenant: TenantId,
+) -> Result<Option<TenantKeyring>, ApiKeyAdministrationFailure> {
+    let mut found = None;
+    for identity in snapshot.object_identities() {
+        let bytes = snapshot
+            .object(identity)
+            .map_err(map_catalog)?
+            .ok_or(ApiKeyAdministrationFailure::PersistenceUnavailable)?;
+        if !bytes.starts_with(&TENANT_KEYRING_MAGIC) {
+            continue;
+        }
+        let decoded = decode_tenant_keyring(bytes)?;
+        if decoded.0 != tenant {
+            continue;
+        }
+        if found.replace(decoded.1).is_some() {
+            return Err(ApiKeyAdministrationFailure::PersistenceUnavailable);
+        }
+    }
+    Ok(found)
+}
+
+fn decode_tenant_keyring(
+    bytes: &[u8],
+) -> Result<(TenantId, TenantKeyring), ApiKeyAdministrationFailure> {
+    let tenant = TenantId::from_bytes(
+        bytes
+            .get(8..24)
+            .ok_or(ApiKeyAdministrationFailure::PersistenceUnavailable)?
+            .try_into()
+            .map_err(|_| ApiKeyAdministrationFailure::PersistenceUnavailable)?,
+    )
+    .map_err(|_| ApiKeyAdministrationFailure::PersistenceUnavailable)?;
+    let generation = u64::from_be_bytes(
+        bytes
+            .get(24..32)
+            .ok_or(ApiKeyAdministrationFailure::PersistenceUnavailable)?
+            .try_into()
+            .map_err(|_| ApiKeyAdministrationFailure::PersistenceUnavailable)?,
+    );
+    if generation == 0 {
+        return Err(ApiKeyAdministrationFailure::PersistenceUnavailable);
+    }
+    let count = usize::from(u16::from_be_bytes(
+        bytes
+            .get(32..34)
+            .ok_or(ApiKeyAdministrationFailure::PersistenceUnavailable)?
+            .try_into()
+            .map_err(|_| ApiKeyAdministrationFailure::PersistenceUnavailable)?,
+    ));
+    if count == 0 || count > 128 || bytes.len() != 34 + count * 90 {
+        return Err(ApiKeyAdministrationFailure::PersistenceUnavailable);
+    }
+    let mut credentials = Vec::new();
+    credentials
+        .try_reserve_exact(count)
+        .map_err(|_| ApiKeyAdministrationFailure::CapacityExceeded)?;
+    for index in 0..count {
+        let offset = 34 + index * 90;
+        let principal = PrincipalId::from_bytes(
+            bytes
+                .get(offset..offset + 16)
+                .ok_or(ApiKeyAdministrationFailure::PersistenceUnavailable)?
+                .try_into()
+                .map_err(|_| ApiKeyAdministrationFailure::PersistenceUnavailable)?,
+        )
+        .map_err(|_| ApiKeyAdministrationFailure::PersistenceUnavailable)?;
+        let scope = bytes
+            .get(offset + 16)
+            .copied()
+            .ok_or(ApiKeyAdministrationFailure::PersistenceUnavailable)?;
+        let active = match bytes.get(offset + 17).copied() {
+            Some(0) => false,
+            Some(1) => true,
+            _ => return Err(ApiKeyAdministrationFailure::PersistenceUnavailable),
+        };
+        let expiry = u64::from_be_bytes(
+            bytes
+                .get(offset + 18..offset + 26)
+                .ok_or(ApiKeyAdministrationFailure::PersistenceUnavailable)?
+                .try_into()
+                .map_err(|_| ApiKeyAdministrationFailure::PersistenceUnavailable)?,
+        );
+        let salt: [u8; 32] = bytes
+            .get(offset + 26..offset + 58)
+            .ok_or(ApiKeyAdministrationFailure::PersistenceUnavailable)?
+            .try_into()
+            .map_err(|_| ApiKeyAdministrationFailure::PersistenceUnavailable)?;
+        let hash: [u8; 32] = bytes
+            .get(offset + 58..offset + 90)
+            .ok_or(ApiKeyAdministrationFailure::PersistenceUnavailable)?
+            .try_into()
+            .map_err(|_| ApiKeyAdministrationFailure::PersistenceUnavailable)?;
+        let credential = CatalogCredential::new(
+            principal,
+            scope,
+            active,
+            (expiry != 0).then_some(expiry),
+            salt,
+            hash,
+        )
+        .map_err(map_catalog)?;
+        if credentials
+            .iter()
+            .any(|prior: &CatalogCredential| prior.principal() == credential.principal())
+        {
+            return Err(ApiKeyAdministrationFailure::PersistenceUnavailable);
+        }
+        credentials.push(credential);
+    }
+    Ok((
+        tenant,
+        TenantKeyring {
+            generation,
+            credentials,
+        },
+    ))
+}
+
+fn encode_tenant_keyring(
+    tenant: TenantId,
+    generation: u64,
+    credentials: &[CatalogCredential],
+) -> Result<Vec<u8>, ApiKeyAdministrationFailure> {
+    if generation == 0 || credentials.is_empty() || credentials.len() > 128 {
+        return Err(ApiKeyAdministrationFailure::CredentialUnavailable);
+    }
+    let mut encoded = Vec::new();
+    encoded
+        .try_reserve_exact(34 + credentials.len() * 90)
+        .map_err(|_| ApiKeyAdministrationFailure::CapacityExceeded)?;
+    encoded.extend_from_slice(&TENANT_KEYRING_MAGIC);
+    encoded.extend_from_slice(&tenant.to_bytes());
+    encoded.extend_from_slice(&generation.to_be_bytes());
+    encoded.extend_from_slice(
+        &u16::try_from(credentials.len())
+            .map_err(|_| ApiKeyAdministrationFailure::CapacityExceeded)?
+            .to_be_bytes(),
+    );
+    for credential in credentials {
+        encoded.extend_from_slice(&credential.principal().to_bytes());
+        encoded.push(credential.scope_code());
+        encoded.push(u8::from(credential.is_active()));
+        encoded.extend_from_slice(
+            &credential
+                .expires_at_unix_seconds()
+                .unwrap_or(0)
+                .to_be_bytes(),
+        );
+        let (salt, hash) = credential.salted_hash();
+        encoded.extend_from_slice(&salt);
+        encoded.extend_from_slice(&hash);
+    }
+    Ok(encoded)
+}
+
+fn commit_tenant_keyring(
+    catalog: &Catalog<'_>,
+    snapshot: &CatalogSnapshot,
+    tenant: TenantId,
+    replacement: Vec<u8>,
+    audit_fields: MutationAudit,
+    request_digest: [u8; 32],
+) -> Result<(), ApiKeyAdministrationFailure> {
+    let mut objects = Vec::new();
+    for object_id in snapshot.object_identities() {
+        let bytes = snapshot
+            .object(object_id)
+            .map_err(map_catalog)?
+            .ok_or(ApiKeyAdministrationFailure::PersistenceUnavailable)?;
+        if bytes.starts_with(&TENANT_KEYRING_MAGIC) && decode_tenant_keyring(bytes)?.0 == tenant {
+            continue;
+        }
+        objects.push(CatalogObject::new(bytes.to_vec()).map_err(map_catalog)?);
+    }
+    objects.push(CatalogObject::new(replacement).map_err(map_catalog)?);
+    let mut audit = Vec::with_capacity(98);
+    audit.extend_from_slice(b"POSKEY01");
+    audit.push(match audit_fields.action {
+        ApiKeyLifecycleAction::Create => 1,
+        ApiKeyLifecycleAction::Rotate => 2,
+        ApiKeyLifecycleAction::Revoke => 3,
+    });
+    audit.extend_from_slice(&audit_fields.actor.to_bytes());
+    audit.extend_from_slice(&audit_fields.principal.to_bytes());
+    audit.extend_from_slice(&audit_fields.target.to_bytes());
+    audit.push(audit_fields.scope);
+    audit.extend_from_slice(
+        &audit_fields
+            .expires_at_unix_seconds
+            .unwrap_or(0)
+            .to_be_bytes(),
+    );
+    audit.extend_from_slice(&audit_fields.expected.get().to_be_bytes());
+    audit.extend_from_slice(&audit_fields.generation.get().to_be_bytes());
+    audit.extend_from_slice(&audit_fields.idempotency.to_bytes());
+    catalog
+        .commit_prepared(
+            snapshot.identity(),
+            CatalogProposal::new(
+                TransactionId::new(audit_fields.idempotency.to_bytes()).map_err(map_catalog)?,
+                snapshot
+                    .format_epoch()
+                    .ok_or(ApiKeyAdministrationFailure::PersistenceUnavailable)?,
+                objects,
+            )
+            .map_err(map_catalog)?,
+            AuditIntent::new(audit).map_err(map_catalog)?,
+            request_digest,
+        )
+        .map_err(map_catalog)?;
+    Ok(())
+}
+
+fn tenant_create_request_digest(
+    idempotency: AdministrativeIdempotencyKey,
+    actor: PrincipalId,
+    tenant: TenantId,
+    scope: Scope,
+    expires_at_unix_seconds: Option<u64>,
+    expected: ResourceGeneration,
+) -> Result<[u8; 32], ApiKeyAdministrationFailure> {
+    let scope = scope_code(scope).ok_or(ApiKeyAdministrationFailure::Unauthorized)?;
+    let mut digest = Sha256::new();
+    digest.update(b"positron-tenant-api-key-create-request-v1");
+    digest.update(idempotency.to_bytes());
+    digest.update(actor.to_bytes());
+    digest.update(tenant.to_bytes());
+    digest.update([scope]);
+    digest.update(expires_at_unix_seconds.unwrap_or(0).to_be_bytes());
+    digest.update(expected.get().to_be_bytes());
+    Ok(digest.finalize().into())
+}
+
+fn tenant_rotate_request_digest(
+    idempotency: AdministrativeIdempotencyKey,
+    actor: PrincipalId,
+    tenant: TenantId,
+    predecessor: PrincipalId,
+    scope: u8,
+    expires_at_unix_seconds: Option<u64>,
+    expected: ResourceGeneration,
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"positron-tenant-api-key-rotate-request-v1");
+    digest.update(idempotency.to_bytes());
+    digest.update(actor.to_bytes());
+    digest.update(tenant.to_bytes());
+    digest.update(predecessor.to_bytes());
+    digest.update([scope]);
+    digest.update(expires_at_unix_seconds.unwrap_or(0).to_be_bytes());
+    digest.update(expected.get().to_be_bytes());
+    digest.finalize().into()
+}
+
+fn tenant_revoke_request_digest(
+    idempotency: AdministrativeIdempotencyKey,
+    actor: PrincipalId,
+    tenant: TenantId,
+    principal: PrincipalId,
+    scope: u8,
+    expires_at_unix_seconds: Option<u64>,
+    expected: ResourceGeneration,
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"positron-tenant-api-key-revoke-request-v1");
+    digest.update(idempotency.to_bytes());
+    digest.update(actor.to_bytes());
+    digest.update(tenant.to_bytes());
+    digest.update(principal.to_bytes());
+    digest.update([scope]);
+    digest.update(expires_at_unix_seconds.unwrap_or(0).to_be_bytes());
+    digest.update(expected.get().to_be_bytes());
+    digest.finalize().into()
+}
+
+fn tenant_key_replay(
+    catalog: &Catalog<'_>,
+    tenant: TenantId,
+    idempotency: AdministrativeIdempotencyKey,
+    actor: PrincipalId,
+    scope: Scope,
+    expires_at_unix_seconds: Option<u64>,
+    expected: ResourceGeneration,
+) -> Result<ApiKeyCreation, ApiKeyAdministrationFailure> {
+    let snapshot = catalog.pin().map_err(map_catalog)?;
+    replay_tenant_creation(
+        catalog,
+        &snapshot,
+        tenant,
+        idempotency,
+        actor,
+        scope,
+        expires_at_unix_seconds,
+        expected,
+    )?
+    .ok_or(ApiKeyAdministrationFailure::IdempotencyConflict)
+}
+
+fn replay_tenant_creation(
+    catalog: &Catalog<'_>,
+    snapshot: &CatalogSnapshot,
+    tenant: TenantId,
+    idempotency: AdministrativeIdempotencyKey,
+    actor: PrincipalId,
+    scope: Scope,
+    expires_at_unix_seconds: Option<u64>,
+    expected: ResourceGeneration,
+) -> Result<Option<ApiKeyCreation>, ApiKeyAdministrationFailure> {
+    let keyring = tenant_keyring(&snapshot, tenant)?;
+    let Some(audit) = replay_entry(catalog, idempotency)? else {
+        return Ok(None);
+    };
+    if audit.action() != ApiKeyLifecycleAction::Create
+        || audit.actor_id() != actor
+        || audit.scope() != scope
+        || audit.expires_at_unix_seconds() != expires_at_unix_seconds
+        || audit.expected_generation() != expected
+    {
+        return Err(ApiKeyAdministrationFailure::IdempotencyConflict);
+    }
+    if !keyring.credentials.iter().any(|credential| {
+        credential.principal() == audit.principal_id()
+            && scope_from_code(credential.scope_code()) == Some(scope)
+            && credential.expires_at_unix_seconds() == expires_at_unix_seconds
+    }) {
+        return Err(ApiKeyAdministrationFailure::PersistenceUnavailable);
+    }
+    Ok(Some(ApiKeyCreation {
+        principal: audit.principal_id(),
+        secret: None,
+    }))
 }
 
 fn credential_material(
@@ -722,7 +1617,9 @@ fn commit(
     audit.extend_from_slice(&audit_fields.idempotency.to_bytes());
     let proposal = CatalogProposal::new(
         TransactionId::new(audit_fields.idempotency.to_bytes()).map_err(map_catalog)?,
-        FormatEpoch::CATALOG_V1,
+        snapshot
+            .format_epoch()
+            .ok_or(ApiKeyAdministrationFailure::PersistenceUnavailable)?,
         objects,
     )
     .map_err(map_catalog)?;

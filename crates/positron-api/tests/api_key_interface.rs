@@ -215,7 +215,6 @@ fn key_request_checks_mutation_preconditions_and_response_redaction() {
         r#"{"action":"scope_inspect"}"#,
         r#"{"action":"rotate","principal":"bad"}"#,
         r#"{"action":"list","expires_at_unix_seconds":1}"#,
-        r#"{"action":"list","target_tenant":"22222222-2222-2222-2222-222222222222"}"#,
         r#"{"action":"create","scope":"custom"}"#,
         r#"{"action":"create","scope":"query","expected_generation":1,"idempotency_key":"01010101-0101-0101-0101-010101010101","target_tenant":"not-a-tenant"}"#,
     ] {
@@ -295,4 +294,27 @@ fn canonical_key_create_can_name_an_explicit_administrative_target_tenant() {
         None,
         "the legacy create constructor retains authenticated tenant selection"
     );
+}
+
+#[test]
+fn canonical_key_lifecycle_actions_can_name_an_explicit_administrative_target_tenant() {
+    let tenant = "22222222-2222-2222-2222-222222222222".to_owned();
+    let principal = "33333333-3333-3333-3333-333333333333".to_owned();
+    let list = ApiKeyRequest::list_for_tenant(tenant.clone());
+    assert_eq!(list.action(), KeyAction::List);
+    assert_eq!(list.target_tenant(), Some(tenant.as_str()));
+    assert!(list.encode().is_ok());
+    let inspect = ApiKeyRequest::inspect_for_tenant(principal.clone(), tenant.clone());
+    assert_eq!(inspect.action(), KeyAction::ScopeInspect);
+    assert_eq!(inspect.target_tenant(), Some(tenant.as_str()));
+    let rotation = ApiKeyRequest::mutation_for_tenant(
+        KeyAction::Rotate,
+        principal,
+        tenant.clone(),
+        2,
+        "01010101-0101-0101-0101-010101010101".to_owned(),
+    )
+    .expect("target rotation request");
+    assert_eq!(rotation.target_tenant(), Some(tenant.as_str()));
+    assert!(rotation.encode().is_ok());
 }

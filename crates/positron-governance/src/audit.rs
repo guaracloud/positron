@@ -20,6 +20,8 @@ const TENANT_QUOTA_MAGIC: [u8; 8] = *b"POSQUO01";
 const KEY_LIFECYCLE_MAGIC: [u8; 8] = *b"POSKEY01";
 const LISTENER_TRANSPORT_MAGIC: [u8; 8] = *b"POSTPT01";
 const TENANT_LIFECYCLE_MAGIC: [u8; 8] = *b"POSTEN01";
+const TENANT_CREATION_MAGIC: [u8; 8] = *b"POSTNA01";
+const FORMAT_MIGRATION_MAGIC: [u8; 8] = *b"POSFMT01";
 
 /// Bounded, non-secret metadata for the initial instance operation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -63,6 +65,8 @@ pub enum GovernanceAuditEntry {
     ApiKeyLifecycle(ApiKeyLifecycleAuditEntry),
     ListenerTransport(ListenerTransportAuditEntry),
     TenantLifecycle(TenantLifecycleAuditEntry),
+    TenantCreation(TenantCreationAuditEntry),
+    CatalogFormatMigration(CatalogFormatMigrationAuditEntry),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -77,6 +81,28 @@ pub struct ApiKeyLifecycleAuditEntry {
     expected_generation: ResourceGeneration,
     generation: ResourceGeneration,
     idempotency_key: AdministrativeIdempotencyKey,
+}
+
+/// Redacted evidence for one committed tenant registry entry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TenantCreationAuditEntry {
+    position: u64,
+    idempotency_key: AdministrativeIdempotencyKey,
+    actor: PrincipalId,
+    tenant: TenantId,
+    expected_generation: ResourceGeneration,
+    generation: ResourceGeneration,
+    request_digest: [u8; 32],
+}
+
+/// Redacted evidence for the one-way catalog representation publication.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatalogFormatMigrationAuditEntry {
+    position: u64,
+    idempotency_key: AdministrativeIdempotencyKey,
+    actor: PrincipalId,
+    from: u32,
+    to: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -278,6 +304,8 @@ impl GovernanceAuditEntry {
             Self::ApiKeyLifecycle(entry) => entry.position,
             Self::ListenerTransport(entry) => entry.position,
             Self::TenantLifecycle(entry) => entry.position,
+            Self::TenantCreation(entry) => entry.position,
+            Self::CatalogFormatMigration(entry) => entry.position,
         }
     }
 
@@ -296,6 +324,8 @@ impl GovernanceAuditEntry {
             },
             Self::ListenerTransport(entry) => entry.action(),
             Self::TenantLifecycle(_) => "tenant.lifecycle.transition",
+            Self::TenantCreation(_) => "tenant.create",
+            Self::CatalogFormatMigration(_) => "catalog.format.migrate",
         }
     }
 
@@ -310,6 +340,8 @@ impl GovernanceAuditEntry {
             Self::ApiKeyLifecycle(_) => "succeeded",
             Self::ListenerTransport(entry) => entry.outcome(),
             Self::TenantLifecycle(_) => "succeeded",
+            Self::TenantCreation(_) => "succeeded",
+            Self::CatalogFormatMigration(_) => "succeeded",
         }
     }
 
@@ -323,7 +355,9 @@ impl GovernanceAuditEntry {
             | Self::SchemaCheckpoint(_)
             | Self::ApiKeyLifecycle(_)
             | Self::ListenerTransport(_)
-            | Self::TenantLifecycle(_) => None,
+            | Self::TenantLifecycle(_)
+            | Self::TenantCreation(_)
+            | Self::CatalogFormatMigration(_) => None,
         }
     }
 
@@ -337,7 +371,9 @@ impl GovernanceAuditEntry {
             | Self::SchemaCheckpoint(_)
             | Self::ApiKeyLifecycle(_)
             | Self::ListenerTransport(_)
-            | Self::TenantLifecycle(_) => None,
+            | Self::TenantLifecycle(_)
+            | Self::TenantCreation(_)
+            | Self::CatalogFormatMigration(_) => None,
         }
     }
 
@@ -351,7 +387,9 @@ impl GovernanceAuditEntry {
             | Self::TenantQuotaUpdate(_)
             | Self::ApiKeyLifecycle(_)
             | Self::ListenerTransport(_)
-            | Self::TenantLifecycle(_) => None,
+            | Self::TenantLifecycle(_)
+            | Self::TenantCreation(_)
+            | Self::CatalogFormatMigration(_) => None,
         }
     }
 
@@ -365,7 +403,9 @@ impl GovernanceAuditEntry {
             | Self::TenantQuotaUpdate(_)
             | Self::SchemaCheckpoint(_)
             | Self::ListenerTransport(_)
-            | Self::TenantLifecycle(_) => None,
+            | Self::TenantLifecycle(_)
+            | Self::TenantCreation(_)
+            | Self::CatalogFormatMigration(_) => None,
         }
     }
 
@@ -379,7 +419,9 @@ impl GovernanceAuditEntry {
             | Self::TenantQuotaUpdate(_)
             | Self::SchemaCheckpoint(_)
             | Self::ApiKeyLifecycle(_)
-            | Self::TenantLifecycle(_) => None,
+            | Self::TenantLifecycle(_)
+            | Self::TenantCreation(_)
+            | Self::CatalogFormatMigration(_) => None,
         }
     }
 
@@ -393,7 +435,9 @@ impl GovernanceAuditEntry {
             | Self::TenantQuotaUpdate(_)
             | Self::SchemaCheckpoint(_)
             | Self::ApiKeyLifecycle(_)
-            | Self::ListenerTransport(_) => None,
+            | Self::ListenerTransport(_)
+            | Self::TenantCreation(_)
+            | Self::CatalogFormatMigration(_) => None,
         }
     }
 
@@ -407,7 +451,9 @@ impl GovernanceAuditEntry {
             | Self::SchemaCheckpoint(_)
             | Self::ApiKeyLifecycle(_)
             | Self::ListenerTransport(_)
-            | Self::TenantLifecycle(_) => None,
+            | Self::TenantLifecycle(_)
+            | Self::TenantCreation(_)
+            | Self::CatalogFormatMigration(_) => None,
         }
     }
 
@@ -606,6 +652,67 @@ impl GovernanceAuditEntry {
                 idempotency_key: AdministrativeIdempotencyKey::new(transaction_id)
                     .map_err(|_| IdentityFailure)?,
             }));
+        }
+        if intent.starts_with(&TENANT_CREATION_MAGIC) {
+            let mut cursor = Cursor::new(intent);
+            if cursor.take_array::<8>()? != TENANT_CREATION_MAGIC {
+                return Err(IdentityFailure);
+            }
+            let idempotency_key = AdministrativeIdempotencyKey::new(cursor.take_array()?)
+                .map_err(|_| IdentityFailure)?;
+            if idempotency_key.to_bytes() != transaction_id {
+                return Err(IdentityFailure);
+            }
+            let actor =
+                PrincipalId::from_bytes(cursor.take_array()?).map_err(|_| IdentityFailure)?;
+            let tenant = TenantId::from_bytes(cursor.take_array()?).map_err(|_| IdentityFailure)?;
+            let expected_generation =
+                ResourceGeneration::new(cursor.take_u64()?).map_err(|_| IdentityFailure)?;
+            let generation =
+                ResourceGeneration::new(cursor.take_u64()?).map_err(|_| IdentityFailure)?;
+            let request_digest = cursor.take_array()?;
+            if expected_generation.get().checked_add(1) != Some(generation.get())
+                || request_digest.iter().all(|byte| *byte == 0)
+                || !cursor.is_empty()
+            {
+                return Err(IdentityFailure);
+            }
+            return Ok(Self::TenantCreation(TenantCreationAuditEntry {
+                position,
+                idempotency_key,
+                actor,
+                tenant,
+                expected_generation,
+                generation,
+                request_digest,
+            }));
+        }
+        if intent.starts_with(&FORMAT_MIGRATION_MAGIC) {
+            let mut cursor = Cursor::new(intent);
+            if cursor.take_array::<8>()? != FORMAT_MIGRATION_MAGIC {
+                return Err(IdentityFailure);
+            }
+            let idempotency_key = AdministrativeIdempotencyKey::new(cursor.take_array()?)
+                .map_err(|_| IdentityFailure)?;
+            if idempotency_key.to_bytes() != transaction_id {
+                return Err(IdentityFailure);
+            }
+            let actor =
+                PrincipalId::from_bytes(cursor.take_array()?).map_err(|_| IdentityFailure)?;
+            let from = u32::from_be_bytes(cursor.take_array()?);
+            let to = u32::from_be_bytes(cursor.take_array()?);
+            if from != 1 || to != 2 || !cursor.is_empty() {
+                return Err(IdentityFailure);
+            }
+            return Ok(Self::CatalogFormatMigration(
+                CatalogFormatMigrationAuditEntry {
+                    position,
+                    idempotency_key,
+                    actor,
+                    from,
+                    to,
+                },
+            ));
         }
         if intent.starts_with(&TENANT_LIFECYCLE_MAGIC) {
             let mut cursor = Cursor::new(intent);

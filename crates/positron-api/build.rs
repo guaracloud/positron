@@ -115,6 +115,8 @@ fn generate_tenant_quota_client(
 use std::io::Read;
 use std::time::Duration;
 
+pub const MAX_REQUEST_BYTES: usize = {request_limit};
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TenantQuotaServiceClientFailure {{
     InvalidRequest,
@@ -154,7 +156,7 @@ impl TenantQuotaServiceClient {{
     }}
     pub fn update(&self, bearer: &str, request: &super::TenantQuotaUpdateRequest) -> Result<super::TenantQuotaUpdateResponse, TenantQuotaServiceClientFailure> {{
         let body = request.encode().map_err(|_| TenantQuotaServiceClientFailure::InvalidRequest)?;
-        if body.len() > {request_limit} {{ return Err(TenantQuotaServiceClientFailure::Transport); }}
+        if body.len() > MAX_REQUEST_BYTES {{ return Err(TenantQuotaServiceClientFailure::Transport); }}
         let response = self.client.post(format!("{{}}{path}", self.endpoint)).bearer_auth(bearer).header(reqwest::header::CONTENT_TYPE, "application/json").body(body).send().map_err(|_| TenantQuotaServiceClientFailure::Transport)?;
         let status = response.status().as_u16();
         let mut bytes = Vec::with_capacity({response_limit});

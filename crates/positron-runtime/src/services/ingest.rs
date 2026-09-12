@@ -21,8 +21,9 @@ pub(super) fn ingest_authenticated<'authority>(
 ) -> Result<IngestRequestOutcome, ServiceFailure> {
     services.revalidate_ingest_context(context)?;
     let instance = &services.instance;
+    let tenant = super::context_tenant(context)?;
     let _drain = instance
-        .enter_ingest_finalization()
+        .enter_ingest_finalization_for(tenant)
         .map_err(|_| ServiceFailure::Unauthorized)?;
     services.revalidate_ingest_context(context)?;
     let batch = OtlpLogsReceiver::with_value_limit_profile(instance.value_limit_profile)
@@ -38,17 +39,18 @@ pub(super) fn ingest_native_batch(
 ) -> Result<IngestRequestOutcome, ServiceFailure> {
     services.revalidate_ingest_context(context)?;
     let instance = &services.instance;
+    let tenant = super::context_tenant(context)?;
     let _drain = instance
-        .enter_ingest_finalization()
+        .enter_ingest_finalization_for(tenant)
         .map_err(|_| ServiceFailure::Unauthorized)?;
     services.revalidate_ingest_context(context)?;
     let policy = services
-        .ingest_policy
+        .tenant_ingest_policy(tenant)?
         .pin()
         .map_err(|_| ServiceFailure::Internal)?;
     let schema = services
         .schema_sessions
-        .session(instance.tenant, instance.resource_governor())
+        .session(tenant, instance.resource_governor())
         .map_err(|_| ServiceFailure::CapacityUnavailable)?;
     let groups = batch
         .into_admission_groups(instance.admission_group_planner.as_ref())
@@ -91,6 +93,7 @@ pub(super) fn ingest_native_batch(
             &catalog,
             &policy,
             schema.clone(),
+            tenant,
             group,
         );
         outcomes.push(AdmissionGroupOutcome::new(shard, records, outcome));
@@ -106,8 +109,9 @@ pub(super) fn ingest_authenticated_traces<'authority>(
 ) -> Result<IngestRequestOutcome, ServiceFailure> {
     services.revalidate_ingest_context(context)?;
     let instance = &services.instance;
+    let tenant = super::context_tenant(context)?;
     let policy = services
-        .ingest_policy
+        .tenant_ingest_policy(tenant)?
         .pin()
         .map_err(|_| ServiceFailure::Internal)?;
     let batch = OtlpTracesReceiver::with_value_limit_profile(instance.value_limit_profile)
@@ -123,8 +127,9 @@ fn ingest_native_trace_batch(
 ) -> Result<IngestRequestOutcome, ServiceFailure> {
     services.revalidate_ingest_context(context)?;
     let instance = &services.instance;
+    let tenant = super::context_tenant(context)?;
     let _drain = instance
-        .enter_ingest_finalization()
+        .enter_ingest_finalization_for(tenant)
         .map_err(|_| ServiceFailure::Unauthorized)?;
     services.revalidate_ingest_context(context)?;
     let groups = batch
@@ -168,7 +173,7 @@ fn ingest_native_trace_batch(
     for group in groups {
         let shard = group.shard();
         let records = group.records();
-        let outcome = ingest_trace_group(instance, &identity, &catalog, group);
+        let outcome = ingest_trace_group(instance, &identity, &catalog, tenant, group);
         outcomes.push(AdmissionGroupOutcome::new(shard, records, outcome));
     }
     drop(catalog);
@@ -183,10 +188,11 @@ fn ingest_trace_group(
     instance: &crate::InitializedInstance,
     identity: &positron_governance::Identity,
     catalog: &Catalog<'_>,
+    tenant: positron_domain::identity::TenantId,
     group: positron_ingest::NativeSpanAdmissionGroup<'_>,
 ) -> IngestOutcome {
     let shard = group.shard();
-    let scope = SegmentScope::new(instance.tenant, SignalKind::Traces, shard);
+    let scope = SegmentScope::new(tenant, SignalKind::Traces, shard);
     let protection = match super::tenant_segment_key(instance, identity, scope) {
         Ok(protection) => protection,
         Err(_) => {
@@ -216,7 +222,7 @@ fn ingest_trace_group(
             return IngestOutcome::Retryable(IngestFailureCode::StorageUnavailable);
         },
     };
-    TraceIngest::new(&instance._authority, &ledger, instance.tenant, shard)
+    TraceIngest::new(&instance._authority, &ledger, tenant, shard)
         .accept(group.into_batch(), identity)
 }
 
@@ -247,10 +253,11 @@ fn ingest_group(
     catalog: &Catalog<'_>,
     policy: &positron_ingest::IngestPolicy,
     schema: positron_ingest::TenantSchemaSession,
+    tenant: positron_domain::identity::TenantId,
     group: positron_ingest::NativeLogAdmissionGroup<'_>,
 ) -> IngestOutcome {
     let shard = group.shard();
-    let scope = SegmentScope::new(instance.tenant, SignalKind::Logs, shard);
+    let scope = SegmentScope::new(tenant, SignalKind::Logs, shard);
     let Ok(protection) = super::tenant_segment_key(instance, identity, scope) else {
         return IngestOutcome::Retryable(IngestFailureCode::StorageUnavailable);
     };
@@ -273,13 +280,6 @@ fn ingest_group(
         Some(identity) => identity,
         None => return IngestOutcome::Retryable(IngestFailureCode::StorageUnavailable),
     };
-    LogIngest::new(
-        &instance._authority,
-        &ledger,
-        policy,
-        instance.tenant,
-        shard,
-        schema,
-    )
-    .accept(group.into_batch(), identity)
+    LogIngest::new(&instance._authority, &ledger, policy, tenant, shard, schema)
+        .accept(group.into_batch(), identity)
 }

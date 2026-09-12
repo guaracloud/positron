@@ -4,11 +4,15 @@ use std::fmt::{Display, Formatter};
 use positron_domain::identity::{PrincipalId, TenantId};
 use positron_kernel::{
     AuditIntent, Catalog, CatalogFailureCode, CatalogObject, CatalogProposal, CatalogSnapshot,
-    FormatEpoch, ResourceAmounts, StorageKernelResourceAuthority, TransactionId,
+    ResourceAmounts, StorageKernelResourceAuthority, TransactionId,
 };
 use sha2::{Digest, Sha256};
 
-use crate::{AdministrativeIdempotencyKey, AuthorizedContext, Identity, ResourceGeneration};
+use crate::{
+    AdministrativeIdempotencyKey, AuthorizedContext, Identity, ResourceGeneration,
+    TenantAdministrationFailure,
+    tenant_quota_record::{TenantQuotaState, replace_tenant_quota_record, tenant_quota_state},
+};
 
 const RECEIPT_MAGIC: [u8; 8] = *b"POSQUR01";
 const AUDIT_MAGIC: [u8; 8] = *b"POSQUO01";
@@ -126,27 +130,31 @@ impl TenantQuotaAdministration {
                 audit_position: audit_position(catalog, request.key)?,
             });
         }
-        let (governance_id, governance) = snapshot.governance_object().map_err(map_catalog)?;
-        if governance.tenant() != request.tenant {
-            return Err(TenantQuotaAdministrationFailure::new(
-                TenantQuotaAdministrationFailureCode::Unauthorized,
-            ));
-        }
-        if governance.quota_generation() != request.expected.get() {
-            return Err(TenantQuotaAdministrationFailure::stale(
-                ResourceGeneration::new(governance.quota_generation()).map_err(|_| corrupt())?,
-            ));
-        }
-        let mut objects = retained_objects(&snapshot, governance_id)?;
-        let successor = governance
-            .with_quota(generation.get(), request.weight, request.resources)
-            .map_err(map_catalog)?;
-        objects.try_reserve(2).map_err(|_| {
+        let mut objects = match tenant_quota_state(&snapshot, request.tenant)
+            .map_err(map_tenant_quota_record_failure)?
+        {
+            Some(current) => {
+                if current.generation != request.expected {
+                    return Err(TenantQuotaAdministrationFailure::stale(current, request));
+                }
+                replace_tenant_quota_record(
+                    &snapshot,
+                    request.tenant,
+                    TenantQuotaState {
+                        generation,
+                        weight: request.weight,
+                        resources: request.resources,
+                    },
+                )
+                .map_err(map_tenant_quota_record_failure)?
+            },
+            None => default_tenant_successor(&snapshot, request, generation)?,
+        };
+        objects.try_reserve(1).map_err(|_| {
             TenantQuotaAdministrationFailure::new(
                 TenantQuotaAdministrationFailureCode::PersistenceUnavailable,
             )
         })?;
-        objects.push(CatalogObject::new(successor).map_err(map_catalog)?);
         let semantics = QuotaSemantics {
             key: request.key,
             principal,
@@ -163,13 +171,17 @@ impl TenantQuotaAdministration {
                 snapshot.identity(),
                 CatalogProposal::new(
                     TransactionId::new(request.key.to_bytes()).map_err(map_catalog)?,
-                    FormatEpoch::CATALOG_V1,
+                    snapshot.format_epoch().ok_or_else(|| {
+                        TenantQuotaAdministrationFailure::new(
+                            TenantQuotaAdministrationFailureCode::PersistenceUnavailable,
+                        )
+                    })?,
                     objects,
                 )
                 .map_err(map_catalog)?,
                 Some(AuditIntent::new(encode(AUDIT_MAGIC, semantics)).map_err(map_catalog)?),
             )
-            .map_err(|failure| map_commit_failure(catalog, failure))?;
+            .map_err(|failure| map_commit_failure(catalog, request.tenant, failure))?;
         let audit_position = commit
             .governance_audit_record()
             .ok_or_else(|| {
@@ -227,21 +239,28 @@ pub enum TenantQuotaAdministrationFailureCode {
 #[derive(Debug)]
 pub struct TenantQuotaAdministrationFailure {
     code: TenantQuotaAdministrationFailureCode,
-    current: Option<ResourceGeneration>,
+    conflict: Option<TenantQuotaGenerationConflict>,
 }
 
 impl TenantQuotaAdministrationFailure {
     const fn new(code: TenantQuotaAdministrationFailureCode) -> Self {
         Self {
             code,
-            current: None,
+            conflict: None,
         }
     }
 
-    const fn stale(current: ResourceGeneration) -> Self {
+    fn stale(current: TenantQuotaState, request: TenantQuotaUpdateRequest) -> Self {
         Self {
             code: TenantQuotaAdministrationFailureCode::StaleResourceGeneration,
-            current: Some(current),
+            conflict: Some(TenantQuotaGenerationConflict::between(current, request)),
+        }
+    }
+
+    const fn stale_generation(current: ResourceGeneration) -> Self {
+        Self {
+            code: TenantQuotaAdministrationFailureCode::StaleResourceGeneration,
+            conflict: Some(TenantQuotaGenerationConflict::generation_only(current)),
         }
     }
 
@@ -251,8 +270,109 @@ impl TenantQuotaAdministrationFailure {
     }
 
     #[must_use]
-    pub const fn current_generation(&self) -> Option<ResourceGeneration> {
+    pub fn current_generation(&self) -> Option<ResourceGeneration> {
+        self.conflict
+            .map(TenantQuotaGenerationConflict::current_generation)
+    }
+
+    #[must_use]
+    pub const fn generation_conflict(&self) -> Option<TenantQuotaGenerationConflict> {
+        self.conflict
+    }
+}
+
+/// A stale quota precondition's current generation and redacted field-level
+/// difference. It deliberately never includes quota values or credentials.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TenantQuotaGenerationConflict {
+    current: ResourceGeneration,
+    changed_fields: u16,
+}
+
+impl TenantQuotaGenerationConflict {
+    const WEIGHT_BIT: u16 = 1;
+    const RESOURCE_START_BIT: u16 = 1 << 1;
+    const GENERATION_ONLY_BIT: u16 = 1 << 12;
+    const RESOURCE_NAMES: [&str; 11] = [
+        "memory_bytes",
+        "queue_slots",
+        "task_slots",
+        "buffer_cache_bytes",
+        "batch_items",
+        "lease_slots",
+        "retry_slots",
+        "io_permits",
+        "cpu_work_units",
+        "file_descriptors",
+        "disk_headroom_bytes",
+    ];
+
+    fn between(current: TenantQuotaState, request: TenantQuotaUpdateRequest) -> Self {
+        Self::from_parts(current, request.weight, request.resources)
+    }
+
+    fn from_parts(
+        current: TenantQuotaState,
+        requested_weight: u32,
+        requested_resources: [u64; 11],
+    ) -> Self {
+        let mut changed_fields = if current.weight == requested_weight {
+            0
+        } else {
+            Self::WEIGHT_BIT
+        };
+        for (index, (current, requested)) in current
+            .resources
+            .into_iter()
+            .zip(requested_resources)
+            .enumerate()
+        {
+            if current != requested {
+                changed_fields |= Self::RESOURCE_START_BIT << index;
+            }
+        }
+        if changed_fields == 0 {
+            changed_fields = Self::GENERATION_ONLY_BIT;
+        }
+        Self {
+            current: current.generation,
+            changed_fields,
+        }
+    }
+
+    const fn generation_only(current: ResourceGeneration) -> Self {
+        Self {
+            current,
+            changed_fields: Self::GENERATION_ONLY_BIT,
+        }
+    }
+
+    #[must_use]
+    pub const fn current_generation(self) -> ResourceGeneration {
         self.current
+    }
+
+    /// Renders only stable field names in canonical order; values stay
+    /// inside the authorized administration boundary.
+    #[must_use]
+    pub fn semantic_diff(self) -> String {
+        let mut rendered = String::with_capacity(192);
+        if self.changed_fields & Self::WEIGHT_BIT != 0 {
+            rendered.push_str("weight");
+        }
+        for (index, name) in Self::RESOURCE_NAMES.iter().enumerate() {
+            if self.changed_fields & (Self::RESOURCE_START_BIT << index) == 0 {
+                continue;
+            }
+            if !rendered.is_empty() {
+                rendered.push(',');
+            }
+            rendered.push_str(name);
+        }
+        if rendered.is_empty() {
+            rendered.push_str("resource_generation");
+        }
+        rendered
     }
 }
 
@@ -380,6 +500,41 @@ fn decode(bytes: &[u8]) -> Result<Receipt, TenantQuotaAdministrationFailure> {
     })
 }
 
+fn default_tenant_successor(
+    snapshot: &CatalogSnapshot,
+    request: TenantQuotaUpdateRequest,
+    generation: ResourceGeneration,
+) -> Result<Vec<CatalogObject>, TenantQuotaAdministrationFailure> {
+    let (governance_id, governance) = snapshot.governance_object().map_err(map_catalog)?;
+    if governance.tenant() != request.tenant {
+        return Err(TenantQuotaAdministrationFailure::new(
+            TenantQuotaAdministrationFailureCode::Unauthorized,
+        ));
+    }
+    if governance.quota_generation() != request.expected.get() {
+        return Err(TenantQuotaAdministrationFailure::stale(
+            TenantQuotaState {
+                generation: ResourceGeneration::new(governance.quota_generation())
+                    .map_err(|_| corrupt())?,
+                weight: governance.quota_weight(),
+                resources: governance.quota_resources(),
+            },
+            request,
+        ));
+    }
+    let mut objects = retained_objects(snapshot, governance_id)?;
+    let successor = governance
+        .with_quota(generation.get(), request.weight, request.resources)
+        .map_err(map_catalog)?;
+    objects.try_reserve(1).map_err(|_| {
+        TenantQuotaAdministrationFailure::new(
+            TenantQuotaAdministrationFailureCode::PersistenceUnavailable,
+        )
+    })?;
+    objects.push(CatalogObject::new(successor).map_err(map_catalog)?);
+    Ok(objects)
+}
+
 fn retained_objects(
     snapshot: &CatalogSnapshot,
     governance: positron_kernel::CatalogObjectId,
@@ -414,22 +569,49 @@ fn audit_position(
 
 fn map_commit_failure(
     catalog: &Catalog<'_>,
+    tenant: TenantId,
     failure: positron_kernel::CatalogFailure,
 ) -> TenantQuotaAdministrationFailure {
     if failure.code() != CatalogFailureCode::StaleGeneration {
         return map_catalog(failure);
     }
-    let current = catalog
-        .pin()
-        .map_err(map_catalog)
-        .and_then(|snapshot| snapshot.governance_object().map_err(map_catalog));
+    let current =
+        catalog.pin().map_err(map_catalog).and_then(|snapshot| {
+            match tenant_quota_state(&snapshot, tenant).map_err(map_tenant_quota_record_failure)? {
+                Some(state) => Ok(state.generation),
+                None => {
+                    let (_, governance) = snapshot.governance_object().map_err(map_catalog)?;
+                    if governance.tenant() != tenant {
+                        return Err(TenantQuotaAdministrationFailure::new(
+                            TenantQuotaAdministrationFailureCode::Unauthorized,
+                        ));
+                    }
+                    ResourceGeneration::new(governance.quota_generation()).map_err(|_| corrupt())
+                },
+            }
+        });
     match current {
-        Ok((_, governance)) => match ResourceGeneration::new(governance.quota_generation()) {
-            Ok(generation) => TenantQuotaAdministrationFailure::stale(generation),
-            Err(_) => corrupt(),
-        },
+        Ok(generation) => TenantQuotaAdministrationFailure::stale_generation(generation),
         Err(failure) => failure,
     }
+}
+
+fn map_tenant_quota_record_failure(
+    failure: TenantAdministrationFailure,
+) -> TenantQuotaAdministrationFailure {
+    let code = match failure {
+        TenantAdministrationFailure::Unauthorized => {
+            TenantQuotaAdministrationFailureCode::Unauthorized
+        },
+        TenantAdministrationFailure::InvalidInput
+        | TenantAdministrationFailure::DuplicateTenant
+        | TenantAdministrationFailure::StaleGeneration
+        | TenantAdministrationFailure::IdempotencyConflict
+        | TenantAdministrationFailure::PersistenceUnavailable => {
+            TenantQuotaAdministrationFailureCode::CorruptState
+        },
+    };
+    TenantQuotaAdministrationFailure::new(code)
 }
 
 fn corrupt() -> TenantQuotaAdministrationFailure {
@@ -476,5 +658,26 @@ mod tests {
                 "truncation at {length}"
             );
         }
+    }
+
+    #[test]
+    fn stale_quota_diff_names_only_changed_fields_in_canonical_order() {
+        let current = TenantQuotaState {
+            generation: ResourceGeneration::new(7).expect("generation"),
+            weight: 2,
+            resources: [11; 11],
+        };
+        let mut requested = [11; 11];
+        requested[0] = 12;
+        requested[10] = 13;
+        let conflict = TenantQuotaGenerationConflict::from_parts(current, 3, requested);
+        assert_eq!(conflict.current_generation().get(), 7);
+        assert_eq!(
+            conflict.semantic_diff(),
+            "weight,memory_bytes,disk_headroom_bytes"
+        );
+        assert!(!conflict.semantic_diff().contains("11"));
+        assert!(!conflict.semantic_diff().contains("12"));
+        assert!(!conflict.semantic_diff().contains("13"));
     }
 }

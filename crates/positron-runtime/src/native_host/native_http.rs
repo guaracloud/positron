@@ -84,14 +84,29 @@ fn route_tls_api<S: Read + Write>(
                 },
             }
         },
+        ("POST", positron_api::tenant_quotas::HTTP_PATH) => {
+            let services = services.ok_or_else(|| Response::empty(503))?;
+            let bearer = Zeroizing::new(head.bearer.take().ok_or_else(|| {
+                Response::json(401, "{\"code\":\"authentication_rejected\"}".to_owned())
+            })?);
+            let body = read_body(
+                stream,
+                head.content_length,
+                positron_api::tenant_quotas::MAX_REQUEST_BYTES,
+            )?;
+            tenant_quota_response(services, &bearer, &body)
+        },
         ("POST", "/v1/capabilities:negotiate") => {
             let services = services.ok_or_else(|| Response::empty(503))?;
             let body = read_body(stream, head.content_length, MAX_API_BODY_BYTES)?;
             Ok(capability_response(services.negotiate_capability(&body)))
         },
-        (_, positron_api::api_keys::HTTP_PATH | "/v1/capabilities:negotiate") => {
-            Ok(Response::empty(405))
-        },
+        (
+            _,
+            positron_api::api_keys::HTTP_PATH
+            | positron_api::tenant_quotas::HTTP_PATH
+            | "/v1/capabilities:negotiate",
+        ) => Ok(Response::empty(405)),
         _ => Ok(Response::empty(404)),
     }
 }
@@ -144,6 +159,18 @@ fn route(
                 },
             }
         },
+        (ListenerRole::Api, "POST", positron_api::tenant_quotas::HTTP_PATH) => {
+            let services = services.ok_or_else(|| Response::empty(503))?;
+            let bearer = Zeroizing::new(head.bearer.take().ok_or_else(|| {
+                Response::json(401, "{\"code\":\"authentication_rejected\"}".to_owned())
+            })?);
+            let body = read_body(
+                stream,
+                head.content_length,
+                positron_api::tenant_quotas::MAX_REQUEST_BYTES,
+            )?;
+            tenant_quota_response(services, &bearer, &body)
+        },
         (ListenerRole::Operations, "GET", "/health/live") => Ok(health_response(
             health.liveness() == Liveness::Live,
             "live",
@@ -178,11 +205,41 @@ fn route(
         (ListenerRole::Operations, _, "/health/live" | "/health/ready")
         | (ListenerRole::Api, _, "/v1/capabilities:negotiate")
         | (ListenerRole::Api, _, positron_api::api_keys::HTTP_PATH)
+        | (ListenerRole::Api, _, positron_api::tenant_quotas::HTTP_PATH)
         | (ListenerRole::OtlpHttp, _, "/v1/logs" | "/v1/traces") => Ok(Response::empty(405)),
         (ListenerRole::LokiPush, _, "/loki/api/v1/push" | "/otlp/v1/logs") => {
             Ok(Response::empty(405))
         },
         (ListenerRole::Control, _, _) | (_, _, _) => Ok(Response::empty(404)),
+    }
+}
+
+fn tenant_quota_response(
+    services: &ServiceHandle,
+    bearer: &str,
+    body: &[u8],
+) -> Result<Response, Response> {
+    match services.administer_tenant_quota(bearer, body) {
+        Ok(response) => Ok(Response {
+            status: 200,
+            content_type: "application/json",
+            body: serde_json::to_vec(&response).map_err(|_| Response::empty(500))?,
+            retry_after_seconds: None,
+        }),
+        Err(crate::services::tenant_quotas::TenantQuotaHttpFailure::Code(status, code)) => {
+            Ok(Response::json(status, format!("{{\"code\":\"{code}\"}}")))
+        },
+        Err(crate::services::tenant_quotas::TenantQuotaHttpFailure::StaleGeneration(conflict)) => {
+            Ok(Response::json(
+                409,
+                format!(
+                    "{{\"code\":\"stale_generation\",\"resource_generation\":{},\"semantic_diff\":{}}}",
+                    conflict.current_generation().get(),
+                    serde_json::to_string(&conflict.semantic_diff())
+                        .map_err(|_| Response::empty(500))?,
+                ),
+            ))
+        },
     }
 }
 

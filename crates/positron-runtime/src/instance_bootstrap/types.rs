@@ -57,8 +57,8 @@ struct QueryDrainState {
 }
 
 impl QueryDrainGate {
-    pub(super) fn new() -> Self {
-        Self {
+    pub(super) fn new() -> Arc<Self> {
+        Arc::new(Self {
             state: Mutex::new(QueryDrainState {
                 closing: false,
                 next_id: 0,
@@ -67,13 +67,13 @@ impl QueryDrainGate {
             changed: Condvar::new(),
             #[cfg(test)]
             transition_observer: Mutex::new(None),
-        }
+        })
     }
 
     fn enter(
-        &self,
+        self: &Arc<Self>,
         cancellation: QueryCancellation,
-    ) -> Result<QueryDrainPermit<'_>, BootstrapFailure> {
+    ) -> Result<QueryDrainPermit, BootstrapFailure> {
         let mut state = self
             .state
             .lock()
@@ -93,10 +93,13 @@ impl QueryDrainGate {
             .try_reserve(1)
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
         state.active.push((id, cancellation));
-        Ok(QueryDrainPermit { gate: self, id })
+        Ok(QueryDrainPermit {
+            gate: Arc::clone(self),
+            id,
+        })
     }
 
-    fn cancel_and_drain(&self) -> Result<QueryLifecycleDrainPermit<'_>, BootstrapFailure> {
+    fn cancel_and_drain(self: &Arc<Self>) -> Result<QueryLifecycleDrainPermit, BootstrapFailure> {
         let mut state = self
             .state
             .lock()
@@ -137,7 +140,9 @@ impl QueryDrainGate {
                 ));
             }
         }
-        Ok(QueryLifecycleDrainPermit { gate: self })
+        Ok(QueryLifecycleDrainPermit {
+            gate: Arc::clone(self),
+        })
     }
 
     #[cfg(test)]
@@ -168,12 +173,12 @@ fn wait_for_query_drain<'gate>(
     Ok((state, timed_out.timed_out()))
 }
 
-pub(crate) struct QueryDrainPermit<'gate> {
-    gate: &'gate QueryDrainGate,
+pub(crate) struct QueryDrainPermit {
+    gate: Arc<QueryDrainGate>,
     id: u64,
 }
 
-impl Drop for QueryDrainPermit<'_> {
+impl Drop for QueryDrainPermit {
     fn drop(&mut self) {
         let mut state = match self.gate.state.lock() {
             Ok(state) => state,
@@ -186,11 +191,11 @@ impl Drop for QueryDrainPermit<'_> {
     }
 }
 
-struct QueryLifecycleDrainPermit<'gate> {
-    gate: &'gate QueryDrainGate,
+struct QueryLifecycleDrainPermit {
+    gate: Arc<QueryDrainGate>,
 }
 
-impl Drop for QueryLifecycleDrainPermit<'_> {
+impl Drop for QueryLifecycleDrainPermit {
     fn drop(&mut self) {
         let mut state = match self.gate.state.lock() {
             Ok(state) => state,
@@ -202,8 +207,8 @@ impl Drop for QueryLifecycleDrainPermit<'_> {
 }
 
 impl IngestDrainGate {
-    pub(super) fn new() -> Self {
-        Self {
+    pub(super) fn new() -> Arc<Self> {
+        Arc::new(Self {
             state: Mutex::new(IngestDrainState {
                 lifecycle_transitioning: false,
                 in_flight: 0,
@@ -211,10 +216,10 @@ impl IngestDrainGate {
             changed: Condvar::new(),
             #[cfg(test)]
             transition_observer: Mutex::new(None),
-        }
+        })
     }
 
-    fn enter(&self) -> Result<IngestDrainPermit<'_>, BootstrapFailure> {
+    fn enter(self: &Arc<Self>) -> Result<IngestDrainPermit, BootstrapFailure> {
         let mut state = self
             .state
             .lock()
@@ -228,10 +233,12 @@ impl IngestDrainGate {
             .in_flight
             .checked_add(1)
             .ok_or_else(|| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
-        Ok(IngestDrainPermit { gate: self })
+        Ok(IngestDrainPermit {
+            gate: Arc::clone(self),
+        })
     }
 
-    fn close_and_drain(&self) -> Result<LifecycleDrainPermit<'_>, BootstrapFailure> {
+    fn close_and_drain(self: &Arc<Self>) -> Result<LifecycleDrainPermit, BootstrapFailure> {
         let deadline = Instant::now()
             .checked_add(LIFECYCLE_DRAIN_TIMEOUT)
             .ok_or_else(|| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
@@ -239,9 +246,9 @@ impl IngestDrainGate {
     }
 
     fn close_and_drain_before(
-        &self,
+        self: &Arc<Self>,
         deadline: Instant,
-    ) -> Result<LifecycleDrainPermit<'_>, BootstrapFailure> {
+    ) -> Result<LifecycleDrainPermit, BootstrapFailure> {
         let mut state = self
             .state
             .lock()
@@ -276,7 +283,9 @@ impl IngestDrainGate {
                 ));
             }
         }
-        Ok(LifecycleDrainPermit { gate: self })
+        Ok(LifecycleDrainPermit {
+            gate: Arc::clone(self),
+        })
     }
 
     #[cfg(test)]
@@ -307,11 +316,11 @@ fn wait_for_lifecycle_drain<'gate>(
     Ok((state, timed_out.timed_out()))
 }
 
-pub(crate) struct IngestDrainPermit<'gate> {
-    gate: &'gate IngestDrainGate,
+pub(crate) struct IngestDrainPermit {
+    gate: Arc<IngestDrainGate>,
 }
 
-impl Drop for IngestDrainPermit<'_> {
+impl Drop for IngestDrainPermit {
     fn drop(&mut self) {
         let mut state = match self.gate.state.lock() {
             Ok(state) => state,
@@ -322,11 +331,11 @@ impl Drop for IngestDrainPermit<'_> {
     }
 }
 
-struct LifecycleDrainPermit<'gate> {
-    gate: &'gate IngestDrainGate,
+struct LifecycleDrainPermit {
+    gate: Arc<IngestDrainGate>,
 }
 
-impl Drop for LifecycleDrainPermit<'_> {
+impl Drop for LifecycleDrainPermit {
     fn drop(&mut self) {
         let mut state = match self.gate.state.lock() {
             Ok(state) => state,
@@ -334,6 +343,233 @@ impl Drop for LifecycleDrainPermit<'_> {
         };
         state.lifecycle_transitioning = false;
         self.gate.changed.notify_all();
+    }
+}
+
+/// Bounded, tenant-keyed lifecycle drain gates for the tenants that are
+/// actually registered in the Catalog. The Catalog remains the lifecycle
+/// authority; this registry only prevents one tenant's transition from
+/// draining another tenant's data-plane work.
+pub(super) struct TenantDrainRegistry {
+    maximum: usize,
+    entries: Mutex<Vec<TenantDrainEntry>>,
+}
+
+struct TenantDrainEntry {
+    tenant: TenantId,
+    ingest: Arc<IngestDrainGate>,
+    query: Arc<QueryDrainGate>,
+    active: bool,
+}
+
+pub(super) struct TenantDrainEnrollment<'registry> {
+    registry: &'registry TenantDrainRegistry,
+    tenant: TenantId,
+    activated: bool,
+}
+
+impl TenantDrainRegistry {
+    pub(super) fn establish(
+        registered: &[TenantId],
+        maximum: u16,
+    ) -> Result<Self, BootstrapFailure> {
+        let maximum = usize::from(maximum);
+        if maximum == 0 || registered.is_empty() || registered.len() > maximum {
+            return Err(BootstrapFailure::new(
+                BootstrapFailureCode::ResourceUnavailable,
+            ));
+        }
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(registered.len())
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
+        for tenant in registered {
+            if entries
+                .iter()
+                .any(|entry: &TenantDrainEntry| entry.tenant == *tenant)
+            {
+                return Err(BootstrapFailure::new(
+                    BootstrapFailureCode::ResourceUnavailable,
+                ));
+            }
+            entries.push(TenantDrainEntry {
+                tenant: *tenant,
+                ingest: IngestDrainGate::new(),
+                query: QueryDrainGate::new(),
+                active: true,
+            });
+        }
+        Ok(Self {
+            maximum,
+            entries: Mutex::new(entries),
+        })
+    }
+
+    fn active_entry(
+        &self,
+        tenant: TenantId,
+    ) -> Result<(Arc<IngestDrainGate>, Arc<QueryDrainGate>), BootstrapFailure> {
+        let entries = self
+            .entries
+            .lock()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
+        let entry = entries
+            .iter()
+            .find(|entry| entry.tenant == tenant && entry.active)
+            .ok_or_else(|| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
+        Ok((Arc::clone(&entry.ingest), Arc::clone(&entry.query)))
+    }
+
+    pub(super) fn enter_ingest(
+        &self,
+        tenant: TenantId,
+    ) -> Result<IngestDrainPermit, BootstrapFailure> {
+        self.active_entry(tenant)?.0.enter()
+    }
+
+    pub(super) fn enter_query(
+        &self,
+        tenant: TenantId,
+        cancellation: QueryCancellation,
+    ) -> Result<QueryDrainPermit, BootstrapFailure> {
+        self.active_entry(tenant)?.1.enter(cancellation)
+    }
+
+    fn close_and_drain(&self, tenant: TenantId) -> Result<LifecycleDrainPermit, BootstrapFailure> {
+        self.active_entry(tenant)?.0.close_and_drain()
+    }
+
+    fn cancel_and_drain(
+        &self,
+        tenant: TenantId,
+    ) -> Result<QueryLifecycleDrainPermit, BootstrapFailure> {
+        self.active_entry(tenant)?.1.cancel_and_drain()
+    }
+
+    fn close_all_and_drain(&self) -> Result<Vec<LifecycleDrainPermit>, BootstrapFailure> {
+        let gates = self.active_gates()?;
+        let mut permits = Vec::new();
+        permits
+            .try_reserve_exact(gates.len())
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
+        for (ingest, _) in gates {
+            permits.push(ingest.close_and_drain()?);
+        }
+        Ok(permits)
+    }
+
+    fn cancel_all_and_drain(&self) -> Result<Vec<QueryLifecycleDrainPermit>, BootstrapFailure> {
+        let gates = self.active_gates()?;
+        let mut permits = Vec::new();
+        permits
+            .try_reserve_exact(gates.len())
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
+        for (_, query) in gates {
+            permits.push(query.cancel_and_drain()?);
+        }
+        Ok(permits)
+    }
+
+    fn active_gates(
+        &self,
+    ) -> Result<Vec<(Arc<IngestDrainGate>, Arc<QueryDrainGate>)>, BootstrapFailure> {
+        let entries = self
+            .entries
+            .lock()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
+        let mut gates = Vec::new();
+        gates
+            .try_reserve_exact(entries.len())
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
+        for entry in entries.iter().filter(|entry| entry.active) {
+            gates.push((Arc::clone(&entry.ingest), Arc::clone(&entry.query)));
+        }
+        Ok(gates)
+    }
+
+    pub(super) fn prepare_tenant(
+        &self,
+        tenant: TenantId,
+    ) -> Result<TenantDrainEnrollment<'_>, BootstrapFailure> {
+        let mut entries = self
+            .entries
+            .lock()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
+        if entries.len() >= self.maximum || entries.iter().any(|entry| entry.tenant == tenant) {
+            return Err(BootstrapFailure::new(
+                BootstrapFailureCode::ResourceUnavailable,
+            ));
+        }
+        entries
+            .try_reserve(1)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
+        entries.push(TenantDrainEntry {
+            tenant,
+            ingest: IngestDrainGate::new(),
+            query: QueryDrainGate::new(),
+            active: false,
+        });
+        Ok(TenantDrainEnrollment {
+            registry: self,
+            tenant,
+            activated: false,
+        })
+    }
+
+    #[cfg(test)]
+    fn install_ingest_transition_observer(
+        &self,
+        tenant: TenantId,
+        observer: std::sync::mpsc::Sender<()>,
+    ) -> Result<(), BootstrapFailure> {
+        self.active_entry(tenant)?
+            .0
+            .install_transition_observer(observer)
+    }
+
+    #[cfg(test)]
+    fn install_query_transition_observer(
+        &self,
+        tenant: TenantId,
+        observer: std::sync::mpsc::Sender<()>,
+    ) -> Result<(), BootstrapFailure> {
+        self.active_entry(tenant)?
+            .1
+            .install_transition_observer(observer)
+    }
+}
+
+impl TenantDrainEnrollment<'_> {
+    fn activate(&mut self) {
+        let mut entries = match self.registry.entries.lock() {
+            Ok(entries) => entries,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(entry) = entries
+            .iter_mut()
+            .find(|entry| entry.tenant == self.tenant && !entry.active)
+        {
+            entry.active = true;
+            self.activated = true;
+        }
+    }
+}
+
+impl Drop for TenantDrainEnrollment<'_> {
+    fn drop(&mut self) {
+        if self.activated {
+            return;
+        }
+        let mut entries = match self.registry.entries.lock() {
+            Ok(entries) => entries,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(index) = entries
+            .iter()
+            .position(|entry| entry.tenant == self.tenant && !entry.active)
+        {
+            entries.remove(index);
+        }
     }
 }
 
@@ -379,7 +615,7 @@ pub enum BootstrapFailureCode {
 pub struct BootstrapFailure {
     code: BootstrapFailureCode,
     lifecycle_generation_conflict: Option<positron_governance::TenantLifecycleGenerationConflict>,
-    quota_generation_conflict: Option<ResourceGeneration>,
+    quota_generation_conflict: Option<positron_governance::TenantQuotaGenerationConflict>,
 }
 
 impl BootstrapFailure {
@@ -401,11 +637,13 @@ impl BootstrapFailure {
         }
     }
 
-    const fn with_quota_generation_conflict(current: ResourceGeneration) -> Self {
+    const fn with_quota_generation_conflict(
+        conflict: positron_governance::TenantQuotaGenerationConflict,
+    ) -> Self {
         Self {
             code: BootstrapFailureCode::TenantQuotaStaleGeneration,
             lifecycle_generation_conflict: None,
-            quota_generation_conflict: Some(current),
+            quota_generation_conflict: Some(conflict),
         }
     }
 
@@ -423,6 +661,16 @@ impl BootstrapFailure {
 
     #[must_use]
     pub const fn quota_generation_conflict(&self) -> Option<ResourceGeneration> {
+        match self.quota_generation_conflict {
+            Some(conflict) => Some(conflict.current_generation()),
+            None => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn quota_generation_conflict_detail(
+        &self,
+    ) -> Option<positron_governance::TenantQuotaGenerationConflict> {
         self.quota_generation_conflict
     }
 }
@@ -556,11 +804,9 @@ pub struct InitializedInstance {
     pub(crate) instance: InstanceId,
     pub(crate) tenant: TenantId,
     pub(crate) logs_shard: positron_domain::routing::VirtualShardId,
-    pub(crate) ingest_policy: positron_governance::IngestPolicyAdministration,
     pub(crate) value_limit_profile: positron_domain::value::ValueLimitProfile,
     pub(crate) admission_group_planner: Arc<dyn positron_ingest::AdmissionGroupPlanner>,
-    pub(super) ingest_drain: IngestDrainGate,
-    pub(super) query_drain: QueryDrainGate,
+    pub(super) tenant_drains: TenantDrainRegistry,
     pub(super) tenant_slug: TenantSlug,
     pub(super) administrator: PrincipalId,
     pub(super) integrity_key_fingerprint: [u8; 32],
@@ -582,17 +828,23 @@ impl std::fmt::Debug for InitializedInstance {
 }
 
 impl InitializedInstance {
-    pub(crate) fn enter_ingest_finalization(
-        &self,
-    ) -> Result<IngestDrainPermit<'_>, BootstrapFailure> {
-        self.ingest_drain.enter()
+    pub(crate) fn enter_ingest_finalization(&self) -> Result<IngestDrainPermit, BootstrapFailure> {
+        self.enter_ingest_finalization_for(self.tenant)
     }
 
-    pub(crate) fn enter_query_execution(
+    pub(crate) fn enter_ingest_finalization_for(
         &self,
+        tenant: TenantId,
+    ) -> Result<IngestDrainPermit, BootstrapFailure> {
+        self.tenant_drains.enter_ingest(tenant)
+    }
+
+    pub(crate) fn enter_query_execution_for(
+        &self,
+        tenant: TenantId,
         cancellation: QueryCancellation,
-    ) -> Result<QueryDrainPermit<'_>, BootstrapFailure> {
-        self.query_drain.enter(cancellation)
+    ) -> Result<QueryDrainPermit, BootstrapFailure> {
+        self.tenant_drains.enter_query(tenant, cancellation)
     }
 
     #[cfg(test)]
@@ -600,7 +852,8 @@ impl InitializedInstance {
         &self,
         observer: std::sync::mpsc::Sender<()>,
     ) -> Result<(), BootstrapFailure> {
-        self.query_drain.install_transition_observer(observer)
+        self.tenant_drains
+            .install_query_transition_observer(self.tenant, observer)
     }
 
     #[cfg(test)]
@@ -608,7 +861,8 @@ impl InitializedInstance {
         &self,
         observer: std::sync::mpsc::Sender<()>,
     ) -> Result<(), BootstrapFailure> {
-        self.ingest_drain.install_transition_observer(observer)
+        self.tenant_drains
+            .install_ingest_transition_observer(self.tenant, observer)
     }
 
     pub(crate) fn durable_identity(
@@ -734,6 +988,37 @@ impl InitializedInstance {
         .map_err(map_api_key_failure)
     }
 
+    /// Provisions a scoped API key for an explicitly named tenant without
+    /// granting the system actor data-plane attribution for that tenant.
+    pub fn create_api_key_for_tenant(
+        &self,
+        actor: AuthorizedContext,
+        tenant: TenantId,
+        scope: Scope,
+        expires_at_unix_seconds: Option<u64>,
+        expected: ResourceGeneration,
+        idempotency: AdministrativeIdempotencyKey,
+    ) -> Result<ApiKeyCreation, BootstrapFailure> {
+        let secret = self
+            .key
+            .catalog_secret(self.instance)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
+        let catalog = Catalog::open(&self._authority, self.instance, secret)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        positron_governance::ApiKeyAdministration::create_for_tenant(
+            &catalog,
+            &self.key,
+            self.administrator,
+            actor,
+            tenant,
+            scope,
+            expires_at_unix_seconds,
+            expected,
+            idempotency,
+        )
+        .map_err(map_api_key_failure)
+    }
+
     /// Durably publishes a tenant quota successor and then applies its limits
     /// to future local admission. Existing reservations are retained by the
     /// Resource Governor's bounded quota-update contract.
@@ -786,7 +1071,6 @@ impl InitializedInstance {
         retention_seconds: u64,
         weight: u32,
         resources: [u64; 11],
-        expected: ResourceGeneration,
         idempotency: AdministrativeIdempotencyKey,
     ) -> Result<positron_governance::TenantCreation, BootstrapFailure> {
         let request = positron_governance::TenantCreateRequest::new(
@@ -797,7 +1081,6 @@ impl InitializedInstance {
             retention_seconds,
             weight,
             resources,
-            expected,
             idempotency,
         );
         let secret = self
@@ -815,6 +1098,7 @@ impl InitializedInstance {
         {
             return Ok(replay);
         }
+        let mut drain_enrollment = self.tenant_drains.prepare_tenant(tenant)?;
         let mut enrollment = self
             ._authority
             .prepare_tenant_enrollment(tenant, ResourceAmounts::new(resources))
@@ -834,6 +1118,7 @@ impl InitializedInstance {
         )
         .map_err(map_tenant_administration_failure)?;
         enrollment.activate();
+        drain_enrollment.activate();
         Ok(created)
     }
 
@@ -845,8 +1130,8 @@ impl InitializedInstance {
         actor: AuthorizedContext,
         idempotency: AdministrativeIdempotencyKey,
     ) -> Result<CatalogFormatMigration, BootstrapFailure> {
-        let _ingest_drain = self.ingest_drain.close_and_drain()?;
-        let _query_drain = self.query_drain.cancel_and_drain()?;
+        let _ingest_drain = self.tenant_drains.close_all_and_drain()?;
+        let _query_drain = self.tenant_drains.cancel_all_and_drain()?;
         let secret = self
             .key
             .catalog_secret(self.instance)
@@ -902,10 +1187,10 @@ impl InitializedInstance {
         {
             return Ok(replay);
         }
-        let _drain = self.ingest_drain.close_and_drain()?;
+        let _drain = self.tenant_drains.close_and_drain(tenant)?;
         let _query_drain = match target {
             TenantLifecycleState::Suspended | TenantLifecycleState::Purging => {
-                Some(self.query_drain.cancel_and_drain()?)
+                Some(self.tenant_drains.cancel_and_drain(tenant)?)
             },
             TenantLifecycleState::Active
             | TenantLifecycleState::ReadOnly
@@ -966,6 +1251,27 @@ impl InitializedInstance {
             .map_err(map_api_key_failure)
     }
 
+    /// Returns redacted descriptors for one explicitly targeted tenant.
+    pub fn list_api_keys_for_tenant(
+        &self,
+        actor: AuthorizedContext,
+        tenant: TenantId,
+    ) -> Result<Vec<positron_governance::ApiKeyDescriptor>, BootstrapFailure> {
+        let secret = self
+            .key
+            .catalog_secret(self.instance)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
+        let catalog = Catalog::open(&self._authority, self.instance, secret)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        positron_governance::ApiKeyAdministration::list_for_tenant(
+            &catalog,
+            self.administrator,
+            actor,
+            tenant,
+        )
+        .map_err(map_api_key_failure)
+    }
+
     /// Creates a successor credential without retiring its predecessor.  The
     /// caller must explicitly revoke the old key once dependent clients have
     /// switched, so a failed rollout never loses the only working key.
@@ -994,6 +1300,34 @@ impl InitializedInstance {
         .map_err(map_api_key_failure)
     }
 
+    /// Rotates a credential in one explicitly named tenant keyring.
+    pub fn rotate_api_key_for_tenant(
+        &self,
+        actor: AuthorizedContext,
+        tenant: TenantId,
+        predecessor: PrincipalId,
+        expected: ResourceGeneration,
+        idempotency: AdministrativeIdempotencyKey,
+    ) -> Result<ApiKeyCreation, BootstrapFailure> {
+        let secret = self
+            .key
+            .catalog_secret(self.instance)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
+        let catalog = Catalog::open(&self._authority, self.instance, secret)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        positron_governance::ApiKeyAdministration::rotate_for_tenant(
+            &catalog,
+            &self.key,
+            self.administrator,
+            actor,
+            tenant,
+            predecessor,
+            expected,
+            idempotency,
+        )
+        .map_err(map_api_key_failure)
+    }
+
     /// Immediately disables one tenant credential while retaining its redacted
     /// descriptor as permanent identity history.
     pub fn revoke_api_key(
@@ -1013,6 +1347,33 @@ impl InitializedInstance {
             &catalog,
             self.administrator,
             actor,
+            principal,
+            expected,
+            idempotency,
+        )
+        .map_err(map_api_key_failure)
+    }
+
+    /// Revokes a credential in one explicitly named tenant keyring.
+    pub fn revoke_api_key_for_tenant(
+        &self,
+        actor: AuthorizedContext,
+        tenant: TenantId,
+        principal: PrincipalId,
+        expected: ResourceGeneration,
+        idempotency: AdministrativeIdempotencyKey,
+    ) -> Result<(), BootstrapFailure> {
+        let secret = self
+            .key
+            .catalog_secret(self.instance)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
+        let catalog = Catalog::open(&self._authority, self.instance, secret)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        positron_governance::ApiKeyAdministration::revoke_for_tenant(
+            &catalog,
+            self.administrator,
+            actor,
+            tenant,
             principal,
             expected,
             idempotency,
@@ -1128,8 +1489,8 @@ fn map_tenant_lifecycle_failure(failure: TenantLifecycleAdministrationFailure) -
 fn map_tenant_quota_failure(
     failure: positron_governance::TenantQuotaAdministrationFailure,
 ) -> BootstrapFailure {
-    if let Some(current) = failure.current_generation() {
-        return BootstrapFailure::with_quota_generation_conflict(current);
+    if let Some(conflict) = failure.generation_conflict() {
+        return BootstrapFailure::with_quota_generation_conflict(conflict);
     }
     let code = match failure.code() {
         positron_governance::TenantQuotaAdministrationFailureCode::Unauthorized => {

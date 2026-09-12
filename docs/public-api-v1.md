@@ -61,10 +61,11 @@ Recovery is to correct malformed input, remove unknown fields, stay within the
 published bound, or select an API major and capability reported by the target.
 Read-only capability negotiation writes no durable state. Authenticated API-key lifecycle
 mutations publish one Catalog generation and the matching redacted Governance Audit record.
-An API-key create may carry `target_tenant`, an explicit administrative Tenant ID
-selected only by a System Administration principal. It provisions a tenant-bound
-principal through the ordinary lifecycle and never supplies data-plane attribution
-or system-administrator impersonation.
+An API-key lifecycle action may carry `target_tenant`, an explicit administrative
+Tenant ID selected only by a System Administration principal. It provisions,
+inspects, rotates, or revokes a tenant-bound principal through the ordinary
+lifecycle and never supplies data-plane attribution or system-administrator
+impersonation.
 
 ## Tenant quota updates
 
