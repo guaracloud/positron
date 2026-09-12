@@ -19,6 +19,7 @@ use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
 mod keys;
+mod tenant_quotas;
 
 const EXIT_OK: u8 = 0;
 const EXIT_CONFIGURATION: u8 = 2;
@@ -34,6 +35,13 @@ pub fn run_native(
     if arguments.peek().is_some_and(|argument| argument == "key") {
         arguments.next();
         return keys::run(arguments);
+    }
+    if arguments
+        .peek()
+        .is_some_and(|argument| argument == "tenant")
+    {
+        arguments.next();
+        return tenant_quotas::run(arguments);
     }
     match run(arguments, environment) {
         Ok(outcome) => exit_code(outcome),

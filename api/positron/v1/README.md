@@ -67,3 +67,21 @@ The client preserves only published failures: `invalid_request`, `authentication
 `administration_unavailable`. Malformed,
 oversized, or status-mismatched error responses are a bounded transport failure and do not echo
 their body.
+
+`TenantQuotaService.Update` is served by the authenticated `api` listener at
+`POST /v1/tenant-quotas:update`. A Tenant Administration bearer may mutate only its
+attributed control-plane tenant; `tenant` never provides data-plane attribution. The request
+contains an expected resource generation, idempotency key, positive weight, and eleven positive
+named resource limits: `memory_bytes`, `queue_slots`, `task_slots`, `buffer_cache_bytes`,
+`batch_items`, `lease_slots`, `retry_slots`, `io_permits`, `cpu_work_units`,
+`file_descriptors`, and `disk_headroom_bytes`. A successful update returns the published
+successor `resource_generation`. Replaying the same valid idempotency binding returns that
+successor without restoring obsolete live quota state.
+
+The quota CLI is `positron tenant quota update` and uses the same protected stdin credential and
+TLS defaults as `positron key`. It requires all eleven named limits, `--tenant`,
+`--expected-generation`, and `--idempotency-key`; plaintext needs explicit `--allow-plaintext`.
+Quota failures are `invalid_request` (400), `authentication_rejected` (401),
+`stale_generation` or `idempotency_conflict` (409), and `administration_unavailable` (503).
+A stale-generation body also carries the current nonzero `resource_generation` and a bounded,
+redacted `semantic_diff`, so a caller can recover without receiving quota values or credentials.

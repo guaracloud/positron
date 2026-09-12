@@ -3,7 +3,7 @@
   "info": {
     "title": "Positron API",
     "version": "v1",
-    "x-positron-schema-digest": "701583ffcc43d1cc3f379bc7b363d48ddb4679e25391a38d9c535f16349d2050"
+    "x-positron-schema-digest": "a659bf6816084271d7b01c19a7b0e34d0cbd4f23ce43c178f9415b46cefcbb1f"
   },
   "paths": {
     "/v1/capabilities:negotiate": {
@@ -109,6 +109,79 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ApiKeyFailure"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/tenant-quotas:update": {
+      "post": {
+        "operationId": "UpdateTenantQuota",
+        "security": [
+          {
+            "apiKeyBearer": []
+          }
+        ],
+        "x-positron-max-request-bytes": 1024,
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TenantQuotaUpdateRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Published successor quota resource generation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TenantQuotaUpdateResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Closed tenant quota administration refusal",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TenantQuotaFailure"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Closed tenant quota administration refusal",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TenantQuotaFailure"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Closed tenant quota administration refusal",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TenantQuotaFailure"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Closed tenant quota administration refusal",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TenantQuotaFailure"
                 }
               }
             }
@@ -537,6 +610,150 @@
             ]
           }
         }
+      },
+      "TenantQuotaUpdateRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "tenant",
+          "expected_generation",
+          "idempotency_key",
+          "weight",
+          "memory_bytes",
+          "queue_slots",
+          "task_slots",
+          "buffer_cache_bytes",
+          "batch_items",
+          "lease_slots",
+          "retry_slots",
+          "io_permits",
+          "cpu_work_units",
+          "file_descriptors",
+          "disk_headroom_bytes"
+        ],
+        "properties": {
+          "tenant": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Explicit control-plane tenant. TenantAdministration credentials may select only their attributed tenant."
+          },
+          "expected_generation": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "idempotency_key": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "weight": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65535
+          },
+          "memory_bytes": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "queue_slots": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "task_slots": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "buffer_cache_bytes": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "batch_items": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "lease_slots": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "retry_slots": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "io_permits": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "cpu_work_units": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "file_descriptors": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "disk_headroom_bytes": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      },
+      "TenantQuotaUpdateResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "resource_generation"
+        ],
+        "properties": {
+          "resource_generation": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      },
+      "TenantQuotaFailure": {
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "code"
+            ],
+            "properties": {
+              "code": {
+                "type": "string",
+                "enum": [
+                  "invalid_request",
+                  "authentication_rejected",
+                  "idempotency_conflict",
+                  "administration_unavailable"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "code",
+              "resource_generation",
+              "semantic_diff"
+            ],
+            "properties": {
+              "code": {
+                "const": "stale_generation"
+              },
+              "resource_generation": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "semantic_diff": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 1024,
+                "description": "Redacted description of the changed quota resource; it never contains quota values or credentials."
+              }
+            }
+          }
+        ]
       }
     },
     "securitySchemes": {

@@ -65,3 +65,22 @@ An API-key create may carry `target_tenant`, an explicit administrative Tenant I
 selected only by a System Administration principal. It provisions a tenant-bound
 principal through the ordinary lifecycle and never supplies data-plane attribution
 or system-administrator impersonation.
+
+## Tenant quota updates
+
+`POST /v1/tenant-quotas:update` updates one tenant's durable quota resource through a
+Tenant Administration bearer. The `tenant` value is an explicit control-plane target and must
+equal the bearer-attributed tenant; it cannot select data-plane attribution. The direct mutation
+requires a nonzero expected resource generation, an Administrative Idempotency Key, a positive
+weight, and eleven positive named limits: `memory_bytes`, `queue_slots`, `task_slots`,
+`buffer_cache_bytes`, `batch_items`, `lease_slots`, `retry_slots`, `io_permits`,
+`cpu_work_units`, `file_descriptors`, and `disk_headroom_bytes`. Success returns the published
+successor `resource_generation`; the same idempotency binding replays that successor without a
+second mutation.
+
+The operation uses stable `invalid_request` (400), `authentication_rejected` (401),
+`stale_generation` or `idempotency_conflict` (409), and `administration_unavailable` (503)
+responses. A stale-generation response includes the current `resource_generation` and a bounded
+redacted `semantic_diff`. The diff identifies a quota-resource change without exposing quota
+values or credentials. The native command is `positron tenant quota update`; it supplies its
+bearer on protected stdin and uses TLS unless explicitly passed `--allow-plaintext`.

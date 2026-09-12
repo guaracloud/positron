@@ -17,6 +17,34 @@ service ApiKeyService {
   rpc Manage(ApiKeyRequest) returns (ApiKeyResponse);
 }
 
+// Authenticated tenant-scoped quota administration. The bearer determines
+// authority and must be bound to the named control-plane tenant.
+service TenantQuotaService {
+  rpc Update(TenantQuotaUpdateRequest) returns (TenantQuotaUpdateResponse);
+}
+
+message TenantQuotaUpdateRequest {
+  string tenant = 1;
+  uint64 expected_generation = 2;
+  string idempotency_key = 3;
+  uint32 weight = 4;
+  uint64 memory_bytes = 5;
+  uint64 queue_slots = 6;
+  uint64 task_slots = 7;
+  uint64 buffer_cache_bytes = 8;
+  uint64 batch_items = 9;
+  uint64 lease_slots = 10;
+  uint64 retry_slots = 11;
+  uint64 io_permits = 12;
+  uint64 cpu_work_units = 13;
+  uint64 file_descriptors = 14;
+  uint64 disk_headroom_bytes = 15;
+}
+
+message TenantQuotaUpdateResponse {
+  uint64 resource_generation = 1;
+}
+
 message ApiKeyRequest {
   KeyAction action = 1;
   optional KeyScope scope = 2;

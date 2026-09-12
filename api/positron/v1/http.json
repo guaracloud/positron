@@ -1,5 +1,5 @@
 {
-  "schema_digest": "701583ffcc43d1cc3f379bc7b363d48ddb4679e25391a38d9c535f16349d2050",
+  "schema_digest": "a659bf6816084271d7b01c19a7b0e34d0cbd4f23ce43c178f9415b46cefcbb1f",
   "max_request_bytes": 64,
   "unknown_fields": "reject",
   "enums": {
@@ -377,6 +377,39 @@
         ],
         "503": "administration_unavailable"
       }
+    },
+    {
+      "rpc": "positron.v1.TenantQuotaService/Update",
+      "method": "POST",
+      "path": "/v1/tenant-quotas:update",
+      "request": "TenantQuotaUpdateRequest",
+      "response": "TenantQuotaUpdateResponse",
+      "authentication": "Bearer TenantAdministration",
+      "max_request_bytes": 1024,
+      "max_response_bytes": 1024,
+      "unknown_fields": "reject",
+      "request_fields": [
+        {"proto":"tenant","json":"tenant","type":"string","number":1,"deprecated":false},
+        {"proto":"expected_generation","json":"expected_generation","type":"uint64","number":2,"deprecated":false},
+        {"proto":"idempotency_key","json":"idempotency_key","type":"string","number":3,"deprecated":false},
+        {"proto":"weight","json":"weight","type":"uint32","number":4,"deprecated":false},
+        {"proto":"memory_bytes","json":"memory_bytes","type":"uint64","number":5,"deprecated":false},
+        {"proto":"queue_slots","json":"queue_slots","type":"uint64","number":6,"deprecated":false},
+        {"proto":"task_slots","json":"task_slots","type":"uint64","number":7,"deprecated":false},
+        {"proto":"buffer_cache_bytes","json":"buffer_cache_bytes","type":"uint64","number":8,"deprecated":false},
+        {"proto":"batch_items","json":"batch_items","type":"uint64","number":9,"deprecated":false},
+        {"proto":"lease_slots","json":"lease_slots","type":"uint64","number":10,"deprecated":false},
+        {"proto":"retry_slots","json":"retry_slots","type":"uint64","number":11,"deprecated":false},
+        {"proto":"io_permits","json":"io_permits","type":"uint64","number":12,"deprecated":false},
+        {"proto":"cpu_work_units","json":"cpu_work_units","type":"uint64","number":13,"deprecated":false},
+        {"proto":"file_descriptors","json":"file_descriptors","type":"uint64","number":14,"deprecated":false},
+        {"proto":"disk_headroom_bytes","json":"disk_headroom_bytes","type":"uint64","number":15,"deprecated":false}
+      ],
+      "responses":{"200":"TenantQuotaUpdateResponse","400":"invalid_request","401":"authentication_rejected","409":["stale_generation","idempotency_conflict"],"503":"administration_unavailable"},
+      "stale_generation_response_fields": [
+        {"json":"resource_generation","type":"uint64","minimum":1,"description":"current resource generation"},
+        {"json":"semantic_diff","type":"string","minimum_length":1,"maximum_length":1024,"description":"redacted quota change summary"}
+      ]
     }
   ]
 }

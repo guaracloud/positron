@@ -11,3 +11,6 @@ pub mod generated;
 
 /// V1 API-key administration wire types and bounded client encoding.
 pub mod api_keys;
+
+/// V1 tenant-quota administration wire types and bounded client encoding.
+pub mod tenant_quotas;
