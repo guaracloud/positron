@@ -42,6 +42,32 @@ fn runtime_endpoints_and_key_path_are_explicit_typed_configuration() {
 }
 
 #[test]
+fn runtime_registered_tenant_capacity_is_explicit_typed_configuration() {
+    let effective = inputs(
+        Some(
+            "schema_version = 1\n\
+             [runtime]\n\
+             max_registered_tenants = 3\n",
+        ),
+        [],
+        [],
+    )
+    .and_then(resolve)
+    .expect("registered tenant capacity resolves");
+
+    assert_eq!(effective.max_registered_tenants(), 3);
+    assert_eq!(
+        effective.source_for("runtime.max_registered_tenants"),
+        Some(SettingSource::ConfigurationFile)
+    );
+    assert!(
+        effective
+            .redacted_reference()
+            .contains("max_registered_tenants = 3")
+    );
+}
+
+#[test]
 fn api_transport_profile_allows_explicit_public_tls_and_plaintext() {
     let tls = inputs(
         Some(
@@ -75,9 +101,11 @@ fn api_transport_profile_allows_explicit_public_tls_and_plaintext() {
         plaintext.security_warnings(),
         [positron_config::ConfigurationWarning::PublicPlaintextApi]
     );
-    assert!(plaintext
-        .redacted_reference()
-        .contains("warning = \"public API transport is plaintext\""));
+    assert!(
+        plaintext
+            .redacted_reference()
+            .contains("warning = \"public API transport is plaintext\"")
+    );
     let unused_server_trust = inputs(
         Some("schema_version = 1\n[listener]\napi_tls_trust_file = \"/secrets/ca.pem\"\n"),
         [],

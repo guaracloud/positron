@@ -59,6 +59,7 @@ struct Candidate {
     schema_version: u16,
     log_level: LogLevel,
     shutdown_grace_seconds: u16,
+    max_registered_tenants: u16,
     control_path: String,
     operations_bind_address: SocketAddr,
     api_bind_address: SocketAddr,
@@ -71,7 +72,7 @@ struct Candidate {
     data_directory: String,
     secrets_directory: String,
     local_key_file: ProtectedFileReference,
-    sources: [SettingSource; 15],
+    sources: [SettingSource; 16],
 }
 
 impl Candidate {
@@ -79,6 +80,8 @@ impl Candidate {
         let schema_version = setting_definition(Setting::SchemaVersion).default_value();
         let log_level = setting_definition(Setting::DiagnosticsLogLevel).default_value();
         let shutdown = setting_definition(Setting::RuntimeShutdownGraceSeconds).default_value();
+        let max_registered_tenants =
+            setting_definition(Setting::RuntimeMaxRegisteredTenants).default_value();
         let control = setting_definition(Setting::ListenerControlPath).default_value();
         let operations = setting_definition(Setting::ListenerOperationsBindAddress).default_value();
         let api = setting_definition(Setting::ListenerApiBindAddress).default_value();
@@ -97,6 +100,7 @@ impl Candidate {
             schema_version: parse_schema_version(schema_version)?,
             log_level: LogLevel::parse(log_level)?,
             shutdown_grace_seconds: parse_shutdown_grace_seconds(shutdown)?,
+            max_registered_tenants: parse_max_registered_tenants(max_registered_tenants)?,
             control_path: checked_path(control, Setting::ListenerControlPath)?,
             operations_bind_address: parse_loopback_address(
                 operations,
@@ -121,7 +125,7 @@ impl Candidate {
             data_directory: checked_path(data, Setting::StorageDataDirectory)?,
             secrets_directory: checked_path(secrets, Setting::StorageSecretsDirectory)?,
             local_key_file: ProtectedFileReference::parse(local_key)?,
-            sources: [SettingSource::CompiledDefault; 15],
+            sources: [SettingSource::CompiledDefault; 16],
         })
     }
 
@@ -147,6 +151,9 @@ impl Candidate {
             Setting::DiagnosticsLogLevel => self.log_level = LogLevel::parse(value)?,
             Setting::RuntimeShutdownGraceSeconds => {
                 self.shutdown_grace_seconds = parse_shutdown_grace_seconds(value)?;
+            },
+            Setting::RuntimeMaxRegisteredTenants => {
+                self.max_registered_tenants = parse_max_registered_tenants(value)?;
             },
             Setting::ListenerControlPath => {
                 self.control_path = checked_path(value, setting)?;
@@ -206,6 +213,7 @@ impl Candidate {
             schema_version: self.schema_version,
             log_level: self.log_level,
             shutdown_grace_seconds: self.shutdown_grace_seconds,
+            max_registered_tenants: self.max_registered_tenants,
             control_path: self.control_path,
             operations_bind_address: self.operations_bind_address,
             api_bind_address: self.api_bind_address,
@@ -257,6 +265,24 @@ fn parse_shutdown_grace_seconds(value: &str) -> Result<u16, ConfigurationFailure
         ));
     }
     Ok(seconds)
+}
+
+fn parse_max_registered_tenants(value: &str) -> Result<u16, ConfigurationFailure> {
+    let tenants = parse_canonical_u16(value, FailureSource::RuntimeMaxRegisteredTenants)?;
+    let ValueDomain::UnsignedIntegerRange(minimum, maximum) =
+        setting_definition(Setting::RuntimeMaxRegisteredTenants).domain()
+    else {
+        return Err(ConfigurationFailure::new(
+            ConfigurationFailureCode::Malformed,
+            FailureSource::RuntimeMaxRegisteredTenants,
+        ));
+    };
+    if !(minimum..=maximum).contains(&tenants) {
+        return Err(ConfigurationFailure::unsupported_value(
+            FailureSource::RuntimeMaxRegisteredTenants,
+        ));
+    }
+    Ok(tenants)
 }
 
 fn parse_canonical_u16(value: &str, source: FailureSource) -> Result<u16, ConfigurationFailure> {
@@ -346,18 +372,19 @@ const fn setting_index(setting: Setting) -> usize {
         Setting::SchemaVersion => 0,
         Setting::DiagnosticsLogLevel => 1,
         Setting::RuntimeShutdownGraceSeconds => 2,
-        Setting::ListenerControlPath => 3,
-        Setting::ListenerOperationsBindAddress => 4,
-        Setting::ListenerApiBindAddress => 5,
-        Setting::ListenerApiTransport => 6,
-        Setting::ListenerApiTlsCertificateFile => 7,
-        Setting::ListenerApiTlsPrivateKeyFile => 8,
-        Setting::ListenerOtlpGrpcBindAddress => 9,
-        Setting::ListenerOtlpHttpBindAddress => 10,
-        Setting::ListenerLokiPushBindAddress => 11,
-        Setting::StorageDataDirectory => 12,
-        Setting::StorageSecretsDirectory => 13,
-        Setting::SecurityLocalKeyFile => 14,
+        Setting::RuntimeMaxRegisteredTenants => 3,
+        Setting::ListenerControlPath => 4,
+        Setting::ListenerOperationsBindAddress => 5,
+        Setting::ListenerApiBindAddress => 6,
+        Setting::ListenerApiTransport => 7,
+        Setting::ListenerApiTlsCertificateFile => 8,
+        Setting::ListenerApiTlsPrivateKeyFile => 9,
+        Setting::ListenerOtlpGrpcBindAddress => 10,
+        Setting::ListenerOtlpHttpBindAddress => 11,
+        Setting::ListenerLokiPushBindAddress => 12,
+        Setting::StorageDataDirectory => 13,
+        Setting::StorageSecretsDirectory => 14,
+        Setting::SecurityLocalKeyFile => 15,
     }
 }
 
@@ -373,6 +400,7 @@ const fn failure_source(setting: Setting) -> FailureSource {
         Setting::SchemaVersion => FailureSource::SchemaVersion,
         Setting::DiagnosticsLogLevel => FailureSource::DiagnosticsLogLevel,
         Setting::RuntimeShutdownGraceSeconds => FailureSource::RuntimeShutdownGraceSeconds,
+        Setting::RuntimeMaxRegisteredTenants => FailureSource::RuntimeMaxRegisteredTenants,
         Setting::ListenerControlPath => FailureSource::ListenerControlPath,
         Setting::ListenerOperationsBindAddress => FailureSource::ListenerOperationsBindAddress,
         Setting::ListenerApiBindAddress => FailureSource::ListenerApiBindAddress,

@@ -212,6 +212,16 @@ fn exposes_the_complete_canonical_setting_contract_and_compiled_defaults()
             MutabilityClass::RestartRequired,
         ),
         (
+            Setting::RuntimeMaxRegisteredTenants,
+            "runtime.max_registered_tenants",
+            SettingKind::Integer,
+            "2",
+            ValueDomain::UnsignedIntegerRange(1, 1024),
+            SecrecyClass::Public,
+            ProvenancePolicy::NonSecretOverrides,
+            MutabilityClass::RestartRequired,
+        ),
+        (
             Setting::ListenerControlPath,
             "listener.control_path",
             SettingKind::String,
@@ -352,6 +362,7 @@ fn exposes_the_complete_canonical_setting_contract_and_compiled_defaults()
     assert_eq!(effective.schema_version(), 1);
     assert_eq!(effective.log_level(), LogLevel::Info);
     assert_eq!(effective.shutdown_grace_seconds(), 30);
+    assert_eq!(effective.max_registered_tenants(), 2);
     assert_eq!(effective.control_path(), "/var/run/positron/control.sock");
     assert_eq!(
         effective.operations_bind_address().to_string(),
@@ -381,7 +392,7 @@ fn exposes_the_complete_canonical_setting_contract_and_compiled_defaults()
         effective.redacted_reference(),
         "schema_version = 1\n\n\
          [diagnostics]\nlog_level = \"info\"\n\n\
-         [runtime]\nshutdown_grace_seconds = 30\n\n\
+         [runtime]\nshutdown_grace_seconds = 30\nmax_registered_tenants = 2\n\n\
          [listener]\ncontrol_path = \"/var/run/positron/control.sock\"\n\
          operations_bind_address = \"127.0.0.1:13133\"\n\
          api_bind_address = \"127.0.0.1:8080\"\n\

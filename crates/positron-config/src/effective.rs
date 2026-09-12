@@ -32,6 +32,7 @@ pub struct EffectiveConfiguration {
     pub(crate) schema_version: u16,
     pub(crate) log_level: LogLevel,
     pub(crate) shutdown_grace_seconds: u16,
+    pub(crate) max_registered_tenants: u16,
     pub(crate) control_path: String,
     pub(crate) operations_bind_address: SocketAddr,
     pub(crate) api_bind_address: SocketAddr,
@@ -44,7 +45,7 @@ pub struct EffectiveConfiguration {
     pub(crate) data_directory: String,
     pub(crate) secrets_directory: String,
     pub(crate) local_key_file: ProtectedFileReference,
-    pub(crate) sources: [SettingSource; 15],
+    pub(crate) sources: [SettingSource; 16],
 }
 
 impl EffectiveConfiguration {
@@ -61,6 +62,12 @@ impl EffectiveConfiguration {
     #[must_use]
     pub const fn shutdown_grace_seconds(&self) -> u16 {
         self.shutdown_grace_seconds
+    }
+
+    /// Maximum tenant quotas simultaneously registered in the live Resource Governor.
+    #[must_use]
+    pub const fn max_registered_tenants(&self) -> u16 {
+        self.max_registered_tenants
     }
 
     #[must_use]
@@ -146,6 +153,8 @@ impl EffectiveConfiguration {
         rendered.push_str(self.log_level.as_str());
         rendered.push_str("\"\n\n[runtime]\nshutdown_grace_seconds = ");
         rendered.push_str(&self.shutdown_grace_seconds.to_string());
+        rendered.push_str("\nmax_registered_tenants = ");
+        rendered.push_str(&self.max_registered_tenants.to_string());
         rendered.push_str("\n\n[listener]\ncontrol_path = \"");
         rendered.push_str(&self.control_path);
         rendered.push_str("\"\noperations_bind_address = \"");
@@ -199,6 +208,9 @@ impl EffectiveConfiguration {
             Setting::RuntimeShutdownGraceSeconds => {
                 self.shutdown_grace_seconds != other.shutdown_grace_seconds
             },
+            Setting::RuntimeMaxRegisteredTenants => {
+                self.max_registered_tenants != other.max_registered_tenants
+            },
             Setting::ListenerControlPath => self.control_path != other.control_path,
             Setting::ListenerOperationsBindAddress => {
                 self.operations_bind_address != other.operations_bind_address
@@ -234,6 +246,7 @@ impl Debug for EffectiveConfiguration {
             .field("schema_version", &self.schema_version)
             .field("log_level", &self.log_level)
             .field("shutdown_grace_seconds", &self.shutdown_grace_seconds)
+            .field("max_registered_tenants", &self.max_registered_tenants)
             .field("control_path", &self.control_path)
             .field("operations_bind_address", &self.operations_bind_address)
             .field("api_bind_address", &self.api_bind_address)

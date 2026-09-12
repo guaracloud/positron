@@ -343,7 +343,7 @@ fn authenticated_system_administrator_reads_the_successor_heterogeneous_audit_ch
     let roots = Roots::new()?;
     let volume =
         PrimaryDataVolume::acquire(&roots.parent().join("data"), MountQualification::LocalHost)?;
-    let authority = resources::establish(volume, tenant)?;
+    let authority = resources::establish(volume, tenant, 2)?;
     let marker = [53; 32];
     let catalog = Catalog::open(
         &authority,

@@ -98,9 +98,12 @@ fn run(
     let recovery =
         NativeRecovery::new(Signals::new([SIGINT, SIGTERM]).map_err(|_| LaunchFailure::Signal)?);
     let configuration = if effective.api_transport() == ApiTransport::PlaintextOptOut {
-        ServeConfiguration::new(paths, arguments.initialization).with_public_plaintext_api_warning()
+        ServeConfiguration::new(paths, arguments.initialization)
+            .with_max_registered_tenants(effective.max_registered_tenants())
+            .with_public_plaintext_api_warning()
     } else {
         ServeConfiguration::new(paths, arguments.initialization)
+            .with_max_registered_tenants(effective.max_registered_tenants())
     };
     let process = match ApplicationRuntime::start(
         configuration,

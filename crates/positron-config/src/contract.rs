@@ -31,10 +31,11 @@ macro_rules! define_settings {
     };
 }
 
-pub(crate) const SETTING_DEFINITIONS: [SettingDefinition; 15] = define_settings! {
+pub(crate) const SETTING_DEFINITIONS: [SettingDefinition; 16] = define_settings! {
     SchemaVersion | "schema_version" | Integer | "1" | ExactUnsignedInteger(1) | Public | ConfigurationFileOnly | ImmutableAfterInitialization;
     DiagnosticsLogLevel | "diagnostics.log_level" | String | "info" | StringEnumeration(&["error", "warn", "info", "debug"]) | Public | NonSecretOverrides | LiveReloadable;
     RuntimeShutdownGraceSeconds | "runtime.shutdown_grace_seconds" | Integer | "30" | UnsignedIntegerRange(1, 3600) | Public | NonSecretOverrides | RestartRequired;
+    RuntimeMaxRegisteredTenants | "runtime.max_registered_tenants" | Integer | "2" | UnsignedIntegerRange(1, 1024) | Public | NonSecretOverrides | RestartRequired;
     ListenerControlPath | "listener.control_path" | String | "/var/run/positron/control.sock" | AbsolutePath(256) | Public | NonSecretOverrides | DrainAndReload;
     ListenerOperationsBindAddress | "listener.operations_bind_address" | String | "127.0.0.1:13133" | LoopbackSocketAddress(256) | Public | NonSecretOverrides | DrainAndReload;
     ListenerApiBindAddress | "listener.api_bind_address" | String | "127.0.0.1:8080" | SocketAddress(256) | Public | NonSecretOverrides | DrainAndReload;

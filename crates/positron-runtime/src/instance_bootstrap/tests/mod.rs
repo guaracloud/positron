@@ -1,3 +1,4 @@
+mod capacity;
 mod classification;
 mod codec;
 mod compatibility;

@@ -36,19 +36,20 @@ use support::{
 pub(super) fn initialize(
     paths: &BootstrapPaths,
     plan: InitializationPlan,
+    max_registered_tenants: u16,
 ) -> Result<InitializedInstance, BootstrapFailure> {
     match storage::classify(paths)? {
         BootstrapState::Empty => {
             let (volume, access) = acquire(paths)?;
             storage::write_new(&access, BootstrapArtifact::Pending, INTENT)?;
-            return resume(paths, plan, volume, access);
+            return resume(paths, plan, volume, access, max_registered_tenants);
         },
         BootstrapState::Incomplete => {},
-        BootstrapState::Initialized => return reopen(paths),
+        BootstrapState::Initialized => return reopen(paths, max_registered_tenants),
         BootstrapState::Inconsistent => return Err(inconsistent()),
     }
     let (volume, access) = acquire(paths)?;
-    resume(paths, plan, volume, access)
+    resume(paths, plan, volume, access, max_registered_tenants)
 }
 
 fn resume(
@@ -56,13 +57,14 @@ fn resume(
     plan: InitializationPlan,
     volume: OwnedPrimaryDataVolume,
     access: BootstrapArtifactAccess,
+    max_registered_tenants: u16,
 ) -> Result<InitializedInstance, BootstrapFailure> {
     if storage::exists(&access, BootstrapArtifact::InitializedStaging)?
         && !storage::exists(&access, BootstrapArtifact::Pending)?
     {
         storage::publish_initialized(&access)?;
         drop(volume);
-        return reopen(paths);
+        return reopen(paths, max_registered_tenants);
     }
     let key = if access
         .layout()
@@ -90,7 +92,7 @@ fn resume(
         decode_record(&key, BootstrapObjectPurpose::Pending, &pending_bytes)?
     };
     require_key_identity(&record, key.identity())?;
-    let authority = resources::establish(volume, record.tenant)?;
+    let authority = resources::establish(volume, record.tenant, max_registered_tenants)?;
     let catalog = Catalog::open(
         &authority,
         record.instance,
@@ -242,7 +244,10 @@ fn resume(
     )
 }
 
-pub(super) fn reopen(paths: &BootstrapPaths) -> Result<InitializedInstance, BootstrapFailure> {
+pub(super) fn reopen(
+    paths: &BootstrapPaths,
+    max_registered_tenants: u16,
+) -> Result<InitializedInstance, BootstrapFailure> {
     let (volume, access) = acquire(paths)?;
     if storage::classify_with(&access)? != BootstrapState::Initialized {
         return Err(inconsistent());
@@ -251,7 +256,7 @@ pub(super) fn reopen(paths: &BootstrapPaths) -> Result<InitializedInstance, Boot
     let encoded = storage::read(&access, BootstrapArtifact::Initialized)?;
     let record = decode_record(&key, BootstrapObjectPurpose::Initialized, &encoded)?;
     require_key_identity(&record, key.identity())?;
-    let authority = resources::establish(volume, record.tenant)?;
+    let authority = resources::establish(volume, record.tenant, max_registered_tenants)?;
     let catalog = Catalog::open(
         &authority,
         record.instance,

@@ -9,6 +9,7 @@ Precedence: compiled defaults, TOML file, non-secret POSITRON__ overrides, then 
 | `schema_version` | integer | `1` | exactly `1` | public | compiled default, configuration file | immutable after initialization |
 | `diagnostics.log_level` | string | `info` | `error`, `warn`, `info`, `debug` | public | compiled default, configuration file, environment, command line | live-reloadable |
 | `runtime.shutdown_grace_seconds` | integer | `30` | `1..=3600` | public | compiled default, configuration file, environment, command line | restart-required |
+| `runtime.max_registered_tenants` | integer | `2` | `1..=1024`; maximum tenant quotas simultaneously registered in the live Resource Governor, including the default tenant and a pending non-admittable tenant-creation reservation | public | compiled default, configuration file, environment, command line | restart-required |
 | `listener.control_path` | string | `/var/run/positron/control.sock` | absolute path; at most 256 bytes | public | compiled default, configuration file, environment, command line | drain-and-reload |
 | `listener.operations_bind_address` | string | `127.0.0.1:13133` | loopback socket address; at most 256 bytes | public | compiled default, configuration file, environment, command line | drain-and-reload |
 | `listener.api_bind_address` | string | `127.0.0.1:8080` | socket address; at most 256 bytes; non-loopback requires TLS or the explicit plaintext opt-out | public | compiled default, configuration file, environment, command line | drain-and-reload |

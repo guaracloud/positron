@@ -286,11 +286,17 @@ fn bootstrap_once(
         }
     })?;
     let instance = match configuration.initialization {
-        InitializationMode::ExistingOnly => InstanceBootstrap::reopen(&configuration.paths),
-        InitializationMode::InitializeIfEmpty => InstanceBootstrap::initialize(
+        InitializationMode::ExistingOnly => InstanceBootstrap::reopen_with_max_registered_tenants(
             &configuration.paths,
-            InitializationPlan::non_interactive(),
+            configuration.max_registered_tenants,
         ),
+        InitializationMode::InitializeIfEmpty => {
+            InstanceBootstrap::initialize_with_max_registered_tenants(
+                &configuration.paths,
+                InitializationPlan::non_interactive(),
+                configuration.max_registered_tenants,
+            )
+        },
     };
     instance
         .map(|instance| (classified, instance))
