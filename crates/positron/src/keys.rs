@@ -101,7 +101,7 @@ fn parse(
         Some("scope-inspect") => KeyAction::ScopeInspect,
         _ => {
             return Err(
-                "usage: positron key create|list|rotate|revoke|scope-inspect --endpoint IP:PORT --credential-stdin [--scope SCOPE] [--principal ID] [--expected-generation N --idempotency-key ID] [--expires-at N]",
+                "usage: positron key create|list|rotate|revoke|scope-inspect --endpoint IP:PORT --credential-stdin [--scope SCOPE] [--target-tenant ID] [--principal ID] [--expected-generation N --idempotency-key ID] [--expires-at N]",
             );
         },
     };
@@ -121,6 +121,7 @@ fn parse(
             argument.as_str(),
             "--endpoint"
                 | "--scope"
+                | "--target-tenant"
                 | "--principal"
                 | "--expected-generation"
                 | "--idempotency-key"
@@ -194,7 +195,17 @@ fn parse(
                     .map(|value| value.parse())
                     .transpose()
                     .map_err(|_| "invalid expiry")?;
-                ApiKeyRequest::create(scope, expiry, expected, idempotency)
+                if let Some(target_tenant) = options.remove("--target-tenant") {
+                    ApiKeyRequest::create_for_tenant(
+                        scope,
+                        target_tenant,
+                        expiry,
+                        expected,
+                        idempotency,
+                    )
+                } else {
+                    ApiKeyRequest::create(scope, expiry, expected, idempotency)
+                }
             } else {
                 ApiKeyRequest::mutation(
                     action,
@@ -240,6 +251,7 @@ mod tests {
         for command in [
             "list --endpoint 127.0.0.1:8080 --credential-stdin --secret sensitive",
             "list --endpoint 127.0.0.1:8080 --credential-stdin --scope query",
+            "list --endpoint 127.0.0.1:8080 --credential-stdin --target-tenant 22222222-2222-2222-2222-222222222222",
             "list --endpoint 192.0.2.1:8080 --credential-stdin",
             "list --endpoint 127.0.0.1:8080",
         ] {
@@ -268,6 +280,21 @@ mod tests {
                     .map(ToOwned::to_owned)
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn key_create_parses_an_explicit_administrative_target_tenant() {
+        let (_, request) = parse(
+            "create --endpoint 127.0.0.1:8080 --credential-stdin --allow-plaintext --scope query --target-tenant 22222222-2222-2222-2222-222222222222 --expected-generation 1 --idempotency-key 01010101-0101-0101-0101-010101010101"
+                .split_whitespace()
+                .map(ToOwned::to_owned),
+        )
+        .expect("target tenant create parses");
+
+        assert_eq!(
+            request.target_tenant(),
+            Some("22222222-2222-2222-2222-222222222222")
         );
     }
 }

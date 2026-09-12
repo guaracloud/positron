@@ -37,6 +37,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         "expires_at_unix_seconds",
         "expected_generation",
         "idempotency_key",
+        "target_tenant",
     ] {
         config.field_attribute(
             format!(".positron.v1.ApiKeyRequest.{field}"),

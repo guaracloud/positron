@@ -1,5 +1,5 @@
 {
-  "schema_digest": "e0231f6e90a0ff3fb5dc9ea1c2231d2da7ce1dfbfed219608aeec97ba19b69c5",
+  "schema_digest": "701583ffcc43d1cc3f379bc7b363d48ddb4679e25391a38d9c535f16349d2050",
   "max_request_bytes": 64,
   "unknown_fields": "reject",
   "enums": {
@@ -356,6 +356,13 @@
           "json": "idempotency_key",
           "type": "string",
           "number": 6,
+          "deprecated": false
+        },
+        {
+          "proto": "target_tenant",
+          "json": "target_tenant",
+          "type": "string",
+          "number": 7,
           "deprecated": false
         }
       ],

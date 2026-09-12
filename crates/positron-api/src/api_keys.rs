@@ -42,6 +42,24 @@ impl ApiKeyRequest {
         expected: u64,
         idempotency: String,
     ) -> Self {
+        Self::create_with_target(scope, None, expiry, expected, idempotency)
+    }
+    pub fn create_for_tenant(
+        scope: KeyScope,
+        target_tenant: String,
+        expiry: Option<u64>,
+        expected: u64,
+        idempotency: String,
+    ) -> Self {
+        Self::create_with_target(scope, Some(target_tenant), expiry, expected, idempotency)
+    }
+    fn create_with_target(
+        scope: KeyScope,
+        target_tenant: Option<String>,
+        expiry: Option<u64>,
+        expected: u64,
+        idempotency: String,
+    ) -> Self {
         Self(protobuf::ApiKeyRequest {
             action: KeyAction::Create.into(),
             scope: Some(scope.into()),
@@ -49,6 +67,7 @@ impl ApiKeyRequest {
             expires_at_unix_seconds: expiry,
             expected_generation: Some(expected),
             idempotency_key: Some(idempotency),
+            target_tenant,
         })
     }
     pub fn list() -> Self {
@@ -100,6 +119,9 @@ impl ApiKeyRequest {
     pub fn idempotency_key(&self) -> Option<&str> {
         self.0.idempotency_key.as_deref()
     }
+    pub fn target_tenant(&self) -> Option<&str> {
+        self.0.target_tenant.as_deref()
+    }
     pub fn encode(&self) -> Result<Vec<u8>, KeyWireFailure> {
         self.validate()?;
         serde_json::to_vec(&self.0).map_err(|_| KeyWireFailure)
@@ -138,11 +160,17 @@ impl ApiKeyRequest {
                 .principal
                 .as_ref()
                 .is_some_and(|value| !identifier(value))
+            || self
+                .0
+                .target_tenant
+                .as_ref()
+                .is_some_and(|value| !identifier(value))
             || matches!(
                 action,
                 KeyAction::Rotate | KeyAction::Revoke | KeyAction::ScopeInspect
             ) != self.0.principal.is_some()
             || (action == KeyAction::Create) != self.0.scope.is_some()
+            || (action != KeyAction::Create && self.0.target_tenant.is_some())
             || (action != KeyAction::Create && self.0.expires_at_unix_seconds.is_some())
             || self.0.expires_at_unix_seconds == Some(0)
         {

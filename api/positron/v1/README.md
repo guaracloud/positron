@@ -26,12 +26,16 @@ introduce SDK publication or a deferred product capability.
 `POST /v1/api-keys:manage`. The body is limited to 1024 bytes; responses are
 limited to 64 KiB. JSON uses snake_case action and scope names. Unknown fields,
 duplicate fields, malformed identifiers, and action-inapplicable fields are
-rejected. Authorization is `Bearer` metadata; no request field may choose a
-tenant or impersonate one. Only System Administration may manage keys.
+rejected. Authorization is `Bearer` metadata. `target_tenant` is an optional,
+create-only control-plane target selected by a System Administration principal;
+it never chooses or impersonates data-plane authority. Only System
+Administration may manage keys.
 
 Create requires `scope`, `expected_generation`, and `idempotency_key`, with an
 optional `expires_at_unix_seconds` measured against the persisted Lifecycle
-Clock. Rotate and revoke require `principal`, `expected_generation`, and
+Clock. It may name `target_tenant` to provision a tenant-bound principal for
+that immutable Tenant ID; otherwise it retains the authenticated legacy
+administrative create behavior. Rotate and revoke require `principal`, `expected_generation`, and
 `idempotency_key`. List has no other fields; scope_inspect requires `principal`.
 Identifiers use canonical lowercase UUID text. List returns only redacted
 descriptors. A create or rotate retry returns the original principal without a
@@ -47,7 +51,8 @@ reference is read only for that connection. `--allow-plaintext` is an explicit o
 be combined with a trust reference. Supply the bearer through a pipe from a secret manager. Terminal input is refused to prevent echo. Secrets
 are never accepted in arguments or environment variables. Mutations require
 `--expected-generation N --idempotency-key UUID`; create also requires
-`--scope ingest|query|tenant-administration`, while rotate/revoke/scope-inspect
+`--scope ingest|query|tenant-administration` and accepts optional
+`--target-tenant UUID`, while rotate/revoke/scope-inspect
 require `--principal UUID`. `--expires-at N` is optional for create. A new
 secret is emitted once to stdout; protect that output as credential material.
 Public plaintext requires the server's configuration-file-only
