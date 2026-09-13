@@ -12,6 +12,27 @@ use crate::{HealthState, HealthWarning, ListenerRole, Liveness, Readiness, Servi
 const MAX_HEADER_BYTES: usize = 8 * 1024;
 const MAX_API_BODY_BYTES: usize = positron_api::generated::MAX_PUBLIC_REQUEST_BYTES;
 
+macro_rules! bounded_json_response {
+    ($value:expr, $limit:expr) => {{
+        let body = serde_json::to_vec($value).map_err(|_| {
+            Response::json(503, "{\"code\":\"administration_unavailable\"}".to_owned())
+        })?;
+        if body.len() > $limit {
+            Err(Response::json(
+                503,
+                "{\"code\":\"administration_unavailable\"}".to_owned(),
+            ))
+        } else {
+            Ok(Response {
+                status: 200,
+                content_type: "application/json",
+                body,
+                retry_after_seconds: None,
+            })
+        }
+    }};
+}
+
 pub(super) fn serve_connection(
     stream: &mut TcpStream,
     role: ListenerRole,
@@ -605,7 +626,9 @@ fn tenant_service_response<T>(
         Ok(response) => Ok(Response {
             status: 200,
             content_type: "application/json",
-            body: encode(&response).map_err(|_| Response::empty(500))?,
+            body: encode(&response).map_err(|_| {
+                Response::json(503, "{\"code\":\"administration_unavailable\"}".to_owned())
+            })?,
             retry_after_seconds: None,
         }),
         Err(crate::services::tenant_service::TenantServiceHttpFailure::Code(status, code)) => {
@@ -662,7 +685,9 @@ fn tenant_retention_preview_response(
         Ok(response) => Ok(Response {
             status: 200,
             content_type: "application/json",
-            body: response.encode().map_err(|_| Response::empty(500))?,
+            body: response.encode().map_err(|_| {
+                Response::json(503, "{\"code\":\"administration_unavailable\"}".to_owned())
+            })?,
             retry_after_seconds: None,
         }),
         Err(crate::services::tenant_retention::TenantRetentionHttpFailure::Code(status, code)) => {
@@ -689,7 +714,9 @@ fn tenant_retention_update_response(
         Ok(response) => Ok(Response {
             status: 200,
             content_type: "application/json",
-            body: response.encode().map_err(|_| Response::empty(500))?,
+            body: response.encode().map_err(|_| {
+                Response::json(503, "{\"code\":\"administration_unavailable\"}".to_owned())
+            })?,
             retry_after_seconds: None,
         }),
         Err(crate::services::tenant_retention::TenantRetentionHttpFailure::Code(status, code)) => {
@@ -742,12 +769,7 @@ fn policy_validation_response(
     body: &[u8],
 ) -> Result<Response, Response> {
     match services.validate_ingest_policy(bearer, body) {
-        Ok(response) => Ok(Response {
-            status: 200,
-            content_type: "application/json",
-            body: serde_json::to_vec(&response).map_err(|_| Response::empty(500))?,
-            retry_after_seconds: None,
-        }),
+        Ok(response) => bounded_json_response!(&response, 1024),
         Err((status, code)) => Ok(Response::json(status, format!("{{\"code\":\"{code}\"}}"))),
     }
 }
@@ -758,12 +780,7 @@ fn policy_test_response(
     body: &[u8],
 ) -> Result<Response, Response> {
     match services.test_ingest_policy(bearer, body) {
-        Ok(response) => Ok(Response {
-            status: 200,
-            content_type: "application/json",
-            body: serde_json::to_vec(&response).map_err(|_| Response::empty(500))?,
-            retry_after_seconds: None,
-        }),
+        Ok(response) => bounded_json_response!(&response, 1024),
         Err((status, code)) => Ok(Response::json(status, format!("{{\"code\":\"{code}\"}}"))),
     }
 }
@@ -774,12 +791,7 @@ fn policy_diff_response(
     body: &[u8],
 ) -> Result<Response, Response> {
     match services.diff_ingest_policy(bearer, body) {
-        Ok(response) => Ok(Response {
-            status: 200,
-            content_type: "application/json",
-            body: serde_json::to_vec(&response).map_err(|_| Response::empty(500))?,
-            retry_after_seconds: None,
-        }),
+        Ok(response) => bounded_json_response!(&response, 8192),
         Err((status, code)) => Ok(Response::json(status, format!("{{\"code\":\"{code}\"}}"))),
     }
 }
@@ -790,12 +802,7 @@ fn policy_explain_response(
     body: &[u8],
 ) -> Result<Response, Response> {
     match services.explain_ingest_policy(bearer, body) {
-        Ok(response) => Ok(Response {
-            status: 200,
-            content_type: "application/json",
-            body: serde_json::to_vec(&response).map_err(|_| Response::empty(500))?,
-            retry_after_seconds: None,
-        }),
+        Ok(response) => bounded_json_response!(&response, 8192),
         Err((status, code)) => Ok(Response::json(status, format!("{{\"code\":\"{code}\"}}"))),
     }
 }

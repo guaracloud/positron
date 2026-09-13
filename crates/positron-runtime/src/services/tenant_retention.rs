@@ -1,8 +1,9 @@
 use std::num::NonZeroU64;
 
 use positron_api::tenant_retention::{
-    RetentionReclamation, RetentionScopeImpact, TenantRetentionPreviewRequest,
-    TenantRetentionPreviewResponse, TenantRetentionUpdateRequest, TenantRetentionUpdateResponse,
+    MAX_PREVIEW_PAGE_ITEMS, RetentionReclamation, RetentionScopeImpact,
+    TenantRetentionPreviewRequest, TenantRetentionPreviewResponse, TenantRetentionUpdateRequest,
+    TenantRetentionUpdateResponse,
 };
 use positron_domain::identity::{PrincipalId, TenantId};
 use positron_domain::routing::SignalKind;
@@ -37,10 +38,11 @@ impl ServiceHandle {
             .map_err(|_| TenantRetentionHttpFailure::Code(400, "invalid_request"))?;
         let tenant = tenant(request.tenant())?;
         let proposed = seconds(request.proposed_retention_seconds())?;
-        self.instance
+        let preview = self
+            .instance
             .inspect_tenant_retention_impact(actor, tenant, proposed)
-            .map(preview_response)
-            .map_err(map_failure)
+            .map_err(map_failure)?;
+        preview_response(preview, request.continuation())
     }
 
     /// Recomputes a supplied opaque confirmation at the runtime boundary
@@ -130,16 +132,61 @@ const fn hex_value(value: u8) -> Option<u8> {
     }
 }
 
-fn preview_response(preview: TenantRetentionImpactPreview) -> TenantRetentionPreviewResponse {
-    TenantRetentionPreviewResponse {
+fn preview_response(
+    preview: TenantRetentionImpactPreview,
+    continuation: Option<&str>,
+) -> Result<TenantRetentionPreviewResponse, TenantRetentionHttpFailure> {
+    let start = match continuation {
+        None => 0,
+        Some(value) => {
+            let token = parse_preview_continuation(value)?;
+            if token.get(..16) != Some(preview.tenant().to_bytes().as_slice())
+                || token.get(16..24)
+                    != Some(
+                        preview
+                            .proposed_retention_seconds()
+                            .get()
+                            .to_be_bytes()
+                            .as_slice(),
+                    )
+                || token.get(24..56) != Some(preview.catalog_identity().to_bytes().as_slice())
+                || token.get(56..64) != Some(preview.catalog_generation().to_be_bytes().as_slice())
+                || token.get(64..96) != Some(preview.confirmation_digest().as_slice())
+            {
+                return Err(TenantRetentionHttpFailure::Code(409, "stale_continuation"));
+            }
+            usize::from(u16::from_be_bytes(
+                token
+                    .get(96..98)
+                    .ok_or(TenantRetentionHttpFailure::Code(400, "invalid_request"))?
+                    .try_into()
+                    .map_err(|_| TenantRetentionHttpFailure::Code(400, "invalid_request"))?,
+            ))
+        },
+    };
+    if start > preview.scopes().len() {
+        return Err(TenantRetentionHttpFailure::Code(400, "invalid_request"));
+    }
+    let end = start
+        .checked_add(MAX_PREVIEW_PAGE_ITEMS)
+        .map(|end| end.min(preview.scopes().len()))
+        .ok_or(TenantRetentionHttpFailure::Code(
+            503,
+            "administration_unavailable",
+        ))?;
+    let continuation = if end < preview.scopes().len() {
+        Some(format_preview_continuation(&preview, end)?)
+    } else {
+        None
+    };
+    Ok(TenantRetentionPreviewResponse {
         tenant: preview.tenant().to_canonical_text(),
         retention_generation: preview.retention_generation().get(),
         proposed_retention_seconds: preview.proposed_retention_seconds().get(),
         catalog_identity: hex(preview.catalog_identity().to_bytes()),
         catalog_generation: preview.catalog_generation(),
         confirmation_digest: hex(preview.confirmation_digest()),
-        scopes: preview
-            .scopes()
+        scopes: preview.scopes()[start..end]
             .iter()
             .copied()
             .map(|scope| {
@@ -169,7 +216,50 @@ fn preview_response(preview: TenantRetentionImpactPreview) -> TenantRetentionPre
                 }
             })
             .collect(),
+        continuation,
+    })
+}
+
+fn parse_preview_continuation(value: &str) -> Result<[u8; 98], TenantRetentionHttpFailure> {
+    if value.len() != 196 {
+        return Err(TenantRetentionHttpFailure::Code(400, "invalid_request"));
     }
+    let mut bytes = [0_u8; 98];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let high = pair
+            .first()
+            .and_then(|byte| hex_value(*byte))
+            .ok_or(TenantRetentionHttpFailure::Code(400, "invalid_request"))?;
+        let low = pair
+            .get(1)
+            .and_then(|byte| hex_value(*byte))
+            .ok_or(TenantRetentionHttpFailure::Code(400, "invalid_request"))?;
+        *bytes
+            .get_mut(index)
+            .ok_or(TenantRetentionHttpFailure::Code(400, "invalid_request"))? = (high << 4) | low;
+    }
+    Ok(bytes)
+}
+
+fn format_preview_continuation(
+    preview: &TenantRetentionImpactPreview,
+    index: usize,
+) -> Result<String, TenantRetentionHttpFailure> {
+    let index = u16::try_from(index)
+        .map_err(|_| TenantRetentionHttpFailure::Code(503, "administration_unavailable"))?;
+    let mut bytes = [0_u8; 98];
+    bytes[..16].copy_from_slice(&preview.tenant().to_bytes());
+    bytes[16..24].copy_from_slice(&preview.proposed_retention_seconds().get().to_be_bytes());
+    bytes[24..56].copy_from_slice(&preview.catalog_identity().to_bytes());
+    bytes[56..64].copy_from_slice(&preview.catalog_generation().to_be_bytes());
+    bytes[64..96].copy_from_slice(&preview.confirmation_digest());
+    bytes[96..].copy_from_slice(&index.to_be_bytes());
+    let mut text = String::with_capacity(196);
+    for byte in bytes {
+        text.push(hex_digit(byte >> 4));
+        text.push(hex_digit(byte & 0x0f));
+    }
+    Ok(text)
 }
 
 fn reclamation(value: RetentionReclamationEstimate) -> (RetentionReclamation, Option<i64>) {

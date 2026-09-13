@@ -1,6 +1,6 @@
 use positron_api::tenant_retention::{
-    RetentionReclamation, RetentionScopeImpact, TenantRetentionPreviewRequest,
-    TenantRetentionPreviewResponse, TenantRetentionServiceClient,
+    MAX_PREVIEW_PAGE_ITEMS, MAX_RESPONSE_BYTES, RetentionReclamation, RetentionScopeImpact,
+    TenantRetentionPreviewRequest, TenantRetentionPreviewResponse, TenantRetentionServiceClient,
     TenantRetentionServiceClientFailure, TenantRetentionTransport, TenantRetentionUpdateRequest,
 };
 
@@ -72,10 +72,52 @@ fn retention_preview_is_redacted_generation_bound_evidence() {
             earliest_reclamation: RetentionReclamation::BlockedByInProcessSnapshot,
             earliest_reclamation_unix_nanos: None,
         }],
+        continuation: None,
     };
     assert_eq!(
         TenantRetentionPreviewResponse::decode(&response.encode().expect("encode response")),
         Ok(response)
+    );
+}
+
+#[test]
+fn retention_preview_pages_render_below_the_response_bound() {
+    let scope = RetentionScopeImpact {
+        signal: "traces".to_owned(),
+        shard: u32::MAX,
+        catalog_identity: DIGEST.to_owned(),
+        catalog_generation: u64::MAX,
+        evaluated_at_unix_nanos: i64::MIN,
+        affected_start_unix_nanos: Some(i64::MIN),
+        affected_end_unix_nanos: Some(i64::MIN),
+        affected_bytes: u64::MAX,
+        immediately_reclaimable_bytes: u64::MAX,
+        deferred_active_segment_bytes: u64::MAX,
+        deferred_mixed_sealed_segment_bytes: u64::MAX,
+        earliest_reclamation: RetentionReclamation::BlockedByInProcessSnapshot,
+        earliest_reclamation_unix_nanos: None,
+    };
+    let response = TenantRetentionPreviewResponse {
+        tenant: TENANT.to_owned(),
+        retention_generation: u64::MAX,
+        proposed_retention_seconds: u64::MAX,
+        catalog_identity: DIGEST.to_owned(),
+        catalog_generation: u64::MAX,
+        confirmation_digest: DIGEST.to_owned(),
+        scopes: vec![scope.clone(); MAX_PREVIEW_PAGE_ITEMS],
+        continuation: Some("ab".repeat(98)),
+    };
+    assert!(
+        response.encode().expect("bounded maximum page").len() <= MAX_RESPONSE_BYTES,
+        "the checked UTF-8 JSON response must remain within the HTTP limit"
+    );
+    assert!(
+        TenantRetentionPreviewResponse {
+            scopes: vec![scope; MAX_PREVIEW_PAGE_ITEMS + 1],
+            ..response
+        }
+        .encode()
+        .is_err()
     );
 }
 
@@ -93,7 +135,7 @@ fn retention_client_uses_the_canonical_routes_and_preserves_typed_stale_details(
             (
                 "/v1/tenant-retention:preview",
                 "200 OK",
-                r#"{"tenant":"22222222-2222-2222-2222-222222222222","retention_generation":1,"proposed_retention_seconds":86400,"catalog_identity":"abababababababababababababababababababababababababababababababab","catalog_generation":7,"confirmation_digest":"abababababababababababababababababababababababababababababababab","scopes":[]}"#,
+                r#"{"tenant":"22222222-2222-2222-2222-222222222222","retention_generation":1,"proposed_retention_seconds":86400,"catalog_identity":"abababababababababababababababababababababababababababababababab","catalog_generation":7,"confirmation_digest":"abababababababababababababababababababababababababababababababab","scopes":[],"continuation":null}"#,
             ),
             (
                 "/v1/tenant-retention:update",

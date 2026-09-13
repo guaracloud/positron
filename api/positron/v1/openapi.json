@@ -3,7 +3,7 @@
   "info": {
     "title": "Positron API",
     "version": "v1",
-    "x-positron-schema-digest": "724d134ab61e1a80dc89b1a8fa84e2de7dec4e61011e4f5624cb27baf041bb6d"
+    "x-positron-schema-digest": "c851d30cdeeb0c2dc29048790458d7b6ec73b25a08eb52c4227d1775b545679c"
   },
   "paths": {
     "/v1/capabilities:negotiate": {
@@ -390,9 +390,10 @@
         "x-positron-max-request-bytes": 2048,
         "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/TenantListRequest"}}}},
         "responses": {
-          "200": {"description": "Bounded redacted tenant registry descriptors.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/TenantListResponse"}}}},
+          "200": {"description": "A snapshot-pinned page of redacted tenant registry descriptors.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/TenantListResponse"}}}},
           "400": {"description": "Invalid bounded tenant-list request."},
           "401": {"description": "System-administration authentication failed before request decoding."},
+          "409": {"description": "The opaque continuation belongs to an older Catalog snapshot; restart enumeration."},
           "503": {"description": "Tenant administration is unavailable."}
         }
       }
@@ -420,10 +421,11 @@
         "x-positron-max-request-bytes": 2048,
         "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/TenantRetentionPreviewRequest"}}}},
         "responses": {
-          "200": {"description": "Generation-pinned redacted retention impact evidence.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/TenantRetentionPreviewResponse"}}}},
+          "200": {"description": "A snapshot-pinned page of redacted retention impact evidence with a full-impact confirmation digest.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/TenantRetentionPreviewResponse"}}}},
           "400": {"description": "Invalid bounded retention preview request."},
           "401": {"description": "Tenant-administration authentication failed before request decoding."},
           "404": {"description": "The explicit tenant is unavailable."},
+          "409": {"description": "The opaque continuation belongs to an older impact snapshot; restart the preview."},
           "503": {"description": "Retention administration is unavailable."}
         }
       }
@@ -862,7 +864,7 @@
         "properties": {
           "keys": {
             "type": "array",
-            "maxItems": 128,
+            "maxItems": 48,
             "items": {
               "$ref": "#/components/schemas/KeyDescriptor"
             }
@@ -1171,12 +1173,12 @@
       },
       "TenantListRequest": {
         "type": "object", "additionalProperties": false,
-        "properties": {}
+        "properties": {"continuation": {"type": "string", "pattern": "^[0-9a-f]{84}$", "minLength": 84, "maxLength": 84}}
       },
       "TenantListResponse": {
         "type": "object", "additionalProperties": false,
-        "required": ["tenants"],
-        "properties": {"tenants": {"type": "array", "maxItems": 1024, "items": {"$ref": "#/components/schemas/TenantDescriptor"}}}
+        "required": ["tenants", "continuation"],
+        "properties": {"tenants": {"type": "array", "maxItems": 48, "items": {"$ref": "#/components/schemas/TenantDescriptor"}}, "continuation": {"type": ["string", "null"], "pattern": "^[0-9a-f]{84}$", "maxLength": 84}}
       },
       "TenantDisplayNameUpdateRequest": {
         "type": "object", "additionalProperties": false,
@@ -1203,7 +1205,8 @@
         "required": ["tenant", "proposed_retention_seconds"],
         "properties": {
           "tenant": {"type": "string", "format": "uuid", "description": "Explicit tenant-administration target; it cannot select another tenant."},
-          "proposed_retention_seconds": {"type": "integer", "minimum": 1}
+          "proposed_retention_seconds": {"type": "integer", "minimum": 1},
+          "continuation": {"type": "string", "pattern": "^[0-9a-f]{196}$", "minLength": 196, "maxLength": 196}
         }
       },
       "TenantRetentionScopeImpact": {
@@ -1229,7 +1232,7 @@
       "TenantRetentionPreviewResponse": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["tenant", "retention_generation", "proposed_retention_seconds", "catalog_identity", "catalog_generation", "confirmation_digest", "scopes"],
+        "required": ["tenant", "retention_generation", "proposed_retention_seconds", "catalog_identity", "catalog_generation", "confirmation_digest", "scopes", "continuation"],
         "properties": {
           "tenant": {"type": "string", "format": "uuid"},
           "retention_generation": {"type": "integer", "minimum": 1},
@@ -1237,7 +1240,8 @@
           "catalog_identity": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
           "catalog_generation": {"type": "integer", "minimum": 1},
           "confirmation_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$", "description": "Opaque confirmation binding computed from current canonical evidence."},
-          "scopes": {"type": "array", "maxItems": 1024, "items": {"$ref": "#/components/schemas/TenantRetentionScopeImpact"}}
+          "scopes": {"type": "array", "maxItems": 64, "items": {"$ref": "#/components/schemas/TenantRetentionScopeImpact"}},
+          "continuation": {"type": ["string", "null"], "pattern": "^[0-9a-f]{196}$", "maxLength": 196}
         }
       },
       "TenantRetentionUpdateRequest": {

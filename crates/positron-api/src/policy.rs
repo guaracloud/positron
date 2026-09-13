@@ -49,6 +49,9 @@ pub const HTTP_TEST_PATH: &str = "/v1/policies:test";
 pub const HTTP_DIFF_PATH: &str = "/v1/policies:diff";
 pub const HTTP_EXPLAIN_PATH: &str = "/v1/policies:explain";
 pub const HTTP_ACTIVATE_PATH: &str = "/v1/policies:activate";
+/// One generation change plus at most two semantic changes for each of the
+/// 64 rules accepted by the canonical preview policy.
+pub const MAX_DIFF_SEMANTIC_CHANGES: usize = 129;
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -370,7 +373,7 @@ impl PolicyDiffResponse {
             || response.after_policy_generation == 0
             || !valid_digest(&response.before_policy_digest)
             || !valid_digest(&response.after_policy_digest)
-            || response.semantic_changes.len() > 4096
+            || response.semantic_changes.len() > MAX_DIFF_SEMANTIC_CHANGES
             || !response.semantic_changes.iter().all(|change| {
                 matches!(
                     change.as_str(),

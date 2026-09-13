@@ -11,6 +11,10 @@ pub const LIST_HTTP_PATH: &str = "/v1/tenants:list";
 pub const UPDATE_DISPLAY_NAME_HTTP_PATH: &str = "/v1/tenants:update-display-name";
 pub const MAX_REQUEST_BYTES: usize = 2048;
 pub const MAX_RESPONSE_BYTES: usize = 64 * 1024;
+/// A fixed page size keeps a fully populated descriptor page below the
+/// published rendered-response limit.
+pub const MAX_LIST_PAGE_ITEMS: usize = 48;
+const LIST_CONTINUATION_HEX_BYTES: usize = 42;
 mod client {
     include!(concat!(env!("OUT_DIR"), "/tenant_service_client.rs"));
 }
@@ -167,17 +171,41 @@ impl TenantInspectRequest {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct TenantListRequest {}
+pub struct TenantListRequest {
+    continuation: Option<String>,
+}
 impl TenantListRequest {
     #[must_use]
     pub const fn new() -> Self {
-        Self {}
+        Self { continuation: None }
+    }
+    #[must_use]
+    pub fn with_continuation(continuation: String) -> Self {
+        Self {
+            continuation: Some(continuation),
+        }
     }
     pub fn decode(body: &[u8]) -> Result<Self, TenantServiceWireFailure> {
         decode(body)
     }
     pub fn encode(&self) -> Result<Vec<u8>, TenantServiceWireFailure> {
+        self.validate()?;
         serde_json::to_vec(self).map_err(|_| TenantServiceWireFailure)
+    }
+    #[must_use]
+    pub fn continuation(&self) -> Option<&str> {
+        self.continuation.as_deref()
+    }
+    pub fn validate(&self) -> Result<(), TenantServiceWireFailure> {
+        if self
+            .continuation
+            .as_deref()
+            .is_none_or(valid_list_continuation)
+        {
+            Ok(())
+        } else {
+            Err(TenantServiceWireFailure)
+        }
     }
 }
 
@@ -281,7 +309,7 @@ impl TenantCreateResponse {
     }
     pub fn encode(&self) -> Result<Vec<u8>, TenantServiceWireFailure> {
         self.validate()?;
-        serde_json::to_vec(self).map_err(|_| TenantServiceWireFailure)
+        encode_response(self)
     }
     pub fn validate(&self) -> Result<(), TenantServiceWireFailure> {
         if identifier(&self.tenant) && self.resource_generation != 0 && self.audit_position != 0 {
@@ -303,7 +331,7 @@ impl TenantInspectResponse {
     }
     pub fn encode(&self) -> Result<Vec<u8>, TenantServiceWireFailure> {
         self.validate()?;
-        serde_json::to_vec(self).map_err(|_| TenantServiceWireFailure)
+        encode_response(self)
     }
     pub fn validate(&self) -> Result<(), TenantServiceWireFailure> {
         self.tenant.validate()
@@ -314,6 +342,7 @@ impl TenantInspectResponse {
 #[serde(deny_unknown_fields)]
 pub struct TenantListResponse {
     pub tenants: Vec<TenantDescriptor>,
+    pub continuation: Option<String>,
 }
 impl TenantListResponse {
     pub fn decode(body: &[u8]) -> Result<Self, TenantServiceWireFailure> {
@@ -321,10 +350,15 @@ impl TenantListResponse {
     }
     pub fn encode(&self) -> Result<Vec<u8>, TenantServiceWireFailure> {
         self.validate()?;
-        serde_json::to_vec(self).map_err(|_| TenantServiceWireFailure)
+        encode_response(self)
     }
     pub fn validate(&self) -> Result<(), TenantServiceWireFailure> {
-        if self.tenants.len() > 1024 {
+        if self.tenants.len() > MAX_LIST_PAGE_ITEMS
+            || !self
+                .continuation
+                .as_deref()
+                .is_none_or(valid_list_continuation)
+        {
             return Err(TenantServiceWireFailure);
         }
         for tenant in &self.tenants {
@@ -347,7 +381,7 @@ impl TenantDisplayNameUpdateResponse {
     }
     pub fn encode(&self) -> Result<Vec<u8>, TenantServiceWireFailure> {
         self.validate()?;
-        serde_json::to_vec(self).map_err(|_| TenantServiceWireFailure)
+        encode_response(self)
     }
     pub fn validate(&self) -> Result<(), TenantServiceWireFailure> {
         if identifier(&self.tenant) && self.display_generation != 0 && self.audit_position != 0 {
@@ -379,6 +413,16 @@ where
     let value: T = serde_json::from_slice(body).map_err(|_| TenantServiceWireFailure)?;
     value.validate_wire()?;
     Ok(value)
+}
+fn encode_response<T>(value: &T) -> Result<Vec<u8>, TenantServiceWireFailure>
+where
+    T: Serialize,
+{
+    let encoded = serde_json::to_vec(value).map_err(|_| TenantServiceWireFailure)?;
+    if encoded.len() > MAX_RESPONSE_BYTES {
+        return Err(TenantServiceWireFailure);
+    }
+    Ok(encoded)
 }
 trait TenantWireValidate {
     fn validate_wire(&self) -> Result<(), TenantServiceWireFailure>;
@@ -420,4 +464,10 @@ fn slug(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+fn valid_list_continuation(value: &str) -> bool {
+    value.len() == LIST_CONTINUATION_HEX_BYTES * 2
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }

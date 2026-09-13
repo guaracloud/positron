@@ -51,10 +51,11 @@ codes `authentication_rejected` (401), `invalid_request` (400),
 `TenantRetentionService` is served by the authenticated `api` listener at
 `POST /v1/tenant-retention:preview` and
 `POST /v1/tenant-retention:update`. A tenant-administration credential may
-operate only on its own active or read-only tenant. The bounded preview carries
-generation-pinned, redacted per-signal evidence and an opaque confirmation
-digest; a reduction update carries that digest, expected retention generation,
-and idempotency key. Authentication completes before body decoding. The
+operate only on its own active or read-only tenant. Preview returns pages of at
+most 64 redacted scope impacts, with an opaque Catalog-snapshot continuation;
+the confirmation digest still covers the full canonical impact. A reduction
+update carries that digest, expected retention generation, and idempotency key.
+Authentication completes before body decoding. The
 schema-derived `TenantRetentionServiceClient` and `positron tenant retention
 preview|update` CLI use the protected-stdin credential and TLS-default
 transport contract shared by the administration clients.
@@ -65,7 +66,9 @@ System Administration requests: `POST /v1/tenants:create`,
 `POST /v1/tenants:update-display-name`. All requests authenticate before the
 bounded body is decoded. Create receives an immutable tenant ID, canonical slug,
 display name, retention period, positive resource limits, and idempotency key;
-inspect and list return only redacted tenant descriptors; the display-name update
+inspect returns one redacted tenant descriptor. List returns fixed pages of up to
+48 descriptors and an opaque Catalog-snapshot continuation; a stale continuation
+must restart enumeration rather than mixing descriptor snapshots. The display-name update
 uses a nonzero display generation and idempotency key. The schema-derived
 `TenantServiceClient` and `positron tenant create|inspect|list|update-display-name`
 CLI use protected-stdin credentials and TLS by default; plaintext requires the

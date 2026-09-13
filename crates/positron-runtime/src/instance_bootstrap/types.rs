@@ -1409,6 +1409,19 @@ impl InitializedInstance {
             .map_err(map_tenant_administration_failure)
     }
 
+    /// Enumerates one authenticated, snapshot-pinned page of tenant state.
+    pub fn list_tenant_page(
+        &self,
+        actor: AuthorizedContext,
+        continuation: Option<positron_governance::TenantListContinuation>,
+        limit: usize,
+    ) -> Result<positron_governance::TenantInspectionPage, BootstrapFailure> {
+        self.authorize_tenant_inspection(actor)?;
+        let snapshot = self.current_catalog_snapshot()?;
+        positron_governance::TenantAdministration::list_page(&snapshot, continuation, limit)
+            .map_err(map_tenant_administration_failure)
+    }
+
     /// Returns one redacted tenant-administration view without exposing keys.
     pub fn inspect_tenant(
         &self,

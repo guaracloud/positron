@@ -1,6 +1,7 @@
 use positron_api::tenant_service::{
-    TenantCreateRequest, TenantDescriptor, TenantDisplayNameUpdateRequest, TenantInspectRequest,
-    TenantLifecycleState, TenantServiceClient, TenantServiceClientFailure, TenantServiceTransport,
+    MAX_RESPONSE_BYTES, TenantCreateRequest, TenantDescriptor, TenantDisplayNameUpdateRequest,
+    TenantInspectRequest, TenantLifecycleState, TenantListResponse, TenantServiceClient,
+    TenantServiceClientFailure, TenantServiceTransport,
 };
 use std::net::SocketAddr;
 
@@ -58,6 +59,33 @@ fn tenant_descriptor_exposes_only_redacted_administration_metadata() {
         br#"{"tenant":"22222222-2222-2222-2222-222222222222","slug":"acme-observability","display_name":"Acme","retention_seconds":0,"display_generation":1,"retention_generation":1,"lifecycle":"active"}"#,
     )
     .is_err());
+}
+
+#[test]
+fn tenant_list_pages_have_a_rendered_response_bound() {
+    let descriptor = TenantDescriptor {
+        tenant: "22222222-2222-2222-2222-222222222222".to_owned(),
+        slug: "a".repeat(63),
+        // This permitted 128-byte value combines UTF-8 and JSON escaping.
+        display_name: format!("{}😀", "\0".repeat(124)),
+        retention_seconds: u64::MAX,
+        display_generation: u64::MAX,
+        retention_generation: u64::MAX,
+        lifecycle: TenantLifecycleState::Suspended,
+    };
+    let page = TenantListResponse {
+        tenants: vec![descriptor.clone(); 48],
+        continuation: Some("ab".repeat(42)),
+    };
+    assert!(page.encode().expect("bounded page").len() <= MAX_RESPONSE_BYTES);
+    assert!(
+        TenantListResponse {
+            tenants: vec![descriptor; 49],
+            continuation: None,
+        }
+        .encode()
+        .is_err()
+    );
 }
 
 #[test]

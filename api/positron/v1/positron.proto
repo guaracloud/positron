@@ -165,6 +165,7 @@ message TenantAliasBindResponse {
 message TenantRetentionPreviewRequest {
   string tenant = 1;
   uint64 proposed_retention_seconds = 2;
+  optional string continuation = 3;
 }
 
 message TenantRetentionScopeImpact {
@@ -198,6 +199,7 @@ message TenantRetentionPreviewResponse {
   uint64 catalog_generation = 5;
   string confirmation_digest = 6;
   repeated TenantRetentionScopeImpact scopes = 7;
+  optional string continuation = 8;
 }
 
 message TenantRetentionUpdateRequest {
@@ -245,7 +247,9 @@ message TenantInspectRequest {
   string tenant = 1;
 }
 
-message TenantListRequest {}
+message TenantListRequest {
+  optional string continuation = 1;
+}
 
 message TenantDescriptor {
   string tenant = 1;
@@ -263,6 +267,7 @@ message TenantInspectResponse {
 
 message TenantListResponse {
   repeated TenantDescriptor tenants = 1;
+  optional string continuation = 2;
 }
 
 message TenantDisplayNameUpdateRequest {

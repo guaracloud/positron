@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
@@ -23,6 +24,67 @@ const TENANT_REGISTRY_V2_MAGIC: [u8; 8] = *b"POSTRG02";
 struct TenantRegistry {
     generation: ResourceGeneration,
     tenants: Vec<TenantId>,
+}
+
+/// Opaque position in one immutable tenant-registry generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TenantListContinuation {
+    catalog_identity: [u8; 32],
+    catalog_generation: u64,
+    next_index: u16,
+}
+
+impl TenantListContinuation {
+    #[must_use]
+    pub fn to_bytes(self) -> [u8; 42] {
+        let mut bytes = [0; 42];
+        bytes[..32].copy_from_slice(&self.catalog_identity);
+        bytes[32..40].copy_from_slice(&self.catalog_generation.to_be_bytes());
+        bytes[40..].copy_from_slice(&self.next_index.to_be_bytes());
+        bytes
+    }
+
+    pub fn from_bytes(bytes: [u8; 42]) -> Result<Self, TenantAdministrationFailure> {
+        let catalog_generation = u64::from_be_bytes(
+            bytes[32..40]
+                .try_into()
+                .map_err(|_| TenantAdministrationFailure::InvalidInput)?,
+        );
+        let next_index = u16::from_be_bytes(
+            bytes[40..]
+                .try_into()
+                .map_err(|_| TenantAdministrationFailure::InvalidInput)?,
+        );
+        if catalog_generation == 0 || next_index == 0 {
+            return Err(TenantAdministrationFailure::InvalidInput);
+        }
+        Ok(Self {
+            catalog_identity: bytes[..32]
+                .try_into()
+                .map_err(|_| TenantAdministrationFailure::InvalidInput)?,
+            catalog_generation,
+            next_index,
+        })
+    }
+}
+
+/// One bounded page of authenticated tenant-registry descriptors.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TenantInspectionPage {
+    inspections: Vec<TenantInspection>,
+    continuation: Option<TenantListContinuation>,
+}
+
+impl TenantInspectionPage {
+    #[must_use]
+    pub fn inspections(&self) -> &[TenantInspection] {
+        &self.inspections
+    }
+
+    #[must_use]
+    pub const fn continuation(&self) -> Option<TenantListContinuation> {
+        self.continuation
+    }
 }
 
 /// Public redacted outcome of a tenant creation publication.
@@ -198,15 +260,61 @@ impl TenantAdministration {
     pub fn list(
         snapshot: &CatalogSnapshot,
     ) -> Result<Vec<TenantInspection>, TenantAdministrationFailure> {
-        let tenants = Self::registered_tenant_ids(snapshot)?;
-        let mut inspections = Vec::new();
-        inspections
-            .try_reserve(tenants.len())
-            .map_err(|_| TenantAdministrationFailure::PersistenceUnavailable)?;
-        for tenant in tenants {
-            inspections.push(Self::inspect(snapshot, tenant)?);
+        Ok(tenant_inspections(snapshot)?.1)
+    }
+
+    /// Enumerates one fixed-size page from an immutable Catalog snapshot.
+    /// A continuation from a different snapshot is explicit rather than
+    /// risking a skipped, duplicated, or mixed descriptor page.
+    pub fn list_page(
+        snapshot: &CatalogSnapshot,
+        continuation: Option<TenantListContinuation>,
+        limit: usize,
+    ) -> Result<TenantInspectionPage, TenantAdministrationFailure> {
+        if limit == 0 || limit > 128 {
+            return Err(TenantAdministrationFailure::InvalidInput);
         }
-        Ok(inspections)
+        let (_, inspections) = tenant_inspections(snapshot)?;
+        let start = match continuation {
+            None => 0,
+            Some(continuation) => {
+                if continuation.catalog_identity != snapshot.identity().to_bytes()
+                    || continuation.catalog_generation != snapshot.number()
+                {
+                    return Err(TenantAdministrationFailure::StaleGeneration);
+                }
+                usize::from(continuation.next_index)
+            },
+        };
+        if start > inspections.len() {
+            return Err(TenantAdministrationFailure::InvalidInput);
+        }
+        let end = start
+            .checked_add(limit)
+            .map(|end| end.min(inspections.len()))
+            .ok_or(TenantAdministrationFailure::PersistenceUnavailable)?;
+        let mut page = Vec::new();
+        page.try_reserve(end - start)
+            .map_err(|_| TenantAdministrationFailure::PersistenceUnavailable)?;
+        page.extend_from_slice(
+            inspections
+                .get(start..end)
+                .ok_or(TenantAdministrationFailure::PersistenceUnavailable)?,
+        );
+        let continuation = if end < inspections.len() {
+            Some(TenantListContinuation {
+                catalog_identity: snapshot.identity().to_bytes(),
+                catalog_generation: snapshot.number(),
+                next_index: u16::try_from(end)
+                    .map_err(|_| TenantAdministrationFailure::PersistenceUnavailable)?,
+            })
+        } else {
+            None
+        };
+        Ok(TenantInspectionPage {
+            inspections: page,
+            continuation,
+        })
     }
 
     /// Resolves one registered tenant from one authenticated Catalog snapshot.
@@ -214,51 +322,11 @@ impl TenantAdministration {
         snapshot: &CatalogSnapshot,
         tenant: TenantId,
     ) -> Result<TenantInspection, TenantAdministrationFailure> {
-        let (governance_id, governance) = snapshot.governance_object().map_err(map_catalog)?;
-        if governance.tenant() == tenant {
-            let _ = governance_id;
-            return Ok(TenantInspection {
-                tenant,
-                slug: governance.tenant_slug(),
-                display_name: governance.display_name().to_owned(),
-                retention_seconds: governance.retention_seconds(),
-                display_generation: ResourceGeneration::new(governance.display_generation())
-                    .map_err(|_| TenantAdministrationFailure::PersistenceUnavailable)?,
-                retention_generation: ResourceGeneration::new(governance.retention_generation())
-                    .map_err(|_| TenantAdministrationFailure::PersistenceUnavailable)?,
-                lifecycle: governance.lifecycle(),
-            });
-        }
-        if !Self::registered_tenant_ids(snapshot)?.contains(&tenant) {
-            return Err(TenantAdministrationFailure::Unauthorized);
-        }
-        let mut found = None;
-        for identity in snapshot.object_identities() {
-            let bytes = snapshot
-                .object(identity)
-                .map_err(map_catalog)?
-                .ok_or(TenantAdministrationFailure::PersistenceUnavailable)?;
-            if !is_tenant_record(bytes) {
-                continue;
-            }
-            let record = tenant_record_metadata(bytes)?;
-            if record.tenant == tenant {
-                if found.is_some() {
-                    return Err(TenantAdministrationFailure::PersistenceUnavailable);
-                }
-                found = Some(TenantInspection {
-                    tenant,
-                    slug: TenantSlug::parse_canonical(&record.slug)
-                        .map_err(|_| TenantAdministrationFailure::PersistenceUnavailable)?,
-                    display_name: record.display_name,
-                    retention_seconds: record.retention_seconds,
-                    display_generation: record.display_generation,
-                    retention_generation: record.retention_generation,
-                    lifecycle: record.lifecycle,
-                });
-            }
-        }
-        found.ok_or(TenantAdministrationFailure::PersistenceUnavailable)
+        tenant_inspections(snapshot)?
+            .1
+            .into_iter()
+            .find(|inspection| inspection.tenant == tenant)
+            .ok_or(TenantAdministrationFailure::Unauthorized)
     }
 
     /// Reconstructs only the bounded admission limits from authenticated
@@ -335,39 +403,11 @@ impl TenantAdministration {
     pub fn registered_tenant_ids(
         snapshot: &CatalogSnapshot,
     ) -> Result<Vec<TenantId>, TenantAdministrationFailure> {
-        if snapshot.format_epoch() == Some(positron_kernel::FormatEpoch::CATALOG_V1) {
-            let (_, governance) = snapshot.governance_object().map_err(map_catalog)?;
-            return Ok(vec![governance.tenant()]);
-        }
-        let registry =
-            registry(snapshot)?.ok_or(TenantAdministrationFailure::PersistenceUnavailable)?;
-        if registry.tenants.is_empty() {
-            return Err(TenantAdministrationFailure::PersistenceUnavailable);
-        }
-        let (_, governance) = snapshot.governance_object().map_err(map_catalog)?;
-        let mut states = vec![governance.tenant()];
-        for identity in snapshot.object_identities() {
-            let bytes = snapshot
-                .object(identity)
-                .map_err(map_catalog)?
-                .ok_or(TenantAdministrationFailure::PersistenceUnavailable)?;
-            if is_tenant_record(bytes) {
-                let record = tenant_record_metadata(bytes)?;
-                if states.contains(&record.tenant) {
-                    return Err(TenantAdministrationFailure::PersistenceUnavailable);
-                }
-                states.push(record.tenant);
-            }
-        }
-        if registry.tenants.len() != states.len()
-            || registry
-                .tenants
-                .iter()
-                .any(|tenant| !states.contains(tenant))
-        {
-            return Err(TenantAdministrationFailure::PersistenceUnavailable);
-        }
-        Ok(registry.tenants)
+        Ok(tenant_inspections(snapshot)?
+            .1
+            .into_iter()
+            .map(|inspection| inspection.tenant)
+            .collect())
     }
 
     /// Reconstructs each registered tenant's durable lifecycle. The default
@@ -597,6 +637,89 @@ pub(crate) fn is_registry(bytes: &[u8]) -> bool {
     bytes.starts_with(&TENANT_REGISTRY_V1_MAGIC) || bytes.starts_with(&TENANT_REGISTRY_V2_MAGIC)
 }
 
+fn tenant_inspections(
+    snapshot: &CatalogSnapshot,
+) -> Result<(TenantRegistry, Vec<TenantInspection>), TenantAdministrationFailure> {
+    let (_, governance) = snapshot.governance_object().map_err(map_catalog)?;
+    let default = TenantInspection {
+        tenant: governance.tenant(),
+        slug: governance.tenant_slug(),
+        display_name: governance.display_name().to_owned(),
+        retention_seconds: governance.retention_seconds(),
+        display_generation: ResourceGeneration::new(governance.display_generation())
+            .map_err(|_| TenantAdministrationFailure::PersistenceUnavailable)?,
+        retention_generation: ResourceGeneration::new(governance.retention_generation())
+            .map_err(|_| TenantAdministrationFailure::PersistenceUnavailable)?,
+        lifecycle: governance.lifecycle(),
+    };
+    if snapshot.format_epoch() == Some(positron_kernel::FormatEpoch::CATALOG_V1) {
+        return Ok((
+            TenantRegistry {
+                generation: ResourceGeneration::new(1)
+                    .map_err(|_| TenantAdministrationFailure::PersistenceUnavailable)?,
+                tenants: vec![default.tenant],
+            },
+            vec![default],
+        ));
+    }
+
+    let mut registry = None;
+    let mut records = BTreeMap::new();
+    for identity in snapshot.object_identities() {
+        let bytes = snapshot
+            .object(identity)
+            .map_err(map_catalog)?
+            .ok_or(TenantAdministrationFailure::PersistenceUnavailable)?;
+        if is_registry(bytes) {
+            if registry.is_some() {
+                return Err(TenantAdministrationFailure::PersistenceUnavailable);
+            }
+            registry = Some(decode_registry(bytes)?);
+        } else if is_tenant_record(bytes) {
+            let record = tenant_record_metadata(bytes)?;
+            if record.tenant == default.tenant || records.insert(record.tenant, record).is_some() {
+                return Err(TenantAdministrationFailure::PersistenceUnavailable);
+            }
+        }
+    }
+    let registry = registry.ok_or(TenantAdministrationFailure::PersistenceUnavailable)?;
+    let registered = registry.tenants.iter().copied().collect::<BTreeSet<_>>();
+    if registered.len() != registry.tenants.len()
+        || !registered.contains(&default.tenant)
+        || records.len().checked_add(1) != Some(registered.len())
+        || records.keys().any(|tenant| !registered.contains(tenant))
+    {
+        return Err(TenantAdministrationFailure::PersistenceUnavailable);
+    }
+    let mut inspections = Vec::new();
+    inspections
+        .try_reserve(registry.tenants.len())
+        .map_err(|_| TenantAdministrationFailure::PersistenceUnavailable)?;
+    for tenant in &registry.tenants {
+        if *tenant == default.tenant {
+            inspections.push(default.clone());
+            continue;
+        }
+        let record = records
+            .remove(tenant)
+            .ok_or(TenantAdministrationFailure::PersistenceUnavailable)?;
+        inspections.push(TenantInspection {
+            tenant: record.tenant,
+            slug: TenantSlug::parse_canonical(&record.slug)
+                .map_err(|_| TenantAdministrationFailure::PersistenceUnavailable)?,
+            display_name: record.display_name,
+            retention_seconds: record.retention_seconds,
+            display_generation: record.display_generation,
+            retention_generation: record.retention_generation,
+            lifecycle: record.lifecycle,
+        });
+    }
+    if !records.is_empty() {
+        return Err(TenantAdministrationFailure::PersistenceUnavailable);
+    }
+    Ok((registry, inspections))
+}
+
 fn registry(
     snapshot: &CatalogSnapshot,
 ) -> Result<Option<TenantRegistry>, TenantAdministrationFailure> {
@@ -610,61 +733,70 @@ fn registry(
             if found.is_some() {
                 return Err(TenantAdministrationFailure::PersistenceUnavailable);
             }
-            let generation = generation_at(bytes, 24)?;
-            let tenants = if bytes.starts_with(&TENANT_REGISTRY_V1_MAGIC) {
-                if bytes.len() != 32 {
-                    return Err(TenantAdministrationFailure::PersistenceUnavailable);
-                }
-                Vec::new()
-            } else {
-                let count = usize::from(u16::from_be_bytes(
-                    bytes
-                        .get(32..34)
-                        .ok_or(TenantAdministrationFailure::PersistenceUnavailable)?
-                        .try_into()
-                        .map_err(|_| TenantAdministrationFailure::PersistenceUnavailable)?,
-                ));
-                let expected = 34_usize
-                    .checked_add(
-                        count
-                            .checked_mul(16)
-                            .ok_or(TenantAdministrationFailure::PersistenceUnavailable)?,
-                    )
-                    .ok_or(TenantAdministrationFailure::PersistenceUnavailable)?;
-                if bytes.len() != expected || count == 0 {
-                    return Err(TenantAdministrationFailure::PersistenceUnavailable);
-                }
-                let mut tenants = Vec::with_capacity(count);
-                for index in 0..count {
-                    let offset = 34_usize
-                        .checked_add(
-                            index
-                                .checked_mul(16)
-                                .ok_or(TenantAdministrationFailure::PersistenceUnavailable)?,
-                        )
-                        .ok_or(TenantAdministrationFailure::PersistenceUnavailable)?;
-                    let tenant = TenantId::from_bytes(
-                        bytes
-                            .get(offset..offset + 16)
-                            .ok_or(TenantAdministrationFailure::PersistenceUnavailable)?
-                            .try_into()
-                            .map_err(|_| TenantAdministrationFailure::PersistenceUnavailable)?,
-                    )
-                    .map_err(|_| TenantAdministrationFailure::PersistenceUnavailable)?;
-                    if tenants.contains(&tenant) {
-                        return Err(TenantAdministrationFailure::PersistenceUnavailable);
-                    }
-                    tenants.push(tenant);
-                }
-                tenants
-            };
-            found = Some(TenantRegistry {
-                generation,
-                tenants,
-            });
+            found = Some(decode_registry(bytes)?);
         }
     }
     Ok(found)
+}
+
+fn decode_registry(bytes: &[u8]) -> Result<TenantRegistry, TenantAdministrationFailure> {
+    let generation = generation_at(bytes, 24)?;
+    if bytes.starts_with(&TENANT_REGISTRY_V1_MAGIC) {
+        if bytes.len() != 32 {
+            return Err(TenantAdministrationFailure::PersistenceUnavailable);
+        }
+        return Ok(TenantRegistry {
+            generation,
+            tenants: Vec::new(),
+        });
+    }
+    let count = usize::from(u16::from_be_bytes(
+        bytes
+            .get(32..34)
+            .ok_or(TenantAdministrationFailure::PersistenceUnavailable)?
+            .try_into()
+            .map_err(|_| TenantAdministrationFailure::PersistenceUnavailable)?,
+    ));
+    let expected = 34_usize
+        .checked_add(
+            count
+                .checked_mul(16)
+                .ok_or(TenantAdministrationFailure::PersistenceUnavailable)?,
+        )
+        .ok_or(TenantAdministrationFailure::PersistenceUnavailable)?;
+    if bytes.len() != expected || count == 0 {
+        return Err(TenantAdministrationFailure::PersistenceUnavailable);
+    }
+    let mut tenants = Vec::new();
+    tenants
+        .try_reserve(count)
+        .map_err(|_| TenantAdministrationFailure::PersistenceUnavailable)?;
+    let mut unique = BTreeSet::new();
+    for index in 0..count {
+        let offset = 34_usize
+            .checked_add(
+                index
+                    .checked_mul(16)
+                    .ok_or(TenantAdministrationFailure::PersistenceUnavailable)?,
+            )
+            .ok_or(TenantAdministrationFailure::PersistenceUnavailable)?;
+        let tenant = TenantId::from_bytes(
+            bytes
+                .get(offset..offset + 16)
+                .ok_or(TenantAdministrationFailure::PersistenceUnavailable)?
+                .try_into()
+                .map_err(|_| TenantAdministrationFailure::PersistenceUnavailable)?,
+        )
+        .map_err(|_| TenantAdministrationFailure::PersistenceUnavailable)?;
+        if !unique.insert(tenant) {
+            return Err(TenantAdministrationFailure::PersistenceUnavailable);
+        }
+        tenants.push(tenant);
+    }
+    Ok(TenantRegistry {
+        generation,
+        tenants,
+    })
 }
 
 fn registry_object(

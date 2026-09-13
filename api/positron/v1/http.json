@@ -1,5 +1,5 @@
 {
-  "schema_digest": "724d134ab61e1a80dc89b1a8fa84e2de7dec4e61011e4f5624cb27baf041bb6d",
+  "schema_digest": "c851d30cdeeb0c2dc29048790458d7b6ec73b25a08eb52c4227d1775b545679c",
   "max_request_bytes": 64,
   "unknown_fields": "reject",
   "enums": {
@@ -525,9 +525,9 @@
       "max_request_bytes": 2048,
       "max_response_bytes": 65536,
       "unknown_fields": "reject",
-      "request_fields": [],
-      "response_fields": [{"proto":"tenants","json":"tenants","type":"TenantDescriptor","number":1,"deprecated":false,"repeated":true}],
-      "responses":{"200":"TenantListResponse","400":"invalid_request","401":"authentication_rejected","503":"administration_unavailable"}
+      "request_fields": [{"proto":"continuation","json":"continuation","type":"string","number":1,"deprecated":false}],
+      "response_fields": [{"proto":"tenants","json":"tenants","type":"TenantDescriptor","number":1,"deprecated":false,"repeated":true},{"proto":"continuation","json":"continuation","type":"string","number":2,"deprecated":false}],
+      "responses":{"200":"TenantListResponse","400":"invalid_request","401":"authentication_rejected","409":"stale_continuation","503":"administration_unavailable"}
     },
     {
       "rpc": "positron.v1.TenantService/UpdateDisplayName",
@@ -569,7 +569,8 @@
       "unknown_fields": "reject",
       "request_fields": [
         {"proto":"tenant","json":"tenant","type":"string","number":1,"deprecated":false},
-        {"proto":"proposed_retention_seconds","json":"proposed_retention_seconds","type":"uint64","number":2,"deprecated":false}
+        {"proto":"proposed_retention_seconds","json":"proposed_retention_seconds","type":"uint64","number":2,"deprecated":false},
+        {"proto":"continuation","json":"continuation","type":"string","number":3,"deprecated":false}
       ],
       "response_fields": [
         {"proto":"tenant","json":"tenant","type":"string","number":1,"deprecated":false},
@@ -578,9 +579,10 @@
         {"proto":"catalog_identity","json":"catalog_identity","type":"string","number":4,"deprecated":false},
         {"proto":"catalog_generation","json":"catalog_generation","type":"uint64","number":5,"deprecated":false},
         {"proto":"confirmation_digest","json":"confirmation_digest","type":"string","number":6,"deprecated":false},
-        {"proto":"scopes","json":"scopes","type":"TenantRetentionScopeImpact","number":7,"deprecated":false,"repeated":true}
+        {"proto":"scopes","json":"scopes","type":"TenantRetentionScopeImpact","number":7,"deprecated":false,"repeated":true},
+        {"proto":"continuation","json":"continuation","type":"string","number":8,"deprecated":false}
       ],
-      "responses":{"200":"TenantRetentionPreviewResponse","400":"invalid_request","401":"authentication_rejected","404":"tenant_unavailable","503":"administration_unavailable"}
+      "responses":{"200":"TenantRetentionPreviewResponse","400":"invalid_request","401":"authentication_rejected","404":"tenant_unavailable","409":"stale_continuation","503":"administration_unavailable"}
     },
     {
       "rpc": "positron.v1.TenantRetentionService/Update",

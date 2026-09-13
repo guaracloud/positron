@@ -124,7 +124,10 @@ impl ServiceHandle {
             .iter()
             .map(policy_diff_category)
             .map(str::to_owned)
-            .collect();
+            .collect::<Vec<_>>();
+        if semantic_changes.len() > positron_api::policy::MAX_DIFF_SEMANTIC_CHANGES {
+            return Err((503, "administration_unavailable"));
+        }
         Ok(positron_api::policy::PolicyDiffResponse {
             before_policy_generation: before_validation.generation(),
             before_policy_digest: hex_digest(before_validation.digest()),

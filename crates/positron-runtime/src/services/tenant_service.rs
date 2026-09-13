@@ -1,7 +1,7 @@
 use positron_api::tenant_service::{
-    TenantCreateRequest, TenantCreateResponse, TenantDescriptor, TenantDisplayNameUpdateRequest,
-    TenantDisplayNameUpdateResponse, TenantInspectRequest, TenantInspectResponse,
-    TenantLifecycleState, TenantListRequest, TenantListResponse,
+    MAX_LIST_PAGE_ITEMS, TenantCreateRequest, TenantCreateResponse, TenantDescriptor,
+    TenantDisplayNameUpdateRequest, TenantDisplayNameUpdateResponse, TenantInspectRequest,
+    TenantInspectResponse, TenantLifecycleState, TenantListRequest, TenantListResponse,
 };
 use positron_domain::identity::{PrincipalId, TenantId, TenantSlug};
 use positron_domain::lifecycle::TenantLifecycleState as DomainLifecycleState;
@@ -81,16 +81,23 @@ impl ServiceHandle {
         body: &[u8],
     ) -> Result<TenantListResponse, TenantServiceHttpFailure> {
         let actor = system_actor(self, bearer)?;
-        TenantListRequest::decode(body).map_err(invalid)?;
-        let inspections = self.instance.list_tenants(actor).map_err(unavailable)?;
+        let request = TenantListRequest::decode(body).map_err(invalid)?;
+        let continuation = request.continuation().map(parse_continuation).transpose()?;
+        let page = self
+            .instance
+            .list_tenant_page(actor, continuation, MAX_LIST_PAGE_ITEMS)
+            .map_err(map_list_failure)?;
         let mut tenants = Vec::new();
         tenants
-            .try_reserve(inspections.len())
+            .try_reserve(page.inspections().len())
             .map_err(|_| TenantServiceHttpFailure::Code(503, "administration_unavailable"))?;
-        for inspection in &inspections {
+        for inspection in page.inspections() {
             tenants.push(descriptor(inspection));
         }
-        Ok(TenantListResponse { tenants })
+        Ok(TenantListResponse {
+            tenants,
+            continuation: page.continuation().map(format_continuation),
+        })
     }
 
     pub(crate) fn update_tenant_display_name_service(
@@ -161,6 +168,51 @@ fn lifecycle(state: DomainLifecycleState) -> TenantLifecycleState {
 }
 fn invalid<T>(_: T) -> TenantServiceHttpFailure {
     TenantServiceHttpFailure::Code(400, "invalid_request")
+}
+fn map_list_failure(failure: BootstrapFailure) -> TenantServiceHttpFailure {
+    if failure.code() == BootstrapFailureCode::ApiKeyStaleGeneration {
+        TenantServiceHttpFailure::Code(409, "stale_continuation")
+    } else {
+        unavailable(failure)
+    }
+}
+fn parse_continuation(
+    value: &str,
+) -> Result<positron_governance::TenantListContinuation, TenantServiceHttpFailure> {
+    if value.len() != 84 {
+        return Err(invalid(()));
+    }
+    let mut bytes = [0_u8; 42];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let high =
+            hex_value(*pair.first().ok_or_else(|| invalid(()))?).ok_or_else(|| invalid(()))?;
+        let low = hex_value(*pair.get(1).ok_or_else(|| invalid(()))?).ok_or_else(|| invalid(()))?;
+        *bytes.get_mut(index).ok_or_else(|| invalid(()))? = (high << 4) | low;
+    }
+    positron_governance::TenantListContinuation::from_bytes(bytes).map_err(invalid)
+}
+fn format_continuation(value: positron_governance::TenantListContinuation) -> String {
+    let bytes = value.to_bytes();
+    let mut text = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        text.push(hex_digit(byte >> 4));
+        text.push(hex_digit(byte & 0x0f));
+    }
+    text
+}
+const fn hex_value(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        _ => None,
+    }
+}
+const fn hex_digit(value: u8) -> char {
+    match value {
+        0..=9 => (b'0' + value) as char,
+        10..=15 => (b'a' + value - 10) as char,
+        _ => '0',
+    }
 }
 fn map_create_failure(failure: BootstrapFailure) -> TenantServiceHttpFailure {
     match failure.code() {

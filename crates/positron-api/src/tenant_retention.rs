@@ -16,6 +16,8 @@ pub const PREVIEW_HTTP_PATH: &str = "/v1/tenant-retention:preview";
 pub const UPDATE_HTTP_PATH: &str = "/v1/tenant-retention:update";
 pub const MAX_REQUEST_BYTES: usize = 2048;
 pub const MAX_RESPONSE_BYTES: usize = 64 * 1024;
+pub const MAX_PREVIEW_PAGE_ITEMS: usize = 64;
+const PREVIEW_CONTINUATION_HEX_BYTES: usize = 98;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TenantRetentionWireFailure;
@@ -32,6 +34,7 @@ impl std::error::Error for TenantRetentionWireFailure {}
 pub struct TenantRetentionPreviewRequest {
     tenant: String,
     proposed_retention_seconds: u64,
+    continuation: Option<String>,
 }
 impl TenantRetentionPreviewRequest {
     #[must_use]
@@ -39,7 +42,13 @@ impl TenantRetentionPreviewRequest {
         Self {
             tenant,
             proposed_retention_seconds,
+            continuation: None,
         }
+    }
+    #[must_use]
+    pub fn with_continuation(mut self, continuation: String) -> Self {
+        self.continuation = Some(continuation);
+        self
     }
     pub fn decode(body: &[u8]) -> Result<Self, TenantRetentionWireFailure> {
         decode(body)
@@ -56,8 +65,18 @@ impl TenantRetentionPreviewRequest {
     pub const fn proposed_retention_seconds(&self) -> u64 {
         self.proposed_retention_seconds
     }
+    #[must_use]
+    pub fn continuation(&self) -> Option<&str> {
+        self.continuation.as_deref()
+    }
     pub fn validate(&self) -> Result<(), TenantRetentionWireFailure> {
-        if uuid(&self.tenant) && self.proposed_retention_seconds != 0 {
+        if uuid(&self.tenant)
+            && self.proposed_retention_seconds != 0
+            && self
+                .continuation
+                .as_deref()
+                .is_none_or(preview_continuation)
+        {
             Ok(())
         } else {
             Err(TenantRetentionWireFailure)
@@ -176,6 +195,7 @@ pub struct TenantRetentionPreviewResponse {
     pub catalog_generation: u64,
     pub confirmation_digest: String,
     pub scopes: Vec<RetentionScopeImpact>,
+    pub continuation: Option<String>,
 }
 impl TenantRetentionPreviewResponse {
     pub fn decode(body: &[u8]) -> Result<Self, TenantRetentionWireFailure> {
@@ -188,7 +208,11 @@ impl TenantRetentionPreviewResponse {
     }
     pub fn encode(&self) -> Result<Vec<u8>, TenantRetentionWireFailure> {
         self.validate()?;
-        serde_json::to_vec(self).map_err(|_| TenantRetentionWireFailure)
+        let encoded = serde_json::to_vec(self).map_err(|_| TenantRetentionWireFailure)?;
+        if encoded.len() > MAX_RESPONSE_BYTES {
+            return Err(TenantRetentionWireFailure);
+        }
+        Ok(encoded)
     }
     pub fn validate(&self) -> Result<(), TenantRetentionWireFailure> {
         if !uuid(&self.tenant)
@@ -197,7 +221,11 @@ impl TenantRetentionPreviewResponse {
             || !hex_digest(&self.catalog_identity)
             || self.catalog_generation == 0
             || !hex_digest(&self.confirmation_digest)
-            || self.scopes.len() > 1024
+            || self.scopes.len() > MAX_PREVIEW_PAGE_ITEMS
+            || !self
+                .continuation
+                .as_deref()
+                .is_none_or(preview_continuation)
         {
             return Err(TenantRetentionWireFailure);
         }
@@ -257,7 +285,11 @@ impl TenantRetentionUpdateResponse {
             && self.audit_position != 0
             && self.audit_ingest_time_unix_seconds != 0
         {
-            serde_json::to_vec(self).map_err(|_| TenantRetentionWireFailure)
+            let encoded = serde_json::to_vec(self).map_err(|_| TenantRetentionWireFailure)?;
+            if encoded.len() > MAX_RESPONSE_BYTES {
+                return Err(TenantRetentionWireFailure);
+            }
+            Ok(encoded)
         } else {
             Err(TenantRetentionWireFailure)
         }
@@ -304,6 +336,12 @@ fn uuid(value: &str) -> bool {
 }
 fn hex_digest(value: &str) -> bool {
     value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+fn preview_continuation(value: &str) -> bool {
+    value.len() == PREVIEW_CONTINUATION_HEX_BYTES * 2
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))

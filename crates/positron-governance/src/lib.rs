@@ -58,7 +58,8 @@ pub use quota_administration::{
 };
 pub use tenant_administration::{
     TenantAdministration, TenantAdministrationFailure, TenantCreateConfiguration,
-    TenantCreateRequest, TenantCreation, TenantInspection,
+    TenantCreateRequest, TenantCreation, TenantInspection, TenantInspectionPage,
+    TenantListContinuation,
 };
 pub use tenant_alias_administration::{
     TenantAliasAdministration, TenantAliasAdministrationFailure, TenantAliasBindRequest,

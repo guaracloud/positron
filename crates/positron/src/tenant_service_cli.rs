@@ -36,10 +36,14 @@ fn execute(arguments: impl Iterator<Item = String>) -> Result<(), &'static str> 
             let response = client.inspect(bearer, &request).map_err(client_failure)?;
             print_descriptor(&response.tenant);
         },
-        Command::List(request) => {
+        Command::List(mut request) => loop {
             let response = client.list(bearer, &request).map_err(client_failure)?;
             for descriptor in response.tenants {
                 print_descriptor(&descriptor);
+            }
+            match response.continuation {
+                Some(continuation) => request = TenantListRequest::with_continuation(continuation),
+                None => break,
             }
         },
         Command::UpdateDisplayName(request) => {
@@ -100,6 +104,9 @@ fn client_failure(failure: TenantServiceClientFailure) -> &'static str {
         TenantServiceClientFailure::TenantUnavailable => "tenant unavailable",
         TenantServiceClientFailure::StaleGeneration => {
             "stale display generation; inspect current state before retrying"
+        },
+        TenantServiceClientFailure::StaleContinuation => {
+            "tenant list changed; restart enumeration without a continuation"
         },
         TenantServiceClientFailure::IdempotencyConflict => {
             "idempotency conflict; inspect current state before retrying"
@@ -168,6 +175,7 @@ fn parse(
                     | "--disk-headroom-bytes"
                     | "--idempotency-key"
                     | "--expected-display-generation"
+                    | "--continuation"
             ) {
                 return Err("unknown tenant option");
             }
@@ -209,7 +217,10 @@ fn parse(
             &mut options,
             "--tenant",
         )?)),
-        "list" => Command::List(TenantListRequest::new()),
+        "list" => match options.remove("--continuation") {
+            Some(continuation) => Command::List(TenantListRequest::with_continuation(continuation)),
+            None => Command::List(TenantListRequest::new()),
+        },
         "update-display-name" => Command::UpdateDisplayName(TenantDisplayNameUpdateRequest::new(
             required(&mut options, "--tenant")?,
             number(&mut options, "--expected-display-generation")?,
@@ -272,7 +283,7 @@ fn number<T: std::str::FromStr>(
         .map_err(|_| "invalid tenant numeric value")
 }
 
-const USAGE: &str = "usage: positron tenant create|inspect|list|update-display-name --endpoint IP:PORT --credential-stdin [named request options] [--server-name NAME --trust-file PATH | --allow-plaintext]";
+const USAGE: &str = "usage: positron tenant create|inspect|list [--continuation OPAQUE_TOKEN]|update-display-name --endpoint IP:PORT --credential-stdin [named request options] [--server-name NAME --trust-file PATH | --allow-plaintext]";
 
 #[cfg(test)]
 mod tests {
@@ -355,7 +366,7 @@ mod tests {
                 (
                     "/v1/tenants:list",
                     200,
-                    r#"{"tenants":[{"tenant":"22222222-2222-2222-2222-222222222222","slug":"acme-observability","display_name":"Acme Observability","retention_seconds":2592000,"display_generation":1,"retention_generation":1,"lifecycle":"active"}]}"#,
+                    r#"{"tenants":[{"tenant":"22222222-2222-2222-2222-222222222222","slug":"acme-observability","display_name":"Acme Observability","retention_seconds":2592000,"display_generation":1,"retention_generation":1,"lifecycle":"active"}],"continuation":null}"#,
                 ),
                 (
                     "/v1/tenants:update-display-name",

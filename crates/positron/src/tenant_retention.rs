@@ -43,17 +43,44 @@ fn execute(arguments: impl Iterator<Item = String>) -> Result<(), &'static str> 
     let client =
         TenantRetentionServiceClient::new(transport).map_err(|_| "API endpoint unavailable")?;
     match request {
-        Request::Preview(request) => {
-            let preview = client.preview(bearer, &request).map_err(client_failure)?;
+        Request::Preview(mut request) => {
+            let mut complete = None;
+            let mut scopes = 0_usize;
+            loop {
+                let preview = client.preview(bearer, &request).map_err(client_failure)?;
+                let current = (
+                    preview.tenant.clone(),
+                    preview.retention_generation,
+                    preview.proposed_retention_seconds,
+                    preview.catalog_identity.clone(),
+                    preview.catalog_generation,
+                    preview.confirmation_digest.clone(),
+                );
+                if let Some(expected) = &complete {
+                    if expected != &current {
+                        return Err("retention preview changed; request a new complete preview");
+                    }
+                } else {
+                    complete = Some(current);
+                }
+                scopes = scopes
+                    .checked_add(preview.scopes.len())
+                    .ok_or("retention preview has too many scopes")?;
+                match preview.continuation {
+                    Some(continuation) => {
+                        request = TenantRetentionPreviewRequest::new(
+                            request.tenant().to_owned(),
+                            request.proposed_retention_seconds(),
+                        )
+                        .with_continuation(continuation);
+                    },
+                    None => break,
+                }
+            }
+            let (tenant, generation, proposed, identity, catalog_generation, digest) =
+                complete.ok_or("retention preview response was empty")?;
             println!(
-                "tenant={} retention_generation={} proposed_retention_seconds={} catalog_identity={} catalog_generation={} confirmation_digest={} scopes={}",
-                preview.tenant,
-                preview.retention_generation,
-                preview.proposed_retention_seconds,
-                preview.catalog_identity,
-                preview.catalog_generation,
-                preview.confirmation_digest,
-                preview.scopes.len()
+                "tenant={tenant} retention_generation={generation} proposed_retention_seconds={proposed} catalog_identity={identity} catalog_generation={catalog_generation} confirmation_digest={digest} scopes={scopes}"
             );
         },
         Request::Update(request) => {
@@ -79,6 +106,9 @@ fn client_failure(failure: TenantRetentionServiceClientFailure) -> &'static str 
         TenantRetentionServiceClientFailure::TenantUnavailable => "tenant unavailable",
         TenantRetentionServiceClientFailure::InvalidConfirmation => {
             "retention confirmation is invalid; request a current preview before retrying"
+        },
+        TenantRetentionServiceClientFailure::StaleContinuation => {
+            "stale retention preview; request a current preview before retrying"
         },
         TenantRetentionServiceClientFailure::StaleGeneration { .. } => {
             "stale retention generation; request a current preview before retrying"
@@ -135,6 +165,7 @@ fn parse(
                 | "--idempotency-key"
                 | "--server-name"
                 | "--trust-file"
+                | "--continuation"
         ) {
             return Err("unknown retention option");
         }
@@ -155,10 +186,13 @@ fn parse(
         "--proposed-retention-seconds is required",
     )?;
     let request = match operation.as_str() {
-        "preview" => Request::Preview(TenantRetentionPreviewRequest::new(
-            tenant,
-            proposed_retention_seconds,
-        )),
+        "preview" => {
+            let request = TenantRetentionPreviewRequest::new(tenant, proposed_retention_seconds);
+            Request::Preview(match options.remove("--continuation") {
+                Some(continuation) => request.with_continuation(continuation),
+                None => request,
+            })
+        },
         "update" => Request::Update(TenantRetentionUpdateRequest::new(
             tenant,
             proposed_retention_seconds,
@@ -231,7 +265,7 @@ fn positive_u64(value: Option<String>, absent: &'static str) -> Result<u64, &'st
 }
 
 const fn usage() -> &'static str {
-    "usage: positron tenant retention preview --endpoint IP:PORT --credential-stdin --tenant UUID --proposed-retention-seconds N [--server-name NAME --trust-file PATH | --allow-plaintext]\n       positron tenant retention update --endpoint IP:PORT --credential-stdin --tenant UUID --proposed-retention-seconds N --expected-generation N --idempotency-key UUID [--confirmation-digest HEX] [--server-name NAME --trust-file PATH | --allow-plaintext]"
+    "usage: positron tenant retention preview --endpoint IP:PORT --credential-stdin --tenant UUID --proposed-retention-seconds N [--continuation OPAQUE_TOKEN] [--server-name NAME --trust-file PATH | --allow-plaintext]\n       positron tenant retention update --endpoint IP:PORT --credential-stdin --tenant UUID --proposed-retention-seconds N --expected-generation N --idempotency-key UUID [--confirmation-digest HEX] [--server-name NAME --trust-file PATH | --allow-plaintext]"
 }
 
 #[cfg(test)]
