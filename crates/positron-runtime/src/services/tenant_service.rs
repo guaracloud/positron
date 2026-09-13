@@ -28,13 +28,11 @@ impl ServiceHandle {
     ) -> Result<TenantCreateResponse, TenantServiceHttpFailure> {
         let actor = system_actor(self, bearer)?;
         let request = TenantCreateRequest::decode(body).map_err(invalid)?;
-        let tenant = TenantId::parse_canonical(request.tenant()).map_err(invalid)?;
         let slug = TenantSlug::parse_canonical(request.slug()).map_err(invalid)?;
         let created = self
             .instance
-            .create_tenant(
+            .create_tenant_generated(
                 actor,
-                tenant,
                 positron_governance::TenantCreateConfiguration::new(
                     slug,
                     request.display_name(),

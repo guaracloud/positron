@@ -11,7 +11,6 @@ const IDEMPOTENCY: &str = "01010101-0101-0101-0101-010101010101";
 #[test]
 fn tenant_service_requests_are_bounded_canonical_and_explicit() {
     let create = TenantCreateRequest::new(
-        TENANT.to_owned(),
         "acme-observability".to_owned(),
         "Acme Observability".to_owned(),
         2_592_000,

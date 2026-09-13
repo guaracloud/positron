@@ -1,5 +1,5 @@
 {
-  "schema_digest": "c851d30cdeeb0c2dc29048790458d7b6ec73b25a08eb52c4227d1775b545679c",
+  "schema_digest": "0e7b239667b2eb2a8ea5d6a0e99de55ba8427941e1cd5476ab4e708414e8787a",
   "max_request_bytes": 64,
   "unknown_fields": "reject",
   "enums": {
@@ -389,7 +389,6 @@
       "max_response_bytes": 1024,
       "unknown_fields": "reject",
       "request_fields": [
-        {"proto":"tenant","json":"tenant","type":"string","number":1,"deprecated":false},
         {"proto":"expected_generation","json":"expected_generation","type":"uint64","number":2,"deprecated":false},
         {"proto":"idempotency_key","json":"idempotency_key","type":"string","number":3,"deprecated":false},
         {"proto":"weight","json":"weight","type":"uint32","number":4,"deprecated":false},

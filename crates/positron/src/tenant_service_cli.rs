@@ -193,7 +193,6 @@ fn parse(
     let transport = transport(&mut options, allow_plaintext)?;
     let command = match command.as_str() {
         "create" => Command::Create(TenantCreateRequest::new(
-            required(&mut options, "--tenant")?,
             required(&mut options, "--slug")?,
             required(&mut options, "--display-name")?,
             number(&mut options, "--retention-seconds")?,
@@ -415,7 +414,6 @@ mod tests {
             trust_file: certificate.into(),
         })?;
         let create = TenantCreateRequest::new(
-            "22222222-2222-2222-2222-222222222222".to_owned(),
             "acme-observability".to_owned(),
             "Acme Observability".to_owned(),
             2_592_000,

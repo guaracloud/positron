@@ -218,7 +218,7 @@ message TenantRetentionUpdateResponse {
 }
 
 message TenantCreateRequest {
-  string tenant = 1;
+  reserved 1;
   string slug = 2;
   string display_name = 3;
   uint64 retention_seconds = 4;

@@ -33,7 +33,6 @@ impl std::error::Error for TenantServiceWireFailure {}
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TenantCreateRequest {
-    tenant: String,
     slug: String,
     display_name: String,
     retention_seconds: u64,
@@ -55,7 +54,6 @@ pub struct TenantCreateRequest {
 impl TenantCreateRequest {
     #[must_use]
     pub fn new(
-        tenant: String,
         slug: String,
         display_name: String,
         retention_seconds: u64,
@@ -64,7 +62,6 @@ impl TenantCreateRequest {
         idempotency_key: String,
     ) -> Self {
         Self {
-            tenant,
             slug,
             display_name,
             retention_seconds,
@@ -89,9 +86,6 @@ impl TenantCreateRequest {
     pub fn encode(&self) -> Result<Vec<u8>, TenantServiceWireFailure> {
         self.validate()?;
         serde_json::to_vec(self).map_err(|_| TenantServiceWireFailure)
-    }
-    pub fn tenant(&self) -> &str {
-        &self.tenant
     }
     pub fn slug(&self) -> &str {
         &self.slug
@@ -124,8 +118,7 @@ impl TenantCreateRequest {
         &self.idempotency_key
     }
     pub fn validate(&self) -> Result<(), TenantServiceWireFailure> {
-        if !identifier(&self.tenant)
-            || !slug(&self.slug)
+        if !slug(&self.slug)
             || self.display_name.is_empty()
             || self.display_name.len() > 128
             || self.retention_seconds == 0
