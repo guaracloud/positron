@@ -105,7 +105,7 @@ fn every_named_bootstrap_allocation_stage_fails_with_typed_inventory() {
 }
 
 #[test]
-fn tenant_payload_growth_enumerates_all_nine_retained_tables() {
+fn tenant_payload_growth_enumerates_all_ten_retained_tables() {
     let one = BootstrapInventoryLayout::new(1, 8).expect("layout is valid");
     let maximum = BootstrapInventoryLayout::new(1_024, 8).expect("layout is valid");
     let per_tenant = [
@@ -113,6 +113,7 @@ fn tenant_payload_growth_enumerates_all_nine_retained_tables() {
         size_of::<PoolCapacities>(),
         size_of::<ResourceAmounts>(),
         size_of::<RecoveryPoolCapacities>(),
+        size_of::<ResourceAmounts>(),
         size_of::<ResourceAmounts>(),
         size_of::<ResourceAmounts>(),
         size_of::<RecoveryPoolUsage>(),

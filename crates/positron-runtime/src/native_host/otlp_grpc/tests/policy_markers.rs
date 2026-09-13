@@ -78,7 +78,7 @@ fn assert_trace_marker(
         .into_iter()
         .next()
         .ok_or("trace scope missing after authenticated export")?;
-    let protection = initialized.key.segment_key(initialized.instance, scope)?;
+    let protection = initialized.tenant_segment_key_for_test(scope)?;
     let ledger = ActiveSegmentLedger::open(
         &initialized._authority,
         &catalog,

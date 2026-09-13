@@ -65,7 +65,7 @@ fn literal_v2_governance_identity_remains_readable_without_query_authority() {
 #[test]
 fn initial_governance_identity_publishes_three_redacted_scoped_credentials() {
     let encoded = encoded_identity();
-    assert!(encoded.starts_with(b"POSGOV05"));
+    assert!(encoded.starts_with(b"POSGOV07"));
     let decoded = positron_kernel::CatalogGovernanceObject::decode(&encoded)
         .expect("initial governance identity is a readable catalog object");
     assert_eq!(decoded.credentials().len(), 3);

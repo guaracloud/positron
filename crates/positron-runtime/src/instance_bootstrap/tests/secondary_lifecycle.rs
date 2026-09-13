@@ -67,11 +67,13 @@ fn default_lifecycle_drains_do_not_block_active_secondary_data_routes()
     initialized.create_tenant(
         system(&initialized, claim.secret())?,
         secondary,
-        TenantSlug::parse_canonical("drain-secondary")?,
-        "Drain secondary",
-        2_592_000,
-        1,
-        resources::initial_tenant_quota(),
+        positron_governance::TenantCreateConfiguration::new(
+            TenantSlug::parse_canonical("drain-secondary")?,
+            "Drain secondary",
+            2_592_000,
+            1,
+            resources::initial_tenant_quota(),
+        ),
         AdministrativeIdempotencyKey::new([0xa2; 16])?,
     )?;
     let ingest = initialized.create_api_key_for_tenant(
@@ -239,11 +241,13 @@ fn secondary_read_only_transition_is_audited_idempotent_and_survives_reopen()
     initialized.create_tenant(
         administrator,
         secondary,
-        TenantSlug::parse_canonical("lifecycle-secondary")?,
-        "Lifecycle secondary",
-        2_592_000,
-        1,
-        resources::initial_tenant_quota(),
+        positron_governance::TenantCreateConfiguration::new(
+            TenantSlug::parse_canonical("lifecycle-secondary")?,
+            "Lifecycle secondary",
+            2_592_000,
+            1,
+            resources::initial_tenant_quota(),
+        ),
         AdministrativeIdempotencyKey::new([0x92; 16])?,
     )?;
     let ingest = initialized.create_api_key_for_tenant(
@@ -434,11 +438,13 @@ fn failed_secondary_lifecycle_publication_keeps_predecessor_authoritative()
     initialized.create_tenant(
         system(&initialized, claim.secret())?,
         secondary,
-        TenantSlug::parse_canonical("fault-secondary")?,
-        "Fault secondary",
-        2_592_000,
-        1,
-        resources::initial_tenant_quota(),
+        positron_governance::TenantCreateConfiguration::new(
+            TenantSlug::parse_canonical("fault-secondary")?,
+            "Fault secondary",
+            2_592_000,
+            1,
+            resources::initial_tenant_quota(),
+        ),
         AdministrativeIdempotencyKey::new([0xb2; 16])?,
     )?;
     let idempotency = AdministrativeIdempotencyKey::new([0xb3; 16])?;

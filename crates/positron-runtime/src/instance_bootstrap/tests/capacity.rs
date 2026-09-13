@@ -124,11 +124,13 @@ fn full_capacity_rejects_before_publication_and_lower_reopen_fails_closed()
         .create_tenant(
             system,
             TenantId::from_bytes([0x92; 16])?,
-            TenantSlug::parse_canonical("capacity-rejected")?,
-            "Capacity rejected",
-            2_592_000,
-            1,
-            resources::initial_tenant_quota(),
+            positron_governance::TenantCreateConfiguration::new(
+                TenantSlug::parse_canonical("capacity-rejected")?,
+                "Capacity rejected",
+                2_592_000,
+                1,
+                resources::initial_tenant_quota(),
+            ),
             AdministrativeIdempotencyKey::new([0xa2; 16])?,
         )
         .expect_err("a full configured governor must reject before publication");
@@ -170,11 +172,13 @@ fn create_tenant(
         .create_tenant(
             system,
             tenant,
-            TenantSlug::parse_canonical(slug)?,
-            "Configured capacity tenant",
-            2_592_000,
-            1,
-            resources::initial_tenant_quota(),
+            positron_governance::TenantCreateConfiguration::new(
+                TenantSlug::parse_canonical(slug)?,
+                "Configured capacity tenant",
+                2_592_000,
+                1,
+                resources::initial_tenant_quota(),
+            ),
             AdministrativeIdempotencyKey::new(idempotency)?,
         )
         .map_err(|failure| format!("tenant creation: {failure:?}"))?;

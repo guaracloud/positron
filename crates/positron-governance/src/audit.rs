@@ -8,6 +8,7 @@ use positron_domain::lifecycle::TenantLifecycleState;
 use positron_kernel::GovernanceAuditRecord;
 
 use crate::identity::IdentityFailure;
+use crate::tenant_profile_administration::TENANT_DISPLAY_MAGIC;
 use crate::{AdministrativeIdempotencyKey, ResourceGeneration};
 
 pub use rotation::{CatalogRootRotationAuditEntry, CatalogRootRotationStage};
@@ -22,6 +23,8 @@ const LISTENER_TRANSPORT_MAGIC: [u8; 8] = *b"POSTPT01";
 const TENANT_LIFECYCLE_MAGIC: [u8; 8] = *b"POSTEN01";
 const TENANT_CREATION_MAGIC: [u8; 8] = *b"POSTNA01";
 const FORMAT_MIGRATION_MAGIC: [u8; 8] = *b"POSFMT01";
+const TENANT_ALIAS_MAGIC: [u8; 8] = *b"POSALI01";
+const TENANT_RETENTION_MAGIC: [u8; 8] = *b"POSTRT01";
 
 /// Bounded, non-secret metadata for the initial instance operation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -61,12 +64,43 @@ pub enum GovernanceAuditEntry {
     CatalogRootRotation(CatalogRootRotationAuditEntry),
     IngestPolicyActivation(IngestPolicyActivationAuditEntry),
     TenantQuotaUpdate(TenantQuotaUpdateAuditEntry),
+    TenantDisplayNameUpdate(TenantDisplayNameUpdateAuditEntry),
     SchemaCheckpoint(SchemaCheckpointAuditEntry),
     ApiKeyLifecycle(ApiKeyLifecycleAuditEntry),
     ListenerTransport(ListenerTransportAuditEntry),
     TenantLifecycle(TenantLifecycleAuditEntry),
     TenantCreation(TenantCreationAuditEntry),
     CatalogFormatMigration(CatalogFormatMigrationAuditEntry),
+    TenantAliasBinding(TenantAliasBindingAuditEntry),
+    TenantRetentionUpdate(TenantRetentionUpdateAuditEntry),
+}
+
+/// Redacted evidence for a retention successor. The duration and impact
+/// evidence remain bound only by the request digest.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TenantRetentionUpdateAuditEntry {
+    position: u64,
+    ingest_time_unix_seconds: u64,
+    actor: PrincipalId,
+    tenant: TenantId,
+    expected_generation: ResourceGeneration,
+    generation: ResourceGeneration,
+    request_digest: [u8; 32],
+    idempotency_key: AdministrativeIdempotencyKey,
+}
+
+/// Redacted immutable-alias binding evidence. The alias text is intentionally
+/// omitted; its canonical request digest is the idempotency binding.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TenantAliasBindingAuditEntry {
+    position: u64,
+    ingest_time_unix_seconds: u64,
+    actor: PrincipalId,
+    tenant: TenantId,
+    expected_generation: ResourceGeneration,
+    generation: ResourceGeneration,
+    request_digest: [u8; 32],
+    idempotency_key: AdministrativeIdempotencyKey,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -194,6 +228,50 @@ pub struct TenantQuotaUpdateAuditEntry {
     request_digest: [u8; 32],
 }
 
+/// Redacted evidence for one display-name successor. The label itself is
+/// bound only through the request digest and is never copied into audit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TenantDisplayNameUpdateAuditEntry {
+    position: u64,
+    idempotency_key: AdministrativeIdempotencyKey,
+    principal: PrincipalId,
+    tenant: TenantId,
+    expected_generation: ResourceGeneration,
+    generation: ResourceGeneration,
+    request_digest: [u8; 32],
+}
+
+impl TenantDisplayNameUpdateAuditEntry {
+    #[must_use]
+    pub const fn position(&self) -> u64 {
+        self.position
+    }
+    #[must_use]
+    pub const fn idempotency_key(&self) -> AdministrativeIdempotencyKey {
+        self.idempotency_key
+    }
+    #[must_use]
+    pub const fn principal_id(&self) -> PrincipalId {
+        self.principal
+    }
+    #[must_use]
+    pub const fn tenant_id(&self) -> TenantId {
+        self.tenant
+    }
+    #[must_use]
+    pub const fn expected_generation(&self) -> ResourceGeneration {
+        self.expected_generation
+    }
+    #[must_use]
+    pub const fn generation(&self) -> ResourceGeneration {
+        self.generation
+    }
+    #[must_use]
+    pub const fn request_digest(&self) -> [u8; 32] {
+        self.request_digest
+    }
+}
+
 impl TenantQuotaUpdateAuditEntry {
     #[must_use]
     pub const fn position(&self) -> u64 {
@@ -300,12 +378,15 @@ impl GovernanceAuditEntry {
             Self::CatalogRootRotation(entry) => entry.position(),
             Self::IngestPolicyActivation(entry) => entry.position,
             Self::TenantQuotaUpdate(entry) => entry.position,
+            Self::TenantDisplayNameUpdate(entry) => entry.position,
             Self::SchemaCheckpoint(entry) => entry.position(),
             Self::ApiKeyLifecycle(entry) => entry.position,
             Self::ListenerTransport(entry) => entry.position,
             Self::TenantLifecycle(entry) => entry.position,
             Self::TenantCreation(entry) => entry.position,
             Self::CatalogFormatMigration(entry) => entry.position,
+            Self::TenantAliasBinding(entry) => entry.position,
+            Self::TenantRetentionUpdate(entry) => entry.position,
         }
     }
 
@@ -316,6 +397,7 @@ impl GovernanceAuditEntry {
             Self::CatalogRootRotation(entry) => entry.action(),
             Self::IngestPolicyActivation(_) => "ingest-policy.activate",
             Self::TenantQuotaUpdate(_) => "tenant-quota.update",
+            Self::TenantDisplayNameUpdate(_) => "tenant.display-name.update",
             Self::SchemaCheckpoint(_) => "schema-checkpoint.replace",
             Self::ApiKeyLifecycle(entry) => match entry.action {
                 ApiKeyLifecycleAction::Create => "api-key.create",
@@ -326,6 +408,8 @@ impl GovernanceAuditEntry {
             Self::TenantLifecycle(_) => "tenant.lifecycle.transition",
             Self::TenantCreation(_) => "tenant.create",
             Self::CatalogFormatMigration(_) => "catalog.format.migrate",
+            Self::TenantAliasBinding(_) => "tenant.alias.bind",
+            Self::TenantRetentionUpdate(_) => "tenant.retention.update",
         }
     }
 
@@ -336,12 +420,15 @@ impl GovernanceAuditEntry {
             Self::CatalogRootRotation(entry) => entry.outcome(),
             Self::IngestPolicyActivation(_) => "succeeded",
             Self::TenantQuotaUpdate(_) => "succeeded",
+            Self::TenantDisplayNameUpdate(_) => "succeeded",
             Self::SchemaCheckpoint(_) => "succeeded",
             Self::ApiKeyLifecycle(_) => "succeeded",
             Self::ListenerTransport(entry) => entry.outcome(),
             Self::TenantLifecycle(_) => "succeeded",
             Self::TenantCreation(_) => "succeeded",
             Self::CatalogFormatMigration(_) => "succeeded",
+            Self::TenantAliasBinding(_) => "succeeded",
+            Self::TenantRetentionUpdate(_) => "succeeded",
         }
     }
 
@@ -352,12 +439,15 @@ impl GovernanceAuditEntry {
             Self::CatalogRootRotation(_)
             | Self::IngestPolicyActivation(_)
             | Self::TenantQuotaUpdate(_)
+            | Self::TenantDisplayNameUpdate(_)
             | Self::SchemaCheckpoint(_)
             | Self::ApiKeyLifecycle(_)
             | Self::ListenerTransport(_)
             | Self::TenantLifecycle(_)
             | Self::TenantCreation(_)
-            | Self::CatalogFormatMigration(_) => None,
+            | Self::CatalogFormatMigration(_)
+            | Self::TenantAliasBinding(_)
+            | Self::TenantRetentionUpdate(_) => None,
         }
     }
 
@@ -368,12 +458,15 @@ impl GovernanceAuditEntry {
             Self::Initialization(_)
             | Self::IngestPolicyActivation(_)
             | Self::TenantQuotaUpdate(_)
+            | Self::TenantDisplayNameUpdate(_)
             | Self::SchemaCheckpoint(_)
             | Self::ApiKeyLifecycle(_)
             | Self::ListenerTransport(_)
             | Self::TenantLifecycle(_)
             | Self::TenantCreation(_)
-            | Self::CatalogFormatMigration(_) => None,
+            | Self::CatalogFormatMigration(_)
+            | Self::TenantAliasBinding(_)
+            | Self::TenantRetentionUpdate(_) => None,
         }
     }
 
@@ -385,11 +478,14 @@ impl GovernanceAuditEntry {
             | Self::CatalogRootRotation(_)
             | Self::IngestPolicyActivation(_)
             | Self::TenantQuotaUpdate(_)
+            | Self::TenantDisplayNameUpdate(_)
             | Self::ApiKeyLifecycle(_)
             | Self::ListenerTransport(_)
             | Self::TenantLifecycle(_)
             | Self::TenantCreation(_)
-            | Self::CatalogFormatMigration(_) => None,
+            | Self::CatalogFormatMigration(_)
+            | Self::TenantAliasBinding(_)
+            | Self::TenantRetentionUpdate(_) => None,
         }
     }
 
@@ -401,11 +497,14 @@ impl GovernanceAuditEntry {
             | Self::CatalogRootRotation(_)
             | Self::IngestPolicyActivation(_)
             | Self::TenantQuotaUpdate(_)
+            | Self::TenantDisplayNameUpdate(_)
             | Self::SchemaCheckpoint(_)
             | Self::ListenerTransport(_)
             | Self::TenantLifecycle(_)
             | Self::TenantCreation(_)
-            | Self::CatalogFormatMigration(_) => None,
+            | Self::CatalogFormatMigration(_)
+            | Self::TenantAliasBinding(_)
+            | Self::TenantRetentionUpdate(_) => None,
         }
     }
 
@@ -417,11 +516,14 @@ impl GovernanceAuditEntry {
             | Self::CatalogRootRotation(_)
             | Self::IngestPolicyActivation(_)
             | Self::TenantQuotaUpdate(_)
+            | Self::TenantDisplayNameUpdate(_)
             | Self::SchemaCheckpoint(_)
             | Self::ApiKeyLifecycle(_)
             | Self::TenantLifecycle(_)
             | Self::TenantCreation(_)
-            | Self::CatalogFormatMigration(_) => None,
+            | Self::CatalogFormatMigration(_)
+            | Self::TenantAliasBinding(_)
+            | Self::TenantRetentionUpdate(_) => None,
         }
     }
 
@@ -433,11 +535,14 @@ impl GovernanceAuditEntry {
             | Self::CatalogRootRotation(_)
             | Self::IngestPolicyActivation(_)
             | Self::TenantQuotaUpdate(_)
+            | Self::TenantDisplayNameUpdate(_)
             | Self::SchemaCheckpoint(_)
             | Self::ApiKeyLifecycle(_)
             | Self::ListenerTransport(_)
             | Self::TenantCreation(_)
-            | Self::CatalogFormatMigration(_) => None,
+            | Self::CatalogFormatMigration(_)
+            | Self::TenantAliasBinding(_)
+            | Self::TenantRetentionUpdate(_) => None,
         }
     }
 
@@ -448,12 +553,55 @@ impl GovernanceAuditEntry {
             Self::Initialization(_)
             | Self::CatalogRootRotation(_)
             | Self::IngestPolicyActivation(_)
+            | Self::TenantDisplayNameUpdate(_)
             | Self::SchemaCheckpoint(_)
             | Self::ApiKeyLifecycle(_)
             | Self::ListenerTransport(_)
             | Self::TenantLifecycle(_)
             | Self::TenantCreation(_)
-            | Self::CatalogFormatMigration(_) => None,
+            | Self::CatalogFormatMigration(_)
+            | Self::TenantAliasBinding(_)
+            | Self::TenantRetentionUpdate(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_tenant_display_name_update(
+        &self,
+    ) -> Option<&TenantDisplayNameUpdateAuditEntry> {
+        match self {
+            Self::TenantDisplayNameUpdate(entry) => Some(entry),
+            Self::Initialization(_)
+            | Self::CatalogRootRotation(_)
+            | Self::IngestPolicyActivation(_)
+            | Self::TenantQuotaUpdate(_)
+            | Self::SchemaCheckpoint(_)
+            | Self::ApiKeyLifecycle(_)
+            | Self::ListenerTransport(_)
+            | Self::TenantLifecycle(_)
+            | Self::TenantCreation(_)
+            | Self::CatalogFormatMigration(_)
+            | Self::TenantAliasBinding(_)
+            | Self::TenantRetentionUpdate(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_tenant_retention_update(&self) -> Option<&TenantRetentionUpdateAuditEntry> {
+        match self {
+            Self::TenantRetentionUpdate(entry) => Some(entry),
+            Self::Initialization(_)
+            | Self::CatalogRootRotation(_)
+            | Self::IngestPolicyActivation(_)
+            | Self::TenantQuotaUpdate(_)
+            | Self::TenantDisplayNameUpdate(_)
+            | Self::SchemaCheckpoint(_)
+            | Self::ApiKeyLifecycle(_)
+            | Self::ListenerTransport(_)
+            | Self::TenantLifecycle(_)
+            | Self::TenantCreation(_)
+            | Self::CatalogFormatMigration(_)
+            | Self::TenantAliasBinding(_) => None,
         }
     }
 
@@ -552,6 +700,42 @@ impl GovernanceAuditEntry {
                 resources,
                 request_digest,
             }));
+        }
+        if intent.starts_with(&TENANT_DISPLAY_MAGIC) {
+            let mut cursor = Cursor::new(intent);
+            if cursor.take_array::<8>()? != TENANT_DISPLAY_MAGIC {
+                return Err(IdentityFailure);
+            }
+            let idempotency_key = AdministrativeIdempotencyKey::new(cursor.take_array()?)
+                .map_err(|_| IdentityFailure)?;
+            if idempotency_key.to_bytes() != transaction_id {
+                return Err(IdentityFailure);
+            }
+            let principal =
+                PrincipalId::from_bytes(cursor.take_array()?).map_err(|_| IdentityFailure)?;
+            let tenant = TenantId::from_bytes(cursor.take_array()?).map_err(|_| IdentityFailure)?;
+            let expected_generation =
+                ResourceGeneration::new(cursor.take_u64()?).map_err(|_| IdentityFailure)?;
+            let generation =
+                ResourceGeneration::new(cursor.take_u64()?).map_err(|_| IdentityFailure)?;
+            let request_digest = cursor.take_array()?;
+            if expected_generation.get().checked_add(1) != Some(generation.get())
+                || request_digest.iter().all(|byte| *byte == 0)
+                || !cursor.is_empty()
+            {
+                return Err(IdentityFailure);
+            }
+            return Ok(Self::TenantDisplayNameUpdate(
+                TenantDisplayNameUpdateAuditEntry {
+                    position,
+                    idempotency_key,
+                    principal,
+                    tenant,
+                    expected_generation,
+                    generation,
+                    request_digest,
+                },
+            ));
         }
         if intent.starts_with(&schema_checkpoint::MAGIC) {
             return SchemaCheckpointAuditEntry::decode_intent(position, transaction_id, intent)
@@ -754,7 +938,117 @@ impl GovernanceAuditEntry {
                 idempotency_key,
             }));
         }
+        if intent.starts_with(&TENANT_RETENTION_MAGIC) {
+            let mut cursor = Cursor::new(intent);
+            if cursor.take_array::<8>()? != TENANT_RETENTION_MAGIC {
+                return Err(IdentityFailure);
+            }
+            let ingest_time_unix_seconds = cursor.take_u64()?;
+            let idempotency_key = AdministrativeIdempotencyKey::new(cursor.take_array()?)
+                .map_err(|_| IdentityFailure)?;
+            if ingest_time_unix_seconds == 0 || idempotency_key.to_bytes() != transaction_id {
+                return Err(IdentityFailure);
+            }
+            let actor =
+                PrincipalId::from_bytes(cursor.take_array()?).map_err(|_| IdentityFailure)?;
+            let tenant = TenantId::from_bytes(cursor.take_array()?).map_err(|_| IdentityFailure)?;
+            let expected_generation =
+                ResourceGeneration::new(cursor.take_u64()?).map_err(|_| IdentityFailure)?;
+            let generation =
+                ResourceGeneration::new(cursor.take_u64()?).map_err(|_| IdentityFailure)?;
+            let _proposed_retention_seconds = cursor.take_u64()?;
+            let request_digest = cursor.take_array()?;
+            if expected_generation.get().checked_add(1) != Some(generation.get())
+                || request_digest.iter().all(|byte| *byte == 0)
+                || !cursor.is_empty()
+            {
+                return Err(IdentityFailure);
+            }
+            return Ok(Self::TenantRetentionUpdate(
+                TenantRetentionUpdateAuditEntry {
+                    position,
+                    ingest_time_unix_seconds,
+                    actor,
+                    tenant,
+                    expected_generation,
+                    generation,
+                    request_digest,
+                    idempotency_key,
+                },
+            ));
+        }
+        if intent.starts_with(&TENANT_ALIAS_MAGIC) {
+            let mut cursor = Cursor::new(intent);
+            if cursor.take_array::<8>()? != TENANT_ALIAS_MAGIC {
+                return Err(IdentityFailure);
+            }
+            let ingest_time_unix_seconds = cursor.take_u64()?;
+            let idempotency_key = AdministrativeIdempotencyKey::new(cursor.take_array()?)
+                .map_err(|_| IdentityFailure)?;
+            if ingest_time_unix_seconds == 0 || idempotency_key.to_bytes() != transaction_id {
+                return Err(IdentityFailure);
+            }
+            let actor =
+                PrincipalId::from_bytes(cursor.take_array()?).map_err(|_| IdentityFailure)?;
+            let tenant = TenantId::from_bytes(cursor.take_array()?).map_err(|_| IdentityFailure)?;
+            let expected_generation =
+                ResourceGeneration::new(cursor.take_u64()?).map_err(|_| IdentityFailure)?;
+            let generation =
+                ResourceGeneration::new(cursor.take_u64()?).map_err(|_| IdentityFailure)?;
+            let request_digest = cursor.take_array()?;
+            if expected_generation.get().checked_add(1) != Some(generation.get())
+                || request_digest.iter().all(|byte| *byte == 0)
+                || !cursor.is_empty()
+            {
+                return Err(IdentityFailure);
+            }
+            return Ok(Self::TenantAliasBinding(TenantAliasBindingAuditEntry {
+                position,
+                ingest_time_unix_seconds,
+                actor,
+                tenant,
+                expected_generation,
+                generation,
+                request_digest,
+                idempotency_key,
+            }));
+        }
         Err(IdentityFailure)
+    }
+}
+
+impl TenantRetentionUpdateAuditEntry {
+    #[must_use]
+    pub const fn position(&self) -> u64 {
+        self.position
+    }
+    #[must_use]
+    pub const fn ingest_time_unix_seconds(&self) -> u64 {
+        self.ingest_time_unix_seconds
+    }
+    #[must_use]
+    pub const fn actor_id(&self) -> PrincipalId {
+        self.actor
+    }
+    #[must_use]
+    pub const fn tenant_id(&self) -> TenantId {
+        self.tenant
+    }
+    #[must_use]
+    pub const fn expected_generation(&self) -> ResourceGeneration {
+        self.expected_generation
+    }
+    #[must_use]
+    pub const fn generation(&self) -> ResourceGeneration {
+        self.generation
+    }
+    #[must_use]
+    pub const fn request_digest(&self) -> [u8; 32] {
+        self.request_digest
+    }
+    #[must_use]
+    pub const fn idempotency_key(&self) -> AdministrativeIdempotencyKey {
+        self.idempotency_key
     }
 }
 

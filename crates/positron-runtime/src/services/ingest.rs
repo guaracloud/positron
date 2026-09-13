@@ -48,6 +48,8 @@ pub(super) fn ingest_native_batch(
         .tenant_ingest_policy(tenant)?
         .pin()
         .map_err(|_| ServiceFailure::Internal)?;
+    #[cfg(test)]
+    services.await_ingest_policy_snapshot_test_hook(SignalKind::Logs)?;
     let schema = services
         .schema_sessions
         .session(tenant, instance.resource_governor())
@@ -114,6 +116,8 @@ pub(super) fn ingest_authenticated_traces<'authority>(
         .tenant_ingest_policy(tenant)?
         .pin()
         .map_err(|_| ServiceFailure::Internal)?;
+    #[cfg(test)]
+    services.await_ingest_policy_snapshot_test_hook(SignalKind::Traces)?;
     let batch = OtlpTracesReceiver::with_value_limit_profile(instance.value_limit_profile)
         .decode_with_policy(request, &policy)
         .map_err(super::failure::map_trace_receive_failure)?;

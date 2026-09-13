@@ -20,6 +20,7 @@ use positron_domain::identity::{
 use positron_domain::lifecycle::TenantLifecycleState;
 use positron_kernel::{BootstrapKeyCustody, CatalogSnapshot, FormatEpoch};
 
+use crate::tenant_quota_record::tenant_alias_record;
 use crate::{ApiKeyAdministration, GovernanceAuditEntry, TenantAdministration};
 
 use codec::identity_from_catalog;
@@ -52,6 +53,7 @@ pub(super) struct CredentialIdentity {
 struct AdditionalTenantIdentity {
     tenant: TenantId,
     lifecycle: TenantLifecycleState,
+    external_alias: Option<ExternalTenantAlias>,
     credentials: Vec<CredentialIdentity>,
 }
 
@@ -77,6 +79,18 @@ pub struct Identity {
 }
 
 impl Identity {
+    /// Authorizes a retention preview or confirmed update for one tenant.
+    /// Tenant administrators are bound to their own active or read-only
+    /// tenant; system administration is reserved for in-process governance
+    /// recovery workflows.
+    pub fn authorize_tenant_retention(
+        &self,
+        context: AuthorizedContext,
+        tenant: TenantId,
+    ) -> Result<PrincipalId, AttributionFailure> {
+        self.authorize_policy_activation(context, tenant)
+    }
+
     pub(super) fn authorize_policy_activation(
         &self,
         context: AuthorizedContext,
@@ -175,9 +189,14 @@ impl Identity {
                                 })
                             })
                             .collect::<Result<Vec<_>, IdentityFailure>>()?;
+                        let external_alias = tenant_alias_record(snapshot, record.tenant)
+                            .map_err(|_| IdentityFailure)?
+                            .ok_or(IdentityFailure)?
+                            .alias;
                         Ok(AdditionalTenantIdentity {
                             tenant: record.tenant,
                             lifecycle,
+                            external_alias,
                             credentials,
                         })
                     })
@@ -223,15 +242,9 @@ impl Identity {
         hints: CompatibilityHints,
         lifecycle_seconds: Option<u64>,
     ) -> Result<AuthorizedContext, AttributionFailure> {
-        let alias_matches = match (&self.external_alias, &hints.external_alias) {
-            (_, None) => true,
-            (Some(bound), Some(presented)) => bound == presented,
-            (None, Some(_)) => false,
-        };
         if hints.has_untrusted_authority_claims()
             || (matches!(intent, RequestedIntent::SystemAdministration)
                 && hints.external_alias.is_some())
-            || !alias_matches
         {
             return Err(AttributionFailure);
         }
@@ -270,17 +283,32 @@ impl Identity {
                     let unexpired = candidate
                         .expires_at_unix_seconds
                         .is_none_or(|expiry| lifecycle_seconds.is_some_and(|now| now < expiry));
-                    if matches && candidate.active && unexpired && candidate.scope == scope {
-                        if selected
+                    if matches
+                        && candidate.active
+                        && unexpired
+                        && candidate.scope == scope
+                        && selected
                             .replace((candidate.principal, identity.tenant, identity.lifecycle))
                             .is_some()
-                        {
-                            return Err(AttributionFailure);
-                        }
+                    {
+                        return Err(AttributionFailure);
                     }
                 }
             }
             let (principal, tenant, lifecycle) = selected.ok_or(AttributionFailure)?;
+            let bound_alias = if tenant == self.tenant {
+                self.external_alias.as_ref()
+            } else {
+                self.additional_tenants
+                    .iter()
+                    .find_map(|identity| {
+                        (identity.tenant == tenant).then_some(identity.external_alias.as_ref())
+                    })
+                    .flatten()
+            };
+            if !alias_matches(bound_alias, hints.external_alias.as_ref()) {
+                return Err(AttributionFailure);
+            }
             if scope == Scope::Ingest && lifecycle != TenantLifecycleState::Active {
                 return Err(AttributionFailure);
             }
@@ -318,6 +346,9 @@ impl Identity {
                 })
             },
             RequestedIntent::Ingest => {
+                if !alias_matches(self.external_alias.as_ref(), hints.external_alias.as_ref()) {
+                    return Err(AttributionFailure);
+                }
                 if self.lifecycle != TenantLifecycleState::Active {
                     return Err(AttributionFailure);
                 }
@@ -342,6 +373,9 @@ impl Identity {
                 })
             },
             RequestedIntent::Query => {
+                if !alias_matches(self.external_alias.as_ref(), hints.external_alias.as_ref()) {
+                    return Err(AttributionFailure);
+                }
                 if !is_query_readable(self.lifecycle) {
                     return Err(AttributionFailure);
                 }
@@ -497,6 +531,17 @@ impl std::fmt::Debug for Identity {
             .field("principal", &self.principal)
             .field("tenant", &self.tenant)
             .finish_non_exhaustive()
+    }
+}
+
+fn alias_matches(
+    bound: Option<&ExternalTenantAlias>,
+    presented: Option<&ExternalTenantAlias>,
+) -> bool {
+    match (bound, presented) {
+        (_, None) => true,
+        (Some(bound), Some(presented)) => bound == presented,
+        (None, Some(_)) => false,
     }
 }
 

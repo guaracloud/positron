@@ -333,7 +333,7 @@ fn catalog_commit_admission_refuses_before_work_and_releases_every_dimension_for
 }
 
 #[test]
-fn catalog_writes_only_the_declared_current_format_epoch_before_admission_or_io()
+fn catalog_rejects_unsupported_epochs_before_admission_and_writes_v1_and_v2()
 -> Result<(), Box<dyn Error>> {
     assert_eq!(
         FormatEpoch::new(0)
@@ -354,7 +354,7 @@ fn catalog_writes_only_the_declared_current_format_epoch_before_admission_or_io(
         catalog_recovery_claim(),
     )?)?;
     let expected = catalog.pin()?.identity();
-    for (transaction, epoch) in [(68_u8, 2_u32), (69, u32::MAX)] {
+    for (transaction, epoch) in [(68_u8, 3_u32), (69, u32::MAX)] {
         let failure = catalog
             .commit(
                 expected,
@@ -376,14 +376,31 @@ fn catalog_writes_only_the_declared_current_format_epoch_before_admission_or_io(
                 expected,
                 CatalogProposal::new(
                     TransactionId::new(id(70))?,
-                    FormatEpoch::new(1)?,
-                    vec![CatalogObject::new(b"current epoch".to_vec())?],
+                    FormatEpoch::CATALOG_V1,
+                    vec![CatalogObject::new(b"epoch one".to_vec())?],
                 )?,
                 None,
             )?
             .number(),
         1
     );
+    let epoch_one = catalog.pin()?;
+    assert_eq!(epoch_one.format_epoch(), Some(FormatEpoch::CATALOG_V1));
+    assert_eq!(
+        catalog
+            .commit(
+                epoch_one.identity(),
+                CatalogProposal::new(
+                    TransactionId::new(id(71))?,
+                    FormatEpoch::CATALOG_V2,
+                    vec![CatalogObject::new(b"epoch two".to_vec())?],
+                )?,
+                None,
+            )?
+            .number(),
+        2
+    );
+    assert_eq!(catalog.pin()?.format_epoch(), Some(FormatEpoch::CATALOG_V2));
     Ok(())
 }
 

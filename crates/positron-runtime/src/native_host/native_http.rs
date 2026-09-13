@@ -96,6 +96,174 @@ fn route_tls_api<S: Read + Write>(
             )?;
             tenant_quota_response(services, &bearer, &body)
         },
+        ("POST", positron_api::tenant_lifecycle::HTTP_PATH) => {
+            let services = services.ok_or_else(|| Response::empty(503))?;
+            let bearer = Zeroizing::new(head.bearer.take().ok_or_else(|| {
+                Response::json(401, "{\"code\":\"authentication_rejected\"}".to_owned())
+            })?);
+            let body = read_body(
+                stream,
+                head.content_length,
+                positron_api::tenant_lifecycle::MAX_REQUEST_BYTES,
+            )?;
+            tenant_lifecycle_response(services, &bearer, &body)
+        },
+        ("POST", positron_api::tenant_retention::PREVIEW_HTTP_PATH) => {
+            let services = services.ok_or_else(|| Response::empty(503))?;
+            let bearer = Zeroizing::new(head.bearer.take().ok_or_else(|| {
+                Response::json(401, "{\"code\":\"authentication_rejected\"}".to_owned())
+            })?);
+            let body = read_body(
+                stream,
+                head.content_length,
+                positron_api::tenant_retention::MAX_REQUEST_BYTES,
+            )?;
+            tenant_retention_preview_response(services, &bearer, &body)
+        },
+        ("POST", positron_api::tenant_retention::UPDATE_HTTP_PATH) => {
+            let services = services.ok_or_else(|| Response::empty(503))?;
+            let bearer = Zeroizing::new(head.bearer.take().ok_or_else(|| {
+                Response::json(401, "{\"code\":\"authentication_rejected\"}".to_owned())
+            })?);
+            let body = read_body(
+                stream,
+                head.content_length,
+                positron_api::tenant_retention::MAX_REQUEST_BYTES,
+            )?;
+            tenant_retention_update_response(services, &bearer, &body)
+        },
+        ("POST", positron_api::tenant_aliases::HTTP_PATH) => {
+            let services = services.ok_or_else(|| Response::empty(503))?;
+            let bearer = Zeroizing::new(head.bearer.take().ok_or_else(|| {
+                Response::json(401, "{\"code\":\"authentication_rejected\"}".to_owned())
+            })?);
+            let body = read_body(
+                stream,
+                head.content_length,
+                positron_api::tenant_aliases::MAX_REQUEST_BYTES,
+            )?;
+            tenant_alias_response(services, &bearer, &body)
+        },
+        ("POST", positron_api::tenant_service::CREATE_HTTP_PATH) => {
+            let services = services.ok_or_else(|| Response::empty(503))?;
+            let bearer = Zeroizing::new(head.bearer.take().ok_or_else(|| {
+                Response::json(401, "{\"code\":\"authentication_rejected\"}".to_owned())
+            })?);
+            let body = read_body(
+                stream,
+                head.content_length,
+                positron_api::tenant_service::MAX_REQUEST_BYTES,
+            )?;
+            tenant_service_response(
+                services.create_tenant_service(&bearer, &body),
+                positron_api::tenant_service::TenantCreateResponse::encode,
+            )
+        },
+        ("POST", positron_api::tenant_service::INSPECT_HTTP_PATH) => {
+            let services = services.ok_or_else(|| Response::empty(503))?;
+            let bearer = Zeroizing::new(head.bearer.take().ok_or_else(|| {
+                Response::json(401, "{\"code\":\"authentication_rejected\"}".to_owned())
+            })?);
+            let body = read_body(
+                stream,
+                head.content_length,
+                positron_api::tenant_service::MAX_REQUEST_BYTES,
+            )?;
+            tenant_service_response(
+                services.inspect_tenant_service(&bearer, &body),
+                positron_api::tenant_service::TenantInspectResponse::encode,
+            )
+        },
+        ("POST", positron_api::tenant_service::LIST_HTTP_PATH) => {
+            let services = services.ok_or_else(|| Response::empty(503))?;
+            let bearer = Zeroizing::new(head.bearer.take().ok_or_else(|| {
+                Response::json(401, "{\"code\":\"authentication_rejected\"}".to_owned())
+            })?);
+            let body = read_body(
+                stream,
+                head.content_length,
+                positron_api::tenant_service::MAX_REQUEST_BYTES,
+            )?;
+            tenant_service_response(
+                services.list_tenants_service(&bearer, &body),
+                positron_api::tenant_service::TenantListResponse::encode,
+            )
+        },
+        ("POST", positron_api::tenant_service::UPDATE_DISPLAY_NAME_HTTP_PATH) => {
+            let services = services.ok_or_else(|| Response::empty(503))?;
+            let bearer = Zeroizing::new(head.bearer.take().ok_or_else(|| {
+                Response::json(401, "{\"code\":\"authentication_rejected\"}".to_owned())
+            })?);
+            let body = read_body(
+                stream,
+                head.content_length,
+                positron_api::tenant_service::MAX_REQUEST_BYTES,
+            )?;
+            tenant_service_response(
+                services.update_tenant_display_name_service(&bearer, &body),
+                positron_api::tenant_service::TenantDisplayNameUpdateResponse::encode,
+            )
+        },
+        ("POST", positron_api::policy::HTTP_VALIDATE_PATH) => {
+            let services = services.ok_or_else(|| Response::empty(503))?;
+            let bearer = Zeroizing::new(head.bearer.take().ok_or_else(|| {
+                Response::json(401, "{\"code\":\"authentication_rejected\"}".to_owned())
+            })?);
+            let body = read_body(
+                stream,
+                head.content_length,
+                positron_api::policy::MAX_REQUEST_BYTES,
+            )?;
+            policy_validation_response(services, &bearer, &body)
+        },
+        ("POST", positron_api::policy::HTTP_TEST_PATH) => {
+            let services = services.ok_or_else(|| Response::empty(503))?;
+            let bearer = Zeroizing::new(head.bearer.take().ok_or_else(|| {
+                Response::json(401, "{\"code\":\"authentication_rejected\"}".to_owned())
+            })?);
+            let body = read_body(
+                stream,
+                head.content_length,
+                positron_api::policy::MAX_TEST_REQUEST_BYTES,
+            )?;
+            policy_test_response(services, &bearer, &body)
+        },
+        ("POST", positron_api::policy::HTTP_DIFF_PATH) => {
+            let services = services.ok_or_else(|| Response::empty(503))?;
+            let bearer = Zeroizing::new(head.bearer.take().ok_or_else(|| {
+                Response::json(401, "{\"code\":\"authentication_rejected\"}".to_owned())
+            })?);
+            let body = read_body(
+                stream,
+                head.content_length,
+                positron_api::policy::MAX_DIFF_REQUEST_BYTES,
+            )?;
+            policy_diff_response(services, &bearer, &body)
+        },
+        ("POST", positron_api::policy::HTTP_EXPLAIN_PATH) => {
+            let services = services.ok_or_else(|| Response::empty(503))?;
+            let bearer = Zeroizing::new(head.bearer.take().ok_or_else(|| {
+                Response::json(401, "{\"code\":\"authentication_rejected\"}".to_owned())
+            })?);
+            let body = read_body(
+                stream,
+                head.content_length,
+                positron_api::policy::MAX_EXPLAIN_REQUEST_BYTES,
+            )?;
+            policy_explain_response(services, &bearer, &body)
+        },
+        ("POST", positron_api::policy::HTTP_ACTIVATE_PATH) => {
+            let services = services.ok_or_else(|| Response::empty(503))?;
+            let bearer = Zeroizing::new(head.bearer.take().ok_or_else(|| {
+                Response::json(401, "{\"code\":\"authentication_rejected\"}".to_owned())
+            })?);
+            let body = read_body(
+                stream,
+                head.content_length,
+                positron_api::policy::MAX_ACTIVATE_REQUEST_BYTES,
+            )?;
+            policy_activate_response(services, &bearer, &body)
+        },
         ("POST", "/v1/capabilities:negotiate") => {
             let services = services.ok_or_else(|| Response::empty(503))?;
             let body = read_body(stream, head.content_length, MAX_API_BODY_BYTES)?;
@@ -105,6 +273,19 @@ fn route_tls_api<S: Read + Write>(
             _,
             positron_api::api_keys::HTTP_PATH
             | positron_api::tenant_quotas::HTTP_PATH
+            | positron_api::tenant_lifecycle::HTTP_PATH
+            | positron_api::tenant_retention::PREVIEW_HTTP_PATH
+            | positron_api::tenant_retention::UPDATE_HTTP_PATH
+            | positron_api::tenant_aliases::HTTP_PATH
+            | positron_api::tenant_service::CREATE_HTTP_PATH
+            | positron_api::tenant_service::INSPECT_HTTP_PATH
+            | positron_api::tenant_service::LIST_HTTP_PATH
+            | positron_api::tenant_service::UPDATE_DISPLAY_NAME_HTTP_PATH
+            | positron_api::policy::HTTP_VALIDATE_PATH
+            | positron_api::policy::HTTP_TEST_PATH
+            | positron_api::policy::HTTP_DIFF_PATH
+            | positron_api::policy::HTTP_EXPLAIN_PATH
+            | positron_api::policy::HTTP_ACTIVATE_PATH
             | "/v1/capabilities:negotiate",
         ) => Ok(Response::empty(405)),
         _ => Ok(Response::empty(404)),
@@ -171,6 +352,178 @@ fn route(
             )?;
             tenant_quota_response(services, &bearer, &body)
         },
+        (ListenerRole::Api, "POST", positron_api::tenant_lifecycle::HTTP_PATH) => {
+            let services = services.ok_or_else(|| Response::empty(503))?;
+            let bearer = Zeroizing::new(head.bearer.take().ok_or_else(|| {
+                Response::json(401, "{\"code\":\"authentication_rejected\"}".to_owned())
+            })?);
+            let body = read_body(
+                stream,
+                head.content_length,
+                positron_api::tenant_lifecycle::MAX_REQUEST_BYTES,
+            )?;
+            tenant_lifecycle_response(services, &bearer, &body)
+        },
+        (ListenerRole::Api, "POST", positron_api::tenant_retention::PREVIEW_HTTP_PATH) => {
+            let services = services.ok_or_else(|| Response::empty(503))?;
+            let bearer = Zeroizing::new(head.bearer.take().ok_or_else(|| {
+                Response::json(401, "{\"code\":\"authentication_rejected\"}".to_owned())
+            })?);
+            let body = read_body(
+                stream,
+                head.content_length,
+                positron_api::tenant_retention::MAX_REQUEST_BYTES,
+            )?;
+            tenant_retention_preview_response(services, &bearer, &body)
+        },
+        (ListenerRole::Api, "POST", positron_api::tenant_retention::UPDATE_HTTP_PATH) => {
+            let services = services.ok_or_else(|| Response::empty(503))?;
+            let bearer = Zeroizing::new(head.bearer.take().ok_or_else(|| {
+                Response::json(401, "{\"code\":\"authentication_rejected\"}".to_owned())
+            })?);
+            let body = read_body(
+                stream,
+                head.content_length,
+                positron_api::tenant_retention::MAX_REQUEST_BYTES,
+            )?;
+            tenant_retention_update_response(services, &bearer, &body)
+        },
+        (ListenerRole::Api, "POST", positron_api::tenant_aliases::HTTP_PATH) => {
+            let services = services.ok_or_else(|| Response::empty(503))?;
+            let bearer = Zeroizing::new(head.bearer.take().ok_or_else(|| {
+                Response::json(401, "{\"code\":\"authentication_rejected\"}".to_owned())
+            })?);
+            let body = read_body(
+                stream,
+                head.content_length,
+                positron_api::tenant_aliases::MAX_REQUEST_BYTES,
+            )?;
+            tenant_alias_response(services, &bearer, &body)
+        },
+        (ListenerRole::Api, "POST", positron_api::tenant_service::CREATE_HTTP_PATH) => {
+            let services = services.ok_or_else(|| Response::empty(503))?;
+            let bearer = Zeroizing::new(head.bearer.take().ok_or_else(|| {
+                Response::json(401, "{\"code\":\"authentication_rejected\"}".to_owned())
+            })?);
+            let body = read_body(
+                stream,
+                head.content_length,
+                positron_api::tenant_service::MAX_REQUEST_BYTES,
+            )?;
+            tenant_service_response(
+                services.create_tenant_service(&bearer, &body),
+                positron_api::tenant_service::TenantCreateResponse::encode,
+            )
+        },
+        (ListenerRole::Api, "POST", positron_api::tenant_service::INSPECT_HTTP_PATH) => {
+            let services = services.ok_or_else(|| Response::empty(503))?;
+            let bearer = Zeroizing::new(head.bearer.take().ok_or_else(|| {
+                Response::json(401, "{\"code\":\"authentication_rejected\"}".to_owned())
+            })?);
+            let body = read_body(
+                stream,
+                head.content_length,
+                positron_api::tenant_service::MAX_REQUEST_BYTES,
+            )?;
+            tenant_service_response(
+                services.inspect_tenant_service(&bearer, &body),
+                positron_api::tenant_service::TenantInspectResponse::encode,
+            )
+        },
+        (ListenerRole::Api, "POST", positron_api::tenant_service::LIST_HTTP_PATH) => {
+            let services = services.ok_or_else(|| Response::empty(503))?;
+            let bearer = Zeroizing::new(head.bearer.take().ok_or_else(|| {
+                Response::json(401, "{\"code\":\"authentication_rejected\"}".to_owned())
+            })?);
+            let body = read_body(
+                stream,
+                head.content_length,
+                positron_api::tenant_service::MAX_REQUEST_BYTES,
+            )?;
+            tenant_service_response(
+                services.list_tenants_service(&bearer, &body),
+                positron_api::tenant_service::TenantListResponse::encode,
+            )
+        },
+        (
+            ListenerRole::Api,
+            "POST",
+            positron_api::tenant_service::UPDATE_DISPLAY_NAME_HTTP_PATH,
+        ) => {
+            let services = services.ok_or_else(|| Response::empty(503))?;
+            let bearer = Zeroizing::new(head.bearer.take().ok_or_else(|| {
+                Response::json(401, "{\"code\":\"authentication_rejected\"}".to_owned())
+            })?);
+            let body = read_body(
+                stream,
+                head.content_length,
+                positron_api::tenant_service::MAX_REQUEST_BYTES,
+            )?;
+            tenant_service_response(
+                services.update_tenant_display_name_service(&bearer, &body),
+                positron_api::tenant_service::TenantDisplayNameUpdateResponse::encode,
+            )
+        },
+        (ListenerRole::Api, "POST", positron_api::policy::HTTP_VALIDATE_PATH) => {
+            let services = services.ok_or_else(|| Response::empty(503))?;
+            let bearer = Zeroizing::new(head.bearer.take().ok_or_else(|| {
+                Response::json(401, "{\"code\":\"authentication_rejected\"}".to_owned())
+            })?);
+            let body = read_body(
+                stream,
+                head.content_length,
+                positron_api::policy::MAX_REQUEST_BYTES,
+            )?;
+            policy_validation_response(services, &bearer, &body)
+        },
+        (ListenerRole::Api, "POST", positron_api::policy::HTTP_TEST_PATH) => {
+            let services = services.ok_or_else(|| Response::empty(503))?;
+            let bearer = Zeroizing::new(head.bearer.take().ok_or_else(|| {
+                Response::json(401, "{\"code\":\"authentication_rejected\"}".to_owned())
+            })?);
+            let body = read_body(
+                stream,
+                head.content_length,
+                positron_api::policy::MAX_TEST_REQUEST_BYTES,
+            )?;
+            policy_test_response(services, &bearer, &body)
+        },
+        (ListenerRole::Api, "POST", positron_api::policy::HTTP_DIFF_PATH) => {
+            let services = services.ok_or_else(|| Response::empty(503))?;
+            let bearer = Zeroizing::new(head.bearer.take().ok_or_else(|| {
+                Response::json(401, "{\"code\":\"authentication_rejected\"}".to_owned())
+            })?);
+            let body = read_body(
+                stream,
+                head.content_length,
+                positron_api::policy::MAX_DIFF_REQUEST_BYTES,
+            )?;
+            policy_diff_response(services, &bearer, &body)
+        },
+        (ListenerRole::Api, "POST", positron_api::policy::HTTP_EXPLAIN_PATH) => {
+            let services = services.ok_or_else(|| Response::empty(503))?;
+            let bearer = Zeroizing::new(head.bearer.take().ok_or_else(|| {
+                Response::json(401, "{\"code\":\"authentication_rejected\"}".to_owned())
+            })?);
+            let body = read_body(
+                stream,
+                head.content_length,
+                positron_api::policy::MAX_EXPLAIN_REQUEST_BYTES,
+            )?;
+            policy_explain_response(services, &bearer, &body)
+        },
+        (ListenerRole::Api, "POST", positron_api::policy::HTTP_ACTIVATE_PATH) => {
+            let services = services.ok_or_else(|| Response::empty(503))?;
+            let bearer = Zeroizing::new(head.bearer.take().ok_or_else(|| {
+                Response::json(401, "{\"code\":\"authentication_rejected\"}".to_owned())
+            })?);
+            let body = read_body(
+                stream,
+                head.content_length,
+                positron_api::policy::MAX_ACTIVATE_REQUEST_BYTES,
+            )?;
+            policy_activate_response(services, &bearer, &body)
+        },
         (ListenerRole::Operations, "GET", "/health/live") => Ok(health_response(
             health.liveness() == Liveness::Live,
             "live",
@@ -206,11 +559,151 @@ fn route(
         | (ListenerRole::Api, _, "/v1/capabilities:negotiate")
         | (ListenerRole::Api, _, positron_api::api_keys::HTTP_PATH)
         | (ListenerRole::Api, _, positron_api::tenant_quotas::HTTP_PATH)
+        | (ListenerRole::Api, _, positron_api::tenant_retention::PREVIEW_HTTP_PATH)
+        | (ListenerRole::Api, _, positron_api::tenant_retention::UPDATE_HTTP_PATH)
+        | (ListenerRole::Api, _, positron_api::tenant_aliases::HTTP_PATH)
+        | (ListenerRole::Api, _, positron_api::tenant_service::CREATE_HTTP_PATH)
+        | (ListenerRole::Api, _, positron_api::tenant_service::INSPECT_HTTP_PATH)
+        | (ListenerRole::Api, _, positron_api::tenant_service::LIST_HTTP_PATH)
+        | (ListenerRole::Api, _, positron_api::tenant_service::UPDATE_DISPLAY_NAME_HTTP_PATH)
+        | (ListenerRole::Api, _, positron_api::policy::HTTP_VALIDATE_PATH)
+        | (ListenerRole::Api, _, positron_api::policy::HTTP_TEST_PATH)
+        | (ListenerRole::Api, _, positron_api::policy::HTTP_DIFF_PATH)
+        | (ListenerRole::Api, _, positron_api::policy::HTTP_EXPLAIN_PATH)
+        | (ListenerRole::Api, _, positron_api::policy::HTTP_ACTIVATE_PATH)
         | (ListenerRole::OtlpHttp, _, "/v1/logs" | "/v1/traces") => Ok(Response::empty(405)),
         (ListenerRole::LokiPush, _, "/loki/api/v1/push" | "/otlp/v1/logs") => {
             Ok(Response::empty(405))
         },
         (ListenerRole::Control, _, _) | (_, _, _) => Ok(Response::empty(404)),
+    }
+}
+
+fn tenant_alias_response(
+    services: &ServiceHandle,
+    bearer: &str,
+    body: &[u8],
+) -> Result<Response, Response> {
+    match services.bind_tenant_alias(bearer, body) {
+        Ok(response) => Ok(Response {
+            status: 200,
+            content_type: "application/json",
+            body: serde_json::to_vec(&response).map_err(|_| Response::empty(500))?,
+            retry_after_seconds: None,
+        }),
+        Err(crate::services::tenant_aliases::TenantAliasHttpFailure::Code(status, code)) => {
+            Ok(Response::json(status, format!("{{\"code\":\"{code}\"}}")))
+        },
+    }
+}
+
+fn tenant_service_response<T>(
+    result: Result<T, crate::services::tenant_service::TenantServiceHttpFailure>,
+    encode: fn(&T) -> Result<Vec<u8>, positron_api::tenant_service::TenantServiceWireFailure>,
+) -> Result<Response, Response> {
+    match result {
+        Ok(response) => Ok(Response {
+            status: 200,
+            content_type: "application/json",
+            body: encode(&response).map_err(|_| Response::empty(500))?,
+            retry_after_seconds: None,
+        }),
+        Err(crate::services::tenant_service::TenantServiceHttpFailure::Code(status, code)) => {
+            Ok(Response::json(status, format!("{{\"code\":\"{code}\"}}")))
+        },
+        Err(
+            crate::services::tenant_service::TenantServiceHttpFailure::StaleDisplayGeneration {
+                generation,
+                semantic_diff,
+            },
+        ) => Ok(Response::json(
+            409,
+            format!(
+                "{{\"code\":\"stale_display_generation\",\"display_generation\":{generation},\"semantic_diff\":\"{semantic_diff}\"}}"
+            ),
+        )),
+    }
+}
+
+fn tenant_lifecycle_response(
+    services: &ServiceHandle,
+    bearer: &str,
+    body: &[u8],
+) -> Result<Response, Response> {
+    match services.administer_tenant_lifecycle(bearer, body) {
+        Ok(response) => Ok(Response {
+            status: 200,
+            content_type: "application/json",
+            body: serde_json::to_vec(&response).map_err(|_| Response::empty(500))?,
+            retry_after_seconds: None,
+        }),
+        Err(crate::services::tenant_lifecycle::TenantLifecycleHttpFailure::Code(status, code)) => {
+            Ok(Response::json(status, format!("{{\"code\":\"{code}\"}}")))
+        },
+        Err(crate::services::tenant_lifecycle::TenantLifecycleHttpFailure::StaleGeneration {
+            conflict,
+            semantic_diff,
+        }) => Ok(Response::json(
+            409,
+            format!(
+                "{{\"code\":\"stale_generation\",\"lifecycle_generation\":{},\"semantic_diff\":\"{semantic_diff}\"}}",
+                conflict.current_generation().get()
+            ),
+        )),
+    }
+}
+
+fn tenant_retention_preview_response(
+    services: &ServiceHandle,
+    bearer: &str,
+    body: &[u8],
+) -> Result<Response, Response> {
+    match services.preview_tenant_retention(bearer, body) {
+        Ok(response) => Ok(Response {
+            status: 200,
+            content_type: "application/json",
+            body: response.encode().map_err(|_| Response::empty(500))?,
+            retry_after_seconds: None,
+        }),
+        Err(crate::services::tenant_retention::TenantRetentionHttpFailure::Code(status, code)) => {
+            Ok(Response::json(status, format!("{{\"code\":\"{code}\"}}")))
+        },
+        Err(crate::services::tenant_retention::TenantRetentionHttpFailure::StaleGeneration {
+            generation,
+            semantic_diff,
+        }) => Ok(Response::json(
+            409,
+            format!(
+                "{{\"code\":\"stale_generation\",\"retention_generation\":{generation},\"semantic_diff\":\"{semantic_diff}\"}}"
+            ),
+        )),
+    }
+}
+
+fn tenant_retention_update_response(
+    services: &ServiceHandle,
+    bearer: &str,
+    body: &[u8],
+) -> Result<Response, Response> {
+    match services.update_tenant_retention_service(bearer, body) {
+        Ok(response) => Ok(Response {
+            status: 200,
+            content_type: "application/json",
+            body: response.encode().map_err(|_| Response::empty(500))?,
+            retry_after_seconds: None,
+        }),
+        Err(crate::services::tenant_retention::TenantRetentionHttpFailure::Code(status, code)) => {
+            Ok(Response::json(status, format!("{{\"code\":\"{code}\"}}")))
+        },
+        Err(crate::services::tenant_retention::TenantRetentionHttpFailure::StaleGeneration {
+            generation,
+            semantic_diff,
+        }) => Ok(Response::json(
+            409,
+            format!(
+                "{{\"code\":\"stale_generation\",\"retention_generation\":{generation},\"semantic_diff\":\"{semantic_diff}\"}}"
+            ),
+        )),
     }
 }
 
@@ -237,6 +730,97 @@ fn tenant_quota_response(
                     conflict.current_generation().get(),
                     serde_json::to_string(&conflict.semantic_diff())
                         .map_err(|_| Response::empty(500))?,
+                ),
+            ))
+        },
+    }
+}
+
+fn policy_validation_response(
+    services: &ServiceHandle,
+    bearer: &str,
+    body: &[u8],
+) -> Result<Response, Response> {
+    match services.validate_ingest_policy(bearer, body) {
+        Ok(response) => Ok(Response {
+            status: 200,
+            content_type: "application/json",
+            body: serde_json::to_vec(&response).map_err(|_| Response::empty(500))?,
+            retry_after_seconds: None,
+        }),
+        Err((status, code)) => Ok(Response::json(status, format!("{{\"code\":\"{code}\"}}"))),
+    }
+}
+
+fn policy_test_response(
+    services: &ServiceHandle,
+    bearer: &str,
+    body: &[u8],
+) -> Result<Response, Response> {
+    match services.test_ingest_policy(bearer, body) {
+        Ok(response) => Ok(Response {
+            status: 200,
+            content_type: "application/json",
+            body: serde_json::to_vec(&response).map_err(|_| Response::empty(500))?,
+            retry_after_seconds: None,
+        }),
+        Err((status, code)) => Ok(Response::json(status, format!("{{\"code\":\"{code}\"}}"))),
+    }
+}
+
+fn policy_diff_response(
+    services: &ServiceHandle,
+    bearer: &str,
+    body: &[u8],
+) -> Result<Response, Response> {
+    match services.diff_ingest_policy(bearer, body) {
+        Ok(response) => Ok(Response {
+            status: 200,
+            content_type: "application/json",
+            body: serde_json::to_vec(&response).map_err(|_| Response::empty(500))?,
+            retry_after_seconds: None,
+        }),
+        Err((status, code)) => Ok(Response::json(status, format!("{{\"code\":\"{code}\"}}"))),
+    }
+}
+
+fn policy_explain_response(
+    services: &ServiceHandle,
+    bearer: &str,
+    body: &[u8],
+) -> Result<Response, Response> {
+    match services.explain_ingest_policy(bearer, body) {
+        Ok(response) => Ok(Response {
+            status: 200,
+            content_type: "application/json",
+            body: serde_json::to_vec(&response).map_err(|_| Response::empty(500))?,
+            retry_after_seconds: None,
+        }),
+        Err((status, code)) => Ok(Response::json(status, format!("{{\"code\":\"{code}\"}}"))),
+    }
+}
+
+fn policy_activate_response(
+    services: &ServiceHandle,
+    bearer: &str,
+    body: &[u8],
+) -> Result<Response, Response> {
+    match services.activate_ingest_policy_http(bearer, body) {
+        Ok(response) => Ok(Response {
+            status: 200,
+            content_type: "application/json",
+            body: serde_json::to_vec(&response).map_err(|_| Response::empty(500))?,
+            retry_after_seconds: None,
+        }),
+        Err(crate::services::policy::PolicyActivateHttpFailure::Code(status, code)) => {
+            Ok(Response::json(status, format!("{{\"code\":\"{code}\"}}")))
+        },
+        Err(crate::services::policy::PolicyActivateHttpFailure::StaleGeneration(generation)) => {
+            Ok(Response::json(
+                409,
+                format!(
+                    "{{\"code\":\"stale_generation\",\"resource_generation\":{},\"semantic_diff\":\"policy generation changed\"}}",
+                    generation.get()
                 ),
             ))
         },
@@ -532,4 +1116,63 @@ fn write_response<S: Write>(stream: &mut S, response: Response) -> Result<(), st
     );
     stream.write_all(header.as_bytes())?;
     stream.write_all(&response.body)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Cursor, Read, Write};
+
+    use super::serve_tls_api_connection;
+
+    struct MemoryStream {
+        input: Cursor<Vec<u8>>,
+        output: Vec<u8>,
+    }
+
+    impl MemoryStream {
+        fn request(path: &str) -> Self {
+            Self {
+                input: Cursor::new(
+                    format!("POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\n\r\n")
+                        .into_bytes(),
+                ),
+                output: Vec::new(),
+            }
+        }
+    }
+
+    impl Read for MemoryStream {
+        fn read(&mut self, buffer: &mut [u8]) -> Result<usize, std::io::Error> {
+            self.input.read(buffer)
+        }
+    }
+
+    impl Write for MemoryStream {
+        fn write(&mut self, buffer: &[u8]) -> Result<usize, std::io::Error> {
+            self.output.extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> Result<(), std::io::Error> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn tls_api_dispatch_reaches_each_existing_authenticated_route() {
+        let health = crate::health::ProcessState::starting().health();
+        for path in [
+            positron_api::tenant_aliases::HTTP_PATH,
+            positron_api::policy::HTTP_EXPLAIN_PATH,
+            positron_api::policy::HTTP_ACTIVATE_PATH,
+        ] {
+            let mut stream = MemoryStream::request(path);
+            assert!(serve_tls_api_connection(&mut stream, &health, None).is_ok());
+            let response = std::str::from_utf8(&stream.output).expect("HTTP response");
+            assert!(
+                response.starts_with("HTTP/1.1 503 Service Unavailable"),
+                "TLS dispatcher did not reach {path}: {response}"
+            );
+        }
+    }
 }

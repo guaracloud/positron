@@ -39,11 +39,13 @@ fn pre_marker_tenant_creation_is_invisible_then_resumes_its_prepared_envelope()
             instance.create_tenant(
                 administrator().expect("administrator"),
                 tenant,
-                TenantSlug::parse_canonical("prepared-tenant").expect("tenant slug"),
-                "Prepared tenant",
-                2_592_000,
-                1,
-                [1; 11],
+                positron_governance::TenantCreateConfiguration::new(
+                    TenantSlug::parse_canonical("prepared-tenant").expect("tenant slug"),
+                    "Prepared tenant",
+                    2_592_000,
+                    1,
+                    [1; 11],
+                ),
                 idempotency,
             )
         })
@@ -85,11 +87,13 @@ fn pre_marker_tenant_creation_is_invisible_then_resumes_its_prepared_envelope()
         .create_tenant(
             administrator()?,
             tenant,
-            TenantSlug::parse_canonical("prepared-tenant")?,
-            "Changed tenant",
-            2_592_000,
-            1,
-            [1; 11],
+            positron_governance::TenantCreateConfiguration::new(
+                TenantSlug::parse_canonical("prepared-tenant")?,
+                "Changed tenant",
+                2_592_000,
+                1,
+                [1; 11],
+            ),
             idempotency,
         )
         .expect_err("a changed request must not claim the prepared tenant transaction");
@@ -103,11 +107,13 @@ fn pre_marker_tenant_creation_is_invisible_then_resumes_its_prepared_envelope()
     let resumed = recovered.create_tenant(
         administrator()?,
         tenant,
-        TenantSlug::parse_canonical("prepared-tenant")?,
-        "Prepared tenant",
-        2_592_000,
-        1,
-        [1; 11],
+        positron_governance::TenantCreateConfiguration::new(
+            TenantSlug::parse_canonical("prepared-tenant")?,
+            "Prepared tenant",
+            2_592_000,
+            1,
+            [1; 11],
+        ),
         idempotency,
     )?;
     assert_eq!(resumed.tenant_id(), tenant);
@@ -131,7 +137,7 @@ fn pre_marker_tenant_creation_is_invisible_then_resumes_its_prepared_envelope()
                 .ok()
                 .flatten()
                 .is_some_and(|object| {
-                    object.starts_with(b"POSTNR02")
+                    object.starts_with(b"POSTNR03")
                         && object.windows(8).any(|window| window == b"POSTKE01")
                 })
         }),
@@ -178,11 +184,13 @@ fn tenant_scoped_actor_cannot_claim_a_prepared_tenant_creation_idempotency_key()
         instance.create_tenant(
             administrator().expect("administrator"),
             tenant,
-            TenantSlug::parse_canonical("actor-bound-tenant").expect("tenant slug"),
-            "Actor-bound tenant",
-            2_592_000,
-            1,
-            [1; 11],
+            positron_governance::TenantCreateConfiguration::new(
+                TenantSlug::parse_canonical("actor-bound-tenant").expect("tenant slug"),
+                "Actor-bound tenant",
+                2_592_000,
+                1,
+                [1; 11],
+            ),
             idempotency,
         )
     })
@@ -201,11 +209,13 @@ fn tenant_scoped_actor_cannot_claim_a_prepared_tenant_creation_idempotency_key()
         .create_tenant(
             query_actor,
             tenant,
-            TenantSlug::parse_canonical("actor-bound-tenant")?,
-            "Actor-bound tenant",
-            2_592_000,
-            1,
-            [1; 11],
+            positron_governance::TenantCreateConfiguration::new(
+                TenantSlug::parse_canonical("actor-bound-tenant")?,
+                "Actor-bound tenant",
+                2_592_000,
+                1,
+                [1; 11],
+            ),
             idempotency,
         )
         .expect_err("a changed actor must not resolve another administrator's transaction");
@@ -221,11 +231,13 @@ fn tenant_scoped_actor_cannot_claim_a_prepared_tenant_creation_idempotency_key()
     let resumed = recovered.create_tenant(
         administrator,
         tenant,
-        TenantSlug::parse_canonical("actor-bound-tenant")?,
-        "Actor-bound tenant",
-        2_592_000,
-        1,
-        [1; 11],
+        positron_governance::TenantCreateConfiguration::new(
+            TenantSlug::parse_canonical("actor-bound-tenant")?,
+            "Actor-bound tenant",
+            2_592_000,
+            1,
+            [1; 11],
+        ),
         idempotency,
     )?;
     assert_eq!(resumed.tenant_id(), tenant);
@@ -256,11 +268,13 @@ fn advanced_catalog_refuses_prepared_tenant_creation_without_live_admission()
         instance.create_tenant(
             administrator().expect("administrator"),
             tenant,
-            TenantSlug::parse_canonical("advanced-tenant").expect("tenant slug"),
-            "Advanced tenant",
-            2_592_000,
-            1,
-            [1; 11],
+            positron_governance::TenantCreateConfiguration::new(
+                TenantSlug::parse_canonical("advanced-tenant").expect("tenant slug"),
+                "Advanced tenant",
+                2_592_000,
+                1,
+                [1; 11],
+            ),
             idempotency,
         )
     })
@@ -287,11 +301,13 @@ fn advanced_catalog_refuses_prepared_tenant_creation_without_live_admission()
         .create_tenant(
             administrator()?,
             tenant,
-            TenantSlug::parse_canonical("advanced-tenant")?,
-            "Advanced tenant",
-            2_592_000,
-            1,
-            [1; 11],
+            positron_governance::TenantCreateConfiguration::new(
+                TenantSlug::parse_canonical("advanced-tenant")?,
+                "Advanced tenant",
+                2_592_000,
+                1,
+                [1; 11],
+            ),
             idempotency,
         )
         .expect_err("an advanced predecessor must not publish a stale tenant proposal");

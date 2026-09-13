@@ -3,8 +3,10 @@ use std::fs;
 use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use opentelemetry_proto::tonic::collector::logs::v1::{
     ExportLogsServiceRequest, ExportLogsServiceResponse,
@@ -30,9 +32,261 @@ use prost::Message;
 
 use super::super::{ResponseEncoding, receive, receive_traces};
 use crate::native_host::native_http::RequestHead;
+use crate::services::IngestPolicySnapshotTestHook;
 use crate::{
     BootstrapPaths, InitializationPlan, InitializedInstance, InstanceBootstrap, ServiceHandle,
 };
+
+struct BlockingCapturedPolicy {
+    signal: SignalKind,
+    entered: mpsc::SyncSender<()>,
+    resume: Mutex<mpsc::Receiver<()>>,
+    blocked: AtomicBool,
+}
+
+impl IngestPolicySnapshotTestHook for BlockingCapturedPolicy {
+    fn after_policy_snapshot(&self, signal: SignalKind) {
+        if signal != self.signal || self.blocked.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let _ = self.entered.send(());
+        if let Ok(resume) = self.resume.lock() {
+            let _ = resume.recv_timeout(Duration::from_secs(2));
+        }
+    }
+}
+
+#[test]
+fn admitted_http_log_request_keeps_captured_policy_after_successor_activation()
+-> Result<(), Box<dyn Error>> {
+    let roots = TestRoots::new()?;
+    let paths = roots.paths()?;
+    drop(InstanceBootstrap::initialize(
+        &paths,
+        InitializationPlan::non_interactive(),
+    )?);
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let administrator_secret = claim.secret().to_owned();
+    let bearer = claim
+        .ingest_secret()
+        .ok_or("ingest secret missing")?
+        .to_owned();
+    let initialized = Arc::new(InstanceBootstrap::reopen(&paths)?);
+    let services = ServiceHandle::new(Arc::clone(&initialized))?;
+    let old_policy = IngestPolicy::compile(
+        2,
+        vec![PolicyRule::new(
+            "redact-body",
+            Vec::new(),
+            PolicyAction::Redact(PolicyTarget::body()),
+        )?],
+    )?;
+    services.activate_ingest_policy(
+        initialized.attribute(
+            PresentedCredential::parse(&administrator_secret)?,
+            RequestedIntent::SystemAdministration,
+            CompatibilityHints::none(),
+        )?,
+        ResourceGeneration::new(1)?,
+        AdministrativeIdempotencyKey::new([0xd1; 16])?,
+        old_policy.clone(),
+    )?;
+    let (entered_sender, entered_receiver) = mpsc::sync_channel(1);
+    let (resume_sender, resume_receiver) = mpsc::sync_channel(1);
+    services.install_ingest_policy_snapshot_test_hook(Arc::new(BlockingCapturedPolicy {
+        signal: SignalKind::Logs,
+        entered: entered_sender,
+        resume: Mutex::new(resume_receiver),
+        blocked: AtomicBool::new(false),
+    }))?;
+    let body = log_request("captured-log").encode_to_vec();
+    let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
+    let endpoint = listener.local_addr()?;
+    let mut client = TcpStream::connect(endpoint)?;
+    let (mut server, _) = listener.accept()?;
+    client.write_all(&body)?;
+    let in_flight = thread::scope(|scope| -> Result<_, Box<dyn Error>> {
+        let in_flight_services = services.clone();
+        let in_flight_bearer = bearer.clone();
+        let handle = scope.spawn(move || {
+            receive(
+                &mut server,
+                RequestHead {
+                    method: "POST".to_owned(),
+                    path: "/v1/logs".to_owned(),
+                    content_length: body.len(),
+                    bearer: Some(in_flight_bearer),
+                    content_type: Some(ResponseEncoding::Protobuf.content_type().to_owned()),
+                    content_encoding: None,
+                    tenant_hint: None,
+                    forwarded_for: None,
+                    forwarded_actor: None,
+                },
+                &in_flight_services,
+            )
+        });
+        entered_receiver.recv_timeout(Duration::from_secs(2))?;
+        services.activate_ingest_policy(
+            initialized.attribute(
+                PresentedCredential::parse(&administrator_secret)?,
+                RequestedIntent::SystemAdministration,
+                CompatibilityHints::none(),
+            )?,
+            ResourceGeneration::new(2)?,
+            AdministrativeIdempotencyKey::new([0xd2; 16])?,
+            IngestPolicy::compile(
+                3,
+                vec![PolicyRule::new(
+                    "reject-successor",
+                    Vec::new(),
+                    PolicyAction::Reject,
+                )?],
+            )?,
+        )?;
+        resume_sender.send(())?;
+        handle
+            .join()
+            .map_err(|_| std::io::Error::other("in-flight log route panicked"))?
+            .map_err(|_| std::io::Error::other("in-flight log route was rejected"))
+            .map_err(Into::into)
+    })?;
+    assert_eq!(in_flight.status(), 200);
+    assert!(
+        ExportLogsServiceResponse::decode(in_flight.body())?
+            .partial_success
+            .is_none()
+    );
+    drop(client);
+    assert_log_marker(&initialized, &old_policy)?;
+
+    let later = receive_log_request(
+        &services,
+        &bearer,
+        log_request("successor-log").encode_to_vec(),
+    )?;
+    assert_eq!(later.status(), 400, "body={:?}", later.body());
+    Ok(())
+}
+
+#[test]
+fn admitted_http_trace_request_keeps_captured_policy_after_successor_activation()
+-> Result<(), Box<dyn Error>> {
+    let roots = TestRoots::new()?;
+    let paths = roots.paths()?;
+    drop(InstanceBootstrap::initialize(
+        &paths,
+        InitializationPlan::non_interactive(),
+    )?);
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let administrator_secret = claim.secret().to_owned();
+    let bearer = claim
+        .ingest_secret()
+        .ok_or("ingest secret missing")?
+        .to_owned();
+    let initialized = Arc::new(InstanceBootstrap::reopen(&paths)?);
+    let services = ServiceHandle::new(Arc::clone(&initialized))?;
+    let path = PolicyAttributePath::new(AttributeNamespace::Record, "secret")?;
+    let old_policy = IngestPolicy::compile(
+        2,
+        vec![PolicyRule::new(
+            "redact-secret",
+            vec![],
+            PolicyAction::Redact(PolicyTarget::attribute(path)),
+        )?],
+    )?;
+    services.activate_ingest_policy(
+        initialized.attribute(
+            PresentedCredential::parse(&administrator_secret)?,
+            RequestedIntent::SystemAdministration,
+            CompatibilityHints::none(),
+        )?,
+        ResourceGeneration::new(1)?,
+        AdministrativeIdempotencyKey::new([0xd3; 16])?,
+        old_policy.clone(),
+    )?;
+    let (entered_sender, entered_receiver) = mpsc::sync_channel(1);
+    let (resume_sender, resume_receiver) = mpsc::sync_channel(1);
+    services.install_ingest_policy_snapshot_test_hook(Arc::new(BlockingCapturedPolicy {
+        signal: SignalKind::Traces,
+        entered: entered_sender,
+        resume: Mutex::new(resume_receiver),
+        blocked: AtomicBool::new(false),
+    }))?;
+    let body = trace_request(0xd4, 0xd5, "captured-trace").encode_to_vec();
+    let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
+    let endpoint = listener.local_addr()?;
+    let mut client = TcpStream::connect(endpoint)?;
+    let (mut server, _) = listener.accept()?;
+    client.write_all(&body)?;
+    let in_flight = thread::scope(|scope| -> Result<_, Box<dyn Error>> {
+        let in_flight_services = services.clone();
+        let in_flight_bearer = bearer.clone();
+        let handle = scope.spawn(move || {
+            receive_traces(
+                &mut server,
+                RequestHead {
+                    method: "POST".to_owned(),
+                    path: "/v1/traces".to_owned(),
+                    content_length: body.len(),
+                    bearer: Some(in_flight_bearer),
+                    content_type: Some(ResponseEncoding::Protobuf.content_type().to_owned()),
+                    content_encoding: None,
+                    tenant_hint: None,
+                    forwarded_for: None,
+                    forwarded_actor: None,
+                },
+                &in_flight_services,
+            )
+        });
+        entered_receiver.recv_timeout(Duration::from_secs(2))?;
+        services.activate_ingest_policy(
+            initialized.attribute(
+                PresentedCredential::parse(&administrator_secret)?,
+                RequestedIntent::SystemAdministration,
+                CompatibilityHints::none(),
+            )?,
+            ResourceGeneration::new(2)?,
+            AdministrativeIdempotencyKey::new([0xd6; 16])?,
+            IngestPolicy::compile(
+                3,
+                vec![PolicyRule::new(
+                    "reject-successor",
+                    Vec::new(),
+                    PolicyAction::Reject,
+                )?],
+            )?,
+        )?;
+        resume_sender.send(())?;
+        handle
+            .join()
+            .map_err(|_| std::io::Error::other("in-flight trace route panicked"))?
+            .map_err(|_| std::io::Error::other("in-flight trace route was rejected"))
+            .map_err(Into::into)
+    })?;
+    assert_eq!(in_flight.status(), 200);
+    assert!(
+        ExportTraceServiceResponse::decode(in_flight.body())?
+            .partial_success
+            .is_none()
+    );
+    drop(client);
+    assert_trace_marker(&initialized, &old_policy)?;
+
+    let later = receive_trace_request(
+        &services,
+        &bearer,
+        trace_request(0xd7, 0xd8, "successor-trace").encode_to_vec(),
+    )?;
+    assert_eq!(later.status(), 200, "body={:?}", later.body());
+    assert_eq!(
+        ExportTraceServiceResponse::decode(later.body())?
+            .partial_success
+            .ok_or("successor trace policy did not reject")?
+            .rejected_spans,
+        1
+    );
+    Ok(())
+}
 
 #[test]
 fn authenticated_http_log_marker_survives_ack_and_runtime_reopen() -> Result<(), Box<dyn Error>> {
@@ -136,9 +390,10 @@ fn authenticated_http_log_attribute_marker_reports_insufficient_governor_headroo
 -> Result<(), Box<dyn Error>> {
     let roots = TestRoots::new()?;
     let paths = roots.paths()?;
-    drop(InstanceBootstrap::initialize(
+    drop(InstanceBootstrap::initialize_with_max_registered_tenants(
         &paths,
         InitializationPlan::non_interactive(),
+        1,
     )?);
     let (administrator_secret, bearer) = {
         let claim = InstanceBootstrap::claim(&paths)?;
@@ -150,7 +405,9 @@ fn authenticated_http_log_attribute_marker_reports_insufficient_governor_headroo
                 .to_owned(),
         )
     };
-    let initialized = Arc::new(InstanceBootstrap::reopen(&paths)?);
+    let initialized = Arc::new(InstanceBootstrap::reopen_with_max_registered_tenants(
+        &paths, 1,
+    )?);
     let administrator = initialized.attribute(
         PresentedCredential::parse(&administrator_secret)?,
         RequestedIntent::SystemAdministration,
@@ -177,7 +434,7 @@ fn authenticated_http_log_attribute_marker_reports_insufficient_governor_headroo
     assert_eq!(
         before.ordinary_capacity(ResourceDimension::CpuWorkUnits),
         32,
-        "the runtime bootstrap contract fixes ordinary CPU capacity"
+        "this headroom scenario registers one 32-unit tenant CPU quota"
     );
     assert_eq!(
         before.pool_capacity(OrdinaryPool::Shared, ResourceDimension::CpuWorkUnits),
@@ -282,7 +539,7 @@ fn authenticated_http_log_attribute_marker_reports_insufficient_governor_headroo
     drop(services);
     drop(initialized);
 
-    let reopened = InstanceBootstrap::reopen(&paths)?;
+    let reopened = InstanceBootstrap::reopen_with_max_registered_tenants(&paths, 1)?;
     assert_log_attribute_marker(&reopened, &policy)?;
     Ok(())
 }
@@ -428,6 +685,104 @@ fn authenticated_http_trace_marker_survives_ack_and_runtime_reopen() -> Result<(
     Ok(())
 }
 
+fn receive_log_request(
+    services: &ServiceHandle,
+    bearer: &str,
+    body: Vec<u8>,
+) -> Result<crate::native_host::native_http::Response, Box<dyn Error>> {
+    let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
+    let endpoint = listener.local_addr()?;
+    let mut client = TcpStream::connect(endpoint)?;
+    let (mut server, _) = listener.accept()?;
+    client.write_all(&body)?;
+    let response = receive(
+        &mut server,
+        RequestHead {
+            method: "POST".to_owned(),
+            path: "/v1/logs".to_owned(),
+            content_length: body.len(),
+            bearer: Some(bearer.to_owned()),
+            content_type: Some(ResponseEncoding::Protobuf.content_type().to_owned()),
+            content_encoding: None,
+            tenant_hint: None,
+            forwarded_for: None,
+            forwarded_actor: None,
+        },
+        services,
+    )
+    .map_err(|_| "log HTTP response was rejected")?;
+    drop(client);
+    Ok(response)
+}
+
+fn receive_trace_request(
+    services: &ServiceHandle,
+    bearer: &str,
+    body: Vec<u8>,
+) -> Result<crate::native_host::native_http::Response, Box<dyn Error>> {
+    let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
+    let endpoint = listener.local_addr()?;
+    let mut client = TcpStream::connect(endpoint)?;
+    let (mut server, _) = listener.accept()?;
+    client.write_all(&body)?;
+    let response = receive_traces(
+        &mut server,
+        RequestHead {
+            method: "POST".to_owned(),
+            path: "/v1/traces".to_owned(),
+            content_length: body.len(),
+            bearer: Some(bearer.to_owned()),
+            content_type: Some(ResponseEncoding::Protobuf.content_type().to_owned()),
+            content_encoding: None,
+            tenant_hint: None,
+            forwarded_for: None,
+            forwarded_actor: None,
+        },
+        services,
+    )
+    .map_err(|_| "trace HTTP response was rejected")?;
+    drop(client);
+    Ok(response)
+}
+
+fn log_request(body: &str) -> ExportLogsServiceRequest {
+    ExportLogsServiceRequest {
+        resource_logs: vec![ResourceLogs {
+            scope_logs: vec![ScopeLogs {
+                log_records: vec![LogRecord {
+                    body: Some(string_value(body)),
+                    attributes: vec![
+                        attribute("secret", string_value("source-secret")),
+                        attribute("null", AnyValue { value: None }),
+                        attribute("lookalike", string_value("[REDACTED]")),
+                    ],
+                    ..LogRecord::default()
+                }],
+                ..ScopeLogs::default()
+            }],
+            ..ResourceLogs::default()
+        }],
+    }
+}
+
+fn trace_request(trace: u8, span: u8, name: &str) -> ExportTraceServiceRequest {
+    ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            scope_spans: vec![ScopeSpans {
+                spans: vec![Span {
+                    trace_id: vec![trace; 16],
+                    span_id: vec![span; 8],
+                    name: name.to_owned(),
+                    attributes: vec![attribute("secret", string_value("source-secret"))],
+                    ..Span::default()
+                }],
+                ..ScopeSpans::default()
+            }],
+            ..ResourceSpans::default()
+        }],
+    }
+}
+
 fn assert_trace_marker(
     initialized: &InitializedInstance,
     policy: &IngestPolicy,
@@ -443,7 +798,7 @@ fn assert_trace_marker(
         .into_iter()
         .next()
         .ok_or("trace scope missing after authenticated export")?;
-    let protection = initialized.key.segment_key(initialized.instance, scope)?;
+    let protection = initialized.tenant_segment_key_for_test(scope)?;
     let ledger = ActiveSegmentLedger::open(
         &initialized._authority,
         &catalog,
@@ -500,7 +855,7 @@ fn assert_log_marker(
         .into_iter()
         .next()
         .ok_or("log scope missing after authenticated export")?;
-    let protection = initialized.key.segment_key(initialized.instance, scope)?;
+    let protection = initialized.tenant_segment_key_for_test(scope)?;
     let ledger = ActiveSegmentLedger::open(
         &initialized._authority,
         &catalog,
@@ -562,7 +917,7 @@ fn assert_log_attribute_marker(
         .into_iter()
         .next()
         .ok_or("log scope missing after authenticated export")?;
-    let protection = initialized.key.segment_key(initialized.instance, scope)?;
+    let protection = initialized.tenant_segment_key_for_test(scope)?;
     let ledger = ActiveSegmentLedger::open(
         &initialized._authority,
         &catalog,

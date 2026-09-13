@@ -250,6 +250,8 @@ fn publish_legacy_governance(
             || object.starts_with(b"POSGOV04")
             || object.starts_with(b"POSGOV05")
             || object.starts_with(b"POSGOV06")
+            || object.starts_with(b"POSGOV07")
+            || object.starts_with(b"POSGOV08")
         {
             replaced = true;
             legacy_governance(object)?
@@ -354,13 +356,43 @@ fn rewrite_pending_replacement_as_v1(
 
 fn legacy_governance(current: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let mut legacy = current.to_vec();
-    if legacy.starts_with(b"POSGOV06") {
-        let credential_extension = CatalogGovernanceObject::decode(&legacy)?
-            .credentials()
+    let credential_extension = CatalogGovernanceObject::decode(current)?
+        .credentials()
+        .len()
+        .checked_mul(90)
+        .and_then(|bytes| bytes.checked_add(10))
+        .ok_or("credential extension overflow")?;
+    if legacy.starts_with(b"POSGOV08") {
+        let generation_start = legacy
             .len()
-            .checked_mul(90)
-            .and_then(|bytes| bytes.checked_add(10))
-            .ok_or("credential extension overflow")?;
+            .checked_sub(credential_extension)
+            .and_then(|start| start.checked_sub(8))
+            .ok_or("truncated V8 alias generation")?;
+        let suffix = legacy.split_off(
+            generation_start
+                .checked_add(8)
+                .ok_or("alias generation overflow")?,
+        );
+        legacy.truncate(generation_start);
+        legacy.extend_from_slice(&suffix);
+        legacy[..8].copy_from_slice(b"POSGOV07");
+    }
+    if legacy.starts_with(b"POSGOV07") {
+        let generation_start = legacy
+            .len()
+            .checked_sub(credential_extension)
+            .and_then(|start| start.checked_sub(16))
+            .ok_or("truncated V7 profile generations")?;
+        let suffix = legacy.split_off(
+            generation_start
+                .checked_add(16)
+                .ok_or("profile generation overflow")?,
+        );
+        legacy.truncate(generation_start);
+        legacy.extend_from_slice(&suffix);
+        legacy[..8].copy_from_slice(b"POSGOV06");
+    }
+    if legacy.starts_with(b"POSGOV06") {
         let generation_start = legacy
             .len()
             .checked_sub(credential_extension)

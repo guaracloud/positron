@@ -17,7 +17,7 @@ mod tests;
 pub use test_support::GovernanceTestFixture;
 pub use types::{
     BootstrapClaim, BootstrapFailure, BootstrapFailureCode, BootstrapPaths, BootstrapState,
-    InitializationPlan, InitializedInstance,
+    InitializationPlan, InitializedInstance, TenantRetentionImpactPreview,
 };
 
 /// The sole Application Runtime authority for classifying and initializing an instance.

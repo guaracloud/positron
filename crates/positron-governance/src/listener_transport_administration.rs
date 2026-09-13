@@ -3,7 +3,7 @@ use std::fmt::{Display, Formatter};
 
 use positron_kernel::{
     AuditIntent, Catalog, CatalogFailureCode, CatalogObject, CatalogProposal, CatalogSnapshot,
-    FormatEpoch, InstanceId, TransactionId,
+    InstanceId, TransactionId,
 };
 
 use crate::GovernanceAuditEntry;
@@ -71,8 +71,14 @@ impl ListenerTransportAdministration {
         let commit = catalog
             .commit(
                 snapshot.identity(),
-                CatalogProposal::new(transaction, FormatEpoch::CATALOG_V1, objects)
-                    .map_err(map_catalog)?,
+                CatalogProposal::new(
+                    transaction,
+                    snapshot
+                        .format_epoch()
+                        .ok_or(ListenerTransportAdministrationFailure::CorruptState)?,
+                    objects,
+                )
+                .map_err(map_catalog)?,
                 Some(audit),
             )
             .map_err(map_catalog)?;

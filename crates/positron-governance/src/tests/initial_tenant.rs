@@ -42,7 +42,7 @@ fn tenant_creation_encodes_every_authority_and_closed_audit() {
     )
     .expect("encodable intent")
     .into_parts();
-    assert!(object.starts_with(b"POSGOV05"));
+    assert!(object.starts_with(b"POSGOV07"));
     assert!(object.windows(14).any(|bytes| bytes == b"Default tenant"));
     assert!(object.windows(48).any(|bytes| bytes == [9; 48]));
     assert!(

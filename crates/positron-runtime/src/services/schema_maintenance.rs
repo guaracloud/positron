@@ -2,8 +2,8 @@ use positron_governance::schema_checkpoint_audit_intent;
 use positron_ingest::{SchemaBudget, TenantSchemaCheckpoint, load_schema_checkpoint};
 use positron_kernel::{
     AuditIntent, Catalog, CatalogFailureCode, CatalogObject, CatalogProposal, CatalogSnapshot,
-    ResourceAmounts, ResourceDimension, TransactionId, TransferredResourceReservation,
-    WorkClaim, WorkKind,
+    ResourceAmounts, ResourceDimension, TransactionId, TransferredResourceReservation, WorkClaim,
+    WorkKind,
 };
 
 use super::{ServiceFailure, failure::classify_catalog_failure_code};
@@ -194,7 +194,9 @@ fn replacement(
         .map_err(|_| ServiceFailure::CapacityUnavailable)?;
     encoded.extend_from_slice(checkpoint);
     objects.push(CatalogObject::new(encoded).map_err(map_catalog)?);
-    let epoch = snapshot.format_epoch().ok_or(ServiceFailure::CorruptState)?;
+    let epoch = snapshot
+        .format_epoch()
+        .ok_or(ServiceFailure::CorruptState)?;
     CatalogProposal::new(transaction, epoch, objects).map_err(map_catalog)
 }
 

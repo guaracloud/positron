@@ -113,7 +113,13 @@ impl ApiKeyRequest {
         expected: u64,
         idempotency: String,
     ) -> Result<Self, KeyWireFailure> {
-        Self::mutation_with_target(action, principal, Some(target_tenant), expected, idempotency)
+        Self::mutation_with_target(
+            action,
+            principal,
+            Some(target_tenant),
+            expected,
+            idempotency,
+        )
     }
     fn mutation_with_target(
         action: KeyAction,

@@ -117,7 +117,9 @@ impl InitializedInstance {
                     || object.starts_with(b"POSGOV03")
                     || object.starts_with(b"POSGOV04")
                     || object.starts_with(b"POSGOV05")
-                    || object.starts_with(b"POSGOV06"))
+                    || object.starts_with(b"POSGOV06")
+                    || object.starts_with(b"POSGOV07")
+                    || object.starts_with(b"POSGOV08"))
             {
                 return GovernanceTestFixture::new(object);
             }

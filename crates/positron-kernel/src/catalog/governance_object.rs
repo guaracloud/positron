@@ -12,6 +12,8 @@ const MAGIC_V3: [u8; 8] = *b"POSGOV03";
 const MAGIC_V4: [u8; 8] = *b"POSGOV04";
 const MAGIC_V5: [u8; 8] = *b"POSGOV05";
 const MAGIC_V6: [u8; 8] = *b"POSGOV06";
+const MAGIC_V7: [u8; 8] = *b"POSGOV07";
+const MAGIC_V8: [u8; 8] = *b"POSGOV08";
 const MAX_CREDENTIALS: usize = 128;
 const MAX_RETENTION_SECONDS: u64 = i64::MAX as u64 / 1_000_000_000;
 
@@ -23,6 +25,8 @@ pub enum CatalogGovernanceVersion {
     V4,
     V5,
     V6,
+    V7,
+    V8,
 }
 
 #[derive(Clone)]
@@ -105,19 +109,26 @@ pub struct CatalogGovernanceObject {
     tenant: TenantId,
     tenant_slug: TenantSlug,
     external_alias: Option<ExternalTenantAlias>,
+    display_name: String,
     principal: PrincipalId,
     salt: [u8; 32],
     hash: [u8; 32],
     ingest: Option<CredentialRecord>,
     query: Option<CredentialRecord>,
     retention_seconds: u64,
+    retention_offset: usize,
     quota_generation: u64,
     quota_weight: u32,
     quota_resources: [u64; 11],
     quota_offset: usize,
     tenant_key_envelope: Vec<u8>,
     lifecycle: TenantLifecycleState,
+    #[cfg(feature = "test-support")]
+    lifecycle_end: usize,
     lifecycle_generation: u64,
+    display_generation: u64,
+    retention_generation: u64,
+    alias_generation: u64,
     credentials: Vec<CatalogCredential>,
     credential_generation: u64,
     credential_prefix: Vec<u8>,
@@ -148,6 +159,32 @@ impl CatalogGovernanceObject {
     #[must_use]
     pub fn external_tenant_alias(&self) -> Option<ExternalTenantAlias> {
         self.external_alias.clone()
+    }
+
+    #[must_use]
+    pub fn display_name(&self) -> &str {
+        &self.display_name
+    }
+
+    #[must_use]
+    pub const fn display_generation(&self) -> u64 {
+        self.display_generation
+    }
+
+    #[must_use]
+    pub const fn retention_generation(&self) -> u64 {
+        self.retention_generation
+    }
+
+    /// Returns the generation of the immutable external-alias resource.
+    #[must_use]
+    pub const fn alias_generation(&self) -> u64 {
+        self.alias_generation
+    }
+
+    #[must_use]
+    pub const fn retention_seconds(&self) -> u64 {
+        self.retention_seconds
     }
 
     #[must_use]
@@ -222,16 +259,7 @@ impl CatalogGovernanceObject {
 
     #[cfg(feature = "test-support")]
     pub fn fixture_lifecycle_end(&self) -> Result<usize, CatalogFailure> {
-        if !matches!(
-            self.version,
-            CatalogGovernanceVersion::V5 | CatalogGovernanceVersion::V6
-        ) {
-            return Err(corrupt());
-        }
-        self.credential_prefix
-            .len()
-            .checked_sub(usize::from(self.version == CatalogGovernanceVersion::V6) * 8)
-            .ok_or_else(corrupt)
+        Ok(self.lifecycle_end)
     }
 
     /// Encodes a successor credential set while preserving all non-credential
@@ -258,7 +286,12 @@ impl CatalogGovernanceObject {
             return Err(corrupt());
         }
         let mut prefix = self.credential_prefix.clone();
-        if self.version != CatalogGovernanceVersion::V6 {
+        if !matches!(
+            self.version,
+            CatalogGovernanceVersion::V6
+                | CatalogGovernanceVersion::V7
+                | CatalogGovernanceVersion::V8
+        ) {
             let lifecycle_end = prefix.len();
             prefix
                 .get_mut(..8)
@@ -314,7 +347,10 @@ impl CatalogGovernanceObject {
         }
         let mut prefix = self.credential_prefix.clone();
         let lifecycle_end = prefix.len();
-        if self.version != CatalogGovernanceVersion::V6 {
+        if !matches!(
+            self.version,
+            CatalogGovernanceVersion::V6 | CatalogGovernanceVersion::V7
+        ) {
             prefix
                 .get_mut(..8)
                 .ok_or_else(corrupt)?
@@ -322,16 +358,25 @@ impl CatalogGovernanceObject {
             prefix.try_reserve_exact(8).map_err(|_| corrupt())?;
             prefix.extend_from_slice(&lifecycle_generation.to_be_bytes());
         } else {
-            let generation_start = lifecycle_end.checked_sub(8).ok_or_else(corrupt)?;
+            let generation_start = lifecycle_end
+                .checked_sub(if self.version == CatalogGovernanceVersion::V7 {
+                    24
+                } else {
+                    8
+                })
+                .ok_or_else(corrupt)?;
             prefix
-                .get_mut(generation_start..lifecycle_end)
+                .get_mut(generation_start..generation_start.checked_add(8).ok_or_else(corrupt)?)
                 .ok_or_else(corrupt)?
                 .copy_from_slice(&lifecycle_generation.to_be_bytes());
             let state_start = generation_start.checked_sub(5).ok_or_else(corrupt)?;
             let state = prefix.get_mut(state_start).ok_or_else(corrupt)?;
             *state = lifecycle_code(lifecycle);
         }
-        if self.version != CatalogGovernanceVersion::V6 {
+        if !matches!(
+            self.version,
+            CatalogGovernanceVersion::V6 | CatalogGovernanceVersion::V7
+        ) {
             let state_start = lifecycle_end.checked_sub(5).ok_or_else(corrupt)?;
             let state = prefix.get_mut(state_start).ok_or_else(corrupt)?;
             *state = lifecycle_code(lifecycle);
@@ -401,6 +446,209 @@ impl CatalogGovernanceObject {
         }
         encode_credentials(&prefix, self.credential_generation, &self.credentials)
     }
+
+    /// Encodes a successor display resource, upgrading a legacy record only
+    /// when that resource first changes.
+    pub fn with_display_name(
+        &self,
+        display_name: &str,
+        display_generation: u64,
+    ) -> Result<Vec<u8>, CatalogFailure> {
+        if display_name.is_empty() || display_name.len() > 128 || display_generation == 0 {
+            return Err(corrupt());
+        }
+        let prefix = self.display_successor_prefix(display_name)?;
+        let prefix = append_or_replace_profile_generations(
+            prefix,
+            self.version,
+            display_generation,
+            self.retention_generation,
+        )?;
+        encode_credentials(&prefix, self.credential_generation, &self.credentials)
+    }
+
+    /// Encodes a successor retention resource without changing the display
+    /// label or its independent generation.
+    pub fn with_retention_seconds(
+        &self,
+        retention_seconds: u64,
+        retention_generation: u64,
+    ) -> Result<Vec<u8>, CatalogFailure> {
+        if retention_seconds == 0
+            || retention_seconds > MAX_RETENTION_SECONDS
+            || retention_generation == 0
+        {
+            return Err(corrupt());
+        }
+        let retention_offset = self
+            .retention_offset
+            .checked_add(usize::from(matches!(
+                self.version,
+                CatalogGovernanceVersion::V1
+                    | CatalogGovernanceVersion::V2
+                    | CatalogGovernanceVersion::V3
+            )))
+            .ok_or_else(corrupt)?;
+        let mut prefix = self.credential_prefix.clone();
+        let retention_end = retention_offset.checked_add(8).ok_or_else(corrupt)?;
+        prefix
+            .get_mut(retention_offset..retention_end)
+            .ok_or_else(corrupt)?
+            .copy_from_slice(&retention_seconds.to_be_bytes());
+        let prefix = append_or_replace_profile_generations(
+            prefix,
+            self.version,
+            self.display_generation,
+            retention_generation,
+        )?;
+        encode_credentials(&prefix, self.credential_generation, &self.credentials)
+    }
+
+    /// Binds the one protocol compatibility alias while preserving every
+    /// unrelated governance authority. Only the alias-administration layer
+    /// decides whether this successor is legal; this codec only validates its
+    /// bounded durable representation.
+    pub fn with_external_tenant_alias(
+        &self,
+        alias: ExternalTenantAlias,
+        alias_generation: u64,
+    ) -> Result<Vec<u8>, CatalogFailure> {
+        if alias_generation == 0
+            || !matches!(
+                self.version,
+                CatalogGovernanceVersion::V7 | CatalogGovernanceVersion::V8
+            )
+        {
+            return Err(corrupt());
+        }
+        let prefix = &self.credential_prefix;
+        let slug_length = usize::from(*prefix.get(40).ok_or_else(corrupt)?);
+        let alias_at = 41_usize.checked_add(slug_length).ok_or_else(corrupt)?;
+        let old_alias_end = match *prefix.get(alias_at).ok_or_else(corrupt)? {
+            1 => {
+                let length = usize::from(
+                    *prefix
+                        .get(alias_at.checked_add(1).ok_or_else(corrupt)?)
+                        .ok_or_else(corrupt)?,
+                );
+                alias_at
+                    .checked_add(2)
+                    .and_then(|at| at.checked_add(length))
+                    .ok_or_else(corrupt)?
+            },
+            _ => return Err(corrupt()),
+        };
+        let suffix_end = if self.version == CatalogGovernanceVersion::V8 {
+            prefix.len().checked_sub(8).ok_or_else(corrupt)?
+        } else {
+            prefix.len()
+        };
+        let alias_text = alias.as_str();
+        let capacity = prefix
+            .len()
+            .checked_sub(old_alias_end.checked_sub(alias_at).ok_or_else(corrupt)?)
+            .and_then(|size| size.checked_add(2))
+            .and_then(|size| size.checked_add(alias_text.len()))
+            .and_then(|size| size.checked_add(8))
+            .ok_or_else(corrupt)?;
+        let mut successor = Vec::new();
+        successor
+            .try_reserve_exact(capacity)
+            .map_err(|_| corrupt())?;
+        successor.extend_from_slice(&MAGIC_V8);
+        successor.extend_from_slice(prefix.get(8..alias_at).ok_or_else(corrupt)?);
+        successor.push(1);
+        successor.push(u8::try_from(alias_text.len()).map_err(|_| corrupt())?);
+        successor.extend_from_slice(alias_text.as_bytes());
+        successor.extend_from_slice(prefix.get(old_alias_end..suffix_end).ok_or_else(corrupt)?);
+        successor.extend_from_slice(&alias_generation.to_be_bytes());
+        encode_credentials(&successor, self.credential_generation, &self.credentials)
+    }
+
+    fn display_successor_prefix(&self, display_name: &str) -> Result<Vec<u8>, CatalogFailure> {
+        let prefix = &self.credential_prefix;
+        let slug_length = usize::from(*prefix.get(40).ok_or_else(corrupt)?);
+        let alias_at = 41_usize.checked_add(slug_length).ok_or_else(corrupt)?;
+        let display_length_at = match *prefix.get(alias_at).ok_or_else(corrupt)? {
+            0 => alias_at.checked_add(1).ok_or_else(corrupt)?,
+            1 => {
+                let alias_length = usize::from(
+                    *prefix
+                        .get(alias_at.checked_add(1).ok_or_else(corrupt)?)
+                        .ok_or_else(corrupt)?,
+                );
+                alias_at
+                    .checked_add(2)
+                    .and_then(|at| at.checked_add(alias_length))
+                    .ok_or_else(corrupt)?
+            },
+            _ => return Err(corrupt()),
+        };
+        let display_length = usize::from(*prefix.get(display_length_at).ok_or_else(corrupt)?);
+        let display_end = display_length_at
+            .checked_add(1)
+            .and_then(|at| at.checked_add(display_length))
+            .ok_or_else(corrupt)?;
+        let capacity = prefix
+            .len()
+            .checked_sub(display_length)
+            .and_then(|size| size.checked_add(display_name.len()))
+            .ok_or_else(corrupt)?;
+        let mut successor = Vec::new();
+        successor
+            .try_reserve_exact(capacity)
+            .map_err(|_| corrupt())?;
+        successor.extend_from_slice(if self.version == CatalogGovernanceVersion::V8 {
+            &MAGIC_V8
+        } else {
+            &MAGIC_V7
+        });
+        successor.extend_from_slice(prefix.get(8..display_length_at).ok_or_else(corrupt)?);
+        successor.push(u8::try_from(display_name.len()).map_err(|_| corrupt())?);
+        successor.extend_from_slice(display_name.as_bytes());
+        successor.extend_from_slice(prefix.get(display_end..).ok_or_else(corrupt)?);
+        Ok(successor)
+    }
+}
+
+fn append_or_replace_profile_generations(
+    mut prefix: Vec<u8>,
+    version: CatalogGovernanceVersion,
+    display_generation: u64,
+    retention_generation: u64,
+) -> Result<Vec<u8>, CatalogFailure> {
+    if display_generation == 0 || retention_generation == 0 {
+        return Err(corrupt());
+    }
+    let (display_at, retention_at) = match version {
+        CatalogGovernanceVersion::V7 => (
+            prefix.len().checked_sub(16).ok_or_else(corrupt)?,
+            prefix.len().checked_sub(8).ok_or_else(corrupt)?,
+        ),
+        CatalogGovernanceVersion::V8 => (
+            prefix.len().checked_sub(24).ok_or_else(corrupt)?,
+            prefix.len().checked_sub(16).ok_or_else(corrupt)?,
+        ),
+        _ => {
+            prefix
+                .get_mut(..8)
+                .ok_or_else(corrupt)?
+                .copy_from_slice(&MAGIC_V7);
+            prefix.try_reserve_exact(16).map_err(|_| corrupt())?;
+            prefix.extend_from_slice(&display_generation.to_be_bytes());
+            prefix.extend_from_slice(&retention_generation.to_be_bytes());
+            return Ok(prefix);
+        },
+    };
+    prefix
+        .get_mut(display_at..retention_at)
+        .ok_or_else(corrupt)?
+        .copy_from_slice(&display_generation.to_be_bytes());
+    prefix
+        .get_mut(retention_at..retention_at.checked_add(8).ok_or_else(corrupt)?)
+        .ok_or_else(corrupt)?
+        .copy_from_slice(&retention_generation.to_be_bytes());
+    Ok(prefix)
 }
 
 /// Opaque v3/v4 signal retention evidence from one authenticated Catalog snapshot.
@@ -473,6 +721,8 @@ impl CatalogSnapshot {
                 | CatalogGovernanceVersion::V4
                 | CatalogGovernanceVersion::V5
                 | CatalogGovernanceVersion::V6
+                | CatalogGovernanceVersion::V7
+                | CatalogGovernanceVersion::V8
         ) {
             return Err(CatalogFailure::new(CatalogFailureCode::UnsupportedFormat));
         }
@@ -498,6 +748,8 @@ fn decode(encoded: &[u8]) -> Result<CatalogGovernanceObject, CatalogFailure> {
         MAGIC_V4 => CatalogGovernanceVersion::V4,
         MAGIC_V5 => CatalogGovernanceVersion::V5,
         MAGIC_V6 => CatalogGovernanceVersion::V6,
+        MAGIC_V7 => CatalogGovernanceVersion::V7,
+        MAGIC_V8 => CatalogGovernanceVersion::V8,
         _ => return Err(corrupt()),
     };
     let instance = cursor.take_array::<16>()?;
@@ -513,7 +765,10 @@ fn decode(encoded: &[u8]) -> Result<CatalogGovernanceObject, CatalogFailure> {
             ),
             _ => return Err(corrupt()),
         },
-        CatalogGovernanceVersion::V5 | CatalogGovernanceVersion::V6 => match cursor.take_u8()? {
+        CatalogGovernanceVersion::V5
+        | CatalogGovernanceVersion::V6
+        | CatalogGovernanceVersion::V7
+        | CatalogGovernanceVersion::V8 => match cursor.take_u8()? {
             1 => (
                 Some(ExternalTenantAlias::parse(cursor.take_text_u8(128)?).map_err(|_| corrupt())?),
                 false,
@@ -527,7 +782,8 @@ fn decode(encoded: &[u8]) -> Result<CatalogGovernanceObject, CatalogFailure> {
         | CatalogGovernanceVersion::V2
         | CatalogGovernanceVersion::V3 => (None, false),
     };
-    if cursor.take_text_u8(128)?.is_empty() {
+    let display_name = cursor.take_text_u8(128)?;
+    if display_name.is_empty() {
         return Err(corrupt());
     }
     let principal = PrincipalId::from_bytes(cursor.take_array::<16>()?).map_err(|_| corrupt())?;
@@ -544,6 +800,8 @@ fn decode(encoded: &[u8]) -> Result<CatalogGovernanceObject, CatalogFailure> {
             | CatalogGovernanceVersion::V4
             | CatalogGovernanceVersion::V5
             | CatalogGovernanceVersion::V6
+            | CatalogGovernanceVersion::V7
+            | CatalogGovernanceVersion::V8
     ) {
         Some(cursor.take_credential()?)
     } else {
@@ -563,6 +821,8 @@ fn decode(encoded: &[u8]) -> Result<CatalogGovernanceObject, CatalogFailure> {
             | CatalogGovernanceVersion::V4
             | CatalogGovernanceVersion::V5
             | CatalogGovernanceVersion::V6
+            | CatalogGovernanceVersion::V7
+            | CatalogGovernanceVersion::V8
     ) {
         Some(cursor.take_credential()?)
     } else {
@@ -580,6 +840,10 @@ fn decode(encoded: &[u8]) -> Result<CatalogGovernanceObject, CatalogFailure> {
     require_nonzero(cursor.take_array::<32>()?)?;
     cursor.skip_u16_bytes()?;
     let tenant_key_envelope = cursor.take_u16_bytes()?.to_vec();
+    let retention_offset = encoded
+        .len()
+        .checked_sub(cursor.remaining.len())
+        .ok_or_else(corrupt)?;
     let retention_seconds = cursor.take_u64()?;
     let quota_offset = encoded
         .len()
@@ -605,7 +869,48 @@ fn decode(encoded: &[u8]) -> Result<CatalogGovernanceObject, CatalogFailure> {
         [5, 4, 0, 1, 1] => TenantLifecycleState::Purged,
         _ => return Err(corrupt()),
     };
-    let lifecycle_generation = if version == CatalogGovernanceVersion::V6 {
+    #[cfg(feature = "test-support")]
+    let lifecycle_end = encoded
+        .len()
+        .checked_sub(cursor.remaining.len())
+        .ok_or_else(corrupt)?;
+    let lifecycle_generation = if matches!(
+        version,
+        CatalogGovernanceVersion::V6 | CatalogGovernanceVersion::V7 | CatalogGovernanceVersion::V8
+    ) {
+        let generation = cursor.take_u64()?;
+        if generation == 0 {
+            return Err(corrupt());
+        }
+        generation
+    } else {
+        1
+    };
+    let display_generation = if matches!(
+        version,
+        CatalogGovernanceVersion::V7 | CatalogGovernanceVersion::V8
+    ) {
+        let generation = cursor.take_u64()?;
+        if generation == 0 {
+            return Err(corrupt());
+        }
+        generation
+    } else {
+        1
+    };
+    let retention_generation = if matches!(
+        version,
+        CatalogGovernanceVersion::V7 | CatalogGovernanceVersion::V8
+    ) {
+        let generation = cursor.take_u64()?;
+        if generation == 0 {
+            return Err(corrupt());
+        }
+        generation
+    } else {
+        1
+    };
+    let alias_generation = if version == CatalogGovernanceVersion::V8 {
         let generation = cursor.take_u64()?;
         if generation == 0 {
             return Err(corrupt());
@@ -616,7 +921,10 @@ fn decode(encoded: &[u8]) -> Result<CatalogGovernanceObject, CatalogFailure> {
     };
     let credential_prefix = if matches!(
         version,
-        CatalogGovernanceVersion::V5 | CatalogGovernanceVersion::V6
+        CatalogGovernanceVersion::V5
+            | CatalogGovernanceVersion::V6
+            | CatalogGovernanceVersion::V7
+            | CatalogGovernanceVersion::V8
     ) {
         encoded
             .get(
@@ -632,7 +940,10 @@ fn decode(encoded: &[u8]) -> Result<CatalogGovernanceObject, CatalogFailure> {
     };
     let credential_generation = if matches!(
         version,
-        CatalogGovernanceVersion::V5 | CatalogGovernanceVersion::V6
+        CatalogGovernanceVersion::V5
+            | CatalogGovernanceVersion::V6
+            | CatalogGovernanceVersion::V7
+            | CatalogGovernanceVersion::V8
     ) {
         let generation = cursor.take_u64()?;
         if generation == 0 {
@@ -644,7 +955,10 @@ fn decode(encoded: &[u8]) -> Result<CatalogGovernanceObject, CatalogFailure> {
     };
     let credentials = if matches!(
         version,
-        CatalogGovernanceVersion::V5 | CatalogGovernanceVersion::V6
+        CatalogGovernanceVersion::V5
+            | CatalogGovernanceVersion::V6
+            | CatalogGovernanceVersion::V7
+            | CatalogGovernanceVersion::V8
     ) {
         let count = usize::from(cursor.take_u16()?);
         if !(1..=MAX_CREDENTIALS).contains(&count) {
@@ -710,19 +1024,26 @@ fn decode(encoded: &[u8]) -> Result<CatalogGovernanceObject, CatalogFailure> {
         tenant,
         tenant_slug,
         external_alias,
+        display_name: display_name.to_owned(),
         principal,
         salt,
         hash,
         ingest,
         query,
         retention_seconds,
+        retention_offset,
         quota_generation,
         quota_weight,
         quota_resources,
         quota_offset,
         tenant_key_envelope,
         lifecycle,
+        #[cfg(feature = "test-support")]
+        lifecycle_end,
         lifecycle_generation,
+        display_generation,
+        retention_generation,
+        alias_generation,
         credentials,
         credential_generation,
         credential_prefix,
@@ -874,6 +1195,8 @@ fn is_governance(bytes: &[u8]) -> bool {
         || bytes.starts_with(&MAGIC_V4)
         || bytes.starts_with(&MAGIC_V5)
         || bytes.starts_with(&MAGIC_V6)
+        || bytes.starts_with(&MAGIC_V7)
+        || bytes.starts_with(&MAGIC_V8)
 }
 
 const fn lifecycle_code(lifecycle: TenantLifecycleState) -> u8 {
@@ -979,7 +1302,10 @@ impl<'encoded> Cursor<'encoded> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "test-support")]
+    use super::super::types::GovernanceFixtureObject;
     use super::{CatalogFailureCode, CatalogGovernanceObject, CatalogGovernanceVersion};
+    use positron_domain::identity::ExternalTenantAlias;
     use positron_domain::lifecycle::TenantLifecycleState;
 
     #[test]
@@ -1042,6 +1368,201 @@ mod tests {
         assert_eq!(decoded.lifecycle_generation(), 2);
         assert_eq!(decoded.credential_generation(), 1);
         assert_eq!(decoded.credentials(), credentials.as_slice());
+    }
+
+    #[test]
+    fn v6_display_and_retention_successors_upgrade_independent_generations() {
+        let mut v6 = valid_v4_object(true);
+        v6[..8].copy_from_slice(b"POSGOV06");
+        v6.extend_from_slice(&1_u64.to_be_bytes());
+        v6.extend_from_slice(&1_u64.to_be_bytes());
+        v6.extend_from_slice(&3_u16.to_be_bytes());
+        for (principal, scope) in [([3; 16], 4_u8), ([6; 16], 1), ([9; 16], 2)] {
+            v6.extend_from_slice(&principal);
+            v6.push(scope);
+            v6.push(1);
+            v6.extend_from_slice(&0_u64.to_be_bytes());
+            v6.extend_from_slice(&[7; 32]);
+            v6.extend_from_slice(&[8; 32]);
+        }
+        let decoded = CatalogGovernanceObject::decode(&v6).expect("v6 record decodes");
+
+        assert_eq!(decoded.display_generation(), 1);
+        assert_eq!(decoded.retention_generation(), 1);
+        let display = decoded
+            .with_display_name("Renamed tenant", 2)
+            .expect("display successor encodes");
+        let display = CatalogGovernanceObject::decode(&display).expect("v7 display decodes");
+        assert_eq!(display.display_name(), "Renamed tenant");
+        assert_eq!(display.display_generation(), 2);
+        assert_eq!(display.retention_generation(), 1);
+        assert_eq!(display.tenant_key_envelope(), decoded.tenant_key_envelope());
+        assert_eq!(display.quota_resources(), decoded.quota_resources());
+        assert_eq!(
+            display.lifecycle_generation(),
+            decoded.lifecycle_generation()
+        );
+
+        let retention = display
+            .with_retention_seconds(86_400, 2)
+            .expect("retention successor encodes");
+        let retention = CatalogGovernanceObject::decode(&retention).expect("v7 retention decodes");
+        assert_eq!(retention.retention_seconds(), 86_400);
+        assert_eq!(retention.display_generation(), 2);
+        assert_eq!(retention.retention_generation(), 2);
+        assert_eq!(
+            retention.tenant_key_envelope(),
+            decoded.tenant_key_envelope()
+        );
+        assert_eq!(retention.quota_resources(), decoded.quota_resources());
+        assert_eq!(
+            retention.lifecycle_generation(),
+            decoded.lifecycle_generation()
+        );
+
+        let lifecycle = retention
+            .with_lifecycle(TenantLifecycleState::ReadOnly, 2)
+            .expect("v7 lifecycle successor encodes");
+        let lifecycle = CatalogGovernanceObject::decode(&lifecycle).expect("v7 lifecycle decodes");
+        assert_eq!(lifecycle.lifecycle(), TenantLifecycleState::ReadOnly);
+        assert_eq!(lifecycle.lifecycle_generation(), 2);
+        assert_eq!(lifecycle.display_generation(), 2);
+        assert_eq!(lifecycle.retention_generation(), 2);
+    }
+
+    #[test]
+    fn v8_profile_successors_preserve_alias_and_remain_decodable() {
+        let mut v6 = valid_v4_object(true);
+        v6[..8].copy_from_slice(b"POSGOV06");
+        v6.extend_from_slice(&1_u64.to_be_bytes());
+        v6.extend_from_slice(&1_u64.to_be_bytes());
+        v6.extend_from_slice(&3_u16.to_be_bytes());
+        for (principal, scope) in [([3; 16], 4_u8), ([6; 16], 1), ([9; 16], 2)] {
+            v6.extend_from_slice(&principal);
+            v6.push(scope);
+            v6.push(1);
+            v6.extend_from_slice(&0_u64.to_be_bytes());
+            v6.extend_from_slice(&[7; 32]);
+            v6.extend_from_slice(&[8; 32]);
+        }
+        let alias =
+            ExternalTenantAlias::parse("loki.retention-reopen").expect("canonical alias parses");
+        let v8 = CatalogGovernanceObject::decode(&v6)
+            .and_then(|record| record.with_display_name("Renamed tenant", 2))
+            .and_then(|record| CatalogGovernanceObject::decode(&record))
+            .and_then(|record| record.with_external_tenant_alias(alias.clone(), 2))
+            .expect("alias successor encodes");
+        let v8 = CatalogGovernanceObject::decode(&v8).expect("v8 record decodes");
+        let expected_lifecycle = v8.lifecycle();
+        let expected_lifecycle_generation = v8.lifecycle_generation();
+        let expected_credential_generation = v8.credential_generation();
+        let expected_credentials = v8.credentials().to_vec();
+        let expected_envelope = v8.tenant_key_envelope().to_vec();
+        let expected_quota = v8.quota_resources();
+
+        let display = v8
+            .with_display_name("Revised tenant", 3)
+            .expect("display successor encodes");
+        assert!(display.starts_with(b"POSGOV08"));
+        let display =
+            CatalogGovernanceObject::decode(&display).expect("v8 display successor decodes");
+        assert_eq!(display.display_name(), "Revised tenant");
+        assert_eq!(display.display_generation(), 3);
+        assert_eq!(display.retention_generation(), 1);
+        assert_eq!(display.external_tenant_alias(), Some(alias.clone()));
+        assert_eq!(display.alias_generation(), 2);
+
+        let successor = display
+            .with_retention_seconds(86_400, 2)
+            .expect("retention successor encodes");
+        assert!(successor.starts_with(b"POSGOV08"));
+        let successor =
+            CatalogGovernanceObject::decode(&successor).expect("v8 retention successor decodes");
+        assert_eq!(successor.retention_seconds(), 86_400);
+        assert_eq!(successor.display_name(), "Revised tenant");
+        assert_eq!(successor.display_generation(), 3);
+        assert_eq!(successor.retention_generation(), 2);
+        assert_eq!(successor.external_tenant_alias(), Some(alias));
+        assert_eq!(successor.alias_generation(), 2);
+        assert_eq!(successor.lifecycle(), expected_lifecycle);
+        assert_eq!(
+            successor.lifecycle_generation(),
+            expected_lifecycle_generation
+        );
+        assert_eq!(
+            successor.credential_generation(),
+            expected_credential_generation
+        );
+        assert_eq!(successor.credentials(), expected_credentials.as_slice());
+        assert_eq!(successor.tenant_key_envelope(), expected_envelope);
+        assert_eq!(successor.quota_resources(), expected_quota);
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn fixture_lifecycle_mutation_preserves_v7_v8_generations_and_alias_from_decoded_offsets() {
+        let mut v6 = valid_v4_object(true);
+        v6[..8].copy_from_slice(b"POSGOV06");
+        v6.extend_from_slice(&1_u64.to_be_bytes());
+        v6.extend_from_slice(&1_u64.to_be_bytes());
+        v6.extend_from_slice(&3_u16.to_be_bytes());
+        for (principal, scope) in [([3; 16], 4_u8), ([6; 16], 1), ([9; 16], 2)] {
+            v6.extend_from_slice(&principal);
+            v6.push(scope);
+            v6.push(1);
+            v6.extend_from_slice(&0_u64.to_be_bytes());
+            v6.extend_from_slice(&[7; 32]);
+            v6.extend_from_slice(&[8; 32]);
+        }
+        let v6 = CatalogGovernanceObject::decode(&v6).expect("v6 record decodes");
+        let v7 = v6
+            .with_display_name("Renamed tenant", 2)
+            .and_then(|record| CatalogGovernanceObject::decode(&record))
+            .and_then(|record| record.with_retention_seconds(86_400, 2))
+            .expect("canonical v7 record encodes");
+        let v7 = CatalogGovernanceObject::decode(&v7).expect("canonical v7 record decodes");
+        let v7_alias = v7.external_tenant_alias();
+        let v7_lifecycle = GovernanceFixtureObject::from_bytes(
+            &v7.with_lifecycle(TenantLifecycleState::Active, v7.lifecycle_generation())
+                .expect("v7 lifecycle record encodes"),
+        )
+        .expect("v7 fixture accepts canonical bytes")
+        .with_lifecycle(TenantLifecycleState::ReadOnly)
+        .expect("fixture locates v7 lifecycle through the decoder");
+        let v7_lifecycle = CatalogGovernanceObject::decode(&v7_lifecycle.plaintext)
+            .expect("fixture-mutated v7 record decodes");
+        assert_eq!(v7_lifecycle.lifecycle(), TenantLifecycleState::ReadOnly);
+        assert_eq!(v7_lifecycle.lifecycle_generation(), 1);
+        assert_eq!(v7_lifecycle.display_generation(), 2);
+        assert_eq!(v7_lifecycle.retention_generation(), 2);
+        assert_eq!(v7_lifecycle.alias_generation(), 1);
+        assert_eq!(v7_lifecycle.external_tenant_alias(), v7_alias);
+
+        let alias = ExternalTenantAlias::parse("fixture.rebound").expect("valid external alias");
+        let v8 = v7
+            .with_external_tenant_alias(alias.clone(), 2)
+            .expect("canonical v8 record encodes");
+        let v8_lifecycle = GovernanceFixtureObject::from_bytes(&v8)
+            .expect("v8 fixture accepts canonical bytes")
+            .with_lifecycle(TenantLifecycleState::Suspended)
+            .expect("fixture locates v8 lifecycle through the decoder");
+        let v8_lifecycle = CatalogGovernanceObject::decode(&v8_lifecycle.plaintext)
+            .expect("fixture-mutated v8 record decodes");
+        assert_eq!(v8_lifecycle.lifecycle(), TenantLifecycleState::Suspended);
+        assert_eq!(v8_lifecycle.lifecycle_generation(), 1);
+        assert_eq!(v8_lifecycle.display_generation(), 2);
+        assert_eq!(v8_lifecycle.retention_generation(), 2);
+        assert_eq!(v8_lifecycle.alias_generation(), 2);
+        assert_eq!(v8_lifecycle.external_tenant_alias(), Some(alias));
+
+        let result = GovernanceFixtureObject::from_bytes(b"POSGOV08")
+            .expect("bounded malformed fixture bytes are copyable")
+            .with_lifecycle(TenantLifecycleState::ReadOnly);
+        let failure = match result {
+            Ok(_) => panic!("recognized governance prefixes require a canonical record"),
+            Err(failure) => failure,
+        };
+        assert_eq!(failure.code(), CatalogFailureCode::IntegrityCorruption);
     }
 
     #[test]

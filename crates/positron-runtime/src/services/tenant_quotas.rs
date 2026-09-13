@@ -93,7 +93,26 @@ fn map_failure(failure: crate::BootstrapFailure) -> TenantQuotaHttpFailure {
         | BootstrapFailureCode::TenantLifecycleIdempotencyConflict
         | BootstrapFailureCode::TenantLifecycleInvalidTransition
         | BootstrapFailureCode::TenantLifecyclePurgeCompletionUnavailable
-        | BootstrapFailureCode::TenantLifecycleUnknownTenant => {
+        | BootstrapFailureCode::TenantLifecycleUnknownTenant
+        | BootstrapFailureCode::TenantDisplayNameUnauthorized
+        | BootstrapFailureCode::TenantDisplayNameStaleGeneration
+        | BootstrapFailureCode::TenantDisplayNameIdempotencyConflict
+        | BootstrapFailureCode::TenantAliasUnauthorized
+        | BootstrapFailureCode::TenantAliasUnknownTenant
+        | BootstrapFailureCode::TenantAliasAlreadyBound
+        | BootstrapFailureCode::TenantAliasConflict
+        | BootstrapFailureCode::TenantAliasStaleGeneration
+        | BootstrapFailureCode::TenantAliasIdempotencyConflict => {
+            TenantQuotaHttpFailure::Code(503, "administration_unavailable")
+        },
+        BootstrapFailureCode::TenantRetentionUnauthorized
+        | BootstrapFailureCode::TenantRetentionUnknownTenant
+        | BootstrapFailureCode::TenantRetentionInvalidConfirmation
+        | BootstrapFailureCode::TenantRetentionStaleGeneration
+        | BootstrapFailureCode::TenantRetentionIdempotencyConflict => {
+            TenantQuotaHttpFailure::Code(503, "administration_unavailable")
+        },
+        BootstrapFailureCode::TenantCreateConflict => {
             TenantQuotaHttpFailure::Code(503, "administration_unavailable")
         },
     }

@@ -11,7 +11,7 @@ use positron_policy::IngestPolicy;
 use sha2::{Digest, Sha256};
 
 use crate::tenant_quota_record::{
-    TENANT_RECORD_V2_MAGIC, is_tenant_record, tenant_record_metadata,
+    TENANT_RECORD_V3_MAGIC, is_tenant_record, tenant_record_metadata,
 };
 use crate::{AdministrativeIdempotencyKey, AuthorizedContext, ResourceGeneration};
 
@@ -31,6 +31,56 @@ pub struct TenantCreation {
     tenant: TenantId,
     generation: ResourceGeneration,
     audit_position: u64,
+}
+
+/// One redacted, authenticated tenant-administration view. It contains no
+/// credential material or opaque key-envelope bytes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TenantInspection {
+    tenant: TenantId,
+    slug: TenantSlug,
+    display_name: String,
+    retention_seconds: u64,
+    display_generation: ResourceGeneration,
+    retention_generation: ResourceGeneration,
+    lifecycle: TenantLifecycleState,
+}
+
+impl TenantInspection {
+    #[must_use]
+    pub const fn tenant_id(&self) -> TenantId {
+        self.tenant
+    }
+
+    #[must_use]
+    pub fn slug(&self) -> &str {
+        self.slug.as_str()
+    }
+
+    #[must_use]
+    pub fn display_name(&self) -> &str {
+        &self.display_name
+    }
+
+    #[must_use]
+    pub const fn retention_seconds(&self) -> u64 {
+        self.retention_seconds
+    }
+
+    #[must_use]
+    pub const fn display_generation(&self) -> ResourceGeneration {
+        self.display_generation
+    }
+
+    #[must_use]
+    pub const fn retention_generation(&self) -> ResourceGeneration {
+        self.retention_generation
+    }
+
+    #[must_use]
+    pub const fn lifecycle(&self) -> TenantLifecycleState {
+        self.lifecycle
+    }
 }
 
 impl TenantCreation {
@@ -63,26 +113,56 @@ pub struct TenantCreateRequest {
     idempotency: AdministrativeIdempotencyKey,
 }
 
-impl TenantCreateRequest {
+/// Bounded durable attributes for a newly created tenant.
+#[derive(Clone)]
+pub struct TenantCreateConfiguration {
+    slug: TenantSlug,
+    display_name: String,
+    retention_seconds: u64,
+    weight: u32,
+    resources: [u64; 11],
+}
+
+impl TenantCreateConfiguration {
     #[must_use]
     pub fn new(
-        actor: AuthorizedContext,
-        tenant: TenantId,
         slug: TenantSlug,
         display_name: &str,
         retention_seconds: u64,
         weight: u32,
         resources: [u64; 11],
-        idempotency: AdministrativeIdempotencyKey,
     ) -> Self {
         Self {
-            actor,
-            tenant,
             slug,
             display_name: display_name.to_owned(),
             retention_seconds,
             weight,
             resources,
+        }
+    }
+
+    #[must_use]
+    pub const fn resources(&self) -> [u64; 11] {
+        self.resources
+    }
+}
+
+impl TenantCreateRequest {
+    #[must_use]
+    pub fn new(
+        actor: AuthorizedContext,
+        tenant: TenantId,
+        configuration: TenantCreateConfiguration,
+        idempotency: AdministrativeIdempotencyKey,
+    ) -> Self {
+        Self {
+            actor,
+            tenant,
+            slug: configuration.slug,
+            display_name: configuration.display_name,
+            retention_seconds: configuration.retention_seconds,
+            weight: configuration.weight,
+            resources: configuration.resources,
             idempotency,
         }
     }
@@ -108,6 +188,74 @@ impl Error for TenantAdministrationFailure {}
 pub struct TenantAdministration;
 
 impl TenantAdministration {
+    /// Lists redacted tenant state from one authenticated Catalog snapshot.
+    /// The runtime authorizes enumeration before calling this pure decoder.
+    pub fn list(
+        snapshot: &CatalogSnapshot,
+    ) -> Result<Vec<TenantInspection>, TenantAdministrationFailure> {
+        let tenants = Self::registered_tenant_ids(snapshot)?;
+        let mut inspections = Vec::new();
+        inspections
+            .try_reserve(tenants.len())
+            .map_err(|_| TenantAdministrationFailure::PersistenceUnavailable)?;
+        for tenant in tenants {
+            inspections.push(Self::inspect(snapshot, tenant)?);
+        }
+        Ok(inspections)
+    }
+
+    /// Resolves one registered tenant from one authenticated Catalog snapshot.
+    pub fn inspect(
+        snapshot: &CatalogSnapshot,
+        tenant: TenantId,
+    ) -> Result<TenantInspection, TenantAdministrationFailure> {
+        let (governance_id, governance) = snapshot.governance_object().map_err(map_catalog)?;
+        if governance.tenant() == tenant {
+            let _ = governance_id;
+            return Ok(TenantInspection {
+                tenant,
+                slug: governance.tenant_slug(),
+                display_name: governance.display_name().to_owned(),
+                retention_seconds: governance.retention_seconds(),
+                display_generation: ResourceGeneration::new(governance.display_generation())
+                    .map_err(|_| TenantAdministrationFailure::PersistenceUnavailable)?,
+                retention_generation: ResourceGeneration::new(governance.retention_generation())
+                    .map_err(|_| TenantAdministrationFailure::PersistenceUnavailable)?,
+                lifecycle: governance.lifecycle(),
+            });
+        }
+        if !Self::registered_tenant_ids(snapshot)?.contains(&tenant) {
+            return Err(TenantAdministrationFailure::Unauthorized);
+        }
+        let mut found = None;
+        for identity in snapshot.object_identities() {
+            let bytes = snapshot
+                .object(identity)
+                .map_err(map_catalog)?
+                .ok_or(TenantAdministrationFailure::PersistenceUnavailable)?;
+            if !is_tenant_record(bytes) {
+                continue;
+            }
+            let record = tenant_record_metadata(bytes)?;
+            if record.tenant == tenant {
+                if found.is_some() {
+                    return Err(TenantAdministrationFailure::PersistenceUnavailable);
+                }
+                found = Some(TenantInspection {
+                    tenant,
+                    slug: TenantSlug::parse_canonical(&record.slug)
+                        .map_err(|_| TenantAdministrationFailure::PersistenceUnavailable)?,
+                    display_name: record.display_name,
+                    retention_seconds: record.retention_seconds,
+                    display_generation: record.display_generation,
+                    retention_generation: record.retention_generation,
+                    lifecycle: record.lifecycle,
+                });
+            }
+        }
+        found.ok_or(TenantAdministrationFailure::PersistenceUnavailable)
+    }
+
     /// Reconstructs only the bounded admission limits from authenticated
     /// tenant registry records during instance reopen. The caller keeps the
     /// resulting live registration in the governor authority.
@@ -328,7 +476,10 @@ impl TenantAdministration {
         let prepared = match catalog.resume_prepared(transaction, digest) {
             Ok(prepared) => prepared,
             Err(failure) if failure.code() == CatalogFailureCode::IdempotencyConflict => catalog
-                .resume_prepared(transaction, legacy_request_digest(&request, registry.generation))
+                .resume_prepared(
+                    transaction,
+                    legacy_request_digest(&request, registry.generation),
+                )
                 .map_err(map_catalog)?,
             Err(failure) => return Err(map_catalog(failure)),
         };
@@ -396,8 +547,13 @@ impl TenantAdministration {
             .map_err(|_| TenantAdministrationFailure::PersistenceUnavailable)?;
         objects.push(CatalogObject::new(policy.into_bytes()).map_err(map_catalog)?);
         objects.push(
-            CatalogObject::new(encode_receipt(&request, registry.generation, generation, digest))
-                .map_err(map_catalog)?,
+            CatalogObject::new(encode_receipt(
+                &request,
+                registry.generation,
+                generation,
+                digest,
+            ))
+            .map_err(map_catalog)?,
         );
         let commit = catalog
             .commit_prepared(
@@ -410,8 +566,13 @@ impl TenantAdministration {
                     objects,
                 )
                 .map_err(map_catalog)?,
-                AuditIntent::new(encode_audit(&request, registry.generation, generation, digest))
-                    .map_err(map_catalog)?,
+                AuditIntent::new(encode_audit(
+                    &request,
+                    registry.generation,
+                    generation,
+                    digest,
+                ))
+                .map_err(map_catalog)?,
                 digest,
             )
             .map_err(map_catalog)?;
@@ -530,9 +691,23 @@ fn encode_record(
     let envelope_len =
         u16::try_from(envelope.len()).map_err(|_| TenantAdministrationFailure::InvalidInput)?;
     let mut encoded = Vec::with_capacity(
-        8 + 16 + 16 + 1 + slug.len() + 1 + display.len() + 8 + 4 + 88 + 1 + 8 + 2 + envelope.len(),
+        8 + 16
+            + 16
+            + 1
+            + slug.len()
+            + 1
+            + display.len()
+            + 8
+            + 4
+            + 88
+            + 1
+            + 8
+            + 8
+            + 8
+            + 2
+            + envelope.len(),
     );
-    encoded.extend_from_slice(&TENANT_RECORD_V2_MAGIC);
+    encoded.extend_from_slice(&TENANT_RECORD_V3_MAGIC);
     encoded.extend_from_slice(&instance.to_bytes());
     encoded.extend_from_slice(&request.tenant.to_bytes());
     encoded.push(u8::try_from(slug.len()).map_err(|_| TenantAdministrationFailure::InvalidInput)?);
@@ -546,9 +721,11 @@ fn encode_record(
     for value in request.resources {
         encoded.extend_from_slice(&value.to_be_bytes());
     }
-    // Active lifecycle, policy generation, and independent lifecycle generation
-    // are durable tenant state.
+    // Active lifecycle, policy generation, and independent lifecycle, display,
+    // and retention generations are durable tenant state.
     encoded.push(1);
+    encoded.extend_from_slice(&1_u64.to_be_bytes());
+    encoded.extend_from_slice(&1_u64.to_be_bytes());
     encoded.extend_from_slice(&1_u64.to_be_bytes());
     encoded.extend_from_slice(&1_u64.to_be_bytes());
     encoded.extend_from_slice(&envelope_len.to_be_bytes());
@@ -664,8 +841,11 @@ fn decode_receipt(
     if !bytes.starts_with(&TENANT_RECEIPT_MAGIC) {
         return Ok(None);
     }
-    if bytes.len() != 112 || bytes.get(8..24) != Some(key.to_bytes().as_slice()) {
+    if bytes.len() != 112 {
         return Err(TenantAdministrationFailure::PersistenceUnavailable);
+    }
+    if bytes.get(8..24) != Some(key.to_bytes().as_slice()) {
+        return Ok(None);
     }
     let actor = principal_at(bytes, 24)?;
     let tenant = tenant_at(bytes, 40)?;
@@ -743,10 +923,7 @@ fn request_digest(request: &TenantCreateRequest) -> [u8; 32] {
 /// Verifies receipts and prepared transactions created by the retired
 /// creation precondition without making that precondition part of the current
 /// request contract.
-fn legacy_request_digest(
-    request: &TenantCreateRequest,
-    expected: ResourceGeneration,
-) -> [u8; 32] {
+fn legacy_request_digest(request: &TenantCreateRequest, expected: ResourceGeneration) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(request.actor.principal_id().to_bytes());
     hasher.update(request.tenant.to_bytes());
@@ -795,7 +972,14 @@ mod tests {
         let key = AdministrativeIdempotencyKey::new([0x43; 16]).expect("idempotency");
         let expected = ResourceGeneration::new(7).expect("prior generation");
         let generation = ResourceGeneration::new(8).expect("successor generation");
-        let legacy = digest(actor, tenant, "legacy", "Legacy tenant", key, Some(expected));
+        let legacy = digest(
+            actor,
+            tenant,
+            "legacy",
+            "Legacy tenant",
+            key,
+            Some(expected),
+        );
         let canonical = digest(actor, tenant, "legacy", "Legacy tenant", key, None);
 
         let mut encoded = Vec::new();
@@ -815,10 +999,42 @@ mod tests {
         assert_eq!(receipt.audit_position, 17);
         assert!(replay_receipt(&receipt, actor, tenant, canonical, legacy).is_ok());
 
-        let changed_legacy = digest(actor, tenant, "legacy", "Changed tenant", key, Some(expected));
+        let changed_legacy = digest(
+            actor,
+            tenant,
+            "legacy",
+            "Changed tenant",
+            key,
+            Some(expected),
+        );
         assert_eq!(
             replay_receipt(&receipt, actor, tenant, canonical, changed_legacy),
             Err(TenantAdministrationFailure::IdempotencyConflict)
+        );
+    }
+
+    #[test]
+    fn receipt_lookup_skips_a_well_formed_record_for_a_different_idempotency_key() {
+        let recorded = AdministrativeIdempotencyKey::new([0x43; 16]).expect("recorded key");
+        let sought = AdministrativeIdempotencyKey::new([0x44; 16]).expect("sought key");
+        let actor = PrincipalId::from_bytes([0x41; 16]).expect("principal");
+        let tenant = TenantId::from_bytes([0x42; 16]).expect("tenant");
+        let expected = ResourceGeneration::new(7).expect("prior generation");
+        let generation = ResourceGeneration::new(8).expect("successor generation");
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(&TENANT_RECEIPT_MAGIC);
+        encoded.extend_from_slice(&recorded.to_bytes());
+        encoded.extend_from_slice(&actor.to_bytes());
+        encoded.extend_from_slice(&tenant.to_bytes());
+        encoded.extend_from_slice(&expected.get().to_be_bytes());
+        encoded.extend_from_slice(&generation.get().to_be_bytes());
+        encoded.extend_from_slice(&[0x45; 32]);
+        encoded.extend_from_slice(&17_u64.to_be_bytes());
+
+        assert!(
+            decode_receipt(&encoded, sought)
+                .expect("well-formed unrelated receipt is ignored")
+                .is_none()
         );
     }
 

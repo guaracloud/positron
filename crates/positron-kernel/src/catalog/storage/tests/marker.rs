@@ -189,7 +189,7 @@ fn existing_marker_retry_classifies_authentication_format_and_shape_failures()
 #[test]
 fn recovery_rejects_authenticated_but_semantically_inconsistent_records()
 -> Result<(), Box<dyn std::error::Error>> {
-    for (suffix, epoch) in [(20_u8, 2_u32), (21, u32::MAX)] {
+    for (suffix, epoch) in [(20_u8, 3_u32), (21, u32::MAX)] {
         let root = TemporaryRoot::new()?;
         let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
         let storage = CatalogStorage::open(&volume)?;

@@ -53,7 +53,9 @@ pub(super) fn publish(
         basis.identity(),
         CatalogProposal::new(
             TransactionId::new(transaction)?,
-            FormatEpoch::new(FORMAT_EPOCH)?,
+            basis
+                .format_epoch()
+                .unwrap_or(FormatEpoch::new(FORMAT_EPOCH)?),
             objects,
         )?,
         None,

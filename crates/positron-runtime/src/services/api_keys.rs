@@ -97,20 +97,25 @@ impl ServiceHandle {
                 )
                 .map_err(|_| (400, "invalid_request"))?;
                 if request.action() == KeyAction::Rotate {
-                    Some(match request.target_tenant() {
-                        Some(target) => self.instance.rotate_api_key_for_tenant(
-                            actor,
-                            TenantId::parse_canonical(target)
-                                .map_err(|_| (400, "invalid_request"))?,
-                            principal,
-                            expected,
-                            idempotency,
-                        ),
-                        None => self
-                            .instance
-                            .rotate_api_key(actor, principal, expected, idempotency),
-                    }
-                    .map_err(|error| map_failure(error.code()))?)
+                    Some(
+                        match request.target_tenant() {
+                            Some(target) => self.instance.rotate_api_key_for_tenant(
+                                actor,
+                                TenantId::parse_canonical(target)
+                                    .map_err(|_| (400, "invalid_request"))?,
+                                principal,
+                                expected,
+                                idempotency,
+                            ),
+                            None => self.instance.rotate_api_key(
+                                actor,
+                                principal,
+                                expected,
+                                idempotency,
+                            ),
+                        }
+                        .map_err(|error| map_failure(error.code()))?,
+                    )
                 } else {
                     match request.target_tenant() {
                         Some(target) => self.instance.revoke_api_key_for_tenant(
@@ -121,9 +126,10 @@ impl ServiceHandle {
                             expected,
                             idempotency,
                         ),
-                        None => self
-                            .instance
-                            .revoke_api_key(actor, principal, expected, idempotency),
+                        None => {
+                            self.instance
+                                .revoke_api_key(actor, principal, expected, idempotency)
+                        },
                     }
                     .map_err(|error| map_failure(error.code()))?;
                     response.principal = Some(principal.to_canonical_text());

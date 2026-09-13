@@ -18,6 +18,9 @@ positron-kernel = { path = "../positron-kernel" }
 positron-runtime = { path = "../positron-runtime" }
 signal-hook = "=0.3.18"
 
+[dev-dependencies]
+rustls = { version = "=0.23.43", default-features = false, features = ["ring", "std", "tls12"] }
+
 [lib]
 name = "positron"
 path = "src/lib.rs"

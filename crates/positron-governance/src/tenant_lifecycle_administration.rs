@@ -5,8 +5,9 @@ use positron_domain::identity::{PrincipalId, Scope, TenantId};
 use positron_domain::lifecycle::{TenantLifecycle, TenantLifecycleState};
 use positron_kernel::{
     AuditIntent, Catalog, CatalogFailureCode, CatalogObject, CatalogProposal, CatalogReadView,
-    CatalogSnapshot, GovernanceAuditRecord, TransactionId,
+    CatalogSnapshot, GovernanceAuditRecord, PreparedTransactionResolution, TransactionId,
 };
+use sha2::{Digest, Sha256};
 
 use crate::audit::TenantLifecycleAuditIntent;
 use crate::tenant_quota_record::{
@@ -184,6 +185,9 @@ impl TenantLifecycleAdministration {
         )? {
             return Ok(replay);
         }
+        if let Some(resumed) = resume_prepared(catalog, request)? {
+            return Ok(resumed);
+        }
         if request.tenant != governance.tenant() {
             return transition_secondary(catalog, &snapshot, request, audit_time);
         }
@@ -195,11 +199,11 @@ impl TenantLifecycleAdministration {
         if request.target == TenantLifecycleState::Purged {
             return Err(TenantLifecycleAdministrationFailure::PurgeCompletionUnavailable);
         }
+        let generation =
+            next_generation(governance.lifecycle_generation(), from, request.expected)?;
         TenantLifecycle::from_durable_state(from)
             .transition_to(request.target)
             .map_err(|_| TenantLifecycleAdministrationFailure::InvalidTransition)?;
-        let generation =
-            next_generation(governance.lifecycle_generation(), from, request.expected)?;
         let replacement = governance
             .with_lifecycle(request.target, generation.get())
             .map_err(map_catalog)?;
@@ -214,7 +218,7 @@ impl TenantLifecycleAdministration {
             generation,
         }
         .encode();
-        let commit = commit(catalog, &snapshot, replacement, request.idempotency, audit)?;
+        let commit = commit(catalog, &snapshot, replacement, request, audit)?;
         let record = commit
             .governance_audit_record()
             .ok_or(TenantLifecycleAdministrationFailure::PersistenceUnavailable)?;
@@ -253,10 +257,10 @@ where
     if request.target == TenantLifecycleState::Purged {
         return Err(TenantLifecycleAdministrationFailure::PurgeCompletionUnavailable);
     }
+    let generation = next_generation(current.generation.get(), current.state, request.expected)?;
     TenantLifecycle::from_durable_state(current.state)
         .transition_to(request.target)
         .map_err(|_| TenantLifecycleAdministrationFailure::InvalidTransition)?;
-    let generation = next_generation(current.generation.get(), current.state, request.expected)?;
     let objects = replace_tenant_lifecycle_record(
         snapshot,
         request.tenant,
@@ -277,7 +281,7 @@ where
         generation,
     }
     .encode();
-    let commit = commit_objects(catalog, snapshot, objects, request.idempotency, audit)?;
+    let commit = commit_objects(catalog, snapshot, objects, request, audit)?;
     transition_from_commit(
         commit,
         request.tenant,
@@ -391,6 +395,37 @@ fn replay_records(
     Ok(None)
 }
 
+fn resume_prepared(
+    catalog: &Catalog<'_>,
+    request: TenantLifecycleTransitionRequest,
+) -> Result<Option<TenantLifecycleTransition>, TenantLifecycleAdministrationFailure> {
+    let transaction = TransactionId::new(request.idempotency.to_bytes()).map_err(map_catalog)?;
+    match catalog
+        .resume_prepared(transaction, request_digest(request))
+        .map_err(map_catalog)?
+    {
+        PreparedTransactionResolution::Absent => Ok(None),
+        PreparedTransactionResolution::Unavailable => {
+            Err(TenantLifecycleAdministrationFailure::PersistenceUnavailable)
+        },
+        PreparedTransactionResolution::Resumed(commit) => {
+            let record = commit
+                .governance_audit_record()
+                .ok_or(TenantLifecycleAdministrationFailure::PersistenceUnavailable)?;
+            replay_records(
+                std::slice::from_ref(record),
+                request.idempotency,
+                request.actor.principal_id(),
+                request.tenant,
+                request.target,
+                request.expected,
+            )?
+            .ok_or(TenantLifecycleAdministrationFailure::PersistenceUnavailable)
+            .map(Some)
+        },
+    }
+}
+
 fn next_generation(
     current: u64,
     current_state: TenantLifecycleState,
@@ -419,7 +454,7 @@ fn commit(
     catalog: &Catalog<'_>,
     snapshot: &CatalogSnapshot,
     replacement: Vec<u8>,
-    idempotency: AdministrativeIdempotencyKey,
+    request: TenantLifecycleTransitionRequest,
     audit: Vec<u8>,
 ) -> Result<positron_kernel::CatalogCommit, TenantLifecycleAdministrationFailure> {
     let mut objects = Vec::new();
@@ -433,18 +468,18 @@ fn commit(
         }
     }
     objects.push(CatalogObject::new(replacement).map_err(map_catalog)?);
-    commit_objects(catalog, snapshot, objects, idempotency, audit)
+    commit_objects(catalog, snapshot, objects, request, audit)
 }
 
 fn commit_objects(
     catalog: &Catalog<'_>,
     snapshot: &CatalogSnapshot,
     objects: Vec<CatalogObject>,
-    idempotency: AdministrativeIdempotencyKey,
+    request: TenantLifecycleTransitionRequest,
     audit: Vec<u8>,
 ) -> Result<positron_kernel::CatalogCommit, TenantLifecycleAdministrationFailure> {
     let proposal = CatalogProposal::new(
-        TransactionId::new(idempotency.to_bytes()).map_err(map_catalog)?,
+        TransactionId::new(request.idempotency.to_bytes()).map_err(map_catalog)?,
         snapshot
             .format_epoch()
             .ok_or(TenantLifecycleAdministrationFailure::PersistenceUnavailable)?,
@@ -452,12 +487,34 @@ fn commit_objects(
     )
     .map_err(map_catalog)?;
     catalog
-        .commit(
+        .commit_prepared(
             snapshot.identity(),
             proposal,
-            Some(AuditIntent::new(audit).map_err(map_catalog)?),
+            AuditIntent::new(audit).map_err(map_catalog)?,
+            request_digest(request),
         )
         .map_err(map_catalog)
+}
+
+fn request_digest(request: TenantLifecycleTransitionRequest) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(b"positron.tenant-lifecycle.transition.request.v1\0");
+    hash.update(request.idempotency.to_bytes());
+    hash.update(request.actor.principal_id().to_bytes());
+    hash.update(request.tenant.to_bytes());
+    hash.update([lifecycle_state_code(request.target)]);
+    hash.update(request.expected.get().to_be_bytes());
+    hash.finalize().into()
+}
+
+const fn lifecycle_state_code(state: TenantLifecycleState) -> u8 {
+    match state {
+        TenantLifecycleState::Active => 1,
+        TenantLifecycleState::ReadOnly => 2,
+        TenantLifecycleState::Suspended => 3,
+        TenantLifecycleState::Purging => 4,
+        TenantLifecycleState::Purged => 5,
+    }
 }
 
 fn map_tenant_record_failure(

@@ -23,6 +23,261 @@ service TenantQuotaService {
   rpc Update(TenantQuotaUpdateRequest) returns (TenantQuotaUpdateResponse);
 }
 
+// Authenticated system-administration lifecycle transitions for one explicit
+// tenant. The target is never inferred from a bearer or a request hint.
+service TenantLifecycleService {
+  rpc Transition(TenantLifecycleTransitionRequest) returns (TenantLifecycleTransitionResponse);
+}
+
+// One immutable, protocol-specific compatibility binding for an explicit
+// tenant. It validates a hint after credential attribution; it never routes
+// traffic or selects tenant authority.
+service TenantAliasService {
+  rpc Bind(TenantAliasBindRequest) returns (TenantAliasBindResponse);
+}
+
+// Authenticated tenant retention inspection and confirmed publication. The
+// preview is read-only evidence; a reduction submits only its opaque digest,
+// which the server recomputes from current canonical state before mutation.
+service TenantRetentionService {
+  rpc Preview(TenantRetentionPreviewRequest) returns (TenantRetentionPreviewResponse);
+  rpc Update(TenantRetentionUpdateRequest) returns (TenantRetentionUpdateResponse);
+}
+
+// Authenticated system administration for explicit tenant registry entries.
+// Tenant identity is always explicit and is never inferred from a bearer.
+service TenantService {
+  rpc Create(TenantCreateRequest) returns (TenantCreateResponse);
+  rpc Inspect(TenantInspectRequest) returns (TenantInspectResponse);
+  rpc List(TenantListRequest) returns (TenantListResponse);
+  rpc UpdateDisplayName(TenantDisplayNameUpdateRequest) returns (TenantDisplayNameUpdateResponse);
+}
+
+// Authenticated tenant policy preview. This operation compiles a bounded
+// prospective policy and never activates or mutates it.
+service PolicyService {
+  rpc Validate(PolicyPreviewRequest) returns (PolicyValidateResponse);
+  rpc Test(PolicyTestRequest) returns (PolicyTestResponse);
+  rpc Diff(PolicyDiffRequest) returns (PolicyDiffResponse);
+  rpc Explain(PolicyExplainRequest) returns (PolicyExplainResponse);
+  rpc Activate(PolicyActivateRequest) returns (PolicyActivateResponse);
+}
+
+message PolicyPreviewRequest {
+  string policy_json = 1;
+}
+
+message PolicyValidateResponse {
+  uint64 policy_generation = 1;
+  string policy_digest = 2;
+  uint32 rule_count = 3;
+}
+
+message PolicyTestRequest {
+  string policy_json = 1;
+  string candidate_json = 2;
+}
+
+message PolicyTestResponse {
+  uint64 policy_generation = 1;
+  string policy_digest = 2;
+  bool accepted = 3;
+  uint32 applied_rule_count = 4;
+}
+
+message PolicyDiffRequest {
+  string before_policy_json = 1;
+  string after_policy_json = 2;
+}
+
+message PolicyDiffResponse {
+  uint64 before_policy_generation = 1;
+  string before_policy_digest = 2;
+  uint64 after_policy_generation = 3;
+  string after_policy_digest = 4;
+  repeated string semantic_changes = 5;
+}
+
+message PolicyExplainRequest {
+  string policy_json = 1;
+  string candidate_json = 2;
+}
+
+message PolicyExplainResponse {
+  uint64 policy_generation = 1;
+  string policy_digest = 2;
+  string outcome = 3;
+  string explanation = 4;
+}
+
+message PolicyActivateRequest {
+  string policy_json = 1;
+  uint64 expected_generation = 2;
+  string idempotency_key = 3;
+}
+
+message PolicyActivateResponse {
+  uint64 resource_generation = 1;
+  string policy_digest = 2;
+  uint64 audit_position = 3;
+}
+
+
+enum TenantLifecycleTarget {
+  TENANT_LIFECYCLE_TARGET_UNSPECIFIED = 0;
+  TENANT_LIFECYCLE_TARGET_ACTIVE = 1;
+  TENANT_LIFECYCLE_TARGET_READ_ONLY = 2;
+  TENANT_LIFECYCLE_TARGET_SUSPENDED = 3;
+  TENANT_LIFECYCLE_TARGET_PURGING = 4;
+  TENANT_LIFECYCLE_TARGET_PURGED = 5;
+}
+
+message TenantLifecycleTransitionRequest {
+  string tenant = 1;
+  TenantLifecycleTarget target = 2;
+  uint64 expected_generation = 3;
+  string idempotency_key = 4;
+}
+
+message TenantLifecycleTransitionResponse {
+  string tenant = 1;
+  TenantLifecycleTarget from = 2;
+  TenantLifecycleTarget to = 3;
+  uint64 lifecycle_generation = 4;
+  uint64 audit_position = 5;
+  uint64 audit_ingest_time_unix_seconds = 6;
+}
+
+message TenantAliasBindRequest {
+  string tenant = 1;
+  string external_alias = 2;
+  uint64 expected_generation = 3;
+  string idempotency_key = 4;
+}
+
+message TenantAliasBindResponse {
+  string tenant = 1;
+  uint64 alias_generation = 2;
+  uint64 audit_position = 3;
+  uint64 audit_ingest_time_unix_seconds = 4;
+}
+
+message TenantRetentionPreviewRequest {
+  string tenant = 1;
+  uint64 proposed_retention_seconds = 2;
+}
+
+message TenantRetentionScopeImpact {
+  string signal = 1;
+  uint32 shard = 2;
+  string catalog_identity = 3;
+  uint64 catalog_generation = 4;
+  sint64 evaluated_at_unix_nanos = 5;
+  optional sint64 affected_start_unix_nanos = 6;
+  optional sint64 affected_end_unix_nanos = 7;
+  uint64 affected_bytes = 8;
+  uint64 immediately_reclaimable_bytes = 9;
+  uint64 deferred_active_segment_bytes = 10;
+  uint64 deferred_mixed_sealed_segment_bytes = 11;
+  RetentionReclamation earliest_reclamation = 12;
+  optional sint64 earliest_reclamation_unix_nanos = 13;
+}
+
+enum RetentionReclamation {
+  RETENTION_RECLAMATION_NONE = 0;
+  RETENTION_RECLAMATION_AT = 1;
+  RETENTION_RECLAMATION_BLOCKED_BY_DURABLE_LEASE = 2;
+  RETENTION_RECLAMATION_BLOCKED_BY_IN_PROCESS_SNAPSHOT = 3;
+}
+
+message TenantRetentionPreviewResponse {
+  string tenant = 1;
+  uint64 retention_generation = 2;
+  uint64 proposed_retention_seconds = 3;
+  string catalog_identity = 4;
+  uint64 catalog_generation = 5;
+  string confirmation_digest = 6;
+  repeated TenantRetentionScopeImpact scopes = 7;
+}
+
+message TenantRetentionUpdateRequest {
+  string tenant = 1;
+  uint64 proposed_retention_seconds = 2;
+  uint64 expected_generation = 3;
+  optional string confirmation_digest = 4;
+  string idempotency_key = 5;
+}
+
+message TenantRetentionUpdateResponse {
+  string tenant = 1;
+  uint64 retention_generation = 2;
+  uint64 audit_position = 3;
+  uint64 audit_ingest_time_unix_seconds = 4;
+}
+
+message TenantCreateRequest {
+  string tenant = 1;
+  string slug = 2;
+  string display_name = 3;
+  uint64 retention_seconds = 4;
+  uint32 weight = 5;
+  uint64 memory_bytes = 6;
+  uint64 queue_slots = 7;
+  uint64 task_slots = 8;
+  uint64 buffer_cache_bytes = 9;
+  uint64 batch_items = 10;
+  uint64 lease_slots = 11;
+  uint64 retry_slots = 12;
+  uint64 io_permits = 13;
+  uint64 cpu_work_units = 14;
+  uint64 file_descriptors = 15;
+  uint64 disk_headroom_bytes = 16;
+  string idempotency_key = 17;
+}
+
+message TenantCreateResponse {
+  string tenant = 1;
+  uint64 resource_generation = 2;
+  uint64 audit_position = 3;
+}
+
+message TenantInspectRequest {
+  string tenant = 1;
+}
+
+message TenantListRequest {}
+
+message TenantDescriptor {
+  string tenant = 1;
+  string slug = 2;
+  string display_name = 3;
+  uint64 retention_seconds = 4;
+  uint64 display_generation = 5;
+  uint64 retention_generation = 6;
+  TenantLifecycleTarget lifecycle = 7;
+}
+
+message TenantInspectResponse {
+  TenantDescriptor tenant = 1;
+}
+
+message TenantListResponse {
+  repeated TenantDescriptor tenants = 1;
+}
+
+message TenantDisplayNameUpdateRequest {
+  string tenant = 1;
+  uint64 expected_display_generation = 2;
+  string display_name = 3;
+  string idempotency_key = 4;
+}
+
+message TenantDisplayNameUpdateResponse {
+  string tenant = 1;
+  uint64 display_generation = 2;
+  uint64 audit_position = 3;
+}
+
 message TenantQuotaUpdateRequest {
   string tenant = 1;
   uint64 expected_generation = 2;

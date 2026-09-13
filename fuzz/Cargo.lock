@@ -1213,6 +1213,7 @@ name = "positron-policy"
 version = "0.0.0"
 dependencies = [
  "positron-domain",
+ "serde_json",
  "sha2",
 ]
 
@@ -1242,11 +1243,13 @@ dependencies = [
  "positron-governance",
  "positron-ingest",
  "positron-kernel",
+ "positron-policy",
  "positron-query",
  "positron-signals",
  "prost",
  "rustls",
  "serde_json",
+ "sha2",
  "tokio",
  "tokio-stream",
  "tonic",

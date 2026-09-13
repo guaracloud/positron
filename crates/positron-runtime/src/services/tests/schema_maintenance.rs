@@ -24,8 +24,16 @@ type InitializedCredentials = (Arc<crate::InitializedInstance>, String, String, 
 fn startup_rebuild_publishes_before_service_and_preserves_unrelated_objects()
 -> Result<(), Box<dyn Error>> {
     let fixture = Fixture::new()?;
-    let (initialized, _, _) = fixture.initialized()?;
+    let (initialized, ingest, _) = fixture.initialized()?;
     let unrelated = publish_unrelated(&initialized)?;
+    let services = ServiceHandle::new(Arc::clone(&initialized))?;
+    assert_eq!(
+        services
+            .ingest_otlp_logs(&ingest, request("rebuild").encode_to_vec())?
+            .accepted_records(),
+        1
+    );
+    drop(services);
     let services = ServiceHandle::new(Arc::clone(&initialized))?;
 
     let catalog = open_catalog(&initialized)?;
@@ -190,7 +198,13 @@ fn quiescent_publication_is_tenant_bound_and_same_content_is_idempotent()
     let audits = schema_audit_count(&initialized)?;
 
     schema_maintenance::publish_quiescent_checkpoint(&initialized, checkpoint)?;
-    assert_eq!(schema_audit_count(&initialized)?, audits);
+    assert_eq!(schema_audit_count(&initialized)?, audits + 1);
+    let checkpoint = services
+        .schema_sessions
+        .session(initialized.tenant, initialized.resource_governor())?
+        .checkpoint()?;
+    schema_maintenance::publish_quiescent_checkpoint(&initialized, checkpoint)?;
+    assert_eq!(schema_audit_count(&initialized)?, audits + 1);
 
     let other_fixture = Fixture::new()?;
     let (other, _, _) = other_fixture.initialized()?;
@@ -223,6 +237,11 @@ fn duplicate_tenant_checkpoints_block_serving() -> Result<(), Box<dyn Error>> {
     let fixture = Fixture::new()?;
     let (initialized, ingest, _) = fixture.initialized()?;
     let services = ServiceHandle::new(Arc::clone(&initialized))?;
+    let older = services
+        .schema_sessions
+        .session(initialized.tenant, initialized.resource_governor())?
+        .checkpoint()?
+        .into_catalog_bytes();
     assert_eq!(
         services
             .ingest_otlp_logs(&ingest, request("new-schema").encode_to_vec())?
@@ -234,7 +253,9 @@ fn duplicate_tenant_checkpoints_block_serving() -> Result<(), Box<dyn Error>> {
         .session(initialized.tenant, initialized.resource_governor())?
         .checkpoint()?
         .into_catalog_bytes();
-    publish_unrelated_bytes(&initialized, newer)?;
+    assert_ne!(older, newer);
+    publish_unrelated_bytes(&initialized, older)?;
+    publish_unrelated_bytes_with_transaction(&initialized, newer, [0x76; 16])?;
     drop(services);
 
     assert!(matches!(
@@ -277,6 +298,14 @@ fn publish_unrelated_bytes(
     initialized: &crate::InitializedInstance,
     bytes: Vec<u8>,
 ) -> Result<positron_kernel::CatalogObjectId, Box<dyn Error>> {
+    publish_unrelated_bytes_with_transaction(initialized, bytes, [0x75; 16])
+}
+
+fn publish_unrelated_bytes_with_transaction(
+    initialized: &crate::InitializedInstance,
+    bytes: Vec<u8>,
+    transaction: [u8; 16],
+) -> Result<positron_kernel::CatalogObjectId, Box<dyn Error>> {
     let catalog = open_catalog(initialized)?;
     let before = catalog.pin()?;
     let object = CatalogObject::new(bytes)?;
@@ -294,7 +323,7 @@ fn publish_unrelated_bytes(
     catalog.commit(
         before.identity(),
         CatalogProposal::new(
-            TransactionId::new([0x75; 16])?,
+            TransactionId::new(transaction)?,
             FormatEpoch::CATALOG_V1,
             objects,
         )?,
@@ -393,6 +422,15 @@ impl Fixture {
             query,
             administrator,
         ))
+    }
+
+    pub(super) fn reopen(&self) -> Result<Arc<crate::InitializedInstance>, Box<dyn Error>> {
+        let paths = BootstrapPaths::new(
+            &self.root.join("data"),
+            &self.root.join("secrets"),
+            MountQualification::LocalHost,
+        )?;
+        Ok(Arc::new(InstanceBootstrap::reopen(&paths)?))
     }
 }
 

@@ -2,7 +2,9 @@ use std::collections::BTreeSet;
 
 use positron_domain::routing::CommitPosition;
 
-use crate::catalog::{CatalogFailureCode, CatalogObject, CatalogProposal, TransactionId};
+use crate::catalog::{
+    CatalogFailureCode, CatalogObject, CatalogProposal, FormatEpoch, TransactionId,
+};
 use crate::data_protection::DataProtection;
 
 use super::super::format::SegmentState;
@@ -10,8 +12,8 @@ use super::super::recovery::RecoveryMode;
 use super::super::snapshot_lease_codec::decode;
 use super::super::snapshot_lease_record::{LeaseRecord, SnapshotLeaseId};
 use super::super::{
-    ActiveSegmentLedger, CommittedBlock, LedgerFailure, LedgerFailureCode, LedgerSnapshot,
-    SegmentScope, map_frame_failure,
+    ActiveSegmentLedger, CommittedBlock, FORMAT_EPOCH, LedgerFailure, LedgerFailureCode,
+    LedgerSnapshot, SegmentScope, map_frame_failure,
 };
 
 fn rollback_lease_reservation(
@@ -343,6 +345,28 @@ pub(crate) fn active_segments(
     Ok(segments)
 }
 
+/// Returns the latest durable lease expiry that still protects one segment.
+pub(crate) fn reclamation_lease_expiry(
+    snapshot: &crate::CatalogSnapshot,
+    scope: SegmentScope,
+    segment: super::super::SegmentId,
+    now: u64,
+) -> Result<Option<u64>, LedgerFailure> {
+    records(snapshot)?
+        .into_iter()
+        .try_fold(None, |latest, record| {
+            if record.scope != scope
+                || now >= record.expiry
+                || !record.blocks.iter().any(|block| block.segment == segment)
+            {
+                return Ok(latest);
+            }
+            Ok(Some(latest.map_or(record.expiry, |previous: u64| {
+                previous.max(record.expiry)
+            })))
+        })
+}
+
 pub(super) fn publish(
     catalog: &crate::Catalog<'_>,
     basis: &crate::CatalogSnapshot,
@@ -420,7 +444,7 @@ fn publish_many_with_expected_catalog_inner(
             transaction,
             basis
                 .format_epoch()
-                .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?,
+                .unwrap_or(FormatEpoch::new(FORMAT_EPOCH)?),
             objects,
         )?,
         None,

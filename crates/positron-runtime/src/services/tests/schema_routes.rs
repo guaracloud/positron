@@ -340,12 +340,12 @@ fn production_query_pool_admits_the_full_effective_cpu_budget() -> Result<(), Bo
     let refused = match services.query_events_for_test(
         context,
         source,
-        QueryBudget::new(1_000_000, 100, 100, 1_000_000, 1_000_000, 10)?.with_cpu_work_units(17)?,
+        QueryBudget::new(1_000_000, 100, 100, 1_000_000, 1_000_000, 10)?.with_cpu_work_units(33)?,
         None,
     )? {
         QueryTestOutcome::Failure(code) => code,
         QueryTestOutcome::Events(_) => {
-            return Err("17 CPU work units exceeded the production query pool".into());
+            return Err("33 CPU work units exceeded the production tenant query capacity".into());
         },
     };
     assert_eq!(refused, QueryFailureCode::ResourceAdmissionRefused);
@@ -493,12 +493,15 @@ fn checked_query_resume_revalidates_every_durable_tenant_lifecycle_state()
             query_allowed,
             "{state} query identity state"
         );
+        // Every resume request authenticates its bearer against the durable
+        // lifecycle state before presenting its cursor.
+        let resume_context = durable_query.unwrap_or(context);
 
         let before = initialized
             .resource_governor()
             .inspect()?
             .outstanding_for(positron_kernel::WorkClass::InteractiveQueryTail);
-        let resumed = services.resume_query_events_for_test(context, &cursor, 1)?;
+        let resumed = services.resume_query_events_for_test(resume_context, &cursor, 1)?;
         if query_allowed {
             match resumed {
                 QueryTestOutcome::Events(_) => {},
@@ -588,7 +591,12 @@ fn durable_lifecycle_transition_drains_admitted_ingest_and_revalidates_query_cur
         Err(ServiceFailure::Unauthorized),
         "the final Catalog-writer check drains pre-admitted ingest before ReadOnly publishes"
     );
-    let resumed = services.resume_query_events_for_test(query_context, &cursor, 1)?;
+    let read_only_query_context = initialized.attribute(
+        PresentedCredential::parse(&query_secret)?,
+        RequestedIntent::Query,
+        CompatibilityHints::none(),
+    )?;
+    let resumed = services.resume_query_events_for_test(read_only_query_context, &cursor, 1)?;
     assert!(
         matches!(resumed, QueryTestOutcome::Events(_)),
         "ReadOnly preserves bounded cursor resume: {resumed:?}"
@@ -868,7 +876,7 @@ fn timed_out_lifecycle_drain_reopens_admission_without_publishing() -> Result<()
     let fixture = Fixture::new()?;
     let (initialized, ingest, _, administrator_secret) = fixture.initialized_with_admin()?;
     let services = ServiceHandle::new(Arc::clone(&initialized))?;
-    let held = initialized.enter_ingest_finalization()?;
+    let held = initialized.enter_ingest_finalization_for(initialized.default_tenant_id())?;
     let actor = initialized.attribute(
         PresentedCredential::parse(&administrator_secret)?,
         RequestedIntent::SystemAdministration,

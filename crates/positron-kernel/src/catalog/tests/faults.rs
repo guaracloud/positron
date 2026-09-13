@@ -122,6 +122,85 @@ fn proposal(transaction: u8, value: u8) -> Result<CatalogProposal, CatalogFailur
     )
 }
 
+fn proposal_at_epoch(
+    transaction: u8,
+    value: u8,
+    epoch: u32,
+) -> Result<CatalogProposal, CatalogFailure> {
+    CatalogProposal::new(
+        TransactionId::new(id(transaction))?,
+        FormatEpoch::new(epoch)?,
+        vec![CatalogObject::new(vec![value])?],
+    )
+}
+
+#[test]
+fn current_reader_recovers_a_published_catalog_epoch_two_generation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = TemporaryRoot::new()?;
+    let instance = InstanceId::new(id(30))?;
+    let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
+    let authority = establish_catalog_authority(volume)?;
+    let catalog = Catalog::open(&authority, instance, secret())?;
+
+    let committed = catalog.commit(
+        catalog.pin()?.identity(),
+        proposal_at_epoch(31, 7, 2)?,
+        Some(AuditIntent::new(b"epoch two publication".to_vec())?),
+    )?;
+    assert_eq!(
+        committed.snapshot().format_epoch(),
+        Some(FormatEpoch::new(2)?)
+    );
+    drop(catalog);
+    drop(authority);
+
+    let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
+    let authority = establish_catalog_authority(volume)?;
+    let reopened = Catalog::open(&authority, instance, secret())?;
+    assert_eq!(reopened.pin()?.format_epoch(), Some(FormatEpoch::new(2)?));
+    assert_eq!(reopened.governance_audit_records()?.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn epoch_two_pre_marker_fault_leaves_the_epoch_one_predecessor_current()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = TemporaryRoot::new()?;
+    let instance = InstanceId::new(id(32))?;
+    let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
+    let authority = establish_catalog_authority(volume)?;
+    let catalog = Catalog::open(&authority, instance, secret())?;
+
+    catalog.commit(
+        catalog.pin()?.identity(),
+        proposal(33, 1)?,
+        Some(AuditIntent::new(b"epoch one predecessor".to_vec())?),
+    )?;
+    let failure = with_catalog_fault(CatalogFileEvent::WriteMarker, || {
+        catalog.commit(
+            catalog.pin()?.identity(),
+            proposal_at_epoch(34, 2, FormatEpoch::CATALOG_V2.value())?,
+            Some(AuditIntent::new(b"epoch two migration candidate".to_vec())?),
+        )
+    })
+    .expect_err("pre-marker epoch-two publication must not become visible");
+    assert_eq!(failure.code(), CatalogFailureCode::StorageUnavailable);
+    drop(catalog);
+    drop(authority);
+
+    let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
+    let authority = establish_catalog_authority(volume)?;
+    let reopened = Catalog::open(&authority, instance, secret())?;
+    assert_eq!(reopened.pin()?.number(), 1);
+    assert_eq!(
+        reopened.pin()?.format_epoch(),
+        Some(FormatEpoch::CATALOG_V1)
+    );
+    assert_eq!(reopened.governance_audit_records()?.len(), 1);
+    Ok(())
+}
+
 #[test]
 fn transaction_identity_file_and_directory_sync_faults_restart_and_retry_idempotently()
 -> Result<(), Box<dyn std::error::Error>> {

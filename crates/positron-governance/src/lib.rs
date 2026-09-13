@@ -19,18 +19,21 @@ mod listener_transport_administration;
 mod policy_administration;
 mod quota_administration;
 mod tenant_administration;
+mod tenant_alias_administration;
 mod tenant_lifecycle_administration;
+mod tenant_profile_administration;
 mod tenant_quota_record;
+mod tenant_retention_administration;
 
 pub use api_key_administration::{
     ApiKeyAdministration, ApiKeyAdministrationFailure, ApiKeyCreateRequest, ApiKeyCreation,
-    ApiKeyDescriptor,
+    ApiKeyDescriptor, ApiKeyRotationRequest,
 };
 pub use audit::{
     ApiKeyLifecycleAction, CatalogRootRotationAuditEntry, CatalogRootRotationStage,
     GovernanceAuditEntry, IngestPolicyActivationAuditEntry, InitialAuditMetadata,
     InitializationAuditEntry, ListenerTransportAuditEntry, SchemaCheckpointAuditEntry,
-    TenantQuotaUpdateAuditEntry, schema_checkpoint_audit_intent,
+    TenantDisplayNameUpdateAuditEntry, TenantQuotaUpdateAuditEntry, schema_checkpoint_audit_intent,
 };
 pub use format_migration_administration::{
     CatalogFormatMigration, CatalogFormatMigrationAdministration, CatalogFormatMigrationFailure,
@@ -54,14 +57,29 @@ pub use quota_administration::{
     TenantQuotaUpdateRequest,
 };
 pub use tenant_administration::{
-    TenantAdministration, TenantAdministrationFailure, TenantCreateRequest, TenantCreation,
+    TenantAdministration, TenantAdministrationFailure, TenantCreateConfiguration,
+    TenantCreateRequest, TenantCreation, TenantInspection,
+};
+pub use tenant_alias_administration::{
+    TenantAliasAdministration, TenantAliasAdministrationFailure, TenantAliasBindRequest,
+    TenantAliasBinding, TenantAliasGenerationConflict,
 };
 pub use tenant_lifecycle_administration::{
     TenantLifecycleAdministration, TenantLifecycleAdministrationFailure,
     TenantLifecycleGenerationConflict, TenantLifecycleTransition, TenantLifecycleTransitionRequest,
 };
+pub use tenant_profile_administration::{
+    TenantDisplayGenerationConflict, TenantDisplayNameUpdate, TenantDisplayNameUpdateRequest,
+    TenantProfileAdministration, TenantProfileAdministrationFailure,
+    TenantProfileAdministrationFailureCode,
+};
+pub use tenant_retention_administration::{
+    RetentionImpactConfirmation, TenantRetentionAdministration,
+    TenantRetentionAdministrationFailure, TenantRetentionGenerationConflict, TenantRetentionUpdate,
+    TenantRetentionUpdateRequest,
+};
 
-const GOVERNANCE_OBJECT_MAGIC: [u8; 8] = *b"POSGOV05";
+const GOVERNANCE_OBJECT_MAGIC: [u8; 8] = *b"POSGOV07";
 const GOVERNANCE_AUDIT_MAGIC: [u8; 8] = *b"POSAUD02";
 const DEFAULT_EXTERNAL_TENANT_ALIAS: &str = "trace-external";
 
@@ -336,8 +354,12 @@ impl InitialGovernanceIntent {
             object.extend_from_slice(&resource.to_be_bytes());
         }
         // Active lifecycle, system-administration scope, policy generation 1,
-        // and independent local-key recovery required.
+        // independent lifecycle generation, and independent display/retention
+        // generations are all durable default-tenant state.
         object.extend_from_slice(&[1, 4, 0, 1, 1]);
+        object.extend_from_slice(&1_u64.to_be_bytes());
+        object.extend_from_slice(&1_u64.to_be_bytes());
+        object.extend_from_slice(&1_u64.to_be_bytes());
         object.extend_from_slice(&1_u64.to_be_bytes());
         object.extend_from_slice(&3_u16.to_be_bytes());
         for (credential_principal, scope, salt, hash) in [

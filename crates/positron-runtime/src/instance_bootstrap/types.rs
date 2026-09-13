@@ -1,5 +1,6 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
+use std::num::NonZeroU64;
 use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -8,20 +9,115 @@ use positron_domain::identity::{ExternalTenantAlias, PrincipalId, Scope, TenantI
 use positron_domain::lifecycle::TenantLifecycleState;
 use positron_domain::routing::SignalKind;
 use positron_kernel::{
-    BootstrapKeyCustody, Catalog, CatalogFailureCode, InstanceBootstrapStorage, InstanceId,
-    MountQualification, OwnedPrimaryDataVolume, ResourceAmounts, RetentionTimeAuthority,
+    BootstrapKeyCustody, Catalog, CatalogFailureCode, CommittedLedgerReader,
+    InstanceBootstrapStorage, InstanceId, MountQualification, OwnedPrimaryDataVolume,
+    ResourceAmounts, RetentionImpactPreview, RetentionReclamationEstimate, RetentionTimeAuthority,
     StorageKernelResourceAuthority,
 };
+use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use positron_governance::{
     AdministrativeIdempotencyKey, ApiKeyAdministrationFailure, ApiKeyCreation, AuthorizedContext,
     CatalogFormatMigration, CatalogFormatMigrationAdministration, CatalogFormatMigrationFailure,
     ListenerTransportAdministration, ListenerTransportAdministrationFailure, ResourceGeneration,
-    TenantLifecycleAdministration, TenantLifecycleAdministrationFailure, TenantLifecycleTransition,
-    TenantLifecycleTransitionRequest,
+    RetentionImpactConfirmation, TenantAliasAdministration, TenantAliasAdministrationFailure,
+    TenantAliasBindRequest, TenantAliasBinding, TenantDisplayGenerationConflict,
+    TenantDisplayNameUpdate, TenantDisplayNameUpdateRequest, TenantLifecycleAdministration,
+    TenantLifecycleAdministrationFailure, TenantLifecycleTransition,
+    TenantLifecycleTransitionRequest, TenantProfileAdministration,
+    TenantProfileAdministrationFailure, TenantProfileAdministrationFailureCode,
+    TenantRetentionAdministration, TenantRetentionAdministrationFailure, TenantRetentionUpdate,
+    TenantRetentionUpdateRequest,
 };
 use positron_query::QueryCancellation;
+
+/// Read-only, generation-bound retention-reduction evidence for one tenant.
+pub struct TenantRetentionImpactPreview {
+    tenant: TenantId,
+    retention_generation: ResourceGeneration,
+    proposed_retention_seconds: NonZeroU64,
+    catalog_identity: positron_kernel::CatalogGenerationId,
+    catalog_generation: u64,
+    scopes: Vec<RetentionImpactPreview>,
+}
+
+impl TenantRetentionImpactPreview {
+    #[must_use]
+    pub const fn tenant(&self) -> TenantId {
+        self.tenant
+    }
+    #[must_use]
+    pub const fn retention_generation(&self) -> ResourceGeneration {
+        self.retention_generation
+    }
+    #[must_use]
+    pub const fn proposed_retention_seconds(&self) -> NonZeroU64 {
+        self.proposed_retention_seconds
+    }
+    #[must_use]
+    pub const fn catalog_identity(&self) -> positron_kernel::CatalogGenerationId {
+        self.catalog_identity
+    }
+    #[must_use]
+    pub const fn catalog_generation(&self) -> u64 {
+        self.catalog_generation
+    }
+    #[must_use]
+    pub fn scopes(&self) -> &[RetentionImpactPreview] {
+        &self.scopes
+    }
+    #[must_use]
+    pub fn confirmation_digest(&self) -> [u8; 32] {
+        let mut hash = Sha256::new();
+        hash.update(b"positron.tenant-retention-impact.v1");
+        hash.update(self.tenant.to_bytes());
+        hash.update(self.retention_generation.get().to_be_bytes());
+        hash.update(self.proposed_retention_seconds.get().to_be_bytes());
+        hash.update(self.catalog_identity.to_bytes());
+        hash.update(self.catalog_generation.to_be_bytes());
+        for scope in &self.scopes {
+            hash.update(scope.scope().tenant_id().to_bytes());
+            hash.update([match scope.scope().signal_kind() {
+                SignalKind::Logs => 1,
+                SignalKind::Traces => 2,
+            }]);
+            hash.update(scope.scope().shard_id().value().to_be_bytes());
+            hash.update(scope.catalog_identity().to_bytes());
+            hash.update(scope.catalog_generation().to_be_bytes());
+            hash.update(scope.evaluated_at().value().to_be_bytes());
+            hash.update(scope.approximate_affected_bytes().to_be_bytes());
+            hash.update(
+                scope
+                    .approximate_immediately_reclaimable_bytes()
+                    .to_be_bytes(),
+            );
+            hash.update(scope.deferred_active_segment_bytes().to_be_bytes());
+            hash.update(scope.deferred_mixed_sealed_segment_bytes().to_be_bytes());
+            match scope.affected_time_range() {
+                Some(range) => {
+                    hash.update([1]);
+                    hash.update(range.earliest().value().to_be_bytes());
+                    hash.update(range.latest().value().to_be_bytes());
+                },
+                None => hash.update([0]),
+            }
+            match scope.earliest_reclamation() {
+                RetentionReclamationEstimate::None => hash.update([0]),
+                RetentionReclamationEstimate::At(time) => {
+                    hash.update([1]);
+                    hash.update(time.value().to_be_bytes());
+                },
+                RetentionReclamationEstimate::BlockedByDurableLease(time) => {
+                    hash.update([2]);
+                    hash.update(time.value().to_be_bytes());
+                },
+                RetentionReclamationEstimate::BlockedByInProcessSnapshot => hash.update([3]),
+            }
+        }
+        hash.finalize().into()
+    }
+}
 
 /// Coordinates the bounded native-ingest finalization with lifecycle closure.
 ///
@@ -470,9 +566,7 @@ impl TenantDrainRegistry {
         Ok(permits)
     }
 
-    fn active_gates(
-        &self,
-    ) -> Result<Vec<(Arc<IngestDrainGate>, Arc<QueryDrainGate>)>, BootstrapFailure> {
+    fn active_gates(&self) -> Result<Vec<TenantDrainGates>, BootstrapFailure> {
         let entries = self
             .entries
             .lock()
@@ -538,6 +632,8 @@ impl TenantDrainRegistry {
             .install_transition_observer(observer)
     }
 }
+
+type TenantDrainGates = (Arc<IngestDrainGate>, Arc<QueryDrainGate>);
 
 impl TenantDrainEnrollment<'_> {
     fn activate(&mut self) {
@@ -609,6 +705,21 @@ pub enum BootstrapFailureCode {
     TenantQuotaUnauthorized,
     TenantQuotaStaleGeneration,
     TenantQuotaIdempotencyConflict,
+    TenantDisplayNameUnauthorized,
+    TenantDisplayNameStaleGeneration,
+    TenantDisplayNameIdempotencyConflict,
+    TenantAliasUnauthorized,
+    TenantAliasUnknownTenant,
+    TenantAliasAlreadyBound,
+    TenantAliasConflict,
+    TenantAliasStaleGeneration,
+    TenantAliasIdempotencyConflict,
+    TenantRetentionUnauthorized,
+    TenantRetentionUnknownTenant,
+    TenantRetentionInvalidConfirmation,
+    TenantRetentionStaleGeneration,
+    TenantRetentionIdempotencyConflict,
+    TenantCreateConflict,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -616,6 +727,8 @@ pub struct BootstrapFailure {
     code: BootstrapFailureCode,
     lifecycle_generation_conflict: Option<positron_governance::TenantLifecycleGenerationConflict>,
     quota_generation_conflict: Option<positron_governance::TenantQuotaGenerationConflict>,
+    display_generation_conflict: Option<TenantDisplayGenerationConflict>,
+    retention_generation_conflict: Option<positron_governance::TenantRetentionGenerationConflict>,
 }
 
 impl BootstrapFailure {
@@ -624,6 +737,8 @@ impl BootstrapFailure {
             code,
             lifecycle_generation_conflict: None,
             quota_generation_conflict: None,
+            display_generation_conflict: None,
+            retention_generation_conflict: None,
         }
     }
 
@@ -634,6 +749,8 @@ impl BootstrapFailure {
             code: BootstrapFailureCode::TenantLifecycleStaleGeneration,
             lifecycle_generation_conflict: Some(conflict),
             quota_generation_conflict: None,
+            display_generation_conflict: None,
+            retention_generation_conflict: None,
         }
     }
 
@@ -644,6 +761,30 @@ impl BootstrapFailure {
             code: BootstrapFailureCode::TenantQuotaStaleGeneration,
             lifecycle_generation_conflict: None,
             quota_generation_conflict: Some(conflict),
+            display_generation_conflict: None,
+            retention_generation_conflict: None,
+        }
+    }
+
+    const fn with_display_generation_conflict(conflict: TenantDisplayGenerationConflict) -> Self {
+        Self {
+            code: BootstrapFailureCode::TenantDisplayNameStaleGeneration,
+            lifecycle_generation_conflict: None,
+            quota_generation_conflict: None,
+            display_generation_conflict: Some(conflict),
+            retention_generation_conflict: None,
+        }
+    }
+
+    const fn with_retention_generation_conflict(
+        conflict: positron_governance::TenantRetentionGenerationConflict,
+    ) -> Self {
+        Self {
+            code: BootstrapFailureCode::TenantRetentionStaleGeneration,
+            lifecycle_generation_conflict: None,
+            quota_generation_conflict: None,
+            display_generation_conflict: None,
+            retention_generation_conflict: Some(conflict),
         }
     }
 
@@ -672,6 +813,18 @@ impl BootstrapFailure {
         &self,
     ) -> Option<positron_governance::TenantQuotaGenerationConflict> {
         self.quota_generation_conflict
+    }
+
+    #[must_use]
+    pub const fn display_generation_conflict(&self) -> Option<TenantDisplayGenerationConflict> {
+        self.display_generation_conflict
+    }
+
+    #[must_use]
+    pub const fn retention_generation_conflict(
+        &self,
+    ) -> Option<positron_governance::TenantRetentionGenerationConflict> {
+        self.retention_generation_conflict
     }
 }
 
@@ -828,10 +981,6 @@ impl std::fmt::Debug for InitializedInstance {
 }
 
 impl InitializedInstance {
-    pub(crate) fn enter_ingest_finalization(&self) -> Result<IngestDrainPermit, BootstrapFailure> {
-        self.enter_ingest_finalization_for(self.tenant)
-    }
-
     pub(crate) fn enter_ingest_finalization_for(
         &self,
         tenant: TenantId,
@@ -1009,12 +1158,14 @@ impl InitializedInstance {
             &catalog,
             &self.key,
             self.administrator,
-            actor,
-            tenant,
-            scope,
-            expires_at_unix_seconds,
-            expected,
-            idempotency,
+            positron_governance::ApiKeyCreateRequest::new(
+                actor,
+                scope,
+                expires_at_unix_seconds,
+                expected,
+                idempotency,
+            )
+            .for_tenant(tenant),
         )
         .map_err(map_api_key_failure)
     }
@@ -1060,27 +1211,50 @@ impl InitializedInstance {
         Ok(update)
     }
 
+    /// Durably updates one tenant's display label while retaining independent
+    /// retention, quota, policy, and lifecycle resources unchanged.
+    pub fn update_tenant_display_name(
+        &self,
+        actor: AuthorizedContext,
+        tenant: TenantId,
+        expected: ResourceGeneration,
+        display_name: &str,
+        idempotency: AdministrativeIdempotencyKey,
+    ) -> Result<TenantDisplayNameUpdate, BootstrapFailure> {
+        let secret = self
+            .key
+            .catalog_secret(self.instance)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
+        let catalog = Catalog::open(&self._authority, self.instance, secret)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        let identity = positron_governance::Identity::open(
+            &catalog
+                .pin()
+                .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?,
+        )
+        .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
+        TenantProfileAdministration::update_display_name(
+            &catalog,
+            &identity,
+            TenantDisplayNameUpdateRequest::new(actor, tenant, expected, display_name, idempotency),
+        )
+        .map_err(map_tenant_profile_failure)
+    }
+
     /// Atomically publishes a new tenant registry record, then enrolls that
     /// tenant in the live bounded admission authority.
     pub fn create_tenant(
         &self,
         actor: AuthorizedContext,
         tenant: TenantId,
-        slug: TenantSlug,
-        display_name: &str,
-        retention_seconds: u64,
-        weight: u32,
-        resources: [u64; 11],
+        configuration: positron_governance::TenantCreateConfiguration,
         idempotency: AdministrativeIdempotencyKey,
     ) -> Result<positron_governance::TenantCreation, BootstrapFailure> {
+        let resources = configuration.resources();
         let request = positron_governance::TenantCreateRequest::new(
             actor,
             tenant,
-            slug,
-            display_name,
-            retention_seconds,
-            weight,
-            resources,
+            configuration,
             idempotency,
         );
         let secret = self
@@ -1120,6 +1294,242 @@ impl InitializedInstance {
         enrollment.activate();
         drain_enrollment.activate();
         Ok(created)
+    }
+
+    /// Enumerates tenant state only for the authenticated system administrator.
+    pub fn list_tenants(
+        &self,
+        actor: AuthorizedContext,
+    ) -> Result<Vec<positron_governance::TenantInspection>, BootstrapFailure> {
+        self.authorize_tenant_inspection(actor)?;
+        let snapshot = self.current_catalog_snapshot()?;
+        positron_governance::TenantAdministration::list(&snapshot)
+            .map_err(map_tenant_administration_failure)
+    }
+
+    /// Returns one redacted tenant-administration view without exposing keys.
+    pub fn inspect_tenant(
+        &self,
+        actor: AuthorizedContext,
+        tenant: TenantId,
+    ) -> Result<positron_governance::TenantInspection, BootstrapFailure> {
+        self.authorize_tenant_inspection(actor)?;
+        let snapshot = self.current_catalog_snapshot()?;
+        positron_governance::TenantAdministration::inspect(&snapshot, tenant)
+            .map_err(map_tenant_administration_failure)
+    }
+
+    /// Reads bounded canonical segment evidence without publishing a retention change.
+    pub fn inspect_tenant_retention_impact(
+        &self,
+        actor: AuthorizedContext,
+        tenant: TenantId,
+        proposed_retention_seconds: NonZeroU64,
+    ) -> Result<TenantRetentionImpactPreview, BootstrapFailure> {
+        let secret = self
+            .key
+            .catalog_secret(self.instance)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
+        let catalog = Catalog::open(&self._authority, self.instance, secret)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        let snapshot = catalog
+            .pin()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        let inspection = positron_governance::TenantAdministration::inspect(&snapshot, tenant)
+            .map_err(map_tenant_administration_failure)?;
+        let identity = positron_governance::Identity::open(&snapshot)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
+        identity
+            .authorize_tenant_retention(actor, tenant)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ApiKeyUnauthorized))?;
+        let mut scopes = Vec::new();
+        for signal in [SignalKind::Logs, SignalKind::Traces] {
+            for scope in snapshot
+                .reachable_ledger_scopes(tenant, signal)
+                .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?
+            {
+                let protection = self
+                    .key
+                    .segment_key_from_tenant_envelope(
+                        self.instance,
+                        scope,
+                        identity.tenant_key_envelope(tenant).map_err(|_| {
+                            BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable)
+                        })?,
+                    )
+                    .map_err(|_| {
+                        BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable)
+                    })?;
+                let seconds = self
+                    .retention_time
+                    .governance_time_seconds(scope)
+                    .map_err(|_| {
+                        BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable)
+                    })?;
+                let nanos = seconds
+                    .checked_mul(1_000_000_000)
+                    .and_then(|value| i64::try_from(value).ok())
+                    .ok_or_else(|| {
+                        BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable)
+                    })?;
+                let reader =
+                    CommittedLedgerReader::open(&self._authority, &catalog, scope, protection)
+                        .map_err(|_| {
+                            BootstrapFailure::new(BootstrapFailureCode::LedgerUnavailable)
+                        })?;
+                scopes.push(
+                    reader
+                        .inspect_retention_impact_at(
+                            proposed_retention_seconds,
+                            positron_domain::time::UnixNanoseconds::new(nanos),
+                        )
+                        .map_err(|_| {
+                            BootstrapFailure::new(BootstrapFailureCode::LedgerUnavailable)
+                        })?,
+                );
+            }
+        }
+        Ok(TenantRetentionImpactPreview {
+            tenant,
+            retention_generation: ResourceGeneration::new(inspection.retention_generation().get())
+                .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?,
+            proposed_retention_seconds,
+            catalog_identity: snapshot.identity(),
+            catalog_generation: snapshot.number(),
+            scopes,
+        })
+    }
+
+    /// Publishes a retention successor. A reduction must carry a preview that
+    /// is recomputed here from the current committed ledgers before its opaque
+    /// confirmation binding can reach governance.
+    pub fn update_tenant_retention(
+        &self,
+        actor: AuthorizedContext,
+        tenant: TenantId,
+        proposed_retention_seconds: NonZeroU64,
+        expected: ResourceGeneration,
+        confirmation: Option<&TenantRetentionImpactPreview>,
+        idempotency: AdministrativeIdempotencyKey,
+    ) -> Result<TenantRetentionUpdate, BootstrapFailure> {
+        if confirmation.is_some_and(|candidate| {
+            candidate.tenant() != tenant
+                || candidate.retention_generation() != expected
+                || candidate.proposed_retention_seconds() != proposed_retention_seconds
+        }) {
+            return Err(BootstrapFailure::new(
+                BootstrapFailureCode::TenantRetentionInvalidConfirmation,
+            ));
+        }
+        self.update_tenant_retention_with_confirmation_digest(
+            actor,
+            tenant,
+            proposed_retention_seconds,
+            expected,
+            confirmation.map(TenantRetentionImpactPreview::confirmation_digest),
+            idempotency,
+        )
+    }
+
+    /// Publishes a retention successor using only an opaque confirmation that
+    /// was returned by a prior preview. Exact retries resolve before a current
+    /// preview is rebuilt; fresh reductions still bind the digest to current
+    /// canonical retention evidence below.
+    pub(crate) fn update_tenant_retention_with_confirmation_digest(
+        &self,
+        actor: AuthorizedContext,
+        tenant: TenantId,
+        proposed_retention_seconds: NonZeroU64,
+        expected: ResourceGeneration,
+        confirmation_digest: Option<[u8; 32]>,
+        idempotency: AdministrativeIdempotencyKey,
+    ) -> Result<TenantRetentionUpdate, BootstrapFailure> {
+        let requested_confirmation = confirmation_digest
+            .map(RetentionImpactConfirmation::from_runtime_digest)
+            .transpose()
+            .map_err(map_tenant_retention_failure)?;
+        let prepared_replay = {
+            let secret = self
+                .key
+                .catalog_secret(self.instance)
+                .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
+            let catalog = Catalog::open(&self._authority, self.instance, secret)
+                .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+            TenantRetentionAdministration::resume_prepared_existing(
+                &catalog,
+                self.instance.to_bytes(),
+                TenantRetentionUpdateRequest::new(
+                    actor,
+                    tenant,
+                    proposed_retention_seconds,
+                    expected,
+                    requested_confirmation,
+                    idempotency,
+                ),
+            )
+            .map_err(map_tenant_retention_failure)?
+        };
+        if let Some(replay) = prepared_replay {
+            return Ok(replay);
+        }
+        let (binding, preview_catalog) = if let Some(digest) = confirmation_digest {
+            let current =
+                self.inspect_tenant_retention_impact(actor, tenant, proposed_retention_seconds)?;
+            if digest != current.confirmation_digest() {
+                return Err(BootstrapFailure::new(
+                    BootstrapFailureCode::TenantRetentionInvalidConfirmation,
+                ));
+            }
+            (
+                Some(
+                    RetentionImpactConfirmation::from_runtime_digest(current.confirmation_digest())
+                        .map_err(map_tenant_retention_failure)?,
+                ),
+                Some((current.catalog_identity(), current.catalog_generation())),
+            )
+        } else {
+            (None, None)
+        };
+        let secret = self
+            .key
+            .catalog_secret(self.instance)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
+        let catalog = Catalog::open(&self._authority, self.instance, secret)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        let snapshot = catalog
+            .pin()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        if preview_catalog.is_some_and(|(identity, generation)| {
+            snapshot.identity() != identity || snapshot.number() != generation
+        }) {
+            return Err(BootstrapFailure::new(
+                BootstrapFailureCode::TenantRetentionInvalidConfirmation,
+            ));
+        }
+        let identity = positron_governance::Identity::open(&snapshot)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
+        TenantRetentionAdministration::update(
+            &catalog,
+            &identity,
+            TenantRetentionUpdateRequest::new(
+                actor,
+                tenant,
+                proposed_retention_seconds,
+                expected,
+                binding,
+                idempotency,
+            ),
+            || {
+                self.retention_time
+                    .governance_time_seconds(positron_kernel::SegmentScope::new(
+                        tenant,
+                        SignalKind::Logs,
+                        self.logs_shard,
+                    ))
+                    .map_err(|_| TenantRetentionAdministrationFailure::TimeUnavailable)
+            },
+        )
+        .map_err(map_tenant_retention_failure)
     }
 
     /// Publishes the concrete V1-to-V2 Catalog transformation while both
@@ -1212,6 +1622,49 @@ impl InitializedInstance {
         .map_err(map_tenant_lifecycle_failure)
     }
 
+    /// Binds one external compatibility assertion to a tenant. The alias is
+    /// never an authority selector: authentication still attributes requests
+    /// to the credential's immutable tenant before this value is consulted.
+    pub fn bind_tenant_alias(
+        &self,
+        actor: AuthorizedContext,
+        tenant: TenantId,
+        alias: ExternalTenantAlias,
+        expected: ResourceGeneration,
+        idempotency: AdministrativeIdempotencyKey,
+    ) -> Result<TenantAliasBinding, BootstrapFailure> {
+        let request = TenantAliasBindRequest::new(actor, tenant, alias, expected, idempotency);
+        let secret = self
+            .key
+            .catalog_secret(self.instance)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
+        let preflight = Catalog::read_current_view(&self._authority, self.instance, secret)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        if let Some(replay) = TenantAliasAdministration::replay_from_view(
+            &preflight,
+            self.administrator,
+            request.clone(),
+        )
+        .map_err(map_tenant_alias_failure)?
+        {
+            return Ok(replay);
+        }
+        let secret = self
+            .key
+            .catalog_secret(self.instance)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
+        let catalog = Catalog::open(&self._authority, self.instance, secret)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        let audit_scope =
+            positron_kernel::SegmentScope::new(self.tenant, SignalKind::Logs, self.logs_shard);
+        TenantAliasAdministration::bind(&catalog, self.administrator, request, || {
+            self.retention_time
+                .governance_time_seconds(audit_scope)
+                .map_err(|_| TenantAliasAdministrationFailure::TimeUnavailable)
+        })
+        .map_err(map_tenant_alias_failure)
+    }
+
     /// Returns decoded audit evidence through the same authenticated Catalog
     /// reader used by lifecycle integration tests.
     #[cfg(any(test, feature = "test-support"))]
@@ -1292,10 +1745,12 @@ impl InitializedInstance {
             &catalog,
             &self.key,
             self.administrator,
-            actor,
-            predecessor,
-            expected,
-            idempotency,
+            positron_governance::ApiKeyRotationRequest::new(
+                actor,
+                predecessor,
+                expected,
+                idempotency,
+            ),
         )
         .map_err(map_api_key_failure)
     }
@@ -1319,11 +1774,13 @@ impl InitializedInstance {
             &catalog,
             &self.key,
             self.administrator,
-            actor,
-            tenant,
-            predecessor,
-            expected,
-            idempotency,
+            positron_governance::ApiKeyRotationRequest::new(
+                actor,
+                predecessor,
+                expected,
+                idempotency,
+            )
+            .for_tenant(tenant),
         )
         .map_err(map_api_key_failure)
     }
@@ -1433,6 +1890,30 @@ impl InitializedInstance {
         self.governance_audit_frontier
     }
 
+    fn current_catalog_snapshot(
+        &self,
+    ) -> Result<positron_kernel::CatalogSnapshot, BootstrapFailure> {
+        let secret = self
+            .key
+            .catalog_secret(self.instance)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
+        Catalog::read_current_snapshot(&self._authority, self.instance, secret)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))
+    }
+
+    fn authorize_tenant_inspection(
+        &self,
+        actor: AuthorizedContext,
+    ) -> Result<(), BootstrapFailure> {
+        let snapshot = self.current_catalog_snapshot()?;
+        let identity = positron_governance::Identity::open(&snapshot)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
+        identity
+            .inspect(actor, &[])
+            .map(|_| ())
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ApiKeyUnauthorized))
+    }
+
     #[must_use]
     pub const fn claim_available(&self) -> bool {
         self.claim_available
@@ -1486,6 +1967,65 @@ fn map_tenant_lifecycle_failure(failure: TenantLifecycleAdministrationFailure) -
     BootstrapFailure::new(code)
 }
 
+fn map_tenant_alias_failure(failure: TenantAliasAdministrationFailure) -> BootstrapFailure {
+    let code = match failure {
+        TenantAliasAdministrationFailure::Unauthorized => {
+            BootstrapFailureCode::TenantAliasUnauthorized
+        },
+        TenantAliasAdministrationFailure::UnknownTenant => {
+            BootstrapFailureCode::TenantAliasUnknownTenant
+        },
+        TenantAliasAdministrationFailure::AliasAlreadyBound => {
+            BootstrapFailureCode::TenantAliasAlreadyBound
+        },
+        TenantAliasAdministrationFailure::AliasConflict => {
+            BootstrapFailureCode::TenantAliasConflict
+        },
+        TenantAliasAdministrationFailure::StaleGeneration(_) => {
+            BootstrapFailureCode::TenantAliasStaleGeneration
+        },
+        TenantAliasAdministrationFailure::IdempotencyConflict => {
+            BootstrapFailureCode::TenantAliasIdempotencyConflict
+        },
+        TenantAliasAdministrationFailure::CapacityExceeded
+        | TenantAliasAdministrationFailure::TimeUnavailable
+        | TenantAliasAdministrationFailure::PersistenceUnavailable => {
+            BootstrapFailureCode::CatalogUnavailable
+        },
+    };
+    BootstrapFailure::new(code)
+}
+
+fn map_tenant_retention_failure(failure: TenantRetentionAdministrationFailure) -> BootstrapFailure {
+    if let TenantRetentionAdministrationFailure::StaleGeneration(conflict) = failure {
+        return BootstrapFailure::with_retention_generation_conflict(conflict);
+    }
+    let code = match failure {
+        TenantRetentionAdministrationFailure::Unauthorized => {
+            BootstrapFailureCode::TenantRetentionUnauthorized
+        },
+        TenantRetentionAdministrationFailure::UnknownTenant => {
+            BootstrapFailureCode::TenantRetentionUnknownTenant
+        },
+        TenantRetentionAdministrationFailure::InvalidConfirmation => {
+            BootstrapFailureCode::TenantRetentionInvalidConfirmation
+        },
+        TenantRetentionAdministrationFailure::IdempotencyConflict => {
+            BootstrapFailureCode::TenantRetentionIdempotencyConflict
+        },
+        TenantRetentionAdministrationFailure::InvalidInput
+        | TenantRetentionAdministrationFailure::CapacityExceeded
+        | TenantRetentionAdministrationFailure::TimeUnavailable
+        | TenantRetentionAdministrationFailure::PersistenceUnavailable => {
+            BootstrapFailureCode::CatalogUnavailable
+        },
+        TenantRetentionAdministrationFailure::StaleGeneration(_) => {
+            BootstrapFailureCode::CatalogUnavailable
+        },
+    };
+    BootstrapFailure::new(code)
+}
+
 fn map_tenant_quota_failure(
     failure: positron_governance::TenantQuotaAdministrationFailure,
 ) -> BootstrapFailure {
@@ -1511,6 +2051,29 @@ fn map_tenant_quota_failure(
     BootstrapFailure::new(code)
 }
 
+fn map_tenant_profile_failure(failure: TenantProfileAdministrationFailure) -> BootstrapFailure {
+    if let Some(conflict) = failure.generation_conflict() {
+        return BootstrapFailure::with_display_generation_conflict(conflict);
+    }
+    let code = match failure.code() {
+        TenantProfileAdministrationFailureCode::Unauthorized => {
+            BootstrapFailureCode::TenantDisplayNameUnauthorized
+        },
+        TenantProfileAdministrationFailureCode::IdempotencyConflict => {
+            BootstrapFailureCode::TenantDisplayNameIdempotencyConflict
+        },
+        TenantProfileAdministrationFailureCode::InvalidInput
+        | TenantProfileAdministrationFailureCode::UnknownTenant
+        | TenantProfileAdministrationFailureCode::PersistenceUnavailable => {
+            BootstrapFailureCode::CatalogUnavailable
+        },
+        TenantProfileAdministrationFailureCode::StaleDisplayGeneration => {
+            BootstrapFailureCode::TenantDisplayNameStaleGeneration
+        },
+    };
+    BootstrapFailure::new(code)
+}
+
 fn map_tenant_administration_failure(
     failure: positron_governance::TenantAdministrationFailure,
 ) -> BootstrapFailure {
@@ -1524,8 +2087,10 @@ fn map_tenant_administration_failure(
         positron_governance::TenantAdministrationFailure::IdempotencyConflict => {
             BootstrapFailureCode::ApiKeyIdempotencyConflict
         },
+        positron_governance::TenantAdministrationFailure::DuplicateTenant => {
+            BootstrapFailureCode::TenantCreateConflict
+        },
         positron_governance::TenantAdministrationFailure::InvalidInput
-        | positron_governance::TenantAdministrationFailure::DuplicateTenant
         | positron_governance::TenantAdministrationFailure::PersistenceUnavailable => {
             BootstrapFailureCode::CatalogUnavailable
         },

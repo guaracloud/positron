@@ -40,12 +40,10 @@ fn run_checked(data: &[u8]) -> Result<(), String> {
     let first_scope = SegmentScope::new(instance.tenant, SignalKind::Logs, instance.logs_shard);
     let second_scope = SegmentScope::new(instance.tenant, SignalKind::Logs, second_shard);
     let first_key = instance
-        .key
-        .segment_key(instance.instance, first_scope)
+        .tenant_segment_key_for_test(first_scope)
         .map_err(describe)?;
     let second_key = instance
-        .key
-        .segment_key(instance.instance, second_scope)
+        .tenant_segment_key_for_test(second_scope)
         .map_err(describe)?;
     let first_ledger = ActiveSegmentLedger::open_with_retention_time(
         &instance._authority,

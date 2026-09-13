@@ -62,9 +62,16 @@ fn resource_sizing(max_registered_tenants: u16) -> Result<ResourceSizing, Bootst
     let repair = at_least(large, dual_scope_recovery);
     let fencing = small;
     let shutdown = small;
-    let recovery_capacity = recovery_reserve(
-        durability, retention, compaction, purge, repair, fencing, shutdown, large,
-    )?;
+    let recovery_capacity = recovery_reserve(RecoveryReserveTerms {
+        durability,
+        retention,
+        compaction,
+        purge,
+        repair,
+        fencing,
+        shutdown,
+        baseline_slack: large,
+    })?;
     let per_tenant_ordinary_capacity = ResourceAmounts::new(DEFAULT_TENANT_QUOTA);
     let ordinary_capacity = multiply(per_tenant_ordinary_capacity, max_registered_tenants)?;
     let governed = add(recovery_capacity, ordinary_capacity)?;
@@ -168,7 +175,7 @@ fn at_least(left: ResourceAmounts, right: ResourceAmounts) -> ResourceAmounts {
     ])
 }
 
-fn recovery_reserve(
+struct RecoveryReserveTerms {
     durability: ResourceAmounts,
     retention: ResourceAmounts,
     compaction: ResourceAmounts,
@@ -177,7 +184,19 @@ fn recovery_reserve(
     fencing: ResourceAmounts,
     shutdown: ResourceAmounts,
     baseline_slack: ResourceAmounts,
-) -> Result<ResourceAmounts, BootstrapFailure> {
+}
+
+fn recovery_reserve(terms: RecoveryReserveTerms) -> Result<ResourceAmounts, BootstrapFailure> {
+    let RecoveryReserveTerms {
+        durability,
+        retention,
+        compaction,
+        purge,
+        repair,
+        fencing,
+        shutdown,
+        baseline_slack,
+    } = terms;
     let protected = add(
         add(add(durability, retention)?, add(compaction, purge)?)?,
         add(add(repair, fencing)?, shutdown)?,

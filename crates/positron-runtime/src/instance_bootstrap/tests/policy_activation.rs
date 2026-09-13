@@ -38,11 +38,13 @@ fn system_administrator_creates_a_second_tenant_with_live_admission_authority()
     let created = initialized.create_tenant(
         system,
         tenant,
-        TenantSlug::parse_canonical("second-tenant")?,
-        "Second tenant",
-        2_592_000,
-        1,
-        [1; 11],
+        positron_governance::TenantCreateConfiguration::new(
+            TenantSlug::parse_canonical("second-tenant")?,
+            "Second tenant",
+            2_592_000,
+            1,
+            [1; 11],
+        ),
         AdministrativeIdempotencyKey::new([0x92; 16])?,
     )?;
     assert_eq!(created.tenant_id(), tenant);
@@ -50,11 +52,13 @@ fn system_administrator_creates_a_second_tenant_with_live_admission_authority()
     let replay = initialized.create_tenant(
         system,
         tenant,
-        TenantSlug::parse_canonical("second-tenant")?,
-        "Second tenant",
-        2_592_000,
-        1,
-        [1; 11],
+        positron_governance::TenantCreateConfiguration::new(
+            TenantSlug::parse_canonical("second-tenant")?,
+            "Second tenant",
+            2_592_000,
+            1,
+            [1; 11],
+        ),
         AdministrativeIdempotencyKey::new([0x92; 16])?,
     )?;
     assert_eq!(
@@ -70,7 +74,10 @@ fn system_administrator_creates_a_second_tenant_with_live_admission_authority()
     let mut record = None;
     for identity in snapshot.object_identities() {
         let bytes = snapshot.object(identity)?.ok_or("catalog object")?;
-        if bytes.starts_with(b"POSTNR02") {
+        // Tenant creation is the canonical writer for the profile-bearing
+        // secondary record. POSTNR02 remains a legacy lifecycle successor;
+        // newly created tenants are emitted as POSTNR03.
+        if bytes.starts_with(b"POSTNR03") {
             record = Some(bytes.to_vec());
             break;
         }
@@ -116,11 +123,13 @@ fn system_administrator_creates_a_second_tenant_with_live_admission_authority()
     let replay_after_reopen = reopened.create_tenant(
         system,
         tenant,
-        TenantSlug::parse_canonical("second-tenant")?,
-        "Second tenant",
-        2_592_000,
-        1,
-        [1; 11],
+        positron_governance::TenantCreateConfiguration::new(
+            TenantSlug::parse_canonical("second-tenant")?,
+            "Second tenant",
+            2_592_000,
+            1,
+            [1; 11],
+        ),
         AdministrativeIdempotencyKey::new([0x92; 16])?,
     )?;
     assert_eq!(replay_after_reopen, created);
@@ -136,11 +145,13 @@ fn system_administrator_creates_a_second_tenant_with_live_admission_authority()
     let replay_after_unrelated_mutation = reopened.create_tenant(
         system,
         tenant,
-        TenantSlug::parse_canonical("second-tenant")?,
-        "Second tenant",
-        2_592_000,
-        1,
-        [1; 11],
+        positron_governance::TenantCreateConfiguration::new(
+            TenantSlug::parse_canonical("second-tenant")?,
+            "Second tenant",
+            2_592_000,
+            1,
+            [1; 11],
+        ),
         AdministrativeIdempotencyKey::new([0x92; 16])?,
     )?;
     assert_eq!(replay_after_unrelated_mutation, created);
@@ -148,11 +159,13 @@ fn system_administrator_creates_a_second_tenant_with_live_admission_authority()
         .create_tenant(
             system,
             tenant,
-            TenantSlug::parse_canonical("second-tenant")?,
-            "Changed tenant name",
-            2_592_000,
-            1,
-            [1; 11],
+            positron_governance::TenantCreateConfiguration::new(
+                TenantSlug::parse_canonical("second-tenant")?,
+                "Changed tenant name",
+                2_592_000,
+                1,
+                [1; 11],
+            ),
             AdministrativeIdempotencyKey::new([0x92; 16])?,
         )
         .expect_err("changed retry must not replace the committed tenant");
@@ -606,6 +619,75 @@ fn failed_quota_catalog_publication_preserves_the_durable_and_live_limit()
             ResourceAmounts::only(ResourceDimension::MemoryBytes, 2)?,
         )?)?;
     drop(reservation);
+    Ok(())
+}
+
+#[test]
+fn failed_policy_catalog_publication_preserves_the_durable_and_live_policy()
+-> Result<(), Box<dyn std::error::Error>> {
+    let roots = Roots::new()?;
+    let paths = roots.paths();
+    drop(InstanceBootstrap::initialize(
+        &paths,
+        InitializationPlan::non_interactive(),
+    )?);
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let initialized = InstanceBootstrap::reopen(&paths)?;
+    let administrator = initialized.attribute(
+        PresentedCredential::parse(claim.secret())?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let catalog = Catalog::open(
+        &initialized._authority,
+        initialized.instance,
+        initialized.key.catalog_secret(initialized.instance)?,
+    )?;
+    let administration = IngestPolicyAdministration::open(&catalog, initialized.tenant)?;
+    let candidate = IngestPolicy::compile(
+        2,
+        vec![PolicyRule::new(
+            "reject-after-failed-publication",
+            Vec::new(),
+            PolicyAction::Reject,
+        )?],
+    )?;
+    let failure =
+        with_catalog_publication_fault_after(CatalogPublicationFault::SynchronizeCommit, 0, || {
+            administration.activate(
+                &catalog,
+                &initialized.identity,
+                administrator,
+                ResourceGeneration::new(1).expect("known valid generation"),
+                AdministrativeIdempotencyKey::new([0xa6; 16]).expect("known valid key"),
+                candidate.clone(),
+            )
+        })
+        .expect_err("a failed audited catalog commit must reject policy activation");
+    assert_eq!(
+        failure.code(),
+        PolicyAdministrationFailureCode::PersistenceUnavailable
+    );
+    assert_eq!(
+        administration.serving().pin()?.generation(),
+        1,
+        "a failed commit must not advance the in-memory serving snapshot"
+    );
+    let reopened_administration = IngestPolicyAdministration::open(&catalog, initialized.tenant)?;
+    assert_eq!(
+        reopened_administration.serving().pin()?.generation(),
+        1,
+        "a failed commit must not publish a durable policy generation"
+    );
+    assert!(
+        catalog
+            .governance_audit_records()?
+            .iter()
+            .all(|record| GovernanceAuditEntry::decode(record)
+                .map(|entry| entry.action() != "ingest-policy.activate")
+                .unwrap_or(false)),
+        "a rejected commit must not emit a successful policy activation audit entry"
+    );
     Ok(())
 }
 
