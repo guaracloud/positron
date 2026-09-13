@@ -1348,6 +1348,8 @@ impl InitializedInstance {
         idempotency: AdministrativeIdempotencyKey,
     ) -> Result<positron_governance::TenantCreation, BootstrapFailure> {
         let resources = configuration.resources();
+        let weight = u16::try_from(configuration.weight())
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
         let request = positron_governance::TenantCreateRequest::new(
             actor,
             tenant,
@@ -1369,17 +1371,20 @@ impl InitializedInstance {
         {
             return Ok(replay);
         }
-        let mut drain_enrollment = self.tenant_drains.prepare_tenant(tenant)?;
-        let mut enrollment = self
-            ._authority
-            .prepare_tenant_enrollment(tenant, ResourceAmounts::new(resources))
-            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
         let secret = self
             .key
             .catalog_secret(self.instance)
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
         let catalog = Catalog::open(&self._authority, self.instance, secret)
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        // The Catalog Writer serializes all governance changes that can alter
+        // tenant topology. Prepare live enrollment only after acquiring it, so
+        // a quota successor cannot be derived from stale membership.
+        let mut drain_enrollment = self.tenant_drains.prepare_tenant(tenant)?;
+        let mut enrollment = self
+            ._authority
+            .prepare_tenant_enrollment(tenant, weight, ResourceAmounts::new(resources))
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
         let created = positron_governance::TenantAdministration::create(
             &catalog,
             &self.key,

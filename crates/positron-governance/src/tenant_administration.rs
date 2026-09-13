@@ -145,6 +145,11 @@ impl TenantCreateConfiguration {
     pub const fn resources(&self) -> [u64; 11] {
         self.resources
     }
+
+    #[must_use]
+    pub const fn weight(&self) -> u32 {
+        self.weight
+    }
 }
 
 impl TenantCreateRequest {
