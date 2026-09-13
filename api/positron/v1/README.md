@@ -6,7 +6,7 @@ Schema Digest, reference documentation, and validation fixtures are part of
 the same product surface and must change together.
 
 `positron-api/build.rs` generates Protobuf messages, fixed enums, and the Rust
-`ApiKeyServiceClient`, `TenantQuotaServiceClient`, `TenantLifecycleServiceClient`, `TenantRetentionServiceClient`,
+`ApiKeyServiceClient`, `TenantQuotaServiceClient`, `TenantServiceClient`, `TenantAliasServiceClient`, `TenantLifecycleServiceClient`, `TenantRetentionServiceClient`,
 `PolicyPreviewServiceClient`, `PolicyTestServiceClient`, `PolicyDiffServiceClient`,
 `PolicyExplainServiceClient`, and `PolicyActivateServiceClient` directly from this schema using locked `prost-build 0.14.3` and
 `protoc-bin-vendored 3.2.0`. Ordinary Cargo builds regenerate the output in
@@ -66,13 +66,17 @@ System Administration requests: `POST /v1/tenants:create`,
 bounded body is decoded. Create receives an immutable tenant ID, canonical slug,
 display name, retention period, positive resource limits, and idempotency key;
 inspect and list return only redacted tenant descriptors; the display-name update
-uses a nonzero display generation and idempotency key. These routes do not have a
-generated `TenantServiceClient` or native CLI wrapper.
+uses a nonzero display generation and idempotency key. The schema-derived
+`TenantServiceClient` and `positron tenant create|inspect|list|update-display-name`
+CLI use protected-stdin credentials and TLS by default; plaintext requires the
+explicit `--allow-plaintext` opt-out.
 
 `TenantAliasService.Bind` is served at `POST /v1/tenant-aliases:bind` for a
 System Administration bearer. It records an immutable compatibility assertion
-for an explicit tenant and returns only a redacted receipt. There is no generated
-alias client or native CLI wrapper.
+for an explicit tenant and returns only a redacted receipt. The schema-derived
+`TenantAliasServiceClient` and `positron tenant alias bind` CLI use
+protected-stdin credentials and TLS by default; plaintext requires the explicit
+`--allow-plaintext` opt-out.
 
 The native CLI invokes this API using `positron key create|list|rotate|revoke|scope-inspect`.
 TLS is the default: pass `--endpoint ADDRESS:PORT --server-name DNS_OR_IP --trust-file CA_PEM

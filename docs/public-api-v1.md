@@ -143,8 +143,11 @@ returns only the current display generation and a bounded redacted semantic
 difference. Stable failures are `invalid_request` (400),
 `authentication_rejected` (401), `tenant_unavailable` (404) for inspection,
 `tenant_conflict`, `stale_display_generation`, or `idempotency_conflict` (409),
-and `administration_unavailable` (503). There is currently no generated
-TenantService client or native CLI wrapper for these routes.
+and `administration_unavailable` (503). The schema-derived `TenantServiceClient`
+and `positron tenant create|inspect|list|update-display-name` CLI require
+`--endpoint` and `--credential-stdin`; TLS also requires `--server-name` and
+`--trust-file`, while plaintext requires the explicit `--allow-plaintext`
+opt-out.
 
 ## Immutable tenant aliases
 
@@ -161,7 +164,10 @@ generation, and an idempotency key. The first bind publishes successor generatio
 be rebound, unbound, or reused by another tenant, including after the original
 tenant is purged. The receipt contains target tenant, alias generation, audit
 position, and audit time only. It never returns the alias, request digest, or
-credentials. Stable failures are `invalid_request` (400),
+credentials. The schema-derived `TenantAliasServiceClient` and `positron tenant
+alias bind` CLI require `--endpoint` and `--credential-stdin`; TLS also requires
+`--server-name` and `--trust-file`, while plaintext requires the explicit
+`--allow-plaintext` opt-out. Stable failures are `invalid_request` (400),
 `authentication_rejected` (401), `tenant_unavailable` (404),
 `stale_generation`, `idempotency_conflict`, `alias_already_bound`, or
 `alias_conflict` (409), and `administration_unavailable` (503).
