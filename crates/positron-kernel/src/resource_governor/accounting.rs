@@ -122,6 +122,59 @@ pub(super) struct AccountingState {
     pub(super) class_counts: [u32; 5],
 }
 
+/// A fully derived quota successor that has no further allocation or fairness
+/// work after its matching Catalog generation is durable.
+pub(super) struct StagedTenantQuotaUpdate<'authority> {
+    governor: &'authority GovernorInner,
+    successor: TenantQuotaSuccessor,
+}
+
+struct TenantQuotaSuccessor {
+    tenant_quotas: Vec<TenantQuota>,
+    tenant_fair_capacities: Vec<PoolCapacities>,
+    recovery_tenant_shared_fair: Vec<ResourceAmounts>,
+    recovery_tenant_pool_fair: Vec<RecoveryPoolCapacities>,
+    recovery_system_pool_capacities: RecoveryPoolCapacities,
+    tenant_limits: Box<[ResourceAmounts]>,
+}
+
+type TenantFairness = (
+    Vec<PoolCapacities>,
+    Vec<ResourceAmounts>,
+    Vec<RecoveryPoolCapacities>,
+);
+
+impl StagedTenantQuotaUpdate<'_> {
+    pub(super) fn publish(self) {
+        let Self {
+            governor,
+            successor,
+        } = self;
+        let mut state = match governor.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                let mut state = poisoned.into_inner();
+                state.lifecycle = GovernorLifecycle::Fenced;
+                state
+            },
+        };
+        governor.drain_pending(&mut state);
+        if governor
+            .drop_ledger
+            .pending_fence
+            .swap(false, Ordering::AcqRel)
+        {
+            state.lifecycle = GovernorLifecycle::Fenced;
+        }
+        state.tenant_quotas = successor.tenant_quotas;
+        state.tenant_fair_capacities = successor.tenant_fair_capacities;
+        state.recovery_tenant_shared_fair = successor.recovery_tenant_shared_fair;
+        state.recovery_tenant_pool_fair = successor.recovery_tenant_pool_fair;
+        state.recovery_system_pool_capacities = successor.recovery_system_pool_capacities;
+        state.tenant_limits = successor.tenant_limits;
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct ChargeOwner {
     pub(super) attribution: ChargeAttribution,
@@ -171,8 +224,19 @@ impl GovernorInner {
         weight: u16,
         limits: ResourceAmounts,
     ) -> Result<(), GovernorFailure> {
+        self.stage_tenant_quota_update(tenant, weight, limits)?
+            .publish();
+        Ok(())
+    }
+
+    pub(super) fn stage_tenant_quota_update(
+        &self,
+        tenant: TenantId,
+        weight: u16,
+        limits: ResourceAmounts,
+    ) -> Result<StagedTenantQuotaUpdate<'_>, GovernorFailure> {
         self.validate_tenant_quota(weight, limits)?;
-        let mut state = self.try_lock_for_control()?;
+        let state = self.try_lock_for_control()?;
         let tenant_index = state
             .tenant_quotas
             .iter()
@@ -185,16 +249,21 @@ impl GovernorInner {
             .ok_or(GovernorFailure::InternalFenced)? = quota;
         let (ordinary, shared, pools) = self.derive_tenant_fairness(&successor)?;
         let recovery_system = system_recovery_capacities(self.recovery_pool_capacities, &pools)?;
-        state.tenant_quotas = successor;
-        state.tenant_fair_capacities = ordinary;
-        state.recovery_tenant_shared_fair = shared;
-        state.recovery_tenant_pool_fair = pools;
-        state.recovery_system_pool_capacities = recovery_system;
-        *state
-            .tenant_limits
+        let mut tenant_limits = state.tenant_limits.clone();
+        *tenant_limits
             .get_mut(tenant_index)
             .ok_or(GovernorFailure::InternalFenced)? = limits;
-        Ok(())
+        Ok(StagedTenantQuotaUpdate {
+            governor: self,
+            successor: TenantQuotaSuccessor {
+                tenant_quotas: successor,
+                tenant_fair_capacities: ordinary,
+                recovery_tenant_shared_fair: shared,
+                recovery_tenant_pool_fair: pools,
+                recovery_system_pool_capacities: recovery_system,
+                tenant_limits,
+            },
+        })
     }
 
     pub(super) fn validate_tenant_quota(
@@ -221,9 +290,10 @@ impl GovernorInner {
     pub(super) fn prepare_tenant_quota(
         &self,
         tenant: TenantId,
+        weight: u16,
         limits: ResourceAmounts,
     ) -> Result<(), GovernorFailure> {
-        self.enroll_tenant_quota(tenant, 1, limits, true)
+        self.enroll_tenant_quota(tenant, weight, limits, true)
     }
 
     fn enroll_tenant_quota(
@@ -283,14 +353,7 @@ impl GovernorInner {
     fn derive_tenant_fairness(
         &self,
         quotas: &[TenantQuota],
-    ) -> Result<
-        (
-            Vec<PoolCapacities>,
-            Vec<ResourceAmounts>,
-            Vec<RecoveryPoolCapacities>,
-        ),
-        GovernorFailure,
-    > {
+    ) -> Result<TenantFairness, GovernorFailure> {
         let total_weight = total_weight(quotas)?;
         let reserve = || GovernorFailure::GovernorBootstrapInventoryUnavailable {
             required: self.bootstrap_overhead,

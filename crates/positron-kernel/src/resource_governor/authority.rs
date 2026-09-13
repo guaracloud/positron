@@ -195,6 +195,21 @@ impl StorageKernelResourceAuthority {
         self.inner.update_tenant_quota(tenant, weight, limits)
     }
 
+    /// Derives a quota successor under the control lock before its matching
+    /// Catalog generation is durably published.
+    pub fn prepare_tenant_quota_update(
+        &self,
+        tenant: TenantId,
+        weight: u16,
+        limits: ResourceAmounts,
+    ) -> Result<PendingTenantQuotaUpdate<'_>, GovernorFailure> {
+        Ok(PendingTenantQuotaUpdate {
+            staged: self
+                .inner
+                .stage_tenant_quota_update(tenant, weight, limits)?,
+        })
+    }
+
     /// Checks immutable quota bounds before durable publication.
     pub fn validate_tenant_quota(
         &self,
@@ -218,9 +233,10 @@ impl StorageKernelResourceAuthority {
     pub fn prepare_tenant_enrollment(
         &self,
         tenant: TenantId,
+        weight: u16,
         limits: ResourceAmounts,
     ) -> Result<PendingTenantEnrollment<'_>, GovernorFailure> {
-        self.inner.prepare_tenant_quota(tenant, limits)?;
+        self.inner.prepare_tenant_quota(tenant, weight, limits)?;
         Ok(PendingTenantEnrollment {
             authority: self,
             tenant,

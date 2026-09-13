@@ -137,6 +137,26 @@ impl TenantQuotaAdministration {
                     TenantQuotaAdministrationFailureCode::IdempotencyConflict,
                 ));
             }
+            let current = tenant_quota_state(&snapshot, request.tenant)
+                .map_err(map_tenant_quota_record_failure)?;
+            if current.is_some_and(|current| {
+                current.generation == receipt.generation
+                    && current.weight == receipt.weight
+                    && current.resources == receipt.resources
+            }) {
+                authority
+                    .prepare_tenant_quota_update(
+                        request.tenant,
+                        weight,
+                        ResourceAmounts::new(request.resources),
+                    )
+                    .map_err(|_| {
+                        TenantQuotaAdministrationFailure::new(
+                            TenantQuotaAdministrationFailureCode::PersistenceUnavailable,
+                        )
+                    })?
+                    .publish();
+            }
             return Ok(TenantQuotaUpdate {
                 generation,
                 audit_position: audit_position(catalog, request.key)?,
@@ -178,6 +198,17 @@ impl TenantQuotaAdministration {
             request_digest,
         };
         objects.push(CatalogObject::new(encode(RECEIPT_MAGIC, semantics)).map_err(map_catalog)?);
+        let staged = authority
+            .prepare_tenant_quota_update(
+                request.tenant,
+                weight,
+                ResourceAmounts::new(request.resources),
+            )
+            .map_err(|_| {
+                TenantQuotaAdministrationFailure::new(
+                    TenantQuotaAdministrationFailureCode::PersistenceUnavailable,
+                )
+            })?;
         let commit = catalog
             .commit(
                 snapshot.identity(),
@@ -202,17 +233,7 @@ impl TenantQuotaAdministration {
                 )
             })?
             .position();
-        authority
-            .update_tenant_quota(
-                request.tenant,
-                weight,
-                ResourceAmounts::new(request.resources),
-            )
-            .map_err(|_| {
-                TenantQuotaAdministrationFailure::new(
-                    TenantQuotaAdministrationFailureCode::PersistenceUnavailable,
-                )
-            })?;
+        staged.publish();
         Ok(TenantQuotaUpdate {
             generation,
             audit_position,

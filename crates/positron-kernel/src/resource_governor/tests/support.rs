@@ -143,7 +143,7 @@ impl TestKernel {
         tenant: positron_domain::identity::TenantId,
         limits: ResourceAmounts,
     ) -> Result<positron_kernel::PendingTenantEnrollment<'_>, GovernorFailure> {
-        self.authority.prepare_tenant_enrollment(tenant, limits)
+        self.authority.prepare_tenant_enrollment(tenant, 1, limits)
     }
 
     pub fn observe_disk(

@@ -153,6 +153,19 @@ pub struct PendingTenantEnrollment<'authority> {
     active: bool,
 }
 
+/// A validated live quota successor prepared before its matching durable
+/// Catalog generation is published.
+pub struct PendingTenantQuotaUpdate<'authority> {
+    staged: accounting::StagedTenantQuotaUpdate<'authority>,
+}
+
+impl PendingTenantQuotaUpdate<'_> {
+    /// Publishes the already-derived live state after any active control section.
+    pub fn publish(self) {
+        self.staged.publish();
+    }
+}
+
 impl PendingTenantEnrollment<'_> {
     pub fn activate(&mut self) {
         self.authority.inner.activate_tenant_quota(self.tenant);
