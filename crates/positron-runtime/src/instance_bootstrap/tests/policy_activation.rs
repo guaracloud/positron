@@ -14,11 +14,46 @@ use positron_kernel::{
 
 use super::super::{InitializationPlan, InitializedInstance, InstanceBootstrap, resources};
 use super::support::Roots;
-use crate::BootstrapFailureCode;
+use crate::{BootstrapFailure, BootstrapFailureCode};
 
 mod concurrency;
 mod corruption;
 mod live;
+
+#[test]
+fn generated_tenant_selection_refuses_entropy_and_exhausted_collisions_without_mutation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let roots = Roots::new()?;
+    let paths = roots.paths();
+    drop(InstanceBootstrap::initialize(
+        &paths,
+        InitializationPlan::non_interactive(),
+    )?);
+    let initialized = InstanceBootstrap::reopen(&paths)?;
+    let audit_before = initialized.governance_audit_for_test()?;
+    let catalog = Catalog::open(
+        &initialized._authority,
+        initialized.instance,
+        initialized.key.catalog_secret(initialized.instance)?,
+    )?;
+    let before = catalog.pin()?;
+    let collision = InitializedInstance::select_unregistered_tenant_for_test(&catalog, || {
+        Ok(initialized.tenant)
+    })
+    .expect_err("eight colliding candidates must be exhausted");
+    assert_eq!(collision.code(), BootstrapFailureCode::ResourceUnavailable);
+    let entropy = InitializedInstance::select_unregistered_tenant_for_test(&catalog, || {
+        Err(BootstrapFailure::new(
+            BootstrapFailureCode::EntropyUnavailable,
+        ))
+    })
+    .expect_err("entropy failure must precede every publication");
+    assert_eq!(entropy.code(), BootstrapFailureCode::EntropyUnavailable);
+    assert_eq!(catalog.pin()?.identity(), before.identity());
+    drop(catalog);
+    assert_eq!(initialized.governance_audit_for_test()?, audit_before);
+    Ok(())
+}
 
 #[test]
 fn system_administrator_creates_a_second_tenant_with_live_admission_authority()
@@ -34,10 +69,8 @@ fn system_administrator_creates_a_second_tenant_with_live_admission_authority()
         RequestedIntent::SystemAdministration,
         CompatibilityHints::none(),
     )?;
-    let tenant = TenantId::from_bytes([0x91; 16])?;
-    let created = initialized.create_tenant(
+    let created = initialized.create_tenant_generated(
         system,
-        tenant,
         positron_governance::TenantCreateConfiguration::new(
             TenantSlug::parse_canonical("second-tenant")?,
             "Second tenant",
@@ -47,11 +80,11 @@ fn system_administrator_creates_a_second_tenant_with_live_admission_authority()
         ),
         AdministrativeIdempotencyKey::new([0x92; 16])?,
     )?;
-    assert_eq!(created.tenant_id(), tenant);
+    let tenant = created.tenant_id();
+    assert_ne!(tenant, initialized.tenant);
     assert_eq!(created.resource_generation().get(), 2);
-    let replay = initialized.create_tenant(
+    let replay = initialized.create_tenant_generated(
         system,
-        tenant,
         positron_governance::TenantCreateConfiguration::new(
             TenantSlug::parse_canonical("second-tenant")?,
             "Second tenant",

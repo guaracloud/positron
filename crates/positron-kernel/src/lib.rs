@@ -81,7 +81,8 @@ pub use catalog::{
     CatalogGenerationId, CatalogGovernanceObject, CatalogGovernanceVersion,
     CatalogLogRetentionPolicy, CatalogObject, CatalogObjectId, CatalogProposal, CatalogReadView,
     CatalogRotation, CatalogSecret, CatalogSnapshot, CatalogWrappingKey, FormatEpoch,
-    GovernanceAuditRecord, InstanceId, PreparedTransactionResolution, TransactionId,
+    GovernanceAuditRecord, InstanceId, PreparedTransactionInspection,
+    PreparedTransactionResolution, TransactionId,
 };
 #[cfg(feature = "test-support")]
 pub use catalog::{
