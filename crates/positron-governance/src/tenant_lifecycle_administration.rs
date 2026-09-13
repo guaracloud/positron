@@ -164,6 +164,21 @@ impl TenantLifecycleAdministration {
         )
     }
 
+    /// Validates a non-replay transition against one pinned read-only Catalog
+    /// view before callers close data-plane admission.
+    ///
+    /// Callers must resolve an exact committed replay first, then open the
+    /// Catalog Writer and call [`Self::transition`] after the required drain.
+    /// The writer path repeats this validation against its current snapshot.
+    pub fn preflight_from_view(
+        view: &CatalogReadView,
+        administrator: PrincipalId,
+        request: TenantLifecycleTransitionRequest,
+    ) -> Result<(), TenantLifecycleAdministrationFailure> {
+        let snapshot = validate_snapshot(view.snapshot().clone(), administrator, request)?;
+        validate_lifecycle_transition(&snapshot, request)
+    }
+
     pub fn transition<F>(
         catalog: &Catalog<'_>,
         administrator: PrincipalId,
@@ -345,6 +360,29 @@ fn validate_snapshot(
         return Err(TenantLifecycleAdministrationFailure::UnknownTenant);
     }
     Ok(snapshot)
+}
+
+fn validate_lifecycle_transition(
+    snapshot: &CatalogSnapshot,
+    request: TenantLifecycleTransitionRequest,
+) -> Result<(), TenantLifecycleAdministrationFailure> {
+    let (_, governance) = snapshot.governance_object().map_err(map_catalog)?;
+    let (generation, state) = if request.tenant == governance.tenant() {
+        (governance.lifecycle_generation(), governance.lifecycle())
+    } else {
+        let current = tenant_lifecycle_record(snapshot, request.tenant)
+            .map_err(map_tenant_record_failure)?
+            .ok_or(TenantLifecycleAdministrationFailure::UnknownTenant)?;
+        (current.generation.get(), current.state)
+    };
+    if request.target == TenantLifecycleState::Purged {
+        return Err(TenantLifecycleAdministrationFailure::PurgeCompletionUnavailable);
+    }
+    next_generation(generation, state, request.expected)?;
+    TenantLifecycle::from_durable_state(state)
+        .transition_to(request.target)
+        .map_err(|_| TenantLifecycleAdministrationFailure::InvalidTransition)?;
+    Ok(())
 }
 
 fn replay(

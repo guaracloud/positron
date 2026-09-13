@@ -1597,6 +1597,8 @@ impl InitializedInstance {
         {
             return Ok(replay);
         }
+        TenantLifecycleAdministration::preflight_from_view(&preflight, self.administrator, request)
+            .map_err(map_tenant_lifecycle_failure)?;
         let _drain = self.tenant_drains.close_and_drain(tenant)?;
         let _query_drain = match target {
             TenantLifecycleState::Suspended | TenantLifecycleState::Purging => {

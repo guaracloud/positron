@@ -4,6 +4,9 @@ use std::sync::{Arc, Mutex, mpsc};
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
+use positron_api::tenant_lifecycle::{
+    TenantLifecycleState as ApiTenantLifecycleState, TenantLifecycleTransitionRequest,
+};
 use positron_domain::lifecycle::TenantLifecycleState;
 use positron_governance::{
     AdministrativeIdempotencyKey, CompatibilityHints, PresentedCredential, RequestedIntent,
@@ -15,11 +18,13 @@ use positron_ingest::{
 };
 use positron_ingest::{LokiPushRequestEncoding, OtlpLogsRequestEncoding};
 use positron_query::{
-    QueryBudget, QueryBudgetDimension, QueryEvent, QueryFailureCode, QueryTerminal,
+    QueryBudget, QueryBudgetDimension, QueryCancellation, QueryEvent, QueryFailureCode,
+    QueryTerminal,
 };
 use prost::Message;
 
 use super::super::query::QueryTestOutcome;
+use super::super::tenant_lifecycle::TenantLifecycleHttpFailure;
 use super::schema_maintenance::{Fixture, request};
 use crate::services::{QueryExecutionTestHook, ReceiverTestBackend, ServiceFailure, ServiceHandle};
 
@@ -800,6 +805,59 @@ fn rejected_lifecycle_transition_reopens_native_ingest_admission() -> Result<(),
             .ingest_otlp_logs(&ingest, request("admission-reopened").encode_to_vec())?
             .accepted_records(),
         1
+    );
+    Ok(())
+}
+
+#[test]
+fn stale_and_invalid_lifecycle_requests_do_not_interrupt_live_work_or_publish()
+-> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let (initialized, ingest, _, administrator_secret) = fixture.initialized_with_admin()?;
+    let services = ServiceHandle::new(Arc::clone(&initialized))?;
+    let _ingest = initialized.enter_ingest_finalization_for(initialized.default_tenant_id())?;
+    let cancellation = QueryCancellation::new();
+    let _query = initialized
+        .enter_query_execution_for(initialized.default_tenant_id(), cancellation.clone())?;
+    let audit_before = initialized.governance_audit_for_test()?;
+    let tenant = initialized.default_tenant_id().to_canonical_text();
+
+    let stale = TenantLifecycleTransitionRequest::new(
+        tenant.clone(),
+        ApiTenantLifecycleState::Suspended,
+        2,
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaab".to_owned(),
+    );
+    assert!(matches!(
+        services.administer_tenant_lifecycle(&administrator_secret, &stale.encode()?),
+        Err(TenantLifecycleHttpFailure::StaleGeneration { .. })
+    ));
+    assert!(
+        !cancellation.is_cancelled(),
+        "a stale 409 must not cancel an already admitted query"
+    );
+
+    let invalid = TenantLifecycleTransitionRequest::new(
+        tenant,
+        ApiTenantLifecycleState::Active,
+        1,
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaac".to_owned(),
+    );
+    assert!(matches!(
+        services.administer_tenant_lifecycle(&administrator_secret, &invalid.encode()?),
+        Err(TenantLifecycleHttpFailure::Code(409, "invalid_transition"))
+    ));
+    assert!(
+        !cancellation.is_cancelled(),
+        "an invalid 409 must not cancel an already admitted query"
+    );
+    assert_eq!(initialized.governance_audit_for_test()?, audit_before);
+    assert_eq!(
+        services
+            .ingest_otlp_logs(&ingest, request("still-open-after-409").encode_to_vec())?
+            .accepted_records(),
+        1,
+        "preflight failures leave ingestion open"
     );
     Ok(())
 }
