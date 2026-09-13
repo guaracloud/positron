@@ -1,4 +1,5 @@
 use std::error::Error;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
@@ -858,6 +859,94 @@ fn stale_and_invalid_lifecycle_requests_do_not_interrupt_live_work_or_publish()
             .accepted_records(),
         1,
         "preflight failures leave ingestion open"
+    );
+    Ok(())
+}
+
+#[test]
+fn lifecycle_successor_between_preflight_and_drain_does_not_cancel_live_query()
+-> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let (initialized, _, _, administrator_secret) = fixture.initialized_with_admin()?;
+    let cancellation = QueryCancellation::new();
+    let _query = initialized
+        .enter_query_execution_for(initialized.default_tenant_id(), cancellation.clone())?;
+    let audit_before = initialized.governance_audit_for_test()?;
+    let (preflight_tx, preflight_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let hook_calls = Arc::clone(&calls);
+    let hook_release = Arc::new(Mutex::new(release_rx));
+    initialized.install_lifecycle_preflight_hook(Arc::new(move || {
+        if hook_calls.fetch_add(1, Ordering::AcqRel) == 0 {
+            let _ = preflight_tx.send(());
+            if let Ok(receiver) = hook_release.lock() {
+                let _ = receiver.recv();
+            }
+        }
+    }))?;
+
+    let racing = Arc::clone(&initialized);
+    let racing_secret = administrator_secret.clone();
+    let stale = std::thread::spawn(move || {
+        let actor = racing
+            .attribute(
+                PresentedCredential::parse(&racing_secret).map_err(|_| {
+                    crate::BootstrapFailure::new(
+                        crate::BootstrapFailureCode::TenantLifecycleUnauthorized,
+                    )
+                })?,
+                RequestedIntent::SystemAdministration,
+                CompatibilityHints::none(),
+            )
+            .map_err(|_| {
+                crate::BootstrapFailure::new(
+                    crate::BootstrapFailureCode::TenantLifecycleUnauthorized,
+                )
+            })?;
+        racing.transition_tenant_lifecycle(
+            actor,
+            racing.default_tenant_id(),
+            TenantLifecycleState::Suspended,
+            ResourceGeneration::new(1).map_err(|_| {
+                crate::BootstrapFailure::new(crate::BootstrapFailureCode::ResourceUnavailable)
+            })?,
+            AdministrativeIdempotencyKey::new([0xac; 16]).map_err(|_| {
+                crate::BootstrapFailure::new(crate::BootstrapFailureCode::ResourceUnavailable)
+            })?,
+        )
+    });
+    preflight_rx.recv()?;
+
+    let actor = initialized.attribute(
+        PresentedCredential::parse(&administrator_secret)?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let successor = initialized.transition_tenant_lifecycle(
+        actor,
+        initialized.default_tenant_id(),
+        TenantLifecycleState::ReadOnly,
+        ResourceGeneration::new(1)?,
+        AdministrativeIdempotencyKey::new([0xad; 16])?,
+    )?;
+    assert_eq!(successor.to(), TenantLifecycleState::ReadOnly);
+    release_tx.send(())?;
+    let stale = stale
+        .join()
+        .map_err(|_| "racing lifecycle transition panicked")?;
+    assert!(
+        !cancellation.is_cancelled(),
+        "a stale transition must not cancel work after another successor wins"
+    );
+    let stale = stale.expect_err("the successor advances the lifecycle generation");
+    assert_eq!(
+        stale.code(),
+        crate::BootstrapFailureCode::TenantLifecycleStaleGeneration
+    );
+    assert_eq!(
+        initialized.governance_audit_for_test()?.len(),
+        audit_before.len() + 1
     );
     Ok(())
 }

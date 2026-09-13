@@ -442,6 +442,67 @@ impl Drop for LifecycleDrainPermit {
     }
 }
 
+/// Serializes a tenant's lifecycle validation, drain, and publication sequence.
+struct LifecycleMutationGate {
+    active: Mutex<bool>,
+    changed: Condvar,
+}
+
+impl LifecycleMutationGate {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            active: Mutex::new(false),
+            changed: Condvar::new(),
+        })
+    }
+
+    fn acquire(self: &Arc<Self>) -> Result<LifecycleMutationPermit, BootstrapFailure> {
+        let deadline = Instant::now()
+            .checked_add(LIFECYCLE_DRAIN_TIMEOUT)
+            .ok_or_else(|| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
+        let mut active = self
+            .active
+            .lock()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
+        while *active {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return Err(BootstrapFailure::new(
+                    BootstrapFailureCode::ResourceUnavailable,
+                ));
+            };
+            let (next, timed_out) = self
+                .changed
+                .wait_timeout(active, remaining)
+                .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
+            if timed_out.timed_out() {
+                return Err(BootstrapFailure::new(
+                    BootstrapFailureCode::ResourceUnavailable,
+                ));
+            }
+            active = next;
+        }
+        *active = true;
+        Ok(LifecycleMutationPermit {
+            gate: Arc::clone(self),
+        })
+    }
+}
+
+struct LifecycleMutationPermit {
+    gate: Arc<LifecycleMutationGate>,
+}
+
+impl Drop for LifecycleMutationPermit {
+    fn drop(&mut self) {
+        let mut active = match self.gate.active.lock() {
+            Ok(active) => active,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *active = false;
+        self.gate.changed.notify_all();
+    }
+}
+
 /// Bounded, tenant-keyed lifecycle drain gates for the tenants that are
 /// actually registered in the Catalog. The Catalog remains the lifecycle
 /// authority; this registry only prevents one tenant's transition from
@@ -455,6 +516,7 @@ struct TenantDrainEntry {
     tenant: TenantId,
     ingest: Arc<IngestDrainGate>,
     query: Arc<QueryDrainGate>,
+    mutation: Arc<LifecycleMutationGate>,
     active: bool,
 }
 
@@ -492,6 +554,7 @@ impl TenantDrainRegistry {
                 tenant: *tenant,
                 ingest: IngestDrainGate::new(),
                 query: QueryDrainGate::new(),
+                mutation: LifecycleMutationGate::new(),
                 active: true,
             });
         }
@@ -540,6 +603,24 @@ impl TenantDrainRegistry {
         tenant: TenantId,
     ) -> Result<QueryLifecycleDrainPermit, BootstrapFailure> {
         self.active_entry(tenant)?.1.cancel_and_drain()
+    }
+
+    fn begin_lifecycle_mutation(
+        &self,
+        tenant: TenantId,
+    ) -> Result<LifecycleMutationPermit, BootstrapFailure> {
+        let mutation = {
+            let entries = self
+                .entries
+                .lock()
+                .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
+            let entry = entries
+                .iter()
+                .find(|entry| entry.tenant == tenant && entry.active)
+                .ok_or_else(|| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
+            Arc::clone(&entry.mutation)
+        };
+        mutation.acquire()
     }
 
     fn close_all_and_drain(&self) -> Result<Vec<LifecycleDrainPermit>, BootstrapFailure> {
@@ -601,6 +682,7 @@ impl TenantDrainRegistry {
             tenant,
             ingest: IngestDrainGate::new(),
             query: QueryDrainGate::new(),
+            mutation: LifecycleMutationGate::new(),
             active: false,
         });
         Ok(TenantDrainEnrollment {
@@ -960,6 +1042,8 @@ pub struct InitializedInstance {
     pub(crate) value_limit_profile: positron_domain::value::ValueLimitProfile,
     pub(crate) admission_group_planner: Arc<dyn positron_ingest::AdmissionGroupPlanner>,
     pub(super) tenant_drains: TenantDrainRegistry,
+    #[cfg(test)]
+    pub(super) lifecycle_preflight_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     pub(super) tenant_slug: TenantSlug,
     pub(super) administrator: PrincipalId,
     pub(super) integrity_key_fingerprint: [u8; 32],
@@ -994,6 +1078,19 @@ impl InitializedInstance {
         cancellation: QueryCancellation,
     ) -> Result<QueryDrainPermit, BootstrapFailure> {
         self.tenant_drains.enter_query(tenant, cancellation)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_lifecycle_preflight_hook(
+        &self,
+        hook: Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<(), BootstrapFailure> {
+        *self
+            .lifecycle_preflight_hook
+            .lock()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))? =
+            Some(hook);
+        Ok(())
     }
 
     #[cfg(test)]
@@ -1589,6 +1686,31 @@ impl InitializedInstance {
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
         let request =
             TenantLifecycleTransitionRequest::new(actor, tenant, target, expected, idempotency);
+        let preflight = Catalog::read_current_view(&self._authority, self.instance, secret)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        if let Some(replay) =
+            TenantLifecycleAdministration::replay_from_view(&preflight, self.administrator, request)
+                .map_err(map_tenant_lifecycle_failure)?
+        {
+            return Ok(replay);
+        }
+        TenantLifecycleAdministration::preflight_from_view(&preflight, self.administrator, request)
+            .map_err(map_tenant_lifecycle_failure)?;
+        #[cfg(test)]
+        let lifecycle_preflight_hook = self
+            .lifecycle_preflight_hook
+            .lock()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?
+            .clone();
+        #[cfg(test)]
+        if let Some(hook) = lifecycle_preflight_hook {
+            hook();
+        }
+        let _mutation = self.tenant_drains.begin_lifecycle_mutation(tenant)?;
+        let secret = self
+            .key
+            .catalog_secret(self.instance)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
         let preflight = Catalog::read_current_view(&self._authority, self.instance, secret)
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
         if let Some(replay) =
