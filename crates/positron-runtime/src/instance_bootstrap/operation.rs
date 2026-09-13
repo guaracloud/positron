@@ -360,14 +360,21 @@ fn apply_catalog_quota(
     authority
         .update_tenant_quota(
             governance.tenant(),
+            u16::try_from(governance.quota_weight())
+                .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?,
             ResourceAmounts::new(governance.quota_resources()),
         )
         .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
-    for (tenant, resources) in TenantAdministration::registered_tenant_quotas(snapshot)
+    for (tenant, weight, resources) in TenantAdministration::registered_tenant_quotas(snapshot)
         .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?
     {
         authority
-            .register_tenant_quota(tenant, ResourceAmounts::new(resources))
+            .register_tenant_quota(
+                tenant,
+                u16::try_from(weight)
+                    .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?,
+                ResourceAmounts::new(resources),
+            )
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
     }
     Ok(())

@@ -189,9 +189,19 @@ impl StorageKernelResourceAuthority {
     pub fn update_tenant_quota(
         &self,
         tenant: TenantId,
+        weight: u16,
         limits: ResourceAmounts,
     ) -> Result<(), GovernorFailure> {
-        self.inner.update_tenant_quota(tenant, limits)
+        self.inner.update_tenant_quota(tenant, weight, limits)
+    }
+
+    /// Checks immutable quota bounds before durable publication.
+    pub fn validate_tenant_quota(
+        &self,
+        weight: u16,
+        limits: ResourceAmounts,
+    ) -> Result<(), GovernorFailure> {
+        self.inner.validate_tenant_quota(weight, limits)
     }
 
     /// Enrolls a Catalog-created tenant in the governor's preallocated
@@ -199,9 +209,10 @@ impl StorageKernelResourceAuthority {
     pub fn register_tenant_quota(
         &self,
         tenant: TenantId,
+        weight: u16,
         limits: ResourceAmounts,
     ) -> Result<(), GovernorFailure> {
-        self.inner.register_tenant_quota(tenant, limits)
+        self.inner.register_tenant_quota(tenant, weight, limits)
     }
 
     pub fn prepare_tenant_enrollment(

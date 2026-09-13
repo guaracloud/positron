@@ -91,6 +91,18 @@ impl TenantQuotaAdministration {
                 TenantQuotaAdministrationFailureCode::InvalidInput,
             ));
         }
+        let weight = u16::try_from(request.weight).map_err(|_| {
+            TenantQuotaAdministrationFailure::new(
+                TenantQuotaAdministrationFailureCode::InvalidInput,
+            )
+        })?;
+        authority
+            .validate_tenant_quota(weight, ResourceAmounts::new(request.resources))
+            .map_err(|_| {
+                TenantQuotaAdministrationFailure::new(
+                    TenantQuotaAdministrationFailureCode::InvalidInput,
+                )
+            })?;
         let generation =
             ResourceGeneration::new(request.expected.get().checked_add(1).ok_or_else(|| {
                 TenantQuotaAdministrationFailure::new(
@@ -191,7 +203,11 @@ impl TenantQuotaAdministration {
             })?
             .position();
         authority
-            .update_tenant_quota(request.tenant, ResourceAmounts::new(request.resources))
+            .update_tenant_quota(
+                request.tenant,
+                weight,
+                ResourceAmounts::new(request.resources),
+            )
             .map_err(|_| {
                 TenantQuotaAdministrationFailure::new(
                     TenantQuotaAdministrationFailureCode::PersistenceUnavailable,

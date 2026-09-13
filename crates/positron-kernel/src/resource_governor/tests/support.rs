@@ -127,7 +127,7 @@ impl TestKernel {
         tenant: positron_domain::identity::TenantId,
         limits: ResourceAmounts,
     ) -> Result<(), GovernorFailure> {
-        self.authority.update_tenant_quota(tenant, limits)
+        self.authority.update_tenant_quota(tenant, 1, limits)
     }
 
     pub fn enroll_tenant(
@@ -135,7 +135,7 @@ impl TestKernel {
         tenant: positron_domain::identity::TenantId,
         limits: ResourceAmounts,
     ) -> Result<(), GovernorFailure> {
-        self.authority.register_tenant_quota(tenant, limits)
+        self.authority.register_tenant_quota(tenant, 1, limits)
     }
 
     pub fn prepare_tenant(

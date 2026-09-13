@@ -261,7 +261,7 @@ impl TenantAdministration {
     /// resulting live registration in the governor authority.
     pub fn registered_tenant_quotas(
         snapshot: &CatalogSnapshot,
-    ) -> Result<Vec<(TenantId, [u64; 11])>, TenantAdministrationFailure> {
+    ) -> Result<Vec<(TenantId, u32, [u64; 11])>, TenantAdministrationFailure> {
         let mut quotas = Vec::new();
         for identity in snapshot.object_identities() {
             let bytes = snapshot
@@ -270,7 +270,7 @@ impl TenantAdministration {
                 .ok_or(TenantAdministrationFailure::PersistenceUnavailable)?;
             if is_tenant_record(bytes) {
                 let record = tenant_record_metadata(bytes)?;
-                quotas.push((record.tenant, record.resources));
+                quotas.push((record.tenant, record.weight, record.resources));
             }
         }
         Ok(quotas)

@@ -56,6 +56,7 @@ pub(crate) struct TenantRecordMetadata {
     pub(crate) retention_seconds: u64,
     pub(crate) retention_generation: ResourceGeneration,
     pub(crate) resources: [u64; 11],
+    pub(crate) weight: u32,
     pub(crate) lifecycle: TenantLifecycleState,
     pub(crate) envelope: Vec<u8>,
 }
@@ -97,6 +98,7 @@ pub(crate) fn tenant_record_metadata(
         retention_seconds: record.retention_seconds,
         retention_generation: record.retention_generation,
         resources: record.state.resources,
+        weight: record.state.weight,
         lifecycle: record.lifecycle,
         envelope: record.envelope,
     })

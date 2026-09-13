@@ -360,6 +360,39 @@ fn tenant_administrator_publishes_a_quota_that_immediately_limits_new_admission(
 }
 
 #[test]
+fn quota_above_the_ordinary_ceiling_is_rejected_before_durable_publication()
+-> Result<(), Box<dyn std::error::Error>> {
+    let roots = Roots::new()?;
+    let paths = roots.paths();
+    let initialized = InstanceBootstrap::initialize(&paths, InitializationPlan::non_interactive())?;
+    drop(initialized);
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let initialized = InstanceBootstrap::reopen(&paths)?;
+    let actor = tenant_administrator(&initialized, claim.secret(), [0x94; 16])?;
+    let key = AdministrativeIdempotencyKey::new([0x95; 16])?;
+    let audit_before = initialized.governance_audit_for_test()?;
+    for _ in 0..2 {
+        let failure = initialized
+            .update_tenant_quota(
+                actor,
+                initialized.tenant,
+                ResourceGeneration::new(1)?,
+                key,
+                2,
+                [u64::MAX; 11],
+            )
+            .expect_err("above-ceiling quota must not publish");
+        assert_eq!(failure.code(), BootstrapFailureCode::CatalogUnavailable);
+    }
+    assert_eq!(initialized.governance_audit_for_test()?, audit_before);
+    drop(initialized);
+
+    let reopened = InstanceBootstrap::reopen(&paths)?;
+    assert_eq!(reopened.governance_audit_for_test()?, audit_before);
+    Ok(())
+}
+
+#[test]
 fn quota_replay_returns_its_original_result_without_restoring_an_obsolete_limit()
 -> Result<(), Box<dyn std::error::Error>> {
     let roots = Roots::new()?;
