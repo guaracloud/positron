@@ -166,13 +166,22 @@ impl TenantCreation {
 #[derive(Clone)]
 pub struct TenantCreateRequest {
     actor: AuthorizedContext,
-    tenant: TenantId,
     slug: TenantSlug,
     display_name: String,
     retention_seconds: u64,
     weight: u32,
     resources: [u64; 11],
     idempotency: AdministrativeIdempotencyKey,
+}
+
+/// A server-selected tenant identity bound to one validated creation request.
+///
+/// It remains private to the governance publication path so callers cannot
+/// select tenant identities through the administrative request contract.
+#[derive(Clone)]
+pub struct TenantCreateCandidate {
+    request: TenantCreateRequest,
+    tenant: TenantId,
 }
 
 /// Bounded durable attributes for a newly created tenant.
@@ -218,19 +227,25 @@ impl TenantCreateRequest {
     #[must_use]
     pub fn new(
         actor: AuthorizedContext,
-        tenant: TenantId,
         configuration: TenantCreateConfiguration,
         idempotency: AdministrativeIdempotencyKey,
     ) -> Self {
         Self {
             actor,
-            tenant,
             slug: configuration.slug,
             display_name: configuration.display_name,
             retention_seconds: configuration.retention_seconds,
             weight: configuration.weight,
             resources: configuration.resources,
             idempotency,
+        }
+    }
+
+    #[must_use]
+    pub fn with_generated_tenant(self, tenant: TenantId) -> TenantCreateCandidate {
+        TenantCreateCandidate {
+            request: self,
+            tenant,
         }
     }
 }
@@ -501,13 +516,41 @@ impl TenantAdministration {
         }))
     }
 
+    /// Reads the exact verified successor of an unpublished tenant creation
+    /// without publishing it. The runtime uses this only to stage the same
+    /// tenant's live admission before resuming the marker publication.
+    pub fn inspect_prepared(
+        catalog: &Catalog<'_>,
+        administrator: PrincipalId,
+        request: &TenantCreateRequest,
+    ) -> Result<Option<TenantCreation>, TenantAdministrationFailure> {
+        validate_request(administrator, request)?;
+        let transaction =
+            TransactionId::new(request.idempotency.to_bytes()).map_err(map_catalog)?;
+        match catalog
+            .inspect_prepared(transaction, request_digest(request))
+            .map_err(map_catalog)?
+        {
+            positron_kernel::PreparedTransactionInspection::Absent => Ok(None),
+            positron_kernel::PreparedTransactionInspection::Unavailable => {
+                Err(TenantAdministrationFailure::PersistenceUnavailable)
+            },
+            positron_kernel::PreparedTransactionInspection::Inspected(snapshot) => {
+                replay_snapshot(&snapshot, request)?
+                    .map(Some)
+                    .ok_or(TenantAdministrationFailure::PersistenceUnavailable)
+            },
+        }
+    }
+
     pub fn create(
         catalog: &Catalog<'_>,
         keys: &BootstrapKeyCustody,
         instance: positron_kernel::InstanceId,
         administrator: PrincipalId,
-        request: TenantCreateRequest,
+        candidate: TenantCreateCandidate,
     ) -> Result<TenantCreation, TenantAdministrationFailure> {
+        let request = &candidate.request;
         validate_request(administrator, &request)?;
         let snapshot = catalog.pin().map_err(map_catalog)?;
         if let Some(replay) = replay_snapshot(&snapshot, &request)? {
@@ -520,12 +563,6 @@ impl TenantAdministration {
             TransactionId::new(request.idempotency.to_bytes()).map_err(map_catalog)?;
         let prepared = match catalog.resume_prepared(transaction, digest) {
             Ok(prepared) => prepared,
-            Err(failure) if failure.code() == CatalogFailureCode::IdempotencyConflict => catalog
-                .resume_prepared(
-                    transaction,
-                    legacy_request_digest(&request, registry.generation),
-                )
-                .map_err(map_catalog)?,
             Err(failure) => return Err(map_catalog(failure)),
         };
         match prepared {
@@ -565,35 +602,35 @@ impl TenantAdministration {
             }
             if is_tenant_record(bytes) {
                 let record = tenant_record_metadata(bytes)?;
-                if record.tenant == request.tenant || record.slug == request.slug.as_str() {
+                if record.tenant == candidate.tenant || record.slug == request.slug.as_str() {
                     return Err(TenantAdministrationFailure::DuplicateTenant);
                 }
             }
             objects.push(CatalogObject::new(bytes.to_vec()).map_err(map_catalog)?);
         }
-        registry.tenants.push(request.tenant);
+        registry.tenants.push(candidate.tenant);
         objects.push(registry_object(instance, generation, &registry.tenants)?);
         let envelope = keys
             .provision_tenant_key_envelope(
                 instance,
-                request.tenant,
+                candidate.tenant,
                 keys.random_identifier()
                     .map_err(|_| TenantAdministrationFailure::PersistenceUnavailable)?,
                 1,
             )
             .map_err(|_| TenantAdministrationFailure::PersistenceUnavailable)?;
         objects.push(
-            CatalogObject::new(encode_record(instance, &request, &envelope)?)
+            CatalogObject::new(encode_record(instance, &candidate, &envelope)?)
                 .map_err(map_catalog)?,
         );
         let policy = IngestPolicy::preserving(1)
             .map_err(|_| TenantAdministrationFailure::PersistenceUnavailable)?
-            .activated_object(request.tenant)
+            .activated_object(candidate.tenant)
             .map_err(|_| TenantAdministrationFailure::PersistenceUnavailable)?;
         objects.push(CatalogObject::new(policy.into_bytes()).map_err(map_catalog)?);
         objects.push(
             CatalogObject::new(encode_receipt(
-                &request,
+                &candidate,
                 registry.generation,
                 generation,
                 digest,
@@ -612,7 +649,7 @@ impl TenantAdministration {
                 )
                 .map_err(map_catalog)?,
                 AuditIntent::new(encode_audit(
-                    &request,
+                    &candidate,
                     registry.generation,
                     generation,
                     digest,
@@ -626,7 +663,7 @@ impl TenantAdministration {
             .ok_or(TenantAdministrationFailure::PersistenceUnavailable)?
             .position();
         Ok(TenantCreation {
-            tenant: request.tenant,
+            tenant: candidate.tenant,
             generation,
             audit_position,
         })
@@ -820,9 +857,10 @@ fn registry_object(
 
 fn encode_record(
     instance: positron_kernel::InstanceId,
-    request: &TenantCreateRequest,
+    candidate: &TenantCreateCandidate,
     envelope: &[u8],
 ) -> Result<Vec<u8>, TenantAdministrationFailure> {
+    let request = &candidate.request;
     let slug = request.slug.as_str().as_bytes();
     let display = request.display_name.as_bytes();
     let envelope_len =
@@ -846,7 +884,7 @@ fn encode_record(
     );
     encoded.extend_from_slice(&TENANT_RECORD_V3_MAGIC);
     encoded.extend_from_slice(&instance.to_bytes());
-    encoded.extend_from_slice(&request.tenant.to_bytes());
+    encoded.extend_from_slice(&candidate.tenant.to_bytes());
     encoded.push(u8::try_from(slug.len()).map_err(|_| TenantAdministrationFailure::InvalidInput)?);
     encoded.extend_from_slice(slug);
     encoded
@@ -901,9 +939,9 @@ fn replay_snapshot(
     replay_receipt(
         &receipt,
         request.actor.principal_id(),
-        request.tenant,
         request_digest(request),
-        legacy_request_digest(request, receipt.expected),
+        legacy_request_digest(request, receipt.tenant),
+        retired_precondition_digest(request, receipt.tenant, receipt.expected),
     )?;
     Ok(Some(TenantCreation {
         tenant: receipt.tenant,
@@ -915,16 +953,17 @@ fn replay_snapshot(
 fn replay_receipt(
     receipt: &Receipt,
     actor: PrincipalId,
-    tenant: TenantId,
     canonical_digest: [u8; 32],
     legacy_digest: [u8; 32],
+    retired_precondition_digest: [u8; 32],
 ) -> Result<(), TenantAdministrationFailure> {
     if receipt.expected.get().checked_add(1) != Some(receipt.generation.get()) {
         return Err(TenantAdministrationFailure::PersistenceUnavailable);
     }
     if receipt.actor != actor
-        || receipt.tenant != tenant
-        || (receipt.digest != canonical_digest && receipt.digest != legacy_digest)
+        || (receipt.digest != canonical_digest
+            && receipt.digest != legacy_digest
+            && receipt.digest != retired_precondition_digest)
     {
         return Err(TenantAdministrationFailure::IdempotencyConflict);
     }
@@ -939,16 +978,16 @@ struct Receipt {
     audit_position: u64,
 }
 fn encode_receipt(
-    request: &TenantCreateRequest,
+    candidate: &TenantCreateCandidate,
     prior_generation: ResourceGeneration,
     generation: ResourceGeneration,
     digest: [u8; 32],
 ) -> Vec<u8> {
     let mut encoded = Vec::with_capacity(112);
     encoded.extend_from_slice(&TENANT_RECEIPT_MAGIC);
-    encoded.extend_from_slice(&request.idempotency.to_bytes());
-    encoded.extend_from_slice(&request.actor.principal_id().to_bytes());
-    encoded.extend_from_slice(&request.tenant.to_bytes());
+    encoded.extend_from_slice(&candidate.request.idempotency.to_bytes());
+    encoded.extend_from_slice(&candidate.request.actor.principal_id().to_bytes());
+    encoded.extend_from_slice(&candidate.tenant.to_bytes());
     encoded.extend_from_slice(&prior_generation.get().to_be_bytes());
     encoded.extend_from_slice(&generation.get().to_be_bytes());
     encoded.extend_from_slice(&digest);
@@ -1045,7 +1084,6 @@ fn generation_at(
 fn request_digest(request: &TenantCreateRequest) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(request.actor.principal_id().to_bytes());
-    hasher.update(request.tenant.to_bytes());
     hasher.update(request.slug.as_str().as_bytes());
     hasher.update(request.display_name.as_bytes());
     hasher.update(request.retention_seconds.to_be_bytes());
@@ -1060,10 +1098,29 @@ fn request_digest(request: &TenantCreateRequest) -> [u8; 32] {
 /// Verifies receipts and prepared transactions created by the retired
 /// creation precondition without making that precondition part of the current
 /// request contract.
-fn legacy_request_digest(request: &TenantCreateRequest, expected: ResourceGeneration) -> [u8; 32] {
+fn legacy_request_digest(request: &TenantCreateRequest, tenant: TenantId) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(request.actor.principal_id().to_bytes());
-    hasher.update(request.tenant.to_bytes());
+    hasher.update(tenant.to_bytes());
+    hasher.update(request.slug.as_str().as_bytes());
+    hasher.update(request.display_name.as_bytes());
+    hasher.update(request.retention_seconds.to_be_bytes());
+    hasher.update(request.weight.to_be_bytes());
+    for resource in request.resources {
+        hasher.update(resource.to_be_bytes());
+    }
+    hasher.update(request.idempotency.to_bytes());
+    hasher.finalize().into()
+}
+
+fn retired_precondition_digest(
+    request: &TenantCreateRequest,
+    tenant: TenantId,
+    expected: ResourceGeneration,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(request.actor.principal_id().to_bytes());
+    hasher.update(tenant.to_bytes());
     hasher.update(request.slug.as_str().as_bytes());
     hasher.update(request.display_name.as_bytes());
     hasher.update(request.retention_seconds.to_be_bytes());
@@ -1076,16 +1133,16 @@ fn legacy_request_digest(request: &TenantCreateRequest, expected: ResourceGenera
     hasher.finalize().into()
 }
 fn encode_audit(
-    request: &TenantCreateRequest,
+    candidate: &TenantCreateCandidate,
     prior_generation: ResourceGeneration,
     generation: ResourceGeneration,
     digest: [u8; 32],
 ) -> Vec<u8> {
     let mut audit = Vec::with_capacity(96);
     audit.extend_from_slice(&TENANT_AUDIT_MAGIC);
-    audit.extend_from_slice(&request.idempotency.to_bytes());
-    audit.extend_from_slice(&request.actor.principal_id().to_bytes());
-    audit.extend_from_slice(&request.tenant.to_bytes());
+    audit.extend_from_slice(&candidate.request.idempotency.to_bytes());
+    audit.extend_from_slice(&candidate.request.actor.principal_id().to_bytes());
+    audit.extend_from_slice(&candidate.tenant.to_bytes());
     audit.extend_from_slice(&prior_generation.get().to_be_bytes());
     audit.extend_from_slice(&generation.get().to_be_bytes());
     audit.extend_from_slice(&digest);
@@ -1134,7 +1191,7 @@ mod tests {
             .expect("matching receipt");
         assert_eq!(receipt.generation, generation);
         assert_eq!(receipt.audit_position, 17);
-        assert!(replay_receipt(&receipt, actor, tenant, canonical, legacy).is_ok());
+        assert!(replay_receipt(&receipt, actor, [0; 32], canonical, legacy).is_ok());
 
         let changed_legacy = digest(
             actor,
@@ -1145,7 +1202,7 @@ mod tests {
             Some(expected),
         );
         assert_eq!(
-            replay_receipt(&receipt, actor, tenant, canonical, changed_legacy),
+            replay_receipt(&receipt, actor, [0; 32], changed_legacy, [1; 32]),
             Err(TenantAdministrationFailure::IdempotencyConflict)
         );
     }
@@ -1172,6 +1229,32 @@ mod tests {
             decode_receipt(&encoded, sought)
                 .expect("well-formed unrelated receipt is ignored")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn registry_decoder_accepts_a_high_cardinality_directory_once() {
+        let count = 1_024_u16;
+        let mut bytes = Vec::with_capacity(34 + usize::from(count) * 16);
+        bytes.extend_from_slice(&TENANT_REGISTRY_V2_MAGIC);
+        bytes.extend_from_slice(&[0x11; 16]);
+        bytes.extend_from_slice(&1_u64.to_be_bytes());
+        bytes.extend_from_slice(&count.to_be_bytes());
+        for index in 1..=count {
+            let mut tenant = [0_u8; 16];
+            tenant[..2].copy_from_slice(&index.to_be_bytes());
+            bytes.extend_from_slice(&tenant);
+        }
+
+        let registry = decode_registry(&bytes).expect("bounded high-cardinality registry");
+        assert_eq!(registry.tenants.len(), usize::from(count));
+        assert_eq!(
+            registry.tenants.first().map(|tenant| tenant.to_bytes()),
+            Some([0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+        );
+        assert_eq!(
+            registry.tenants.last().map(|tenant| tenant.to_bytes()),
+            Some([4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
         );
     }
 

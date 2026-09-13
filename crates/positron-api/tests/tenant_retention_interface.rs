@@ -105,7 +105,7 @@ fn retention_preview_pages_render_below_the_response_bound() {
         catalog_generation: u64::MAX,
         confirmation_digest: DIGEST.to_owned(),
         scopes: vec![scope.clone(); MAX_PREVIEW_PAGE_ITEMS],
-        continuation: Some("ab".repeat(98)),
+        continuation: Some("ab".repeat(106)),
     };
     assert!(
         response.encode().expect("bounded maximum page").len() <= MAX_RESPONSE_BYTES,

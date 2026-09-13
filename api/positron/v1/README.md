@@ -52,8 +52,9 @@ codes `authentication_rejected` (401), `invalid_request` (400),
 `POST /v1/tenant-retention:preview` and
 `POST /v1/tenant-retention:update`. A tenant-administration credential may
 operate only on its own active or read-only tenant. Preview returns pages of at
-most 64 redacted scope impacts, with an opaque Catalog-snapshot continuation;
-the confirmation digest still covers the full canonical impact. A reduction
+most 64 redacted scope impacts, with an opaque continuation that binds the
+Catalog snapshot, trusted evaluation instant, and complete confirmation digest.
+The confirmation digest still covers the full canonical impact. A reduction
 update carries that digest, expected retention generation, and idempotency key.
 Authentication completes before body decoding. The
 schema-derived `TenantRetentionServiceClient` and `positron tenant retention

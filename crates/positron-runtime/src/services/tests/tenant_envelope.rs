@@ -308,6 +308,18 @@ fn system_administrator_previews_real_log_and_trace_retention_impact_without_mut
         catalog_before
     );
     assert_eq!(initialized.governance_audit_for_test()?.len(), audit_before);
+    elapsed.advance(2_000_000_000)?;
+    let resumed = initialized.inspect_tenant_retention_impact_at(
+        system,
+        tenant,
+        proposed,
+        Some(preview.evaluated_at()),
+    )?;
+    assert_eq!(
+        resumed.confirmation_digest(),
+        preview.confirmation_digest(),
+        "a continuation resumes the original trusted evaluation instant after the clock advances"
+    );
     let unauthorized =
         match initialized.inspect_tenant_retention_impact(ordinary_ingest, tenant, proposed) {
             Ok(_) => return Err("ingest credentials cannot inspect tenant-retention impact".into()),

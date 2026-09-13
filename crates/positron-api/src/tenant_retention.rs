@@ -17,7 +17,7 @@ pub const UPDATE_HTTP_PATH: &str = "/v1/tenant-retention:update";
 pub const MAX_REQUEST_BYTES: usize = 2048;
 pub const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 pub const MAX_PREVIEW_PAGE_ITEMS: usize = 64;
-const PREVIEW_CONTINUATION_HEX_BYTES: usize = 98;
+const PREVIEW_CONTINUATION_HEX_BYTES: usize = 106;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TenantRetentionWireFailure;

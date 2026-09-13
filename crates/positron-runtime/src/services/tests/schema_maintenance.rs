@@ -403,21 +403,32 @@ impl Fixture {
     }
 
     pub(super) fn initialized_with_admin(&self) -> Result<InitializedCredentials, Box<dyn Error>> {
+        self.initialized_with_admin_max_registered_tenants(2)
+    }
+
+    fn initialized_with_admin_max_registered_tenants(
+        &self,
+        max_registered_tenants: u16,
+    ) -> Result<InitializedCredentials, Box<dyn Error>> {
         let paths = BootstrapPaths::new(
             &self.root.join("data"),
             &self.root.join("secrets"),
             MountQualification::LocalHost,
         )?;
-        drop(InstanceBootstrap::initialize(
+        drop(InstanceBootstrap::initialize_with_max_registered_tenants(
             &paths,
             InitializationPlan::non_interactive(),
+            max_registered_tenants,
         )?);
         let claim = InstanceBootstrap::claim(&paths)?;
         let ingest = claim.ingest_secret().ok_or("ingest secret")?.to_owned();
         let query = claim.query_secret().ok_or("query secret")?.to_owned();
         let administrator = claim.secret().to_owned();
         Ok((
-            Arc::new(InstanceBootstrap::reopen(&paths)?),
+            Arc::new(InstanceBootstrap::reopen_with_max_registered_tenants(
+                &paths,
+                max_registered_tenants,
+            )?),
             ingest,
             query,
             administrator,

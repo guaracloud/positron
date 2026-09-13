@@ -38,11 +38,19 @@ impl ServiceHandle {
             .map_err(|_| TenantRetentionHttpFailure::Code(400, "invalid_request"))?;
         let tenant = tenant(request.tenant())?;
         let proposed = seconds(request.proposed_retention_seconds())?;
+        let continuation = request
+            .continuation()
+            .map(parse_preview_continuation)
+            .transpose()?;
+        let evaluation = continuation
+            .as_ref()
+            .map(continuation_evaluation)
+            .transpose()?;
         let preview = self
             .instance
-            .inspect_tenant_retention_impact(actor, tenant, proposed)
+            .inspect_tenant_retention_impact_at(actor, tenant, proposed, evaluation)
             .map_err(map_failure)?;
-        preview_response(preview, request.continuation())
+        preview_response(preview, continuation)
     }
 
     /// Recomputes a supplied opaque confirmation at the runtime boundary
@@ -134,12 +142,11 @@ const fn hex_value(value: u8) -> Option<u8> {
 
 fn preview_response(
     preview: TenantRetentionImpactPreview,
-    continuation: Option<&str>,
+    continuation: Option<[u8; 106]>,
 ) -> Result<TenantRetentionPreviewResponse, TenantRetentionHttpFailure> {
     let start = match continuation {
         None => 0,
-        Some(value) => {
-            let token = parse_preview_continuation(value)?;
+        Some(token) => {
             if token.get(..16) != Some(preview.tenant().to_bytes().as_slice())
                 || token.get(16..24)
                     != Some(
@@ -151,13 +158,15 @@ fn preview_response(
                     )
                 || token.get(24..56) != Some(preview.catalog_identity().to_bytes().as_slice())
                 || token.get(56..64) != Some(preview.catalog_generation().to_be_bytes().as_slice())
-                || token.get(64..96) != Some(preview.confirmation_digest().as_slice())
+                || token.get(64..72)
+                    != Some(preview.evaluated_at().value().to_be_bytes().as_slice())
+                || token.get(72..104) != Some(preview.confirmation_digest().as_slice())
             {
                 return Err(TenantRetentionHttpFailure::Code(409, "stale_continuation"));
             }
             usize::from(u16::from_be_bytes(
                 token
-                    .get(96..98)
+                    .get(104..106)
                     .ok_or(TenantRetentionHttpFailure::Code(400, "invalid_request"))?
                     .try_into()
                     .map_err(|_| TenantRetentionHttpFailure::Code(400, "invalid_request"))?,
@@ -220,11 +229,11 @@ fn preview_response(
     })
 }
 
-fn parse_preview_continuation(value: &str) -> Result<[u8; 98], TenantRetentionHttpFailure> {
-    if value.len() != 196 {
+fn parse_preview_continuation(value: &str) -> Result<[u8; 106], TenantRetentionHttpFailure> {
+    if value.len() != 212 {
         return Err(TenantRetentionHttpFailure::Code(400, "invalid_request"));
     }
-    let mut bytes = [0_u8; 98];
+    let mut bytes = [0_u8; 106];
     for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
         let high = pair
             .first()
@@ -241,20 +250,37 @@ fn parse_preview_continuation(value: &str) -> Result<[u8; 98], TenantRetentionHt
     Ok(bytes)
 }
 
+fn continuation_evaluation(
+    token: &[u8; 106],
+) -> Result<positron_domain::time::UnixNanoseconds, TenantRetentionHttpFailure> {
+    let value = i64::from_be_bytes(
+        token
+            .get(64..72)
+            .ok_or(TenantRetentionHttpFailure::Code(400, "invalid_request"))?
+            .try_into()
+            .map_err(|_| TenantRetentionHttpFailure::Code(400, "invalid_request"))?,
+    );
+    if value <= 0 {
+        return Err(TenantRetentionHttpFailure::Code(400, "invalid_request"));
+    }
+    Ok(positron_domain::time::UnixNanoseconds::new(value))
+}
+
 fn format_preview_continuation(
     preview: &TenantRetentionImpactPreview,
     index: usize,
 ) -> Result<String, TenantRetentionHttpFailure> {
     let index = u16::try_from(index)
         .map_err(|_| TenantRetentionHttpFailure::Code(503, "administration_unavailable"))?;
-    let mut bytes = [0_u8; 98];
+    let mut bytes = [0_u8; 106];
     bytes[..16].copy_from_slice(&preview.tenant().to_bytes());
     bytes[16..24].copy_from_slice(&preview.proposed_retention_seconds().get().to_be_bytes());
     bytes[24..56].copy_from_slice(&preview.catalog_identity().to_bytes());
     bytes[56..64].copy_from_slice(&preview.catalog_generation().to_be_bytes());
-    bytes[64..96].copy_from_slice(&preview.confirmation_digest());
-    bytes[96..].copy_from_slice(&index.to_be_bytes());
-    let mut text = String::with_capacity(196);
+    bytes[64..72].copy_from_slice(&preview.evaluated_at().value().to_be_bytes());
+    bytes[72..104].copy_from_slice(&preview.confirmation_digest());
+    bytes[104..].copy_from_slice(&index.to_be_bytes());
+    let mut text = String::with_capacity(212);
     for byte in bytes {
         text.push(hex_digit(byte >> 4));
         text.push(hex_digit(byte & 0x0f));

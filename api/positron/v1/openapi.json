@@ -1206,7 +1206,7 @@
         "properties": {
           "tenant": {"type": "string", "format": "uuid", "description": "Explicit tenant-administration target; it cannot select another tenant."},
           "proposed_retention_seconds": {"type": "integer", "minimum": 1},
-          "continuation": {"type": "string", "pattern": "^[0-9a-f]{196}$", "minLength": 196, "maxLength": 196}
+          "continuation": {"type": "string", "pattern": "^[0-9a-f]{212}$", "minLength": 212, "maxLength": 212}
         }
       },
       "TenantRetentionScopeImpact": {
@@ -1241,7 +1241,7 @@
           "catalog_generation": {"type": "integer", "minimum": 1},
           "confirmation_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$", "description": "Opaque confirmation binding computed from current canonical evidence."},
           "scopes": {"type": "array", "maxItems": 64, "items": {"$ref": "#/components/schemas/TenantRetentionScopeImpact"}},
-          "continuation": {"type": ["string", "null"], "pattern": "^[0-9a-f]{196}$", "maxLength": 196}
+          "continuation": {"type": ["string", "null"], "pattern": "^[0-9a-f]{212}$", "maxLength": 212}
         }
       },
       "TenantRetentionUpdateRequest": {
