@@ -21,7 +21,13 @@ pub(super) fn replay_creation(
         && lifecycle.expires_at_unix_seconds() == expires_at_unix_seconds
         && lifecycle.expected_generation() == expected
         && lifecycle.action() == ApiKeyLifecycleAction::Create;
-    if !request_matches {
+    let request_digest =
+        create_request_digest(idempotency, actor, scope, expires_at_unix_seconds, expected)?;
+    if !request_matches
+        || lifecycle
+            .request_digest()
+            .is_some_and(|actual| actual != request_digest)
+    {
         return Err(ApiKeyAdministrationFailure::IdempotencyConflict);
     }
     let published = credentials.iter().any(|credential| {
@@ -52,10 +58,21 @@ pub(super) fn replay_rotation(
     let Some(lifecycle) = replay_entry(catalog, idempotency)? else {
         return Ok(None);
     };
+    let request_digest = rotate_request_digest(
+        idempotency,
+        actor,
+        predecessor,
+        scope_code(lifecycle.scope()).ok_or(ApiKeyAdministrationFailure::PersistenceUnavailable)?,
+        lifecycle.expires_at_unix_seconds(),
+        expected,
+    )?;
     if lifecycle.action() != ApiKeyLifecycleAction::Rotate
         || lifecycle.actor_id() != actor
         || lifecycle.target_principal_id() != predecessor
         || lifecycle.expected_generation() != expected
+        || lifecycle
+            .request_digest()
+            .is_some_and(|actual| actual != request_digest)
     {
         return Err(ApiKeyAdministrationFailure::IdempotencyConflict);
     }

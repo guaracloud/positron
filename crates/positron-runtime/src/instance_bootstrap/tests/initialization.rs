@@ -186,6 +186,12 @@ fn read_only_transition_is_durable_idempotent_and_preserves_query_access()
     assert_eq!(lifecycle_audit.generation().get(), 2);
     assert!(lifecycle_audit.ingest_time_unix_seconds() > 0);
     assert_eq!(lifecycle_audit.idempotency_key(), idempotency);
+    assert!(
+        lifecycle_audit
+            .request_digest()
+            .is_some_and(|digest| digest.iter().any(|byte| *byte != 0)),
+        "new lifecycle transitions must durably bind their canonical request"
+    );
     let replay = instance.transition_tenant_lifecycle(
         administrator()?,
         instance.default_tenant_id(),

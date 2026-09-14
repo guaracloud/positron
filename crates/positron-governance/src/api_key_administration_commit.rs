@@ -7,7 +7,7 @@ pub(super) fn commit(
     snapshot: &CatalogSnapshot,
     replacement: Vec<u8>,
     audit_fields: MutationAudit,
-    prepared_request: Option<[u8; 32]>,
+    request_digest: [u8; 32],
 ) -> Result<(), ApiKeyAdministrationFailure> {
     let mut objects = Vec::new();
     for object_id in snapshot.object_identities() {
@@ -20,8 +20,8 @@ pub(super) fn commit(
         }
     }
     objects.push(CatalogObject::new(replacement).map_err(map_catalog)?);
-    let mut audit = Vec::with_capacity(98);
-    audit.extend_from_slice(b"POSKEY01");
+    let mut audit = Vec::with_capacity(130);
+    audit.extend_from_slice(b"POSKEY02");
     audit.push(match audit_fields.action {
         ApiKeyLifecycleAction::Create => 1,
         ApiKeyLifecycleAction::Rotate => 2,
@@ -40,6 +40,7 @@ pub(super) fn commit(
     audit.extend_from_slice(&audit_fields.expected.get().to_be_bytes());
     audit.extend_from_slice(&audit_fields.generation.get().to_be_bytes());
     audit.extend_from_slice(&audit_fields.idempotency.to_bytes());
+    audit.extend_from_slice(&request_digest);
     let proposal = CatalogProposal::new(
         TransactionId::new(audit_fields.idempotency.to_bytes()).map_err(map_catalog)?,
         snapshot
@@ -49,14 +50,9 @@ pub(super) fn commit(
     )
     .map_err(map_catalog)?;
     let audit = AuditIntent::new(audit).map_err(map_catalog)?;
-    match prepared_request {
-        Some(request_digest) => catalog
-            .commit_prepared(snapshot.identity(), proposal, audit, request_digest)
-            .map_err(map_catalog)?,
-        None => catalog
-            .commit(snapshot.identity(), proposal, Some(audit))
-            .map_err(map_catalog)?,
-    };
+    catalog
+        .commit_prepared(snapshot.identity(), proposal, audit, request_digest)
+        .map_err(map_catalog)?;
     Ok(())
 }
 

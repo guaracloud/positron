@@ -203,8 +203,8 @@ pub(super) fn commit_tenant_keyring(
         objects.push(CatalogObject::new(bytes.to_vec()).map_err(map_catalog)?);
     }
     objects.push(CatalogObject::new(replacement).map_err(map_catalog)?);
-    let mut audit = Vec::with_capacity(98);
-    audit.extend_from_slice(b"POSKEY01");
+    let mut audit = Vec::with_capacity(130);
+    audit.extend_from_slice(b"POSKEY02");
     audit.push(match audit_fields.action {
         ApiKeyLifecycleAction::Create => 1,
         ApiKeyLifecycleAction::Rotate => 2,
@@ -223,6 +223,7 @@ pub(super) fn commit_tenant_keyring(
     audit.extend_from_slice(&audit_fields.expected.get().to_be_bytes());
     audit.extend_from_slice(&audit_fields.generation.get().to_be_bytes());
     audit.extend_from_slice(&audit_fields.idempotency.to_bytes());
+    audit.extend_from_slice(&request_digest);
     catalog
         .commit_prepared(
             snapshot.identity(),

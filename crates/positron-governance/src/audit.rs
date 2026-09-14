@@ -20,8 +20,10 @@ const ROOT_ROTATION_MAGIC: &[u8] = b"catalog-root-rotation-v1\0";
 const POLICY_ACTIVATION_MAGIC: [u8; 8] = *b"POSPOL02";
 const TENANT_QUOTA_MAGIC: [u8; 8] = *b"POSQUO01";
 const KEY_LIFECYCLE_MAGIC: [u8; 8] = *b"POSKEY01";
+const KEY_LIFECYCLE_V2_MAGIC: [u8; 8] = *b"POSKEY02";
 const LISTENER_TRANSPORT_MAGIC: [u8; 8] = *b"POSTPT01";
 const TENANT_LIFECYCLE_MAGIC: [u8; 8] = *b"POSTEN01";
+const TENANT_LIFECYCLE_V2_MAGIC: [u8; 8] = *b"POSTEN02";
 const TENANT_CREATION_MAGIC: [u8; 8] = *b"POSTNA01";
 const FORMAT_MIGRATION_MAGIC: [u8; 8] = *b"POSFMT01";
 const TENANT_ALIAS_MAGIC: [u8; 8] = *b"POSALI01";
@@ -116,6 +118,7 @@ pub struct ApiKeyLifecycleAuditEntry {
     expected_generation: ResourceGeneration,
     generation: ResourceGeneration,
     idempotency_key: AdministrativeIdempotencyKey,
+    request_digest: Option<[u8; 32]>,
 }
 
 /// Redacted evidence for one committed tenant registry entry.
@@ -159,6 +162,7 @@ pub struct TenantLifecycleAuditEntry {
     expected_generation: ResourceGeneration,
     generation: ResourceGeneration,
     idempotency_key: AdministrativeIdempotencyKey,
+    request_digest: Option<[u8; 32]>,
 }
 
 /// Redacted evidence that the active API listener uses the explicit plaintext
@@ -679,6 +683,13 @@ impl TenantLifecycleAuditEntry {
     pub const fn idempotency_key(&self) -> AdministrativeIdempotencyKey {
         self.idempotency_key
     }
+
+    /// Returns the canonical request binding for current durable records.
+    /// Legacy v1 records intentionally decode without rewriting their bytes.
+    #[must_use]
+    pub const fn request_digest(&self) -> Option<[u8; 32]> {
+        self.request_digest
+    }
 }
 
 pub(crate) struct TenantLifecycleAuditIntent {
@@ -690,12 +701,13 @@ pub(crate) struct TenantLifecycleAuditIntent {
     pub(crate) to: TenantLifecycleState,
     pub(crate) expected_generation: ResourceGeneration,
     pub(crate) generation: ResourceGeneration,
+    pub(crate) request_digest: [u8; 32],
 }
 
 impl TenantLifecycleAuditIntent {
     pub(crate) fn encode(self) -> Vec<u8> {
-        let mut intent = Vec::with_capacity(82);
-        intent.extend_from_slice(&TENANT_LIFECYCLE_MAGIC);
+        let mut intent = Vec::with_capacity(114);
+        intent.extend_from_slice(&TENANT_LIFECYCLE_V2_MAGIC);
         intent.extend_from_slice(&self.ingest_time_unix_seconds.to_be_bytes());
         intent.extend_from_slice(&self.idempotency_key.to_bytes());
         intent.extend_from_slice(&self.actor.to_bytes());
@@ -704,6 +716,7 @@ impl TenantLifecycleAuditIntent {
         intent.push(lifecycle_state_code(self.to));
         intent.extend_from_slice(&self.expected_generation.get().to_be_bytes());
         intent.extend_from_slice(&self.generation.get().to_be_bytes());
+        intent.extend_from_slice(&self.request_digest);
         intent
     }
 }
@@ -773,6 +786,13 @@ impl ApiKeyLifecycleAuditEntry {
     #[must_use]
     pub const fn idempotency_key(&self) -> AdministrativeIdempotencyKey {
         self.idempotency_key
+    }
+
+    /// Returns the canonical request binding for current durable records.
+    /// Legacy v1 records intentionally decode without rewriting their bytes.
+    #[must_use]
+    pub const fn request_digest(&self) -> Option<[u8; 32]> {
+        self.request_digest
     }
 }
 

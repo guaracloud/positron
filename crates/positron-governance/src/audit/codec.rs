@@ -152,7 +152,8 @@ impl GovernanceAuditEntry {
                 transaction_id,
             )));
         }
-        if intent.starts_with(&KEY_LIFECYCLE_MAGIC) {
+        if intent.starts_with(&KEY_LIFECYCLE_MAGIC) || intent.starts_with(&KEY_LIFECYCLE_V2_MAGIC) {
+            let version_two = intent.starts_with(&KEY_LIFECYCLE_V2_MAGIC);
             let fields = 9;
             let action = match *intent.get(8).ok_or(IdentityFailure)? {
                 1 => ApiKeyLifecycleAction::Create,
@@ -160,8 +161,14 @@ impl GovernanceAuditEntry {
                 3 => ApiKeyLifecycleAction::Revoke,
                 _ => return Err(IdentityFailure),
             };
-            if intent.len() != fields + 89
-                || intent.get(..8) != Some(KEY_LIFECYCLE_MAGIC.as_slice())
+            let expected_length = fields + 89 + if version_two { 32 } else { 0 };
+            if intent.len() != expected_length
+                || intent.get(..8)
+                    != Some(if version_two {
+                        KEY_LIFECYCLE_V2_MAGIC.as_slice()
+                    } else {
+                        KEY_LIFECYCLE_MAGIC.as_slice()
+                    })
                 || intent.get(fields + 73..fields + 89) != Some(transaction_id.as_slice())
             {
                 return Err(IdentityFailure);
@@ -218,7 +225,15 @@ impl GovernanceAuditEntry {
                     .ok_or(IdentityFailure)?,
             )
             .map_err(|_| IdentityFailure)?;
-            if expected_generation.get().checked_add(1) != Some(generation.get()) {
+            let request_digest = version_two
+                .then(|| intent.get(fields + 89..fields + 121))
+                .flatten()
+                .map(|bytes| bytes.try_into().map_err(|_| IdentityFailure))
+                .transpose()?;
+            if expected_generation.get().checked_add(1) != Some(generation.get())
+                || request_digest
+                    .is_some_and(|digest: [u8; 32]| digest.iter().all(|byte| *byte == 0))
+            {
                 return Err(IdentityFailure);
             }
             return Ok(Self::ApiKeyLifecycle(ApiKeyLifecycleAuditEntry {
@@ -233,6 +248,7 @@ impl GovernanceAuditEntry {
                 generation,
                 idempotency_key: AdministrativeIdempotencyKey::new(transaction_id)
                     .map_err(|_| IdentityFailure)?,
+                request_digest,
             }));
         }
         if intent.starts_with(&TENANT_CREATION_MAGIC) {
@@ -296,9 +312,18 @@ impl GovernanceAuditEntry {
                 },
             ));
         }
-        if intent.starts_with(&TENANT_LIFECYCLE_MAGIC) {
+        if intent.starts_with(&TENANT_LIFECYCLE_MAGIC)
+            || intent.starts_with(&TENANT_LIFECYCLE_V2_MAGIC)
+        {
+            let version_two = intent.starts_with(&TENANT_LIFECYCLE_V2_MAGIC);
             let mut cursor = Cursor::new(intent);
-            if cursor.take_array::<8>()? != TENANT_LIFECYCLE_MAGIC {
+            if cursor.take_array::<8>()?
+                != if version_two {
+                    TENANT_LIFECYCLE_V2_MAGIC
+                } else {
+                    TENANT_LIFECYCLE_MAGIC
+                }
+            {
                 return Err(IdentityFailure);
             }
             let ingest_time_unix_seconds = cursor.take_u64()?;
@@ -319,7 +344,14 @@ impl GovernanceAuditEntry {
                 ResourceGeneration::new(cursor.take_u64()?).map_err(|_| IdentityFailure)?;
             let generation =
                 ResourceGeneration::new(cursor.take_u64()?).map_err(|_| IdentityFailure)?;
+            let request_digest = if version_two {
+                Some(cursor.take_array()?)
+            } else {
+                None
+            };
             if expected_generation.get().checked_add(1) != Some(generation.get())
+                || request_digest
+                    .is_some_and(|digest: [u8; 32]| digest.iter().all(|byte| *byte == 0))
                 || !cursor.is_empty()
             {
                 return Err(IdentityFailure);
@@ -334,6 +366,7 @@ impl GovernanceAuditEntry {
                 expected_generation,
                 generation,
                 idempotency_key,
+                request_digest,
             }));
         }
         if intent.starts_with(&TENANT_RETENTION_MAGIC) {

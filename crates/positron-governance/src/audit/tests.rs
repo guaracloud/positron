@@ -79,6 +79,57 @@ fn api_key_lifecycle_audit_is_redacted_exact_and_strict() {
     assert!(GovernanceAuditEntry::decode_fields(6, transaction, &trailing).is_err());
 }
 
+#[test]
+fn version_two_lifecycle_audits_bind_the_canonical_request_digest() {
+    let transaction = [9; 16];
+    let request_digest = [41; 32];
+    let mut api_key = b"POSKEY02".to_vec();
+    api_key.push(2);
+    api_key.extend_from_slice(&[1; 16]);
+    api_key.extend_from_slice(&[2; 16]);
+    api_key.extend_from_slice(&[3; 16]);
+    api_key.push(2);
+    api_key.extend_from_slice(&77_u64.to_be_bytes());
+    api_key.extend_from_slice(&4_u64.to_be_bytes());
+    api_key.extend_from_slice(&5_u64.to_be_bytes());
+    api_key.extend_from_slice(&transaction);
+    api_key.extend_from_slice(&request_digest);
+    let entry = GovernanceAuditEntry::decode_fields(6, transaction, &api_key).expect("audit");
+    assert_eq!(
+        entry
+            .as_api_key_lifecycle()
+            .expect("typed lifecycle audit")
+            .request_digest(),
+        Some(request_digest)
+    );
+
+    let mut lifecycle = b"POSTEN02".to_vec();
+    lifecycle.extend_from_slice(&1_725_000_002_u64.to_be_bytes());
+    lifecycle.extend_from_slice(&transaction);
+    lifecycle.extend_from_slice(&[1; 16]);
+    lifecycle.extend_from_slice(&[2; 16]);
+    lifecycle.extend_from_slice(&1_u8.to_be_bytes());
+    lifecycle.extend_from_slice(&2_u8.to_be_bytes());
+    lifecycle.extend_from_slice(&4_u64.to_be_bytes());
+    lifecycle.extend_from_slice(&5_u64.to_be_bytes());
+    lifecycle.extend_from_slice(&request_digest);
+    let entry = GovernanceAuditEntry::decode_fields(7, transaction, &lifecycle).expect("audit");
+    assert_eq!(
+        entry
+            .as_tenant_lifecycle()
+            .expect("typed lifecycle audit")
+            .request_digest(),
+        Some(request_digest)
+    );
+
+    for malformed in [
+        &api_key[..api_key.len() - 1],
+        &lifecycle[..lifecycle.len() - 1],
+    ] {
+        assert!(GovernanceAuditEntry::decode_fields(6, transaction, malformed).is_err());
+    }
+}
+
 fn audit_intent() -> Vec<u8> {
     InitialGovernanceIntent::create_tenant(
         InitialTenantIntent::new(

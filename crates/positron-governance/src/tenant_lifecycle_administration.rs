@@ -136,14 +136,7 @@ impl TenantLifecycleAdministration {
         request: TenantLifecycleTransitionRequest,
     ) -> Result<Option<TenantLifecycleTransition>, TenantLifecycleAdministrationFailure> {
         validate_request(catalog, administrator, request)?;
-        replay(
-            catalog,
-            request.idempotency,
-            request.actor.principal_id(),
-            request.tenant,
-            request.target,
-            request.expected,
-        )
+        replay(catalog, request)
     }
 
     /// Resolves an exact committed retry from one immutable read-only Catalog
@@ -154,14 +147,7 @@ impl TenantLifecycleAdministration {
         request: TenantLifecycleTransitionRequest,
     ) -> Result<Option<TenantLifecycleTransition>, TenantLifecycleAdministrationFailure> {
         validate_snapshot(view.snapshot().clone(), administrator, request)?;
-        replay_records(
-            view.governance_audit_records(),
-            request.idempotency,
-            request.actor.principal_id(),
-            request.tenant,
-            request.target,
-            request.expected,
-        )
+        replay_records(view.governance_audit_records(), request)
     }
 
     /// Validates a non-replay transition against one pinned read-only Catalog
@@ -190,14 +176,7 @@ impl TenantLifecycleAdministration {
     {
         let snapshot = validate_request(catalog, administrator, request)?;
         let (_, governance) = snapshot.governance_object().map_err(map_catalog)?;
-        if let Some(replay) = replay(
-            catalog,
-            request.idempotency,
-            request.actor.principal_id(),
-            request.tenant,
-            request.target,
-            request.expected,
-        )? {
+        if let Some(replay) = replay(catalog, request)? {
             return Ok(replay);
         }
         if let Some(resumed) = resume_prepared(catalog, request)? {
@@ -231,6 +210,7 @@ impl TenantLifecycleAdministration {
             to: request.target,
             expected_generation: request.expected,
             generation,
+            request_digest: request_digest(request),
         }
         .encode();
         let commit = commit(catalog, &snapshot, replacement, request, audit)?;
@@ -294,6 +274,7 @@ where
         to: request.target,
         expected_generation: request.expected,
         generation,
+        request_digest: request_digest(request),
     }
     .encode();
     let commit = commit_objects(catalog, snapshot, objects, request, audit)?;
@@ -387,26 +368,18 @@ fn validate_lifecycle_transition(
 
 fn replay(
     catalog: &Catalog<'_>,
-    idempotency: AdministrativeIdempotencyKey,
-    actor: PrincipalId,
-    tenant: TenantId,
-    target: TenantLifecycleState,
-    expected: ResourceGeneration,
+    request: TenantLifecycleTransitionRequest,
 ) -> Result<Option<TenantLifecycleTransition>, TenantLifecycleAdministrationFailure> {
     let records = catalog.governance_audit_records().map_err(map_catalog)?;
-    replay_records(&records, idempotency, actor, tenant, target, expected)
+    replay_records(&records, request)
 }
 
 fn replay_records(
     records: &[GovernanceAuditRecord],
-    idempotency: AdministrativeIdempotencyKey,
-    actor: PrincipalId,
-    tenant: TenantId,
-    target: TenantLifecycleState,
-    expected: ResourceGeneration,
+    request: TenantLifecycleTransitionRequest,
 ) -> Result<Option<TenantLifecycleTransition>, TenantLifecycleAdministrationFailure> {
     for record in records {
-        if record.transaction().to_bytes() != idempotency.to_bytes() {
+        if record.transaction().to_bytes() != request.idempotency.to_bytes() {
             continue;
         }
         let entry = GovernanceAuditEntry::decode(record)
@@ -414,15 +387,18 @@ fn replay_records(
         let lifecycle = entry
             .as_tenant_lifecycle()
             .ok_or(TenantLifecycleAdministrationFailure::IdempotencyConflict)?;
-        if lifecycle.actor_id() != actor
-            || lifecycle.tenant_id() != tenant
-            || lifecycle.to() != target
-            || lifecycle.expected_generation() != expected
+        if lifecycle.actor_id() != request.actor.principal_id()
+            || lifecycle.tenant_id() != request.tenant
+            || lifecycle.to() != request.target
+            || lifecycle.expected_generation() != request.expected
+            || lifecycle
+                .request_digest()
+                .is_some_and(|actual| actual != request_digest(request))
         {
             return Err(TenantLifecycleAdministrationFailure::IdempotencyConflict);
         }
         return Ok(Some(TenantLifecycleTransition {
-            tenant,
+            tenant: request.tenant,
             from: lifecycle.from(),
             to: lifecycle.to(),
             generation: lifecycle.generation(),
@@ -450,16 +426,9 @@ fn resume_prepared(
             let record = commit
                 .governance_audit_record()
                 .ok_or(TenantLifecycleAdministrationFailure::PersistenceUnavailable)?;
-            replay_records(
-                std::slice::from_ref(record),
-                request.idempotency,
-                request.actor.principal_id(),
-                request.tenant,
-                request.target,
-                request.expected,
-            )?
-            .ok_or(TenantLifecycleAdministrationFailure::PersistenceUnavailable)
-            .map(Some)
+            replay_records(std::slice::from_ref(record), request)?
+                .ok_or(TenantLifecycleAdministrationFailure::PersistenceUnavailable)
+                .map(Some)
         },
     }
 }

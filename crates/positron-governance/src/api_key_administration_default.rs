@@ -44,6 +44,13 @@ impl ApiKeyAdministration {
         }
         let snapshot = catalog.pin().map_err(map_catalog)?;
         let (_, governance) = snapshot.governance_object().map_err(map_catalog)?;
+        let request_digest = create_request_digest(
+            request.idempotency,
+            request.actor.principal_id(),
+            request.scope,
+            request.expires_at_unix_seconds,
+            request.expected,
+        )?;
         if let Some(replay) = replay_creation(
             catalog,
             request.idempotency,
@@ -55,13 +62,6 @@ impl ApiKeyAdministration {
         )? {
             return Ok(replay);
         }
-        let request_digest = create_request_digest(
-            request.idempotency,
-            request.actor.principal_id(),
-            request.scope,
-            request.expires_at_unix_seconds,
-            request.expected,
-        )?;
         match catalog
             .resume_prepared(
                 TransactionId::new(request.idempotency.to_bytes()).map_err(map_catalog)?,
@@ -87,6 +87,7 @@ impl ApiKeyAdministration {
                     || lifecycle.expires_at_unix_seconds() != request.expires_at_unix_seconds
                     || lifecycle.expected_generation() != request.expected
                     || lifecycle.action() != ApiKeyLifecycleAction::Create
+                    || lifecycle.request_digest() != Some(request_digest)
                 {
                     return Err(ApiKeyAdministrationFailure::IdempotencyConflict);
                 }
@@ -136,7 +137,7 @@ impl ApiKeyAdministration {
                     .map_err(|_| ApiKeyAdministrationFailure::PersistenceUnavailable)?,
                 action: ApiKeyLifecycleAction::Create,
             },
-            Some(request_digest),
+            request_digest,
         )?;
         Ok(ApiKeyCreation {
             principal,
@@ -155,15 +156,6 @@ impl ApiKeyAdministration {
         }
         let snapshot = catalog.pin().map_err(map_catalog)?;
         let (_, governance) = snapshot.governance_object().map_err(map_catalog)?;
-        if let Some(replay) = replay_rotation(
-            catalog,
-            request.idempotency,
-            request.actor.principal_id(),
-            request.predecessor,
-            request.expected,
-        )? {
-            return Ok(replay);
-        }
         let predecessor = governance
             .credentials()
             .iter()
@@ -181,6 +173,15 @@ impl ApiKeyAdministration {
             predecessor.expires_at_unix_seconds(),
             request.expected,
         )?;
+        if let Some(replay) = replay_rotation(
+            catalog,
+            request.idempotency,
+            request.actor.principal_id(),
+            request.predecessor,
+            request.expected,
+        )? {
+            return Ok(replay);
+        }
         match catalog
             .resume_prepared(
                 TransactionId::new(request.idempotency.to_bytes()).map_err(map_catalog)?,
@@ -209,6 +210,7 @@ impl ApiKeyAdministration {
                             .ok_or(ApiKeyAdministrationFailure::PersistenceUnavailable)?
                     || lifecycle.expires_at_unix_seconds() != predecessor.expires_at_unix_seconds()
                     || lifecycle.expected_generation() != request.expected
+                    || lifecycle.request_digest() != Some(request_digest)
                 {
                     return Err(ApiKeyAdministrationFailure::IdempotencyConflict);
                 }
@@ -257,7 +259,7 @@ impl ApiKeyAdministration {
                     .map_err(|_| ApiKeyAdministrationFailure::PersistenceUnavailable)?,
                 action: ApiKeyLifecycleAction::Rotate,
             },
-            Some(request_digest),
+            request_digest,
         )?;
         Ok(ApiKeyCreation {
             principal,
@@ -299,6 +301,14 @@ impl ApiKeyAdministration {
             .ok_or(ApiKeyAdministrationFailure::CredentialUnavailable)?;
         credentials[index] = credentials[index].with_active(false);
         let scope = credentials[index].scope_code();
+        let request_digest = revoke_request_digest(
+            idempotency,
+            actor.principal_id(),
+            principal,
+            scope,
+            credentials[index].expires_at_unix_seconds(),
+            expected,
+        );
         let replacement = governance
             .with_credentials(generation, &credentials)
             .map_err(map_catalog)?;
@@ -318,7 +328,7 @@ impl ApiKeyAdministration {
                     .map_err(|_| ApiKeyAdministrationFailure::PersistenceUnavailable)?,
                 action: ApiKeyLifecycleAction::Revoke,
             },
-            None,
+            request_digest,
         )
     }
 }
