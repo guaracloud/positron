@@ -1,5 +1,6 @@
 //! Immutable encrypted Catalog Generations and their single publication authority.
 
+mod audit_checkpoint;
 mod budget;
 mod codec;
 #[cfg(feature = "test-support")]
@@ -19,7 +20,8 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use budget::{
-    commit_resource_claim, recovery_resource_claim, reserve_history, retained_artifact_bytes,
+    audit_checkpoint_resource_claim, commit_resource_claim, recovery_resource_claim,
+    reserve_history, retained_artifact_bytes,
 };
 use codec::{
     CommitRecord, encode_commit, generation_identity, object_set_digest, prepare_audit,
@@ -34,6 +36,7 @@ use crate::data_protection::ControlTokenProtector;
 use crate::resource_governor::CatalogWriterLease;
 use crate::{RecoveryWorkClaim, RecoveryWorkKind, StorageKernelResourceAuthority};
 
+pub use audit_checkpoint::{AuditCheckpointSigner, GovernanceAuditCheckpoint};
 #[cfg(feature = "test-support")]
 pub use fixture::GovernanceFixtureTarget;
 pub use governance_object::{
@@ -97,6 +100,7 @@ pub struct Catalog<'authority> {
 struct CatalogState {
     current: CatalogSnapshot,
     audit: Vec<GovernanceAuditRecord>,
+    audit_checkpoint: Option<GovernanceAuditCheckpoint>,
     transactions: BTreeMap<TransactionId, TransactionOutcome>,
     retained_history_bytes: usize,
 }
@@ -110,6 +114,7 @@ struct CatalogState {
 pub struct CatalogReadView {
     snapshot: CatalogSnapshot,
     audit: Vec<GovernanceAuditRecord>,
+    audit_checkpoint: Option<GovernanceAuditCheckpoint>,
 }
 
 impl CatalogReadView {
@@ -121,6 +126,24 @@ impl CatalogReadView {
     #[must_use]
     pub fn governance_audit_records(&self) -> &[GovernanceAuditRecord] {
         &self.audit
+    }
+
+    /// Returns the most recent durable signed audit-chain anchor, when one has
+    /// been published by the system maintenance path.
+    pub fn latest_audit_checkpoint(
+        &self,
+    ) -> Result<Option<GovernanceAuditCheckpoint>, CatalogFailure> {
+        Ok(self.audit_checkpoint.clone())
+    }
+
+    /// Verifies the complete visible audit chain and an optional trusted
+    /// signed checkpoint without granting any mutation capability.
+    pub fn verify_audit_chain(
+        &self,
+        trusted_public_key: [u8; 32],
+        checkpoint: Option<&GovernanceAuditCheckpoint>,
+    ) -> Result<(), CatalogFailure> {
+        audit_checkpoint::verify_chain(&self.audit, trusted_public_key, checkpoint)
     }
 }
 
@@ -233,6 +256,7 @@ impl<'authority> Catalog<'authority> {
         Ok(CatalogReadView {
             snapshot: recovered.current,
             audit: recovered.audit,
+            audit_checkpoint: recovered.audit_checkpoint,
         })
     }
 
@@ -686,6 +710,53 @@ impl<'authority> Catalog<'authority> {
             .lock()
             .map(|state| state.audit.clone())
             .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))
+    }
+
+    /// Persists a signed anchor for the currently visible Governance Audit
+    /// frontier. It is idempotent for the same frontier and key, and never
+    /// changes Catalog generation visibility.
+    pub fn publish_audit_checkpoint(
+        &self,
+        signer: &AuditCheckpointSigner,
+    ) -> Result<GovernanceAuditCheckpoint, CatalogFailure> {
+        let claim = RecoveryWorkClaim::system(
+            RecoveryWorkKind::DurabilityCompletion,
+            audit_checkpoint_resource_claim(),
+        )
+        .map_err(|_| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?;
+        let _reservation = self
+            .authority
+            .recovery()
+            .reserve(claim)
+            .map_err(CatalogFailure::admission)?;
+        let _operation = self
+            .operation
+            .lock()
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
+        let secret = self
+            .secret
+            .lock()
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
+        let frontier = state
+            .audit
+            .last()
+            .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::InvalidInput))?;
+        if let Some(existing) = state.audit_checkpoint.as_ref()
+            && existing.position() == frontier.position()
+            && existing.record_hash() == frontier.record_hash()
+        {
+            existing.verify(signer.public_key())?;
+            return Ok(existing.clone());
+        }
+        let checkpoint = GovernanceAuditCheckpoint::create(signer, self.instance, frontier)?;
+        self.storage
+            .publish_audit_checkpoint(&secret, self.instance, &checkpoint)?;
+        state.audit_checkpoint = Some(checkpoint.clone());
+        Ok(checkpoint)
     }
 
     pub(crate) fn refresh_state(&self) -> Result<(), CatalogFailure> {

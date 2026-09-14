@@ -9,6 +9,7 @@ impl CatalogStorage {
         Ok(Self {
             objects: open_existing_directory(&catalog, "objects")?,
             audit: open_existing_directory(&catalog, "governance-audit")?,
+            audit_checkpoints: open_existing_directory(&catalog, "governance-audit-checkpoints")?,
             commits: open_existing_directory(&catalog, "commits")?,
             generations: open_existing_directory(&catalog, "generations")?,
             staging: open_existing_directory(&catalog, "staging")?,

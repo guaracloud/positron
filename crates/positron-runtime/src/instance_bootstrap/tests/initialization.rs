@@ -97,6 +97,32 @@ fn reopened_identity_authenticates_the_hash_only_administrator_without_impersona
     Ok(())
 }
 
+#[test]
+fn system_administrator_publishes_and_verifies_a_bootstrap_bound_audit_checkpoint()
+-> Result<(), Box<dyn Error>> {
+    let roots = Roots::new()?;
+    let paths = roots.paths().map_err(|code| format!("paths: {code:?}"))?;
+    drop(InstanceBootstrap::initialize(
+        &paths,
+        InitializationPlan::non_interactive(),
+    )?);
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    let administrator = || {
+        instance.attribute(
+            PresentedCredential::parse(claim.secret()).expect("claim syntax"),
+            RequestedIntent::SystemAdministration,
+            CompatibilityHints::none(),
+        )
+    };
+
+    let checkpoint = instance.publish_governance_audit_checkpoint(administrator()?)?;
+    assert_eq!(checkpoint.position(), 1);
+    assert_eq!(checkpoint.instance(), instance.instance_id());
+    instance.verify_governance_audit_history(administrator()?, Some(&checkpoint))?;
+    Ok(())
+}
+
 #[cfg(feature = "test-support")]
 #[test]
 fn read_only_transition_is_durable_idempotent_and_preserves_query_access()

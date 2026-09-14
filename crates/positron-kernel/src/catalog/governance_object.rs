@@ -121,6 +121,9 @@ pub struct CatalogGovernanceObject {
     quota_weight: u32,
     quota_resources: [u64; 11],
     quota_offset: usize,
+    integrity_public_key: [u8; 32],
+    integrity_key_fingerprint: [u8; 32],
+    protected_integrity_key: Vec<u8>,
     tenant_key_envelope: Vec<u8>,
     lifecycle: TenantLifecycleState,
     #[cfg(feature = "test-support")]
@@ -236,6 +239,24 @@ impl CatalogGovernanceObject {
     #[must_use]
     pub const fn quota_resources(&self) -> [u64; 11] {
         self.quota_resources
+    }
+
+    /// Returns the public verification identity for Governance Audit checkpoints.
+    #[must_use]
+    pub const fn integrity_public_key(&self) -> [u8; 32] {
+        self.integrity_public_key
+    }
+
+    /// Returns the bootstrap-pinned fingerprint of the checkpoint signing identity.
+    #[must_use]
+    pub const fn integrity_key_fingerprint(&self) -> [u8; 32] {
+        self.integrity_key_fingerprint
+    }
+
+    /// Returns the wrapped Instance Integrity Key only to kernel key custody.
+    #[must_use]
+    pub fn protected_integrity_key(&self) -> &[u8] {
+        &self.protected_integrity_key
     }
 
     /// Returns the opaque tenant KEK envelope carried by this authenticated

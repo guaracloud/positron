@@ -7,6 +7,7 @@ use rustix::fs::{self as unix_fs, Dir};
 
 use crate::OwnedPrimaryDataVolume;
 
+use super::audit_checkpoint::GovernanceAuditCheckpoint;
 use super::codec::MAX_AUDIT_RECORD_BYTES;
 use super::preparation::{MAX_PREPARED_BYTES, PreparedCommit};
 use super::types::{
@@ -51,6 +52,7 @@ pub use fault::{
 pub(super) const FRAME_OVERHEAD_BYTES: usize = 315;
 const MAX_COMMIT_FRAME_BYTES: usize = 262_144;
 const MAX_AUDIT_FRAME_BYTES: usize = MAX_AUDIT_RECORD_BYTES + FRAME_OVERHEAD_BYTES;
+const MAX_AUDIT_CHECKPOINT_FRAME_BYTES: usize = 512 + FRAME_OVERHEAD_BYTES;
 const PREPARED_NAME: &str = "prepared.manifest";
 const PREPARED_IDENTITY_BYTES: usize = 32;
 const MAX_PREPARED_FRAME_BYTES: usize =
@@ -62,6 +64,7 @@ pub(super) struct CatalogStorage {
     _catalog: File,
     objects: File,
     audit: File,
+    audit_checkpoints: File,
     commits: File,
     generations: File,
     staging: File,
@@ -122,6 +125,27 @@ impl CatalogStorage {
             instance,
             ArtifactKind::Audit,
             hash,
+            FormatEpoch(1),
+        )
+    }
+
+    pub(super) fn rewrap_audit_checkpoint(
+        &self,
+        current: &CatalogWrappingKey,
+        replacement: &CatalogWrappingKey,
+        instance: InstanceId,
+        checkpoint: &GovernanceAuditCheckpoint,
+    ) -> Result<(), CatalogFailure> {
+        let name = audit_checkpoint_name(checkpoint.position(), checkpoint.record_hash());
+        self.rewrap_named(
+            &self.audit_checkpoints,
+            &name,
+            MAX_AUDIT_CHECKPOINT_FRAME_BYTES,
+            current,
+            replacement,
+            instance,
+            ArtifactKind::AuditCheckpoint,
+            checkpoint.record_hash(),
             FormatEpoch(1),
         )
     }
@@ -255,6 +279,7 @@ impl CatalogStorage {
         let catalog = open_or_create_directory(&volume._root, "catalog")?;
         let objects = open_or_create_directory(&catalog, "objects")?;
         let audit = open_or_create_directory(&catalog, "governance-audit")?;
+        let audit_checkpoints = open_or_create_directory(&catalog, "governance-audit-checkpoints")?;
         let commits = open_or_create_directory(&catalog, "commits")?;
         let generations = open_or_create_directory(&catalog, "generations")?;
         let staging = open_or_create_directory(&catalog, "staging")?;
@@ -264,6 +289,7 @@ impl CatalogStorage {
             _catalog: catalog,
             objects,
             audit,
+            audit_checkpoints,
             commits,
             generations,
             staging,
@@ -556,6 +582,120 @@ impl CatalogStorage {
             FormatEpoch(1),
             &encoded,
         )
+    }
+
+    pub(super) fn publish_audit_checkpoint(
+        &self,
+        secret: &CatalogSecret,
+        instance: InstanceId,
+        checkpoint: &GovernanceAuditCheckpoint,
+    ) -> Result<(), CatalogFailure> {
+        let name = audit_checkpoint_name(checkpoint.position(), checkpoint.record_hash());
+        let plaintext = checkpoint.encode();
+        if entry_exists(&self.audit_checkpoints, &name)? {
+            if self.read_audit_checkpoint(
+                secret,
+                instance,
+                checkpoint.position(),
+                checkpoint.record_hash(),
+            )? != *checkpoint
+            {
+                return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
+            }
+            return synchronize(&self.audit_checkpoints);
+        }
+        let protected = protect_artifact(
+            secret,
+            instance,
+            ArtifactKind::AuditCheckpoint,
+            checkpoint.record_hash(),
+            FormatEpoch(1),
+            &plaintext,
+        )?;
+        let temporary = format!("checkpoint-{name}");
+        write_transaction_file(
+            &self.staging,
+            &temporary,
+            &protected,
+            CatalogFileEvent::PartialAuditCheckpointWrite,
+        )?;
+        emit_event(CatalogFileEvent::SynchronizeAuditCheckpoint)?;
+        synchronize_named_file(&self.staging, &temporary)?;
+        synchronize(&self.staging)?;
+        unix_fs::renameat(&self.staging, &temporary, &self.audit_checkpoints, &name)
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::StorageUnavailable))?;
+        emit_event(CatalogFileEvent::SynchronizeAuditCheckpointDirectory)?;
+        synchronize(&self.audit_checkpoints)
+    }
+
+    pub(super) fn latest_audit_checkpoint(
+        &self,
+        secret: &CatalogSecret,
+        instance: InstanceId,
+        audit: &[GovernanceAuditRecord],
+    ) -> Result<Option<GovernanceAuditCheckpoint>, CatalogFailure> {
+        let mut directory = Dir::read_from(&self.audit_checkpoints)
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::StorageUnavailable))?;
+        let mut entries = 0_usize;
+        let mut name_bytes = 0_usize;
+        let mut latest = None;
+        while let Some(entry) = directory.read() {
+            let entry =
+                entry.map_err(|_| CatalogFailure::new(CatalogFailureCode::StorageUnavailable))?;
+            let name = entry.file_name();
+            if name.to_bytes() == b"." || name.to_bytes() == b".." {
+                continue;
+            }
+            reserve_directory_entry(&mut entries, &mut name_bytes, name.to_bytes().len())?;
+            let (position, record_hash) = parse_audit_checkpoint_name(name.to_bytes())?;
+            let checkpoint = self.read_audit_checkpoint(secret, instance, position, record_hash)?;
+            let offset = position
+                .checked_sub(1)
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::IntegrityCorruption))?;
+            if audit.get(offset).map(GovernanceAuditRecord::record_hash) != Some(record_hash) {
+                return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
+            }
+            if latest
+                .as_ref()
+                .is_none_or(|current: &GovernanceAuditCheckpoint| {
+                    checkpoint.position() > current.position()
+                })
+            {
+                latest = Some(checkpoint);
+            }
+        }
+        Ok(latest)
+    }
+
+    fn read_audit_checkpoint(
+        &self,
+        secret: &CatalogSecret,
+        instance: InstanceId,
+        position: u64,
+        record_hash: [u8; 32],
+    ) -> Result<GovernanceAuditCheckpoint, CatalogFailure> {
+        let encoded = read_exact_file(
+            &self.audit_checkpoints,
+            audit_checkpoint_name(position, record_hash),
+            MAX_AUDIT_CHECKPOINT_FRAME_BYTES,
+        )?;
+        let plaintext = open_artifact(
+            secret,
+            instance,
+            ArtifactKind::AuditCheckpoint,
+            record_hash,
+            FormatEpoch(1),
+            &encoded,
+        )?;
+        let checkpoint = GovernanceAuditCheckpoint::decode(&plaintext)?;
+        if checkpoint.instance() != instance
+            || checkpoint.position() != position
+            || checkpoint.record_hash() != record_hash
+        {
+            return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
+        }
+        Ok(checkpoint)
     }
 
     pub(super) fn publish_commit(
@@ -881,6 +1021,50 @@ fn object_name(format_epoch: FormatEpoch, identity: CatalogObjectId) -> String {
 
 fn audit_name(position: u64, hash: [u8; 32]) -> String {
     format!("{position:020}-{}.frame", hex(&hash))
+}
+
+fn audit_checkpoint_name(position: u64, hash: [u8; 32]) -> String {
+    format!("{position:020}-{}.checkpoint", hex(&hash))
+}
+
+fn parse_audit_checkpoint_name(name: &[u8]) -> Result<(u64, [u8; 32]), CatalogFailure> {
+    if name.len() != 96 || name.get(20) != Some(&b'-') || name.get(85..) != Some(b".checkpoint") {
+        return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
+    }
+    let mut position = 0_u64;
+    for byte in name
+        .get(..20)
+        .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::IntegrityCorruption))?
+    {
+        let digit = byte
+            .checked_sub(b'0')
+            .filter(|digit| *digit <= 9)
+            .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::IntegrityCorruption))?;
+        position = position
+            .checked_mul(10)
+            .and_then(|value| value.checked_add(u64::from(digit)))
+            .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::IntegrityCorruption))?;
+    }
+    if position == 0 {
+        return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
+    }
+    let hexadecimal = name
+        .get(21..85)
+        .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::IntegrityCorruption))?;
+    let mut hash = [0_u8; 32];
+    for (destination, pair) in hash.iter_mut().zip(hexadecimal.chunks_exact(2)) {
+        let high = hex_value(pair.first().copied())
+            .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::IntegrityCorruption))?;
+        let low = hex_value(pair.get(1).copied())
+            .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::IntegrityCorruption))?;
+        *destination = (high << 4) | low;
+    }
+    if hash.iter().all(|byte| *byte == 0)
+        || audit_checkpoint_name(position, hash).as_bytes() != name
+    {
+        return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
+    }
+    Ok((position, hash))
 }
 
 fn commit_name(identity: CatalogGenerationId) -> String {

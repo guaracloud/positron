@@ -7,9 +7,10 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 
 use positron_kernel::{
-    AdmissionFailureCode, AuditIntent, Catalog, CatalogFailureCode, CatalogObject, CatalogProposal,
-    CatalogSecret, CatalogWrappingKey, FormatEpoch, InstanceId, MountQualification,
-    PrimaryDataVolume, RecoveryWorkClaim, RecoveryWorkKind, ResourceDimension, TransactionId,
+    AdmissionFailureCode, AuditCheckpointSigner, AuditIntent, Catalog, CatalogFailureCode,
+    CatalogObject, CatalogProposal, CatalogSecret, CatalogWrappingKey, FormatEpoch, InstanceId,
+    MountQualification, PrimaryDataVolume, RecoveryWorkClaim, RecoveryWorkKind, ResourceDimension,
+    TransactionId,
 };
 
 use super::support::{catalog_recovery_claim, establish_catalog_authority};
@@ -247,6 +248,50 @@ fn governance_sensitive_generation_and_audit_record_publish_jointly() -> Result<
         audit[0].intent(),
         b"principal=system; action=tenant.read-only; outcome=succeeded"
     );
+    Ok(())
+}
+
+#[test]
+fn signed_audit_checkpoint_binds_the_visible_chain_frontier() -> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_catalog_authority(volume)?;
+    let instance = InstanceId::new(id(13))?;
+    let catalog = Catalog::open(
+        &authority,
+        instance,
+        CatalogSecret::from_owned(Box::new([0x93; 32]), Box::new([0xa3; 32])),
+    )?;
+    let signer = AuditCheckpointSigner::from_seed(Box::new([0xb3; 32]))?;
+    let public_key = signer.public_key();
+
+    catalog.commit(
+        catalog.pin()?.identity(),
+        CatalogProposal::new(
+            TransactionId::new(id(14))?,
+            FormatEpoch::new(1)?,
+            vec![CatalogObject::new(b"governed change".to_vec())?],
+        )?,
+        Some(AuditIntent::new(b"action=tenant.suspend".to_vec())?),
+    )?;
+
+    let checkpoint = catalog.publish_audit_checkpoint(&signer)?;
+    assert_eq!(checkpoint.instance(), instance);
+    assert_eq!(checkpoint.position(), 1);
+    assert_eq!(
+        checkpoint.record_hash(),
+        catalog.governance_audit_records()?[0].record_hash()
+    );
+    checkpoint.verify(public_key)?;
+
+    drop(catalog);
+    let view = Catalog::read_current_view(
+        &authority,
+        instance,
+        CatalogSecret::from_owned(Box::new([0x93; 32]), Box::new([0xa3; 32])),
+    )?;
+    assert_eq!(view.latest_audit_checkpoint()?.as_ref(), Some(&checkpoint));
+    view.verify_audit_chain(public_key, Some(&checkpoint))?;
     Ok(())
 }
 

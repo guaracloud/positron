@@ -7,9 +7,9 @@ use positron_kernel::{MountQualification, PrimaryDataVolume};
 use super::super::storage::fault::CatalogFileEvent;
 use super::super::storage::{with_catalog_fault, with_catalog_fault_after};
 use super::super::{
-    AuditIntent, Catalog, CatalogFailure, CatalogFailureCode, CatalogObject, CatalogProposal,
-    CatalogSecret, CatalogWrappingKey, FormatEpoch, InstanceId, PreparedTransactionInspection,
-    TransactionId,
+    AuditCheckpointSigner, AuditIntent, Catalog, CatalogFailure, CatalogFailureCode, CatalogObject,
+    CatalogProposal, CatalogSecret, CatalogWrappingKey, FormatEpoch, InstanceId,
+    PreparedTransactionInspection, TransactionId,
 };
 #[cfg(feature = "test-support")]
 use super::super::{GovernanceFixtureObject, GovernanceFixtureTarget};
@@ -620,6 +620,88 @@ fn every_pre_marker_fault_recovers_only_the_predecessor() -> Result<(), Box<dyn 
             "{event:?}"
         );
     }
+    Ok(())
+}
+
+#[test]
+fn audit_checkpoint_faults_expose_no_partial_anchor_and_remain_retryable()
+-> Result<(), Box<dyn std::error::Error>> {
+    for event in [
+        CatalogFileEvent::PartialAuditCheckpointWrite,
+        CatalogFileEvent::SynchronizeAuditCheckpoint,
+        CatalogFileEvent::SynchronizeAuditCheckpointDirectory,
+    ] {
+        let root = TemporaryRoot::new()?;
+        let instance = InstanceId::new(id(82))?;
+        let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
+        let authority = establish_catalog_authority(volume)?;
+        let catalog = Catalog::open(&authority, instance, secret())?;
+        catalog.commit(
+            catalog.pin()?.identity(),
+            proposal(83, 84)?,
+            Some(AuditIntent::new(b"action=governed-change".to_vec())?),
+        )?;
+        let signer = AuditCheckpointSigner::from_seed(Box::new([0x85; 32]))?;
+        let failure = with_catalog_fault(event, || catalog.publish_audit_checkpoint(&signer))
+            .expect_err("injected checkpoint persistence failure must fail closed");
+        assert_eq!(
+            failure.code(),
+            CatalogFailureCode::StorageUnavailable,
+            "{event:?}"
+        );
+        drop(catalog);
+
+        let view = Catalog::read_current_view(&authority, instance, secret())?;
+        let recovered = view.latest_audit_checkpoint()?;
+        if let Some(checkpoint) = recovered.as_ref() {
+            checkpoint.verify(signer.public_key())?;
+            assert_eq!(checkpoint.position(), 1, "{event:?}");
+        }
+        view.verify_audit_chain(signer.public_key(), recovered.as_ref())?;
+
+        let catalog = Catalog::open(&authority, instance, secret())?;
+        let checkpoint = catalog.publish_audit_checkpoint(&signer)?;
+        assert_eq!(checkpoint.position(), 1, "{event:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn tampered_audit_checkpoint_fences_recovery() -> Result<(), Box<dyn std::error::Error>> {
+    let root = TemporaryRoot::new()?;
+    let instance = InstanceId::new(id(86))?;
+    let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
+    let authority = establish_catalog_authority(volume)?;
+    let catalog = Catalog::open(&authority, instance, secret())?;
+    catalog.commit(
+        catalog.pin()?.identity(),
+        proposal(87, 88)?,
+        Some(AuditIntent::new(b"action=governed-change".to_vec())?),
+    )?;
+    let signer = AuditCheckpointSigner::from_seed(Box::new([0x89; 32]))?;
+    catalog.publish_audit_checkpoint(&signer)?;
+    drop(catalog);
+
+    let checkpoints = root.0.join("catalog/governance-audit-checkpoints");
+    let checkpoint = fs::read_dir(checkpoints)?
+        .next()
+        .ok_or("checkpoint artifact")??
+        .path();
+    let mut bytes = fs::read(&checkpoint)?;
+    let byte = bytes
+        .first_mut()
+        .ok_or("checkpoint artifact must be nonempty")?;
+    *byte ^= 1;
+    fs::write(checkpoint, bytes)?;
+
+    let failure = match Catalog::read_current_view(&authority, instance, secret()) {
+        Ok(_) => return Err("tampered checkpoint must fence recovery".into()),
+        Err(failure) => failure,
+    };
+    assert!(matches!(
+        failure.code(),
+        CatalogFailureCode::AuthenticationFailed | CatalogFailureCode::IntegrityCorruption
+    ));
     Ok(())
 }
 

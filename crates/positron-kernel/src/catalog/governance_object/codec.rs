@@ -99,9 +99,14 @@ pub(super) fn decode(encoded: &[u8]) -> Result<CatalogGovernanceObject, CatalogF
     }) {
         return Err(corrupt());
     }
-    require_nonzero(cursor.take_array::<32>()?)?;
-    require_nonzero(cursor.take_array::<32>()?)?;
-    cursor.skip_u16_bytes()?;
+    let integrity_public_key = cursor.take_array::<32>()?;
+    let integrity_key_fingerprint = cursor.take_array::<32>()?;
+    require_nonzero(integrity_public_key)?;
+    require_nonzero(integrity_key_fingerprint)?;
+    let protected_integrity_key = cursor.take_u16_bytes()?.to_vec();
+    if protected_integrity_key.is_empty() {
+        return Err(corrupt());
+    }
     let tenant_key_envelope = cursor.take_u16_bytes()?.to_vec();
     let retention_offset = encoded
         .len()
@@ -299,6 +304,9 @@ pub(super) fn decode(encoded: &[u8]) -> Result<CatalogGovernanceObject, CatalogF
         quota_weight,
         quota_resources,
         quota_offset,
+        integrity_public_key,
+        integrity_key_fingerprint,
+        protected_integrity_key,
         tenant_key_envelope,
         lifecycle,
         #[cfg(feature = "test-support")]
@@ -539,10 +547,6 @@ impl<'encoded> Cursor<'encoded> {
             salt,
             hash,
         })
-    }
-
-    fn skip_u16_bytes(&mut self) -> Result<(), CatalogFailure> {
-        self.take_u16_bytes().map(|_| ())
     }
 
     fn take_u16_bytes(&mut self) -> Result<&'encoded [u8], CatalogFailure> {

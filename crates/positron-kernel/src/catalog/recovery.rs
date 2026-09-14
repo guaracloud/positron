@@ -24,6 +24,7 @@ pub(super) fn recover(
         return Ok(CatalogState {
             current: CatalogSnapshot::origin(),
             audit: Vec::new(),
+            audit_checkpoint: None,
             transactions: BTreeMap::new(),
             retained_history_bytes: 0,
         });
@@ -155,9 +156,11 @@ pub(super) fn recover(
         .find(|outcome| outcome.record.generation == highest_generation)
         .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::IntegrityCorruption))?;
     let current = load_snapshot(storage, secret, instance, &latest.record)?;
+    let audit_checkpoint = storage.latest_audit_checkpoint(secret, instance, &audit)?;
     Ok(CatalogState {
         current,
         audit,
+        audit_checkpoint,
         transactions,
         retained_history_bytes,
     })

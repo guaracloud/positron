@@ -43,6 +43,12 @@ pub(super) fn recovery_resource_claim() -> ResourceAmounts {
     ])
 }
 
+/// Bounded system-maintenance reservation for one signed audit anchor.
+pub(super) fn audit_checkpoint_resource_claim() -> ResourceAmounts {
+    ResourceAmounts::new([1_048_576, 1, 1, 1_048_576, 4, 0, 1, 1, 1, 4, 16_384])
+        .maximum(recovery_resource_claim())
+}
+
 pub(super) fn commit_resource_claim(
     proposal: &CatalogProposal,
     audit: Option<&AuditIntent>,

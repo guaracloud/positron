@@ -22,6 +22,7 @@ const ENVELOPE_CONTEXT_DOMAIN: &[u8] = b"positron-catalog-key-envelope-context-v
 pub(super) enum ArtifactKind {
     Object,
     Audit,
+    AuditCheckpoint,
     Commit,
     Prepared,
 }
@@ -31,15 +32,16 @@ impl ArtifactKind {
         match self {
             Self::Object => 1,
             Self::Audit => 2,
-            Self::Commit => 3,
-            Self::Prepared => 4,
+            Self::AuditCheckpoint => 3,
+            Self::Commit => 4,
+            Self::Prepared => 5,
         }
     }
 
     const fn system_kind(self) -> SystemObjectKind {
         match self {
             Self::Object | Self::Commit | Self::Prepared => SystemObjectKind::Catalog,
-            Self::Audit => SystemObjectKind::GovernanceAudit,
+            Self::Audit | Self::AuditCheckpoint => SystemObjectKind::GovernanceAudit,
         }
     }
 }

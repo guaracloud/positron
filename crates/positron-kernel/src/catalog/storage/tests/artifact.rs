@@ -7,6 +7,7 @@ fn protected_artifacts_bind_kind_identity_epoch_and_secret() {
     for kind in [
         ArtifactKind::Object,
         ArtifactKind::Audit,
+        ArtifactKind::AuditCheckpoint,
         ArtifactKind::Commit,
     ] {
         let first = protect_artifact(&secret(1), instance(1), kind, identity, epoch, b"plaintext")
@@ -46,9 +47,10 @@ fn protected_artifacts_bind_kind_identity_epoch_and_secret() {
 
         let other_kind = match kind {
             ArtifactKind::Object => ArtifactKind::Audit,
-            ArtifactKind::Audit | ArtifactKind::Commit | ArtifactKind::Prepared => {
-                ArtifactKind::Object
-            },
+            ArtifactKind::Audit
+            | ArtifactKind::AuditCheckpoint
+            | ArtifactKind::Commit
+            | ArtifactKind::Prepared => ArtifactKind::Object,
         };
         assert_eq!(
             open_artifact(&secret(1), instance(1), other_kind, identity, epoch, &first)
