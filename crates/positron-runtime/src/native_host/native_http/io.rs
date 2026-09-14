@@ -313,7 +313,7 @@ pub(in crate::native_host) fn write_response<S: Write>(
 mod tests {
     use std::io::{Cursor, Read, Write};
 
-    use super::serve_tls_api_connection;
+    use super::super::serve_tls_api_connection;
 
     struct MemoryStream {
         input: Cursor<Vec<u8>>,
