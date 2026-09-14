@@ -7,10 +7,16 @@ use super::{
     map_query_failure_code, map_receive_failure,
 };
 
+mod format_migration_compatibility;
 mod schema_maintenance;
 mod schema_replay_integrity;
 mod schema_routes;
-mod tenant_envelope;
+mod tenant_aliases;
+mod tenant_credentials;
+mod tenant_provisioning;
+mod tenant_retention_administration;
+mod tenant_retention_confirmation;
+mod tenant_retention_recovery;
 mod trace_visibility;
 
 #[test]

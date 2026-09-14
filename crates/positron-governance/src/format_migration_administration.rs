@@ -6,7 +6,6 @@ use positron_kernel::{
     AuditIntent, Catalog, CatalogFailureCode, CatalogObject, CatalogProposal, FormatEpoch,
     TransactionId,
 };
-use positron_policy::IngestPolicy;
 
 use crate::{
     AdministrativeIdempotencyKey, AuthorizedContext, TenantAdministration,
@@ -72,10 +71,8 @@ impl CatalogFormatMigrationAdministration {
         let transaction = TransactionId::new(idempotency.to_bytes()).map_err(map_catalog)?;
         match snapshot.format_epoch() {
             Some(FormatEpoch::CATALOG_V1) => {
-                let (_, governance) = snapshot.governance_object().map_err(map_catalog)?;
-                let default_tenant = governance.tenant();
+                let _ = snapshot.governance_object().map_err(map_catalog)?;
                 let mut objects = Vec::new();
-                let mut has_default_policy = false;
                 for identity in snapshot.object_identities() {
                     let bytes = snapshot
                         .object(identity)
@@ -84,28 +81,12 @@ impl CatalogFormatMigrationAdministration {
                     if is_registry(bytes) {
                         continue;
                     }
-                    if IngestPolicy::decode_activated_object(default_tenant, bytes)
-                        .map_err(|_| CatalogFormatMigrationFailure::InvalidState)?
-                        .is_some()
-                    {
-                        if has_default_policy {
-                            return Err(CatalogFormatMigrationFailure::InvalidState);
-                        }
-                        has_default_policy = true;
-                    }
                     objects.push(CatalogObject::new(bytes.to_vec()).map_err(map_catalog)?);
                 }
                 objects.push(
                     TenantAdministration::epoch_two_registry(&snapshot)
                         .map_err(|_| CatalogFormatMigrationFailure::InvalidState)?,
                 );
-                if !has_default_policy {
-                    let policy = IngestPolicy::preserving(1)
-                        .map_err(|_| CatalogFormatMigrationFailure::InvalidState)?
-                        .activated_object(default_tenant)
-                        .map_err(|_| CatalogFormatMigrationFailure::InvalidState)?;
-                    objects.push(CatalogObject::new(policy.into_bytes()).map_err(map_catalog)?);
-                }
                 let audit = encode_audit(administrator, idempotency);
                 let commit = catalog
                     .commit(
