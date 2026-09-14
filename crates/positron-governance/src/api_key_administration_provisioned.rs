@@ -93,6 +93,7 @@ impl ApiKeyAdministration {
             MutationAudit {
                 idempotency: request.idempotency,
                 actor: request.actor.principal_id(),
+                tenant: Some(tenant),
                 principal,
                 target: principal,
                 scope: scope_code,
@@ -176,6 +177,7 @@ impl ApiKeyAdministration {
         if let Some(replay) = replay_tenant_rotation(
             catalog,
             &keyring,
+            tenant,
             request.idempotency,
             request.actor.principal_id(),
             request.predecessor,
@@ -242,6 +244,7 @@ impl ApiKeyAdministration {
             MutationAudit {
                 idempotency: request.idempotency,
                 actor: request.actor.principal_id(),
+                tenant: Some(tenant),
                 principal,
                 target: predecessor.principal(),
                 scope: predecessor.scope_code(),
@@ -290,6 +293,7 @@ impl ApiKeyAdministration {
         if replay_tenant_revocation(
             catalog,
             &keyring,
+            tenant,
             idempotency,
             actor.principal_id(),
             principal,
@@ -350,6 +354,7 @@ impl ApiKeyAdministration {
             MutationAudit {
                 idempotency,
                 actor: actor.principal_id(),
+                tenant: Some(tenant),
                 principal,
                 target: principal,
                 scope,

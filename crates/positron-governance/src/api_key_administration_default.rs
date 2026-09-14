@@ -128,6 +128,7 @@ impl ApiKeyAdministration {
             MutationAudit {
                 idempotency: request.idempotency,
                 actor: request.actor.principal_id(),
+                tenant: None,
                 principal,
                 target: principal,
                 scope: scope_code,
@@ -156,6 +157,15 @@ impl ApiKeyAdministration {
         }
         let snapshot = catalog.pin().map_err(map_catalog)?;
         let (_, governance) = snapshot.governance_object().map_err(map_catalog)?;
+        if let Some(replay) = replay_rotation(
+            catalog,
+            request.idempotency,
+            request.actor.principal_id(),
+            request.predecessor,
+            request.expected,
+        )? {
+            return Ok(replay);
+        }
         let predecessor = governance
             .credentials()
             .iter()
@@ -173,15 +183,6 @@ impl ApiKeyAdministration {
             predecessor.expires_at_unix_seconds(),
             request.expected,
         )?;
-        if let Some(replay) = replay_rotation(
-            catalog,
-            request.idempotency,
-            request.actor.principal_id(),
-            request.predecessor,
-            request.expected,
-        )? {
-            return Ok(replay);
-        }
         match catalog
             .resume_prepared(
                 TransactionId::new(request.idempotency.to_bytes()).map_err(map_catalog)?,
@@ -250,6 +251,7 @@ impl ApiKeyAdministration {
             MutationAudit {
                 idempotency: request.idempotency,
                 actor: request.actor.principal_id(),
+                tenant: None,
                 principal,
                 target: predecessor.principal(),
                 scope,
@@ -319,6 +321,7 @@ impl ApiKeyAdministration {
             MutationAudit {
                 idempotency,
                 actor: actor.principal_id(),
+                tenant: None,
                 principal,
                 target: principal,
                 scope,

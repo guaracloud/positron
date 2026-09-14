@@ -204,6 +204,22 @@ fn read_only_transition_is_durable_idempotent_and_preserves_query_access()
         replay.audit_ingest_time_unix_seconds(),
         transitioned.audit_ingest_time_unix_seconds(),
     );
+    let later = instance.transition_tenant_lifecycle(
+        administrator()?,
+        instance.default_tenant_id(),
+        TenantLifecycleState::Suspended,
+        ResourceGeneration::new(2)?,
+        AdministrativeIdempotencyKey::new([0x73; 16])?,
+    )?;
+    assert_eq!(later.resource_generation().get(), 3);
+    let historical_replay = instance.transition_tenant_lifecycle(
+        administrator()?,
+        instance.default_tenant_id(),
+        TenantLifecycleState::ReadOnly,
+        ResourceGeneration::new(1)?,
+        idempotency,
+    )?;
+    assert_eq!(historical_replay, transitioned);
     drop(instance);
 
     let reopened = InstanceBootstrap::reopen(&paths)?;
@@ -750,6 +766,22 @@ fn api_key_create_rejects_stale_generation_and_mismatched_idempotency_reuse()
         ResourceGeneration::new(1)?,
         idempotency,
     )?;
+    let later = instance.create_api_key(
+        administrator()?,
+        Scope::Query,
+        None,
+        ResourceGeneration::new(2)?,
+        AdministrativeIdempotencyKey::new([0x51; 16])?,
+    )?;
+    let historical_replay = instance.create_api_key(
+        administrator()?,
+        Scope::Ingest,
+        None,
+        ResourceGeneration::new(1)?,
+        idempotency,
+    )?;
+    assert!(historical_replay.secret().is_none());
+    assert_ne!(historical_replay.principal_id(), later.principal_id());
     let descriptors_before_failure = instance.list_api_keys(administrator()?)?;
     let mismatch = instance
         .create_api_key(

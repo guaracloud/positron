@@ -192,6 +192,10 @@ use api_key_administration_support::*;
 mod api_key_administration_replay;
 use api_key_administration_replay::*;
 
+#[path = "api_key_administration_receipt.rs"]
+mod api_key_administration_receipt;
+use api_key_administration_receipt::*;
+
 #[path = "api_key_administration_keyring.rs"]
 mod api_key_administration_keyring;
 use api_key_administration_keyring::*;
