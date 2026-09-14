@@ -551,14 +551,14 @@ impl TenantAdministration {
         candidate: TenantCreateCandidate,
     ) -> Result<TenantCreation, TenantAdministrationFailure> {
         let request = &candidate.request;
-        validate_request(administrator, &request)?;
+        validate_request(administrator, request)?;
         let snapshot = catalog.pin().map_err(map_catalog)?;
-        if let Some(replay) = replay_snapshot(&snapshot, &request)? {
+        if let Some(replay) = replay_snapshot(&snapshot, request)? {
             return Ok(replay);
         }
         let mut registry =
             registry(&snapshot)?.ok_or(TenantAdministrationFailure::PersistenceUnavailable)?;
-        let digest = request_digest(&request);
+        let digest = request_digest(request);
         let transaction =
             TransactionId::new(request.idempotency.to_bytes()).map_err(map_catalog)?;
         let prepared = match catalog.resume_prepared(transaction, digest) {
@@ -571,7 +571,7 @@ impl TenantAdministration {
                 return Err(TenantAdministrationFailure::PersistenceUnavailable);
             },
             PreparedTransactionResolution::Resumed(commit) => {
-                let replay = replay_snapshot(&catalog.pin().map_err(map_catalog)?, &request)?
+                let replay = replay_snapshot(&catalog.pin().map_err(map_catalog)?, request)?
                     .ok_or(TenantAdministrationFailure::PersistenceUnavailable)?;
                 let audit_position = commit
                     .governance_audit_record()

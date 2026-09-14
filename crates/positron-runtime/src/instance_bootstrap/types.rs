@@ -132,7 +132,7 @@ impl TenantRetentionImpactPreview {
 pub(super) struct IngestDrainGate {
     state: Mutex<IngestDrainState>,
     changed: Condvar,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     transition_observer: Mutex<Option<std::sync::mpsc::Sender<()>>>,
 }
 
@@ -1147,7 +1147,7 @@ impl InitializedInstance {
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(test)]
     #[doc(hidden)]
     pub fn install_retention_time_for_test(
         &mut self,
@@ -1345,7 +1345,9 @@ impl InitializedInstance {
 
     /// Atomically publishes a new tenant registry record, then enrolls that
     /// tenant in the live bounded admission authority.
-    pub(crate) fn create_tenant(
+    #[cfg(any(test, feature = "test-support"))]
+    #[allow(dead_code)]
+    pub fn create_tenant(
         &self,
         actor: AuthorizedContext,
         tenant: TenantId,
