@@ -102,6 +102,14 @@ fn plaintext_audit_write_failure_prevents_data_listener_serving()
             positron_runtime::ListenerRole::Control | positron_runtime::ListenerRole::Operations
         )
     }));
+    assert!(
+        !tasks
+            .events
+            .borrow()
+            .iter()
+            .any(|event| matches!(event, TaskEvent::Spawned(positron_runtime::TaskRole::Api))),
+        "the failed plaintext audit must precede API task activation"
+    );
     Ok(())
 }
 

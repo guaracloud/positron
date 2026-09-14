@@ -10,9 +10,9 @@ use positron_governance::{
     InitialTenantIntent, PresentedCredential, RequestedIntent,
 };
 use positron_kernel::{
-    ActiveSegmentLedger, AuditIntent, Catalog, CatalogObject, CatalogProposal, CatalogSecret,
-    CatalogWrappingKey, FormatEpoch, MountQualification, PrimaryDataVolume, SegmentScope,
-    TransactionId,
+    ActiveSegmentLedger, AuditIntent, Catalog, CatalogObject, CatalogProposal,
+    CatalogPublicationFault, CatalogSecret, CatalogWrappingKey, FormatEpoch, MountQualification,
+    PrimaryDataVolume, SegmentScope, TransactionId, with_catalog_publication_fault_after,
 };
 
 use super::super::InitializationPlan;
@@ -276,6 +276,34 @@ fn legacy_plaintext_audit_publishes_a_first_exact_v2_receipt_without_rewriting_h
     let bound = audit[2].as_listener_transport().expect("bound audit");
     assert_eq!(bound.listener_target(), Some(configured.api_bind_address()));
     assert!(bound.request_digest().is_some());
+    Ok(())
+}
+
+#[test]
+fn plaintext_audit_publication_fault_rejects_the_exact_startup_intent_without_a_receipt()
+-> Result<(), Box<dyn std::error::Error>> {
+    let roots = Roots::new()?;
+    let paths = roots.paths();
+    let initialized = InstanceBootstrap::initialize(&paths, InitializationPlan::non_interactive())?;
+    let configured = PublicPlaintextApiStartupIntent::configuration_file(SocketAddr::from((
+        Ipv4Addr::new(198, 51, 100, 25),
+        8_080,
+    )));
+
+    let failure =
+        with_catalog_publication_fault_after(CatalogPublicationFault::SynchronizeCommit, 0, || {
+            initialized.activate_public_plaintext_api_transport(configured)
+        })
+        .expect_err("the plaintext audit's joint commit must fail closed");
+    assert_eq!(
+        failure.code(),
+        crate::BootstrapFailureCode::CatalogUnavailable
+    );
+    assert_eq!(
+        initialized.governance_audit_for_test()?.len(),
+        1,
+        "the failed plaintext intent must not gain an audit receipt"
+    );
     Ok(())
 }
 
