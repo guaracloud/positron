@@ -22,7 +22,7 @@ fn retention_preview_cli_forwards_a_piped_bearer_to_the_configured_endpoint()
         );
         assert!(request.contains(&format!("\r\n\r\n{{\"tenant\":\"{TENANT}\"")));
         let body = format!(
-            "{{\"tenant\":\"{TENANT}\",\"retention_generation\":1,\"proposed_retention_seconds\":86400,\"catalog_identity\":\"abababababababababababababababababababababababababababababababab\",\"catalog_generation\":7,\"confirmation_digest\":\"abababababababababababababababababababababababababababababababab\",\"scopes\":[]}}"
+            "{{\"tenant\":\"{TENANT}\",\"retention_generation\":1,\"proposed_retention_seconds\":86400,\"catalog_identity\":\"abababababababababababababababababababababababababababababababab\",\"catalog_generation\":7,\"confirmation_digest\":\"abababababababababababababababababababababababababababababababab\",\"confirmation_evaluated_at_unix_nanos\":123,\"scopes\":[]}}"
         );
         stream.write_all(
             format!(
