@@ -55,6 +55,7 @@ fn execute(arguments: impl Iterator<Item = String>) -> Result<(), &'static str> 
                     preview.catalog_identity.clone(),
                     preview.catalog_generation,
                     preview.confirmation_digest.clone(),
+                    preview.confirmation_evaluated_at_unix_nanos,
                 );
                 if let Some(expected) = &complete {
                     if expected != &current {
@@ -77,10 +78,10 @@ fn execute(arguments: impl Iterator<Item = String>) -> Result<(), &'static str> 
                     None => break,
                 }
             }
-            let (tenant, generation, proposed, identity, catalog_generation, digest) =
+            let (tenant, generation, proposed, identity, catalog_generation, digest, evaluation) =
                 complete.ok_or("retention preview response was empty")?;
             println!(
-                "tenant={tenant} retention_generation={generation} proposed_retention_seconds={proposed} catalog_identity={identity} catalog_generation={catalog_generation} confirmation_digest={digest} scopes={scopes}"
+                "tenant={tenant} retention_generation={generation} proposed_retention_seconds={proposed} catalog_identity={identity} catalog_generation={catalog_generation} confirmation_digest={digest} confirmation_evaluated_at_unix_nanos={evaluation} scopes={scopes}"
             );
         },
         Request::Update(request) => {
@@ -162,6 +163,7 @@ fn parse(
                 | "--proposed-retention-seconds"
                 | "--expected-generation"
                 | "--confirmation-digest"
+                | "--confirmation-evaluated-at-unix-nanos"
                 | "--idempotency-key"
                 | "--server-name"
                 | "--trust-file"
@@ -193,18 +195,28 @@ fn parse(
                 None => request,
             })
         },
-        "update" => Request::Update(TenantRetentionUpdateRequest::new(
-            tenant,
-            proposed_retention_seconds,
-            positive_u64(
-                options.remove("--expected-generation"),
-                "--expected-generation is required",
-            )?,
-            options.remove("--confirmation-digest"),
-            options
-                .remove("--idempotency-key")
-                .ok_or("--idempotency-key is required")?,
-        )),
+        "update" => {
+            let digest = options.remove("--confirmation-digest");
+            let mut request = TenantRetentionUpdateRequest::new(
+                tenant,
+                proposed_retention_seconds,
+                positive_u64(
+                    options.remove("--expected-generation"),
+                    "--expected-generation is required",
+                )?,
+                digest.clone(),
+                options
+                    .remove("--idempotency-key")
+                    .ok_or("--idempotency-key is required")?,
+            );
+            if digest.is_some() {
+                request = request.with_confirmation_evaluated_at_unix_nanos(positive_i64(
+                    options.remove("--confirmation-evaluated-at-unix-nanos"),
+                    "--confirmation-evaluated-at-unix-nanos is required with confirmation",
+                )?);
+            }
+            Request::Update(request)
+        },
         _ => return Err(usage()),
     };
     if !options.is_empty() {
@@ -264,8 +276,20 @@ fn positive_u64(value: Option<String>, absent: &'static str) -> Result<u64, &'st
         })
 }
 
+fn positive_i64(value: Option<String>, absent: &'static str) -> Result<i64, &'static str> {
+    value
+        .ok_or(absent)?
+        .parse::<i64>()
+        .map_err(|_| "invalid retention evaluation time")
+        .and_then(|value| {
+            (value > 0)
+                .then_some(value)
+                .ok_or("invalid retention evaluation time")
+        })
+}
+
 const fn usage() -> &'static str {
-    "usage: positron tenant retention preview --endpoint IP:PORT --credential-stdin --tenant UUID --proposed-retention-seconds N [--continuation OPAQUE_TOKEN] [--server-name NAME --trust-file PATH | --allow-plaintext]\n       positron tenant retention update --endpoint IP:PORT --credential-stdin --tenant UUID --proposed-retention-seconds N --expected-generation N --idempotency-key UUID [--confirmation-digest HEX] [--server-name NAME --trust-file PATH | --allow-plaintext]"
+    "usage: positron tenant retention preview --endpoint IP:PORT --credential-stdin --tenant UUID --proposed-retention-seconds N [--continuation OPAQUE_TOKEN] [--server-name NAME --trust-file PATH | --allow-plaintext]\n       positron tenant retention update --endpoint IP:PORT --credential-stdin --tenant UUID --proposed-retention-seconds N --expected-generation N --idempotency-key UUID [--confirmation-digest HEX --confirmation-evaluated-at-unix-nanos N] [--server-name NAME --trust-file PATH | --allow-plaintext]"
 }
 
 #[cfg(test)]
@@ -318,7 +342,7 @@ mod tests {
 
     fn update(transport: &str) -> String {
         format!(
-            "update --endpoint 127.0.0.1:8080 --credential-stdin --tenant 22222222-2222-2222-2222-222222222222 --proposed-retention-seconds 86400 --expected-generation 1 --confirmation-digest abababababababababababababababababababababababababababababababab --idempotency-key 01010101-0101-0101-0101-010101010101 {transport}"
+            "update --endpoint 127.0.0.1:8080 --credential-stdin --tenant 22222222-2222-2222-2222-222222222222 --proposed-retention-seconds 86400 --expected-generation 1 --confirmation-digest abababababababababababababababababababababababababababababababab --confirmation-evaluated-at-unix-nanos 123 --idempotency-key 01010101-0101-0101-0101-010101010101 {transport}"
         )
     }
 }

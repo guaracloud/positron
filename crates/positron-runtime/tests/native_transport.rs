@@ -1950,13 +1950,15 @@ fn configured_tls_api_listener_serves_tenant_retention_preview_and_confirmed_upd
     )?;
     assert_eq!(preview.tenant, tenant.to_canonical_text());
     let digest = preview.confirmation_digest;
+    let evaluation = preview.confirmation_evaluated_at_unix_nanos;
     let reduction = positron_api::tenant_retention::TenantRetentionUpdateRequest::new(
         tenant.to_canonical_text(),
         86_400,
         preview.retention_generation,
         Some(digest.clone()),
         "ebebebeb-ebeb-ebeb-ebeb-ebebebebebeb".to_owned(),
-    );
+    )
+    .with_confirmation_evaluated_at_unix_nanos(evaluation);
     let updated = client.update(&administrator_secret, &reduction)?;
     assert_eq!(updated.retention_generation, 2);
     assert_eq!(client.update(&administrator_secret, &reduction)?, updated);
@@ -1970,7 +1972,7 @@ fn configured_tls_api_listener_serves_tenant_retention_preview_and_confirmed_upd
             ("Content-Type", "application/json"),
         ],
         format!(
-            r#"{{"tenant":"{}","proposed_retention_seconds":86400,"expected_generation":1,"confirmation_digest":"{digest}","idempotency_key":"ecececec-ecec-ecec-ecec-ecececececec"}}"#,
+            r#"{{"tenant":"{}","proposed_retention_seconds":86400,"expected_generation":1,"confirmation_digest":"{digest}","confirmation_evaluated_at_unix_nanos":{evaluation},"idempotency_key":"ecececec-ecec-ecec-ecec-ecececececec"}}"#,
             tenant.to_canonical_text()
         )
         .as_bytes(),

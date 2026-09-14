@@ -1,5 +1,5 @@
 {
-  "schema_digest": "0e7b239667b2eb2a8ea5d6a0e99de55ba8427941e1cd5476ab4e708414e8787a",
+  "schema_digest": "f55d1ef754a0d1e1752a48851f259a025eb16cc91059f2daf2c668cd42ca0081",
   "max_request_bytes": 64,
   "unknown_fields": "reject",
   "enums": {
@@ -579,7 +579,8 @@
         {"proto":"catalog_generation","json":"catalog_generation","type":"uint64","number":5,"deprecated":false},
         {"proto":"confirmation_digest","json":"confirmation_digest","type":"string","number":6,"deprecated":false},
         {"proto":"scopes","json":"scopes","type":"TenantRetentionScopeImpact","number":7,"deprecated":false,"repeated":true},
-        {"proto":"continuation","json":"continuation","type":"string","number":8,"deprecated":false}
+        {"proto":"continuation","json":"continuation","type":"string","number":8,"deprecated":false},
+        {"proto":"confirmation_evaluated_at_unix_nanos","json":"confirmation_evaluated_at_unix_nanos","type":"sint64","number":9,"deprecated":false}
       ],
       "responses":{"200":"TenantRetentionPreviewResponse","400":"invalid_request","401":"authentication_rejected","404":"tenant_unavailable","409":"stale_continuation","503":"administration_unavailable"}
     },
@@ -599,7 +600,8 @@
         {"proto":"proposed_retention_seconds","json":"proposed_retention_seconds","type":"uint64","number":2,"deprecated":false},
         {"proto":"expected_generation","json":"expected_generation","type":"uint64","number":3,"deprecated":false},
         {"proto":"confirmation_digest","json":"confirmation_digest","type":"string","number":4,"deprecated":false,"optional":true},
-        {"proto":"idempotency_key","json":"idempotency_key","type":"string","number":5,"deprecated":false}
+        {"proto":"idempotency_key","json":"idempotency_key","type":"string","number":5,"deprecated":false},
+        {"proto":"confirmation_evaluated_at_unix_nanos","json":"confirmation_evaluated_at_unix_nanos","type":"sint64","number":6,"deprecated":false,"optional":true}
       ],
       "response_fields": [
         {"proto":"tenant","json":"tenant","type":"string","number":1,"deprecated":false},

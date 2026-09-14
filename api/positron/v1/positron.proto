@@ -200,6 +200,7 @@ message TenantRetentionPreviewResponse {
   string confirmation_digest = 6;
   repeated TenantRetentionScopeImpact scopes = 7;
   optional string continuation = 8;
+  sint64 confirmation_evaluated_at_unix_nanos = 9;
 }
 
 message TenantRetentionUpdateRequest {
@@ -208,6 +209,7 @@ message TenantRetentionUpdateRequest {
   uint64 expected_generation = 3;
   optional string confirmation_digest = 4;
   string idempotency_key = 5;
+  optional sint64 confirmation_evaluated_at_unix_nanos = 6;
 }
 
 message TenantRetentionUpdateResponse {

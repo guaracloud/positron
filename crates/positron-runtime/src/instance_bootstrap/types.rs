@@ -122,6 +122,30 @@ impl TenantRetentionImpactPreview {
         }
         hash.finalize().into()
     }
+
+    /// A retained confirmation remains usable across ordinary clock movement
+    /// only while no scope can reclaim or affect more data than it did in the
+    /// preview. Catalog and generation bindings are checked separately.
+    fn current_impact_does_not_exceed(&self, preview: &Self) -> bool {
+        self.scopes.len() == preview.scopes.len()
+            && self
+                .scopes
+                .iter()
+                .zip(&preview.scopes)
+                .all(|(current, prior)| {
+                    current.scope() == prior.scope()
+                        && current.catalog_identity() == prior.catalog_identity()
+                        && current.catalog_generation() == prior.catalog_generation()
+                        && current.approximate_affected_bytes()
+                            <= prior.approximate_affected_bytes()
+                        && current.approximate_immediately_reclaimable_bytes()
+                            <= prior.approximate_immediately_reclaimable_bytes()
+                        && current.deferred_active_segment_bytes()
+                            <= prior.deferred_active_segment_bytes()
+                        && current.deferred_mixed_sealed_segment_bytes()
+                            <= prior.deferred_mixed_sealed_segment_bytes()
+                })
+    }
 }
 
 /// Coordinates the bounded native-ingest finalization with lifecycle closure.
@@ -1551,58 +1575,57 @@ impl InitializedInstance {
         identity
             .authorize_tenant_retention(actor, tenant)
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ApiKeyUnauthorized))?;
-        let mut scopes = Vec::new();
-        let mut evaluated_at = requested_evaluation;
-        for signal in [SignalKind::Logs, SignalKind::Traces] {
-            for scope in snapshot
-                .reachable_ledger_scopes(tenant, signal)
-                .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?
-            {
-                let protection = self
-                    .key
-                    .segment_key_from_tenant_envelope(
-                        self.instance,
-                        scope,
-                        identity.tenant_key_envelope(tenant).map_err(|_| {
-                            BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable)
-                        })?,
-                    )
+        let ledger_scopes = [SignalKind::Logs, SignalKind::Traces]
+            .into_iter()
+            .map(|signal| snapshot.reachable_ledger_scopes(tenant, signal))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        let evaluation = match requested_evaluation {
+            Some(value) => value,
+            None => {
+                let seconds = ledger_scopes
+                    .iter()
+                    .map(|scope| self.retention_time.governance_time_seconds(*scope))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?
+                    .into_iter()
+                    .max()
+                    .map(Ok)
+                    .unwrap_or_else(|| self.retention_time.governance_now_seconds())
                     .map_err(|_| {
-                        BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable)
+                        BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable)
                     })?;
-                let evaluation = match evaluated_at {
-                    Some(value) => value,
-                    None => {
-                        let seconds =
-                            self.retention_time
-                                .governance_time_seconds(scope)
-                                .map_err(|_| {
-                                    BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable)
-                                })?;
-                        let nanos = seconds
-                            .checked_mul(1_000_000_000)
-                            .and_then(|value| i64::try_from(value).ok())
-                            .ok_or_else(|| {
-                                BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable)
-                            })?;
-                        let value = positron_domain::time::UnixNanoseconds::new(nanos);
-                        evaluated_at = Some(value);
-                        value
-                    },
-                };
-                let reader =
-                    CommittedLedgerReader::open(&self._authority, &catalog, scope, protection)
-                        .map_err(|_| {
-                            BootstrapFailure::new(BootstrapFailureCode::LedgerUnavailable)
-                        })?;
-                scopes.push(
-                    reader
-                        .inspect_retention_impact_at(proposed_retention_seconds, evaluation)
-                        .map_err(|_| {
-                            BootstrapFailure::new(BootstrapFailureCode::LedgerUnavailable)
-                        })?,
-                );
-            }
+                let nanos = seconds
+                    .checked_mul(1_000_000_000)
+                    .and_then(|value| i64::try_from(value).ok())
+                    .ok_or_else(|| {
+                        BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable)
+                    })?;
+                positron_domain::time::UnixNanoseconds::new(nanos)
+            },
+        };
+        let mut scopes = Vec::new();
+        for scope in ledger_scopes {
+            let protection = self
+                .key
+                .segment_key_from_tenant_envelope(
+                    self.instance,
+                    scope,
+                    identity.tenant_key_envelope(tenant).map_err(|_| {
+                        BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable)
+                    })?,
+                )
+                .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
+            let reader = CommittedLedgerReader::open(&self._authority, &catalog, scope, protection)
+                .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::LedgerUnavailable))?;
+            scopes.push(
+                reader
+                    .inspect_retention_impact_at(proposed_retention_seconds, evaluation)
+                    .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::LedgerUnavailable))?,
+            );
         }
         Ok(TenantRetentionImpactPreview {
             tenant,
@@ -1611,7 +1634,7 @@ impl InitializedInstance {
             proposed_retention_seconds,
             catalog_identity: snapshot.identity(),
             catalog_generation: snapshot.number(),
-            evaluated_at: evaluated_at.unwrap_or(positron_domain::time::UnixNanoseconds::new(0)),
+            evaluated_at: evaluation,
             scopes,
         })
     }
@@ -1643,6 +1666,7 @@ impl InitializedInstance {
             proposed_retention_seconds,
             expected,
             confirmation.map(TenantRetentionImpactPreview::confirmation_digest),
+            confirmation.map(TenantRetentionImpactPreview::evaluated_at),
             idempotency,
         )
     }
@@ -1658,6 +1682,7 @@ impl InitializedInstance {
         proposed_retention_seconds: NonZeroU64,
         expected: ResourceGeneration,
         confirmation_digest: Option<[u8; 32]>,
+        confirmation_evaluation: Option<positron_domain::time::UnixNanoseconds>,
         idempotency: AdministrativeIdempotencyKey,
     ) -> Result<TenantRetentionUpdate, BootstrapFailure> {
         let requested_confirmation = confirmation_digest
@@ -1689,9 +1714,28 @@ impl InitializedInstance {
             return Ok(replay);
         }
         let (binding, preview_catalog) = if let Some(digest) = confirmation_digest {
-            let current =
+            let evaluation = confirmation_evaluation.ok_or_else(|| {
+                BootstrapFailure::new(BootstrapFailureCode::TenantRetentionInvalidConfirmation)
+            })?;
+            let fresh =
                 self.inspect_tenant_retention_impact(actor, tenant, proposed_retention_seconds)?;
+            if evaluation > fresh.evaluated_at() {
+                return Err(BootstrapFailure::new(
+                    BootstrapFailureCode::TenantRetentionInvalidConfirmation,
+                ));
+            }
+            let current = self.inspect_tenant_retention_impact_at(
+                actor,
+                tenant,
+                proposed_retention_seconds,
+                Some(evaluation),
+            )?;
             if digest != current.confirmation_digest() {
+                return Err(BootstrapFailure::new(
+                    BootstrapFailureCode::TenantRetentionInvalidConfirmation,
+                ));
+            }
+            if !fresh.current_impact_does_not_exceed(&current) {
                 return Err(BootstrapFailure::new(
                     BootstrapFailureCode::TenantRetentionInvalidConfirmation,
                 ));

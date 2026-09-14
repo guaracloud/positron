@@ -232,6 +232,19 @@ impl RetentionTimeAuthority {
     ) -> Result<u64, LifecycleClockFailure> {
         self.lease_time(scope)
     }
+
+    /// Returns process-monotonic trusted time when a retention preview has no
+    /// tenant scopes from which to recover a durable lifecycle frontier.
+    pub fn governance_now_seconds(&self) -> Result<u64, LifecycleClockFailure> {
+        let elapsed = i64::try_from(self.elapsed.nanoseconds()?)
+            .map_err(|_| LifecycleClockFailure::OutOfRange)?;
+        self.epoch
+            .value()
+            .checked_add(elapsed)
+            .and_then(|value| value.checked_div(1_000_000_000))
+            .and_then(|value| u64::try_from(value).ok())
+            .ok_or(LifecycleClockFailure::OutOfRange)
+    }
 }
 
 fn advance(

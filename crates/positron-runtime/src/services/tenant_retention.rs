@@ -16,6 +16,7 @@ use positron_kernel::RetentionReclamationEstimate;
 use crate::instance_bootstrap::TenantRetentionImpactPreview;
 use crate::{BootstrapFailure, BootstrapFailureCode, ServiceHandle};
 
+#[derive(Debug)]
 pub(crate) enum TenantRetentionHttpFailure {
     Code(u16, &'static str),
     StaleGeneration {
@@ -73,6 +74,9 @@ impl ServiceHandle {
             .confirmation_digest()
             .map(parse_confirmation_digest)
             .transpose()?;
+        let evaluation = request
+            .confirmation_evaluated_at_unix_nanos()
+            .map(positron_domain::time::UnixNanoseconds::new);
         let update = self
             .instance
             .update_tenant_retention_with_confirmation_digest(
@@ -81,6 +85,7 @@ impl ServiceHandle {
                 proposed,
                 expected,
                 confirmation_digest,
+                evaluation,
                 AdministrativeIdempotencyKey::new(idempotency.to_bytes())
                     .map_err(|_| TenantRetentionHttpFailure::Code(400, "invalid_request"))?,
             )
@@ -195,6 +200,7 @@ fn preview_response(
         catalog_identity: hex(preview.catalog_identity().to_bytes()),
         catalog_generation: preview.catalog_generation(),
         confirmation_digest: hex(preview.confirmation_digest()),
+        confirmation_evaluated_at_unix_nanos: preview.evaluated_at().value(),
         scopes: preview.scopes()[start..end]
             .iter()
             .copied()

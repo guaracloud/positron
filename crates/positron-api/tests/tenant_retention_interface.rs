@@ -22,7 +22,8 @@ fn retention_requests_are_bounded_and_bind_reductions_to_an_opaque_preview_diges
         1,
         Some(DIGEST.to_owned()),
         IDEMPOTENCY.to_owned(),
-    );
+    )
+    .with_confirmation_evaluated_at_unix_nanos(123);
     assert_eq!(
         TenantRetentionUpdateRequest::decode(&reduction.encode().expect("encode reduction")),
         Ok(reduction)
@@ -35,6 +36,7 @@ fn retention_requests_are_bounded_and_bind_reductions_to_an_opaque_preview_diges
             Some(DIGEST.to_owned()),
             IDEMPOTENCY.to_owned(),
         )
+        .with_confirmation_evaluated_at_unix_nanos(123)
         .validate()
         .is_ok()
     );
@@ -44,6 +46,10 @@ fn retention_requests_are_bounded_and_bind_reductions_to_an_opaque_preview_diges
     .is_err());
     assert!(TenantRetentionUpdateRequest::decode(
         br#"{"tenant":"22222222-2222-2222-2222-222222222222","proposed_retention_seconds":86400,"expected_generation":1,"confirmation_digest":"not-a-digest","idempotency_key":"01010101-0101-0101-0101-010101010101"}"#,
+    )
+    .is_err());
+    assert!(TenantRetentionUpdateRequest::decode(
+        br#"{"tenant":"22222222-2222-2222-2222-222222222222","proposed_retention_seconds":86400,"expected_generation":1,"confirmation_digest":"abababababababababababababababababababababababababababababababab","idempotency_key":"01010101-0101-0101-0101-010101010101"}"#,
     )
     .is_err());
 }
@@ -57,6 +63,7 @@ fn retention_preview_is_redacted_generation_bound_evidence() {
         catalog_identity: DIGEST.to_owned(),
         catalog_generation: 7,
         confirmation_digest: DIGEST.to_owned(),
+        confirmation_evaluated_at_unix_nanos: 123,
         scopes: vec![RetentionScopeImpact {
             signal: "logs".to_owned(),
             shard: 0,
@@ -104,6 +111,7 @@ fn retention_preview_pages_render_below_the_response_bound() {
         catalog_identity: DIGEST.to_owned(),
         catalog_generation: u64::MAX,
         confirmation_digest: DIGEST.to_owned(),
+        confirmation_evaluated_at_unix_nanos: 1,
         scopes: vec![scope.clone(); MAX_PREVIEW_PAGE_ITEMS],
         continuation: Some("ab".repeat(106)),
     };
@@ -135,7 +143,7 @@ fn retention_client_uses_the_canonical_routes_and_preserves_typed_stale_details(
             (
                 "/v1/tenant-retention:preview",
                 "200 OK",
-                r#"{"tenant":"22222222-2222-2222-2222-222222222222","retention_generation":1,"proposed_retention_seconds":86400,"catalog_identity":"abababababababababababababababababababababababababababababababab","catalog_generation":7,"confirmation_digest":"abababababababababababababababababababababababababababababababab","scopes":[],"continuation":null}"#,
+                r#"{"tenant":"22222222-2222-2222-2222-222222222222","retention_generation":1,"proposed_retention_seconds":86400,"catalog_identity":"abababababababababababababababababababababababababababababababab","catalog_generation":7,"confirmation_digest":"abababababababababababababababababababababababababababababababab","confirmation_evaluated_at_unix_nanos":123,"scopes":[],"continuation":null}"#,
             ),
             (
                 "/v1/tenant-retention:update",
@@ -179,7 +187,8 @@ fn retention_client_uses_the_canonical_routes_and_preserves_typed_stale_details(
                 1,
                 Some(DIGEST.to_owned()),
                 IDEMPOTENCY.to_owned(),
-            ),
+            )
+            .with_confirmation_evaluated_at_unix_nanos(123),
         ),
         Err(TenantRetentionServiceClientFailure::StaleGeneration {
             retention_generation: 2,
@@ -233,6 +242,11 @@ fn retention_contract_artifacts_describe_the_served_bounded_tenant_administratio
     assert!(
         openapi["components"]["schemas"]["TenantRetentionPreviewResponse"]["properties"]
             .get("confirmation_digest")
+            .is_some()
+    );
+    assert!(
+        openapi["components"]["schemas"]["TenantRetentionPreviewResponse"]["properties"]
+            .get("confirmation_evaluated_at_unix_nanos")
             .is_some()
     );
     assert!(

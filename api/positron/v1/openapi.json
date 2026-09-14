@@ -3,7 +3,7 @@
   "info": {
     "title": "Positron API",
     "version": "v1",
-    "x-positron-schema-digest": "0e7b239667b2eb2a8ea5d6a0e99de55ba8427941e1cd5476ab4e708414e8787a"
+    "x-positron-schema-digest": "f55d1ef754a0d1e1752a48851f259a025eb16cc91059f2daf2c668cd42ca0081"
   },
   "paths": {
     "/v1/capabilities:negotiate": {
@@ -1231,7 +1231,7 @@
       "TenantRetentionPreviewResponse": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["tenant", "retention_generation", "proposed_retention_seconds", "catalog_identity", "catalog_generation", "confirmation_digest", "scopes", "continuation"],
+        "required": ["tenant", "retention_generation", "proposed_retention_seconds", "catalog_identity", "catalog_generation", "confirmation_digest", "confirmation_evaluated_at_unix_nanos", "scopes", "continuation"],
         "properties": {
           "tenant": {"type": "string", "format": "uuid"},
           "retention_generation": {"type": "integer", "minimum": 1},
@@ -1240,7 +1240,8 @@
           "catalog_generation": {"type": "integer", "minimum": 1},
           "confirmation_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$", "description": "Opaque confirmation binding computed from current canonical evidence."},
           "scopes": {"type": "array", "maxItems": 64, "items": {"$ref": "#/components/schemas/TenantRetentionScopeImpact"}},
-          "continuation": {"type": ["string", "null"], "pattern": "^[0-9a-f]{212}$", "maxLength": 212}
+          "continuation": {"type": ["string", "null"], "pattern": "^[0-9a-f]{212}$", "maxLength": 212},
+          "confirmation_evaluated_at_unix_nanos": {"type": "integer", "minimum": 1}
         }
       },
       "TenantRetentionUpdateRequest": {
@@ -1252,6 +1253,7 @@
           "proposed_retention_seconds": {"type": "integer", "minimum": 1},
           "expected_generation": {"type": "integer", "minimum": 1},
           "confirmation_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$", "description": "Opaque digest received from a preview; callers never submit impact fields."},
+          "confirmation_evaluated_at_unix_nanos": {"type": "integer", "minimum": 1, "description": "Trusted instant returned with the confirmation digest; the server verifies the digest at this instant."},
           "idempotency_key": {"type": "string", "format": "uuid"}
         }
       },

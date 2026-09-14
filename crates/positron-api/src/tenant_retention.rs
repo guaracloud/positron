@@ -95,6 +95,8 @@ pub struct TenantRetentionUpdateRequest {
     expected_generation: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     confirmation_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    confirmation_evaluated_at_unix_nanos: Option<i64>,
     idempotency_key: String,
 }
 impl TenantRetentionUpdateRequest {
@@ -111,6 +113,7 @@ impl TenantRetentionUpdateRequest {
             proposed_retention_seconds,
             expected_generation,
             confirmation_digest,
+            confirmation_evaluated_at_unix_nanos: None,
             idempotency_key,
         }
     }
@@ -138,6 +141,15 @@ impl TenantRetentionUpdateRequest {
         self.confirmation_digest.as_deref()
     }
     #[must_use]
+    pub const fn confirmation_evaluated_at_unix_nanos(&self) -> Option<i64> {
+        self.confirmation_evaluated_at_unix_nanos
+    }
+    #[must_use]
+    pub fn with_confirmation_evaluated_at_unix_nanos(mut self, value: i64) -> Self {
+        self.confirmation_evaluated_at_unix_nanos = Some(value);
+        self
+    }
+    #[must_use]
     pub fn idempotency_key(&self) -> &str {
         &self.idempotency_key
     }
@@ -147,6 +159,10 @@ impl TenantRetentionUpdateRequest {
             && self.expected_generation != 0
             && uuid(&self.idempotency_key)
             && self.confirmation_digest.as_deref().is_none_or(hex_digest)
+            && (self.confirmation_digest.is_none()
+                || self
+                    .confirmation_evaluated_at_unix_nanos
+                    .is_some_and(|value| value > 0))
         {
             Ok(())
         } else {
@@ -194,6 +210,7 @@ pub struct TenantRetentionPreviewResponse {
     pub catalog_identity: String,
     pub catalog_generation: u64,
     pub confirmation_digest: String,
+    pub confirmation_evaluated_at_unix_nanos: i64,
     pub scopes: Vec<RetentionScopeImpact>,
     pub continuation: Option<String>,
 }
@@ -221,6 +238,7 @@ impl TenantRetentionPreviewResponse {
             || !hex_digest(&self.catalog_identity)
             || self.catalog_generation == 0
             || !hex_digest(&self.confirmation_digest)
+            || self.confirmation_evaluated_at_unix_nanos <= 0
             || self.scopes.len() > MAX_PREVIEW_PAGE_ITEMS
             || !self
                 .continuation
