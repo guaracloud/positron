@@ -9,8 +9,25 @@ impl InitializedInstance {
         actor: AuthorizedContext,
         idempotency: AdministrativeIdempotencyKey,
     ) -> Result<CatalogFormatMigration, BootstrapFailure> {
-        let _ingest_drain = self.tenant_drains.close_all_and_drain()?;
-        let _query_drain = self.tenant_drains.cancel_all_and_drain()?;
+        let preflight = self.catalog_migration_preflight(actor, idempotency)?;
+        if let Some(replay) = preflight {
+            return Ok(replay);
+        }
+        #[cfg(test)]
+        let catalog_migration_preflight_hook = self
+            .catalog_migration_preflight_hook
+            .lock()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?
+            .clone();
+        #[cfg(test)]
+        if let Some(hook) = catalog_migration_preflight_hook {
+            hook();
+        }
+        let _drain = self.tenant_drains.close_all_and_drain()?;
+        let preflight = self.catalog_migration_preflight(actor, idempotency)?;
+        if let Some(replay) = preflight {
+            return Ok(replay);
+        }
         let secret = self
             .key
             .catalog_secret(self.instance)
@@ -24,6 +41,32 @@ impl InitializedInstance {
             idempotency,
         )
         .map_err(map_catalog_format_migration_failure)
+    }
+
+    fn catalog_migration_preflight(
+        &self,
+        actor: AuthorizedContext,
+        idempotency: AdministrativeIdempotencyKey,
+    ) -> Result<Option<CatalogFormatMigration>, BootstrapFailure> {
+        let secret = self
+            .key
+            .catalog_secret(self.instance)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
+        let view = Catalog::read_current_view(&self._authority, self.instance, secret)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        if let Some(replay) = CatalogFormatMigrationAdministration::replay_from_view(
+            &view,
+            self.administrator,
+            actor,
+            idempotency,
+        )
+        .map_err(map_catalog_format_migration_failure)?
+        {
+            return Ok(Some(replay));
+        }
+        CatalogFormatMigrationAdministration::preflight_from_view(&view, self.administrator, actor)
+            .map_err(map_catalog_format_migration_failure)?;
+        Ok(None)
     }
 
     /// Reads the currently authenticated Catalog format without acquiring the

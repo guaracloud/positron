@@ -1,19 +1,23 @@
 use std::error::Error;
 use std::fs;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{InitializationPlan, InstanceBootstrap};
 use positron_domain::identity::Scope;
 use positron_domain::identity::{TenantId, TenantSlug};
 use positron_domain::lifecycle::TenantLifecycleState;
 use positron_governance::{
-    AdministrativeIdempotencyKey, CompatibilityHints, PresentedCredential, RequestedIntent,
-    ResourceGeneration,
+    AdministrativeIdempotencyKey, CatalogFormatMigrationAdministration, CompatibilityHints,
+    PresentedCredential, RequestedIntent, ResourceGeneration,
 };
 use positron_governance::{Identity, IngestPolicyAdministration};
 use positron_ingest::{IngestPolicy, PolicyAction, PolicyRule};
 use positron_kernel::Catalog;
 use positron_kernel::FormatEpoch;
 use positron_kernel::{CatalogPublicationFault, with_catalog_publication_fault_after};
+use positron_query::QueryCancellation;
 
 use super::initialization::Roots;
 
@@ -244,4 +248,215 @@ fn epoch_two_prepared_tenant_creation_restarts_without_downgrade() -> Result<(),
         Some(FormatEpoch::CATALOG_V2)
     );
     Ok(())
+}
+
+#[test]
+fn unauthorized_and_exact_replayed_migrations_do_not_close_data_admission()
+-> Result<(), Box<dyn Error>> {
+    let fixture = LegacyFixtureRoots::from_f9_fixture()?;
+    let paths = fixture.paths()?;
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    let unauthorized = instance.attribute(
+        PresentedCredential::parse(claim.query_secret().ok_or("query credential")?)?,
+        RequestedIntent::Query,
+        CompatibilityHints::none(),
+    )?;
+    let (ingest_closed_tx, ingest_closed_rx) = std::sync::mpsc::channel();
+    let (query_closed_tx, query_closed_rx) = std::sync::mpsc::channel();
+    instance.install_lifecycle_transition_observer(ingest_closed_tx)?;
+    instance.install_lifecycle_query_transition_observer(query_closed_tx)?;
+    let key = AdministrativeIdempotencyKey::new([0xed; 16])?;
+
+    let unauthorized_failure = instance
+        .migrate_catalog_to_epoch_two(unauthorized, key)
+        .expect_err("query actor cannot migrate the Catalog");
+    assert_eq!(
+        unauthorized_failure.code(),
+        crate::BootstrapFailureCode::ApiKeyUnauthorized
+    );
+    assert!(
+        ingest_closed_rx.try_recv().is_err(),
+        "unauthorized migration does not close ingest admission"
+    );
+    assert!(
+        query_closed_rx.try_recv().is_err(),
+        "unauthorized migration does not close query admission"
+    );
+    drop(
+        instance
+            .enter_ingest_finalization_for(instance.default_tenant_id())
+            .expect("ingest remains admitted"),
+    );
+    drop(
+        instance
+            .enter_query_execution_for(instance.default_tenant_id(), QueryCancellation::new())
+            .expect("query remains admitted"),
+    );
+
+    let administrator = || {
+        instance.attribute(
+            PresentedCredential::parse(claim.secret()).expect("administrator credential"),
+            RequestedIntent::SystemAdministration,
+            CompatibilityHints::none(),
+        )
+    };
+    let committed = instance.migrate_catalog_to_epoch_two(administrator()?, key)?;
+    let (ingest_closed_tx, ingest_closed_rx) = std::sync::mpsc::channel();
+    let (query_closed_tx, query_closed_rx) = std::sync::mpsc::channel();
+    instance.install_lifecycle_transition_observer(ingest_closed_tx)?;
+    instance.install_lifecycle_query_transition_observer(query_closed_tx)?;
+
+    assert_eq!(
+        instance.migrate_catalog_to_epoch_two(administrator()?, key)?,
+        committed,
+        "exact replay resolves the committed migration"
+    );
+    assert!(
+        ingest_closed_rx.try_recv().is_err(),
+        "exact replay does not close fresh ingest admission"
+    );
+    assert!(
+        query_closed_rx.try_recv().is_err(),
+        "exact replay does not close fresh query admission"
+    );
+    drop(
+        instance
+            .enter_ingest_finalization_for(instance.default_tenant_id())
+            .expect("ingest remains admitted after replay"),
+    );
+    drop(
+        instance
+            .enter_query_execution_for(instance.default_tenant_id(), QueryCancellation::new())
+            .expect("query remains admitted after replay"),
+    );
+    Ok(())
+}
+
+#[test]
+fn migration_rechecks_the_current_epoch_and_replays_a_concurrent_successor()
+-> Result<(), Box<dyn Error>> {
+    let fixture = LegacyFixtureRoots::from_f9_fixture()?;
+    let paths = fixture.paths()?;
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = Arc::new(InstanceBootstrap::reopen(&paths)?);
+    let actor = instance.attribute(
+        PresentedCredential::parse(claim.secret())?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let key = AdministrativeIdempotencyKey::new([0xee; 16])?;
+    let audit_before = instance.governance_audit_for_test()?.len();
+    let (successor_tx, successor_rx) = std::sync::mpsc::channel();
+    let successor_instance = Arc::clone(&instance);
+    instance.install_catalog_migration_preflight_hook(Arc::new(move || {
+        let secret = successor_instance
+            .key
+            .catalog_secret(successor_instance.instance)
+            .expect("catalog secret");
+        let catalog = Catalog::open(
+            &successor_instance._authority,
+            successor_instance.instance,
+            secret,
+        )
+        .expect("catalog");
+        let successor = CatalogFormatMigrationAdministration::migrate_to_epoch_two(
+            &catalog,
+            successor_instance.administrator,
+            actor,
+            key,
+        )
+        .expect("concurrent successor migration");
+        let _ = successor_tx.send(successor);
+    }))?;
+
+    let migration = instance.migrate_catalog_to_epoch_two(actor, key)?;
+    assert_eq!(
+        migration,
+        successor_rx.recv().expect("concurrent successor result"),
+        "the second preflight resolves the successor's exact migration"
+    );
+    assert_eq!(
+        instance.catalog_format_epoch()?,
+        Some(FormatEpoch::CATALOG_V2),
+        "the successor remains the sole V2 publication"
+    );
+    assert_eq!(
+        instance.governance_audit_for_test()?.len(),
+        audit_before + 1,
+        "revalidation does not publish a duplicate migration audit record"
+    );
+    Ok(())
+}
+
+struct LegacyFixtureRoots {
+    root: PathBuf,
+}
+
+impl LegacyFixtureRoots {
+    fn from_f9_fixture() -> Result<Self, std::io::Error> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "positron-migration-drain-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root)?;
+        let fixture = Self { root };
+        let source = std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/legacy-f9-v1"
+        ));
+        for name in ["data", "secrets"] {
+            copy_tree(&source.join(name), &fixture.root.join(name))?;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                fixture.root.join("secrets"),
+                fs::Permissions::from_mode(0o700),
+            )?;
+            for name in ["bootstrap-claim.v1", "local-root-key.v1"] {
+                fs::set_permissions(
+                    fixture.root.join("secrets").join(name),
+                    fs::Permissions::from_mode(0o600),
+                )?;
+            }
+        }
+        Ok(fixture)
+    }
+
+    fn paths(&self) -> Result<crate::BootstrapPaths, crate::BootstrapFailure> {
+        crate::BootstrapPaths::new(
+            &self.root.join("data"),
+            &self.root.join("secrets"),
+            positron_kernel::MountQualification::LocalHost,
+        )
+    }
+}
+
+fn copy_tree(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> Result<(), std::io::Error> {
+    fs::create_dir(destination)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let destination_path = destination.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_tree(&entry.path(), &destination_path)?;
+        } else if entry.file_type()?.is_file() {
+            fs::copy(entry.path(), destination_path)?;
+        } else {
+            return Err(std::io::Error::other("unsupported legacy fixture entry"));
+        }
+    }
+    Ok(())
+}
+
+impl Drop for LegacyFixtureRoots {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
 }

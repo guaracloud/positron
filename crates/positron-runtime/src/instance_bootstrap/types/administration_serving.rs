@@ -30,6 +30,19 @@ impl InitializedInstance {
     }
 
     #[cfg(test)]
+    pub(crate) fn install_catalog_migration_preflight_hook(
+        &self,
+        hook: Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<(), BootstrapFailure> {
+        *self
+            .catalog_migration_preflight_hook
+            .lock()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))? =
+            Some(hook);
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub(crate) fn install_lifecycle_query_transition_observer(
         &self,
         observer: std::sync::mpsc::Sender<()>,

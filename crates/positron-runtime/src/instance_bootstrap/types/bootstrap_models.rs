@@ -298,6 +298,9 @@ pub struct InitializedInstance {
     #[cfg(test)]
     pub(in crate::instance_bootstrap) lifecycle_preflight_hook:
         Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    pub(in crate::instance_bootstrap) catalog_migration_preflight_hook:
+        Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     pub(in crate::instance_bootstrap) tenant_slug: TenantSlug,
     pub(in crate::instance_bootstrap) administrator: PrincipalId,
     pub(in crate::instance_bootstrap) integrity_key_fingerprint: [u8; 32],

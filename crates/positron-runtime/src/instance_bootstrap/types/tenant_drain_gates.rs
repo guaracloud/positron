@@ -7,7 +7,7 @@ pub(super) struct IngestDrainGate {
     transition_observer: Mutex<Option<std::sync::mpsc::Sender<()>>>,
 }
 
-const LIFECYCLE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+pub(super) const LIFECYCLE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct IngestDrainState {
     lifecycle_transitioning: bool,
@@ -74,13 +74,22 @@ impl QueryDrainGate {
     pub(super) fn cancel_and_drain(
         self: &Arc<Self>,
     ) -> Result<QueryLifecycleDrainPermit, BootstrapFailure> {
+        let deadline = Instant::now()
+            .checked_add(LIFECYCLE_DRAIN_TIMEOUT)
+            .ok_or_else(|| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
+        let permit = self.cancel_before(deadline)?;
+        permit.wait_for_drain_before(deadline)?;
+        Ok(permit)
+    }
+
+    pub(super) fn cancel_before(
+        self: &Arc<Self>,
+        deadline: Instant,
+    ) -> Result<QueryLifecycleDrainPermit, BootstrapFailure> {
         let mut state = self
             .state
             .lock()
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
-        let deadline = Instant::now()
-            .checked_add(LIFECYCLE_DRAIN_TIMEOUT)
-            .ok_or_else(|| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
         while state.closing {
             let (next, timed_out) = wait_for_query_drain(&self.changed, state, deadline)?;
             if timed_out {
@@ -103,20 +112,26 @@ impl QueryDrainGate {
         for (_, cancellation) in &state.active {
             cancellation.cancel();
         }
+        Ok(QueryLifecycleDrainPermit {
+            gate: Arc::clone(self),
+        })
+    }
+
+    fn wait_for_drain_before(&self, deadline: Instant) -> Result<(), BootstrapFailure> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
         while !state.active.is_empty() {
             let (next, timed_out) = wait_for_query_drain(&self.changed, state, deadline)?;
             state = next;
             if timed_out {
-                state.closing = false;
-                self.changed.notify_all();
                 return Err(BootstrapFailure::new(
                     BootstrapFailureCode::ResourceUnavailable,
                 ));
             }
         }
-        Ok(QueryLifecycleDrainPermit {
-            gate: Arc::clone(self),
-        })
+        Ok(())
     }
 
     #[cfg(test)]
@@ -180,6 +195,12 @@ impl Drop for QueryLifecycleDrainPermit {
     }
 }
 
+impl QueryLifecycleDrainPermit {
+    pub(super) fn wait_for_drain_before(&self, deadline: Instant) -> Result<(), BootstrapFailure> {
+        self.gate.wait_for_drain_before(deadline)
+    }
+}
+
 impl IngestDrainGate {
     pub(super) fn new() -> Arc<Self> {
         Arc::new(Self {
@@ -218,10 +239,12 @@ impl IngestDrainGate {
         let deadline = Instant::now()
             .checked_add(LIFECYCLE_DRAIN_TIMEOUT)
             .ok_or_else(|| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
-        self.close_and_drain_before(deadline)
+        let permit = self.close_before(deadline)?;
+        permit.wait_for_drain_before(deadline)?;
+        Ok(permit)
     }
 
-    pub(super) fn close_and_drain_before(
+    pub(super) fn close_before(
         self: &Arc<Self>,
         deadline: Instant,
     ) -> Result<LifecycleDrainPermit, BootstrapFailure> {
@@ -248,20 +271,26 @@ impl IngestDrainGate {
         {
             let _ = observer.send(());
         }
+        Ok(LifecycleDrainPermit {
+            gate: Arc::clone(self),
+        })
+    }
+
+    fn wait_for_drain_before(&self, deadline: Instant) -> Result<(), BootstrapFailure> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
         while state.in_flight != 0 {
             let (next, timed_out) = wait_for_lifecycle_drain(&self.changed, state, deadline)?;
             state = next;
             if timed_out {
-                state.lifecycle_transitioning = false;
-                self.changed.notify_all();
                 return Err(BootstrapFailure::new(
                     BootstrapFailureCode::ResourceUnavailable,
                 ));
             }
         }
-        Ok(LifecycleDrainPermit {
-            gate: Arc::clone(self),
-        })
+        Ok(())
     }
 
     #[cfg(test)]
@@ -319,6 +348,12 @@ impl Drop for LifecycleDrainPermit {
         };
         state.lifecycle_transitioning = false;
         self.gate.changed.notify_all();
+    }
+}
+
+impl LifecycleDrainPermit {
+    pub(super) fn wait_for_drain_before(&self, deadline: Instant) -> Result<(), BootstrapFailure> {
+        self.gate.wait_for_drain_before(deadline)
     }
 }
 
@@ -391,7 +426,10 @@ mod tests {
         let gate = IngestDrainGate::new();
         let held = gate.enter().expect("initial admission");
 
-        let failure = match gate.close_and_drain_before(Instant::now()) {
+        let failure = match gate.close_before(Instant::now()).and_then(|permit| {
+            permit.wait_for_drain_before(Instant::now())?;
+            Ok(permit)
+        }) {
             Ok(_) => panic!("an already elapsed deadline cannot publish a lifecycle closure"),
             Err(failure) => failure,
         };

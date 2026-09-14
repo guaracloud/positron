@@ -3,8 +3,8 @@ use std::fmt::{Display, Formatter};
 
 use positron_domain::identity::{PrincipalId, Scope};
 use positron_kernel::{
-    AuditIntent, Catalog, CatalogFailureCode, CatalogObject, CatalogProposal, FormatEpoch,
-    TransactionId,
+    AuditIntent, Catalog, CatalogFailureCode, CatalogObject, CatalogProposal, CatalogReadView,
+    FormatEpoch, TransactionId,
 };
 
 use crate::{
@@ -60,6 +60,45 @@ impl Error for CatalogFormatMigrationFailure {}
 pub struct CatalogFormatMigrationAdministration;
 
 impl CatalogFormatMigrationAdministration {
+    /// Resolves an authenticated exact committed V2 retry before callers close
+    /// data-plane admission.
+    pub fn replay_from_view(
+        view: &CatalogReadView,
+        administrator: PrincipalId,
+        actor: AuthorizedContext,
+        idempotency: AdministrativeIdempotencyKey,
+    ) -> Result<Option<CatalogFormatMigration>, CatalogFormatMigrationFailure> {
+        validate_actor(administrator, actor)?;
+        match view.snapshot().format_epoch() {
+            Some(FormatEpoch::CATALOG_V1) => Ok(None),
+            Some(FormatEpoch::CATALOG_V2) => replay_epoch_two_records(
+                view.governance_audit_records(),
+                administrator,
+                idempotency,
+            )
+            .map(Some),
+            None | Some(_) => Err(CatalogFormatMigrationFailure::InvalidState),
+        }
+    }
+
+    /// Validates the V1 migration candidate from an immutable Catalog view
+    /// before callers close data-plane admission.
+    pub fn preflight_from_view(
+        view: &CatalogReadView,
+        administrator: PrincipalId,
+        actor: AuthorizedContext,
+    ) -> Result<(), CatalogFormatMigrationFailure> {
+        validate_actor(administrator, actor)?;
+        match view.snapshot().format_epoch() {
+            Some(FormatEpoch::CATALOG_V1) => view
+                .snapshot()
+                .governance_object()
+                .map(|_| ())
+                .map_err(map_catalog),
+            None | Some(_) => Err(CatalogFormatMigrationFailure::InvalidState),
+        }
+    }
+
     pub fn migrate_to_epoch_two(
         catalog: &Catalog<'_>,
         administrator: PrincipalId,
@@ -130,10 +169,20 @@ fn replay_epoch_two(
     administrator: PrincipalId,
     idempotency: AdministrativeIdempotencyKey,
 ) -> Result<CatalogFormatMigration, CatalogFormatMigrationFailure> {
-    let record = catalog
-        .governance_audit_records()
-        .map_err(map_catalog)?
-        .into_iter()
+    replay_epoch_two_records(
+        &catalog.governance_audit_records().map_err(map_catalog)?,
+        administrator,
+        idempotency,
+    )
+}
+
+fn replay_epoch_two_records(
+    records: &[positron_kernel::GovernanceAuditRecord],
+    administrator: PrincipalId,
+    idempotency: AdministrativeIdempotencyKey,
+) -> Result<CatalogFormatMigration, CatalogFormatMigrationFailure> {
+    let record = records
+        .iter()
         .find(|record| record.transaction().to_bytes() == idempotency.to_bytes())
         .ok_or(CatalogFormatMigrationFailure::InvalidState)?;
     if record.intent() != encode_audit(administrator, idempotency) {

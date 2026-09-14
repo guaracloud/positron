@@ -1,6 +1,6 @@
 use super::tenant_drain_gates::{
-    IngestDrainGate, LifecycleDrainPermit, LifecycleMutationGate, LifecycleMutationPermit,
-    QueryDrainGate, QueryLifecycleDrainPermit,
+    IngestDrainGate, LIFECYCLE_DRAIN_TIMEOUT, LifecycleDrainPermit, LifecycleMutationGate,
+    LifecycleMutationPermit, QueryDrainGate, QueryLifecycleDrainPermit,
 };
 use super::*;
 
@@ -127,32 +127,44 @@ impl TenantDrainRegistry {
         mutation.acquire()
     }
 
-    pub(super) fn close_all_and_drain(
-        &self,
-    ) -> Result<Vec<LifecycleDrainPermit>, BootstrapFailure> {
-        let gates = self.active_gates()?;
-        let mut permits = Vec::new();
-        permits
-            .try_reserve_exact(gates.len())
-            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
-        for (ingest, _) in gates {
-            permits.push(ingest.close_and_drain()?);
-        }
-        Ok(permits)
+    /// Closes all native data admission from one fixed membership snapshot,
+    /// then waits for the already admitted work with one absolute deadline.
+    pub(super) fn close_all_and_drain(&self) -> Result<TenantDrainPermit, BootstrapFailure> {
+        let deadline = Instant::now()
+            .checked_add(LIFECYCLE_DRAIN_TIMEOUT)
+            .ok_or_else(|| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
+        self.close_all_and_drain_before(deadline)
     }
 
-    pub(super) fn cancel_all_and_drain(
+    pub(super) fn close_all_and_drain_before(
         &self,
-    ) -> Result<Vec<QueryLifecycleDrainPermit>, BootstrapFailure> {
+        deadline: Instant,
+    ) -> Result<TenantDrainPermit, BootstrapFailure> {
         let gates = self.active_gates()?;
-        let mut permits = Vec::new();
-        permits
+        let mut ingest = Vec::new();
+        ingest
             .try_reserve_exact(gates.len())
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
-        for (_, query) in gates {
-            permits.push(query.cancel_and_drain()?);
+        let mut query = Vec::new();
+        query
+            .try_reserve_exact(gates.len())
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
+        for (gate, _) in &gates {
+            ingest.push(gate.close_before(deadline)?);
         }
-        Ok(permits)
+        for (_, gate) in &gates {
+            query.push(gate.cancel_before(deadline)?);
+        }
+        for permit in &ingest {
+            permit.wait_for_drain_before(deadline)?;
+        }
+        for permit in &query {
+            permit.wait_for_drain_before(deadline)?;
+        }
+        Ok(TenantDrainPermit {
+            _ingest: ingest,
+            _query: query,
+        })
     }
 
     fn active_gates(&self) -> Result<Vec<TenantDrainGates>, BootstrapFailure> {
@@ -225,6 +237,13 @@ impl TenantDrainRegistry {
 
 type TenantDrainGates = (Arc<IngestDrainGate>, Arc<QueryDrainGate>);
 
+/// Keeps all global migration admission closures active until publication
+/// completes or the attempt fails.
+pub(super) struct TenantDrainPermit {
+    _ingest: Vec<LifecycleDrainPermit>,
+    _query: Vec<QueryLifecycleDrainPermit>,
+}
+
 impl TenantDrainEnrollment<'_> {
     pub(super) fn activate(&mut self) {
         let mut entries = match self.registry.entries.lock() {
@@ -255,6 +274,85 @@ impl Drop for TenantDrainEnrollment<'_> {
             .position(|entry| entry.tenant == self.tenant && !entry.active)
         {
             entries.remove(index);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn global_drain_closes_late_tenant_admission_before_waiting_for_early_work() {
+        let tenants = (0_u16..1024)
+            .map(|number| {
+                let mut bytes = [0_u8; 16];
+                bytes[..2].copy_from_slice(&number.to_be_bytes());
+                bytes[15] = 1;
+                TenantId::from_bytes(bytes).expect("fixed tenant identifier")
+            })
+            .collect::<Vec<_>>();
+        let registry =
+            Arc::new(TenantDrainRegistry::establish(&tenants, 1024).expect("maximum registry"));
+        let held_early = registry.enter_ingest(tenants[0]).expect("early work");
+        let held_middle = registry.enter_ingest(tenants[512]).expect("middle work");
+        let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+        registry
+            .install_query_transition_observer(tenants[1023], closed_tx)
+            .expect("final query closure observer");
+        let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+        let draining = Arc::clone(&registry);
+        let drain = std::thread::spawn(move || {
+            let _ = completed_tx.send(draining.close_all_and_drain());
+        });
+
+        closed_rx.recv().expect("all admission closes");
+        let late_ingest = registry.enter_ingest(tenants[1023]);
+        let late_query = registry.enter_query(tenants[1023], QueryCancellation::new());
+        let late_ingest_refused = late_ingest.is_err();
+        let late_query_refused = late_query.is_err();
+        drop(late_ingest);
+        drop(late_query);
+        drop(held_early);
+        assert!(
+            completed_rx.try_recv().is_err(),
+            "global drain waits for every admitted tenant work item"
+        );
+        drop(held_middle);
+        let permit = completed_rx
+            .recv()
+            .expect("global drain completion")
+            .expect("global drain completes after held work");
+        drop(permit);
+        drain.join().expect("global drain thread");
+
+        assert!(late_ingest_refused, "the final tenant cannot admit ingest");
+        assert!(late_query_refused, "the final tenant cannot admit queries");
+    }
+
+    #[test]
+    fn expired_global_drain_deadline_reopens_every_closed_gate() {
+        let tenants = [
+            TenantId::from_bytes([1; 16]).expect("first tenant"),
+            TenantId::from_bytes([2; 16]).expect("second tenant"),
+        ];
+        let registry = TenantDrainRegistry::establish(&tenants, 2).expect("registry");
+        let held = registry.enter_ingest(tenants[0]).expect("held work");
+
+        let failure = match registry.close_all_and_drain_before(Instant::now()) {
+            Ok(_) => panic!("elapsed migration deadline must fail"),
+            Err(failure) => failure,
+        };
+        let _ = failure;
+        drop(held);
+
+        for tenant in tenants {
+            drop(registry.enter_ingest(tenant).expect("ingest reopens"));
+            drop(
+                registry
+                    .enter_query(tenant, QueryCancellation::new())
+                    .expect("query reopens"),
+            );
         }
     }
 }

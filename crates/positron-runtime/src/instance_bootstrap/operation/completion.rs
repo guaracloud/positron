@@ -139,6 +139,8 @@ pub(super) fn outcome(
         )?,
         #[cfg(test)]
         lifecycle_preflight_hook: std::sync::Mutex::new(None),
+        #[cfg(test)]
+        catalog_migration_preflight_hook: std::sync::Mutex::new(None),
         tenant_slug: BootstrapRecord::tenant_slug()?,
         administrator: record.administrator,
         integrity_key_fingerprint: record.integrity_fingerprint,
