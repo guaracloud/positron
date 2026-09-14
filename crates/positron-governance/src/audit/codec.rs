@@ -1,0 +1,416 @@
+//! Typed, bounded decoding for committed governance audit intents.
+
+use super::*;
+
+impl GovernanceAuditEntry {
+    pub(crate) fn decode_fields(
+        position: u64,
+        transaction_id: [u8; 16],
+        intent: &[u8],
+    ) -> Result<Self, IdentityFailure> {
+        if intent.starts_with(MAGIC_V1.as_slice()) || intent.starts_with(MAGIC_V2.as_slice()) {
+            return InitializationAuditEntry::decode_intent(position, intent)
+                .map(Self::Initialization);
+        }
+        if intent.starts_with(ROOT_ROTATION_MAGIC) {
+            return CatalogRootRotationAuditEntry::decode_intent(position, transaction_id, intent)
+                .map(Self::CatalogRootRotation);
+        }
+        if intent.starts_with(&POLICY_ACTIVATION_MAGIC) {
+            let mut cursor = Cursor::new(intent);
+            if cursor.take_array::<8>()? != POLICY_ACTIVATION_MAGIC {
+                return Err(IdentityFailure);
+            }
+            let idempotency_key = AdministrativeIdempotencyKey::new(cursor.take_array()?)
+                .map_err(|_| IdentityFailure)?;
+            if idempotency_key.to_bytes() != transaction_id {
+                return Err(IdentityFailure);
+            }
+            let principal =
+                PrincipalId::from_bytes(cursor.take_array()?).map_err(|_| IdentityFailure)?;
+            let tenant = TenantId::from_bytes(cursor.take_array()?).map_err(|_| IdentityFailure)?;
+            let expected_generation =
+                ResourceGeneration::new(cursor.take_u64()?).map_err(|_| IdentityFailure)?;
+            let generation =
+                ResourceGeneration::new(cursor.take_u64()?).map_err(|_| IdentityFailure)?;
+            let digest = cursor.take_array()?;
+            let request_digest = cursor.take_array()?;
+            if expected_generation.get().checked_add(1) != Some(generation.get())
+                || digest.iter().all(|byte| *byte == 0)
+                || request_digest.iter().all(|byte| *byte == 0)
+                || !cursor.is_empty()
+            {
+                return Err(IdentityFailure);
+            }
+            return Ok(Self::IngestPolicyActivation(
+                IngestPolicyActivationAuditEntry {
+                    position,
+                    idempotency_key,
+                    principal,
+                    tenant,
+                    expected_generation,
+                    generation,
+                    digest,
+                    request_digest,
+                },
+            ));
+        }
+        if intent.starts_with(&TENANT_QUOTA_MAGIC) {
+            let mut cursor = Cursor::new(intent);
+            if cursor.take_array::<8>()? != TENANT_QUOTA_MAGIC {
+                return Err(IdentityFailure);
+            }
+            let idempotency_key = AdministrativeIdempotencyKey::new(cursor.take_array()?)
+                .map_err(|_| IdentityFailure)?;
+            if idempotency_key.to_bytes() != transaction_id {
+                return Err(IdentityFailure);
+            }
+            let principal =
+                PrincipalId::from_bytes(cursor.take_array()?).map_err(|_| IdentityFailure)?;
+            let tenant = TenantId::from_bytes(cursor.take_array()?).map_err(|_| IdentityFailure)?;
+            let expected_generation =
+                ResourceGeneration::new(cursor.take_u64()?).map_err(|_| IdentityFailure)?;
+            let generation =
+                ResourceGeneration::new(cursor.take_u64()?).map_err(|_| IdentityFailure)?;
+            let weight = u32::from_be_bytes(cursor.take_array::<4>()?);
+            let mut resources = [0_u64; 11];
+            for resource in &mut resources {
+                *resource = cursor.take_u64()?;
+            }
+            let request_digest = cursor.take_array::<32>()?;
+            if expected_generation.get().checked_add(1) != Some(generation.get())
+                || weight == 0
+                || weight > u32::from(u16::MAX)
+                || resources.contains(&0)
+                || request_digest.iter().all(|byte| *byte == 0)
+                || !cursor.is_empty()
+            {
+                return Err(IdentityFailure);
+            }
+            return Ok(Self::TenantQuotaUpdate(TenantQuotaUpdateAuditEntry {
+                position,
+                idempotency_key,
+                principal,
+                tenant,
+                expected_generation,
+                generation,
+                weight,
+                resources,
+                request_digest,
+            }));
+        }
+        if intent.starts_with(&TENANT_DISPLAY_MAGIC) {
+            let mut cursor = Cursor::new(intent);
+            if cursor.take_array::<8>()? != TENANT_DISPLAY_MAGIC {
+                return Err(IdentityFailure);
+            }
+            let idempotency_key = AdministrativeIdempotencyKey::new(cursor.take_array()?)
+                .map_err(|_| IdentityFailure)?;
+            if idempotency_key.to_bytes() != transaction_id {
+                return Err(IdentityFailure);
+            }
+            let principal =
+                PrincipalId::from_bytes(cursor.take_array()?).map_err(|_| IdentityFailure)?;
+            let tenant = TenantId::from_bytes(cursor.take_array()?).map_err(|_| IdentityFailure)?;
+            let expected_generation =
+                ResourceGeneration::new(cursor.take_u64()?).map_err(|_| IdentityFailure)?;
+            let generation =
+                ResourceGeneration::new(cursor.take_u64()?).map_err(|_| IdentityFailure)?;
+            let request_digest = cursor.take_array()?;
+            if expected_generation.get().checked_add(1) != Some(generation.get())
+                || request_digest.iter().all(|byte| *byte == 0)
+                || !cursor.is_empty()
+            {
+                return Err(IdentityFailure);
+            }
+            return Ok(Self::TenantDisplayNameUpdate(
+                TenantDisplayNameUpdateAuditEntry {
+                    position,
+                    idempotency_key,
+                    principal,
+                    tenant,
+                    expected_generation,
+                    generation,
+                    request_digest,
+                },
+            ));
+        }
+        if intent.starts_with(&schema_checkpoint::MAGIC) {
+            return SchemaCheckpointAuditEntry::decode_intent(position, transaction_id, intent)
+                .map(Self::SchemaCheckpoint);
+        }
+        if intent.starts_with(&LISTENER_TRANSPORT_MAGIC) {
+            if intent.len() != LISTENER_TRANSPORT_MAGIC.len() + 16
+                || intent.get(..8) != Some(LISTENER_TRANSPORT_MAGIC.as_slice())
+                || intent.get(8..) != Some(transaction_id.as_slice())
+                || transaction_id.iter().all(|byte| *byte == 0)
+            {
+                return Err(IdentityFailure);
+            }
+            return Ok(Self::ListenerTransport(ListenerTransportAuditEntry::new(
+                position,
+                transaction_id,
+            )));
+        }
+        if intent.starts_with(&KEY_LIFECYCLE_MAGIC) {
+            let fields = 9;
+            let action = match *intent.get(8).ok_or(IdentityFailure)? {
+                1 => ApiKeyLifecycleAction::Create,
+                2 => ApiKeyLifecycleAction::Rotate,
+                3 => ApiKeyLifecycleAction::Revoke,
+                _ => return Err(IdentityFailure),
+            };
+            if intent.len() != fields + 89
+                || intent.get(..8) != Some(KEY_LIFECYCLE_MAGIC.as_slice())
+                || intent.get(fields + 73..fields + 89) != Some(transaction_id.as_slice())
+            {
+                return Err(IdentityFailure);
+            }
+            let actor = PrincipalId::from_bytes(
+                intent
+                    .get(fields..fields + 16)
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .ok_or(IdentityFailure)?,
+            )
+            .map_err(|_| IdentityFailure)?;
+            let principal = PrincipalId::from_bytes(
+                intent
+                    .get(fields + 16..fields + 32)
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .ok_or(IdentityFailure)?,
+            )
+            .map_err(|_| IdentityFailure)?;
+            let target = PrincipalId::from_bytes(
+                intent
+                    .get(fields + 32..fields + 48)
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .ok_or(IdentityFailure)?,
+            )
+            .map_err(|_| IdentityFailure)?;
+            let scope = match *intent.get(fields + 48).ok_or(IdentityFailure)? {
+                1 => Scope::Ingest,
+                2 => Scope::Query,
+                3 => Scope::TenantAdministration,
+                _ => return Err(IdentityFailure),
+            };
+            let expires_at_unix_seconds = match intent
+                .get(fields + 49..fields + 57)
+                .and_then(|bytes| bytes.try_into().ok())
+                .map(u64::from_be_bytes)
+                .ok_or(IdentityFailure)?
+            {
+                0 => None,
+                value => Some(value),
+            };
+            let expected_generation = ResourceGeneration::new(
+                intent
+                    .get(fields + 57..fields + 65)
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .map(u64::from_be_bytes)
+                    .ok_or(IdentityFailure)?,
+            )
+            .map_err(|_| IdentityFailure)?;
+            let generation = ResourceGeneration::new(
+                intent
+                    .get(fields + 65..fields + 73)
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .map(u64::from_be_bytes)
+                    .ok_or(IdentityFailure)?,
+            )
+            .map_err(|_| IdentityFailure)?;
+            if expected_generation.get().checked_add(1) != Some(generation.get()) {
+                return Err(IdentityFailure);
+            }
+            return Ok(Self::ApiKeyLifecycle(ApiKeyLifecycleAuditEntry {
+                position,
+                action,
+                actor,
+                principal,
+                target,
+                scope,
+                expires_at_unix_seconds,
+                expected_generation,
+                generation,
+                idempotency_key: AdministrativeIdempotencyKey::new(transaction_id)
+                    .map_err(|_| IdentityFailure)?,
+            }));
+        }
+        if intent.starts_with(&TENANT_CREATION_MAGIC) {
+            let mut cursor = Cursor::new(intent);
+            if cursor.take_array::<8>()? != TENANT_CREATION_MAGIC {
+                return Err(IdentityFailure);
+            }
+            let idempotency_key = AdministrativeIdempotencyKey::new(cursor.take_array()?)
+                .map_err(|_| IdentityFailure)?;
+            if idempotency_key.to_bytes() != transaction_id {
+                return Err(IdentityFailure);
+            }
+            let actor =
+                PrincipalId::from_bytes(cursor.take_array()?).map_err(|_| IdentityFailure)?;
+            let tenant = TenantId::from_bytes(cursor.take_array()?).map_err(|_| IdentityFailure)?;
+            let expected_generation =
+                ResourceGeneration::new(cursor.take_u64()?).map_err(|_| IdentityFailure)?;
+            let generation =
+                ResourceGeneration::new(cursor.take_u64()?).map_err(|_| IdentityFailure)?;
+            let request_digest = cursor.take_array()?;
+            if expected_generation.get().checked_add(1) != Some(generation.get())
+                || request_digest.iter().all(|byte| *byte == 0)
+                || !cursor.is_empty()
+            {
+                return Err(IdentityFailure);
+            }
+            return Ok(Self::TenantCreation(TenantCreationAuditEntry {
+                position,
+                idempotency_key,
+                actor,
+                tenant,
+                expected_generation,
+                generation,
+                request_digest,
+            }));
+        }
+        if intent.starts_with(&FORMAT_MIGRATION_MAGIC) {
+            let mut cursor = Cursor::new(intent);
+            if cursor.take_array::<8>()? != FORMAT_MIGRATION_MAGIC {
+                return Err(IdentityFailure);
+            }
+            let idempotency_key = AdministrativeIdempotencyKey::new(cursor.take_array()?)
+                .map_err(|_| IdentityFailure)?;
+            if idempotency_key.to_bytes() != transaction_id {
+                return Err(IdentityFailure);
+            }
+            let actor =
+                PrincipalId::from_bytes(cursor.take_array()?).map_err(|_| IdentityFailure)?;
+            let from = u32::from_be_bytes(cursor.take_array()?);
+            let to = u32::from_be_bytes(cursor.take_array()?);
+            if from != 1 || to != 2 || !cursor.is_empty() {
+                return Err(IdentityFailure);
+            }
+            return Ok(Self::CatalogFormatMigration(
+                CatalogFormatMigrationAuditEntry {
+                    position,
+                    idempotency_key,
+                    actor,
+                    from,
+                    to,
+                },
+            ));
+        }
+        if intent.starts_with(&TENANT_LIFECYCLE_MAGIC) {
+            let mut cursor = Cursor::new(intent);
+            if cursor.take_array::<8>()? != TENANT_LIFECYCLE_MAGIC {
+                return Err(IdentityFailure);
+            }
+            let ingest_time_unix_seconds = cursor.take_u64()?;
+            if ingest_time_unix_seconds == 0 {
+                return Err(IdentityFailure);
+            }
+            let idempotency_key = AdministrativeIdempotencyKey::new(cursor.take_array()?)
+                .map_err(|_| IdentityFailure)?;
+            if idempotency_key.to_bytes() != transaction_id {
+                return Err(IdentityFailure);
+            }
+            let actor =
+                PrincipalId::from_bytes(cursor.take_array()?).map_err(|_| IdentityFailure)?;
+            let tenant = TenantId::from_bytes(cursor.take_array()?).map_err(|_| IdentityFailure)?;
+            let from = lifecycle_state(cursor.take_u8()?)?;
+            let to = lifecycle_state(cursor.take_u8()?)?;
+            let expected_generation =
+                ResourceGeneration::new(cursor.take_u64()?).map_err(|_| IdentityFailure)?;
+            let generation =
+                ResourceGeneration::new(cursor.take_u64()?).map_err(|_| IdentityFailure)?;
+            if expected_generation.get().checked_add(1) != Some(generation.get())
+                || !cursor.is_empty()
+            {
+                return Err(IdentityFailure);
+            }
+            return Ok(Self::TenantLifecycle(TenantLifecycleAuditEntry {
+                position,
+                ingest_time_unix_seconds,
+                actor,
+                tenant,
+                from,
+                to,
+                expected_generation,
+                generation,
+                idempotency_key,
+            }));
+        }
+        if intent.starts_with(&TENANT_RETENTION_MAGIC) {
+            let mut cursor = Cursor::new(intent);
+            if cursor.take_array::<8>()? != TENANT_RETENTION_MAGIC {
+                return Err(IdentityFailure);
+            }
+            let ingest_time_unix_seconds = cursor.take_u64()?;
+            let idempotency_key = AdministrativeIdempotencyKey::new(cursor.take_array()?)
+                .map_err(|_| IdentityFailure)?;
+            if ingest_time_unix_seconds == 0 || idempotency_key.to_bytes() != transaction_id {
+                return Err(IdentityFailure);
+            }
+            let actor =
+                PrincipalId::from_bytes(cursor.take_array()?).map_err(|_| IdentityFailure)?;
+            let tenant = TenantId::from_bytes(cursor.take_array()?).map_err(|_| IdentityFailure)?;
+            let expected_generation =
+                ResourceGeneration::new(cursor.take_u64()?).map_err(|_| IdentityFailure)?;
+            let generation =
+                ResourceGeneration::new(cursor.take_u64()?).map_err(|_| IdentityFailure)?;
+            let _proposed_retention_seconds = cursor.take_u64()?;
+            let request_digest = cursor.take_array()?;
+            if expected_generation.get().checked_add(1) != Some(generation.get())
+                || request_digest.iter().all(|byte| *byte == 0)
+                || !cursor.is_empty()
+            {
+                return Err(IdentityFailure);
+            }
+            return Ok(Self::TenantRetentionUpdate(
+                TenantRetentionUpdateAuditEntry {
+                    position,
+                    ingest_time_unix_seconds,
+                    actor,
+                    tenant,
+                    expected_generation,
+                    generation,
+                    request_digest,
+                    idempotency_key,
+                },
+            ));
+        }
+        if intent.starts_with(&TENANT_ALIAS_MAGIC) {
+            let mut cursor = Cursor::new(intent);
+            if cursor.take_array::<8>()? != TENANT_ALIAS_MAGIC {
+                return Err(IdentityFailure);
+            }
+            let ingest_time_unix_seconds = cursor.take_u64()?;
+            let idempotency_key = AdministrativeIdempotencyKey::new(cursor.take_array()?)
+                .map_err(|_| IdentityFailure)?;
+            if ingest_time_unix_seconds == 0 || idempotency_key.to_bytes() != transaction_id {
+                return Err(IdentityFailure);
+            }
+            let actor =
+                PrincipalId::from_bytes(cursor.take_array()?).map_err(|_| IdentityFailure)?;
+            let tenant = TenantId::from_bytes(cursor.take_array()?).map_err(|_| IdentityFailure)?;
+            let expected_generation =
+                ResourceGeneration::new(cursor.take_u64()?).map_err(|_| IdentityFailure)?;
+            let generation =
+                ResourceGeneration::new(cursor.take_u64()?).map_err(|_| IdentityFailure)?;
+            let request_digest = cursor.take_array()?;
+            if expected_generation.get().checked_add(1) != Some(generation.get())
+                || request_digest.iter().all(|byte| *byte == 0)
+                || !cursor.is_empty()
+            {
+                return Err(IdentityFailure);
+            }
+            return Ok(Self::TenantAliasBinding(TenantAliasBindingAuditEntry {
+                position,
+                ingest_time_unix_seconds,
+                actor,
+                tenant,
+                expected_generation,
+                generation,
+                request_digest,
+                idempotency_key,
+            }));
+        }
+        Err(IdentityFailure)
+    }
+}
