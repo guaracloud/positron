@@ -139,6 +139,37 @@ impl GovernanceAuditEntry {
             return SchemaCheckpointAuditEntry::decode_intent(position, transaction_id, intent)
                 .map(Self::SchemaCheckpoint);
         }
+        if intent.starts_with(&LISTENER_TRANSPORT_V2_MAGIC) {
+            let mut cursor = Cursor::new(intent);
+            if cursor.take_array::<8>()? != LISTENER_TRANSPORT_V2_MAGIC {
+                return Err(IdentityFailure);
+            }
+            let instance = cursor.take_array()?;
+            let listener_target = decode_listener_target(&mut cursor)?;
+            let configuration_provenance =
+                ListenerTransportConfigurationProvenance::from_code(cursor.take_u8()?)?;
+            let request_id = cursor.take_array()?;
+            let request_digest = cursor.take_array()?;
+            let request = ListenerTransportAuditRequest::configuration_file(listener_target);
+            if request.configuration_provenance() != configuration_provenance {
+                return Err(IdentityFailure);
+            }
+            if request_id != transaction_id
+                || request_id != request.transaction_id_for(instance)
+                || request_digest != request.digest_for(instance)
+                || !cursor.is_empty()
+            {
+                return Err(IdentityFailure);
+            }
+            return Ok(Self::ListenerTransport(ListenerTransportAuditEntry::bound(
+                position,
+                instance,
+                listener_target,
+                configuration_provenance,
+                request_id,
+                request_digest,
+            )));
+        }
         if intent.starts_with(&LISTENER_TRANSPORT_MAGIC) {
             if intent.len() != LISTENER_TRANSPORT_MAGIC.len() + 16
                 || intent.get(..8) != Some(LISTENER_TRANSPORT_MAGIC.as_slice())

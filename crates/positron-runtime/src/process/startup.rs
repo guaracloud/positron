@@ -6,7 +6,7 @@ impl ApplicationRuntime {
         host: HostInputs<'_>,
     ) -> Result<RunningProcess, ExitOutcome> {
         let state = ProcessState::starting();
-        state.set_public_plaintext_api_warning(configuration.public_plaintext_api_warning);
+        state.set_public_plaintext_api_warning(configuration.public_plaintext_api_intent.is_some());
         let mut listeners = Vec::with_capacity(6);
         bind(
             ListenerRole::Control,
@@ -134,8 +134,8 @@ impl ApplicationRuntime {
         if let Some(planner) = configuration.admission_group_planner {
             instance.admission_group_planner = planner;
         }
-        if configuration.public_plaintext_api_warning
-            && let Err(failure) = instance.activate_public_plaintext_api_transport()
+        if let Some(intent) = configuration.public_plaintext_api_intent
+            && let Err(failure) = instance.activate_public_plaintext_api_transport(intent)
         {
             return Err(cleanup_startup(
                 ExitOutcome::StartupUnavailable(failure.code()),

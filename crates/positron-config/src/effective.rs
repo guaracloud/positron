@@ -27,6 +27,20 @@ const NO_CONFIGURATION_WARNINGS: &[ConfigurationWarning] = &[];
 const PUBLIC_PLAINTEXT_API_WARNING: &[ConfigurationWarning] =
     &[ConfigurationWarning::PublicPlaintextApi];
 
+/// The resolved, configuration-file-only plaintext listener selection that
+/// startup must durably acknowledge before serving.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PublicPlaintextApiConfiguration {
+    api_bind_address: SocketAddr,
+}
+
+impl PublicPlaintextApiConfiguration {
+    #[must_use]
+    pub const fn api_bind_address(self) -> SocketAddr {
+        self.api_bind_address
+    }
+}
+
 #[derive(Clone, Eq, PartialEq)]
 pub struct EffectiveConfiguration {
     pub(crate) schema_version: u16,
@@ -88,6 +102,18 @@ impl EffectiveConfiguration {
     #[must_use]
     pub const fn api_transport(&self) -> ApiTransport {
         self.api_transport
+    }
+
+    /// Returns the typed startup intent only for the exact configuration-file
+    /// opt-out accepted by the Configuration Contract.
+    #[must_use]
+    pub fn public_plaintext_api_configuration(&self) -> Option<PublicPlaintextApiConfiguration> {
+        (self.api_transport == ApiTransport::PlaintextOptOut
+            && self.source_for(Setting::ListenerApiTransport.path())
+                == Some(SettingSource::ConfigurationFile))
+        .then_some(PublicPlaintextApiConfiguration {
+            api_bind_address: self.api_bind_address,
+        })
     }
 
     /// Returns the visible security consequences of the selected profile.

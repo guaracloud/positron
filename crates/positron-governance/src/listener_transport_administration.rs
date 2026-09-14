@@ -6,8 +6,8 @@ use positron_kernel::{
     InstanceId, TransactionId,
 };
 
-use crate::GovernanceAuditEntry;
-use crate::audit::plaintext_api_transport_audit_intent;
+use crate::audit::plaintext_api_transport_audit_intent_v2;
+use crate::{GovernanceAuditEntry, ListenerTransportAuditRequest};
 
 /// Administration-owned activation of the explicitly selected public
 /// plaintext API transport profile.
@@ -40,12 +40,16 @@ impl Display for ListenerTransportAdministrationFailure {
 impl Error for ListenerTransportAdministrationFailure {}
 
 impl ListenerTransportAdministration {
-    /// Records the active explicit opt-out exactly once for this instance.
+    /// Records one exact configured plaintext opt-out intent. Legacy records
+    /// remain readable but cannot prove a later configuration's target.
     pub fn activate_public_plaintext_api(
         catalog: &Catalog<'_>,
         instance: InstanceId,
+        request: ListenerTransportAuditRequest,
     ) -> Result<ListenerTransportActivation, ListenerTransportAdministrationFailure> {
-        let transaction = TransactionId::new(instance.to_bytes()).map_err(map_catalog)?;
+        let request_digest = request.digest_for(instance.to_bytes());
+        let transaction = TransactionId::new(request.transaction_id_for(instance.to_bytes()))
+            .map_err(map_catalog)?;
         let mut existing = None;
         for record in catalog.governance_audit_records().map_err(map_catalog)? {
             let entry = GovernanceAuditEntry::decode(&record)
@@ -54,6 +58,9 @@ impl ListenerTransportAdministration {
                 continue;
             };
             if transport.instance_id() != instance.to_bytes() {
+                continue;
+            }
+            if transport.request_digest() != Some(request_digest) {
                 continue;
             }
             if existing.replace(transport.position()).is_some() {
@@ -66,8 +73,11 @@ impl ListenerTransportAdministration {
 
         let snapshot = catalog.pin().map_err(map_catalog)?;
         let objects = retained_objects(&snapshot)?;
-        let audit = AuditIntent::new(plaintext_api_transport_audit_intent(instance.to_bytes()))
-            .map_err(map_catalog)?;
+        let audit = AuditIntent::new(plaintext_api_transport_audit_intent_v2(
+            instance.to_bytes(),
+            request,
+        ))
+        .map_err(map_catalog)?;
         let commit = catalog
             .commit(
                 snapshot.identity(),
@@ -87,7 +97,12 @@ impl ListenerTransportAdministration {
             .ok_or(ListenerTransportAdministrationFailure::PersistenceUnavailable)?;
         let entry = GovernanceAuditEntry::decode(record)
             .map_err(|_| ListenerTransportAdministrationFailure::CorruptState)?;
-        if entry.as_listener_transport().is_some() && record.transaction() == transaction {
+        if entry.as_listener_transport().is_some_and(|transport| {
+            transport.instance_id() == instance.to_bytes()
+                && transport.request_digest() == Some(request_digest)
+                && transport.request_id() == Some(transaction.to_bytes())
+        }) && record.transaction() == transaction
+        {
             Ok(ListenerTransportActivation {
                 audit_position: record.position(),
             })

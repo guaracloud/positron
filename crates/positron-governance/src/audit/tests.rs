@@ -1,4 +1,5 @@
 use positron_domain::identity::{PrincipalId, TenantId, TenantSlug};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use super::{
     CatalogRootRotationStage, GovernanceAuditEntry, InitializationAuditEntry,
@@ -6,7 +7,8 @@ use super::{
 };
 use crate::{
     ApiKeyLifecycleAction, InitialAuditContext, InitialGovernanceIntent, InitialTenantIntent,
-    ListenerTransportAuditEntry, ResourceGeneration,
+    ListenerTransportAuditEntry, ListenerTransportAuditRequest,
+    ListenerTransportConfigurationProvenance, ResourceGeneration,
 };
 
 #[test]
@@ -34,6 +36,49 @@ fn public_plaintext_api_transport_audit_is_redacted_exact_and_strict() {
     let mut trailing = intent;
     trailing.push(0);
     assert!(GovernanceAuditEntry::decode_fields(7, transaction, &trailing).is_err());
+}
+
+#[test]
+fn version_two_plaintext_transport_audit_binds_target_provenance_and_request_identity() {
+    let instance = [19; 16];
+    let request = ListenerTransportAuditRequest::configuration_file(SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::new(198, 51, 100, 23)),
+        8_080,
+    ));
+    let transaction = request.transaction_id_for(instance);
+    let intent = crate::audit::plaintext_api_transport_audit_intent_v2(instance, request);
+
+    let entry = GovernanceAuditEntry::decode_fields(8, transaction, &intent)
+        .expect("bound plaintext transport audit");
+    let transport = entry
+        .as_listener_transport()
+        .expect("typed transport audit");
+    assert_eq!(transport.instance_id(), instance);
+    assert_eq!(transport.listener_target(), Some(request.listener_target()));
+    assert_eq!(
+        transport.configuration_provenance(),
+        Some(ListenerTransportConfigurationProvenance::ConfigurationFile)
+    );
+    assert_eq!(transport.request_id(), Some(transaction));
+    assert_eq!(
+        transport.request_digest(),
+        Some(request.digest_for(instance))
+    );
+    assert!(transport.is_configuration_file_intent());
+
+    let changed_target = ListenerTransportAuditRequest::configuration_file(SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::new(198, 51, 100, 23)),
+        8_081,
+    ));
+    assert_ne!(changed_target.transaction_id_for(instance), transaction);
+    assert_ne!(
+        changed_target.digest_for(instance),
+        request.digest_for(instance)
+    );
+
+    let mut changed_encoded_target = intent;
+    changed_encoded_target[30] = 24;
+    assert!(GovernanceAuditEntry::decode_fields(8, transaction, &changed_encoded_target).is_err());
 }
 
 #[test]

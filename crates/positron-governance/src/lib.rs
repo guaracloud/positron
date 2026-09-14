@@ -32,7 +32,8 @@ pub use api_key_administration::{
 pub use audit::{
     ApiKeyLifecycleAction, CatalogRootRotationAuditEntry, CatalogRootRotationStage,
     GovernanceAuditEntry, IngestPolicyActivationAuditEntry, InitialAuditMetadata,
-    InitializationAuditEntry, ListenerTransportAuditEntry, SchemaCheckpointAuditEntry,
+    InitializationAuditEntry, ListenerTransportAuditEntry, ListenerTransportAuditRequest,
+    ListenerTransportConfigurationProvenance, SchemaCheckpointAuditEntry,
     TenantDisplayNameUpdateAuditEntry, TenantQuotaUpdateAuditEntry, schema_checkpoint_audit_intent,
 };
 pub use format_migration_administration::{

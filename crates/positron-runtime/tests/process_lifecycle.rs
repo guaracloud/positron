@@ -5,8 +5,8 @@ mod lifecycle;
 
 use lifecycle::{ObservingListeners, ObservingTasks, TaskEvent, TestRoots};
 use positron_runtime::{
-    ApplicationRuntime, HostInputs, InitializationMode, ListenerRole, ProcessPhase, Readiness,
-    ServeConfiguration, ShutdownTrigger, TaskRole,
+    ApplicationRuntime, HostInputs, InitializationMode, ListenerRole, ProcessPhase,
+    PublicPlaintextApiStartupIntent, Readiness, ServeConfiguration, ShutdownTrigger, TaskRole,
 };
 
 #[test]

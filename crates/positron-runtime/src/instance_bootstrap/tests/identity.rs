@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 
@@ -18,7 +19,7 @@ use super::super::InitializationPlan;
 use super::super::operation::governance_audit_records;
 use super::super::resources;
 use super::support::Roots;
-use crate::InstanceBootstrap;
+use crate::{InstanceBootstrap, PublicPlaintextApiStartupIntent};
 
 #[test]
 fn identity_failures_do_not_enumerate_or_expose_secret_material()
@@ -156,7 +157,7 @@ fn initialization_audit_and_non_reuse_survive_idempotent_restart()
 }
 
 #[test]
-fn plaintext_api_transport_activation_is_a_single_redacted_audit_record_across_restart()
+fn plaintext_api_transport_activation_replays_only_the_exact_bound_startup_intent()
 -> Result<(), Box<dyn std::error::Error>> {
     let roots = Roots::new()?;
     let paths = roots.paths();
@@ -166,8 +167,12 @@ fn plaintext_api_transport_activation_is_a_single_redacted_audit_record_across_r
     )?);
     let claim = InstanceBootstrap::claim(&paths)?;
     let instance = InstanceBootstrap::reopen(&paths)?;
-    instance.activate_public_plaintext_api_transport()?;
-    instance.activate_public_plaintext_api_transport()?;
+    let configured = PublicPlaintextApiStartupIntent::configuration_file(SocketAddr::from((
+        Ipv4Addr::new(198, 51, 100, 23),
+        8_080,
+    )));
+    instance.activate_public_plaintext_api_transport(configured)?;
+    instance.activate_public_plaintext_api_transport(configured)?;
     drop(instance);
 
     let reopened = InstanceBootstrap::reopen(&paths)?;
@@ -189,24 +194,88 @@ fn plaintext_api_transport_activation_is_a_single_redacted_audit_record_across_r
         "listener.api-transport.plaintext-opt-out"
     );
     assert_eq!(activation.outcome(), "active");
+    assert_eq!(
+        activation.listener_target(),
+        Some(configured.api_bind_address())
+    );
+    assert!(activation.request_digest().is_some());
     assert!(!format!("{activation:?}").contains(claim.secret()));
     drop(reopened);
 
     let reopened = InstanceBootstrap::reopen(&paths)?;
-    reopened.activate_public_plaintext_api_transport()?;
-    let administrator = reopened.attribute(
-        PresentedCredential::parse(claim.secret())?,
-        RequestedIntent::SystemAdministration,
-        CompatibilityHints::none(),
-    )?;
+    reopened.activate_public_plaintext_api_transport(configured)?;
     assert_eq!(
-        reopened
-            .inspect_governance_for_fixture(administrator)?
-            .audit_records()
-            .len(),
+        reopened.governance_audit_for_test()?.len(),
         2,
-        "restart activation must retain the sole selection record"
+        "restart activation must retain the exact selection record"
     );
+    let changed_target = PublicPlaintextApiStartupIntent::configuration_file(SocketAddr::from((
+        Ipv4Addr::new(198, 51, 100, 23),
+        8_081,
+    )));
+    reopened.activate_public_plaintext_api_transport(changed_target)?;
+    let audit = reopened.governance_audit_for_test()?;
+    assert_eq!(audit.len(), 3, "changed target must publish a new receipt");
+    assert_eq!(
+        audit[2]
+            .as_listener_transport()
+            .expect("changed plaintext transport audit")
+            .listener_target(),
+        Some(changed_target.api_bind_address())
+    );
+    Ok(())
+}
+
+#[test]
+fn legacy_plaintext_audit_publishes_a_first_exact_v2_receipt_without_rewriting_history()
+-> Result<(), Box<dyn std::error::Error>> {
+    let roots = Roots::new()?;
+    let paths = roots.paths();
+    let initialized = InstanceBootstrap::initialize(&paths, InitializationPlan::non_interactive())?;
+    let catalog = Catalog::open(
+        &initialized._authority,
+        initialized.instance,
+        initialized.key.catalog_secret(initialized.instance)?,
+    )?;
+    let snapshot = catalog.pin()?;
+    let mut objects = Vec::new();
+    for identity in snapshot.object_identities() {
+        let object = snapshot
+            .object(identity)?
+            .ok_or("missing retained object")?;
+        objects.push(CatalogObject::new(object.to_vec())?);
+    }
+    let transaction = TransactionId::new(initialized.instance.to_bytes())?;
+    let mut legacy_intent = b"POSTPT01".to_vec();
+    legacy_intent.extend_from_slice(&initialized.instance.to_bytes());
+    catalog.commit(
+        snapshot.identity(),
+        CatalogProposal::new(
+            transaction,
+            snapshot.format_epoch().ok_or("format epoch")?,
+            objects,
+        )?,
+        Some(AuditIntent::new(legacy_intent)?),
+    )?;
+    drop(catalog);
+
+    let configured = PublicPlaintextApiStartupIntent::configuration_file(SocketAddr::from((
+        Ipv4Addr::new(198, 51, 100, 24),
+        8_080,
+    )));
+    initialized.activate_public_plaintext_api_transport(configured)?;
+    initialized.activate_public_plaintext_api_transport(configured)?;
+    let audit = initialized.governance_audit_for_test()?;
+    assert_eq!(
+        audit.len(),
+        3,
+        "v1 history and one v2 receipt remain durable"
+    );
+    let legacy = audit[1].as_listener_transport().expect("legacy audit");
+    assert_eq!(legacy.listener_target(), None);
+    let bound = audit[2].as_listener_transport().expect("bound audit");
+    assert_eq!(bound.listener_target(), Some(configured.api_bind_address()));
+    assert!(bound.request_digest().is_some());
     Ok(())
 }
 

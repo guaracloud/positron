@@ -3,10 +3,12 @@ mod rotation;
 mod schema_checkpoint;
 
 use std::fmt::{Display, Formatter};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use positron_domain::identity::{ExternalTenantAlias, PrincipalId, Scope, TenantId, TenantSlug};
 use positron_domain::lifecycle::TenantLifecycleState;
 use positron_kernel::GovernanceAuditRecord;
+use sha2::{Digest, Sha256};
 
 use crate::identity::IdentityFailure;
 use crate::tenant_profile_administration::TENANT_DISPLAY_MAGIC;
@@ -22,6 +24,8 @@ const TENANT_QUOTA_MAGIC: [u8; 8] = *b"POSQUO01";
 const KEY_LIFECYCLE_MAGIC: [u8; 8] = *b"POSKEY01";
 const KEY_LIFECYCLE_V2_MAGIC: [u8; 8] = *b"POSKEY02";
 const LISTENER_TRANSPORT_MAGIC: [u8; 8] = *b"POSTPT01";
+const LISTENER_TRANSPORT_V2_MAGIC: [u8; 8] = *b"POSTPT02";
+const LISTENER_TRANSPORT_REQUEST_DOMAIN: &[u8] = b"positron.listener-transport.request.v1\0";
 const TENANT_LIFECYCLE_MAGIC: [u8; 8] = *b"POSTEN01";
 const TENANT_LIFECYCLE_V2_MAGIC: [u8; 8] = *b"POSTEN02";
 const TENANT_CREATION_MAGIC: [u8; 8] = *b"POSTNA01";
@@ -171,12 +175,42 @@ pub struct TenantLifecycleAuditEntry {
 pub struct ListenerTransportAuditEntry {
     position: u64,
     instance: [u8; 16],
+    listener_target: Option<SocketAddr>,
+    configuration_provenance: Option<ListenerTransportConfigurationProvenance>,
+    request_id: Option<[u8; 16]>,
+    request_digest: Option<[u8; 32]>,
 }
 
 impl ListenerTransportAuditEntry {
     #[must_use]
     pub const fn new(position: u64, instance: [u8; 16]) -> Self {
-        Self { position, instance }
+        Self {
+            position,
+            instance,
+            listener_target: None,
+            configuration_provenance: None,
+            request_id: None,
+            request_digest: None,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn bound(
+        position: u64,
+        instance: [u8; 16],
+        listener_target: SocketAddr,
+        configuration_provenance: ListenerTransportConfigurationProvenance,
+        request_id: [u8; 16],
+        request_digest: [u8; 32],
+    ) -> Self {
+        Self {
+            position,
+            instance,
+            listener_target: Some(listener_target),
+            configuration_provenance: Some(configuration_provenance),
+            request_id: Some(request_id),
+            request_digest: Some(request_digest),
+        }
     }
 
     #[must_use]
@@ -187,6 +221,42 @@ impl ListenerTransportAuditEntry {
     #[must_use]
     pub const fn instance_id(&self) -> [u8; 16] {
         self.instance
+    }
+
+    /// Returns the exact listener target for current bound records.
+    /// Legacy records retain their original, unbound representation.
+    #[must_use]
+    pub const fn listener_target(&self) -> Option<SocketAddr> {
+        self.listener_target
+    }
+
+    /// Returns the resolved Configuration Contract source for current bound
+    /// records. Legacy records retain no fabricated source identity.
+    #[must_use]
+    pub const fn configuration_provenance(
+        &self,
+    ) -> Option<ListenerTransportConfigurationProvenance> {
+        self.configuration_provenance
+    }
+
+    /// Returns the deterministic request identity for current bound records.
+    #[must_use]
+    pub const fn request_id(&self) -> Option<[u8; 16]> {
+        self.request_id
+    }
+
+    /// Returns the canonical binding digest for current bound records.
+    #[must_use]
+    pub const fn request_digest(&self) -> Option<[u8; 32]> {
+        self.request_digest
+    }
+
+    #[must_use]
+    pub const fn is_configuration_file_intent(&self) -> bool {
+        matches!(
+            self.configuration_provenance,
+            Some(ListenerTransportConfigurationProvenance::ConfigurationFile)
+        )
     }
 
     #[must_use]
@@ -200,11 +270,119 @@ impl ListenerTransportAuditEntry {
     }
 }
 
-pub(crate) fn plaintext_api_transport_audit_intent(instance: [u8; 16]) -> Vec<u8> {
-    let mut intent = Vec::with_capacity(LISTENER_TRANSPORT_MAGIC.len() + instance.len());
-    intent.extend_from_slice(&LISTENER_TRANSPORT_MAGIC);
+/// The only accepted Configuration Contract source for the plaintext
+/// startup-only opt-out.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ListenerTransportConfigurationProvenance {
+    ConfigurationFile,
+}
+
+impl ListenerTransportConfigurationProvenance {
+    const fn code(self) -> u8 {
+        match self {
+            Self::ConfigurationFile => 1,
+        }
+    }
+
+    const fn from_code(code: u8) -> Result<Self, IdentityFailure> {
+        match code {
+            1 => Ok(Self::ConfigurationFile),
+            _ => Err(IdentityFailure),
+        }
+    }
+}
+
+/// A closed startup-only intent from the Configuration Contract. It is not a
+/// public administration request and accepts no caller-controlled identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ListenerTransportAuditRequest {
+    listener_target: SocketAddr,
+    configuration_provenance: ListenerTransportConfigurationProvenance,
+}
+
+impl ListenerTransportAuditRequest {
+    #[must_use]
+    pub const fn configuration_file(listener_target: SocketAddr) -> Self {
+        Self {
+            listener_target,
+            configuration_provenance: ListenerTransportConfigurationProvenance::ConfigurationFile,
+        }
+    }
+
+    #[must_use]
+    pub const fn listener_target(self) -> SocketAddr {
+        self.listener_target
+    }
+
+    #[must_use]
+    pub const fn configuration_provenance(self) -> ListenerTransportConfigurationProvenance {
+        self.configuration_provenance
+    }
+
+    #[must_use]
+    pub fn digest_for(self, instance: [u8; 16]) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(LISTENER_TRANSPORT_REQUEST_DOMAIN);
+        hasher.update(instance);
+        hasher.update([self.configuration_provenance.code()]);
+        hasher.update(listener_target_bytes(self.listener_target));
+        hasher.finalize().into()
+    }
+
+    #[must_use]
+    pub fn transaction_id_for(self, instance: [u8; 16]) -> [u8; 16] {
+        let digest = self.digest_for(instance);
+        let mut request_id = [0_u8; 16];
+        request_id.copy_from_slice(&digest[..16]);
+        if request_id.iter().all(|byte| *byte == 0) {
+            request_id[0] = 1;
+        }
+        request_id
+    }
+}
+
+pub(crate) fn plaintext_api_transport_audit_intent_v2(
+    instance: [u8; 16],
+    request: ListenerTransportAuditRequest,
+) -> Vec<u8> {
+    let digest = request.digest_for(instance);
+    let request_id = request.transaction_id_for(instance);
+    let mut intent = Vec::with_capacity(76);
+    intent.extend_from_slice(&LISTENER_TRANSPORT_V2_MAGIC);
     intent.extend_from_slice(&instance);
+    intent.extend_from_slice(&listener_target_bytes(request.listener_target()));
+    intent.push(request.configuration_provenance().code());
+    intent.extend_from_slice(&request_id);
+    intent.extend_from_slice(&digest);
     intent
+}
+
+fn listener_target_bytes(target: SocketAddr) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(19);
+    match target.ip() {
+        IpAddr::V4(address) => {
+            encoded.push(4);
+            encoded.extend_from_slice(&address.octets());
+        },
+        IpAddr::V6(address) => {
+            encoded.push(6);
+            encoded.extend_from_slice(&address.octets());
+        },
+    }
+    encoded.extend_from_slice(&target.port().to_be_bytes());
+    encoded
+}
+
+fn decode_listener_target(cursor: &mut Cursor<'_>) -> Result<SocketAddr, IdentityFailure> {
+    let address = match cursor.take_u8()? {
+        4 => IpAddr::V4(Ipv4Addr::from(cursor.take_array::<4>()?)),
+        6 => IpAddr::V6(Ipv6Addr::from(cursor.take_array::<16>()?)),
+        _ => return Err(IdentityFailure),
+    };
+    Ok(SocketAddr::new(
+        address,
+        u16::from_be_bytes(cursor.take_array()?),
+    ))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

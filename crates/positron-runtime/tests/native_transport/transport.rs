@@ -1,4 +1,5 @@
 use super::*;
+use std::net::{Ipv4Addr, SocketAddr};
 
 #[test]
 fn operations_health_exposes_plaintext_transport_warning_without_degrading_readiness()
@@ -13,7 +14,9 @@ fn operations_health_exposes_plaintext_transport_warning_without_degrading_readi
     let plaintext_host = NativeHost::new(bindings(&plaintext_roots, "plaintext-health-warning")?);
     let plaintext = ApplicationRuntime::start(
         ServeConfiguration::new(plaintext_paths, InitializationMode::ExistingOnly)
-            .with_public_plaintext_api_warning(),
+            .with_public_plaintext_api_intent(PublicPlaintextApiStartupIntent::configuration_file(
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 8_080)),
+            )),
         HostInputs::new(&plaintext_host, &plaintext_host),
     )?;
     let plaintext_operations = address(
