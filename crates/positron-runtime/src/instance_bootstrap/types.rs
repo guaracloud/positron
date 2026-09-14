@@ -43,6 +43,24 @@ pub struct TenantRetentionImpactPreview {
     scopes: Vec<RetentionImpactPreview>,
 }
 
+/// The two values returned by a preview that must travel together to confirm
+/// a retention reduction at its original trusted evaluation instant.
+#[derive(Clone, Copy)]
+pub(crate) struct TenantRetentionPreviewConfirmation {
+    digest: [u8; 32],
+    evaluation: positron_domain::time::UnixNanoseconds,
+}
+
+impl TenantRetentionPreviewConfirmation {
+    #[must_use]
+    pub(crate) const fn new(
+        digest: [u8; 32],
+        evaluation: positron_domain::time::UnixNanoseconds,
+    ) -> Self {
+        Self { digest, evaluation }
+    }
+}
+
 impl TenantRetentionImpactPreview {
     #[must_use]
     pub const fn tenant(&self) -> TenantId {
@@ -1660,13 +1678,17 @@ impl InitializedInstance {
                 BootstrapFailureCode::TenantRetentionInvalidConfirmation,
             ));
         }
-        self.update_tenant_retention_with_confirmation_digest(
+        self.update_tenant_retention_with_confirmation(
             actor,
             tenant,
             proposed_retention_seconds,
             expected,
-            confirmation.map(TenantRetentionImpactPreview::confirmation_digest),
-            confirmation.map(TenantRetentionImpactPreview::evaluated_at),
+            confirmation.map(|preview| {
+                TenantRetentionPreviewConfirmation::new(
+                    preview.confirmation_digest(),
+                    preview.evaluated_at(),
+                )
+            }),
             idempotency,
         )
     }
@@ -1675,18 +1697,19 @@ impl InitializedInstance {
     /// was returned by a prior preview. Exact retries resolve before a current
     /// preview is rebuilt; fresh reductions still bind the digest to current
     /// canonical retention evidence below.
-    pub(crate) fn update_tenant_retention_with_confirmation_digest(
+    pub(crate) fn update_tenant_retention_with_confirmation(
         &self,
         actor: AuthorizedContext,
         tenant: TenantId,
         proposed_retention_seconds: NonZeroU64,
         expected: ResourceGeneration,
-        confirmation_digest: Option<[u8; 32]>,
-        confirmation_evaluation: Option<positron_domain::time::UnixNanoseconds>,
+        confirmation: Option<TenantRetentionPreviewConfirmation>,
         idempotency: AdministrativeIdempotencyKey,
     ) -> Result<TenantRetentionUpdate, BootstrapFailure> {
-        let requested_confirmation = confirmation_digest
-            .map(RetentionImpactConfirmation::from_runtime_digest)
+        let requested_confirmation = confirmation
+            .map(|confirmation| {
+                RetentionImpactConfirmation::from_runtime_digest(confirmation.digest)
+            })
             .transpose()
             .map_err(map_tenant_retention_failure)?;
         let prepared_replay = {
@@ -1713,10 +1736,9 @@ impl InitializedInstance {
         if let Some(replay) = prepared_replay {
             return Ok(replay);
         }
-        let (binding, preview_catalog) = if let Some(digest) = confirmation_digest {
-            let evaluation = confirmation_evaluation.ok_or_else(|| {
-                BootstrapFailure::new(BootstrapFailureCode::TenantRetentionInvalidConfirmation)
-            })?;
+        let (binding, preview_catalog) = if let Some(confirmation) = confirmation {
+            let digest = confirmation.digest;
+            let evaluation = confirmation.evaluation;
             let fresh =
                 self.inspect_tenant_retention_impact(actor, tenant, proposed_retention_seconds)?;
             if evaluation > fresh.evaluated_at() {

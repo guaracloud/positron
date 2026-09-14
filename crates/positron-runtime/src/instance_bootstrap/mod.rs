@@ -15,6 +15,7 @@ mod tests;
 
 #[cfg(any(test, feature = "test-support"))]
 pub use test_support::GovernanceTestFixture;
+pub(crate) use types::TenantRetentionPreviewConfirmation;
 pub use types::{
     BootstrapClaim, BootstrapFailure, BootstrapFailureCode, BootstrapPaths, BootstrapState,
     InitializationPlan, InitializedInstance, TenantRetentionImpactPreview,

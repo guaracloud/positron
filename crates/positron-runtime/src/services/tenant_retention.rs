@@ -13,7 +13,7 @@ use positron_governance::{
 };
 use positron_kernel::RetentionReclamationEstimate;
 
-use crate::instance_bootstrap::TenantRetentionImpactPreview;
+use crate::instance_bootstrap::{TenantRetentionImpactPreview, TenantRetentionPreviewConfirmation};
 use crate::{BootstrapFailure, BootstrapFailureCode, ServiceHandle};
 
 #[derive(Debug)]
@@ -77,15 +77,21 @@ impl ServiceHandle {
         let evaluation = request
             .confirmation_evaluated_at_unix_nanos()
             .map(positron_domain::time::UnixNanoseconds::new);
+        let confirmation = match (confirmation_digest, evaluation) {
+            (Some(digest), Some(evaluation)) => {
+                Some(TenantRetentionPreviewConfirmation::new(digest, evaluation))
+            },
+            (None, None) => None,
+            _ => return Err(TenantRetentionHttpFailure::Code(400, "invalid_request")),
+        };
         let update = self
             .instance
-            .update_tenant_retention_with_confirmation_digest(
+            .update_tenant_retention_with_confirmation(
                 actor,
                 tenant,
                 proposed,
                 expected,
-                confirmation_digest,
-                evaluation,
+                confirmation,
                 AdministrativeIdempotencyKey::new(idempotency.to_bytes())
                     .map_err(|_| TenantRetentionHttpFailure::Code(400, "invalid_request"))?,
             )

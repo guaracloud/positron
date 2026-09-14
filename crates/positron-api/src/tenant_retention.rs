@@ -159,10 +159,14 @@ impl TenantRetentionUpdateRequest {
             && self.expected_generation != 0
             && uuid(&self.idempotency_key)
             && self.confirmation_digest.as_deref().is_none_or(hex_digest)
-            && (self.confirmation_digest.is_none()
-                || self
-                    .confirmation_evaluated_at_unix_nanos
-                    .is_some_and(|value| value > 0))
+            && match (
+                self.confirmation_digest.as_deref(),
+                self.confirmation_evaluated_at_unix_nanos,
+            ) {
+                (None, None) => true,
+                (Some(_), Some(value)) => value > 0,
+                _ => false,
+            }
         {
             Ok(())
         } else {
