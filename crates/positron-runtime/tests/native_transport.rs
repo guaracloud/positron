@@ -28,7 +28,11 @@ use prost::Message;
 mod support;
 use support::*;
 
+#[path = "native_transport/policy_routes.rs"]
 mod policy_routes;
+#[path = "native_transport/tenant_administration.rs"]
 mod tenant_administration;
+#[path = "native_transport/tls_profiles.rs"]
 mod tls_profiles;
+#[path = "native_transport/transport.rs"]
 mod transport;
