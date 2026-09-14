@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, any_value};
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
-use positron_domain::identity::{TenantId, TenantSlug};
+use positron_domain::identity::TenantSlug;
 use positron_domain::lifecycle::TenantLifecycleState;
 use positron_governance::{
     AdministrativeIdempotencyKey, CompatibilityHints, PresentedCredential, RequestedIntent,
@@ -648,11 +648,9 @@ fn api_client_manages_a_tenant_bound_key_lifecycle() -> Result<(), Box<dyn std::
         RequestedIntent::SystemAdministration,
         CompatibilityHints::none(),
     )?;
-    let tenant = TenantId::from_bytes([0x88; 16])?;
-    initialized
-        .create_tenant(
+    let tenant = initialized
+        .create_tenant_generated(
             system,
-            tenant,
             positron_governance::TenantCreateConfiguration::new(
                 TenantSlug::parse_canonical("client-key-tenant")?,
                 "Client key tenant",
@@ -664,7 +662,8 @@ fn api_client_manages_a_tenant_bound_key_lifecycle() -> Result<(), Box<dyn std::
             ),
             AdministrativeIdempotencyKey::new([0x89; 16])?,
         )
-        .map_err(|failure| format!("tenant creation: {failure:?}"))?;
+        .map_err(|failure| format!("tenant creation: {failure:?}"))?
+        .tenant_id();
     drop(initialized);
 
     let host = NativeHost::new(bindings(&roots, "tenant-key-client")?);
@@ -857,21 +856,21 @@ fn tenant_quota_client_updates_a_bound_tenant_with_replay_and_redacted_stale_det
         RequestedIntent::SystemAdministration,
         CompatibilityHints::none(),
     )?;
-    let tenant = TenantId::from_bytes([0x98; 16])?;
-    initialized.create_tenant(
-        system,
-        tenant,
-        positron_governance::TenantCreateConfiguration::new(
-            TenantSlug::parse_canonical("client-quota-tenant")?,
-            "Client quota tenant",
-            2_592_000,
-            1,
-            [
-                32_000_000, 32, 32, 5_000_000, 2_048, 32, 32, 32, 32, 32, 2_000_000,
-            ],
-        ),
-        AdministrativeIdempotencyKey::new([0x99; 16])?,
-    )?;
+    let tenant = initialized
+        .create_tenant_generated(
+            system,
+            positron_governance::TenantCreateConfiguration::new(
+                TenantSlug::parse_canonical("client-quota-tenant")?,
+                "Client quota tenant",
+                2_592_000,
+                1,
+                [
+                    32_000_000, 32, 32, 5_000_000, 2_048, 32, 32, 32, 32, 32, 2_000_000,
+                ],
+            ),
+            AdministrativeIdempotencyKey::new([0x99; 16])?,
+        )?
+        .tenant_id();
     let administrator = initialized.create_api_key_for_tenant(
         system,
         tenant,
@@ -1288,21 +1287,21 @@ fn tenant_policy_preview_is_authorized_before_decode_and_never_activates()
         RequestedIntent::SystemAdministration,
         CompatibilityHints::none(),
     )?;
-    let tenant = TenantId::from_bytes([0x9b; 16])?;
-    initialized.create_tenant(
-        system,
-        tenant,
-        positron_governance::TenantCreateConfiguration::new(
-            TenantSlug::parse_canonical("client-policy-tenant")?,
-            "Client policy tenant",
-            2_592_000,
-            1,
-            [
-                32_000_000, 32, 32, 5_000_000, 2_048, 32, 32, 32, 32, 32, 2_000_000,
-            ],
-        ),
-        AdministrativeIdempotencyKey::new([0x9c; 16])?,
-    )?;
+    let tenant = initialized
+        .create_tenant_generated(
+            system,
+            positron_governance::TenantCreateConfiguration::new(
+                TenantSlug::parse_canonical("client-policy-tenant")?,
+                "Client policy tenant",
+                2_592_000,
+                1,
+                [
+                    32_000_000, 32, 32, 5_000_000, 2_048, 32, 32, 32, 32, 32, 2_000_000,
+                ],
+            ),
+            AdministrativeIdempotencyKey::new([0x9c; 16])?,
+        )?
+        .tenant_id();
     let administrator = initialized.create_api_key_for_tenant(
         system,
         tenant,
@@ -1677,21 +1676,21 @@ fn configured_tls_api_listener_reaches_alias_explain_and_activate_before_decodin
         RequestedIntent::SystemAdministration,
         CompatibilityHints::none(),
     )?;
-    let tenant = TenantId::from_bytes([0xE1; 16])?;
-    initialized.create_tenant(
-        system,
-        tenant,
-        positron_governance::TenantCreateConfiguration::new(
-            TenantSlug::parse_canonical("tls-route-tenant")?,
-            "TLS route tenant",
-            2_592_000,
-            1,
-            [
-                32_000_000, 32, 32, 5_000_000, 2_048, 32, 32, 32, 32, 32, 2_000_000,
-            ],
-        ),
-        AdministrativeIdempotencyKey::new([0xE2; 16])?,
-    )?;
+    let tenant = initialized
+        .create_tenant_generated(
+            system,
+            positron_governance::TenantCreateConfiguration::new(
+                TenantSlug::parse_canonical("tls-route-tenant")?,
+                "TLS route tenant",
+                2_592_000,
+                1,
+                [
+                    32_000_000, 32, 32, 5_000_000, 2_048, 32, 32, 32, 32, 32, 2_000_000,
+                ],
+            ),
+            AdministrativeIdempotencyKey::new([0xE2; 16])?,
+        )?
+        .tenant_id();
     let tenant_administrator = initialized.create_api_key_for_tenant(
         system,
         tenant,
@@ -1820,22 +1819,22 @@ fn configured_tls_api_listener_serves_tenant_retention_preview_and_confirmed_upd
         RequestedIntent::SystemAdministration,
         CompatibilityHints::none(),
     )?;
-    let tenant = TenantId::from_bytes([0xe6; 16])?;
     let other_tenant = initialized.default_tenant_id();
-    initialized.create_tenant(
-        system,
-        tenant,
-        positron_governance::TenantCreateConfiguration::new(
-            TenantSlug::parse_canonical("tls-retention-tenant")?,
-            "TLS retention tenant",
-            2_592_000,
-            1,
-            [
-                32_000_000, 32, 32, 5_000_000, 2_048, 32, 32, 32, 32, 32, 2_000_000,
-            ],
-        ),
-        AdministrativeIdempotencyKey::new([0xe8; 16])?,
-    )?;
+    let tenant = initialized
+        .create_tenant_generated(
+            system,
+            positron_governance::TenantCreateConfiguration::new(
+                TenantSlug::parse_canonical("tls-retention-tenant")?,
+                "TLS retention tenant",
+                2_592_000,
+                1,
+                [
+                    32_000_000, 32, 32, 5_000_000, 2_048, 32, 32, 32, 32, 32, 2_000_000,
+                ],
+            ),
+            AdministrativeIdempotencyKey::new([0xe8; 16])?,
+        )?
+        .tenant_id();
     let administrator = initialized.create_api_key_for_tenant(
         system,
         tenant,
