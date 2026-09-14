@@ -1179,10 +1179,7 @@ fn system_administrator_manages_explicit_tenants_over_the_public_http_routes()
         positron_runtime::ListenerRole::Api,
     )?;
     let authorization = format!("Bearer {}", claim.secret());
-    let tenant = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
-    let creation = format!(
-        r#"{{"tenant":"{tenant}","slug":"public-tenant","display_name":"Public tenant","retention_seconds":2592000,"weight":1,"memory_bytes":32000000,"queue_slots":32,"task_slots":32,"buffer_cache_bytes":5000000,"batch_items":2048,"lease_slots":32,"retry_slots":32,"io_permits":32,"cpu_work_units":32,"file_descriptors":32,"disk_headroom_bytes":2000000,"idempotency_key":"abababab-abab-abab-abab-abababababab"}}"#,
-    );
+    let creation = r#"{"slug":"public-tenant","display_name":"Public tenant","retention_seconds":2592000,"weight":1,"memory_bytes":32000000,"queue_slots":32,"task_slots":32,"buffer_cache_bytes":5000000,"batch_items":2048,"lease_slots":32,"retry_slots":32,"io_permits":32,"cpu_work_units":32,"file_descriptors":32,"disk_headroom_bytes":2000000,"idempotency_key":"abababab-abab-abab-abab-abababababab"}"#;
     let created = http(
         api,
         "POST",
@@ -1195,18 +1192,30 @@ fn system_administrator_manages_explicit_tenants_over_the_public_http_routes()
     )?;
     assert_status(created.clone(), 200);
     assert!(created.contains("\"resource_generation\":2"), "{created}");
-    assert_status(
-        http(
-            api,
-            "POST",
-            positron_api::tenant_service::CREATE_HTTP_PATH,
-            &[
-                ("Authorization", &authorization),
-                ("Content-Type", "application/json"),
-            ],
-            creation.as_bytes(),
-        )?,
-        200,
+    let created_body = created
+        .split_once("\r\n\r\n")
+        .ok_or("tenant create response body")?
+        .1;
+    let tenant =
+        positron_api::tenant_service::TenantCreateResponse::decode(created_body.as_bytes())?.tenant;
+    let replay = http(
+        api,
+        "POST",
+        positron_api::tenant_service::CREATE_HTTP_PATH,
+        &[
+            ("Authorization", &authorization),
+            ("Content-Type", "application/json"),
+        ],
+        creation.as_bytes(),
+    )?;
+    assert_status(replay.clone(), 200);
+    let replay_body = replay
+        .split_once("\r\n\r\n")
+        .ok_or("tenant create replay response body")?
+        .1;
+    assert_eq!(
+        positron_api::tenant_service::TenantCreateResponse::decode(replay_body.as_bytes())?.tenant,
+        tenant
     );
     let inspection = http(
         api,
@@ -1232,7 +1241,7 @@ fn system_administrator_manages_explicit_tenants_over_the_public_http_routes()
         br#"{}"#,
     )?;
     assert_status(listed.clone(), 200);
-    assert!(listed.contains(tenant));
+    assert!(listed.contains(&tenant));
     let renamed = http(
         api,
         "POST",
