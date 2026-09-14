@@ -1,7 +1,9 @@
 use super::{
     BootstrapKeyCustody, BootstrapKeyFailure, BootstrapKeyIdentity, BootstrapObjectPurpose,
 };
-use crate::InstanceId;
+use crate::{InstanceId, SegmentScope};
+use positron_domain::identity::TenantId;
+use positron_domain::routing::{SignalKind, VirtualShardId};
 
 use super::test_support::SecurityRoot;
 
@@ -56,6 +58,82 @@ fn opening_missing_local_custody_is_a_closed_failure() -> Result<(), Box<dyn std
     assert_eq!(
         BootstrapKeyCustody::open(&root.path).map(|_| ()),
         Err(BootstrapKeyFailure::Custody)
+    );
+    Ok(())
+}
+
+#[test]
+fn tenant_kek_envelope_round_trips_only_for_its_bound_authority()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = SecurityRoot::create()?;
+    let instance = InstanceId::new([0x51; 16])?;
+    let other_instance = InstanceId::new([0x52; 16])?;
+    let tenant = TenantId::from_bytes([0x53; 16])?;
+    let other_tenant = TenantId::from_bytes([0x54; 16])?;
+    let key = BootstrapKeyCustody::initialize(&root.path)?;
+    let envelope = key.provision_tenant_key_envelope(instance, tenant, [0x55; 16], 7)?;
+    let distinct = key.provision_tenant_key_envelope(instance, tenant, [0x56; 16], 7)?;
+    assert_ne!(
+        envelope, distinct,
+        "fresh tenant KEK provisions are opaque and distinct"
+    );
+    let opened = key.resolve_tenant_key_envelope(instance, tenant, &envelope)?;
+    drop(key);
+
+    let reopened = BootstrapKeyCustody::open(&root.path)?;
+    let recovered = reopened.resolve_tenant_key_envelope(instance, tenant, &envelope)?;
+    assert_eq!(opened.expose_to_backend(), recovered.expose_to_backend());
+    assert!(matches!(
+        reopened.resolve_tenant_key_envelope(other_instance, tenant, &envelope),
+        Err(BootstrapKeyFailure::Authentication)
+    ));
+    assert!(matches!(
+        reopened.resolve_tenant_key_envelope(instance, other_tenant, &envelope),
+        Err(BootstrapKeyFailure::Authentication)
+    ));
+    let mut substituted_epoch = envelope.clone();
+    substituted_epoch[31] ^= 1;
+    assert!(matches!(
+        reopened.resolve_tenant_key_envelope(instance, tenant, &substituted_epoch),
+        Err(BootstrapKeyFailure::Authentication)
+    ));
+    let mut substituted_key_id = envelope.clone();
+    substituted_key_id[23] ^= 1;
+    assert!(matches!(
+        reopened.resolve_tenant_key_envelope(instance, tenant, &substituted_key_id),
+        Err(BootstrapKeyFailure::Authentication)
+    ));
+    Ok(())
+}
+
+#[test]
+fn released_tenant_envelope_remains_authenticated_for_segment_reopen()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = SecurityRoot::create()?;
+    let instance = InstanceId::new([0x57; 16])?;
+    let tenant = TenantId::from_bytes([0x58; 16])?;
+    let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(1)?);
+    let key = BootstrapKeyCustody::initialize(&root.path)?;
+    let envelope = key.tenant_key_envelope(instance, tenant)?;
+    assert!(
+        key.segment_key_from_tenant_envelope(instance, scope, &envelope)
+            .is_ok(),
+        "the released authenticated envelope must remain a supported format"
+    );
+    let mut corrupt = envelope.clone();
+    corrupt[0] ^= 1;
+    assert!(matches!(
+        key.segment_key_from_tenant_envelope(instance, scope, &corrupt),
+        Err(BootstrapKeyFailure::Authentication)
+    ));
+    drop(key);
+
+    let reopened = BootstrapKeyCustody::open(&root.path)?;
+    assert!(
+        reopened
+            .segment_key_from_tenant_envelope(instance, scope, &envelope)
+            .is_ok(),
+        "reopening custody must preserve released tenant envelope access"
     );
     Ok(())
 }

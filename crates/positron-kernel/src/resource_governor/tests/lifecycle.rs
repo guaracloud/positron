@@ -1,5 +1,6 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::Barrier;
+use std::sync::{Barrier, mpsc};
+use std::time::Duration;
 
 use positron_domain::identity::TenantId;
 
@@ -75,6 +76,60 @@ fn test_only_authority_exposes_no_primary_volume_observation() {
     assert_eq!(
         governor.observe_disk(),
         Err(GovernorFailure::PrimaryVolumeObservationUnavailable)
+    );
+}
+
+#[test]
+fn staged_quota_publication_waits_for_control_contention_and_applies_its_candidate() {
+    let (governor, tenant) = governor();
+    let staged = governor
+        .prepare_tenant_quota_update(tenant, 1, ResourceAmounts::new([1; 11]))
+        .expect("the candidate is valid before publication");
+    let control = governor.inner.state.lock().expect("test lock is healthy");
+    let (published, received) = mpsc::channel();
+
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            staged.publish();
+            let _ = published.send(());
+        });
+        assert!(
+            received.recv_timeout(Duration::from_millis(20)).is_err(),
+            "publication waits for ordinary control contention instead of failing after durability"
+        );
+        drop(control);
+        received
+            .recv_timeout(Duration::from_secs(1))
+            .expect("publication completes after the competing control section releases");
+    });
+
+    assert_eq!(
+        governor
+            .governor()
+            .reserve(claim(tenant, WorkKind::Ingest, 2))
+            .expect_err("the published quota is active after contention clears")
+            .code(),
+        AdmissionFailureCode::TenantQuotaExceeded
+    );
+}
+
+#[test]
+fn staged_quota_publication_fences_a_poisoned_live_governor() {
+    let (governor, tenant) = governor();
+    let staged = governor
+        .prepare_tenant_quota_update(tenant, 1, ResourceAmounts::new([1; 11]))
+        .expect("the candidate is valid before publication");
+    assert!(catch_unwind(AssertUnwindSafe(|| governor.inner.poison_for_test())).is_err());
+
+    staged.publish();
+
+    assert_eq!(
+        governor
+            .governor()
+            .reserve(claim(tenant, WorkKind::Ingest, 1))
+            .expect_err("a poisoned publication must remain fail-closed")
+            .code(),
+        AdmissionFailureCode::InternalFenced
     );
 }
 

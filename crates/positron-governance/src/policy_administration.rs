@@ -6,7 +6,7 @@ use crate::{AuthorizedContext, Identity};
 use positron_domain::identity::TenantId;
 use positron_kernel::{
     AuditIntent, Catalog, CatalogFailureCode, CatalogObject, CatalogProposal, CatalogSnapshot,
-    FormatEpoch, TransactionId,
+    TransactionId,
 };
 use positron_policy::IngestPolicy;
 
@@ -162,7 +162,14 @@ impl IngestPolicyAdministration {
                 PolicyAdministrationFailureCode::InvalidResourceGeneration,
             ));
         }
-        let request_digest = request_digest(tenant, expected, requested, candidate.digest());
+        let request_digest = request_digest(
+            key,
+            principal,
+            tenant,
+            expected,
+            requested,
+            candidate.digest(),
+        );
         let snapshot = catalog.pin().map_err(map_catalog)?;
         if let Some(receipt) = find_receipt(&snapshot, key)? {
             if receipt.principal != principal
@@ -208,7 +215,11 @@ impl IngestPolicyAdministration {
                 snapshot.identity(),
                 CatalogProposal::new(
                     TransactionId::new(key.0).map_err(map_catalog)?,
-                    FormatEpoch::CATALOG_V1,
+                    snapshot.format_epoch().ok_or_else(|| {
+                        PolicyAdministrationFailure::new(
+                            PolicyAdministrationFailureCode::PersistenceUnavailable,
+                        )
+                    })?,
                     objects,
                 )
                 .map_err(map_catalog)?,

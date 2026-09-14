@@ -85,6 +85,10 @@ pub(super) const fn classify_bootstrap_failure_code(
         | crate::BootstrapFailureCode::ApiKeyIdempotencyConflict => ServiceFailure::InvalidRequest,
         crate::BootstrapFailureCode::ApiKeyUnavailable => ServiceFailure::KeyUnavailable,
         crate::BootstrapFailureCode::TenantLifecycleUnauthorized => ServiceFailure::Unauthorized,
+        crate::BootstrapFailureCode::TenantQuotaUnauthorized => ServiceFailure::Unauthorized,
+        crate::BootstrapFailureCode::TenantDisplayNameUnauthorized => ServiceFailure::Unauthorized,
+        crate::BootstrapFailureCode::TenantAliasUnauthorized => ServiceFailure::Unauthorized,
+        crate::BootstrapFailureCode::TenantRetentionUnauthorized => ServiceFailure::Unauthorized,
         crate::BootstrapFailureCode::TenantLifecycleStaleGeneration
         | crate::BootstrapFailureCode::TenantLifecycleIdempotencyConflict
         | crate::BootstrapFailureCode::TenantLifecycleInvalidTransition
@@ -92,6 +96,26 @@ pub(super) const fn classify_bootstrap_failure_code(
         | crate::BootstrapFailureCode::TenantLifecycleUnknownTenant => {
             ServiceFailure::InvalidRequest
         },
+        crate::BootstrapFailureCode::TenantQuotaStaleGeneration
+        | crate::BootstrapFailureCode::TenantQuotaIdempotencyConflict
+        | crate::BootstrapFailureCode::TenantDisplayNameStaleGeneration
+        | crate::BootstrapFailureCode::TenantDisplayNameIdempotencyConflict => {
+            ServiceFailure::InvalidRequest
+        },
+        crate::BootstrapFailureCode::TenantAliasUnknownTenant
+        | crate::BootstrapFailureCode::TenantAliasAlreadyBound
+        | crate::BootstrapFailureCode::TenantAliasConflict
+        | crate::BootstrapFailureCode::TenantAliasStaleGeneration
+        | crate::BootstrapFailureCode::TenantAliasIdempotencyConflict => {
+            ServiceFailure::InvalidRequest
+        },
+        crate::BootstrapFailureCode::TenantRetentionUnknownTenant
+        | crate::BootstrapFailureCode::TenantRetentionInvalidConfirmation
+        | crate::BootstrapFailureCode::TenantRetentionStaleGeneration
+        | crate::BootstrapFailureCode::TenantRetentionIdempotencyConflict => {
+            ServiceFailure::InvalidRequest
+        },
+        crate::BootstrapFailureCode::TenantCreateConflict => ServiceFailure::InvalidRequest,
         crate::BootstrapFailureCode::KeyCustodyUnavailable => ServiceFailure::KeyUnavailable,
         crate::BootstrapFailureCode::ResourceUnavailable => ServiceFailure::CapacityUnavailable,
         crate::BootstrapFailureCode::CorruptState

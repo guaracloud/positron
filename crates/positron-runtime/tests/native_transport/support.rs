@@ -1,4 +1,7 @@
 use super::*;
+use rustls::pki_types::{CertificateDer, ServerName, pem::PemObject};
+use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
+use std::sync::Arc;
 use std::sync::{Mutex, MutexGuard};
 
 static LIVE_NATIVE_TEST: Mutex<()> = Mutex::new(());
@@ -69,6 +72,73 @@ pub(super) fn http(
             Ok(0) => break,
             Ok(read) => bytes.extend_from_slice(&buffer[..read]),
             Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => break,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(String::from_utf8(bytes)?)
+}
+
+fn write_tls_request(
+    stream: &mut StreamOwned<ClientConnection, TcpStream>,
+    bytes: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    match stream.write_all(bytes) {
+        Ok(()) => Ok(()),
+        Err(error) if error.to_string().contains("peer closed connection") => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub(super) fn tls_http(
+    address: SocketAddr,
+    trust_file: &Path,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut roots = RootCertStore::empty();
+    for certificate in CertificateDer::pem_file_iter(trust_file)? {
+        roots.add(certificate?)?;
+    }
+    let configuration = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let connection = ClientConnection::new(
+        Arc::new(configuration),
+        ServerName::try_from("localhost".to_owned())?,
+    )?;
+    let stream = TcpStream::connect_timeout(&address, Duration::from_secs(2))?;
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+    let mut stream = StreamOwned::new(connection, stream);
+    let mut request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n",
+        body.len()
+    );
+    for (name, value) in headers {
+        request.push_str(name);
+        request.push_str(": ");
+        request.push_str(value);
+        request.push_str("\r\n");
+    }
+    request.push_str("\r\n");
+    write_tls_request(&mut stream, request.as_bytes())?;
+    write_tls_request(&mut stream, body)?;
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 1024];
+    loop {
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => bytes.extend_from_slice(&buffer[..read]),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::UnexpectedEof
+                ) || error.to_string().contains("peer closed connection") =>
+            {
+                break;
+            },
             Err(error) => return Err(error.into()),
         }
     }

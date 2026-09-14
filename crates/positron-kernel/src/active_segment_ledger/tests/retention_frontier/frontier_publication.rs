@@ -1,3 +1,4 @@
+#[cfg(feature = "test-support")]
 use super::*;
 
 #[cfg(feature = "test-support")]

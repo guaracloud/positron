@@ -35,8 +35,7 @@ impl GovernorInner {
         if state.lifecycle == GovernorLifecycle::ShuttingDown {
             return Err(shutdown_failure(class, state.disk_pressure));
         }
-        let tenant_index = self
-            .tenant_index(claim.tenant, class)
+        let tenant_index = Self::tenant_index(state, claim.tenant, class)
             .map_err(|failure| failure.at_pressure(state.disk_pressure))?;
         let outstanding = self.require_healthy_and_slot(state, class, Some(tenant_index))?;
         let shared_eligible = pressure_eligibility(state.disk_pressure, class, claim.amounts)?;
@@ -70,11 +69,7 @@ impl GovernorInner {
             state.lifecycle = GovernorLifecycle::Fenced;
             return Err(internal_failure_at_pressure(class, state.disk_pressure));
         };
-        let Some(tenant_limit) = self
-            .tenant_quotas
-            .get(tenant_index)
-            .map(|quota| quota.limits)
-        else {
+        let Some(tenant_limit) = state.tenant_limits.get(tenant_index).copied() else {
             state.lifecycle = GovernorLifecycle::Fenced;
             return Err(internal_failure_at_pressure(class, state.disk_pressure));
         };
@@ -96,7 +91,7 @@ impl GovernorInner {
             return Err(internal_failure_at_pressure(class, state.disk_pressure));
         };
         let Some(recovery_shared_limit) =
-            self.recovery_tenant_shared_fair.get(tenant_index).copied()
+            state.recovery_tenant_shared_fair.get(tenant_index).copied()
         else {
             state.lifecycle = GovernorLifecycle::Fenced;
             return Err(internal_failure_at_pressure(class, state.disk_pressure));
@@ -124,7 +119,7 @@ impl GovernorInner {
             state.lifecycle = GovernorLifecycle::Fenced;
             return Err(internal_failure_at_pressure(class, state.disk_pressure));
         };
-        let Some(tenant_fair_capacity) = self.tenant_fair_capacities.get(tenant_index).copied()
+        let Some(tenant_fair_capacity) = state.tenant_fair_capacities.get(tenant_index).copied()
         else {
             state.lifecycle = GovernorLifecycle::Fenced;
             return Err(internal_failure_at_pressure(class, state.disk_pressure));

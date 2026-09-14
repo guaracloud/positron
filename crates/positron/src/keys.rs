@@ -101,7 +101,7 @@ fn parse(
         Some("scope-inspect") => KeyAction::ScopeInspect,
         _ => {
             return Err(
-                "usage: positron key create|list|rotate|revoke|scope-inspect --endpoint IP:PORT --credential-stdin [--scope SCOPE] [--principal ID] [--expected-generation N --idempotency-key ID] [--expires-at N]",
+                "usage: positron key create|list|rotate|revoke|scope-inspect --endpoint IP:PORT --credential-stdin [--scope SCOPE] [--target-tenant ID] [--principal ID] [--expected-generation N --idempotency-key ID] [--expires-at N]",
             );
         },
     };
@@ -121,6 +121,7 @@ fn parse(
             argument.as_str(),
             "--endpoint"
                 | "--scope"
+                | "--target-tenant"
                 | "--principal"
                 | "--expected-generation"
                 | "--idempotency-key"
@@ -165,14 +166,22 @@ fn parse(
                 .into(),
         }
     };
+    let target_tenant = options.remove("--target-tenant");
     let request = match action {
         KeyAction::Unspecified => return Err("invalid key command"),
-        KeyAction::List => ApiKeyRequest::list(),
-        KeyAction::ScopeInspect => ApiKeyRequest::inspect(
-            options
+        KeyAction::List => match target_tenant {
+            Some(tenant) => ApiKeyRequest::list_for_tenant(tenant),
+            None => ApiKeyRequest::list(),
+        },
+        KeyAction::ScopeInspect => {
+            let principal = options
                 .remove("--principal")
-                .ok_or("--principal is required")?,
-        ),
+                .ok_or("--principal is required")?;
+            match target_tenant {
+                Some(tenant) => ApiKeyRequest::inspect_for_tenant(principal, tenant),
+                None => ApiKeyRequest::inspect(principal),
+            }
+        },
         KeyAction::Create | KeyAction::Rotate | KeyAction::Revoke => {
             let expected = options
                 .remove("--expected-generation")
@@ -194,16 +203,31 @@ fn parse(
                     .map(|value| value.parse())
                     .transpose()
                     .map_err(|_| "invalid expiry")?;
-                ApiKeyRequest::create(scope, expiry, expected, idempotency)
+                if let Some(target_tenant) = target_tenant {
+                    ApiKeyRequest::create_for_tenant(
+                        scope,
+                        target_tenant,
+                        expiry,
+                        expected,
+                        idempotency,
+                    )
+                } else {
+                    ApiKeyRequest::create(scope, expiry, expected, idempotency)
+                }
             } else {
-                ApiKeyRequest::mutation(
-                    action,
-                    options
-                        .remove("--principal")
-                        .ok_or("--principal is required")?,
-                    expected,
-                    idempotency,
-                )
+                let principal = options
+                    .remove("--principal")
+                    .ok_or("--principal is required")?;
+                match target_tenant {
+                    Some(tenant) => ApiKeyRequest::mutation_for_tenant(
+                        action,
+                        principal,
+                        tenant,
+                        expected,
+                        idempotency,
+                    ),
+                    None => ApiKeyRequest::mutation(action, principal, expected, idempotency),
+                }
                 .map_err(|_| "invalid mutation")?
             }
         },
@@ -268,6 +292,45 @@ mod tests {
                     .map(ToOwned::to_owned)
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn key_create_parses_an_explicit_administrative_target_tenant() {
+        let (_, request) = parse(
+            "create --endpoint 127.0.0.1:8080 --credential-stdin --allow-plaintext --scope query --target-tenant 22222222-2222-2222-2222-222222222222 --expected-generation 1 --idempotency-key 01010101-0101-0101-0101-010101010101"
+                .split_whitespace()
+                .map(ToOwned::to_owned),
+        )
+        .expect("target tenant create parses");
+
+        assert_eq!(
+            request.target_tenant(),
+            Some("22222222-2222-2222-2222-222222222222")
+        );
+    }
+
+    #[test]
+    fn key_lifecycle_parses_an_explicit_administrative_target_tenant() {
+        let (_, list) = parse(
+            "list --endpoint 127.0.0.1:8080 --credential-stdin --allow-plaintext --target-tenant 22222222-2222-2222-2222-222222222222"
+                .split_whitespace()
+                .map(ToOwned::to_owned),
+        )
+        .expect("target tenant list parses");
+        assert_eq!(
+            list.target_tenant(),
+            Some("22222222-2222-2222-2222-222222222222")
+        );
+        let (_, rotate) = parse(
+            "rotate --endpoint 127.0.0.1:8080 --credential-stdin --allow-plaintext --target-tenant 22222222-2222-2222-2222-222222222222 --principal 33333333-3333-3333-3333-333333333333 --expected-generation 2 --idempotency-key 01010101-0101-0101-0101-010101010101"
+                .split_whitespace()
+                .map(ToOwned::to_owned),
+        )
+        .expect("target tenant rotation parses");
+        assert_eq!(
+            rotate.target_tenant(),
+            Some("22222222-2222-2222-2222-222222222222")
         );
     }
 }

@@ -16,6 +16,7 @@ mod reconstruction;
 mod recovery;
 mod retention;
 mod retention_frontier;
+mod retention_impact;
 mod scope_discovery;
 mod snapshot_lease;
 mod snapshot_lease_attempt;
@@ -65,6 +66,89 @@ use storage::LedgerStorage;
 #[cfg(feature = "test-support")]
 pub use test_support::publish_snapshot_lease_marker_for_test;
 pub use types::*;
+
+/// Bounded, generation-pinned estimate of the data exposed by a retention reduction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetentionImpactPreview {
+    scope: SegmentScope,
+    catalog_identity: crate::CatalogGenerationId,
+    catalog_generation: u64,
+    evaluated_at: positron_domain::time::UnixNanoseconds,
+    affected_time_range: Option<RetentionImpactTimeRange>,
+    approximate_affected_bytes: u64,
+    approximate_immediately_reclaimable_bytes: u64,
+    deferred_active_segment_bytes: u64,
+    deferred_mixed_sealed_segment_bytes: u64,
+    earliest_reclamation: RetentionReclamationEstimate,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetentionImpactTimeRange {
+    earliest: positron_domain::time::UnixNanoseconds,
+    latest: positron_domain::time::UnixNanoseconds,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RetentionReclamationEstimate {
+    None,
+    At(positron_domain::time::UnixNanoseconds),
+    BlockedByDurableLease(positron_domain::time::UnixNanoseconds),
+    BlockedByInProcessSnapshot,
+}
+
+impl RetentionImpactPreview {
+    #[must_use]
+    pub const fn scope(self) -> SegmentScope {
+        self.scope
+    }
+    #[must_use]
+    pub const fn catalog_identity(self) -> crate::CatalogGenerationId {
+        self.catalog_identity
+    }
+    #[must_use]
+    pub const fn catalog_generation(self) -> u64 {
+        self.catalog_generation
+    }
+    #[must_use]
+    pub const fn evaluated_at(self) -> positron_domain::time::UnixNanoseconds {
+        self.evaluated_at
+    }
+    #[must_use]
+    pub const fn affected_time_range(self) -> Option<RetentionImpactTimeRange> {
+        self.affected_time_range
+    }
+    #[must_use]
+    pub const fn approximate_affected_bytes(self) -> u64 {
+        self.approximate_affected_bytes
+    }
+    #[must_use]
+    pub const fn approximate_immediately_reclaimable_bytes(self) -> u64 {
+        self.approximate_immediately_reclaimable_bytes
+    }
+    #[must_use]
+    pub const fn deferred_active_segment_bytes(self) -> u64 {
+        self.deferred_active_segment_bytes
+    }
+    #[must_use]
+    pub const fn deferred_mixed_sealed_segment_bytes(self) -> u64 {
+        self.deferred_mixed_sealed_segment_bytes
+    }
+    #[must_use]
+    pub const fn earliest_reclamation(self) -> RetentionReclamationEstimate {
+        self.earliest_reclamation
+    }
+}
+
+impl RetentionImpactTimeRange {
+    #[must_use]
+    pub const fn earliest(self) -> positron_domain::time::UnixNanoseconds {
+        self.earliest
+    }
+    #[must_use]
+    pub const fn latest(self) -> positron_domain::time::UnixNanoseconds {
+        self.latest
+    }
+}
 
 /// Result of a kernel-owned whole-segment retention publication.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

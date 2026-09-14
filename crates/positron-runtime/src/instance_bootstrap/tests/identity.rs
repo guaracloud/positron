@@ -240,7 +240,7 @@ fn query_authorization_generation_ignores_non_security_catalog_churn()
         SignalKind::Logs,
         VirtualShardId::new(1)?,
     );
-    let protection = initialized.key.segment_key(initialized.instance, scope)?;
+    let protection = initialized.tenant_segment_key_for_test(scope)?;
     let ledger = ActiveSegmentLedger::open_with_retention_time(
         &initialized._authority,
         &initialized.retention_time,
@@ -343,7 +343,7 @@ fn authenticated_system_administrator_reads_the_successor_heterogeneous_audit_ch
     let roots = Roots::new()?;
     let volume =
         PrimaryDataVolume::acquire(&roots.parent().join("data"), MountQualification::LocalHost)?;
-    let authority = resources::establish(volume, tenant)?;
+    let authority = resources::establish(volume, tenant, 2)?;
     let marker = [53; 32];
     let catalog = Catalog::open(
         &authority,

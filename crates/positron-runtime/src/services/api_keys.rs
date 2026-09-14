@@ -1,5 +1,5 @@
 use positron_api::api_keys::{ApiKeyRequest, ApiKeyResponse, KeyAction, KeyDescriptor, KeyScope};
-use positron_domain::identity::{PrincipalId, Scope};
+use positron_domain::identity::{PrincipalId, Scope, TenantId};
 use positron_governance::{
     AdministrativeIdempotencyKey, CompatibilityHints, PresentedCredential, RequestedIntent,
     ResourceGeneration,
@@ -28,10 +28,14 @@ impl ServiceHandle {
             secret: None,
         };
         if matches!(request.action(), KeyAction::List | KeyAction::ScopeInspect) {
-            let keys = self
-                .instance
-                .list_api_keys(actor)
-                .map_err(|error| map_failure(error.code()))?;
+            let keys = match request.target_tenant() {
+                Some(target) => self.instance.list_api_keys_for_tenant(
+                    actor,
+                    TenantId::parse_canonical(target).map_err(|_| (400, "invalid_request"))?,
+                ),
+                None => self.instance.list_api_keys(actor),
+            }
+            .map_err(|error| map_failure(error.code()))?;
             response.keys = keys
                 .into_iter()
                 .filter(|key| {
@@ -62,17 +66,31 @@ impl ServiceHandle {
         let idempotency = AdministrativeIdempotencyKey::new(idempotency.to_bytes())
             .map_err(|_| (400, "invalid_request"))?;
         let created = match request.action() {
-            KeyAction::Create => Some(
-                self.instance
-                    .create_api_key(
+            KeyAction::Create => {
+                let scope = domain_scope(request.scope().ok_or((400, "invalid_request"))?)?;
+                let created = match request.target_tenant() {
+                    Some(target) => {
+                        let tenant = TenantId::parse_canonical(target)
+                            .map_err(|_| (400, "invalid_request"))?;
+                        self.instance.create_api_key_for_tenant(
+                            actor,
+                            tenant,
+                            scope,
+                            request.expiry(),
+                            expected,
+                            idempotency,
+                        )
+                    },
+                    None => self.instance.create_api_key(
                         actor,
-                        domain_scope(request.scope().ok_or((400, "invalid_request"))?)?,
+                        scope,
                         request.expiry(),
                         expected,
                         idempotency,
-                    )
-                    .map_err(|error| map_failure(error.code()))?,
-            ),
+                    ),
+                };
+                Some(created.map_err(|error| map_failure(error.code()))?)
+            },
             KeyAction::Rotate | KeyAction::Revoke => {
                 let principal = PrincipalId::parse_canonical(
                     request.principal().ok_or((400, "invalid_request"))?,
@@ -80,14 +98,40 @@ impl ServiceHandle {
                 .map_err(|_| (400, "invalid_request"))?;
                 if request.action() == KeyAction::Rotate {
                     Some(
-                        self.instance
-                            .rotate_api_key(actor, principal, expected, idempotency)
-                            .map_err(|error| map_failure(error.code()))?,
+                        match request.target_tenant() {
+                            Some(target) => self.instance.rotate_api_key_for_tenant(
+                                actor,
+                                TenantId::parse_canonical(target)
+                                    .map_err(|_| (400, "invalid_request"))?,
+                                principal,
+                                expected,
+                                idempotency,
+                            ),
+                            None => self.instance.rotate_api_key(
+                                actor,
+                                principal,
+                                expected,
+                                idempotency,
+                            ),
+                        }
+                        .map_err(|error| map_failure(error.code()))?,
                     )
                 } else {
-                    self.instance
-                        .revoke_api_key(actor, principal, expected, idempotency)
-                        .map_err(|error| map_failure(error.code()))?;
+                    match request.target_tenant() {
+                        Some(target) => self.instance.revoke_api_key_for_tenant(
+                            actor,
+                            TenantId::parse_canonical(target)
+                                .map_err(|_| (400, "invalid_request"))?,
+                            principal,
+                            expected,
+                            idempotency,
+                        ),
+                        None => {
+                            self.instance
+                                .revoke_api_key(actor, principal, expected, idempotency)
+                        },
+                    }
+                    .map_err(|error| map_failure(error.code()))?;
                     response.principal = Some(principal.to_canonical_text());
                     None
                 }

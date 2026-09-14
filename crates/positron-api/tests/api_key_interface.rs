@@ -16,6 +16,7 @@ fn generated_api_key_service_client_uses_the_canonical_http_mapping()
         let request = &request[..length];
         let request = String::from_utf8_lossy(request);
         assert!(request.starts_with("POST /v1/api-keys:manage HTTP/1.1\r\n"));
+        assert!(request.contains("\"target_tenant\":\"22222222-2222-2222-2222-222222222222\""));
         assert!(
             request
                 .to_ascii_lowercase()
@@ -31,10 +32,17 @@ fn generated_api_key_service_client_uses_the_canonical_http_mapping()
         )?;
         Ok(())
     });
+    let request = ApiKeyRequest::create_for_tenant(
+        KeyScope::Query,
+        "22222222-2222-2222-2222-222222222222".to_owned(),
+        None,
+        1,
+        "01010101-0101-0101-0101-010101010101".to_owned(),
+    );
     let client = positron_api::api_keys::ApiKeyServiceClient::new(
         positron_api::api_keys::ApiKeyTransport::PlaintextOptOut { endpoint },
     )?;
-    let response = client.manage("key-material", &ApiKeyRequest::list())?;
+    let response = client.manage("key-material", &request)?;
     assert_eq!(
         response.principal.as_deref(),
         Some("11111111-1111-1111-1111-111111111111")
@@ -155,6 +163,7 @@ fn prost_generated_key_messages_share_the_http_contract() -> Result<(), Box<dyn 
         expires_at_unix_seconds: None,
         expected_generation: Some(1),
         idempotency_key: Some("11111111-1111-1111-1111-111111111111".to_owned()),
+        target_tenant: None,
     };
     let encoded = request.encode_to_vec();
     assert!(encoded.starts_with(&[8, 1, 16, 2, 40, 1, 50, 36]));
@@ -164,6 +173,7 @@ fn prost_generated_key_messages_share_the_http_contract() -> Result<(), Box<dyn 
     let checked = ApiKeyRequest::decode(&http)?;
     assert_eq!(checked.action(), KeyAction::Create);
     assert_eq!(checked.scope(), Some(KeyScope::Query));
+    assert_eq!(checked.target_tenant(), None);
     assert!(ApiKeyRequest::decode(br#"{"action":"unspecified"}"#).is_err());
     Ok(())
 }
@@ -206,6 +216,7 @@ fn key_request_checks_mutation_preconditions_and_response_redaction() {
         r#"{"action":"rotate","principal":"bad"}"#,
         r#"{"action":"list","expires_at_unix_seconds":1}"#,
         r#"{"action":"create","scope":"custom"}"#,
+        r#"{"action":"create","scope":"query","expected_generation":1,"idempotency_key":"01010101-0101-0101-0101-010101010101","target_tenant":"not-a-tenant"}"#,
     ] {
         assert!(ApiKeyRequest::decode(body.as_bytes()).is_err());
     }
@@ -250,4 +261,60 @@ fn canonical_key_request_round_trips_and_rejects_ambient_authority() {
     assert!(ApiKeyRequest::decode(br#"{"action":"list","tenant":"other"}"#).is_err());
     assert!(ApiKeyRequest::decode(br#"{"action":"list","action":"create"}"#).is_err());
     assert!(ApiKeyRequest::decode(&vec![b' '; 1025]).is_err());
+}
+
+#[test]
+fn canonical_key_create_can_name_an_explicit_administrative_target_tenant() {
+    let request = ApiKeyRequest::create_for_tenant(
+        KeyScope::Query,
+        "22222222-2222-2222-2222-222222222222".to_owned(),
+        None,
+        1,
+        "01010101-0101-0101-0101-010101010101".to_owned(),
+    );
+
+    let encoded = request.encode().expect("target tenant request encodes");
+    assert_eq!(
+        String::from_utf8(encoded.clone()).expect("request JSON"),
+        r#"{"action":"create","scope":"query","expected_generation":1,"idempotency_key":"01010101-0101-0101-0101-010101010101","target_tenant":"22222222-2222-2222-2222-222222222222"}"#
+    );
+    let decoded = ApiKeyRequest::decode(&encoded).expect("target tenant request decodes");
+    assert_eq!(
+        decoded.target_tenant(),
+        Some("22222222-2222-2222-2222-222222222222")
+    );
+    assert_eq!(
+        ApiKeyRequest::create(
+            KeyScope::Query,
+            None,
+            1,
+            "01010101-0101-0101-0101-010101010101".to_owned(),
+        )
+        .target_tenant(),
+        None,
+        "the legacy create constructor retains authenticated tenant selection"
+    );
+}
+
+#[test]
+fn canonical_key_lifecycle_actions_can_name_an_explicit_administrative_target_tenant() {
+    let tenant = "22222222-2222-2222-2222-222222222222".to_owned();
+    let principal = "33333333-3333-3333-3333-333333333333".to_owned();
+    let list = ApiKeyRequest::list_for_tenant(tenant.clone());
+    assert_eq!(list.action(), KeyAction::List);
+    assert_eq!(list.target_tenant(), Some(tenant.as_str()));
+    assert!(list.encode().is_ok());
+    let inspect = ApiKeyRequest::inspect_for_tenant(principal.clone(), tenant.clone());
+    assert_eq!(inspect.action(), KeyAction::ScopeInspect);
+    assert_eq!(inspect.target_tenant(), Some(tenant.as_str()));
+    let rotation = ApiKeyRequest::mutation_for_tenant(
+        KeyAction::Rotate,
+        principal,
+        tenant.clone(),
+        2,
+        "01010101-0101-0101-0101-010101010101".to_owned(),
+    )
+    .expect("target rotation request");
+    assert_eq!(rotation.target_tenant(), Some(tenant.as_str()));
+    assert!(rotation.encode().is_ok());
 }

@@ -97,6 +97,7 @@ fn reopened_identity_authenticates_the_hash_only_administrator_without_impersona
     Ok(())
 }
 
+#[cfg(feature = "test-support")]
 #[test]
 fn read_only_transition_is_durable_idempotent_and_preserves_query_access()
 -> Result<(), Box<dyn Error>> {
@@ -237,6 +238,7 @@ fn committed_lifecycle_retry_returns_its_original_audit_when_fresh_governance_ti
     Ok(())
 }
 
+#[cfg(feature = "test-support")]
 #[test]
 fn retention_pass_continues_from_the_v6_governance_record_in_read_only_and_suspended()
 -> Result<(), Box<dyn Error>> {
@@ -466,6 +468,7 @@ fn lifecycle_transitions_preserve_the_closed_access_and_retry_contract()
     Ok(())
 }
 
+#[cfg(feature = "test-support")]
 #[test]
 fn administrator_creates_a_one_time_tenant_administration_key_that_survives_reopen()
 -> Result<(), Box<dyn Error>> {

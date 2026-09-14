@@ -173,21 +173,29 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             transaction.cancel(&mut state);
             return Err(failure);
         }
-        let publication = (|| {
-            #[cfg(any(test, fuzzing, feature = "test-support"))]
-            super::fault::emit_event(super::fault::LedgerFileEvent::BeforeLeaseUsagePublication)?;
-            publish_many(
-                self.catalog,
-                &basis,
-                &BTreeSet::from([identity]),
-                vec![encoded],
-            )
-        })()
-        .and_then(|()| {
-            #[cfg(any(test, fuzzing, feature = "test-support"))]
-            super::fault::emit_event(super::fault::LedgerFileEvent::AfterLeaseUsagePublication)?;
-            Ok(())
-        });
+        #[cfg(any(test, fuzzing, feature = "test-support"))]
+        let publication =
+            super::fault::emit_event(super::fault::LedgerFileEvent::BeforeLeaseUsagePublication)
+                .and_then(|()| {
+                    publish_many(
+                        self.catalog,
+                        &basis,
+                        &BTreeSet::from([identity]),
+                        vec![encoded],
+                    )
+                })
+                .and_then(|()| {
+                    super::fault::emit_event(
+                        super::fault::LedgerFileEvent::AfterLeaseUsagePublication,
+                    )
+                });
+        #[cfg(not(any(test, fuzzing, feature = "test-support")))]
+        let publication = publish_many(
+            self.catalog,
+            &basis,
+            &BTreeSet::from([identity]),
+            vec![encoded],
+        );
         if let Err(failure) = publication {
             if failure.completion_state() == super::LedgerCompletionState::CommitAmbiguous {
                 let reconciled = self.reconcile_ambiguous_usage(

@@ -84,6 +84,13 @@ fn accepts_each_closed_value_and_exact_numeric_and_address_boundaries()
         assert_eq!(effective.shutdown_grace_seconds(), boundary);
     }
 
+    for boundary in [1, 3, 1024] {
+        let document =
+            format!("schema_version = 1\n[runtime]\nmax_registered_tenants = {boundary}\n");
+        let effective = inputs(Some(&document), [], []).and_then(resolve)?;
+        assert_eq!(effective.max_registered_tenants(), boundary);
+    }
+
     for address in ["127.0.0.1:1", "[::1]:65535"] {
         let document =
             format!("schema_version = 1\n[listener]\noperations_bind_address = \"{address}\"\n");
@@ -148,6 +155,16 @@ fn rejects_invalid_shapes_and_values_from_each_closed_value_domain() {
             "schema_version = 1\n[runtime]\nshutdown_grace_seconds = \"30\"\n",
             ConfigurationFailureCode::Malformed,
             FailureSource::ConfigurationDocument,
+        ),
+        (
+            "schema_version = 1\n[runtime]\nmax_registered_tenants = 0\n",
+            ConfigurationFailureCode::UnsupportedValue,
+            FailureSource::RuntimeMaxRegisteredTenants,
+        ),
+        (
+            "schema_version = 1\n[runtime]\nmax_registered_tenants = 1025\n",
+            ConfigurationFailureCode::UnsupportedValue,
+            FailureSource::RuntimeMaxRegisteredTenants,
         ),
         (
             "schema_version = 1\n[listener]\noperations_bind_address = \"not-an-address\"\n",

@@ -18,9 +18,10 @@ use positron_domain::identity::{
     ExternalTenantAlias, PrincipalId, Scope, TenantAttribution, TenantId, TenantSlug,
 };
 use positron_domain::lifecycle::TenantLifecycleState;
-use positron_kernel::{BootstrapKeyCustody, CatalogSnapshot};
+use positron_kernel::{BootstrapKeyCustody, CatalogSnapshot, FormatEpoch};
 
-use crate::GovernanceAuditEntry;
+use crate::tenant_quota_record::tenant_alias_record;
+use crate::{ApiKeyAdministration, GovernanceAuditEntry, TenantAdministration};
 
 use codec::identity_from_catalog;
 
@@ -48,6 +49,14 @@ pub(super) struct CredentialIdentity {
     pub(super) hash: [u8; 32],
 }
 
+#[derive(Clone)]
+struct AdditionalTenantIdentity {
+    tenant: TenantId,
+    lifecycle: TenantLifecycleState,
+    external_alias: Option<ExternalTenantAlias>,
+    credentials: Vec<CredentialIdentity>,
+}
+
 /// The sole immutable identity view reconstructed from one Catalog Generation.
 #[derive(Clone)]
 pub struct Identity {
@@ -63,29 +72,151 @@ pub struct Identity {
     query: Option<QueryIdentity>,
     credentials: Vec<CredentialIdentity>,
     lifecycle: TenantLifecycleState,
+    tenant_key_envelope: Vec<u8>,
+    additional_tenant_key_envelopes: Vec<(TenantId, Vec<u8>)>,
+    additional_tenant_lifecycles: Vec<(TenantId, TenantLifecycleState)>,
+    additional_tenants: Vec<AdditionalTenantIdentity>,
 }
 
 impl Identity {
+    /// Authorizes a retention preview or confirmed update for one tenant.
+    /// Tenant administrators are bound to their own active or read-only
+    /// tenant; system administration is reserved for in-process governance
+    /// recovery workflows.
+    pub fn authorize_tenant_retention(
+        &self,
+        context: AuthorizedContext,
+        tenant: TenantId,
+    ) -> Result<PrincipalId, AttributionFailure> {
+        self.authorize_policy_activation(context, tenant)
+    }
+
     pub(super) fn authorize_policy_activation(
         &self,
         context: AuthorizedContext,
         tenant: TenantId,
     ) -> Result<PrincipalId, AttributionFailure> {
-        if context.principal != self.principal
-            || context.scope != Scope::SystemAdministration
-            || context.tenant.is_some()
-            || context.authority != self.instance
-            || tenant != self.tenant
-        {
+        let lifecycle = self.tenant_lifecycle(tenant).ok_or(AttributionFailure)?;
+        if context.authority != self.instance {
             return Err(AttributionFailure);
         }
-        Ok(context.principal)
+        match context.scope {
+            Scope::SystemAdministration
+                if context.principal == self.principal && context.tenant.is_none() =>
+            {
+                Ok(context.principal)
+            },
+            Scope::TenantAdministration
+                if matches!(
+                    lifecycle,
+                    TenantLifecycleState::Active | TenantLifecycleState::ReadOnly
+                ) && context.lifecycle == lifecycle
+                    && context.tenant.is_some_and(|attribution| {
+                        attribution.principal_id() == context.principal
+                            && attribution.scope() == Scope::TenantAdministration
+                            && attribution.tenant_id() == tenant
+                    }) =>
+            {
+                Ok(context.principal)
+            },
+            Scope::Ingest
+            | Scope::Query
+            | Scope::TenantAdministration
+            | Scope::SystemAdministration => Err(AttributionFailure),
+        }
+    }
+
+    pub(super) fn authorize_quota_update(
+        &self,
+        context: AuthorizedContext,
+        tenant: TenantId,
+    ) -> Result<PrincipalId, AttributionFailure> {
+        self.authorize_policy_activation(context, tenant)
     }
 
     /// Reconstructs the unique initialization identity from a pinned Catalog.
     pub fn open(snapshot: &CatalogSnapshot) -> Result<Self, IdentityFailure> {
         let (_, governance) = snapshot.governance_object().map_err(|_| IdentityFailure)?;
-        identity_from_catalog(governance)
+        let mut identity = identity_from_catalog(governance)?;
+        if snapshot.format_epoch() == Some(FormatEpoch::CATALOG_V2)
+            && !TenantAdministration::registered_tenant_ids(snapshot)
+                .map_err(|_| IdentityFailure)?
+                .contains(&identity.tenant)
+        {
+            return Err(IdentityFailure);
+        }
+        if snapshot.format_epoch() == Some(FormatEpoch::CATALOG_V2) {
+            let lifecycles = TenantAdministration::registered_tenant_lifecycles(snapshot)
+                .map_err(|_| IdentityFailure)?;
+            identity.additional_tenant_lifecycles = lifecycles
+                .iter()
+                .filter_map(|(tenant, lifecycle)| {
+                    (*tenant != identity.tenant).then_some((*tenant, *lifecycle))
+                })
+                .collect();
+            identity.additional_tenant_key_envelopes =
+                TenantAdministration::registered_tenant_key_envelopes(snapshot)
+                    .map_err(|_| IdentityFailure)?;
+            identity.additional_tenants =
+                ApiKeyAdministration::tenant_credential_identities(snapshot)
+                    .map_err(|_| IdentityFailure)?
+                    .into_iter()
+                    .map(|record| {
+                        let lifecycle = lifecycles
+                            .iter()
+                            .find_map(|(tenant, lifecycle)| {
+                                (*tenant == record.tenant).then_some(*lifecycle)
+                            })
+                            .ok_or(IdentityFailure)?;
+                        let credentials = record
+                            .credentials
+                            .into_iter()
+                            .map(|credential| {
+                                let scope = match credential.scope_code() {
+                                    1 => Scope::Ingest,
+                                    2 => Scope::Query,
+                                    3 => Scope::TenantAdministration,
+                                    _ => return Err(IdentityFailure),
+                                };
+                                let (salt, hash) = credential.salted_hash();
+                                Ok(CredentialIdentity {
+                                    principal: credential.principal(),
+                                    scope,
+                                    active: credential.is_active(),
+                                    expires_at_unix_seconds: credential.expires_at_unix_seconds(),
+                                    salt,
+                                    hash,
+                                })
+                            })
+                            .collect::<Result<Vec<_>, IdentityFailure>>()?;
+                        let external_alias = tenant_alias_record(snapshot, record.tenant)
+                            .map_err(|_| IdentityFailure)?
+                            .ok_or(IdentityFailure)?
+                            .alias;
+                        Ok(AdditionalTenantIdentity {
+                            tenant: record.tenant,
+                            lifecycle,
+                            external_alias,
+                            credentials,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, IdentityFailure>>()?;
+        }
+        Ok(identity)
+    }
+
+    /// Returns the opaque tenant KEK envelope only when the requested tenant
+    /// is this immutable identity's authenticated tenant.
+    pub fn tenant_key_envelope(&self, tenant: TenantId) -> Result<&[u8], IdentityFailure> {
+        if tenant == self.tenant {
+            return (!self.tenant_key_envelope.is_empty())
+                .then_some(self.tenant_key_envelope.as_slice())
+                .ok_or(IdentityFailure);
+        }
+        self.additional_tenant_key_envelopes
+            .iter()
+            .find_map(|(candidate, envelope)| (*candidate == tenant).then_some(envelope.as_slice()))
+            .ok_or(IdentityFailure)
     }
 
     /// Authenticates and authorizes before a decoder or data-plane admission
@@ -111,15 +242,9 @@ impl Identity {
         hints: CompatibilityHints,
         lifecycle_seconds: Option<u64>,
     ) -> Result<AuthorizedContext, AttributionFailure> {
-        let alias_matches = match (&self.external_alias, &hints.external_alias) {
-            (_, None) => true,
-            (Some(bound), Some(presented)) => bound == presented,
-            (None, Some(_)) => false,
-        };
         if hints.has_untrusted_authority_claims()
             || (matches!(intent, RequestedIntent::SystemAdministration)
                 && hints.external_alias.is_some())
-            || !alias_matches
         {
             return Err(AttributionFailure);
         }
@@ -143,27 +268,64 @@ impl Identity {
                     .expires_at_unix_seconds
                     .is_none_or(|expiry| lifecycle_seconds.is_some_and(|now| now < expiry));
                 if matches && candidate.active && unexpired && candidate.scope == scope {
-                    selected = Some(candidate);
+                    selected = Some((candidate.principal, self.tenant, self.lifecycle));
                 }
             }
-            let candidate = selected.ok_or(AttributionFailure)?;
-            if scope == Scope::Ingest && self.lifecycle != TenantLifecycleState::Active {
+            for identity in &self.additional_tenants {
+                for candidate in &identity.credentials {
+                    let matches = keys
+                        .verify_salted_secret_hash(
+                            &candidate.salt,
+                            credential.secret(),
+                            &candidate.hash,
+                        )
+                        .map_err(|_| AttributionFailure)?;
+                    let unexpired = candidate
+                        .expires_at_unix_seconds
+                        .is_none_or(|expiry| lifecycle_seconds.is_some_and(|now| now < expiry));
+                    if matches
+                        && candidate.active
+                        && unexpired
+                        && candidate.scope == scope
+                        && selected
+                            .replace((candidate.principal, identity.tenant, identity.lifecycle))
+                            .is_some()
+                    {
+                        return Err(AttributionFailure);
+                    }
+                }
+            }
+            let (principal, tenant, lifecycle) = selected.ok_or(AttributionFailure)?;
+            let bound_alias = if tenant == self.tenant {
+                self.external_alias.as_ref()
+            } else {
+                self.additional_tenants
+                    .iter()
+                    .find_map(|identity| {
+                        (identity.tenant == tenant).then_some(identity.external_alias.as_ref())
+                    })
+                    .flatten()
+            };
+            if !alias_matches(bound_alias, hints.external_alias.as_ref()) {
                 return Err(AttributionFailure);
             }
-            if scope == Scope::Query && !is_query_readable(self.lifecycle) {
+            if scope == Scope::Ingest && lifecycle != TenantLifecycleState::Active {
+                return Err(AttributionFailure);
+            }
+            if scope == Scope::Query && !is_query_readable(lifecycle) {
                 return Err(AttributionFailure);
             }
             return Ok(AuthorizedContext {
-                principal: candidate.principal,
+                principal,
                 scope,
                 tenant: scope
                     .is_tenant_scoped()
-                    .then(|| TenantAttribution::new(candidate.principal, scope, self.tenant))
+                    .then(|| TenantAttribution::new(principal, scope, tenant))
                     .transpose()
                     .map_err(|_| AttributionFailure)?,
                 authority: self.instance,
                 generation: self.generation,
-                lifecycle: self.lifecycle,
+                lifecycle,
                 proxy_actor: hints.proxy_actor,
             });
         }
@@ -184,6 +346,9 @@ impl Identity {
                 })
             },
             RequestedIntent::Ingest => {
+                if !alias_matches(self.external_alias.as_ref(), hints.external_alias.as_ref()) {
+                    return Err(AttributionFailure);
+                }
                 if self.lifecycle != TenantLifecycleState::Active {
                     return Err(AttributionFailure);
                 }
@@ -208,6 +373,9 @@ impl Identity {
                 })
             },
             RequestedIntent::Query => {
+                if !alias_matches(self.external_alias.as_ref(), hints.external_alias.as_ref()) {
+                    return Err(AttributionFailure);
+                }
                 if !is_query_readable(self.lifecycle) {
                     return Err(AttributionFailure);
                 }
@@ -249,17 +417,17 @@ impl Identity {
         context: AuthorizedContext,
     ) -> Result<(), AttributionFailure> {
         let tenant = context.tenant.ok_or(AttributionFailure)?;
-        if self
-            .query
-            .as_ref()
-            .is_none_or(|query| context.principal != query.principal)
-            || context.scope != Scope::Query
+        let lifecycle = self
+            .tenant_lifecycle(tenant.tenant_id())
+            .ok_or(AttributionFailure)?;
+        if context.scope != Scope::Query
             || tenant.principal_id() != context.principal
             || tenant.scope() != Scope::Query
-            || tenant.tenant_id() != self.tenant
             || context.authority != self.instance
             || context.generation != self.generation
-            || !is_query_readable(self.lifecycle)
+            || context.lifecycle != lifecycle
+            || !is_query_readable(lifecycle)
+            || !self.active_tenant_credential(tenant.tenant_id(), context.principal, Scope::Query)
         {
             return Err(AttributionFailure);
         }
@@ -273,18 +441,17 @@ impl Identity {
         context: AuthorizedContext,
     ) -> Result<(), AttributionFailure> {
         let tenant = context.tenant.ok_or(AttributionFailure)?;
-        if self
-            .ingest
-            .as_ref()
-            .is_none_or(|ingest| context.principal != ingest.principal)
-            || context.scope != Scope::Ingest
+        let lifecycle = self
+            .tenant_lifecycle(tenant.tenant_id())
+            .ok_or(AttributionFailure)?;
+        if context.scope != Scope::Ingest
             || tenant.principal_id() != context.principal
             || tenant.scope() != Scope::Ingest
-            || tenant.tenant_id() != self.tenant
             || context.authority != self.instance
             || context.generation != self.generation
-            || context.lifecycle != self.lifecycle
-            || self.lifecycle != TenantLifecycleState::Active
+            || context.lifecycle != lifecycle
+            || lifecycle != TenantLifecycleState::Active
+            || !self.active_tenant_credential(tenant.tenant_id(), context.principal, Scope::Ingest)
         {
             return Err(AttributionFailure);
         }
@@ -298,6 +465,41 @@ impl Identity {
         context: AuthorizedContext,
     ) -> Result<(), AttributionFailure> {
         self.validate_query_context(context)
+    }
+
+    fn active_tenant_credential(
+        &self,
+        tenant: TenantId,
+        principal: PrincipalId,
+        scope: Scope,
+    ) -> bool {
+        if tenant == self.tenant {
+            return self.credentials.iter().any(|credential| {
+                credential.principal == principal && credential.scope == scope && credential.active
+            });
+        }
+        self.additional_tenants.iter().any(|identity| {
+            identity.tenant == tenant
+                && identity.credentials.iter().any(|credential| {
+                    credential.principal == principal
+                        && credential.scope == scope
+                        && credential.active
+                })
+        })
+    }
+
+    fn tenant_lifecycle(&self, tenant: TenantId) -> Option<TenantLifecycleState> {
+        if tenant == self.tenant {
+            return Some(self.lifecycle);
+        }
+        self.additional_tenants
+            .iter()
+            .find_map(|identity| (identity.tenant == tenant).then_some(identity.lifecycle))
+            .or_else(|| {
+                self.additional_tenant_lifecycles
+                    .iter()
+                    .find_map(|(candidate, lifecycle)| (*candidate == tenant).then_some(*lifecycle))
+            })
     }
 
     /// Authorizes the narrow read-only governance view without introducing a
@@ -329,6 +531,17 @@ impl std::fmt::Debug for Identity {
             .field("principal", &self.principal)
             .field("tenant", &self.tenant)
             .finish_non_exhaustive()
+    }
+}
+
+fn alias_matches(
+    bound: Option<&ExternalTenantAlias>,
+    presented: Option<&ExternalTenantAlias>,
+) -> bool {
+    match (bound, presented) {
+        (_, None) => true,
+        (Some(bound), Some(presented)) => bound == presented,
+        (None, Some(_)) => false,
     }
 }
 

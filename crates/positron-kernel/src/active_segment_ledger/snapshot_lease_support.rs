@@ -345,6 +345,28 @@ pub(crate) fn active_segments(
     Ok(segments)
 }
 
+/// Returns the latest durable lease expiry that still protects one segment.
+pub(crate) fn reclamation_lease_expiry(
+    snapshot: &crate::CatalogSnapshot,
+    scope: SegmentScope,
+    segment: super::super::SegmentId,
+    now: u64,
+) -> Result<Option<u64>, LedgerFailure> {
+    records(snapshot)?
+        .into_iter()
+        .try_fold(None, |latest, record| {
+            if record.scope != scope
+                || now >= record.expiry
+                || !record.blocks.iter().any(|block| block.segment == segment)
+            {
+                return Ok(latest);
+            }
+            Ok(Some(latest.map_or(record.expiry, |previous: u64| {
+                previous.max(record.expiry)
+            })))
+        })
+}
+
 pub(super) fn publish(
     catalog: &crate::Catalog<'_>,
     basis: &crate::CatalogSnapshot,
@@ -418,7 +440,13 @@ fn publish_many_with_expected_catalog_inner(
     let transaction = TransactionId::new(fresh_identity()?.to_bytes())?;
     match catalog.commit(
         expected_catalog,
-        CatalogProposal::new(transaction, FormatEpoch::new(FORMAT_EPOCH)?, objects)?,
+        CatalogProposal::new(
+            transaction,
+            basis
+                .format_epoch()
+                .unwrap_or(FormatEpoch::new(FORMAT_EPOCH)?),
+            objects,
+        )?,
         None,
     ) {
         Ok(commit) => Ok(commit.snapshot().clone()),

@@ -19,6 +19,12 @@ use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
 mod keys;
+mod policy;
+mod tenant_alias_cli;
+mod tenant_lifecycle;
+mod tenant_quotas;
+mod tenant_retention;
+mod tenant_service_cli;
 
 const EXIT_OK: u8 = 0;
 const EXIT_CONFIGURATION: u8 = 2;
@@ -34,6 +40,31 @@ pub fn run_native(
     if arguments.peek().is_some_and(|argument| argument == "key") {
         arguments.next();
         return keys::run(arguments);
+    }
+    if arguments
+        .peek()
+        .is_some_and(|argument| argument == "tenant")
+    {
+        arguments.next();
+        return match arguments.next().as_deref() {
+            Some("lifecycle") => tenant_lifecycle::run(arguments),
+            Some("alias") => tenant_alias_cli::run(arguments),
+            Some("retention") => tenant_retention::run(arguments),
+            Some(command @ ("create" | "inspect" | "list" | "update-display-name")) => {
+                tenant_service_cli::run(std::iter::once(command.to_owned()).chain(arguments))
+            },
+            Some(command) => {
+                tenant_quotas::run(std::iter::once(command.to_owned()).chain(arguments))
+            },
+            None => tenant_quotas::run(std::iter::empty()),
+        };
+    }
+    if arguments
+        .peek()
+        .is_some_and(|argument| argument == "policy")
+    {
+        arguments.next();
+        return policy::run(arguments);
     }
     match run(arguments, environment) {
         Ok(outcome) => exit_code(outcome),
@@ -98,9 +129,12 @@ fn run(
     let recovery =
         NativeRecovery::new(Signals::new([SIGINT, SIGTERM]).map_err(|_| LaunchFailure::Signal)?);
     let configuration = if effective.api_transport() == ApiTransport::PlaintextOptOut {
-        ServeConfiguration::new(paths, arguments.initialization).with_public_plaintext_api_warning()
+        ServeConfiguration::new(paths, arguments.initialization)
+            .with_max_registered_tenants(effective.max_registered_tenants())
+            .with_public_plaintext_api_warning()
     } else {
         ServeConfiguration::new(paths, arguments.initialization)
+            .with_max_registered_tenants(effective.max_registered_tenants())
     };
     let process = match ApplicationRuntime::start(
         configuration,

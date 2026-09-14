@@ -1,19 +1,179 @@
+use positron_domain::identity::Scope;
 use positron_governance::{
-    AdministrativeIdempotencyKey, CompatibilityHints, GovernanceAuditEntry,
+    AdministrativeIdempotencyKey, CompatibilityHints, GovernanceAuditEntry, Identity,
     IngestPolicyAdministration, PolicyAdministrationFailureCode, PresentedCredential,
     RequestedIntent, ResourceGeneration,
 };
 use positron_ingest::{IngestPolicy, PolicyAction, PolicyRule};
 use positron_kernel::{
-    AuditIntent, Catalog, CatalogObject, CatalogProposal, FormatEpoch, TransactionId,
+    AuditIntent, Catalog, CatalogObject, CatalogProposal, CatalogPublicationFault, FormatEpoch,
+    TransactionId, with_catalog_publication_fault_after,
 };
 
-use super::super::{InitializationPlan, InstanceBootstrap};
+use super::super::{InitializationPlan, InitializedInstance, InstanceBootstrap};
 use super::support::Roots;
 
+#[path = "policy_activation/concurrency.rs"]
 mod concurrency;
+#[path = "policy_activation/corruption.rs"]
 mod corruption;
+#[path = "policy_activation/live.rs"]
 mod live;
+
+#[test]
+fn tenant_administrator_can_activate_its_prospective_ingest_policy()
+-> Result<(), Box<dyn std::error::Error>> {
+    let roots = Roots::new()?;
+    let paths = roots.paths();
+    let initialized = InstanceBootstrap::initialize(&paths, InitializationPlan::non_interactive())?;
+    drop(initialized);
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let initialized = InstanceBootstrap::reopen(&paths)?;
+    let system = initialized.attribute(
+        PresentedCredential::parse(claim.secret())?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let tenant_administrator = initialized.create_api_key(
+        system,
+        Scope::TenantAdministration,
+        None,
+        ResourceGeneration::new(1)?,
+        AdministrativeIdempotencyKey::new([0x71; 16])?,
+    )?;
+    let tenant_secret = tenant_administrator
+        .secret()
+        .ok_or("tenant-administration secret")?
+        .to_owned();
+    let catalog = Catalog::open(
+        &initialized._authority,
+        initialized.instance,
+        initialized.key.catalog_secret(initialized.instance)?,
+    )?;
+    let identity = Identity::open(&catalog.pin()?)?;
+    let actor = identity.attribute(
+        &initialized.key,
+        PresentedCredential::parse(&tenant_secret)?,
+        RequestedIntent::TenantAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let administration = IngestPolicyAdministration::open(&catalog, initialized.tenant)?;
+    let activation = administration.activate(
+        &catalog,
+        &identity,
+        actor,
+        ResourceGeneration::new(1)?,
+        AdministrativeIdempotencyKey::new([0x72; 16])?,
+        IngestPolicy::compile(
+            2,
+            vec![PolicyRule::new(
+                "tenant-policy",
+                Vec::new(),
+                PolicyAction::Accept,
+            )?],
+        )?,
+    )?;
+    assert_eq!(activation.resource_generation().get(), 2);
+    assert_eq!(
+        administration.serving().pin()?.generation(),
+        2,
+        "activation affects only subsequently pinned policy snapshots"
+    );
+    Ok(())
+}
+
+#[test]
+fn failed_policy_catalog_publication_preserves_the_durable_and_live_policy()
+-> Result<(), Box<dyn std::error::Error>> {
+    let roots = Roots::new()?;
+    let paths = roots.paths();
+    drop(InstanceBootstrap::initialize(
+        &paths,
+        InitializationPlan::non_interactive(),
+    )?);
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let initialized = InstanceBootstrap::reopen(&paths)?;
+    let administrator = initialized.attribute(
+        PresentedCredential::parse(claim.secret())?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let catalog = Catalog::open(
+        &initialized._authority,
+        initialized.instance,
+        initialized.key.catalog_secret(initialized.instance)?,
+    )?;
+    let administration = IngestPolicyAdministration::open(&catalog, initialized.tenant)?;
+    let candidate = IngestPolicy::compile(
+        2,
+        vec![PolicyRule::new(
+            "reject-after-failed-publication",
+            Vec::new(),
+            PolicyAction::Reject,
+        )?],
+    )?;
+    let failure =
+        with_catalog_publication_fault_after(CatalogPublicationFault::SynchronizeCommit, 0, || {
+            administration.activate(
+                &catalog,
+                &initialized.identity,
+                administrator,
+                ResourceGeneration::new(1).expect("known valid generation"),
+                AdministrativeIdempotencyKey::new([0xa6; 16]).expect("known valid key"),
+                candidate.clone(),
+            )
+        })
+        .expect_err("a failed audited catalog commit must reject policy activation");
+    assert_eq!(
+        failure.code(),
+        PolicyAdministrationFailureCode::PersistenceUnavailable
+    );
+    assert_eq!(
+        administration.serving().pin()?.generation(),
+        1,
+        "a failed commit must not advance the in-memory serving snapshot"
+    );
+    let reopened_administration = IngestPolicyAdministration::open(&catalog, initialized.tenant)?;
+    assert_eq!(
+        reopened_administration.serving().pin()?.generation(),
+        1,
+        "a failed commit must not publish a durable policy generation"
+    );
+    assert!(
+        catalog
+            .governance_audit_records()?
+            .iter()
+            .all(|record| GovernanceAuditEntry::decode(record)
+                .map(|entry| entry.action() != "ingest-policy.activate")
+                .unwrap_or(false)),
+        "a rejected commit must not emit a successful policy activation audit entry"
+    );
+    Ok(())
+}
+
+pub(super) fn tenant_administrator(
+    initialized: &InitializedInstance,
+    secret: &str,
+    key: [u8; 16],
+) -> Result<positron_governance::AuthorizedContext, Box<dyn std::error::Error>> {
+    let system = initialized.attribute(
+        PresentedCredential::parse(secret)?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let tenant_key = initialized.create_api_key(
+        system,
+        Scope::TenantAdministration,
+        None,
+        ResourceGeneration::new(1)?,
+        AdministrativeIdempotencyKey::new(key)?,
+    )?;
+    Ok(initialized.attribute(
+        PresentedCredential::parse(tenant_key.secret().ok_or("tenant key")?)?,
+        RequestedIntent::TenantAdministration,
+        CompatibilityHints::none(),
+    )?)
+}
 
 #[test]
 fn catalog_activation_is_loaded_unchanged_after_reopen() -> Result<(), Box<dyn std::error::Error>> {
@@ -201,15 +361,16 @@ fn catalog_activation_is_loaded_unchanged_after_reopen() -> Result<(), Box<dyn s
 
     let reopened = InstanceBootstrap::reopen(&paths)
         .map_err(|failure| format!("bootstrap reopen: {:?}", failure.code()))?;
-    let reopened_policy = reopened.ingest_policy.serving().pin()?;
-    assert_eq!(reopened_policy.generation(), 3);
-    assert_eq!(reopened_policy.digest(), successor_digest);
-
     let catalog = Catalog::open(
         &reopened._authority,
         reopened.instance,
         reopened.key.catalog_secret(reopened.instance)?,
     )?;
+    let reopened_policy = IngestPolicyAdministration::open(&catalog, reopened.tenant)?
+        .serving()
+        .pin()?;
+    assert_eq!(reopened_policy.generation(), 3);
+    assert_eq!(reopened_policy.digest(), successor_digest);
     let current = catalog.pin()?;
     let mut objects = Vec::new();
     for identity in current.object_identities() {

@@ -19,11 +19,11 @@ const MAX_SNAPSHOT_RETRIES: usize = 2;
 /// active-segment writer lease and never repairs storage. Each snapshot pins a
 /// fresh Catalog generation and reconstructs only its acknowledged objects.
 pub struct CommittedLedgerReader<'kernel, 'catalog, 'ledger> {
-    authority: &'kernel StorageKernelResourceAuthority,
-    catalog: &'catalog Catalog<'kernel>,
-    scope: SegmentScope,
-    storage: LedgerStorage,
-    protection: SegmentProtectionKey,
+    pub(super) authority: &'kernel StorageKernelResourceAuthority,
+    pub(super) catalog: &'catalog Catalog<'kernel>,
+    pub(super) scope: SegmentScope,
+    pub(super) storage: LedgerStorage,
+    pub(super) protection: SegmentProtectionKey,
     lease_authority: Option<&'ledger ActiveSegmentLedger<'kernel, 'catalog>>,
 }
 

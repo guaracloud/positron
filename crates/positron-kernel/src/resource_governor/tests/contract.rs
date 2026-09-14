@@ -39,8 +39,9 @@ fn governor(
         [one, two] => GovernorPolicy::new([*one, *two], pool_policy()?)?,
         _ => return Err("test governor requires one or two quotas".into()),
     };
+    let supported_tenants = 2;
     let reserve_amount =
-        resource_governor_support::minimum_recovery_reserve_for_tenants(quotas.len())?;
+        resource_governor_support::minimum_recovery_reserve_for_tenants(supported_tenants)?;
     let reserve = ResourceAmounts::new([reserve_amount; 11]);
     let detected_total = add_reserve(detected, reserve_amount)?;
     let operator_total = add_reserve(operator, reserve_amount)?;
@@ -49,14 +50,14 @@ fn governor(
             resource_governor_support::raw_capacity_for_governed_work_for_tenants(
                 detected_total,
                 64,
-                quotas.len(),
+                supported_tenants,
             )?,
         )?,
         OperatorLimits::new(
             resource_governor_support::raw_capacity_for_governed_work_for_tenants(
                 operator_total,
                 64,
-                quotas.len(),
+                supported_tenants,
             )?,
         )?,
         RecoveryReserve::new(reserve)?,
@@ -67,7 +68,7 @@ fn governor(
     TestKernel::establish_with_recovery_pools(
         inventory,
         policy,
-        resource_governor_support::recovery_pools_for_tenants(quotas.len())?,
+        resource_governor_support::recovery_pools_for_tenants(supported_tenants)?,
     )
 }
 
@@ -94,6 +95,86 @@ fn add_reserve(
         value(ResourceDimension::FileDescriptors)?,
         value(ResourceDimension::DiskHeadroomBytes)?,
     ]))
+}
+
+#[test]
+fn enrolling_a_real_tenant_preserves_existing_admission() -> Result<(), Box<dyn std::error::Error>>
+{
+    let first = tenant(81)?;
+    let second = tenant(82)?;
+    let capacity = amounts(20);
+    let kernel = governor(capacity, capacity, [TenantQuota::new(first, 1, capacity)?])?;
+    let reservation = kernel.reserve(WorkClaim::tenant(
+        first,
+        WorkKind::Ingest,
+        ResourceAmounts::only(ResourceDimension::MemoryBytes, 1)?,
+    )?)?;
+    kernel.enroll_tenant(second, ResourceAmounts::new([1; 11]))?;
+    let second_reservation = kernel.reserve(WorkClaim::tenant(
+        second,
+        WorkKind::Ingest,
+        ResourceAmounts::only(ResourceDimension::MemoryBytes, 1)?,
+    )?)?;
+    drop(second_reservation);
+    drop(reservation);
+    Ok(())
+}
+
+#[test]
+fn pending_tenant_enrollment_denies_work_then_drop_releases_the_slot()
+-> Result<(), Box<dyn std::error::Error>> {
+    let first = tenant(83)?;
+    let second = tenant(84)?;
+    let capacity = amounts(20);
+    let kernel = governor(capacity, capacity, [TenantQuota::new(first, 1, capacity)?])?;
+    let retained = kernel.reserve(WorkClaim::tenant(
+        first,
+        WorkKind::Ingest,
+        ResourceAmounts::only(ResourceDimension::MemoryBytes, 1)?,
+    )?)?;
+    let pending = kernel.prepare_tenant(second, ResourceAmounts::new([1; 11]))?;
+    assert_eq!(
+        kernel
+            .reserve(WorkClaim::tenant(
+                second,
+                WorkKind::Ingest,
+                ResourceAmounts::only(ResourceDimension::MemoryBytes, 1)?
+            )?)
+            .expect_err("pending tenant is not admitted")
+            .code(),
+        AdmissionFailureCode::UnregisteredTenant
+    );
+    drop(pending);
+    kernel.enroll_tenant(second, ResourceAmounts::new([1; 11]))?;
+    drop(retained);
+    Ok(())
+}
+
+#[test]
+fn pending_enrollment_serializes_and_activation_opens_admission()
+-> Result<(), Box<dyn std::error::Error>> {
+    let first = tenant(85)?;
+    let second = tenant(86)?;
+    let third = tenant(87)?;
+    let capacity = amounts(20);
+    let kernel = governor(capacity, capacity, [TenantQuota::new(first, 1, capacity)?])?;
+    let mut pending = kernel.prepare_tenant(second, ResourceAmounts::new([1; 11]))?;
+    assert!(matches!(
+        kernel.prepare_tenant(third, ResourceAmounts::new([1; 11])),
+        Err(GovernorFailure::GovernorContended { .. })
+    ));
+    pending.activate();
+    let reservation = kernel.reserve(WorkClaim::tenant(
+        second,
+        WorkKind::Ingest,
+        ResourceAmounts::only(ResourceDimension::MemoryBytes, 1)?,
+    )?)?;
+    drop(reservation);
+    assert!(matches!(
+        kernel.prepare_tenant(third, ResourceAmounts::new([1; 11])),
+        Err(GovernorFailure::InvalidConfiguration)
+    ));
+    Ok(())
 }
 
 #[test]
@@ -185,6 +266,34 @@ fn reservation_is_atomic_and_drop_returns_capacity() -> Result<(), Box<dyn std::
         WorkKind::Ingest,
         ResourceAmounts::only(ResourceDimension::MemoryBytes, 5)?,
     )?)?;
+    Ok(())
+}
+
+#[test]
+fn quota_reduction_rejects_new_growth_without_revoking_existing_reservations()
+-> Result<(), Box<dyn std::error::Error>> {
+    let tenant = tenant(71)?;
+    let capacity = amounts(10);
+    let governor = governor(capacity, capacity, [TenantQuota::new(tenant, 1, capacity)?])?;
+    let existing = governor.reserve(WorkClaim::tenant(
+        tenant,
+        WorkKind::Ingest,
+        ResourceAmounts::only(ResourceDimension::MemoryBytes, 6)?,
+    )?)?;
+
+    governor.update_tenant_quota(tenant, amounts(5))?;
+
+    let failure = governor
+        .reserve(WorkClaim::tenant(
+            tenant,
+            WorkKind::Ingest,
+            ResourceAmounts::only(ResourceDimension::MemoryBytes, 1)?,
+        )?)
+        .expect_err("a quota reduction must stop later growth");
+    assert_eq!(failure.code(), AdmissionFailureCode::TenantQuotaExceeded);
+    assert_eq!(failure.allowed(), 5);
+    assert_eq!(failure.in_use(), 6);
+    drop(existing);
     Ok(())
 }
 

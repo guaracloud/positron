@@ -138,6 +138,19 @@ pub enum PreparedTransactionResolution {
     Unavailable,
 }
 
+/// Verified read-only view of one transaction-owned administrative proposal.
+///
+/// This is intentionally limited to the immutable successor snapshot. Callers
+/// use it to stage external admission before asking [`Catalog`] to publish the
+/// same exact prepared transaction; it exposes neither prepared bytes nor any
+/// secret material.
+#[derive(Debug)]
+pub enum PreparedTransactionInspection {
+    Absent,
+    Inspected(CatalogSnapshot),
+    Unavailable,
+}
+
 impl std::fmt::Debug for Catalog<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("Catalog { <storage-and-key-redacted> }")
@@ -354,40 +367,9 @@ impl<'authority> Catalog<'authority> {
                 if prepared.request_digest != request_digest {
                     return Err(CatalogFailure::new(CatalogFailureCode::IdempotencyConflict));
                 }
-                let audit_frontier = state.current.0.audit_frontier;
-                if prepared.record.predecessor != state.current.identity()
-                    || prepared.record.number
-                        != state
-                            .current
-                            .number()
-                            .checked_add(1)
-                            .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?
-                    || prepared.audit.position
-                        != audit_frontier
-                            .position
-                            .checked_add(1)
-                            .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?
-                    || prepared.audit.predecessor_hash != audit_frontier.hash
-                {
+                let Some(snapshot) = self.prepared_snapshot(&state, &secret, &prepared)? else {
                     return Ok(PreparedTransactionResolution::Unavailable);
-                }
-                for object in &prepared.record.objects {
-                    self.storage.read_object(
-                        &secret,
-                        self.instance,
-                        *object,
-                        prepared.record.format_epoch,
-                    )?;
-                }
-                if self.storage.read_audit(
-                    &secret,
-                    self.instance,
-                    prepared.audit.position,
-                    prepared.audit.hash,
-                )? != prepared.encoded_audit
-                {
-                    return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
-                }
+                };
                 let additional_history_bytes =
                     retained_artifact_bytes(prepared.encoded_commit.len())?
                         .checked_add(storage::MARKER_BYTES)
@@ -415,8 +397,6 @@ impl<'authority> Catalog<'authority> {
                     prepared.record.number,
                     prepared.record.generation,
                 )?;
-                let snapshot =
-                    load_snapshot(&self.storage, &secret, self.instance, &prepared.record)?;
                 state.audit.push(prepared.audit.clone());
                 state.transactions.insert(
                     prepared.record.transaction,
@@ -437,6 +417,94 @@ impl<'authority> Catalog<'authority> {
                 }))
             },
         }
+    }
+
+    /// Inspects one exact unpublished proposal without making it visible.
+    ///
+    /// The request digest, predecessor, audit frontier, every staged object,
+    /// and the staged audit entry must verify exactly as they do for
+    /// [`Self::resume_prepared`]. A changed or advanced proposal is never
+    /// surfaced as a candidate for external admission.
+    pub fn inspect_prepared(
+        &self,
+        transaction: TransactionId,
+        request_digest: [u8; 32],
+    ) -> Result<PreparedTransactionInspection, CatalogFailure> {
+        let _operation = self
+            .operation
+            .lock()
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
+        let secret = self
+            .secret
+            .lock()
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
+        let recovered = recover(&self.storage, &secret, self.instance)?;
+        if recovered.current.number() > state.current.number() {
+            *state = recovered;
+        }
+        match self
+            .storage
+            .prepared_transaction(&secret, self.instance, transaction)?
+        {
+            PreparedLookup::Absent => Ok(PreparedTransactionInspection::Absent),
+            PreparedLookup::Unavailable => Ok(PreparedTransactionInspection::Unavailable),
+            PreparedLookup::Found { prepared, .. } => {
+                if prepared.request_digest != request_digest {
+                    return Err(CatalogFailure::new(CatalogFailureCode::IdempotencyConflict));
+                }
+                Ok(match self.prepared_snapshot(&state, &secret, &prepared)? {
+                    Some(snapshot) => PreparedTransactionInspection::Inspected(snapshot),
+                    None => PreparedTransactionInspection::Unavailable,
+                })
+            },
+        }
+    }
+
+    fn prepared_snapshot(
+        &self,
+        state: &CatalogState,
+        secret: &CatalogSecret,
+        prepared: &PreparedCommit,
+    ) -> Result<Option<CatalogSnapshot>, CatalogFailure> {
+        let audit_frontier = state.current.0.audit_frontier;
+        if prepared.record.predecessor != state.current.identity()
+            || prepared.record.number
+                != state
+                    .current
+                    .number()
+                    .checked_add(1)
+                    .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?
+            || prepared.audit.position
+                != audit_frontier
+                    .position
+                    .checked_add(1)
+                    .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?
+            || prepared.audit.predecessor_hash != audit_frontier.hash
+        {
+            return Ok(None);
+        }
+        for object in &prepared.record.objects {
+            self.storage.read_object(
+                secret,
+                self.instance,
+                *object,
+                prepared.record.format_epoch,
+            )?;
+        }
+        if self.storage.read_audit(
+            secret,
+            self.instance,
+            prepared.audit.position,
+            prepared.audit.hash,
+        )? != prepared.encoded_audit
+        {
+            return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
+        }
+        load_snapshot(&self.storage, secret, self.instance, &prepared.record).map(Some)
     }
 
     fn commit_unreserved(

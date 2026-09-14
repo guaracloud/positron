@@ -1,3 +1,5 @@
+use positron_domain::identity::TenantId;
+
 use super::*;
 
 impl StorageKernelResourceAuthority {
@@ -177,6 +179,68 @@ impl StorageKernelResourceAuthority {
     pub fn begin_shutdown(&self) -> Result<ShutdownReconciliation, GovernorFailure> {
         Ok(ShutdownReconciliation {
             snapshot: ResourceSnapshot::from_accounting(self.inner.begin_shutdown()?),
+        })
+    }
+
+    /// Applies a validated tenant ceiling to future ordinary admission.
+    ///
+    /// Existing reservations retain their capacity. This is what makes a
+    /// quota reduction safe while still stopping further growth immediately.
+    pub fn update_tenant_quota(
+        &self,
+        tenant: TenantId,
+        weight: u16,
+        limits: ResourceAmounts,
+    ) -> Result<(), GovernorFailure> {
+        self.inner.update_tenant_quota(tenant, weight, limits)
+    }
+
+    /// Derives a quota successor under the control lock before its matching
+    /// Catalog generation is durably published.
+    pub fn prepare_tenant_quota_update(
+        &self,
+        tenant: TenantId,
+        weight: u16,
+        limits: ResourceAmounts,
+    ) -> Result<PendingTenantQuotaUpdate<'_>, GovernorFailure> {
+        Ok(PendingTenantQuotaUpdate {
+            staged: self
+                .inner
+                .stage_tenant_quota_update(tenant, weight, limits)?,
+        })
+    }
+
+    /// Checks immutable quota bounds before durable publication.
+    pub fn validate_tenant_quota(
+        &self,
+        weight: u16,
+        limits: ResourceAmounts,
+    ) -> Result<(), GovernorFailure> {
+        self.inner.validate_tenant_quota(weight, limits)
+    }
+
+    /// Enrolls a Catalog-created tenant in the governor's preallocated
+    /// administrative capacity.
+    pub fn register_tenant_quota(
+        &self,
+        tenant: TenantId,
+        weight: u16,
+        limits: ResourceAmounts,
+    ) -> Result<(), GovernorFailure> {
+        self.inner.register_tenant_quota(tenant, weight, limits)
+    }
+
+    pub fn prepare_tenant_enrollment(
+        &self,
+        tenant: TenantId,
+        weight: u16,
+        limits: ResourceAmounts,
+    ) -> Result<PendingTenantEnrollment<'_>, GovernorFailure> {
+        self.inner.prepare_tenant_quota(tenant, weight, limits)?;
+        Ok(PendingTenantEnrollment {
+            authority: self,
+            tenant,
+            active: false,
         })
     }
 }

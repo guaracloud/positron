@@ -2,18 +2,23 @@ mod codec;
 mod operation;
 mod resources;
 mod storage;
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, fuzzing, feature = "test-support"))]
 mod test_support;
 mod types;
+
+// Direct bootstrap callers have no configuration authority; preserve the shipped
+// configuration default until the composition root supplies its resolved value.
+const DEFAULT_MAX_REGISTERED_TENANTS: u16 = 2;
 
 #[cfg(test)]
 mod tests;
 
 #[cfg(any(test, feature = "test-support"))]
 pub use test_support::GovernanceTestFixture;
+pub(crate) use types::TenantRetentionPreviewConfirmation;
 pub use types::{
     BootstrapClaim, BootstrapFailure, BootstrapFailureCode, BootstrapPaths, BootstrapState,
-    InitializationPlan, InitializedInstance,
+    InitializationPlan, InitializedInstance, TenantRetentionImpactPreview,
 };
 
 /// The sole Application Runtime authority for classifying and initializing an instance.
@@ -28,11 +33,26 @@ impl InstanceBootstrap {
         paths: &BootstrapPaths,
         plan: InitializationPlan,
     ) -> Result<InitializedInstance, BootstrapFailure> {
-        operation::initialize(paths, plan)
+        Self::initialize_with_max_registered_tenants(paths, plan, DEFAULT_MAX_REGISTERED_TENANTS)
     }
 
     pub fn reopen(paths: &BootstrapPaths) -> Result<InitializedInstance, BootstrapFailure> {
-        operation::reopen(paths)
+        Self::reopen_with_max_registered_tenants(paths, DEFAULT_MAX_REGISTERED_TENANTS)
+    }
+
+    pub(crate) fn initialize_with_max_registered_tenants(
+        paths: &BootstrapPaths,
+        plan: InitializationPlan,
+        max_registered_tenants: u16,
+    ) -> Result<InitializedInstance, BootstrapFailure> {
+        operation::initialize(paths, plan, max_registered_tenants)
+    }
+
+    pub(crate) fn reopen_with_max_registered_tenants(
+        paths: &BootstrapPaths,
+        max_registered_tenants: u16,
+    ) -> Result<InitializedInstance, BootstrapFailure> {
+        operation::reopen(paths, max_registered_tenants)
     }
 
     pub fn claim(paths: &BootstrapPaths) -> Result<BootstrapClaim, BootstrapFailure> {

@@ -1,3 +1,4 @@
+mod codec;
 mod rotation;
 mod schema_checkpoint;
 
@@ -8,6 +9,7 @@ use positron_domain::lifecycle::TenantLifecycleState;
 use positron_kernel::GovernanceAuditRecord;
 
 use crate::identity::IdentityFailure;
+use crate::tenant_profile_administration::TENANT_DISPLAY_MAGIC;
 use crate::{AdministrativeIdempotencyKey, ResourceGeneration};
 
 pub use rotation::{CatalogRootRotationAuditEntry, CatalogRootRotationStage};
@@ -16,9 +18,14 @@ const MAGIC_V1: [u8; 8] = *b"POSAUD01";
 const MAGIC_V2: [u8; 8] = *b"POSAUD02";
 const ROOT_ROTATION_MAGIC: &[u8] = b"catalog-root-rotation-v1\0";
 const POLICY_ACTIVATION_MAGIC: [u8; 8] = *b"POSPOL02";
+const TENANT_QUOTA_MAGIC: [u8; 8] = *b"POSQUO01";
 const KEY_LIFECYCLE_MAGIC: [u8; 8] = *b"POSKEY01";
 const LISTENER_TRANSPORT_MAGIC: [u8; 8] = *b"POSTPT01";
 const TENANT_LIFECYCLE_MAGIC: [u8; 8] = *b"POSTEN01";
+const TENANT_CREATION_MAGIC: [u8; 8] = *b"POSTNA01";
+const FORMAT_MIGRATION_MAGIC: [u8; 8] = *b"POSFMT01";
+const TENANT_ALIAS_MAGIC: [u8; 8] = *b"POSALI01";
+const TENANT_RETENTION_MAGIC: [u8; 8] = *b"POSTRT01";
 
 /// Bounded, non-secret metadata for the initial instance operation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -57,10 +64,44 @@ pub enum GovernanceAuditEntry {
     Initialization(InitializationAuditEntry),
     CatalogRootRotation(CatalogRootRotationAuditEntry),
     IngestPolicyActivation(IngestPolicyActivationAuditEntry),
+    TenantQuotaUpdate(TenantQuotaUpdateAuditEntry),
+    TenantDisplayNameUpdate(TenantDisplayNameUpdateAuditEntry),
     SchemaCheckpoint(SchemaCheckpointAuditEntry),
     ApiKeyLifecycle(ApiKeyLifecycleAuditEntry),
     ListenerTransport(ListenerTransportAuditEntry),
     TenantLifecycle(TenantLifecycleAuditEntry),
+    TenantCreation(TenantCreationAuditEntry),
+    CatalogFormatMigration(CatalogFormatMigrationAuditEntry),
+    TenantAliasBinding(TenantAliasBindingAuditEntry),
+    TenantRetentionUpdate(TenantRetentionUpdateAuditEntry),
+}
+
+/// Redacted evidence for a retention successor. The duration and impact
+/// evidence remain bound only by the request digest.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TenantRetentionUpdateAuditEntry {
+    position: u64,
+    ingest_time_unix_seconds: u64,
+    actor: PrincipalId,
+    tenant: TenantId,
+    expected_generation: ResourceGeneration,
+    generation: ResourceGeneration,
+    request_digest: [u8; 32],
+    idempotency_key: AdministrativeIdempotencyKey,
+}
+
+/// Redacted immutable-alias binding evidence. The alias text is intentionally
+/// omitted; its canonical request digest is the idempotency binding.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TenantAliasBindingAuditEntry {
+    position: u64,
+    ingest_time_unix_seconds: u64,
+    actor: PrincipalId,
+    tenant: TenantId,
+    expected_generation: ResourceGeneration,
+    generation: ResourceGeneration,
+    request_digest: [u8; 32],
+    idempotency_key: AdministrativeIdempotencyKey,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -75,6 +116,28 @@ pub struct ApiKeyLifecycleAuditEntry {
     expected_generation: ResourceGeneration,
     generation: ResourceGeneration,
     idempotency_key: AdministrativeIdempotencyKey,
+}
+
+/// Redacted evidence for one committed tenant registry entry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TenantCreationAuditEntry {
+    position: u64,
+    idempotency_key: AdministrativeIdempotencyKey,
+    actor: PrincipalId,
+    tenant: TenantId,
+    expected_generation: ResourceGeneration,
+    generation: ResourceGeneration,
+    request_digest: [u8; 32],
+}
+
+/// Redacted evidence for the one-way catalog representation publication.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatalogFormatMigrationAuditEntry {
+    position: u64,
+    idempotency_key: AdministrativeIdempotencyKey,
+    actor: PrincipalId,
+    from: u32,
+    to: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -152,6 +215,103 @@ pub struct IngestPolicyActivationAuditEntry {
     request_digest: [u8; 32],
 }
 
+/// Redacted evidence for one durably published tenant quota successor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TenantQuotaUpdateAuditEntry {
+    position: u64,
+    idempotency_key: AdministrativeIdempotencyKey,
+    principal: PrincipalId,
+    tenant: TenantId,
+    expected_generation: ResourceGeneration,
+    generation: ResourceGeneration,
+    weight: u32,
+    resources: [u64; 11],
+    request_digest: [u8; 32],
+}
+
+/// Redacted evidence for one display-name successor. The label itself is
+/// bound only through the request digest and is never copied into audit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TenantDisplayNameUpdateAuditEntry {
+    position: u64,
+    idempotency_key: AdministrativeIdempotencyKey,
+    principal: PrincipalId,
+    tenant: TenantId,
+    expected_generation: ResourceGeneration,
+    generation: ResourceGeneration,
+    request_digest: [u8; 32],
+}
+
+impl TenantDisplayNameUpdateAuditEntry {
+    #[must_use]
+    pub const fn position(&self) -> u64 {
+        self.position
+    }
+    #[must_use]
+    pub const fn idempotency_key(&self) -> AdministrativeIdempotencyKey {
+        self.idempotency_key
+    }
+    #[must_use]
+    pub const fn principal_id(&self) -> PrincipalId {
+        self.principal
+    }
+    #[must_use]
+    pub const fn tenant_id(&self) -> TenantId {
+        self.tenant
+    }
+    #[must_use]
+    pub const fn expected_generation(&self) -> ResourceGeneration {
+        self.expected_generation
+    }
+    #[must_use]
+    pub const fn generation(&self) -> ResourceGeneration {
+        self.generation
+    }
+    #[must_use]
+    pub const fn request_digest(&self) -> [u8; 32] {
+        self.request_digest
+    }
+}
+
+impl TenantQuotaUpdateAuditEntry {
+    #[must_use]
+    pub const fn position(&self) -> u64 {
+        self.position
+    }
+    #[must_use]
+    pub const fn idempotency_key(&self) -> AdministrativeIdempotencyKey {
+        self.idempotency_key
+    }
+    #[must_use]
+    pub const fn principal_id(&self) -> PrincipalId {
+        self.principal
+    }
+    #[must_use]
+    pub const fn tenant_id(&self) -> TenantId {
+        self.tenant
+    }
+    #[must_use]
+    pub const fn expected_generation(&self) -> ResourceGeneration {
+        self.expected_generation
+    }
+    #[must_use]
+    pub const fn generation(&self) -> ResourceGeneration {
+        self.generation
+    }
+    #[must_use]
+    pub const fn weight(&self) -> u32 {
+        self.weight
+    }
+    #[must_use]
+    pub const fn resources(&self) -> [u64; 11] {
+        self.resources
+    }
+    #[must_use]
+    pub const fn request_digest(&self) -> [u8; 32] {
+        self.request_digest
+    }
+}
+
 impl IngestPolicyActivationAuditEntry {
     #[must_use]
     pub const fn position(&self) -> u64 {
@@ -218,10 +378,16 @@ impl GovernanceAuditEntry {
             Self::Initialization(entry) => entry.position(),
             Self::CatalogRootRotation(entry) => entry.position(),
             Self::IngestPolicyActivation(entry) => entry.position,
+            Self::TenantQuotaUpdate(entry) => entry.position,
+            Self::TenantDisplayNameUpdate(entry) => entry.position,
             Self::SchemaCheckpoint(entry) => entry.position(),
             Self::ApiKeyLifecycle(entry) => entry.position,
             Self::ListenerTransport(entry) => entry.position,
             Self::TenantLifecycle(entry) => entry.position,
+            Self::TenantCreation(entry) => entry.position,
+            Self::CatalogFormatMigration(entry) => entry.position,
+            Self::TenantAliasBinding(entry) => entry.position,
+            Self::TenantRetentionUpdate(entry) => entry.position,
         }
     }
 
@@ -231,6 +397,8 @@ impl GovernanceAuditEntry {
             Self::Initialization(entry) => entry.action(),
             Self::CatalogRootRotation(entry) => entry.action(),
             Self::IngestPolicyActivation(_) => "ingest-policy.activate",
+            Self::TenantQuotaUpdate(_) => "tenant-quota.update",
+            Self::TenantDisplayNameUpdate(_) => "tenant.display-name.update",
             Self::SchemaCheckpoint(_) => "schema-checkpoint.replace",
             Self::ApiKeyLifecycle(entry) => match entry.action {
                 ApiKeyLifecycleAction::Create => "api-key.create",
@@ -239,6 +407,10 @@ impl GovernanceAuditEntry {
             },
             Self::ListenerTransport(entry) => entry.action(),
             Self::TenantLifecycle(_) => "tenant.lifecycle.transition",
+            Self::TenantCreation(_) => "tenant.create",
+            Self::CatalogFormatMigration(_) => "catalog.format.migrate",
+            Self::TenantAliasBinding(_) => "tenant.alias.bind",
+            Self::TenantRetentionUpdate(_) => "tenant.retention.update",
         }
     }
 
@@ -248,10 +420,16 @@ impl GovernanceAuditEntry {
             Self::Initialization(entry) => entry.outcome(),
             Self::CatalogRootRotation(entry) => entry.outcome(),
             Self::IngestPolicyActivation(_) => "succeeded",
+            Self::TenantQuotaUpdate(_) => "succeeded",
+            Self::TenantDisplayNameUpdate(_) => "succeeded",
             Self::SchemaCheckpoint(_) => "succeeded",
             Self::ApiKeyLifecycle(_) => "succeeded",
             Self::ListenerTransport(entry) => entry.outcome(),
             Self::TenantLifecycle(_) => "succeeded",
+            Self::TenantCreation(_) => "succeeded",
+            Self::CatalogFormatMigration(_) => "succeeded",
+            Self::TenantAliasBinding(_) => "succeeded",
+            Self::TenantRetentionUpdate(_) => "succeeded",
         }
     }
 
@@ -261,10 +439,16 @@ impl GovernanceAuditEntry {
             Self::Initialization(entry) => Some(entry),
             Self::CatalogRootRotation(_)
             | Self::IngestPolicyActivation(_)
+            | Self::TenantQuotaUpdate(_)
+            | Self::TenantDisplayNameUpdate(_)
             | Self::SchemaCheckpoint(_)
             | Self::ApiKeyLifecycle(_)
             | Self::ListenerTransport(_)
-            | Self::TenantLifecycle(_) => None,
+            | Self::TenantLifecycle(_)
+            | Self::TenantCreation(_)
+            | Self::CatalogFormatMigration(_)
+            | Self::TenantAliasBinding(_)
+            | Self::TenantRetentionUpdate(_) => None,
         }
     }
 
@@ -274,10 +458,16 @@ impl GovernanceAuditEntry {
             Self::CatalogRootRotation(entry) => Some(entry),
             Self::Initialization(_)
             | Self::IngestPolicyActivation(_)
+            | Self::TenantQuotaUpdate(_)
+            | Self::TenantDisplayNameUpdate(_)
             | Self::SchemaCheckpoint(_)
             | Self::ApiKeyLifecycle(_)
             | Self::ListenerTransport(_)
-            | Self::TenantLifecycle(_) => None,
+            | Self::TenantLifecycle(_)
+            | Self::TenantCreation(_)
+            | Self::CatalogFormatMigration(_)
+            | Self::TenantAliasBinding(_)
+            | Self::TenantRetentionUpdate(_) => None,
         }
     }
 
@@ -288,9 +478,15 @@ impl GovernanceAuditEntry {
             Self::Initialization(_)
             | Self::CatalogRootRotation(_)
             | Self::IngestPolicyActivation(_)
+            | Self::TenantQuotaUpdate(_)
+            | Self::TenantDisplayNameUpdate(_)
             | Self::ApiKeyLifecycle(_)
             | Self::ListenerTransport(_)
-            | Self::TenantLifecycle(_) => None,
+            | Self::TenantLifecycle(_)
+            | Self::TenantCreation(_)
+            | Self::CatalogFormatMigration(_)
+            | Self::TenantAliasBinding(_)
+            | Self::TenantRetentionUpdate(_) => None,
         }
     }
 
@@ -301,9 +497,15 @@ impl GovernanceAuditEntry {
             Self::Initialization(_)
             | Self::CatalogRootRotation(_)
             | Self::IngestPolicyActivation(_)
+            | Self::TenantQuotaUpdate(_)
+            | Self::TenantDisplayNameUpdate(_)
             | Self::SchemaCheckpoint(_)
             | Self::ListenerTransport(_)
-            | Self::TenantLifecycle(_) => None,
+            | Self::TenantLifecycle(_)
+            | Self::TenantCreation(_)
+            | Self::CatalogFormatMigration(_)
+            | Self::TenantAliasBinding(_)
+            | Self::TenantRetentionUpdate(_) => None,
         }
     }
 
@@ -314,9 +516,15 @@ impl GovernanceAuditEntry {
             Self::Initialization(_)
             | Self::CatalogRootRotation(_)
             | Self::IngestPolicyActivation(_)
+            | Self::TenantQuotaUpdate(_)
+            | Self::TenantDisplayNameUpdate(_)
             | Self::SchemaCheckpoint(_)
             | Self::ApiKeyLifecycle(_)
-            | Self::TenantLifecycle(_) => None,
+            | Self::TenantLifecycle(_)
+            | Self::TenantCreation(_)
+            | Self::CatalogFormatMigration(_)
+            | Self::TenantAliasBinding(_)
+            | Self::TenantRetentionUpdate(_) => None,
         }
     }
 
@@ -327,205 +535,110 @@ impl GovernanceAuditEntry {
             Self::Initialization(_)
             | Self::CatalogRootRotation(_)
             | Self::IngestPolicyActivation(_)
+            | Self::TenantQuotaUpdate(_)
+            | Self::TenantDisplayNameUpdate(_)
             | Self::SchemaCheckpoint(_)
             | Self::ApiKeyLifecycle(_)
-            | Self::ListenerTransport(_) => None,
+            | Self::ListenerTransport(_)
+            | Self::TenantCreation(_)
+            | Self::CatalogFormatMigration(_)
+            | Self::TenantAliasBinding(_)
+            | Self::TenantRetentionUpdate(_) => None,
         }
     }
 
-    pub(crate) fn decode_fields(
-        position: u64,
-        transaction_id: [u8; 16],
-        intent: &[u8],
-    ) -> Result<Self, IdentityFailure> {
-        if intent.starts_with(MAGIC_V1.as_slice()) || intent.starts_with(MAGIC_V2.as_slice()) {
-            return InitializationAuditEntry::decode_intent(position, intent)
-                .map(Self::Initialization);
+    #[must_use]
+    pub const fn as_tenant_quota_update(&self) -> Option<&TenantQuotaUpdateAuditEntry> {
+        match self {
+            Self::TenantQuotaUpdate(entry) => Some(entry),
+            Self::Initialization(_)
+            | Self::CatalogRootRotation(_)
+            | Self::IngestPolicyActivation(_)
+            | Self::TenantDisplayNameUpdate(_)
+            | Self::SchemaCheckpoint(_)
+            | Self::ApiKeyLifecycle(_)
+            | Self::ListenerTransport(_)
+            | Self::TenantLifecycle(_)
+            | Self::TenantCreation(_)
+            | Self::CatalogFormatMigration(_)
+            | Self::TenantAliasBinding(_)
+            | Self::TenantRetentionUpdate(_) => None,
         }
-        if intent.starts_with(ROOT_ROTATION_MAGIC) {
-            return CatalogRootRotationAuditEntry::decode_intent(position, transaction_id, intent)
-                .map(Self::CatalogRootRotation);
+    }
+
+    #[must_use]
+    pub const fn as_tenant_display_name_update(
+        &self,
+    ) -> Option<&TenantDisplayNameUpdateAuditEntry> {
+        match self {
+            Self::TenantDisplayNameUpdate(entry) => Some(entry),
+            Self::Initialization(_)
+            | Self::CatalogRootRotation(_)
+            | Self::IngestPolicyActivation(_)
+            | Self::TenantQuotaUpdate(_)
+            | Self::SchemaCheckpoint(_)
+            | Self::ApiKeyLifecycle(_)
+            | Self::ListenerTransport(_)
+            | Self::TenantLifecycle(_)
+            | Self::TenantCreation(_)
+            | Self::CatalogFormatMigration(_)
+            | Self::TenantAliasBinding(_)
+            | Self::TenantRetentionUpdate(_) => None,
         }
-        if intent.starts_with(&POLICY_ACTIVATION_MAGIC) {
-            let mut cursor = Cursor::new(intent);
-            if cursor.take_array::<8>()? != POLICY_ACTIVATION_MAGIC {
-                return Err(IdentityFailure);
-            }
-            let idempotency_key = AdministrativeIdempotencyKey::new(cursor.take_array()?)
-                .map_err(|_| IdentityFailure)?;
-            if idempotency_key.to_bytes() != transaction_id {
-                return Err(IdentityFailure);
-            }
-            let principal =
-                PrincipalId::from_bytes(cursor.take_array()?).map_err(|_| IdentityFailure)?;
-            let tenant = TenantId::from_bytes(cursor.take_array()?).map_err(|_| IdentityFailure)?;
-            let expected_generation =
-                ResourceGeneration::new(cursor.take_u64()?).map_err(|_| IdentityFailure)?;
-            let generation =
-                ResourceGeneration::new(cursor.take_u64()?).map_err(|_| IdentityFailure)?;
-            let digest = cursor.take_array()?;
-            let request_digest = cursor.take_array()?;
-            if expected_generation.get().checked_add(1) != Some(generation.get())
-                || digest.iter().all(|byte| *byte == 0)
-                || request_digest.iter().all(|byte| *byte == 0)
-                || !cursor.is_empty()
-            {
-                return Err(IdentityFailure);
-            }
-            return Ok(Self::IngestPolicyActivation(
-                IngestPolicyActivationAuditEntry {
-                    position,
-                    idempotency_key,
-                    principal,
-                    tenant,
-                    expected_generation,
-                    generation,
-                    digest,
-                    request_digest,
-                },
-            ));
+    }
+
+    #[must_use]
+    pub const fn as_tenant_retention_update(&self) -> Option<&TenantRetentionUpdateAuditEntry> {
+        match self {
+            Self::TenantRetentionUpdate(entry) => Some(entry),
+            Self::Initialization(_)
+            | Self::CatalogRootRotation(_)
+            | Self::IngestPolicyActivation(_)
+            | Self::TenantQuotaUpdate(_)
+            | Self::TenantDisplayNameUpdate(_)
+            | Self::SchemaCheckpoint(_)
+            | Self::ApiKeyLifecycle(_)
+            | Self::ListenerTransport(_)
+            | Self::TenantLifecycle(_)
+            | Self::TenantCreation(_)
+            | Self::CatalogFormatMigration(_)
+            | Self::TenantAliasBinding(_) => None,
         }
-        if intent.starts_with(&schema_checkpoint::MAGIC) {
-            return SchemaCheckpointAuditEntry::decode_intent(position, transaction_id, intent)
-                .map(Self::SchemaCheckpoint);
-        }
-        if intent.starts_with(&LISTENER_TRANSPORT_MAGIC) {
-            if intent.len() != LISTENER_TRANSPORT_MAGIC.len() + 16
-                || intent.get(..8) != Some(LISTENER_TRANSPORT_MAGIC.as_slice())
-                || intent.get(8..) != Some(transaction_id.as_slice())
-                || transaction_id.iter().all(|byte| *byte == 0)
-            {
-                return Err(IdentityFailure);
-            }
-            return Ok(Self::ListenerTransport(ListenerTransportAuditEntry::new(
-                position,
-                transaction_id,
-            )));
-        }
-        if intent.starts_with(&KEY_LIFECYCLE_MAGIC) {
-            let fields = 9;
-            let action = match *intent.get(8).ok_or(IdentityFailure)? {
-                1 => ApiKeyLifecycleAction::Create,
-                2 => ApiKeyLifecycleAction::Rotate,
-                3 => ApiKeyLifecycleAction::Revoke,
-                _ => return Err(IdentityFailure),
-            };
-            if intent.len() != fields + 89
-                || intent.get(..8) != Some(KEY_LIFECYCLE_MAGIC.as_slice())
-                || intent.get(fields + 73..fields + 89) != Some(transaction_id.as_slice())
-            {
-                return Err(IdentityFailure);
-            }
-            let actor = PrincipalId::from_bytes(
-                intent
-                    .get(fields..fields + 16)
-                    .and_then(|bytes| bytes.try_into().ok())
-                    .ok_or(IdentityFailure)?,
-            )
-            .map_err(|_| IdentityFailure)?;
-            let principal = PrincipalId::from_bytes(
-                intent
-                    .get(fields + 16..fields + 32)
-                    .and_then(|bytes| bytes.try_into().ok())
-                    .ok_or(IdentityFailure)?,
-            )
-            .map_err(|_| IdentityFailure)?;
-            let target = PrincipalId::from_bytes(
-                intent
-                    .get(fields + 32..fields + 48)
-                    .and_then(|bytes| bytes.try_into().ok())
-                    .ok_or(IdentityFailure)?,
-            )
-            .map_err(|_| IdentityFailure)?;
-            let scope = match *intent.get(fields + 48).ok_or(IdentityFailure)? {
-                1 => Scope::Ingest,
-                2 => Scope::Query,
-                3 => Scope::TenantAdministration,
-                _ => return Err(IdentityFailure),
-            };
-            let expires_at_unix_seconds = match intent
-                .get(fields + 49..fields + 57)
-                .and_then(|bytes| bytes.try_into().ok())
-                .map(u64::from_be_bytes)
-                .ok_or(IdentityFailure)?
-            {
-                0 => None,
-                value => Some(value),
-            };
-            let expected_generation = ResourceGeneration::new(
-                intent
-                    .get(fields + 57..fields + 65)
-                    .and_then(|bytes| bytes.try_into().ok())
-                    .map(u64::from_be_bytes)
-                    .ok_or(IdentityFailure)?,
-            )
-            .map_err(|_| IdentityFailure)?;
-            let generation = ResourceGeneration::new(
-                intent
-                    .get(fields + 65..fields + 73)
-                    .and_then(|bytes| bytes.try_into().ok())
-                    .map(u64::from_be_bytes)
-                    .ok_or(IdentityFailure)?,
-            )
-            .map_err(|_| IdentityFailure)?;
-            if expected_generation.get().checked_add(1) != Some(generation.get()) {
-                return Err(IdentityFailure);
-            }
-            return Ok(Self::ApiKeyLifecycle(ApiKeyLifecycleAuditEntry {
-                position,
-                action,
-                actor,
-                principal,
-                target,
-                scope,
-                expires_at_unix_seconds,
-                expected_generation,
-                generation,
-                idempotency_key: AdministrativeIdempotencyKey::new(transaction_id)
-                    .map_err(|_| IdentityFailure)?,
-            }));
-        }
-        if intent.starts_with(&TENANT_LIFECYCLE_MAGIC) {
-            let mut cursor = Cursor::new(intent);
-            if cursor.take_array::<8>()? != TENANT_LIFECYCLE_MAGIC {
-                return Err(IdentityFailure);
-            }
-            let ingest_time_unix_seconds = cursor.take_u64()?;
-            if ingest_time_unix_seconds == 0 {
-                return Err(IdentityFailure);
-            }
-            let idempotency_key = AdministrativeIdempotencyKey::new(cursor.take_array()?)
-                .map_err(|_| IdentityFailure)?;
-            if idempotency_key.to_bytes() != transaction_id {
-                return Err(IdentityFailure);
-            }
-            let actor =
-                PrincipalId::from_bytes(cursor.take_array()?).map_err(|_| IdentityFailure)?;
-            let tenant = TenantId::from_bytes(cursor.take_array()?).map_err(|_| IdentityFailure)?;
-            let from = lifecycle_state(cursor.take_u8()?)?;
-            let to = lifecycle_state(cursor.take_u8()?)?;
-            let expected_generation =
-                ResourceGeneration::new(cursor.take_u64()?).map_err(|_| IdentityFailure)?;
-            let generation =
-                ResourceGeneration::new(cursor.take_u64()?).map_err(|_| IdentityFailure)?;
-            if expected_generation.get().checked_add(1) != Some(generation.get())
-                || !cursor.is_empty()
-            {
-                return Err(IdentityFailure);
-            }
-            return Ok(Self::TenantLifecycle(TenantLifecycleAuditEntry {
-                position,
-                ingest_time_unix_seconds,
-                actor,
-                tenant,
-                from,
-                to,
-                expected_generation,
-                generation,
-                idempotency_key,
-            }));
-        }
-        Err(IdentityFailure)
+    }
+}
+
+impl TenantRetentionUpdateAuditEntry {
+    #[must_use]
+    pub const fn position(&self) -> u64 {
+        self.position
+    }
+    #[must_use]
+    pub const fn ingest_time_unix_seconds(&self) -> u64 {
+        self.ingest_time_unix_seconds
+    }
+    #[must_use]
+    pub const fn actor_id(&self) -> PrincipalId {
+        self.actor
+    }
+    #[must_use]
+    pub const fn tenant_id(&self) -> TenantId {
+        self.tenant
+    }
+    #[must_use]
+    pub const fn expected_generation(&self) -> ResourceGeneration {
+        self.expected_generation
+    }
+    #[must_use]
+    pub const fn generation(&self) -> ResourceGeneration {
+        self.generation
+    }
+    #[must_use]
+    pub const fn request_digest(&self) -> [u8; 32] {
+        self.request_digest
+    }
+    #[must_use]
+    pub const fn idempotency_key(&self) -> AdministrativeIdempotencyKey {
+        self.idempotency_key
     }
 }
 

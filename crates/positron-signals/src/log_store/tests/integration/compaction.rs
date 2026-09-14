@@ -60,11 +60,7 @@ fn retention_replacement(
         .object_identities()
         .filter_map(|identity| {
             let bytes = basis.object(identity).ok().flatten()?;
-            (!bytes.starts_with(b"POSGOV03")
-                && !bytes.starts_with(b"POSGOV04")
-                && !bytes.starts_with(b"POSGOV05")
-                && !bytes.starts_with(b"POSGOV06"))
-            .then(|| CatalogObject::new(bytes.to_vec()).ok())?
+            (!bytes.starts_with(b"POSGOV")).then(|| CatalogObject::new(bytes.to_vec()).ok())?
         })
         .collect::<Vec<_>>();
     objects.push(CatalogObject::new(

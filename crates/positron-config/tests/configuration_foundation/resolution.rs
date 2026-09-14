@@ -99,6 +99,7 @@ fn applies_environment_then_command_line_to_every_overrideable_setting()
     let environment = EnvironmentOverrides::try_from_pairs([
         ("POSITRON__DIAGNOSTICS__LOG_LEVEL", "warn"),
         ("POSITRON__RUNTIME__SHUTDOWN_GRACE_SECONDS", "2"),
+        ("POSITRON__RUNTIME__MAX_REGISTERED_TENANTS", "3"),
         (
             "POSITRON__LISTENER__OPERATIONS_BIND_ADDRESS",
             "127.0.0.1:4319",
@@ -109,6 +110,7 @@ fn applies_environment_then_command_line_to_every_overrideable_setting()
             "schema_version = 1\n\
              [diagnostics]\nlog_level = \"error\"\n\
              [runtime]\nshutdown_grace_seconds = 1\n\
+             max_registered_tenants = 1\n\
              [listener]\noperations_bind_address = \"127.0.0.1:4318\"\n",
         ),
         environment.clone(),
@@ -116,6 +118,7 @@ fn applies_environment_then_command_line_to_every_overrideable_setting()
     )?)?;
     assert_eq!(environment_effective.log_level(), LogLevel::Warn);
     assert_eq!(environment_effective.shutdown_grace_seconds(), 2);
+    assert_eq!(environment_effective.max_registered_tenants(), 3);
     assert_eq!(
         environment_effective.operations_bind_address().to_string(),
         "127.0.0.1:4319"
@@ -123,6 +126,7 @@ fn applies_environment_then_command_line_to_every_overrideable_setting()
     for path in [
         "diagnostics.log_level",
         "runtime.shutdown_grace_seconds",
+        "runtime.max_registered_tenants",
         "listener.operations_bind_address",
     ] {
         assert_eq!(
@@ -134,6 +138,7 @@ fn applies_environment_then_command_line_to_every_overrideable_setting()
     let command_line = CommandLineOverrides::try_from_pairs([
         ("diagnostics.log_level", "debug"),
         ("runtime.shutdown_grace_seconds", "3600"),
+        ("runtime.max_registered_tenants", "4"),
         ("listener.operations_bind_address", "[::1]:4320"),
     ])?;
     let command_line_effective = resolve(ConfigurationInputs::try_new(
@@ -143,6 +148,7 @@ fn applies_environment_then_command_line_to_every_overrideable_setting()
     )?)?;
     assert_eq!(command_line_effective.log_level(), LogLevel::Debug);
     assert_eq!(command_line_effective.shutdown_grace_seconds(), 3600);
+    assert_eq!(command_line_effective.max_registered_tenants(), 4);
     assert_eq!(
         command_line_effective.operations_bind_address().to_string(),
         "[::1]:4320"
@@ -150,6 +156,7 @@ fn applies_environment_then_command_line_to_every_overrideable_setting()
     for path in [
         "diagnostics.log_level",
         "runtime.shutdown_grace_seconds",
+        "runtime.max_registered_tenants",
         "listener.operations_bind_address",
     ] {
         assert_eq!(

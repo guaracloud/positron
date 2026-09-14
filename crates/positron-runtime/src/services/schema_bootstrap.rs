@@ -72,6 +72,11 @@ pub(super) fn recover(
     let basis = catalog
         .pin()
         .map_err(|failure| classify_catalog_failure_code(failure.code()))?;
+    let identity =
+        positron_governance::Identity::open(&basis).map_err(|_| ServiceFailure::CorruptState)?;
+    let tenant_count = positron_governance::TenantAdministration::registered_tenant_ids(&basis)
+        .map_err(|_| ServiceFailure::CorruptState)?
+        .len();
     let checkpoint = load_schema_checkpoint(&basis, instance.tenant, instance.resource_governor())
         .map_err(|failure| {
             if failure.catalog_code().is_some() {
@@ -89,12 +94,16 @@ pub(super) fn recover(
     let scopes = basis
         .reachable_ledger_scopes(instance.tenant, SignalKind::Logs)
         .map_err(|_| ServiceFailure::CorruptState)?;
-    drop(basis);
+    if scopes.is_empty() && checkpoint.is_none() {
+        return Ok(RecoveredSchema {
+            registry: TenantSchemaRegistry::new(tenant_count)
+                .map_err(|_| ServiceFailure::Internal)?,
+            dirty_checkpoint: None,
+        });
+    }
+    let mut replayed_blocks = false;
     for scope in scopes {
-        let protection = instance
-            .key
-            .segment_key(instance.instance, scope)
-            .map_err(|_| ServiceFailure::KeyUnavailable)?;
+        let protection = super::tenant_segment_key(instance, &identity, scope)?;
         let ledger = ActiveSegmentLedger::open_with_retention_time(
             &instance._authority,
             &instance.retention_time,
@@ -108,12 +117,21 @@ pub(super) fn recover(
         let snapshot = ledger
             .snapshot()
             .map_err(|failure| classify_ledger_failure_code(failure.code()))?;
+        replayed_blocks |= !snapshot.blocks().is_empty();
         replay
             .replay_snapshot_cancellable(&snapshot, cancellation)
             .map_err(classify_replay_failure)?;
         drop(snapshot);
         drop(ledger);
     }
+    if checkpoint.is_none() && !replayed_blocks {
+        return Ok(RecoveredSchema {
+            registry: TenantSchemaRegistry::new(tenant_count)
+                .map_err(|_| ServiceFailure::Internal)?,
+            dirty_checkpoint: None,
+        });
+    }
+    drop(basis);
     let current = replay
         .finish_cancellable(cancellation)
         .map_err(classify_replay_failure)?;
@@ -123,7 +141,7 @@ pub(super) fn recover(
     if cancellation.is_cancelled() {
         return Err(ServiceFailure::Cancelled);
     }
-    let registry = TenantSchemaRegistry::new(1).map_err(|_| ServiceFailure::Internal)?;
+    let registry = TenantSchemaRegistry::new(tenant_count).map_err(|_| ServiceFailure::Internal)?;
     registry
         .session_from_checkpoint(
             instance.tenant,

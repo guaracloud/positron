@@ -24,6 +24,8 @@ fn bootstrap_rejects_a_structurally_valid_mismatched_replay_frontier() -> Result
             .accepted_records(),
         1
     );
+    services.prepare_shutdown_schema_checkpoint()?;
+    services.publish_prepared_shutdown_schema_checkpoint()?;
 
     let catalog = open_catalog(&initialized)?;
     let basis = catalog.pin()?;
@@ -105,8 +107,7 @@ fn bootstrap_preserves_authenticated_malformed_log_state_as_corruption()
         .ok_or("missing log scope")?;
     drop(basis);
     let protection = initialized
-        .key
-        .segment_key(initialized.instance, scope)
+        .tenant_segment_key_for_test(scope)
         .map_err(|_| "segment key")?;
     let ledger = ActiveSegmentLedger::open(&initialized._authority, &catalog, scope, protection)
         .map_err(|failure| format!("reopen ledger: {failure:?}"))?;

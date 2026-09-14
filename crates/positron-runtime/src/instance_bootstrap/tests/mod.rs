@@ -1,10 +1,16 @@
+mod capacity;
 mod classification;
 mod codec;
 mod compatibility;
 mod faults;
+mod format_migration;
 mod identity;
 mod initialization;
-mod policy_activation;
 mod prepared_recovery;
+mod secondary_lifecycle;
 mod support;
 mod support_failures;
+mod tenant_policy;
+mod tenant_provisioning;
+mod tenant_quota_admission;
+mod tenant_quota_replay;

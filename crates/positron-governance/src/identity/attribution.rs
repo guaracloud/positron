@@ -224,6 +224,39 @@ impl AuthorizedContext {
     pub const fn has_proxy_actor_context(self) -> bool {
         self.proxy_actor.is_some()
     }
+
+    /// Revalidates a previously authenticated administration context only to
+    /// finish its exact, transaction-owned prepared retention request. The
+    /// caller still binds the request digest and Catalog instance before any
+    /// durable resume can occur.
+    pub(crate) fn authorize_prepared_retention_resume(
+        self,
+        authority: [u8; 16],
+        tenant: TenantId,
+    ) -> Result<PrincipalId, AttributionFailure> {
+        if self.authority != authority {
+            return Err(AttributionFailure);
+        }
+        match self.scope {
+            Scope::SystemAdministration if self.tenant.is_none() => Ok(self.principal),
+            Scope::TenantAdministration
+                if matches!(
+                    self.lifecycle,
+                    TenantLifecycleState::Active | TenantLifecycleState::ReadOnly
+                ) && self.tenant.is_some_and(|attribution| {
+                    attribution.principal_id() == self.principal
+                        && attribution.scope() == Scope::TenantAdministration
+                        && attribution.tenant_id() == tenant
+                }) =>
+            {
+                Ok(self.principal)
+            },
+            Scope::Ingest
+            | Scope::Query
+            | Scope::TenantAdministration
+            | Scope::SystemAdministration => Err(AttributionFailure),
+        }
+    }
 }
 
 /// Constant-shape authentication and authorization rejection.

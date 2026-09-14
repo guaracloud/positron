@@ -125,6 +125,17 @@ fn returns_only_checked_mutability_plans_and_rejects_immutable_changes()
         ConfigurationPlan::RestartRequired { changed } if changed == vec![Setting::RuntimeShutdownGraceSeconds]
     ));
 
+    let registered_tenant_capacity = inputs(
+        Some("schema_version = 1\n[runtime]\nmax_registered_tenants = 3\n"),
+        [],
+        [],
+    )
+    .and_then(resolve)?;
+    assert!(matches!(
+        current.plan_update(&registered_tenant_capacity)?,
+        ConfigurationPlan::RestartRequired { changed } if changed == vec![Setting::RuntimeMaxRegisteredTenants]
+    ));
+
     let immutable = inputs(
         Some("schema_version = 1\n[storage]\ndata_directory = \"/different\"\n"),
         [],
@@ -273,6 +284,9 @@ fn generated_schema_and_reference_are_deterministic_and_secret_safe() {
     assert!(first_schema.contains("\"schema_version\": {\"const\": 1}"));
     assert!(first_schema.contains("\"enum\": [\"error\", \"warn\", \"info\", \"debug\"]"));
     assert!(first_schema.contains("\"minimum\": 1, \"maximum\": 3600"));
+    assert!(first_schema.contains(
+        "\"max_registered_tenants\": {\"type\": \"integer\", \"minimum\": 1, \"maximum\": 1024}"
+    ));
     assert!(first_schema.contains("\"maxLength\": 256"));
     assert!(first_schema.contains("\"required\": [\"schema_version\"]"));
     assert!(first_schema.contains("\"writeOnly\": true"));
@@ -286,6 +300,7 @@ fn generated_schema_and_reference_are_deterministic_and_secret_safe() {
         "schema_version",
         "diagnostics.log_level",
         "runtime.shutdown_grace_seconds",
+        "runtime.max_registered_tenants",
         "listener.operations_bind_address",
         "storage.data_directory",
         "storage.secrets_directory",

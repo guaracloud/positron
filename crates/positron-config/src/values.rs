@@ -125,6 +125,7 @@ pub enum FailureSource {
     SchemaVersion,
     DiagnosticsLogLevel,
     RuntimeShutdownGraceSeconds,
+    RuntimeMaxRegisteredTenants,
     ListenerControlPath,
     ListenerOperationsBindAddress,
     ListenerApiBindAddress,

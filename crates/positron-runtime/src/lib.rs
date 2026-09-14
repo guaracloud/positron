@@ -21,7 +21,7 @@ pub use health::{HealthState, HealthWarning, Liveness, ProcessPhase, Readiness};
 pub use instance_bootstrap::GovernanceTestFixture;
 pub use instance_bootstrap::{
     BootstrapClaim, BootstrapFailure, BootstrapFailureCode, BootstrapPaths, BootstrapState,
-    InitializationPlan, InitializedInstance, InstanceBootstrap,
+    InitializationPlan, InitializedInstance, InstanceBootstrap, TenantRetentionImpactPreview,
 };
 pub use listener::{
     BoundEndpoint, BoundListener, ListenerFactory, ListenerFailure, ListenerRequest, ListenerRole,

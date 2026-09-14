@@ -65,5 +65,9 @@ pub(super) fn identity_from_catalog(
         query,
         credentials,
         lifecycle: decoded.lifecycle(),
+        tenant_key_envelope: decoded.tenant_key_envelope().to_vec(),
+        additional_tenant_key_envelopes: Vec::new(),
+        additional_tenant_lifecycles: Vec::new(),
+        additional_tenants: Vec::new(),
     })
 }

@@ -21,6 +21,7 @@ pub enum InitializationMode {
 pub struct ServeConfiguration {
     paths: BootstrapPaths,
     initialization: InitializationMode,
+    max_registered_tenants: u16,
     public_plaintext_api_warning: bool,
     admission_group_planner: Option<Arc<dyn positron_ingest::AdmissionGroupPlanner>>,
 }
@@ -31,9 +32,17 @@ impl ServeConfiguration {
         Self {
             paths,
             initialization,
+            max_registered_tenants: 2,
             public_plaintext_api_warning: false,
             admission_group_planner: None,
         }
+    }
+
+    /// Sets the configured ceiling for simultaneously registered governor tenant quotas.
+    #[must_use]
+    pub const fn with_max_registered_tenants(mut self, max_registered_tenants: u16) -> Self {
+        self.max_registered_tenants = max_registered_tenants;
+        self
     }
 
     #[must_use]
@@ -60,6 +69,7 @@ impl std::fmt::Debug for ServeConfiguration {
             .debug_struct("ServeConfiguration")
             .field("paths", &self.paths)
             .field("initialization", &self.initialization)
+            .field("max_registered_tenants", &self.max_registered_tenants)
             .field(
                 "public_plaintext_api_warning",
                 &self.public_plaintext_api_warning,

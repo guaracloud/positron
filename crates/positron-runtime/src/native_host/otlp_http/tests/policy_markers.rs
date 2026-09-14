@@ -3,8 +3,10 @@ use std::fs;
 use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use opentelemetry_proto::tonic::collector::logs::v1::{
     ExportLogsServiceRequest, ExportLogsServiceResponse,
@@ -30,68 +32,38 @@ use prost::Message;
 
 use super::super::{ResponseEncoding, receive, receive_traces};
 use crate::native_host::native_http::RequestHead;
+use crate::services::IngestPolicySnapshotTestHook;
 use crate::{
     BootstrapPaths, InitializationPlan, InitializedInstance, InstanceBootstrap, ServiceHandle,
 };
 
-#[test]
-fn authenticated_http_log_marker_survives_ack_and_runtime_reopen() -> Result<(), Box<dyn Error>> {
-    let roots = TestRoots::new()?;
-    let paths = roots.paths()?;
-    drop(InstanceBootstrap::initialize(
-        &paths,
-        InitializationPlan::non_interactive(),
-    )?);
-    let (administrator_secret, bearer) = {
-        let claim = InstanceBootstrap::claim(&paths)?;
-        (
-            claim.secret().to_owned(),
-            claim
-                .ingest_secret()
-                .ok_or("ingest secret missing")?
-                .to_owned(),
-        )
-    };
-    let initialized = Arc::new(InstanceBootstrap::reopen(&paths)?);
-    let administrator = initialized.attribute(
-        PresentedCredential::parse(&administrator_secret)?,
-        RequestedIntent::SystemAdministration,
-        CompatibilityHints::none(),
-    )?;
-    let policy = IngestPolicy::compile(
-        2,
-        vec![PolicyRule::new(
-            "redact-body",
-            Vec::new(),
-            PolicyAction::Redact(PolicyTarget::body()),
-        )?],
-    )?;
-    let services = ServiceHandle::new(Arc::clone(&initialized))?;
-    services.activate_ingest_policy(
-        administrator,
-        ResourceGeneration::new(1)?,
-        AdministrativeIdempotencyKey::new([0xb7; 16])?,
-        policy.clone(),
-    )?;
+struct BlockingCapturedPolicy {
+    signal: SignalKind,
+    entered: mpsc::SyncSender<()>,
+    resume: Mutex<mpsc::Receiver<()>>,
+    blocked: AtomicBool,
+}
 
-    let body = ExportLogsServiceRequest {
-        resource_logs: vec![ResourceLogs {
-            scope_logs: vec![ScopeLogs {
-                log_records: vec![LogRecord {
-                    body: Some(string_value("log-body")),
-                    attributes: vec![
-                        attribute("secret", string_value("source-secret")),
-                        attribute("null", AnyValue { value: None }),
-                        attribute("lookalike", string_value("[REDACTED]")),
-                    ],
-                    ..LogRecord::default()
-                }],
-                ..ScopeLogs::default()
-            }],
-            ..ResourceLogs::default()
-        }],
+impl IngestPolicySnapshotTestHook for BlockingCapturedPolicy {
+    fn after_policy_snapshot(&self, signal: SignalKind) {
+        if signal != self.signal || self.blocked.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let _ = self.entered.send(());
+        if let Ok(resume) = self.resume.lock() {
+            let _ = resume.recv_timeout(Duration::from_secs(2));
+        }
     }
-    .encode_to_vec();
+}
+
+mod logs;
+mod traces;
+
+fn receive_log_request(
+    services: &ServiceHandle,
+    bearer: &str,
+    body: Vec<u8>,
+) -> Result<crate::native_host::native_http::Response, Box<dyn Error>> {
     let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
     let endpoint = listener.local_addr()?;
     let mut client = TcpStream::connect(endpoint)?;
@@ -103,247 +75,25 @@ fn authenticated_http_log_marker_survives_ack_and_runtime_reopen() -> Result<(),
             method: "POST".to_owned(),
             path: "/v1/logs".to_owned(),
             content_length: body.len(),
-            bearer: Some(bearer.clone()),
+            bearer: Some(bearer.to_owned()),
             content_type: Some(ResponseEncoding::Protobuf.content_type().to_owned()),
             content_encoding: None,
             tenant_hint: None,
             forwarded_for: None,
             forwarded_actor: None,
         },
-        &services,
+        services,
     )
     .map_err(|_| "log HTTP response was rejected")?;
-    assert_eq!(
-        response.status(),
-        200,
-        "status={} body={:?}",
-        response.status(),
-        response.body()
-    );
-    let decoded = ExportLogsServiceResponse::decode(response.body())?;
-    assert!(decoded.partial_success.is_none());
     drop(client);
-    drop(services);
-    drop(initialized);
-
-    let reopened = InstanceBootstrap::reopen(&paths)?;
-    assert_log_marker(&reopened, &policy)?;
-    Ok(())
+    Ok(response)
 }
 
-#[test]
-fn authenticated_http_log_attribute_marker_reports_insufficient_governor_headroom()
--> Result<(), Box<dyn Error>> {
-    let roots = TestRoots::new()?;
-    let paths = roots.paths()?;
-    drop(InstanceBootstrap::initialize(
-        &paths,
-        InitializationPlan::non_interactive(),
-    )?);
-    let (administrator_secret, bearer) = {
-        let claim = InstanceBootstrap::claim(&paths)?;
-        (
-            claim.secret().to_owned(),
-            claim
-                .ingest_secret()
-                .ok_or("ingest secret missing")?
-                .to_owned(),
-        )
-    };
-    let initialized = Arc::new(InstanceBootstrap::reopen(&paths)?);
-    let administrator = initialized.attribute(
-        PresentedCredential::parse(&administrator_secret)?,
-        RequestedIntent::SystemAdministration,
-        CompatibilityHints::none(),
-    )?;
-    let path = PolicyAttributePath::new(AttributeNamespace::Record, "secret")?;
-    let policy = IngestPolicy::compile(
-        2,
-        vec![PolicyRule::new(
-            "redact-secret",
-            Vec::new(),
-            PolicyAction::Redact(PolicyTarget::attribute(path)),
-        )?],
-    )?;
-    let services = ServiceHandle::new(Arc::clone(&initialized))?;
-    services.activate_ingest_policy(
-        administrator,
-        ResourceGeneration::new(1)?,
-        AdministrativeIdempotencyKey::new([0xba; 16])?,
-        policy.clone(),
-    )?;
-
-    let before = initialized.resource_governor().inspect()?;
-    assert_eq!(
-        before.ordinary_capacity(ResourceDimension::CpuWorkUnits),
-        32,
-        "the runtime bootstrap contract fixes ordinary CPU capacity"
-    );
-    assert_eq!(
-        before.pool_capacity(OrdinaryPool::Shared, ResourceDimension::CpuWorkUnits),
-        12,
-        "ordinary pool policy reserves 8+6+4+2 CPU units"
-    );
-    assert_eq!(
-        before.pool_capacity(OrdinaryPool::Ingest, ResourceDimension::CpuWorkUnits),
-        6,
-        "ingest class headroom is fixed by the runtime bootstrap policy"
-    );
-    let body = ExportLogsServiceRequest {
-        resource_logs: vec![ResourceLogs {
-            scope_logs: vec![ScopeLogs {
-                log_records: vec![LogRecord {
-                    attributes: vec![
-                        attribute("secret", string_value("source-secret")),
-                        attribute("null", AnyValue { value: None }),
-                        attribute("lookalike", string_value("[REDACTED]")),
-                    ],
-                    ..LogRecord::default()
-                }],
-                ..ScopeLogs::default()
-            }],
-            ..ResourceLogs::default()
-        }],
-    }
-    .encode_to_vec();
-    let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
-    let endpoint = listener.local_addr()?;
-    let mut client = TcpStream::connect(endpoint)?;
-    let (mut server, _) = listener.accept()?;
-    client.write_all(&body)?;
-    let response = receive(
-        &mut server,
-        RequestHead {
-            method: "POST".to_owned(),
-            path: "/v1/logs".to_owned(),
-            content_length: body.len(),
-            bearer: Some(bearer.clone()),
-            content_type: Some(ResponseEncoding::Protobuf.content_type().to_owned()),
-            content_encoding: None,
-            tenant_hint: None,
-            forwarded_for: None,
-            forwarded_actor: None,
-        },
-        &services,
-    )
-    .map_err(|_| "log HTTP response was rejected")?;
-    assert_eq!(
-        response.status(),
-        200,
-        "status={} body={:?}",
-        response.status(),
-        response.body()
-    );
-    let decoded = ExportLogsServiceResponse::decode(response.body())?;
-    assert!(decoded.partial_success.is_none());
-
-    // A source-shaped record near the bounded native value limit must retain
-    // the typed retry outcome: candidate-aware admission is not a universal
-    // capacity exemption for expensive policy work.
-    let expensive_value = "x".repeat(500_000);
-    let expensive_body = ExportLogsServiceRequest {
-        resource_logs: vec![ResourceLogs {
-            scope_logs: vec![ScopeLogs {
-                log_records: vec![LogRecord {
-                    attributes: vec![attribute("secret", string_value(&expensive_value))],
-                    ..LogRecord::default()
-                }],
-                ..ScopeLogs::default()
-            }],
-            ..ResourceLogs::default()
-        }],
-    }
-    .encode_to_vec();
-    let expensive_listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
-    let expensive_endpoint = expensive_listener.local_addr()?;
-    let mut expensive_client = TcpStream::connect(expensive_endpoint)?;
-    let (mut expensive_server, _) = expensive_listener.accept()?;
-    expensive_client.write_all(&expensive_body)?;
-    let expensive_response = receive(
-        &mut expensive_server,
-        RequestHead {
-            method: "POST".to_owned(),
-            path: "/v1/logs".to_owned(),
-            content_length: expensive_body.len(),
-            bearer: Some(bearer),
-            content_type: Some(ResponseEncoding::Protobuf.content_type().to_owned()),
-            content_encoding: None,
-            tenant_hint: None,
-            forwarded_for: None,
-            forwarded_actor: None,
-        },
-        &services,
-    )
-    .map_err(|_| "expensive log HTTP response was rejected")?;
-    assert_eq!(expensive_response.status(), 429);
-    assert_eq!(expensive_response.retry_after_seconds(), Some(1));
-    drop(expensive_client);
-    drop(client);
-    drop(services);
-    drop(initialized);
-
-    let reopened = InstanceBootstrap::reopen(&paths)?;
-    assert_log_attribute_marker(&reopened, &policy)?;
-    Ok(())
-}
-
-#[test]
-fn authenticated_http_trace_marker_survives_ack_and_runtime_reopen() -> Result<(), Box<dyn Error>> {
-    let roots = TestRoots::new()?;
-    let paths = roots.paths()?;
-    drop(InstanceBootstrap::initialize(
-        &paths,
-        InitializationPlan::non_interactive(),
-    )?);
-    let (administrator_secret, bearer) = {
-        let claim = InstanceBootstrap::claim(&paths)?;
-        (
-            claim.secret().to_owned(),
-            claim
-                .ingest_secret()
-                .ok_or("ingest secret missing")?
-                .to_owned(),
-        )
-    };
-    let initialized = Arc::new(InstanceBootstrap::reopen(&paths)?);
-    let administrator = initialized.attribute(
-        PresentedCredential::parse(&administrator_secret)?,
-        RequestedIntent::SystemAdministration,
-        CompatibilityHints::none(),
-    )?;
-    let path = PolicyAttributePath::new(AttributeNamespace::Record, "secret")?;
-    let policy = IngestPolicy::compile(
-        2,
-        vec![PolicyRule::new(
-            "redact-secret",
-            Vec::new(),
-            PolicyAction::Redact(PolicyTarget::attribute(path)),
-        )?],
-    )?;
-    let services = ServiceHandle::new(Arc::clone(&initialized))?;
-    services.activate_ingest_policy(
-        administrator,
-        ResourceGeneration::new(1)?,
-        AdministrativeIdempotencyKey::new([0xb8; 16])?,
-        policy.clone(),
-    )?;
-
-    let body = ExportTraceServiceRequest {
-        resource_spans: vec![ResourceSpans {
-            scope_spans: vec![ScopeSpans {
-                spans: vec![Span {
-                    trace_id: vec![0x41; 16],
-                    span_id: vec![0x42; 8],
-                    name: "http-marker".to_owned(),
-                    attributes: vec![attribute("secret", string_value("source-secret"))],
-                    ..Span::default()
-                }],
-                ..ScopeSpans::default()
-            }],
-            ..ResourceSpans::default()
-        }],
-    }
-    .encode_to_vec();
+fn receive_trace_request(
+    services: &ServiceHandle,
+    bearer: &str,
+    body: Vec<u8>,
+) -> Result<crate::native_host::native_http::Response, Box<dyn Error>> {
     let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
     let endpoint = listener.local_addr()?;
     let mut client = TcpStream::connect(endpoint)?;
@@ -355,38 +105,49 @@ fn authenticated_http_trace_marker_survives_ack_and_runtime_reopen() -> Result<(
             method: "POST".to_owned(),
             path: "/v1/traces".to_owned(),
             content_length: body.len(),
-            bearer: Some(bearer.clone()),
+            bearer: Some(bearer.to_owned()),
             content_type: Some(ResponseEncoding::Protobuf.content_type().to_owned()),
             content_encoding: None,
             tenant_hint: None,
             forwarded_for: None,
             forwarded_actor: None,
         },
-        &services,
+        services,
     )
     .map_err(|_| "trace HTTP response was rejected")?;
-    assert_eq!(
-        response.status(),
-        200,
-        "status={} body={:?}",
-        response.status(),
-        response.body()
-    );
-    let decoded = ExportTraceServiceResponse::decode(response.body())?;
-    assert!(decoded.partial_success.is_none());
+    drop(client);
+    Ok(response)
+}
 
-    let expensive_value = "x".repeat(65_536);
-    let expensive_attributes = (0..8)
-        .map(|_| attribute("secret", string_value(&expensive_value)))
-        .collect();
-    let expensive_body = ExportTraceServiceRequest {
+fn log_request(body: &str) -> ExportLogsServiceRequest {
+    ExportLogsServiceRequest {
+        resource_logs: vec![ResourceLogs {
+            scope_logs: vec![ScopeLogs {
+                log_records: vec![LogRecord {
+                    body: Some(string_value(body)),
+                    attributes: vec![
+                        attribute("secret", string_value("source-secret")),
+                        attribute("null", AnyValue { value: None }),
+                        attribute("lookalike", string_value("[REDACTED]")),
+                    ],
+                    ..LogRecord::default()
+                }],
+                ..ScopeLogs::default()
+            }],
+            ..ResourceLogs::default()
+        }],
+    }
+}
+
+fn trace_request(trace: u8, span: u8, name: &str) -> ExportTraceServiceRequest {
+    ExportTraceServiceRequest {
         resource_spans: vec![ResourceSpans {
             scope_spans: vec![ScopeSpans {
                 spans: vec![Span {
-                    trace_id: vec![0x43; 16],
-                    span_id: vec![0x44; 8],
-                    name: "expensive-http-marker".to_owned(),
-                    attributes: expensive_attributes,
+                    trace_id: vec![trace; 16],
+                    span_id: vec![span; 8],
+                    name: name.to_owned(),
+                    attributes: vec![attribute("secret", string_value("source-secret"))],
                     ..Span::default()
                 }],
                 ..ScopeSpans::default()
@@ -394,38 +155,6 @@ fn authenticated_http_trace_marker_survives_ack_and_runtime_reopen() -> Result<(
             ..ResourceSpans::default()
         }],
     }
-    .encode_to_vec();
-    let expensive_listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
-    let expensive_endpoint = expensive_listener.local_addr()?;
-    let mut expensive_client = TcpStream::connect(expensive_endpoint)?;
-    let (mut expensive_server, _) = expensive_listener.accept()?;
-    expensive_client.write_all(&expensive_body)?;
-    let expensive_response = receive_traces(
-        &mut expensive_server,
-        RequestHead {
-            method: "POST".to_owned(),
-            path: "/v1/traces".to_owned(),
-            content_length: expensive_body.len(),
-            bearer: Some(bearer),
-            content_type: Some(ResponseEncoding::Protobuf.content_type().to_owned()),
-            content_encoding: None,
-            tenant_hint: None,
-            forwarded_for: None,
-            forwarded_actor: None,
-        },
-        &services,
-    )
-    .map_err(|_| "expensive trace HTTP response was rejected")?;
-    assert_eq!(expensive_response.status(), 429);
-    assert_eq!(expensive_response.retry_after_seconds(), Some(1));
-    drop(expensive_client);
-    drop(client);
-    drop(services);
-    drop(initialized);
-
-    let reopened = InstanceBootstrap::reopen(&paths)?;
-    assert_trace_marker(&reopened, &policy)?;
-    Ok(())
 }
 
 fn assert_trace_marker(
@@ -443,7 +172,7 @@ fn assert_trace_marker(
         .into_iter()
         .next()
         .ok_or("trace scope missing after authenticated export")?;
-    let protection = initialized.key.segment_key(initialized.instance, scope)?;
+    let protection = initialized.tenant_segment_key_for_test(scope)?;
     let ledger = ActiveSegmentLedger::open(
         &initialized._authority,
         &catalog,
@@ -500,7 +229,7 @@ fn assert_log_marker(
         .into_iter()
         .next()
         .ok_or("log scope missing after authenticated export")?;
-    let protection = initialized.key.segment_key(initialized.instance, scope)?;
+    let protection = initialized.tenant_segment_key_for_test(scope)?;
     let ledger = ActiveSegmentLedger::open(
         &initialized._authority,
         &catalog,
@@ -562,7 +291,7 @@ fn assert_log_attribute_marker(
         .into_iter()
         .next()
         .ok_or("log scope missing after authenticated export")?;
-    let protection = initialized.key.segment_key(initialized.instance, scope)?;
+    let protection = initialized.tenant_segment_key_for_test(scope)?;
     let ledger = ActiveSegmentLedger::open(
         &initialized._authority,
         &catalog,

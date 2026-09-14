@@ -19,7 +19,8 @@ use super::{ActiveSegmentLedger, LedgerCompletionState, LedgerFailure, LedgerFai
 use crate::CatalogGenerationId;
 pub(super) use snapshot_lease_support::map_catalog_failure;
 pub(super) use snapshot_lease_support::{
-    LeaseReservationTransaction, active_segments, expired_in_scope, publish_many, records,
+    LeaseReservationTransaction, active_segments, expired_in_scope, publish_many,
+    reclamation_lease_expiry, records,
 };
 use snapshot_lease_support::{
     fresh_identity, publish, reject_time_regression, remove_reservations, snapshot_from_record,
@@ -418,11 +419,11 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
                 } else {
                     marker_basis.identity()
                 };
-                let publication = (|| {
-                    #[cfg(any(test, fuzzing, feature = "test-support"))]
-                    super::fault::emit_event(
-                        super::fault::LedgerFileEvent::BeforeLeaseMarkerPublication,
-                    )?;
+                #[cfg(any(test, fuzzing, feature = "test-support"))]
+                let publication = super::fault::emit_event(
+                    super::fault::LedgerFileEvent::BeforeLeaseMarkerPublication,
+                )
+                .and_then(|()| {
                     publish_many_with_expected_catalog(
                         self.catalog,
                         &marker_basis,
@@ -430,7 +431,15 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
                         &BTreeSet::from([identity]),
                         vec![encoded],
                     )
-                })();
+                });
+                #[cfg(not(any(test, fuzzing, feature = "test-support")))]
+                let publication = publish_many_with_expected_catalog(
+                    self.catalog,
+                    &marker_basis,
+                    expected_identity,
+                    &BTreeSet::from([identity]),
+                    vec![encoded],
+                );
                 if let Err(failure) = publication {
                     if failure.completion_state() == super::LedgerCompletionState::CommitAmbiguous {
                         state.lease_resume_markers.remove(&identity);

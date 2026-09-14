@@ -1,10 +1,13 @@
 use positron_domain::identity::{PrincipalId, TenantId};
-use positron_governance::{Identity, IngestPolicyAdministration};
-use positron_governance::{InitialAuditContext, InitialGovernanceIntent, InitialTenantIntent};
+use positron_governance::Identity;
+use positron_governance::{
+    InitialAuditContext, InitialGovernanceIntent, InitialTenantIntent, TenantAdministration,
+};
 use positron_kernel::{
     AuditIntent, BootstrapArtifact, BootstrapArtifactAccess, BootstrapKeyCustody,
     BootstrapObjectPurpose, Catalog, CatalogObject, CatalogProposal, FormatEpoch, InstanceId,
-    OwnedPrimaryDataVolume, RetentionTimeAuthority, TransactionId,
+    OwnedPrimaryDataVolume, ResourceAmounts, RetentionTimeAuthority,
+    StorageKernelResourceAuthority, TransactionId,
 };
 use zeroize::Zeroizing;
 
@@ -33,19 +36,20 @@ use support::{
 pub(super) fn initialize(
     paths: &BootstrapPaths,
     plan: InitializationPlan,
+    max_registered_tenants: u16,
 ) -> Result<InitializedInstance, BootstrapFailure> {
     match storage::classify(paths)? {
         BootstrapState::Empty => {
             let (volume, access) = acquire(paths)?;
             storage::write_new(&access, BootstrapArtifact::Pending, INTENT)?;
-            return resume(paths, plan, volume, access);
+            return resume(paths, plan, volume, access, max_registered_tenants);
         },
         BootstrapState::Incomplete => {},
-        BootstrapState::Initialized => return reopen(paths),
+        BootstrapState::Initialized => return reopen(paths, max_registered_tenants),
         BootstrapState::Inconsistent => return Err(inconsistent()),
     }
     let (volume, access) = acquire(paths)?;
-    resume(paths, plan, volume, access)
+    resume(paths, plan, volume, access, max_registered_tenants)
 }
 
 fn resume(
@@ -53,13 +57,14 @@ fn resume(
     plan: InitializationPlan,
     volume: OwnedPrimaryDataVolume,
     access: BootstrapArtifactAccess,
+    max_registered_tenants: u16,
 ) -> Result<InitializedInstance, BootstrapFailure> {
     if storage::exists(&access, BootstrapArtifact::InitializedStaging)?
         && !storage::exists(&access, BootstrapArtifact::Pending)?
     {
         storage::publish_initialized(&access)?;
         drop(volume);
-        return reopen(paths);
+        return reopen(paths, max_registered_tenants);
     }
     let key = if access
         .layout()
@@ -87,7 +92,7 @@ fn resume(
         decode_record(&key, BootstrapObjectPurpose::Pending, &pending_bytes)?
     };
     require_key_identity(&record, key.identity())?;
-    let authority = resources::establish(volume, record.tenant)?;
+    let authority = resources::establish(volume, record.tenant, max_registered_tenants)?;
     let catalog = Catalog::open(
         &authority,
         record.instance,
@@ -118,7 +123,12 @@ fn resume(
         .protect_instance_integrity_key(record.instance, integrity_secret)
         .map_err(key_failure)?;
     let tenant_key_envelope = key
-        .tenant_key_envelope(record.instance, record.tenant)
+        .provision_tenant_key_envelope(
+            record.instance,
+            record.tenant,
+            key.random_identifier().map_err(key_failure)?,
+            1,
+        )
         .map_err(key_failure)?;
     let before = catalog.pin().map_err(catalog_failure)?;
     let initial = if before.number() == 0 {
@@ -158,14 +168,26 @@ fn resume(
         let governance = InitialGovernanceIntent::create_tenant(tenant_intent)
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
         let (governance_object, audit_intent) = governance.into_parts();
+        let default_policy = positron_ingest::IngestPolicy::preserving(1)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?
+            .activated_object(record.tenant)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
         Some(
             catalog
                 .commit(
                     before.identity(),
                     CatalogProposal::new(
                         record.transaction,
-                        FormatEpoch::CATALOG_V1,
-                        vec![CatalogObject::new(governance_object).map_err(catalog_failure)?],
+                        FormatEpoch::CATALOG_V2,
+                        vec![
+                            CatalogObject::new(governance_object).map_err(catalog_failure)?,
+                            TenantAdministration::initial_registry(record.instance, record.tenant)
+                                .map_err(|_| {
+                                    BootstrapFailure::new(BootstrapFailureCode::CorruptState)
+                                })?,
+                            CatalogObject::new(default_policy.into_bytes())
+                                .map_err(catalog_failure)?,
+                        ],
                     )
                     .map_err(catalog_failure)?,
                     Some(AuditIntent::new(audit_intent).map_err(catalog_failure)?),
@@ -177,6 +199,9 @@ fn resume(
     };
     open_initial_ledgers(&authority, &retention_time, &catalog, &key, &record)?;
     let current = catalog.pin().map_err(catalog_failure)?;
+    apply_catalog_quota(&authority, &current)?;
+    let registered_tenants = TenantAdministration::registered_tenant_ids(&current)
+        .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
     if plan.creates_claim() {
         ensure_claim(&access, &key, &record, api_secret)?;
     }
@@ -204,8 +229,6 @@ fn resume(
     let identity = Identity::open(&current)
         .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
     let audit_records = governance_audit_records(&catalog)?;
-    let ingest_policy = IngestPolicyAdministration::open(&catalog, record.tenant)
-        .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
     drop(catalog);
     outcome(
         &record,
@@ -217,11 +240,15 @@ fn resume(
         generation,
         audit,
         claim_available,
-        ingest_policy,
+        registered_tenants,
+        max_registered_tenants,
     )
 }
 
-pub(super) fn reopen(paths: &BootstrapPaths) -> Result<InitializedInstance, BootstrapFailure> {
+pub(super) fn reopen(
+    paths: &BootstrapPaths,
+    max_registered_tenants: u16,
+) -> Result<InitializedInstance, BootstrapFailure> {
     let (volume, access) = acquire(paths)?;
     if storage::classify_with(&access)? != BootstrapState::Initialized {
         return Err(inconsistent());
@@ -230,7 +257,7 @@ pub(super) fn reopen(paths: &BootstrapPaths) -> Result<InitializedInstance, Boot
     let encoded = storage::read(&access, BootstrapArtifact::Initialized)?;
     let record = decode_record(&key, BootstrapObjectPurpose::Initialized, &encoded)?;
     require_key_identity(&record, key.identity())?;
-    let authority = resources::establish(volume, record.tenant)?;
+    let authority = resources::establish(volume, record.tenant, max_registered_tenants)?;
     let catalog = Catalog::open(
         &authority,
         record.instance,
@@ -251,14 +278,15 @@ pub(super) fn reopen(paths: &BootstrapPaths) -> Result<InitializedInstance, Boot
         open_initial_ledgers(&authority, &retention_time, &catalog, &key, &record)?;
     }
     let current = catalog.pin().map_err(catalog_failure)?;
+    apply_catalog_quota(&authority, &current)?;
+    let registered_tenants = TenantAdministration::registered_tenant_ids(&current)
+        .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
     let generation = current.number();
     let audit = current.governance_audit_frontier();
     let claim_available = storage::exists(&access, BootstrapArtifact::Claim)?;
     let identity = Identity::open(&current)
         .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
     let audit_records = governance_audit_records(&catalog)?;
-    let ingest_policy = IngestPolicyAdministration::open(&catalog, record.tenant)
-        .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
     drop(catalog);
     outcome(
         &record,
@@ -270,7 +298,8 @@ pub(super) fn reopen(paths: &BootstrapPaths) -> Result<InitializedInstance, Boot
         generation,
         audit,
         claim_available,
-        ingest_policy,
+        registered_tenants,
+        max_registered_tenants,
     )
 }
 
@@ -321,6 +350,34 @@ pub(super) fn claim(paths: &BootstrapPaths) -> Result<BootstrapClaim, BootstrapF
         ingest,
         query,
     })
+}
+
+fn apply_catalog_quota(
+    authority: &StorageKernelResourceAuthority,
+    snapshot: &positron_kernel::CatalogSnapshot,
+) -> Result<(), BootstrapFailure> {
+    let (_, governance) = snapshot.governance_object().map_err(catalog_failure)?;
+    authority
+        .update_tenant_quota(
+            governance.tenant(),
+            u16::try_from(governance.quota_weight())
+                .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?,
+            ResourceAmounts::new(governance.quota_resources()),
+        )
+        .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
+    for (tenant, weight, resources) in TenantAdministration::registered_tenant_quotas(snapshot)
+        .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?
+    {
+        authority
+            .register_tenant_quota(
+                tenant,
+                u16::try_from(weight)
+                    .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?,
+                ResourceAmounts::new(resources),
+            )
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
+    }
+    Ok(())
 }
 
 fn generate_record(key: &BootstrapKeyCustody) -> Result<BootstrapRecord, BootstrapFailure> {

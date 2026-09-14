@@ -1,4 +1,5 @@
 use super::*;
+use crate::active_segment_ledger::RetentionReclamationEstimate;
 
 #[test]
 fn sealed_nonempty_segment_expires_only_after_authoritative_elapsed_time()
@@ -56,6 +57,96 @@ fn sealed_nonempty_segment_expires_only_after_authoritative_elapsed_time()
     assert_eq!(outcome.logically_retired_segments(), 1);
     assert_eq!(outcome.physically_reclaimed_segments(), 1);
     assert!(active.snapshot()?.blocks().is_empty());
+    Ok(())
+}
+
+#[test]
+fn retention_impact_distinguishes_sealed_reclamation_from_active_segment_exposure()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_authority(volume)?;
+    let instance = InstanceId::new([0x71; 16])?;
+    let catalog = Catalog::open(
+        &authority,
+        instance,
+        CatalogSecret::from_owned(Box::new([0x72; 32]), Box::new([0x73; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x64; 16])?;
+    install_governance_policy(&catalog, instance, tenant, 10, 0x74)?;
+    let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(71)?);
+    let (retention_time, elapsed) =
+        RetentionTimeAuthority::establish_with_manual_elapsed(UnixNanoseconds::new(10_000_000_000));
+    let key = || SegmentProtectionKey::from_owned(Box::new([0x75; 32]));
+    let first = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    let prepared = first.begin_store_block(
+        preparation_capacity(&authority, tenant)?,
+        StoreBlockIdentity::new([0x76; 16])?,
+    )?;
+    first.append(prepared.finish(b"old".to_vec())?)?;
+    first.seal()?;
+    elapsed.advance(2_000_000_000)?;
+    let active = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    let prepared = active.begin_store_block(
+        preparation_capacity(&authority, tenant)?,
+        StoreBlockIdentity::new([0x77; 16])?,
+    )?;
+    active.append(prepared.finish(b"live".to_vec())?)?;
+    elapsed.advance(2_000_000_000)?;
+
+    let before = catalog.pin()?.identity();
+    let reader = active.reader()?;
+    let preview = reader.inspect_retention_impact_at(
+        NonZeroU64::new(1).ok_or("one second")?,
+        UnixNanoseconds::new(14_000_000_000),
+    )?;
+    assert_eq!(catalog.pin()?.identity(), before, "preview is read-only");
+    assert_eq!(preview.approximate_affected_bytes(), 7);
+    assert_eq!(preview.approximate_immediately_reclaimable_bytes(), 3);
+    assert_eq!(preview.deferred_active_segment_bytes(), 4);
+    assert_eq!(
+        preview
+            .affected_time_range()
+            .ok_or("affected range")?
+            .earliest(),
+        UnixNanoseconds::new(10_000_000_000)
+    );
+    assert_eq!(
+        preview
+            .affected_time_range()
+            .ok_or("affected range")?
+            .latest(),
+        UnixNanoseconds::new(12_000_000_000)
+    );
+    assert_eq!(
+        preview.earliest_reclamation(),
+        RetentionReclamationEstimate::At(UnixNanoseconds::new(14_000_000_000))
+    );
+    let lease =
+        active.create_snapshot_lease_for(0, NonZeroU64::new(10).ok_or("lease duration")?)?;
+    assert_eq!(lease.expiry(), 24);
+    drop(lease);
+    assert_eq!(
+        reader
+            .inspect_retention_impact_at(
+                NonZeroU64::new(1).ok_or("one second")?,
+                UnixNanoseconds::new(14_000_000_000),
+            )?
+            .earliest_reclamation(),
+        RetentionReclamationEstimate::BlockedByDurableLease(UnixNanoseconds::new(24_000_000_000))
+    );
     Ok(())
 }
 

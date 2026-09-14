@@ -81,7 +81,8 @@ pub use catalog::{
     CatalogGenerationId, CatalogGovernanceObject, CatalogGovernanceVersion,
     CatalogLogRetentionPolicy, CatalogObject, CatalogObjectId, CatalogProposal, CatalogReadView,
     CatalogRotation, CatalogSecret, CatalogSnapshot, CatalogWrappingKey, FormatEpoch,
-    GovernanceAuditRecord, InstanceId, PreparedTransactionResolution, TransactionId,
+    GovernanceAuditRecord, InstanceId, PreparedTransactionInspection,
+    PreparedTransactionResolution, TransactionId,
 };
 #[cfg(feature = "test-support")]
 pub use catalog::{
@@ -98,7 +99,8 @@ pub use active_segment_ledger::{
     ActiveSegmentLedger, AppendCancellation, CommitReceipt, CommittedBlock, CommittedLedgerReader,
     CompactionBlock, CompactionPreparation, CompactionPublication, LedgerCompletionState,
     LedgerFailure, LedgerFailureCode, LedgerSnapshot, MAX_SNAPSHOT_LEASE_TTL_SECONDS,
-    PreparedStoreBlock, RetentionBucket, RetentionEvaluation, RetentionReclamation, SealedSegment,
+    PreparedStoreBlock, RetentionBucket, RetentionEvaluation, RetentionImpactPreview,
+    RetentionImpactTimeRange, RetentionReclamation, RetentionReclamationEstimate, SealedSegment,
     SegmentId, SegmentProtectionKey, SegmentScope, SnapshotLeaseAttempt, SnapshotLeaseGrant,
     SnapshotLeaseId, SnapshotLeaseReplacement, SnapshotLeaseUsage, StoreBlockIdentity,
     StoreBlockPreparation,
@@ -130,12 +132,12 @@ pub use resource_governor::{
     DiskPressureState, DiskPressureThresholds, EstablishmentFailure, ExistingCapacityDisposition,
     GovernorFailure, GovernorLifecycle, GovernorPolicy, InventoryCardinalityLimits, LimitingScope,
     MAX_OUTSTANDING_RESERVATIONS, MAX_TENANT_QUOTAS, ObservedResourceEnvironment, OperatorLimits,
-    OrdinaryPool, OrdinaryPoolPolicy, RESOURCE_DIMENSION_COUNT, RecoveryAuthority,
-    RecoveryInterruption, RecoveryPoolCapacities, RecoveryReserve, RecoveryScope,
-    RecoveryWorkClaim, RecoveryWorkKind, RegisteredResourceBounds, ReleaseOutcome, ResizeFailure,
-    ResizeFailureCode, ResizeOutcome, ResourceAmounts, ResourceDimension, ResourceGovernor,
-    ResourceGovernorConfiguration, ResourceInventory, ResourceReservation, ResourceSnapshot,
-    ShutdownReconciliation, StorageKernelResourceAuthority, TenantQuota,
+    OrdinaryPool, OrdinaryPoolPolicy, PendingTenantEnrollment, RESOURCE_DIMENSION_COUNT,
+    RecoveryAuthority, RecoveryInterruption, RecoveryPoolCapacities, RecoveryReserve,
+    RecoveryScope, RecoveryWorkClaim, RecoveryWorkKind, RegisteredResourceBounds, ReleaseOutcome,
+    ResizeFailure, ResizeFailureCode, ResizeOutcome, ResourceAmounts, ResourceDimension,
+    ResourceGovernor, ResourceGovernorConfiguration, ResourceInventory, ResourceReservation,
+    ResourceSnapshot, ShutdownReconciliation, StorageKernelResourceAuthority, TenantQuota,
     TransferredResourceReservation, WorkClaim, WorkClass, WorkKind,
 };
 

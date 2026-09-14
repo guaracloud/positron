@@ -17,7 +17,8 @@ impl IngestPolicy {
         record: NativeLogCandidate,
         receiver: PolicyReceiver,
     ) -> Result<PolicyEvaluation, PolicyEvaluationFailure> {
-        let Some((record, provenance)) = self.evaluate_record(record, receiver)? else {
+        let EvaluationRecord { record, provenance } = self.evaluate_record(record, receiver)?;
+        let Some(record) = record else {
             return Ok(PolicyEvaluation::Rejected);
         };
         Ok(PolicyEvaluation::Accepted(Box::new(
@@ -30,7 +31,8 @@ impl IngestPolicy {
         record: NativeTraceCandidate,
         receiver: PolicyReceiver,
     ) -> Result<TracePolicyEvaluation, PolicyEvaluationFailure> {
-        let Some((record, provenance)) = self.evaluate_record(record, receiver)? else {
+        let EvaluationRecord { record, provenance } = self.evaluate_record(record, receiver)?;
+        let Some(record) = record else {
             return Ok(TracePolicyEvaluation::Rejected);
         };
         Ok(TracePolicyEvaluation::Accepted(Box::new(
@@ -38,11 +40,29 @@ impl IngestPolicy {
         )))
     }
 
+    pub(crate) fn preview_log(
+        &self,
+        record: NativeLogCandidate,
+        receiver: PolicyReceiver,
+    ) -> Result<(bool, PolicyProvenance), PolicyEvaluationFailure> {
+        let EvaluationRecord { record, provenance } = self.evaluate_record(record, receiver)?;
+        Ok((record.is_some(), provenance))
+    }
+
+    pub(crate) fn preview_trace(
+        &self,
+        record: NativeTraceCandidate,
+        receiver: PolicyReceiver,
+    ) -> Result<(bool, PolicyProvenance), PolicyEvaluationFailure> {
+        let EvaluationRecord { record, provenance } = self.evaluate_record(record, receiver)?;
+        Ok((record.is_some(), provenance))
+    }
+
     fn evaluate_record<C: PolicyRecord>(
         &self,
         mut record: C,
         receiver: PolicyReceiver,
-    ) -> Result<Option<(C, PolicyProvenance)>, PolicyEvaluationFailure> {
+    ) -> Result<EvaluationRecord<C>, PolicyEvaluationFailure> {
         if record
             .body()
             .is_some_and(CandidateAttributeValue::contains_policy_marker)
@@ -70,7 +90,17 @@ impl IngestPolicy {
                     applied.push(rule.id.clone());
                     break;
                 },
-                PolicyAction::Reject => return Ok(None),
+                PolicyAction::Reject => {
+                    applied.push(rule.id.clone());
+                    return Ok(EvaluationRecord {
+                        record: None,
+                        provenance: PolicyProvenance::evaluated(
+                            self.generation,
+                            self.digest,
+                            applied,
+                        ),
+                    });
+                },
                 PolicyAction::Remove(target) => {
                     transform_target(&mut record, target, Transformation::Remove)?
                 },
@@ -90,11 +120,16 @@ impl IngestPolicy {
                 applied.push(rule.id.clone());
             }
         }
-        Ok(Some((
-            record,
-            PolicyProvenance::evaluated(self.generation, self.digest, applied),
-        )))
+        Ok(EvaluationRecord {
+            record: Some(record),
+            provenance: PolicyProvenance::evaluated(self.generation, self.digest, applied),
+        })
     }
+}
+
+struct EvaluationRecord<C> {
+    record: Option<C>,
+    provenance: PolicyProvenance,
 }
 
 trait PolicyRecord: Sized {

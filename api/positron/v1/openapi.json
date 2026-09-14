@@ -3,7 +3,7 @@
   "info": {
     "title": "Positron API",
     "version": "v1",
-    "x-positron-schema-digest": "e0231f6e90a0ff3fb5dc9ea1c2231d2da7ce1dfbfed219608aeec97ba19b69c5"
+    "x-positron-schema-digest": "f55d1ef754a0d1e1752a48851f259a025eb16cc91059f2daf2c668cd42ca0081"
   },
   "paths": {
     "/v1/capabilities:negotiate": {
@@ -113,6 +113,380 @@
               }
             }
           }
+        }
+      }
+    },
+    "/v1/tenant-quotas:update": {
+      "post": {
+        "operationId": "UpdateTenantQuota",
+        "security": [
+          {
+            "apiKeyBearer": []
+          }
+        ],
+        "x-positron-max-request-bytes": 1024,
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TenantQuotaUpdateRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Published successor quota resource generation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TenantQuotaUpdateResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Closed tenant quota administration refusal",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TenantQuotaFailure"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Closed tenant quota administration refusal",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TenantQuotaFailure"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Closed tenant quota administration refusal",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TenantQuotaFailure"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Closed tenant quota administration refusal",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TenantQuotaFailure"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/policies:validate": {
+      "post": {
+        "operationId": "ValidatePolicy",
+        "security": [
+          {
+            "apiKeyBearer": []
+          }
+        ],
+        "x-positron-max-request-bytes": 65536,
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PolicyPreviewRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Bounded prospective policy validation; it never activates the candidate.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PolicyValidateResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid policy preview request or candidate.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PolicyPreviewFailure"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Tenant-administration authentication failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PolicyPreviewFailure"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Policy administration is unavailable.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PolicyPreviewFailure"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/policies:test": {
+      "post": {
+        "operationId": "TestPolicy",
+        "security": [
+          {
+            "apiKeyBearer": []
+          }
+        ],
+        "x-positron-max-request-bytes": 65536,
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PolicyTestRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Bounded prospective policy test; it returns only the redacted outcome summary and never activates the candidate.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PolicyTestResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid policy test request or candidate.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PolicyPreviewFailure"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Tenant-administration authentication failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PolicyPreviewFailure"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Policy administration is unavailable.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PolicyPreviewFailure"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/tenant-aliases:bind": {
+      "post": {
+        "operationId": "BindTenantAlias",
+        "security": [
+          {
+            "apiKeyBearer": []
+          }
+        ],
+        "x-positron-max-request-bytes": 1024,
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TenantAliasBindRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Redacted immutable alias-binding receipt. The alias text is never returned.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TenantAliasBindResponse"
+                }
+              }
+            }
+          },
+          "400": {"description": "Invalid bounded alias-binding request."},
+          "401": {"description": "System-administration authentication failed before request decoding."},
+          "404": {"description": "The explicit tenant is unavailable."},
+          "409": {"description": "The alias is already bound or reserved, the generation is stale, or the idempotency binding conflicts."},
+          "503": {"description": "Tenant alias administration is unavailable."}
+        }
+      }
+    },
+    "/v1/tenants:create": {
+      "post": {
+        "operationId": "CreateTenant",
+        "security": [{"apiKeyBearer": []}],
+        "x-positron-max-request-bytes": 2048,
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/TenantCreateRequest"}}}},
+        "responses": {
+          "200": {"description": "Redacted tenant-creation receipt.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/TenantCreateResponse"}}}},
+          "400": {"description": "Invalid bounded tenant-creation request."},
+          "401": {"description": "System-administration authentication failed before request decoding."},
+          "409": {"description": "The tenant already exists or the idempotency binding conflicts."},
+          "503": {"description": "Tenant administration is unavailable."}
+        }
+      }
+    },
+    "/v1/tenants:inspect": {
+      "post": {
+        "operationId": "InspectTenant",
+        "security": [{"apiKeyBearer": []}],
+        "x-positron-max-request-bytes": 2048,
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/TenantInspectRequest"}}}},
+        "responses": {
+          "200": {"description": "Redacted tenant registry descriptor.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/TenantInspectResponse"}}}},
+          "400": {"description": "Invalid bounded tenant-inspection request."},
+          "401": {"description": "System-administration authentication failed before request decoding."},
+          "404": {"description": "The explicit tenant is unavailable."},
+          "503": {"description": "Tenant administration is unavailable."}
+        }
+      }
+    },
+    "/v1/tenants:list": {
+      "post": {
+        "operationId": "ListTenants",
+        "security": [{"apiKeyBearer": []}],
+        "x-positron-max-request-bytes": 2048,
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/TenantListRequest"}}}},
+        "responses": {
+          "200": {"description": "A snapshot-pinned page of redacted tenant registry descriptors.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/TenantListResponse"}}}},
+          "400": {"description": "Invalid bounded tenant-list request."},
+          "401": {"description": "System-administration authentication failed before request decoding."},
+          "409": {"description": "The opaque continuation belongs to an older Catalog snapshot; restart enumeration."},
+          "503": {"description": "Tenant administration is unavailable."}
+        }
+      }
+    },
+    "/v1/tenants:update-display-name": {
+      "post": {
+        "operationId": "UpdateTenantDisplayName",
+        "security": [{"apiKeyBearer": []}],
+        "x-positron-max-request-bytes": 2048,
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/TenantDisplayNameUpdateRequest"}}}},
+        "responses": {
+          "200": {"description": "Redacted tenant-profile update receipt.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/TenantDisplayNameUpdateResponse"}}}},
+          "400": {"description": "Invalid bounded tenant-profile update request."},
+          "401": {"description": "System-administration authentication failed before request decoding."},
+          "409": {"description": "The display generation is stale or the idempotency binding conflicts."},
+          "503": {"description": "Tenant administration is unavailable."}
+        }
+      }
+    },
+    "/v1/tenant-retention:preview": {
+      "post": {
+        "operationId": "PreviewTenantRetention",
+        "security": [{"apiKeyBearer": []}],
+        "x-positron-availability": "available",
+        "x-positron-max-request-bytes": 2048,
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/TenantRetentionPreviewRequest"}}}},
+        "responses": {
+          "200": {"description": "A snapshot-pinned page of redacted retention impact evidence with a full-impact confirmation digest.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/TenantRetentionPreviewResponse"}}}},
+          "400": {"description": "Invalid bounded retention preview request."},
+          "401": {"description": "Tenant-administration authentication failed before request decoding."},
+          "404": {"description": "The explicit tenant is unavailable."},
+          "409": {"description": "The opaque continuation belongs to an older impact snapshot; restart the preview."},
+          "503": {"description": "Retention administration is unavailable."}
+        }
+      }
+    },
+    "/v1/tenant-retention:update": {
+      "post": {
+        "operationId": "UpdateTenantRetention",
+        "security": [{"apiKeyBearer": []}],
+        "x-positron-availability": "available",
+        "x-positron-max-request-bytes": 2048,
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/TenantRetentionUpdateRequest"}}}},
+        "responses": {
+          "200": {"description": "Redacted retention publication receipt.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/TenantRetentionUpdateResponse"}}}},
+          "400": {"description": "Invalid bounded retention update request."},
+          "401": {"description": "Tenant-administration authentication failed before request decoding."},
+          "404": {"description": "The explicit tenant is unavailable."},
+          "409": {"description": "The confirmation is invalid, the generation is stale, or the idempotency binding conflicts."},
+          "503": {"description": "Retention administration is unavailable."}
+        }
+      }
+    },
+    "/v1/policies:diff": {
+      "post": {
+        "operationId": "DiffPolicy",
+        "security": [{"apiKeyBearer": []}],
+        "x-positron-max-request-bytes": 65536,
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/PolicyDiffRequest"}}}},
+        "responses": {
+          "200": {"description": "Bounded prospective policy diff with redacted semantic categories; it never activates either candidate.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/PolicyDiffResponse"}}}},
+          "400": {"description": "Invalid policy diff request or candidate."},
+          "401": {"description": "Tenant-administration authentication failed."},
+          "503": {"description": "Policy administration is unavailable."}
+        }
+      }
+    },
+    "/v1/policies:explain": {
+      "post": {
+        "operationId": "ExplainPolicy",
+        "security": [{"apiKeyBearer": []}],
+        "x-positron-max-request-bytes": 65536,
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/PolicyExplainRequest"}}}},
+        "responses": {
+          "200": {"description": "Bounded prospective policy explanation with redacted outcome evidence; it never activates the candidate.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/PolicyExplainResponse"}}}},
+          "400": {"description": "Invalid policy explanation request or candidate."},
+          "401": {"description": "Tenant-administration authentication failed."},
+          "503": {"description": "Policy administration is unavailable."}
+        }
+      }
+    },
+    "/v1/policies:activate": {
+      "post": {
+        "operationId": "ActivatePolicy",
+        "security": [{"apiKeyBearer": []}],
+        "x-positron-max-request-bytes": 65536,
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/PolicyActivateRequest"}}}},
+        "responses": {
+          "200": {"description": "Generation-checked, idempotent prospective policy activation committed with governance evidence.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/PolicyActivateResponse"}}}},
+          "400": {"description": "Invalid policy activation request or candidate."},
+          "401": {"description": "Tenant-administration authentication failed."},
+          "409": {"description": "The resource generation is stale or the idempotency key binds different content."},
+          "503": {"description": "Policy administration is unavailable."}
         }
       }
     }
@@ -433,6 +807,11 @@
           "idempotency_key": {
             "type": "string",
             "format": "uuid"
+          },
+          "target_tenant": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Explicit administrative target tenant for an API-key lifecycle action; never data-plane attribution."
           }
         }
       },
@@ -485,7 +864,7 @@
         "properties": {
           "keys": {
             "type": "array",
-            "maxItems": 128,
+            "maxItems": 48,
             "items": {
               "$ref": "#/components/schemas/KeyDescriptor"
             }
@@ -528,6 +907,519 @@
               "stale_generation",
               "idempotency_conflict",
               "key_unavailable",
+              "administration_unavailable"
+            ]
+          }
+        }
+      },
+      "TenantQuotaUpdateRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "tenant",
+          "expected_generation",
+          "idempotency_key",
+          "weight",
+          "memory_bytes",
+          "queue_slots",
+          "task_slots",
+          "buffer_cache_bytes",
+          "batch_items",
+          "lease_slots",
+          "retry_slots",
+          "io_permits",
+          "cpu_work_units",
+          "file_descriptors",
+          "disk_headroom_bytes"
+        ],
+        "properties": {
+          "tenant": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Explicit control-plane tenant. TenantAdministration credentials may select only their attributed tenant."
+          },
+          "expected_generation": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "idempotency_key": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "weight": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65535
+          },
+          "memory_bytes": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "queue_slots": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "task_slots": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "buffer_cache_bytes": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "batch_items": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "lease_slots": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "retry_slots": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "io_permits": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "cpu_work_units": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "file_descriptors": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "disk_headroom_bytes": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      },
+      "TenantQuotaUpdateResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "resource_generation"
+        ],
+        "properties": {
+          "resource_generation": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      },
+      "TenantQuotaFailure": {
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "code"
+            ],
+            "properties": {
+              "code": {
+                "type": "string",
+                "enum": [
+                  "invalid_request",
+                  "authentication_rejected",
+                  "idempotency_conflict",
+                  "administration_unavailable"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "code",
+              "resource_generation",
+              "semantic_diff"
+            ],
+            "properties": {
+              "code": {
+                "const": "stale_generation"
+              },
+              "resource_generation": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "semantic_diff": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 1024,
+                "description": "Redacted description of the changed quota resource; it never contains quota values or credentials."
+              }
+            }
+          }
+        ]
+      },
+      "TenantAliasBindRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "tenant",
+          "external_alias",
+          "expected_generation",
+          "idempotency_key"
+        ],
+        "properties": {
+          "tenant": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Explicit system-administration target; it never supplies data-plane attribution."
+          },
+          "external_alias": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9._-]+$",
+            "description": "One protocol compatibility assertion. It is validated only after the credential has attributed data-plane work."
+          },
+          "expected_generation": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "idempotency_key": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "TenantAliasBindResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "tenant",
+          "alias_generation",
+          "audit_position",
+          "audit_ingest_time_unix_seconds"
+        ],
+        "properties": {
+          "tenant": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "alias_generation": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "audit_position": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "audit_ingest_time_unix_seconds": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      },
+      "TenantCreateRequest": {
+        "type": "object", "additionalProperties": false,
+        "required": ["slug", "display_name", "retention_seconds", "weight", "memory_bytes", "queue_slots", "task_slots", "buffer_cache_bytes", "batch_items", "lease_slots", "retry_slots", "io_permits", "cpu_work_units", "file_descriptors", "disk_headroom_bytes", "idempotency_key"],
+        "properties": {
+          "slug": {"type": "string", "minLength": 1, "maxLength": 63, "pattern": "^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$"},
+          "display_name": {"type": "string", "minLength": 1, "maxLength": 128},
+          "retention_seconds": {"type": "integer", "minimum": 1},
+          "weight": {"type": "integer", "minimum": 1, "maximum": 65535},
+          "memory_bytes": {"type": "integer", "minimum": 1},
+          "queue_slots": {"type": "integer", "minimum": 1},
+          "task_slots": {"type": "integer", "minimum": 1},
+          "buffer_cache_bytes": {"type": "integer", "minimum": 1},
+          "batch_items": {"type": "integer", "minimum": 1},
+          "lease_slots": {"type": "integer", "minimum": 1},
+          "retry_slots": {"type": "integer", "minimum": 1},
+          "io_permits": {"type": "integer", "minimum": 1},
+          "cpu_work_units": {"type": "integer", "minimum": 1},
+          "file_descriptors": {"type": "integer", "minimum": 1},
+          "disk_headroom_bytes": {"type": "integer", "minimum": 1},
+          "idempotency_key": {"type": "string", "format": "uuid"}
+        }
+      },
+      "TenantCreateResponse": {
+        "type": "object", "additionalProperties": false,
+        "required": ["tenant", "resource_generation", "audit_position"],
+        "properties": {
+          "tenant": {"type": "string", "format": "uuid"},
+          "resource_generation": {"type": "integer", "minimum": 1},
+          "audit_position": {"type": "integer", "minimum": 1}
+        }
+      },
+      "TenantInspectRequest": {
+        "type": "object", "additionalProperties": false,
+        "required": ["tenant"],
+        "properties": {"tenant": {"type": "string", "format": "uuid"}}
+      },
+      "TenantDescriptor": {
+        "type": "object", "additionalProperties": false,
+        "required": ["tenant", "slug", "display_name", "retention_seconds", "display_generation", "retention_generation", "lifecycle"],
+        "properties": {
+          "tenant": {"type": "string", "format": "uuid"},
+          "slug": {"type": "string", "minLength": 1, "maxLength": 63, "pattern": "^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$"},
+          "display_name": {"type": "string", "minLength": 1, "maxLength": 128},
+          "retention_seconds": {"type": "integer", "minimum": 1},
+          "display_generation": {"type": "integer", "minimum": 1},
+          "retention_generation": {"type": "integer", "minimum": 1},
+          "lifecycle": {"$ref": "#/components/schemas/TenantLifecycleTarget"}
+        }
+      },
+      "TenantInspectResponse": {
+        "type": "object", "additionalProperties": false,
+        "required": ["tenant"],
+        "properties": {"tenant": {"$ref": "#/components/schemas/TenantDescriptor"}}
+      },
+      "TenantListRequest": {
+        "type": "object", "additionalProperties": false,
+        "properties": {"continuation": {"type": "string", "pattern": "^[0-9a-f]{84}$", "minLength": 84, "maxLength": 84}}
+      },
+      "TenantListResponse": {
+        "type": "object", "additionalProperties": false,
+        "required": ["tenants", "continuation"],
+        "properties": {"tenants": {"type": "array", "maxItems": 48, "items": {"$ref": "#/components/schemas/TenantDescriptor"}}, "continuation": {"type": ["string", "null"], "pattern": "^[0-9a-f]{84}$", "maxLength": 84}}
+      },
+      "TenantDisplayNameUpdateRequest": {
+        "type": "object", "additionalProperties": false,
+        "required": ["tenant", "expected_display_generation", "display_name", "idempotency_key"],
+        "properties": {
+          "tenant": {"type": "string", "format": "uuid"},
+          "expected_display_generation": {"type": "integer", "minimum": 1},
+          "display_name": {"type": "string", "minLength": 1, "maxLength": 128},
+          "idempotency_key": {"type": "string", "format": "uuid"}
+        }
+      },
+      "TenantDisplayNameUpdateResponse": {
+        "type": "object", "additionalProperties": false,
+        "required": ["tenant", "display_generation", "audit_position"],
+        "properties": {
+          "tenant": {"type": "string", "format": "uuid"},
+          "display_generation": {"type": "integer", "minimum": 1},
+          "audit_position": {"type": "integer", "minimum": 1}
+        }
+      },
+      "TenantRetentionPreviewRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["tenant", "proposed_retention_seconds"],
+        "properties": {
+          "tenant": {"type": "string", "format": "uuid", "description": "Explicit tenant-administration target; it cannot select another tenant."},
+          "proposed_retention_seconds": {"type": "integer", "minimum": 1},
+          "continuation": {"type": "string", "pattern": "^[0-9a-f]{212}$", "minLength": 212, "maxLength": 212}
+        }
+      },
+      "TenantRetentionScopeImpact": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["signal", "shard", "catalog_identity", "catalog_generation", "evaluated_at_unix_nanos", "affected_bytes", "immediately_reclaimable_bytes", "deferred_active_segment_bytes", "deferred_mixed_sealed_segment_bytes", "earliest_reclamation"],
+        "properties": {
+          "signal": {"type": "string", "enum": ["logs", "traces"]},
+          "shard": {"type": "integer", "minimum": 0},
+          "catalog_identity": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "catalog_generation": {"type": "integer", "minimum": 1},
+          "evaluated_at_unix_nanos": {"type": "integer"},
+          "affected_start_unix_nanos": {"type": "integer"},
+          "affected_end_unix_nanos": {"type": "integer"},
+          "affected_bytes": {"type": "integer", "minimum": 0},
+          "immediately_reclaimable_bytes": {"type": "integer", "minimum": 0},
+          "deferred_active_segment_bytes": {"type": "integer", "minimum": 0},
+          "deferred_mixed_sealed_segment_bytes": {"type": "integer", "minimum": 0},
+          "earliest_reclamation": {"type": "string", "enum": ["none", "at", "blocked_by_durable_lease", "blocked_by_in_process_snapshot"]},
+          "earliest_reclamation_unix_nanos": {"type": "integer"}
+        }
+      },
+      "TenantRetentionPreviewResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["tenant", "retention_generation", "proposed_retention_seconds", "catalog_identity", "catalog_generation", "confirmation_digest", "confirmation_evaluated_at_unix_nanos", "scopes", "continuation"],
+        "properties": {
+          "tenant": {"type": "string", "format": "uuid"},
+          "retention_generation": {"type": "integer", "minimum": 1},
+          "proposed_retention_seconds": {"type": "integer", "minimum": 1},
+          "catalog_identity": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "catalog_generation": {"type": "integer", "minimum": 1},
+          "confirmation_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$", "description": "Opaque confirmation binding computed from current canonical evidence."},
+          "scopes": {"type": "array", "maxItems": 64, "items": {"$ref": "#/components/schemas/TenantRetentionScopeImpact"}},
+          "continuation": {"type": ["string", "null"], "pattern": "^[0-9a-f]{212}$", "maxLength": 212},
+          "confirmation_evaluated_at_unix_nanos": {"type": "integer", "minimum": 1}
+        }
+      },
+      "TenantRetentionUpdateRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["tenant", "proposed_retention_seconds", "expected_generation", "idempotency_key"],
+        "properties": {
+          "tenant": {"type": "string", "format": "uuid", "description": "Explicit tenant-administration target; it cannot select another tenant."},
+          "proposed_retention_seconds": {"type": "integer", "minimum": 1},
+          "expected_generation": {"type": "integer", "minimum": 1},
+          "confirmation_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$", "description": "Opaque digest received from a preview; callers never submit impact fields."},
+          "confirmation_evaluated_at_unix_nanos": {"type": "integer", "minimum": 1, "description": "Trusted instant returned with the confirmation digest; the server verifies the digest at this instant."},
+          "idempotency_key": {"type": "string", "format": "uuid"}
+        }
+      },
+      "TenantRetentionUpdateResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["tenant", "retention_generation", "audit_position", "audit_ingest_time_unix_seconds"],
+        "properties": {
+          "tenant": {"type": "string", "format": "uuid"},
+          "retention_generation": {"type": "integer", "minimum": 1},
+          "audit_position": {"type": "integer", "minimum": 1},
+          "audit_ingest_time_unix_seconds": {"type": "integer", "minimum": 1}
+        }
+      },
+      "PolicyPreviewRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "policy_json"
+        ],
+        "properties": {
+          "policy_json": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 65536,
+            "description": "Bounded declarative candidate. It is compiled prospectively and never exposed in a response or audit record by this operation."
+          }
+        }
+      },
+      "PolicyValidateResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "policy_generation",
+          "policy_digest",
+          "rule_count"
+        ],
+        "properties": {
+          "policy_generation": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "policy_digest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "rule_count": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 4096
+          }
+        }
+      },
+      "PolicyTestRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "policy_json",
+          "candidate_json"
+        ],
+        "properties": {
+          "policy_json": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 65536,
+            "description": "Prospective declarative candidate. It is compiled only in memory and never exposed in a response or audit record by this operation."
+          },
+          "candidate_json": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 65536,
+            "description": "Bounded fixture evaluated only in memory. Its values are never exposed in a response or audit record by this operation."
+          }
+        }
+      },
+      "PolicyTestResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "policy_generation",
+          "policy_digest",
+          "accepted",
+          "applied_rule_count"
+        ],
+        "properties": {
+          "policy_generation": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "policy_digest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "accepted": {
+            "type": "boolean"
+          },
+          "applied_rule_count": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 4096
+          }
+        }
+      },
+      "PolicyDiffRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["before_policy_json", "after_policy_json"],
+        "properties": {
+          "before_policy_json": {"type": "string", "minLength": 1, "maxLength": 65536},
+          "after_policy_json": {"type": "string", "minLength": 1, "maxLength": 65536}
+        }
+      },
+      "PolicyExplainRequest": {
+        "type":"object", "additionalProperties":false,
+        "required":["policy_json","candidate_json"],
+        "properties":{"policy_json":{"type":"string","minLength":1,"maxLength":65536},"candidate_json":{"type":"string","minLength":1,"maxLength":65536}}
+      },
+      "PolicyExplainResponse": {
+        "type":"object", "additionalProperties":false,
+        "required":["policy_generation","policy_digest","outcome","explanation"],
+        "properties":{"policy_generation":{"type":"integer","minimum":1},"policy_digest":{"type":"string","pattern":"^[0-9a-f]{64}$"},"outcome":{"type":"string","enum":["accepted","rejected"]},"explanation":{"type":"string","minLength":1,"maxLength":4096}}
+      },
+      "PolicyActivateRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["policy_json", "expected_generation", "idempotency_key"],
+        "properties": {
+          "policy_json": {"type": "string", "minLength": 1, "maxLength": 65536},
+          "expected_generation": {"type": "integer", "minimum": 1},
+          "idempotency_key": {"type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"}
+        }
+      },
+      "PolicyActivateResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["resource_generation", "policy_digest", "audit_position"],
+        "properties": {
+          "resource_generation": {"type": "integer", "minimum": 1},
+          "policy_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "audit_position": {"type": "integer", "minimum": 1}
+        }
+      },
+      "PolicyDiffResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["before_policy_generation", "before_policy_digest", "after_policy_generation", "after_policy_digest", "semantic_changes"],
+        "properties": {
+          "before_policy_generation": {"type": "integer", "minimum": 1},
+          "before_policy_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "after_policy_generation": {"type": "integer", "minimum": 1},
+          "after_policy_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "semantic_changes": {"type": "array", "maxItems": 4096, "items": {"type": "string", "enum": ["generation_changed", "rule_added", "rule_removed", "rule_predicates_changed", "rule_action_changed"]}}
+        }
+      },
+      "PolicyPreviewFailure": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "code"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "enum": [
+              "invalid_request",
+              "authentication_rejected",
               "administration_unavailable"
             ]
           }

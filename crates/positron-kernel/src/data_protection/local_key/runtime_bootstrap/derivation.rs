@@ -125,6 +125,36 @@ pub(super) fn wrapped_context(
     .map_err(map_frame)
 }
 
+pub(super) fn tenant_envelope_context(
+    instance: InstanceId,
+    tenant: TenantId,
+    key_id: [u8; 16],
+    key_epoch: u64,
+) -> Result<WrappedKeyContext, BootstrapKeyFailure> {
+    if key_id.iter().all(|byte| *byte == 0) || key_epoch == 0 {
+        return Err(BootstrapKeyFailure::InvalidInput);
+    }
+    let mut binding = Vec::with_capacity(96);
+    binding.extend_from_slice(b"positron-tenant-kek-envelope-context-v1\0");
+    binding.extend_from_slice(&instance.to_bytes());
+    binding.extend_from_slice(&tenant.to_bytes());
+    binding.extend_from_slice(&key_id);
+    binding.extend_from_slice(&key_epoch.to_be_bytes());
+    let context_digest = DataProtection::hash(&binding).map_err(map_frame)?;
+    let mut identity = Vec::with_capacity(80);
+    identity.extend_from_slice(b"positron-tenant-kek-envelope-key-id-v1\0");
+    identity.extend_from_slice(&tenant.to_bytes());
+    identity.extend_from_slice(&key_id);
+    WrappedKeyContext::system(
+        instance.to_bytes(),
+        SystemObjectKind::Catalog,
+        DataProtection::hash(&identity).map_err(map_frame)?,
+        key_epoch,
+        context_digest,
+    )
+    .map_err(map_frame)
+}
+
 pub(super) fn tenant_object_id(tenant: TenantId) -> Result<[u8; 16], BootstrapKeyFailure> {
     let mut encoding = Vec::with_capacity(48);
     encoding.extend_from_slice(b"positron-tenant-kek-identity-v1\0");

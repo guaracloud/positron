@@ -42,6 +42,24 @@ impl ApiKeyRequest {
         expected: u64,
         idempotency: String,
     ) -> Self {
+        Self::create_with_target(scope, None, expiry, expected, idempotency)
+    }
+    pub fn create_for_tenant(
+        scope: KeyScope,
+        target_tenant: String,
+        expiry: Option<u64>,
+        expected: u64,
+        idempotency: String,
+    ) -> Self {
+        Self::create_with_target(scope, Some(target_tenant), expiry, expected, idempotency)
+    }
+    fn create_with_target(
+        scope: KeyScope,
+        target_tenant: Option<String>,
+        expiry: Option<u64>,
+        expected: u64,
+        idempotency: String,
+    ) -> Self {
         Self(protobuf::ApiKeyRequest {
             action: KeyAction::Create.into(),
             scope: Some(scope.into()),
@@ -49,16 +67,30 @@ impl ApiKeyRequest {
             expires_at_unix_seconds: expiry,
             expected_generation: Some(expected),
             idempotency_key: Some(idempotency),
+            target_tenant,
         })
     }
     pub fn list() -> Self {
+        Self::list_with_target(None)
+    }
+    pub fn list_for_tenant(target_tenant: String) -> Self {
+        Self::list_with_target(Some(target_tenant))
+    }
+    fn list_with_target(target_tenant: Option<String>) -> Self {
         Self(protobuf::ApiKeyRequest {
             action: KeyAction::List.into(),
+            target_tenant,
             ..Default::default()
         })
     }
     pub fn inspect(principal: String) -> Self {
-        let mut request = Self::list();
+        Self::inspect_with_target(principal, None)
+    }
+    pub fn inspect_for_tenant(principal: String, target_tenant: String) -> Self {
+        Self::inspect_with_target(principal, Some(target_tenant))
+    }
+    fn inspect_with_target(principal: String, target_tenant: Option<String>) -> Self {
+        let mut request = Self::list_with_target(target_tenant);
         request.0.action = KeyAction::ScopeInspect.into();
         request.0.principal = Some(principal);
         request
@@ -72,11 +104,39 @@ impl ApiKeyRequest {
         if !matches!(action, KeyAction::Rotate | KeyAction::Revoke) {
             return Err(KeyWireFailure);
         }
+        Self::mutation_with_target(action, principal, None, expected, idempotency)
+    }
+    pub fn mutation_for_tenant(
+        action: KeyAction,
+        principal: String,
+        target_tenant: String,
+        expected: u64,
+        idempotency: String,
+    ) -> Result<Self, KeyWireFailure> {
+        Self::mutation_with_target(
+            action,
+            principal,
+            Some(target_tenant),
+            expected,
+            idempotency,
+        )
+    }
+    fn mutation_with_target(
+        action: KeyAction,
+        principal: String,
+        target_tenant: Option<String>,
+        expected: u64,
+        idempotency: String,
+    ) -> Result<Self, KeyWireFailure> {
+        if !matches!(action, KeyAction::Rotate | KeyAction::Revoke) {
+            return Err(KeyWireFailure);
+        }
         Ok(Self(protobuf::ApiKeyRequest {
             action: action.into(),
             principal: Some(principal),
             expected_generation: Some(expected),
             idempotency_key: Some(idempotency),
+            target_tenant,
             ..Default::default()
         }))
     }
@@ -99,6 +159,9 @@ impl ApiKeyRequest {
     }
     pub fn idempotency_key(&self) -> Option<&str> {
         self.0.idempotency_key.as_deref()
+    }
+    pub fn target_tenant(&self) -> Option<&str> {
+        self.0.target_tenant.as_deref()
     }
     pub fn encode(&self) -> Result<Vec<u8>, KeyWireFailure> {
         self.validate()?;
@@ -136,6 +199,11 @@ impl ApiKeyRequest {
             || self
                 .0
                 .principal
+                .as_ref()
+                .is_some_and(|value| !identifier(value))
+            || self
+                .0
+                .target_tenant
                 .as_ref()
                 .is_some_and(|value| !identifier(value))
             || matches!(

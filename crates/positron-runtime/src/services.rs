@@ -1,15 +1,14 @@
 use std::sync::{Arc, Mutex};
 
 use positron_governance::{
-    AuthorizedContext, CompatibilityHints, IngestPolicyServingSnapshot, PresentedCredential,
-    RequestedIntent,
+    AuthorizedContext, CompatibilityHints, Identity, PresentedCredential, RequestedIntent,
 };
 use positron_ingest::{
     AuthenticatedLokiPushRequest, AuthenticatedOtlpLogsRequest, AuthenticatedOtlpTracesRequest,
     IngestRequestOutcome, LokiPushReceiver, LokiPushRequestEncoding, TenantSchemaRegistry,
     TenantSchemaSession, reserve_log_receiver_transport, reserve_trace_receiver_transport,
 };
-use positron_kernel::TransferredResourceReservation;
+use positron_kernel::{SegmentProtectionKey, SegmentScope, TransferredResourceReservation};
 use positron_query::QueryBudget;
 
 use crate::InitializedInstance;
@@ -18,10 +17,38 @@ mod api_keys;
 mod failure;
 mod ingest;
 mod otlp;
-mod policy;
+pub(crate) mod policy;
 mod query;
 mod schema_bootstrap;
 mod schema_maintenance;
+pub(crate) mod tenant_aliases;
+pub(crate) mod tenant_lifecycle;
+pub(crate) mod tenant_quotas;
+pub(crate) mod tenant_retention;
+pub(crate) mod tenant_service;
+
+pub(super) fn tenant_segment_key(
+    instance: &InitializedInstance,
+    identity: &Identity,
+    scope: SegmentScope,
+) -> Result<SegmentProtectionKey, ServiceFailure> {
+    let envelope = identity
+        .tenant_key_envelope(scope.tenant_id())
+        .map_err(|_| ServiceFailure::KeyUnavailable)?;
+    instance
+        .key
+        .segment_key_from_tenant_envelope(instance.instance, scope, envelope)
+        .map_err(|_| ServiceFailure::KeyUnavailable)
+}
+
+pub(super) fn context_tenant(
+    context: positron_governance::AuthorizedContext,
+) -> Result<positron_domain::identity::TenantId, ServiceFailure> {
+    context
+        .tenant_attribution()
+        .map(|attribution| attribution.tenant_id())
+        .ok_or(ServiceFailure::Unauthorized)
+}
 
 pub use failure::ServiceFailure;
 #[cfg(test)]
@@ -36,11 +63,12 @@ mod tests;
 
 #[derive(Clone)]
 pub struct ServiceHandle {
-    ingest_policy: IngestPolicyServingSnapshot,
     schema_sessions: TenantSchemaRegistry,
     shutdown_schema_capacity: Arc<Mutex<Option<TransferredResourceReservation>>>,
     #[cfg(test)]
     receiver_test_backend: Arc<Mutex<Option<Arc<dyn ReceiverTestBackend>>>>,
+    #[cfg(test)]
+    ingest_policy_snapshot_test_hook: Arc<Mutex<Option<Arc<dyn IngestPolicySnapshotTestHook>>>>,
     #[cfg(test)]
     query_execution_test_hook: Arc<Mutex<Option<Arc<dyn QueryExecutionTestHook>>>>,
     // Keep the authority alive until every governed session and admission
@@ -63,6 +91,13 @@ pub(crate) trait ReceiverTestBackend: Send + Sync {
     ) -> IngestRequestOutcome {
         IngestRequestOutcome::new(Vec::new())
     }
+}
+
+/// Test-only synchronization point after a request has captured its immutable
+/// ingestion policy and before it can complete its native route.
+#[cfg(test)]
+pub(crate) trait IngestPolicySnapshotTestHook: Send + Sync {
+    fn after_policy_snapshot(&self, signal: positron_domain::routing::SignalKind);
 }
 
 /// Test-only synchronization point immediately after the ordinary query route
@@ -88,7 +123,6 @@ impl ServiceHandle {
         instance: Arc<InitializedInstance>,
         cancellation: Option<&crate::TaskCancellation>,
     ) -> Result<Self, ServiceFailure> {
-        let ingest_policy = instance.ingest_policy.serving();
         let fallback = crate::TaskCancellation::new();
         let cancellation = cancellation.unwrap_or(&fallback);
         let recovered = schema_bootstrap::recover(&instance, cancellation)?;
@@ -102,11 +136,12 @@ impl ServiceHandle {
             schema_maintenance::publish_quiescent_checkpoint(&instance, checkpoint)?;
         }
         Ok(Self {
-            ingest_policy,
             schema_sessions: recovered.registry,
             shutdown_schema_capacity: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             receiver_test_backend: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            ingest_policy_snapshot_test_hook: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             query_execution_test_hook: Arc::new(Mutex::new(None)),
             instance,
@@ -326,6 +361,34 @@ impl ServiceHandle {
             .receiver_test_backend
             .lock()
             .map_err(|_| ServiceFailure::Internal)? = Some(backend);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_ingest_policy_snapshot_test_hook(
+        &self,
+        hook: Arc<dyn IngestPolicySnapshotTestHook>,
+    ) -> Result<(), ServiceFailure> {
+        *self
+            .ingest_policy_snapshot_test_hook
+            .lock()
+            .map_err(|_| ServiceFailure::Internal)? = Some(hook);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn await_ingest_policy_snapshot_test_hook(
+        &self,
+        signal: positron_domain::routing::SignalKind,
+    ) -> Result<(), ServiceFailure> {
+        let hook = self
+            .ingest_policy_snapshot_test_hook
+            .lock()
+            .map_err(|_| ServiceFailure::Internal)?
+            .clone();
+        if let Some(hook) = hook {
+            hook.after_policy_snapshot(signal);
+        }
         Ok(())
     }
 

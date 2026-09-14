@@ -8,7 +8,8 @@ use super::super::storage::fault::CatalogFileEvent;
 use super::super::storage::{with_catalog_fault, with_catalog_fault_after};
 use super::super::{
     AuditIntent, Catalog, CatalogFailure, CatalogFailureCode, CatalogObject, CatalogProposal,
-    CatalogSecret, CatalogWrappingKey, FormatEpoch, InstanceId, TransactionId,
+    CatalogSecret, CatalogWrappingKey, FormatEpoch, InstanceId, PreparedTransactionInspection,
+    TransactionId,
 };
 #[cfg(feature = "test-support")]
 use super::super::{GovernanceFixtureObject, GovernanceFixtureTarget};
@@ -120,6 +121,236 @@ fn proposal(transaction: u8, value: u8) -> Result<CatalogProposal, CatalogFailur
         FormatEpoch::new(1)?,
         vec![CatalogObject::new(vec![value])?],
     )
+}
+
+fn proposal_at_epoch(
+    transaction: u8,
+    value: u8,
+    epoch: u32,
+) -> Result<CatalogProposal, CatalogFailure> {
+    CatalogProposal::new(
+        TransactionId::new(id(transaction))?,
+        FormatEpoch::new(epoch)?,
+        vec![CatalogObject::new(vec![value])?],
+    )
+}
+
+#[test]
+fn prepared_inspection_rejects_changed_digest_and_never_publishes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = TemporaryRoot::new()?;
+    let instance = InstanceId::new(id(39))?;
+    let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
+    let authority = establish_catalog_authority(volume)?;
+    let catalog = Catalog::open(&authority, instance, secret())?;
+    let transaction = TransactionId::new(id(40))?;
+    let digest = [0x41; 32];
+    let failure = with_catalog_fault(CatalogFileEvent::WriteMarker, || {
+        catalog.commit_prepared(
+            catalog.pin().expect("snapshot").identity(),
+            CatalogProposal::new(
+                transaction,
+                FormatEpoch::CATALOG_V1,
+                vec![CatalogObject::new(vec![7]).expect("object")],
+            )
+            .expect("proposal"),
+            AuditIntent::new(b"prepared inspection".to_vec()).expect("audit"),
+            digest,
+        )
+    })
+    .expect_err("pre-marker fault retains only a prepared proposal");
+    assert_eq!(failure.code(), CatalogFailureCode::StorageUnavailable);
+    assert_eq!(catalog.pin()?.number(), 0);
+    let wrong = catalog
+        .inspect_prepared(transaction, [0x42; 32])
+        .expect_err("a changed request digest must not inspect the proposal");
+    assert_eq!(wrong.code(), CatalogFailureCode::IdempotencyConflict);
+    assert_eq!(catalog.pin()?.number(), 0);
+    assert!(matches!(
+        catalog.inspect_prepared(transaction, digest)?,
+        PreparedTransactionInspection::Inspected(_)
+    ));
+    assert_eq!(catalog.pin()?.number(), 0);
+    Ok(())
+}
+
+#[test]
+fn prepared_inspection_refuses_an_advanced_predecessor_without_publication()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = TemporaryRoot::new()?;
+    let instance = InstanceId::new(id(43))?;
+    let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
+    let authority = establish_catalog_authority(volume)?;
+    let catalog = Catalog::open(&authority, instance, secret())?;
+    let transaction = TransactionId::new(id(44))?;
+    let digest = [0x45; 32];
+    with_catalog_fault(CatalogFileEvent::WriteMarker, || {
+        catalog.commit_prepared(
+            catalog.pin().expect("snapshot").identity(),
+            CatalogProposal::new(
+                transaction,
+                FormatEpoch::CATALOG_V1,
+                vec![CatalogObject::new(vec![8]).expect("object")],
+            )
+            .expect("proposal"),
+            AuditIntent::new(b"prepared predecessor".to_vec()).expect("audit"),
+            digest,
+        )
+    })
+    .expect_err("pre-marker fault retains a prepared proposal");
+    catalog.commit(
+        catalog.pin()?.identity(),
+        proposal(46, 9)?,
+        Some(AuditIntent::new(b"independent successor".to_vec())?),
+    )?;
+    assert_eq!(catalog.pin()?.number(), 1);
+    assert!(matches!(
+        catalog.inspect_prepared(transaction, digest)?,
+        PreparedTransactionInspection::Unavailable
+    ));
+    assert_eq!(catalog.pin()?.number(), 1);
+    Ok(())
+}
+
+#[test]
+fn prepared_inspection_refuses_a_missing_staged_object_without_publication()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = TemporaryRoot::new()?;
+    let instance = InstanceId::new(id(47))?;
+    let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
+    let authority = establish_catalog_authority(volume)?;
+    let catalog = Catalog::open(&authority, instance, secret())?;
+    let transaction = TransactionId::new(id(48))?;
+    let digest = [0x49; 32];
+    with_catalog_fault(CatalogFileEvent::WriteMarker, || {
+        catalog.commit_prepared(
+            catalog.pin().expect("snapshot").identity(),
+            CatalogProposal::new(
+                transaction,
+                FormatEpoch::CATALOG_V1,
+                vec![CatalogObject::new(vec![10]).expect("object")],
+            )
+            .expect("proposal"),
+            AuditIntent::new(b"prepared object".to_vec()).expect("audit"),
+            digest,
+        )
+    })
+    .expect_err("pre-marker fault retains a prepared proposal");
+    let object = fs::read_dir(root.0.join("catalog/objects"))?
+        .next()
+        .ok_or("prepared object")??
+        .path();
+    fs::remove_file(object)?;
+    let failure = catalog
+        .inspect_prepared(transaction, digest)
+        .expect_err("missing staged objects must fail closed");
+    assert_eq!(failure.code(), CatalogFailureCode::IntegrityCorruption);
+    assert_eq!(catalog.pin()?.number(), 0);
+    Ok(())
+}
+
+#[test]
+fn prepared_inspection_refuses_an_altered_staged_object_without_publication()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = TemporaryRoot::new()?;
+    let instance = InstanceId::new(id(50))?;
+    let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
+    let authority = establish_catalog_authority(volume)?;
+    let catalog = Catalog::open(&authority, instance, secret())?;
+    let transaction = TransactionId::new(id(51))?;
+    let digest = [0x52; 32];
+    with_catalog_fault(CatalogFileEvent::WriteMarker, || {
+        catalog.commit_prepared(
+            catalog.pin().expect("snapshot").identity(),
+            CatalogProposal::new(
+                transaction,
+                FormatEpoch::CATALOG_V1,
+                vec![CatalogObject::new(vec![11]).expect("object")],
+            )
+            .expect("proposal"),
+            AuditIntent::new(b"altered prepared object".to_vec()).expect("audit"),
+            digest,
+        )
+    })
+    .expect_err("pre-marker fault retains a prepared proposal");
+    let object = fs::read_dir(root.0.join("catalog/objects"))?
+        .next()
+        .ok_or("prepared object")??
+        .path();
+    fs::write(object, [0_u8])?;
+    let failure = catalog
+        .inspect_prepared(transaction, digest)
+        .expect_err("altered staged objects must fail closed");
+    assert_eq!(failure.code(), CatalogFailureCode::IntegrityCorruption);
+    assert_eq!(catalog.pin()?.number(), 0);
+    Ok(())
+}
+
+#[test]
+fn current_reader_recovers_a_published_catalog_epoch_two_generation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = TemporaryRoot::new()?;
+    let instance = InstanceId::new(id(30))?;
+    let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
+    let authority = establish_catalog_authority(volume)?;
+    let catalog = Catalog::open(&authority, instance, secret())?;
+
+    let committed = catalog.commit(
+        catalog.pin()?.identity(),
+        proposal_at_epoch(31, 7, 2)?,
+        Some(AuditIntent::new(b"epoch two publication".to_vec())?),
+    )?;
+    assert_eq!(
+        committed.snapshot().format_epoch(),
+        Some(FormatEpoch::new(2)?)
+    );
+    drop(catalog);
+    drop(authority);
+
+    let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
+    let authority = establish_catalog_authority(volume)?;
+    let reopened = Catalog::open(&authority, instance, secret())?;
+    assert_eq!(reopened.pin()?.format_epoch(), Some(FormatEpoch::new(2)?));
+    assert_eq!(reopened.governance_audit_records()?.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn epoch_two_pre_marker_fault_leaves_the_epoch_one_predecessor_current()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = TemporaryRoot::new()?;
+    let instance = InstanceId::new(id(32))?;
+    let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
+    let authority = establish_catalog_authority(volume)?;
+    let catalog = Catalog::open(&authority, instance, secret())?;
+
+    catalog.commit(
+        catalog.pin()?.identity(),
+        proposal(33, 1)?,
+        Some(AuditIntent::new(b"epoch one predecessor".to_vec())?),
+    )?;
+    let failure = with_catalog_fault(CatalogFileEvent::WriteMarker, || {
+        catalog.commit(
+            catalog.pin()?.identity(),
+            proposal_at_epoch(34, 2, FormatEpoch::CATALOG_V2.value())?,
+            Some(AuditIntent::new(b"epoch two migration candidate".to_vec())?),
+        )
+    })
+    .expect_err("pre-marker epoch-two publication must not become visible");
+    assert_eq!(failure.code(), CatalogFailureCode::StorageUnavailable);
+    drop(catalog);
+    drop(authority);
+
+    let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
+    let authority = establish_catalog_authority(volume)?;
+    let reopened = Catalog::open(&authority, instance, secret())?;
+    assert_eq!(reopened.pin()?.number(), 1);
+    assert_eq!(
+        reopened.pin()?.format_epoch(),
+        Some(FormatEpoch::CATALOG_V1)
+    );
+    assert_eq!(reopened.governance_audit_records()?.len(), 1);
+    Ok(())
 }
 
 #[test]

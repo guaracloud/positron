@@ -219,3 +219,57 @@ fn schema_checkpoint_audit_is_typed_tenant_bound_and_strict() {
     trailing.push(0);
     assert!(GovernanceAuditEntry::decode_fields(9, transaction, &trailing).is_err());
 }
+
+#[test]
+fn tenant_retention_audit_is_typed_redacted_and_strict() {
+    let transaction = [23; 16];
+    let mut intent = b"POSTRT01".to_vec();
+    intent.extend_from_slice(&1_725_000_002_u64.to_be_bytes());
+    intent.extend_from_slice(&transaction);
+    intent.extend_from_slice(&[24; 16]);
+    intent.extend_from_slice(&[25; 16]);
+    intent.extend_from_slice(&1_u64.to_be_bytes());
+    intent.extend_from_slice(&2_u64.to_be_bytes());
+    intent.extend_from_slice(&86_400_u64.to_be_bytes());
+    intent.extend_from_slice(&[26; 32]);
+
+    let entry = GovernanceAuditEntry::decode_fields(10, transaction, &intent).expect("entry");
+    let retention = entry
+        .as_tenant_retention_update()
+        .expect("retention update");
+    assert_eq!(entry.action(), "tenant.retention.update");
+    assert_eq!(entry.outcome(), "succeeded");
+    assert_eq!(retention.position(), 10);
+    assert_eq!(retention.actor_id().to_bytes(), [24; 16]);
+    assert_eq!(retention.tenant_id().to_bytes(), [25; 16]);
+    assert_eq!(
+        retention.expected_generation(),
+        ResourceGeneration::new(1).expect("generation")
+    );
+    assert_eq!(
+        retention.generation(),
+        ResourceGeneration::new(2).expect("generation")
+    );
+    assert_eq!(retention.idempotency_key().to_bytes(), transaction);
+    assert_eq!(retention.request_digest(), [26; 32]);
+    assert!(
+        !format!("{entry:?} {entry}").contains("86400"),
+        "the audit must not disclose the requested retention duration"
+    );
+
+    for length in [0, 7, 8, intent.len() - 1] {
+        assert!(GovernanceAuditEntry::decode_fields(10, transaction, &intent[..length]).is_err());
+    }
+    let mut zero_digest = intent.clone();
+    let digest_start = zero_digest.len() - 32;
+    zero_digest[digest_start..].fill(0);
+    assert!(GovernanceAuditEntry::decode_fields(10, transaction, &zero_digest).is_err());
+    let mut mismatched_generation = intent.clone();
+    let generation_start = 8 + 8 + 16 + 16 + 16 + 8;
+    mismatched_generation[generation_start..generation_start + 8]
+        .copy_from_slice(&1_u64.to_be_bytes());
+    assert!(GovernanceAuditEntry::decode_fields(10, transaction, &mismatched_generation).is_err());
+    let mut trailing = intent;
+    trailing.push(0);
+    assert!(GovernanceAuditEntry::decode_fields(10, transaction, &trailing).is_err());
+}
