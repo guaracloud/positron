@@ -132,7 +132,7 @@ impl TenantRetentionImpactPreview {
 pub(super) struct IngestDrainGate {
     state: Mutex<IngestDrainState>,
     changed: Condvar,
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(test)]
     transition_observer: Mutex<Option<std::sync::mpsc::Sender<()>>>,
 }
 
@@ -1147,7 +1147,7 @@ impl InitializedInstance {
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub fn install_retention_time_for_test(
         &mut self,
