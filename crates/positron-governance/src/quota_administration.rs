@@ -1,26 +1,26 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
-use positron_domain::identity::{PrincipalId, TenantId};
-use positron_kernel::{
-    AuditIntent, Catalog, CatalogFailureCode, CatalogObject, CatalogProposal, CatalogSnapshot,
-    ResourceAmounts, StorageKernelResourceAuthority, TransactionId,
-};
-use sha2::{Digest, Sha256};
+use positron_domain::identity::TenantId;
+use positron_kernel::CatalogFailureCode;
 
+use crate::tenant_quota_record::TenantQuotaState;
 use crate::{
-    AdministrativeIdempotencyKey, AuthorizedContext, Identity, ResourceGeneration,
+    AdministrativeIdempotencyKey, AuthorizedContext, ResourceGeneration,
     TenantAdministrationFailure,
-    tenant_quota_record::{TenantQuotaState, replace_tenant_quota_record, tenant_quota_state},
 };
 
-const RECEIPT_MAGIC: [u8; 8] = *b"POSQUR01";
-const AUDIT_MAGIC: [u8; 8] = *b"POSQUO01";
+#[path = "quota_administration_flow.rs"]
+mod quota_administration_flow;
+#[path = "quota_administration_publication.rs"]
+mod quota_administration_publication;
+#[path = "quota_administration_receipt.rs"]
+mod quota_administration_receipt;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TenantQuotaUpdate {
-    generation: ResourceGeneration,
-    audit_position: u64,
+    pub(super) generation: ResourceGeneration,
+    pub(super) audit_position: u64,
 }
 
 impl TenantQuotaUpdate {
@@ -40,12 +40,12 @@ pub struct TenantQuotaAdministration;
 /// One bounded tenant-quota mutation request at the Administration boundary.
 #[derive(Clone, Copy)]
 pub struct TenantQuotaUpdateRequest {
-    actor: AuthorizedContext,
-    tenant: TenantId,
-    expected: ResourceGeneration,
-    key: AdministrativeIdempotencyKey,
-    weight: u32,
-    resources: [u64; 11],
+    pub(super) actor: AuthorizedContext,
+    pub(super) tenant: TenantId,
+    pub(super) expected: ResourceGeneration,
+    pub(super) key: AdministrativeIdempotencyKey,
+    pub(super) weight: u32,
+    pub(super) resources: [u64; 11],
 }
 
 impl TenantQuotaUpdateRequest {
@@ -69,200 +69,6 @@ impl TenantQuotaUpdateRequest {
     }
 }
 
-impl TenantQuotaAdministration {
-    pub fn update(
-        catalog: &Catalog<'_>,
-        authority: &StorageKernelResourceAuthority,
-        identity: &Identity,
-        request: TenantQuotaUpdateRequest,
-    ) -> Result<TenantQuotaUpdate, TenantQuotaAdministrationFailure> {
-        let principal = identity
-            .authorize_quota_update(request.actor, request.tenant)
-            .map_err(|_| {
-                TenantQuotaAdministrationFailure::new(
-                    TenantQuotaAdministrationFailureCode::Unauthorized,
-                )
-            })?;
-        if request.weight == 0
-            || request.weight > u32::from(u16::MAX)
-            || request.resources.contains(&0)
-        {
-            return Err(TenantQuotaAdministrationFailure::new(
-                TenantQuotaAdministrationFailureCode::InvalidInput,
-            ));
-        }
-        let weight = u16::try_from(request.weight).map_err(|_| {
-            TenantQuotaAdministrationFailure::new(
-                TenantQuotaAdministrationFailureCode::InvalidInput,
-            )
-        })?;
-        authority
-            .validate_tenant_quota(weight, ResourceAmounts::new(request.resources))
-            .map_err(|_| {
-                TenantQuotaAdministrationFailure::new(
-                    TenantQuotaAdministrationFailureCode::InvalidInput,
-                )
-            })?;
-        let generation =
-            ResourceGeneration::new(request.expected.get().checked_add(1).ok_or_else(|| {
-                TenantQuotaAdministrationFailure::new(
-                    TenantQuotaAdministrationFailureCode::InvalidInput,
-                )
-            })?)
-            .map_err(|_| {
-                TenantQuotaAdministrationFailure::new(
-                    TenantQuotaAdministrationFailureCode::InvalidInput,
-                )
-            })?;
-        let request_digest = request_digest(
-            request.key,
-            principal,
-            request.tenant,
-            request.expected,
-            generation,
-            request.weight,
-            request.resources,
-        );
-        let snapshot = catalog.pin().map_err(map_catalog)?;
-        if let Some(receipt) = find_receipt(&snapshot, request.key)? {
-            if receipt.principal != principal
-                || receipt.tenant != request.tenant
-                || receipt.expected != request.expected
-                || receipt.generation != generation
-                || receipt.weight != request.weight
-                || receipt.resources != request.resources
-                || receipt.request_digest != request_digest
-            {
-                return Err(TenantQuotaAdministrationFailure::new(
-                    TenantQuotaAdministrationFailureCode::IdempotencyConflict,
-                ));
-            }
-            let current = tenant_quota_state(&snapshot, request.tenant)
-                .map_err(map_tenant_quota_record_failure)?;
-            if current.is_some_and(|current| {
-                current.generation == receipt.generation
-                    && current.weight == receipt.weight
-                    && current.resources == receipt.resources
-            }) {
-                authority
-                    .prepare_tenant_quota_update(
-                        request.tenant,
-                        weight,
-                        ResourceAmounts::new(request.resources),
-                    )
-                    .map_err(|_| {
-                        TenantQuotaAdministrationFailure::new(
-                            TenantQuotaAdministrationFailureCode::PersistenceUnavailable,
-                        )
-                    })?
-                    .publish();
-            }
-            return Ok(TenantQuotaUpdate {
-                generation,
-                audit_position: audit_position(catalog, request.key)?,
-            });
-        }
-        let mut objects = match tenant_quota_state(&snapshot, request.tenant)
-            .map_err(map_tenant_quota_record_failure)?
-        {
-            Some(current) => {
-                if current.generation != request.expected {
-                    return Err(TenantQuotaAdministrationFailure::stale(current, request));
-                }
-                replace_tenant_quota_record(
-                    &snapshot,
-                    request.tenant,
-                    TenantQuotaState {
-                        generation,
-                        weight: request.weight,
-                        resources: request.resources,
-                    },
-                )
-                .map_err(map_tenant_quota_record_failure)?
-            },
-            None => default_tenant_successor(&snapshot, request, generation)?,
-        };
-        objects.try_reserve(1).map_err(|_| {
-            TenantQuotaAdministrationFailure::new(
-                TenantQuotaAdministrationFailureCode::PersistenceUnavailable,
-            )
-        })?;
-        let semantics = QuotaSemantics {
-            key: request.key,
-            principal,
-            tenant: request.tenant,
-            expected: request.expected,
-            generation,
-            weight: request.weight,
-            resources: request.resources,
-            request_digest,
-        };
-        objects.push(CatalogObject::new(encode(RECEIPT_MAGIC, semantics)).map_err(map_catalog)?);
-        let staged = authority
-            .prepare_tenant_quota_update(
-                request.tenant,
-                weight,
-                ResourceAmounts::new(request.resources),
-            )
-            .map_err(|_| {
-                TenantQuotaAdministrationFailure::new(
-                    TenantQuotaAdministrationFailureCode::PersistenceUnavailable,
-                )
-            })?;
-        let commit = catalog
-            .commit(
-                snapshot.identity(),
-                CatalogProposal::new(
-                    TransactionId::new(request.key.to_bytes()).map_err(map_catalog)?,
-                    snapshot.format_epoch().ok_or_else(|| {
-                        TenantQuotaAdministrationFailure::new(
-                            TenantQuotaAdministrationFailureCode::PersistenceUnavailable,
-                        )
-                    })?,
-                    objects,
-                )
-                .map_err(map_catalog)?,
-                Some(AuditIntent::new(encode(AUDIT_MAGIC, semantics)).map_err(map_catalog)?),
-            )
-            .map_err(|failure| map_commit_failure(catalog, request.tenant, failure))?;
-        let audit_position = commit
-            .governance_audit_record()
-            .ok_or_else(|| {
-                TenantQuotaAdministrationFailure::new(
-                    TenantQuotaAdministrationFailureCode::PersistenceUnavailable,
-                )
-            })?
-            .position();
-        staged.publish();
-        Ok(TenantQuotaUpdate {
-            generation,
-            audit_position,
-        })
-    }
-}
-
-#[derive(Clone, Copy)]
-struct QuotaSemantics {
-    key: AdministrativeIdempotencyKey,
-    principal: PrincipalId,
-    tenant: TenantId,
-    expected: ResourceGeneration,
-    generation: ResourceGeneration,
-    weight: u32,
-    resources: [u64; 11],
-    request_digest: [u8; 32],
-}
-
-struct Receipt {
-    principal: PrincipalId,
-    tenant: TenantId,
-    expected: ResourceGeneration,
-    generation: ResourceGeneration,
-    weight: u32,
-    resources: [u64; 11],
-    request_digest: [u8; 32],
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TenantQuotaAdministrationFailureCode {
     InvalidInput,
@@ -280,21 +86,21 @@ pub struct TenantQuotaAdministrationFailure {
 }
 
 impl TenantQuotaAdministrationFailure {
-    const fn new(code: TenantQuotaAdministrationFailureCode) -> Self {
+    pub(super) const fn new(code: TenantQuotaAdministrationFailureCode) -> Self {
         Self {
             code,
             conflict: None,
         }
     }
 
-    fn stale(current: TenantQuotaState, request: TenantQuotaUpdateRequest) -> Self {
+    pub(super) fn stale(current: TenantQuotaState, request: TenantQuotaUpdateRequest) -> Self {
         Self {
             code: TenantQuotaAdministrationFailureCode::StaleResourceGeneration,
             conflict: Some(TenantQuotaGenerationConflict::between(current, request)),
         }
     }
 
-    const fn stale_generation(current: ResourceGeneration) -> Self {
+    pub(super) const fn stale_generation(current: ResourceGeneration) -> Self {
         Self {
             code: TenantQuotaAdministrationFailureCode::StaleResourceGeneration,
             conflict: Some(TenantQuotaGenerationConflict::generation_only(current)),
@@ -420,220 +226,7 @@ impl Display for TenantQuotaAdministrationFailure {
 }
 
 impl Error for TenantQuotaAdministrationFailure {}
-
-fn request_digest(
-    key: AdministrativeIdempotencyKey,
-    principal: PrincipalId,
-    tenant: TenantId,
-    expected: ResourceGeneration,
-    generation: ResourceGeneration,
-    weight: u32,
-    resources: [u64; 11],
-) -> [u8; 32] {
-    let mut hash = Sha256::new();
-    hash.update(b"positron.tenant-quota.update.request.v1\0");
-    hash.update(key.to_bytes());
-    hash.update(principal.to_bytes());
-    hash.update(tenant.to_bytes());
-    hash.update(expected.get().to_be_bytes());
-    hash.update(generation.get().to_be_bytes());
-    hash.update(weight.to_be_bytes());
-    for resource in resources {
-        hash.update(resource.to_be_bytes());
-    }
-    hash.finalize().into()
-}
-
-fn encode(magic: [u8; 8], semantics: QuotaSemantics) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(196);
-    bytes.extend_from_slice(&magic);
-    bytes.extend_from_slice(&semantics.key.to_bytes());
-    bytes.extend_from_slice(&semantics.principal.to_bytes());
-    bytes.extend_from_slice(&semantics.tenant.to_bytes());
-    bytes.extend_from_slice(&semantics.expected.get().to_be_bytes());
-    bytes.extend_from_slice(&semantics.generation.get().to_be_bytes());
-    bytes.extend_from_slice(&semantics.weight.to_be_bytes());
-    for resource in semantics.resources {
-        bytes.extend_from_slice(&resource.to_be_bytes());
-    }
-    bytes.extend_from_slice(&semantics.request_digest);
-    bytes
-}
-
-fn find_receipt(
-    snapshot: &CatalogSnapshot,
-    key: AdministrativeIdempotencyKey,
-) -> Result<Option<Receipt>, TenantQuotaAdministrationFailure> {
-    let mut found = None;
-    for identity in snapshot.object_identities() {
-        let bytes = snapshot
-            .object(identity)
-            .map_err(map_catalog)?
-            .ok_or_else(corrupt)?;
-        if !bytes.starts_with(&RECEIPT_MAGIC) {
-            continue;
-        }
-        let receipt = decode(bytes)?;
-        if bytes.get(8..24) == Some(key.to_bytes().as_slice()) && found.replace(receipt).is_some() {
-            return Err(corrupt());
-        }
-    }
-    Ok(found)
-}
-
-fn decode(bytes: &[u8]) -> Result<Receipt, TenantQuotaAdministrationFailure> {
-    if bytes.len() != 196 {
-        return Err(corrupt());
-    }
-    let array = |start| {
-        bytes
-            .get(start..start + 16)
-            .and_then(|value| value.try_into().ok())
-            .ok_or_else(corrupt)
-    };
-    let long = |start| {
-        bytes
-            .get(start..start + 8)
-            .and_then(|value| value.try_into().ok())
-            .map(u64::from_be_bytes)
-            .ok_or_else(corrupt)
-    };
-    let principal = PrincipalId::from_bytes(array(24)?).map_err(|_| corrupt())?;
-    let tenant = TenantId::from_bytes(array(40)?).map_err(|_| corrupt())?;
-    let expected = ResourceGeneration::new(long(56)?).map_err(|_| corrupt())?;
-    let generation = ResourceGeneration::new(long(64)?).map_err(|_| corrupt())?;
-    if expected.get().checked_add(1) != Some(generation.get()) {
-        return Err(corrupt());
-    }
-    let weight = bytes
-        .get(72..76)
-        .and_then(|value| value.try_into().ok())
-        .map(u32::from_be_bytes)
-        .filter(|value| *value != 0 && *value <= u32::from(u16::MAX))
-        .ok_or_else(corrupt)?;
-    let mut resources = [0_u64; 11];
-    for (index, resource) in resources.iter_mut().enumerate() {
-        let start = 76_usize
-            .checked_add(index.checked_mul(8).ok_or_else(corrupt)?)
-            .ok_or_else(corrupt)?;
-        *resource = long(start)?;
-    }
-    if resources.contains(&0) {
-        return Err(corrupt());
-    }
-    let request_digest = bytes
-        .get(164..196)
-        .and_then(|value| value.try_into().ok())
-        .filter(|value: &[u8; 32]| !value.iter().all(|byte| *byte == 0))
-        .ok_or_else(corrupt)?;
-    Ok(Receipt {
-        principal,
-        tenant,
-        expected,
-        generation,
-        weight,
-        resources,
-        request_digest,
-    })
-}
-
-fn default_tenant_successor(
-    snapshot: &CatalogSnapshot,
-    request: TenantQuotaUpdateRequest,
-    generation: ResourceGeneration,
-) -> Result<Vec<CatalogObject>, TenantQuotaAdministrationFailure> {
-    let (governance_id, governance) = snapshot.governance_object().map_err(map_catalog)?;
-    if governance.tenant() != request.tenant {
-        return Err(TenantQuotaAdministrationFailure::new(
-            TenantQuotaAdministrationFailureCode::Unauthorized,
-        ));
-    }
-    if governance.quota_generation() != request.expected.get() {
-        return Err(TenantQuotaAdministrationFailure::stale(
-            TenantQuotaState {
-                generation: ResourceGeneration::new(governance.quota_generation())
-                    .map_err(|_| corrupt())?,
-                weight: governance.quota_weight(),
-                resources: governance.quota_resources(),
-            },
-            request,
-        ));
-    }
-    let mut objects = retained_objects(snapshot, governance_id)?;
-    let successor = governance
-        .with_quota(generation.get(), request.weight, request.resources)
-        .map_err(map_catalog)?;
-    objects.try_reserve(1).map_err(|_| {
-        TenantQuotaAdministrationFailure::new(
-            TenantQuotaAdministrationFailureCode::PersistenceUnavailable,
-        )
-    })?;
-    objects.push(CatalogObject::new(successor).map_err(map_catalog)?);
-    Ok(objects)
-}
-
-fn retained_objects(
-    snapshot: &CatalogSnapshot,
-    governance: positron_kernel::CatalogObjectId,
-) -> Result<Vec<CatalogObject>, TenantQuotaAdministrationFailure> {
-    let mut objects = Vec::new();
-    for identity in snapshot.object_identities() {
-        if identity == governance {
-            continue;
-        }
-        let bytes = snapshot
-            .object(identity)
-            .map_err(map_catalog)?
-            .ok_or_else(corrupt)?;
-        objects.push(CatalogObject::new(bytes.to_vec()).map_err(map_catalog)?);
-    }
-    Ok(objects)
-}
-
-fn audit_position(
-    catalog: &Catalog<'_>,
-    key: AdministrativeIdempotencyKey,
-) -> Result<u64, TenantQuotaAdministrationFailure> {
-    let transaction = TransactionId::new(key.to_bytes()).map_err(map_catalog)?;
-    catalog
-        .governance_audit_records()
-        .map_err(map_catalog)?
-        .into_iter()
-        .find(|record| record.transaction() == transaction)
-        .map(|record| record.position())
-        .ok_or_else(corrupt)
-}
-
-fn map_commit_failure(
-    catalog: &Catalog<'_>,
-    tenant: TenantId,
-    failure: positron_kernel::CatalogFailure,
-) -> TenantQuotaAdministrationFailure {
-    if failure.code() != CatalogFailureCode::StaleGeneration {
-        return map_catalog(failure);
-    }
-    let current =
-        catalog.pin().map_err(map_catalog).and_then(|snapshot| {
-            match tenant_quota_state(&snapshot, tenant).map_err(map_tenant_quota_record_failure)? {
-                Some(state) => Ok(state.generation),
-                None => {
-                    let (_, governance) = snapshot.governance_object().map_err(map_catalog)?;
-                    if governance.tenant() != tenant {
-                        return Err(TenantQuotaAdministrationFailure::new(
-                            TenantQuotaAdministrationFailureCode::Unauthorized,
-                        ));
-                    }
-                    ResourceGeneration::new(governance.quota_generation()).map_err(|_| corrupt())
-                },
-            }
-        });
-    match current {
-        Ok(generation) => TenantQuotaAdministrationFailure::stale_generation(generation),
-        Err(failure) => failure,
-    }
-}
-
-fn map_tenant_quota_record_failure(
+pub(super) fn map_tenant_quota_record_failure(
     failure: TenantAdministrationFailure,
 ) -> TenantQuotaAdministrationFailure {
     let code = match failure {
@@ -651,11 +244,13 @@ fn map_tenant_quota_record_failure(
     TenantQuotaAdministrationFailure::new(code)
 }
 
-fn corrupt() -> TenantQuotaAdministrationFailure {
+pub(super) fn corrupt() -> TenantQuotaAdministrationFailure {
     TenantQuotaAdministrationFailure::new(TenantQuotaAdministrationFailureCode::CorruptState)
 }
 
-fn map_catalog(failure: positron_kernel::CatalogFailure) -> TenantQuotaAdministrationFailure {
+pub(super) fn map_catalog(
+    failure: positron_kernel::CatalogFailure,
+) -> TenantQuotaAdministrationFailure {
     let code = match failure.code() {
         CatalogFailureCode::IdempotencyConflict => {
             TenantQuotaAdministrationFailureCode::IdempotencyConflict
@@ -672,6 +267,7 @@ fn map_catalog(failure: positron_kernel::CatalogFailure) -> TenantQuotaAdministr
 mod tests {
     use positron_domain::identity::{PrincipalId, TenantId};
 
+    use super::quota_administration_receipt::{QuotaSemantics, RECEIPT_MAGIC, decode, encode};
     use super::*;
 
     #[test]
