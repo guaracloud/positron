@@ -185,23 +185,6 @@ impl InitializedInstance {
         {
             return Ok(replay);
         }
-        let deadline = TenantDrainRegistry::lifecycle_deadline()?;
-        let _topology = self.tenant_drains.begin_tenant_creation_before(deadline)?;
-        let secret = self
-            .key
-            .catalog_secret(self.instance)
-            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
-        let preflight = Catalog::read_current_view(&self._authority, self.instance, secret)
-            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
-        if let Some(replay) = positron_governance::TenantAdministration::replay_from_view(
-            &preflight,
-            self.administrator,
-            request.clone(),
-        )
-        .map_err(map_tenant_administration_failure)?
-        {
-            return Ok(replay);
-        }
         let secret = self
             .key
             .catalog_secret(self.instance)

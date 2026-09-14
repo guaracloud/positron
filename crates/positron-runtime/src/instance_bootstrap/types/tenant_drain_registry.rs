@@ -11,17 +11,6 @@ use super::*;
 pub(in crate::instance_bootstrap) struct TenantDrainRegistry {
     maximum: usize,
     entries: Mutex<Vec<TenantDrainEntry>>,
-    topology: TopologyBarrier,
-}
-
-struct TopologyBarrier {
-    state: Mutex<TopologyBarrierState>,
-    changed: Condvar,
-}
-
-struct TopologyBarrierState {
-    migration: bool,
-    creations: u16,
 }
 
 struct TenantDrainEntry {
@@ -36,14 +25,6 @@ pub(in crate::instance_bootstrap) struct TenantDrainEnrollment<'registry> {
     registry: &'registry TenantDrainRegistry,
     tenant: TenantId,
     activated: bool,
-}
-
-pub(super) struct MigrationTopologyPermit<'registry> {
-    registry: &'registry TenantDrainRegistry,
-}
-
-pub(super) struct TenantCreationTopologyPermit<'registry> {
-    registry: &'registry TenantDrainRegistry,
 }
 
 impl TenantDrainRegistry {
@@ -81,67 +62,7 @@ impl TenantDrainRegistry {
         Ok(Self {
             maximum,
             entries: Mutex::new(entries),
-            topology: TopologyBarrier {
-                state: Mutex::new(TopologyBarrierState {
-                    migration: false,
-                    creations: 0,
-                }),
-                changed: Condvar::new(),
-            },
         })
-    }
-
-    pub(super) fn lifecycle_deadline() -> Result<Instant, BootstrapFailure> {
-        Instant::now()
-            .checked_add(LIFECYCLE_DRAIN_TIMEOUT)
-            .ok_or_else(|| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))
-    }
-
-    pub(super) fn begin_migration_before(
-        &self,
-        deadline: Instant,
-    ) -> Result<MigrationTopologyPermit<'_>, BootstrapFailure> {
-        let mut state = self
-            .topology
-            .state
-            .lock()
-            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
-        while state.migration || state.creations != 0 {
-            let (next, timed_out) = wait_for_topology(&self.topology.changed, state, deadline)?;
-            if timed_out {
-                return Err(BootstrapFailure::new(
-                    BootstrapFailureCode::ResourceUnavailable,
-                ));
-            }
-            state = next;
-        }
-        state.migration = true;
-        Ok(MigrationTopologyPermit { registry: self })
-    }
-
-    pub(super) fn begin_tenant_creation_before(
-        &self,
-        deadline: Instant,
-    ) -> Result<TenantCreationTopologyPermit<'_>, BootstrapFailure> {
-        let mut state = self
-            .topology
-            .state
-            .lock()
-            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
-        while state.migration {
-            let (next, timed_out) = wait_for_topology(&self.topology.changed, state, deadline)?;
-            if timed_out {
-                return Err(BootstrapFailure::new(
-                    BootstrapFailureCode::ResourceUnavailable,
-                ));
-            }
-            state = next;
-        }
-        state.creations = state
-            .creations
-            .checked_add(1)
-            .ok_or_else(|| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
-        Ok(TenantCreationTopologyPermit { registry: self })
     }
 
     fn active_entry(
@@ -208,9 +129,11 @@ impl TenantDrainRegistry {
 
     /// Closes all native data admission from one fixed membership snapshot,
     /// then waits for the already admitted work with one absolute deadline.
-    #[cfg(test)]
-    fn close_all_and_drain(&self) -> Result<TenantDrainPermit, BootstrapFailure> {
-        self.close_all_and_drain_before(Self::lifecycle_deadline()?)
+    pub(super) fn close_all_and_drain(&self) -> Result<TenantDrainPermit, BootstrapFailure> {
+        let deadline = Instant::now()
+            .checked_add(LIFECYCLE_DRAIN_TIMEOUT)
+            .ok_or_else(|| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
+        self.close_all_and_drain_before(deadline)
     }
 
     pub(super) fn close_all_and_drain_before(
@@ -309,42 +232,6 @@ impl TenantDrainRegistry {
         self.active_entry(tenant)?
             .1
             .install_transition_observer(observer)
-    }
-}
-
-fn wait_for_topology<'registry>(
-    changed: &'registry Condvar,
-    state: std::sync::MutexGuard<'registry, TopologyBarrierState>,
-    deadline: Instant,
-) -> Result<(std::sync::MutexGuard<'registry, TopologyBarrierState>, bool), BootstrapFailure> {
-    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-        return Ok((state, true));
-    };
-    let (state, timed_out) = changed
-        .wait_timeout(state, remaining)
-        .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
-    Ok((state, timed_out.timed_out()))
-}
-
-impl Drop for MigrationTopologyPermit<'_> {
-    fn drop(&mut self) {
-        let mut state = match self.registry.topology.state.lock() {
-            Ok(state) => state,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        state.migration = false;
-        self.registry.topology.changed.notify_all();
-    }
-}
-
-impl Drop for TenantCreationTopologyPermit<'_> {
-    fn drop(&mut self) {
-        let mut state = match self.registry.topology.state.lock() {
-            Ok(state) => state,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        state.creations = state.creations.saturating_sub(1);
-        self.registry.topology.changed.notify_all();
     }
 }
 
@@ -467,53 +354,5 @@ mod tests {
                     .expect("query reopens"),
             );
         }
-    }
-
-    #[test]
-    fn migration_topology_barrier_refuses_creation_until_publication_permit_drops() {
-        let tenant = TenantId::from_bytes([3; 16]).expect("tenant");
-        let registry = TenantDrainRegistry::establish(&[tenant], 2).expect("registry");
-        let deadline = Instant::now()
-            .checked_add(LIFECYCLE_DRAIN_TIMEOUT)
-            .expect("deadline");
-        let migration = registry
-            .begin_migration_before(deadline)
-            .expect("migration barrier");
-
-        assert!(
-            registry
-                .begin_tenant_creation_before(Instant::now())
-                .is_err(),
-            "creation cannot enter a migration topology interval"
-        );
-        drop(migration);
-        drop(
-            registry
-                .begin_tenant_creation_before(deadline)
-                .expect("creation proceeds after migration publication"),
-        );
-    }
-
-    #[test]
-    fn creation_topology_barrier_is_included_before_migration_snapshot() {
-        let tenant = TenantId::from_bytes([4; 16]).expect("tenant");
-        let registry = TenantDrainRegistry::establish(&[tenant], 2).expect("registry");
-        let deadline = Instant::now()
-            .checked_add(LIFECYCLE_DRAIN_TIMEOUT)
-            .expect("deadline");
-        let creation = registry
-            .begin_tenant_creation_before(deadline)
-            .expect("creation barrier");
-
-        assert!(
-            registry.begin_migration_before(Instant::now()).is_err(),
-            "migration cannot snapshot while a tenant enrollment is pending"
-        );
-        drop(creation);
-        drop(
-            registry
-                .begin_migration_before(deadline)
-                .expect("migration proceeds after enrollment completes"),
-        );
     }
 }

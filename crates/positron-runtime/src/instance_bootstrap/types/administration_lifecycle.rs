@@ -23,13 +23,11 @@ impl InitializedInstance {
         if let Some(hook) = catalog_migration_preflight_hook {
             hook();
         }
-        let deadline = TenantDrainRegistry::lifecycle_deadline()?;
-        let _topology = self.tenant_drains.begin_migration_before(deadline)?;
+        let _drain = self.tenant_drains.close_all_and_drain()?;
         let preflight = self.catalog_migration_preflight(actor, idempotency)?;
         if let Some(replay) = preflight {
             return Ok(replay);
         }
-        let _drain = self.tenant_drains.close_all_and_drain_before(deadline)?;
         let secret = self
             .key
             .catalog_secret(self.instance)
