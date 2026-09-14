@@ -79,6 +79,20 @@ pub(super) fn recover(
         generation = predecessor;
     }
     chain.reverse();
+    let latest_record = chain
+        .last()
+        .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::IntegrityCorruption))?;
+    // The anchor lives in the newest authenticated Catalog snapshot. Verify it
+    // before deciding whether an expired audit prefix may be unavailable.
+    // Commit records remain complete and authenticated; the signed anchor is
+    // the only authority that can replace re-reading the prefix audit frames.
+    let current = load_snapshot(storage, secret, instance, latest_record)?;
+    let retained_anchor = audit_retention_anchor(&current, instance, &chain)?;
+    let missing_retained_prefix = retained_anchor
+        .as_ref()
+        .map(|anchor| retained_prefix_is_absent(storage, &chain, anchor))
+        .transpose()?
+        .unwrap_or(false);
     let mut predecessor_generation = CatalogGenerationId::ORIGIN;
     let mut predecessor_number = 0_u64;
     let mut predecessor_audit = AuditFrontier::ORIGIN;
@@ -89,45 +103,57 @@ pub(super) fn recover(
         if record.predecessor != predecessor_generation || record.number != predecessor_number + 1 {
             return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
         }
+        let retained_prefix = missing_retained_prefix
+            && retained_anchor
+                .as_ref()
+                .is_some_and(|anchor| record.audit_frontier.position <= anchor.position());
         let visible_audit = if record.audit_frontier == predecessor_audit {
             None
         } else {
             if record.audit_frontier.position != predecessor_audit.position + 1 {
                 return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
             }
-            let encoded = storage.read_audit(
-                secret,
-                instance,
-                record.audit_frontier.position,
-                record.audit_frontier.hash,
-            )?;
-            retained_history_bytes = reserve_history(
-                retained_history_bytes,
-                retained_artifact_bytes(encoded.len())?,
-                highest_number,
-            )?;
-            let decoded = decode_audit(&encoded)?;
-            if decoded.position != record.audit_frontier.position
-                || decoded.hash != record.audit_frontier.hash
-                || decoded.predecessor_hash != predecessor_audit.hash
-                || decoded.transaction != record.transaction
-            {
-                return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
+            if retained_prefix {
+                // The authenticated anchor commits to this exact boundary.
+                // Prefix records are intentionally absent from memory and may
+                // already be physically reclaimed by a later lifecycle step.
+                None
+            } else {
+                let encoded = storage.read_audit(
+                    secret,
+                    instance,
+                    record.audit_frontier.position,
+                    record.audit_frontier.hash,
+                )?;
+                retained_history_bytes = reserve_history(
+                    retained_history_bytes,
+                    retained_artifact_bytes(encoded.len())?,
+                    highest_number,
+                )?;
+                let decoded = decode_audit(&encoded)?;
+                if decoded.position != record.audit_frontier.position
+                    || decoded.hash != record.audit_frontier.hash
+                    || decoded.predecessor_hash != predecessor_audit.hash
+                    || decoded.transaction != record.transaction
+                {
+                    return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
+                }
+                audit_bytes = audit_bytes
+                    .checked_add(decoded.intent.len())
+                    .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?;
+                if audit_bytes > MAX_RECOVERED_AUDIT_BYTES {
+                    return Err(CatalogFailure::new(CatalogFailureCode::LimitExceeded));
+                }
+                audit.push(decoded.clone());
+                Some(decoded)
             }
-            audit_bytes = audit_bytes
-                .checked_add(decoded.intent.len())
-                .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?;
-            if audit_bytes > MAX_RECOVERED_AUDIT_BYTES {
-                return Err(CatalogFailure::new(CatalogFailureCode::LimitExceeded));
-            }
-            audit.push(decoded.clone());
-            Some(decoded)
         };
-        if transaction_digest(
-            record.format_epoch,
-            &record.objects,
-            visible_audit.as_ref().map(|entry| entry.intent()),
-        )? != record.transaction_digest
+        if !retained_prefix
+            && transaction_digest(
+                record.format_epoch,
+                &record.objects,
+                visible_audit.as_ref().map(|entry| entry.intent()),
+            )? != record.transaction_digest
         {
             return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
         }
@@ -151,12 +177,13 @@ pub(super) fn recover(
             },
         }
     }
-    let latest = transactions
-        .values()
-        .find(|outcome| outcome.record.generation == highest_generation)
-        .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::IntegrityCorruption))?;
-    let current = load_snapshot(storage, secret, instance, &latest.record)?;
-    let audit_checkpoint = storage.latest_audit_checkpoint(secret, instance, &audit)?;
+    let audit_checkpoint = if retained_anchor.is_some() {
+        // Checkpoints address the complete legacy vector. A retained suffix
+        // has its own signed boundary and cannot be indexed as that vector.
+        None
+    } else {
+        storage.latest_audit_checkpoint(secret, instance, &audit)?
+    };
     Ok(CatalogState {
         current,
         audit,
@@ -164,6 +191,51 @@ pub(super) fn recover(
         transactions,
         retained_history_bytes,
     })
+}
+
+fn audit_retention_anchor(
+    current: &CatalogSnapshot,
+    instance: InstanceId,
+    chain: &[CommitRecord],
+) -> Result<Option<super::AuditRetentionAnchor>, CatalogFailure> {
+    let Some(anchor) = super::audit_checkpoint::retention_anchor(current)? else {
+        return Ok(None);
+    };
+    let trust = super::audit_checkpoint::retention_trust(current, instance)?;
+    anchor.verify(trust)?;
+    if anchor.instance() != instance
+        || !chain.iter().any(|record| {
+            record.audit_frontier.position == anchor.position()
+                && record.audit_frontier.hash == anchor.record_hash()
+        })
+    {
+        return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
+    }
+    Ok(Some(anchor))
+}
+
+fn retained_prefix_is_absent(
+    storage: &CatalogStorage,
+    chain: &[CommitRecord],
+    anchor: &super::AuditRetentionAnchor,
+) -> Result<bool, CatalogFailure> {
+    let mut previous = AuditFrontier::ORIGIN;
+    let mut present = None;
+    for record in chain {
+        if record.audit_frontier != previous && record.audit_frontier.position <= anchor.position()
+        {
+            let frame_present =
+                storage.audit_exists(record.audit_frontier.position, record.audit_frontier.hash)?;
+            if present
+                .replace(frame_present)
+                .is_some_and(|expected| expected != frame_present)
+            {
+                return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
+            }
+        }
+        previous = record.audit_frontier;
+    }
+    Ok(present == Some(false))
 }
 
 pub(super) fn load_snapshot(

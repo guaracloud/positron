@@ -8,9 +8,10 @@ use std::thread;
 
 use positron_kernel::{
     AdmissionFailureCode, AuditCheckpointSigner, AuditIntent, Catalog, CatalogFailureCode,
-    CatalogObject, CatalogProposal, CatalogSecret, CatalogWrappingKey, FormatEpoch, InstanceId,
-    MountQualification, PrimaryDataVolume, RecoveryWorkClaim, RecoveryWorkKind, ResourceDimension,
-    TransactionId,
+    CatalogObject, CatalogProposal, CatalogSecret, CatalogWrappingKey, FormatEpoch,
+    GovernanceFixtureObject, GovernanceFixtureTarget, InstanceId, MountQualification,
+    PrimaryDataVolume, RecoveryWorkClaim, RecoveryWorkKind, ResourceDimension,
+    SystemAuditRetentionPolicy, TransactionId,
 };
 
 use super::support::{catalog_recovery_claim, establish_catalog_authority};
@@ -293,6 +294,304 @@ fn signed_audit_checkpoint_binds_the_visible_chain_frontier() -> Result<(), Box<
     assert_eq!(view.latest_audit_checkpoint()?.as_ref(), Some(&checkpoint));
     view.verify_audit_chain(public_key, Some(&checkpoint))?;
     Ok(())
+}
+
+#[test]
+fn signed_retention_anchor_authorizes_only_its_contiguous_audit_suffix()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_catalog_authority(volume)?;
+    let instance = InstanceId::new([0x79; 16])?;
+    let catalog = Catalog::open(
+        &authority,
+        instance,
+        CatalogSecret::from_owned(Box::new([0x63; 32]), Box::new([0xd3; 32])),
+    )?;
+    let signer = AuditCheckpointSigner::from_seed(Box::new([0x39; 32]))?;
+    catalog.install_governance_fixture(&governance_fixture(
+        instance,
+        signer.public_key(),
+        [0x95; 32],
+        7,
+    )?)?;
+    let basis = catalog.pin()?;
+    catalog.commit(
+        basis.identity(),
+        CatalogProposal::new(
+            TransactionId::new([0x50; 16])?,
+            FormatEpoch::CATALOG_V1,
+            catalog_objects_with(
+                &basis,
+                SystemAuditRetentionPolicy::new(instance, 7)?.into_catalog_object()?,
+            )?,
+        )?,
+        None,
+    )?;
+
+    for (transaction, action) in [
+        (51, b"action=one".as_slice()),
+        (52, b"action=two"),
+        (53, b"action=three"),
+    ] {
+        let basis = catalog.pin()?;
+        catalog.commit(
+            basis.identity(),
+            CatalogProposal::new(
+                TransactionId::new([transaction; 16])?,
+                FormatEpoch::CATALOG_V1,
+                catalog_objects_with(&basis, CatalogObject::new(vec![transaction])?)?,
+            )?,
+            Some(AuditIntent::new(action.to_vec())?),
+        )?;
+    }
+    let records = catalog.governance_audit_records()?;
+    let unanchored_view = Catalog::read_current_view(
+        &authority,
+        instance,
+        CatalogSecret::from_owned(Box::new([0x63; 32]), Box::new([0xd3; 32])),
+    )?;
+    assert!(
+        unanchored_view
+            .verify_retained_audit_suffix(&records[2..])
+            .is_err()
+    );
+    let other_signer = AuditCheckpointSigner::from_seed(Box::new([0x49; 32]))?;
+    let failure = catalog
+        .publish_audit_retention_anchor(TransactionId::new([0x55; 16])?, &other_signer, &records[1])
+        .expect_err("a signer outside the authenticated integrity-key history must be rejected");
+    assert_eq!(failure.code(), CatalogFailureCode::AuthenticationFailed);
+    let anchor = catalog.publish_audit_retention_anchor(
+        TransactionId::new([0x56; 16])?,
+        &signer,
+        &records[1],
+    )?;
+
+    let view = Catalog::read_current_view(
+        &authority,
+        instance,
+        CatalogSecret::from_owned(Box::new([0x63; 32]), Box::new([0xd3; 32])),
+    )?;
+    assert_eq!(view.audit_retention_anchor(), Some(&anchor));
+    view.verify_retained_audit_suffix(&records[2..])?;
+    assert!(view.verify_retained_audit_suffix(&records[1..]).is_err());
+    assert!(view.verify_retained_audit_suffix(&[]).is_err());
+
+    let legacy_view = Catalog::read_current_view(
+        &authority,
+        instance,
+        CatalogSecret::from_owned(Box::new([0x63; 32]), Box::new([0xd3; 32])),
+    )?;
+    legacy_view.verify_audit_chain(signer.public_key(), None)?;
+
+    catalog.replace_governance_fixture(&governance_fixture(
+        instance,
+        signer.public_key(),
+        [0x95; 32],
+        8,
+    )?)?;
+    let view = Catalog::read_current_view(
+        &authority,
+        instance,
+        CatalogSecret::from_owned(Box::new([0x63; 32]), Box::new([0xd3; 32])),
+    )?;
+    view.verify_retained_audit_suffix(&records[2..])?;
+
+    let successor = catalog.publish_system_audit_retention_policy(
+        TransactionId::new([0x57; 16])?,
+        &signer,
+        SystemAuditRetentionPolicy::new(instance, 8)?,
+        &records[1],
+        AuditIntent::new(b"action=update-system-audit-retention".to_vec())?,
+    )?;
+    assert_eq!(successor.system_policy_generation(), 8);
+    let records = catalog.governance_audit_records()?;
+    let view = Catalog::read_current_view(
+        &authority,
+        instance,
+        CatalogSecret::from_owned(Box::new([0x63; 32]), Box::new([0xd3; 32])),
+    )?;
+    assert_eq!(view.audit_retention_anchor(), Some(&successor));
+    view.verify_retained_audit_suffix(&records[2..])?;
+    let wrong_instance = catalog
+        .publish_system_audit_retention_policy(
+            TransactionId::new([0x59; 16])?,
+            &signer,
+            SystemAuditRetentionPolicy::new(InstanceId::new([0x78; 16])?, 9)?,
+            &records[2],
+            AuditIntent::new(b"action=invalid-instance".to_vec())?,
+        )
+        .expect_err("an anchor policy for another instance must be rejected");
+    assert_eq!(
+        wrong_instance.code(),
+        CatalogFailureCode::IntegrityCorruption
+    );
+
+    drop(view);
+    drop(unanchored_view);
+    drop(legacy_view);
+    drop(catalog);
+    drop(authority);
+    let mut expired_frames = Vec::new();
+    for position in [1_u64, 2] {
+        let prefix = format!("{position:020}-");
+        let frame = fs::read_dir(root.path().join("catalog/governance-audit"))?
+            .find_map(|entry| {
+                let entry = entry.ok()?;
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&prefix)
+                    .then_some(entry.path())
+            })
+            .ok_or("published audit frame")?;
+        expired_frames.push(frame);
+    }
+    let first = expired_frames.first().ok_or("first expired audit frame")?;
+    fs::remove_file(first)?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_catalog_authority(volume)?;
+    let failure = Catalog::open(
+        &authority,
+        instance,
+        CatalogSecret::from_owned(Box::new([0x63; 32]), Box::new([0xd3; 32])),
+    )
+    .expect_err("a partially missing anchored prefix must fence recovery");
+    assert_eq!(failure.code(), CatalogFailureCode::IntegrityCorruption);
+    drop(authority);
+    for frame in expired_frames.iter().skip(1) {
+        fs::remove_file(frame)?;
+    }
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_catalog_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        instance,
+        CatalogSecret::from_owned(Box::new([0x63; 32]), Box::new([0xd3; 32])),
+    )?;
+    let retained = catalog.governance_audit_records()?;
+    assert_eq!(retained, records[2..]);
+    let view = Catalog::read_current_view(
+        &authority,
+        instance,
+        CatalogSecret::from_owned(Box::new([0x63; 32]), Box::new([0xd3; 32])),
+    )?;
+    view.verify_retained_audit_suffix(&retained)?;
+
+    // A policy object written outside the atomic policy-and-anchor transition
+    // becomes incompatible with the previous signature and fences recovery.
+    replace_system_audit_retention_policy(&catalog, instance, 9, 0x58)?;
+    let failure = match Catalog::read_current_view(
+        &authority,
+        instance,
+        CatalogSecret::from_owned(Box::new([0x63; 32]), Box::new([0xd3; 32])),
+    ) {
+        Ok(_) => {
+            return Err("recovery accepted an unpaired system audit policy update".into());
+        },
+        Err(failure) => failure,
+    };
+    assert_eq!(failure.code(), CatalogFailureCode::AuthenticationFailed);
+    Ok(())
+}
+
+fn replace_system_audit_retention_policy(
+    catalog: &Catalog<'_>,
+    instance: InstanceId,
+    generation: u64,
+    transaction: u8,
+) -> Result<(), Box<dyn Error>> {
+    let basis = catalog.pin()?;
+    let mut objects = Vec::new();
+    for identity in basis.object_identities() {
+        let object = basis.object(identity)?.ok_or("catalog object")?;
+        if !object.starts_with(b"POSAUP01") {
+            objects.push(CatalogObject::new(object.to_vec())?);
+        }
+    }
+    objects.push(SystemAuditRetentionPolicy::new(instance, generation)?.into_catalog_object()?);
+    catalog.commit(
+        basis.identity(),
+        CatalogProposal::new(
+            TransactionId::new([transaction; 16])?,
+            FormatEpoch::CATALOG_V1,
+            objects,
+        )?,
+        None,
+    )?;
+    Ok(())
+}
+
+fn catalog_objects_with(
+    snapshot: &positron_kernel::CatalogSnapshot,
+    appended: CatalogObject,
+) -> Result<Vec<CatalogObject>, Box<dyn Error>> {
+    let mut objects = Vec::new();
+    for identity in snapshot.object_identities() {
+        let object = snapshot.object(identity)?.ok_or("catalog object")?;
+        objects.push(CatalogObject::new(object.to_vec())?);
+    }
+    objects.push(appended);
+    Ok(objects)
+}
+
+fn governance_fixture(
+    instance: InstanceId,
+    integrity_public_key: [u8; 32],
+    integrity_key_fingerprint: [u8; 32],
+    retention_generation: u64,
+) -> Result<GovernanceFixtureObject, Box<dyn Error>> {
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(b"POSGOV08");
+    encoded.extend_from_slice(&instance.to_bytes());
+    encoded.extend_from_slice(&[2; 16]);
+    encoded.push(7);
+    encoded.extend_from_slice(b"default");
+    encoded.push(1);
+    encoded.push(14);
+    encoded.extend_from_slice(b"trace-external");
+    encoded.push(7);
+    encoded.extend_from_slice(b"Default");
+    encoded.extend_from_slice(&[3; 16]);
+    encoded.extend_from_slice(&[4; 32]);
+    encoded.extend_from_slice(&[5; 32]);
+    for (principal, salt, hash) in [([6; 16], [7; 32], [8; 32]), ([9; 16], [10; 32], [11; 32])] {
+        encoded.extend_from_slice(&principal);
+        encoded.extend_from_slice(&salt);
+        encoded.extend_from_slice(&hash);
+    }
+    encoded.extend_from_slice(&integrity_public_key);
+    encoded.extend_from_slice(&integrity_key_fingerprint);
+    encoded.extend_from_slice(&2_u16.to_be_bytes());
+    encoded.extend_from_slice(&[14; 2]);
+    encoded.extend_from_slice(&2_u16.to_be_bytes());
+    encoded.extend_from_slice(&[15; 2]);
+    encoded.extend_from_slice(&86_400_u64.to_be_bytes());
+    encoded.extend_from_slice(&1_u64.to_be_bytes());
+    encoded.extend_from_slice(&1_u32.to_be_bytes());
+    for _ in 0..11 {
+        encoded.extend_from_slice(&10_u64.to_be_bytes());
+    }
+    encoded.extend_from_slice(&[1, 4, 0, 1, 1]);
+    encoded.extend_from_slice(&1_u64.to_be_bytes());
+    encoded.extend_from_slice(&1_u64.to_be_bytes());
+    encoded.extend_from_slice(&retention_generation.to_be_bytes());
+    encoded.extend_from_slice(&1_u64.to_be_bytes());
+    encoded.extend_from_slice(&1_u64.to_be_bytes());
+    encoded.extend_from_slice(&3_u16.to_be_bytes());
+    for (principal, scope, salt, hash) in [
+        ([3; 16], 4_u8, [4; 32], [5; 32]),
+        ([6; 16], 1, [7; 32], [8; 32]),
+        ([9; 16], 2, [10; 32], [11; 32]),
+    ] {
+        encoded.extend_from_slice(&principal);
+        encoded.push(scope);
+        encoded.push(1);
+        encoded.extend_from_slice(&0_u64.to_be_bytes());
+        encoded.extend_from_slice(&salt);
+        encoded.extend_from_slice(&hash);
+    }
+    Ok(GovernanceFixtureObject::from_bytes(&encoded)?)
 }
 
 #[test]

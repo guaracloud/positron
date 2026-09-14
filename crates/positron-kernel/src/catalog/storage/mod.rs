@@ -584,6 +584,17 @@ impl CatalogStorage {
         )
     }
 
+    /// Returns whether the exact named audit frame is present. Recovery uses
+    /// this only after verifying a retention anchor, so a missing expired
+    /// prefix can be distinguished from a present-but-tampered frame.
+    pub(super) fn audit_exists(
+        &self,
+        position: u64,
+        hash: [u8; 32],
+    ) -> Result<bool, CatalogFailure> {
+        entry_exists(&self.audit, &audit_name(position, hash))
+    }
+
     pub(super) fn publish_audit_checkpoint(
         &self,
         secret: &CatalogSecret,

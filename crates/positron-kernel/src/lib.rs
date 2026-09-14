@@ -77,12 +77,13 @@ mod resource_governor;
 mod retention_time;
 
 pub use catalog::{
-    AuditCheckpointSigner, AuditIntent, Catalog, CatalogCommit, CatalogCredential, CatalogFailure,
-    CatalogFailureCode, CatalogGenerationId, CatalogGovernanceObject, CatalogGovernanceVersion,
-    CatalogLogRetentionPolicy, CatalogObject, CatalogObjectId, CatalogProposal, CatalogReadView,
-    CatalogRotation, CatalogSecret, CatalogSnapshot, CatalogWrappingKey, FormatEpoch,
-    GovernanceAuditCheckpoint, GovernanceAuditRecord, InstanceId, PreparedTransactionInspection,
-    PreparedTransactionResolution, TransactionId,
+    AuditCheckpointSigner, AuditIntent, AuditRetentionAnchor, AuditRetentionTrust, Catalog,
+    CatalogCommit, CatalogCredential, CatalogFailure, CatalogFailureCode, CatalogGenerationId,
+    CatalogGovernanceObject, CatalogGovernanceVersion, CatalogLogRetentionPolicy, CatalogObject,
+    CatalogObjectId, CatalogProposal, CatalogReadView, CatalogRotation, CatalogSecret,
+    CatalogSnapshot, CatalogWrappingKey, FormatEpoch, GovernanceAuditCheckpoint,
+    GovernanceAuditRecord, InstanceId, PreparedTransactionInspection,
+    PreparedTransactionResolution, SystemAuditRetentionPolicy, TransactionId,
 };
 #[cfg(feature = "test-support")]
 pub use catalog::{

@@ -36,7 +36,10 @@ use crate::data_protection::ControlTokenProtector;
 use crate::resource_governor::CatalogWriterLease;
 use crate::{RecoveryWorkClaim, RecoveryWorkKind, StorageKernelResourceAuthority};
 
-pub use audit_checkpoint::{AuditCheckpointSigner, GovernanceAuditCheckpoint};
+pub use audit_checkpoint::{
+    AuditCheckpointSigner, AuditRetentionAnchor, AuditRetentionTrust, GovernanceAuditCheckpoint,
+    SystemAuditRetentionPolicy,
+};
 #[cfg(feature = "test-support")]
 pub use fixture::GovernanceFixtureTarget;
 pub use governance_object::{
@@ -115,6 +118,8 @@ pub struct CatalogReadView {
     snapshot: CatalogSnapshot,
     audit: Vec<GovernanceAuditRecord>,
     audit_checkpoint: Option<GovernanceAuditCheckpoint>,
+    audit_retention_anchor: Option<AuditRetentionAnchor>,
+    audit_retention_trust: Option<AuditRetentionTrust>,
 }
 
 impl CatalogReadView {
@@ -134,6 +139,35 @@ impl CatalogReadView {
         &self,
     ) -> Result<Option<GovernanceAuditCheckpoint>, CatalogFailure> {
         Ok(self.audit_checkpoint.clone())
+    }
+
+    /// Returns the authenticated Catalog-reachable retention boundary, if the
+    /// system policy has published one.
+    #[must_use]
+    pub fn audit_retention_anchor(&self) -> Option<&AuditRetentionAnchor> {
+        self.audit_retention_anchor.as_ref()
+    }
+
+    /// Verifies a future physically retained suffix against this view's
+    /// Catalog-reachable boundary and trusted system policy.
+    pub fn verify_retained_audit_suffix(
+        &self,
+        records: &[GovernanceAuditRecord],
+    ) -> Result<(), CatalogFailure> {
+        let trust = self
+            .audit_retention_trust
+            .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::IntegrityCorruption))?;
+        let frontier = self.snapshot.governance_audit_frontier();
+        let anchor = self
+            .audit_retention_anchor
+            .as_ref()
+            .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::IntegrityCorruption))?;
+        if records.last().map(GovernanceAuditRecord::position) != Some(frontier)
+            && !(records.is_empty() && anchor.position() == frontier)
+        {
+            return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
+        }
+        AuditRetentionAnchor::verify_retained_suffix(records, Some(anchor), trust)
     }
 
     /// Verifies the complete visible audit chain and an optional trusted
@@ -253,10 +287,22 @@ impl<'authority> Catalog<'authority> {
             .map_err(|_| CatalogFailure::new(CatalogFailureCode::StorageUnavailable))?;
         let storage = CatalogStorage::inspect(&root)?;
         let recovered = recover(&storage, &secret, instance)?;
+        let audit_retention_anchor = audit_checkpoint::retention_anchor(&recovered.current)?;
+        let audit_retention_trust = audit_retention_anchor
+            .as_ref()
+            .map(|anchor| {
+                let trust =
+                    audit_checkpoint::retention_trust(&recovered.current, anchor.instance())?;
+                anchor.verify(trust)?;
+                Ok(trust)
+            })
+            .transpose()?;
         Ok(CatalogReadView {
             snapshot: recovered.current,
             audit: recovered.audit,
             audit_checkpoint: recovered.audit_checkpoint,
+            audit_retention_anchor,
+            audit_retention_trust,
         })
     }
 
@@ -757,6 +803,161 @@ impl<'authority> Catalog<'authority> {
             .publish_audit_checkpoint(&secret, self.instance, &checkpoint)?;
         state.audit_checkpoint = Some(checkpoint.clone());
         Ok(checkpoint)
+    }
+
+    /// Publishes one signed, Catalog-reachable predecessor boundary for a
+    /// later audit-retention reclamation. This publication keeps every audit
+    /// record and Catalog generation reachable; physical pruning remains a
+    /// separate receipt-aware lifecycle operation.
+    pub fn publish_audit_retention_anchor(
+        &self,
+        transaction: TransactionId,
+        signer: &AuditCheckpointSigner,
+        last_removed: &GovernanceAuditRecord,
+    ) -> Result<AuditRetentionAnchor, CatalogFailure> {
+        let basis = self.pin()?;
+        let trust = audit_checkpoint::retention_trust(&basis, self.instance)?;
+        let records = self.governance_audit_records()?;
+        if !records.iter().any(|record| {
+            record.position == last_removed.position && record.hash == last_removed.hash
+        }) {
+            return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
+        }
+        let anchor = AuditRetentionAnchor::create(signer, trust, last_removed)?;
+        if let Some(existing) = audit_checkpoint::retention_anchor(&basis)? {
+            if existing == anchor {
+                return Ok(existing);
+            }
+            if existing.position() > anchor.position() {
+                return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
+            }
+        }
+        let capacity = basis
+            .plaintext_object_count()
+            .checked_add(1)
+            .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?;
+        let mut objects = Vec::new();
+        objects
+            .try_reserve_exact(capacity)
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?;
+        for identity in basis.object_identities() {
+            let object = basis
+                .object(identity)?
+                .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::StorageUnavailable))?;
+            if AuditRetentionAnchor::is_encoded(object) {
+                AuditRetentionAnchor::decode(object)?;
+                continue;
+            }
+            objects.push(CatalogObject::new(object.to_vec())?);
+        }
+        objects.push(CatalogObject::new(anchor.encode())?);
+        let format_epoch = basis
+            .format_epoch()
+            .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::UnsupportedFormat))?;
+        let proposal = CatalogProposal::new(transaction, format_epoch, objects)?;
+        let durability_claim = RecoveryWorkClaim::system(
+            RecoveryWorkKind::DurabilityCompletion,
+            commit_resource_claim(&proposal, None)?,
+        )
+        .map_err(|_| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?;
+        let reservation = self
+            .authority
+            .recovery()
+            .reserve(durability_claim)
+            .map_err(CatalogFailure::admission)?;
+        let result = {
+            let _operation = self
+                .operation
+                .lock()
+                .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
+            self.commit_unreserved(basis.identity(), proposal, None, None)
+        };
+        drop(reservation);
+        #[cfg(any(test, feature = "test-support"))]
+        if result
+            .as_ref()
+            .is_err_and(|failure| failure.code() == CatalogFailureCode::StorageUnavailable)
+        {
+            storage::after_ambiguous_publication(self);
+        }
+        result?;
+        Ok(anchor)
+    }
+
+    /// Atomically publishes an Administration-owned system audit-retention
+    /// policy successor and its rebound signed anchor in one joint-audited
+    /// Catalog generation. This is the only supported policy-generation
+    /// transition: replacing a policy object without its matching anchor
+    /// deliberately fences recovery.
+    pub fn publish_system_audit_retention_policy(
+        &self,
+        transaction: TransactionId,
+        signer: &AuditCheckpointSigner,
+        policy: SystemAuditRetentionPolicy,
+        last_removed: &GovernanceAuditRecord,
+        audit: AuditIntent,
+    ) -> Result<AuditRetentionAnchor, CatalogFailure> {
+        let basis = self.pin()?;
+        let trust = audit_checkpoint::retention_trust_for_policy(&basis, self.instance, policy)?;
+        let records = self.governance_audit_records()?;
+        if !records.iter().any(|record| {
+            record.position == last_removed.position && record.hash == last_removed.hash
+        }) {
+            return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
+        }
+        let anchor = AuditRetentionAnchor::create(signer, trust, last_removed)?;
+        let capacity = basis
+            .plaintext_object_count()
+            .checked_add(2)
+            .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?;
+        let mut objects = Vec::new();
+        objects
+            .try_reserve_exact(capacity)
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?;
+        for identity in basis.object_identities() {
+            let object = basis
+                .object(identity)?
+                .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::StorageUnavailable))?;
+            if AuditRetentionAnchor::is_encoded(object)
+                || SystemAuditRetentionPolicy::is_encoded(object)
+            {
+                continue;
+            }
+            objects.push(CatalogObject::new(object.to_vec())?);
+        }
+        objects.push(policy.into_catalog_object()?);
+        objects.push(CatalogObject::new(anchor.encode())?);
+        let format_epoch = basis
+            .format_epoch()
+            .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::UnsupportedFormat))?;
+        let proposal = CatalogProposal::new(transaction, format_epoch, objects)?;
+        let durability_claim = RecoveryWorkClaim::system(
+            RecoveryWorkKind::DurabilityCompletion,
+            commit_resource_claim(&proposal, Some(&audit))?,
+        )
+        .map_err(|_| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?;
+        let reservation = self
+            .authority
+            .recovery()
+            .reserve(durability_claim)
+            .map_err(CatalogFailure::admission)?;
+        let result = {
+            let _operation = self
+                .operation
+                .lock()
+                .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
+            self.commit_unreserved(basis.identity(), proposal, Some(audit), None)
+        };
+        drop(reservation);
+        #[cfg(any(test, feature = "test-support"))]
+        if result
+            .as_ref()
+            .is_err_and(|failure| failure.code() == CatalogFailureCode::StorageUnavailable)
+        {
+            storage::after_ambiguous_publication(self);
+        }
+        result?;
+        Ok(anchor)
     }
 
     pub(crate) fn refresh_state(&self) -> Result<(), CatalogFailure> {
