@@ -758,6 +758,13 @@ impl<'authority> Catalog<'authority> {
             .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))
     }
 
+    /// Returns the current Administration-owned system audit-retention policy.
+    pub fn system_audit_retention_policy(
+        &self,
+    ) -> Result<Option<SystemAuditRetentionPolicy>, CatalogFailure> {
+        audit_checkpoint::retention_policy(&self.pin()?)
+    }
+
     /// Persists a signed anchor for the currently visible Governance Audit
     /// frontier. It is idempotent for the same frontier and key, and never
     /// changes Catalog generation visibility.
@@ -897,18 +904,49 @@ impl<'authority> Catalog<'authority> {
         last_removed: &GovernanceAuditRecord,
         audit: AuditIntent,
     ) -> Result<AuditRetentionAnchor, CatalogFailure> {
+        self.publish_system_audit_retention_policy_with_receipt(
+            transaction,
+            signer,
+            policy,
+            Some(last_removed),
+            audit,
+            None,
+        )?
+        .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::IntegrityCorruption))
+    }
+
+    /// Publishes a system retention successor together with an Administration
+    /// receipt. The receipt is an opaque immutable object retained across later
+    /// policy replacements; it never grants Catalog mutation authority.
+    pub fn publish_system_audit_retention_policy_with_receipt(
+        &self,
+        transaction: TransactionId,
+        signer: &AuditCheckpointSigner,
+        policy: SystemAuditRetentionPolicy,
+        last_removed: Option<&GovernanceAuditRecord>,
+        audit: AuditIntent,
+        receipt: Option<CatalogObject>,
+    ) -> Result<Option<AuditRetentionAnchor>, CatalogFailure> {
         let basis = self.pin()?;
         let trust = audit_checkpoint::retention_trust_for_policy(&basis, self.instance, policy)?;
         let records = self.governance_audit_records()?;
-        if !records.iter().any(|record| {
-            record.position == last_removed.position && record.hash == last_removed.hash
-        }) {
-            return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
-        }
-        let anchor = AuditRetentionAnchor::create(signer, trust, last_removed)?;
+        let anchor = match last_removed {
+            Some(record) => {
+                if !records.iter().any(|candidate| {
+                    candidate.position == record.position && candidate.hash == record.hash
+                }) {
+                    return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
+                }
+                Some(AuditRetentionAnchor::create(signer, trust, record)?)
+            },
+            None => audit_checkpoint::retention_anchor(&basis)?
+                .as_ref()
+                .map(|previous| previous.rebind(signer, trust))
+                .transpose()?,
+        };
         let capacity = basis
             .plaintext_object_count()
-            .checked_add(3)
+            .checked_add(3 + usize::from(receipt.is_some()))
             .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?;
         let mut objects = Vec::new();
         objects
@@ -927,10 +965,15 @@ impl<'authority> Catalog<'authority> {
             objects.push(CatalogObject::new(object.to_vec())?);
         }
         objects.push(policy.into_catalog_object()?);
-        objects.push(CatalogObject::new(anchor.encode())?);
-        objects.push(CatalogObject::new(
-            audit_checkpoint::AuditRetentionReclamationReceipt::new(&anchor).encode(),
-        )?);
+        if let Some(anchor) = &anchor {
+            objects.push(CatalogObject::new(anchor.encode())?);
+            objects.push(CatalogObject::new(
+                audit_checkpoint::AuditRetentionReclamationReceipt::new(anchor).encode(),
+            )?);
+        }
+        if let Some(receipt) = receipt {
+            objects.push(receipt);
+        }
         let format_epoch = basis
             .format_epoch()
             .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::UnsupportedFormat))?;
@@ -961,7 +1004,9 @@ impl<'authority> Catalog<'authority> {
             storage::after_ambiguous_publication(self);
         }
         result?;
-        self.complete_audit_retention_reclamation()?;
+        if anchor.is_some() {
+            self.complete_audit_retention_reclamation()?;
+        }
         Ok(anchor)
     }
 

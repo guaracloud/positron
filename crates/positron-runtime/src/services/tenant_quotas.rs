@@ -112,6 +112,11 @@ fn map_failure(failure: crate::BootstrapFailure) -> TenantQuotaHttpFailure {
         | BootstrapFailureCode::TenantRetentionIdempotencyConflict => {
             TenantQuotaHttpFailure::Code(503, "administration_unavailable")
         },
+        BootstrapFailureCode::SystemAuditRetentionUnauthorized
+        | BootstrapFailureCode::SystemAuditRetentionStaleGeneration
+        | BootstrapFailureCode::SystemAuditRetentionIdempotencyConflict => {
+            TenantQuotaHttpFailure::Code(503, "administration_unavailable")
+        },
         BootstrapFailureCode::TenantCreateConflict => {
             TenantQuotaHttpFailure::Code(503, "administration_unavailable")
         },

@@ -89,6 +89,9 @@ pub(super) const fn classify_bootstrap_failure_code(
         crate::BootstrapFailureCode::TenantDisplayNameUnauthorized => ServiceFailure::Unauthorized,
         crate::BootstrapFailureCode::TenantAliasUnauthorized => ServiceFailure::Unauthorized,
         crate::BootstrapFailureCode::TenantRetentionUnauthorized => ServiceFailure::Unauthorized,
+        crate::BootstrapFailureCode::SystemAuditRetentionUnauthorized => {
+            ServiceFailure::Unauthorized
+        },
         crate::BootstrapFailureCode::TenantLifecycleStaleGeneration
         | crate::BootstrapFailureCode::TenantLifecycleIdempotencyConflict
         | crate::BootstrapFailureCode::TenantLifecycleInvalidTransition
@@ -113,6 +116,10 @@ pub(super) const fn classify_bootstrap_failure_code(
         | crate::BootstrapFailureCode::TenantRetentionInvalidConfirmation
         | crate::BootstrapFailureCode::TenantRetentionStaleGeneration
         | crate::BootstrapFailureCode::TenantRetentionIdempotencyConflict => {
+            ServiceFailure::InvalidRequest
+        },
+        crate::BootstrapFailureCode::SystemAuditRetentionStaleGeneration
+        | crate::BootstrapFailureCode::SystemAuditRetentionIdempotencyConflict => {
             ServiceFailure::InvalidRequest
         },
         crate::BootstrapFailureCode::TenantCreateConflict => ServiceFailure::InvalidRequest,

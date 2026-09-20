@@ -323,7 +323,7 @@ fn signed_retention_anchor_authorizes_only_its_contiguous_audit_suffix()
             FormatEpoch::CATALOG_V1,
             catalog_objects_with(
                 &basis,
-                SystemAuditRetentionPolicy::new(instance, 7)?.into_catalog_object()?,
+                SystemAuditRetentionPolicy::new(instance, 7, 1)?.into_catalog_object()?,
             )?,
         )?,
         None,
@@ -407,7 +407,7 @@ fn signed_retention_anchor_authorizes_only_its_contiguous_audit_suffix()
     let successor = catalog.publish_system_audit_retention_policy(
         TransactionId::new([0x57; 16])?,
         &signer,
-        SystemAuditRetentionPolicy::new(instance, 8)?,
+        SystemAuditRetentionPolicy::new(instance, 8, 1)?,
         &all_records[1],
         AuditIntent::new(b"action=update-system-audit-retention".to_vec())?,
     )?;
@@ -438,7 +438,7 @@ fn signed_retention_anchor_authorizes_only_its_contiguous_audit_suffix()
             catalog.publish_system_audit_retention_policy(
                 TransactionId::new([0x5a; 16])?,
                 &signer,
-                SystemAuditRetentionPolicy::new(instance, 9)?,
+                SystemAuditRetentionPolicy::new(instance, 9, 1)?,
                 &retained[1],
                 AuditIntent::new(b"action=retry-system-audit-retention".to_vec())?,
             )
@@ -449,7 +449,7 @@ fn signed_retention_anchor_authorizes_only_its_contiguous_audit_suffix()
         .publish_system_audit_retention_policy(
             TransactionId::new([0x59; 16])?,
             &signer,
-            SystemAuditRetentionPolicy::new(InstanceId::new([0x78; 16])?, 9)?,
+            SystemAuditRetentionPolicy::new(InstanceId::new([0x78; 16])?, 9, 1)?,
             &all_records[2],
             AuditIntent::new(b"action=invalid-instance".to_vec())?,
         )
@@ -495,7 +495,7 @@ fn signed_retention_anchor_authorizes_only_its_contiguous_audit_suffix()
             catalog.publish_system_audit_retention_policy(
                 TransactionId::new([0x5b; 16])?,
                 &signer,
-                SystemAuditRetentionPolicy::new(instance, 10)?,
+                SystemAuditRetentionPolicy::new(instance, 10, 1)?,
                 &retained_after_restart[0],
                 AuditIntent::new(b"action=complete-system-audit-retention".to_vec())?,
             )
@@ -548,11 +548,11 @@ fn replace_system_audit_retention_policy(
     let mut objects = Vec::new();
     for identity in basis.object_identities() {
         let object = basis.object(identity)?.ok_or("catalog object")?;
-        if !object.starts_with(b"POSAUP01") {
+        if !object.starts_with(b"POSAUP01") && !object.starts_with(b"POSAUP02") {
             objects.push(CatalogObject::new(object.to_vec())?);
         }
     }
-    objects.push(SystemAuditRetentionPolicy::new(instance, generation)?.into_catalog_object()?);
+    objects.push(SystemAuditRetentionPolicy::new(instance, generation, 1)?.into_catalog_object()?);
     catalog.commit(
         basis.identity(),
         CatalogProposal::new(

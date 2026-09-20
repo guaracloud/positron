@@ -319,7 +319,6 @@ impl<'audit> GovernanceAuditInspection<'audit> {
     /// Iterates the already-bounded recovered audit view without copying or
     /// decoding records. Tenant scope is matched only against typed Tenant ID
     /// semantics, never textual audit content.
-    #[must_use]
     pub fn audit_records(&self) -> impl Iterator<Item = &'audit GovernanceAuditEntry> {
         self.audit.iter().filter(move |entry| {
             self.tenant

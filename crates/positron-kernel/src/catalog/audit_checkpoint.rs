@@ -12,9 +12,12 @@ const RETENTION_MAGIC: [u8; 8] = *b"POSAUDR1";
 const RETENTION_VERSION: u16 = 1;
 const RETENTION_ENCODED_BYTES: usize = 8 + 2 + 16 + 32 + 8 + 8 + 32 + 32 + SIGNATURE_BYTES;
 const RETENTION_SIGNING_DOMAIN: &[u8] = b"positron-governance-audit-retention-anchor-v1\0";
-const RETENTION_POLICY_MAGIC: [u8; 8] = *b"POSAUP01";
+const RETENTION_POLICY_V1_MAGIC: [u8; 8] = *b"POSAUP01";
+const RETENTION_POLICY_MAGIC: [u8; 8] = *b"POSAUP02";
 const RETENTION_POLICY_VERSION: u16 = 1;
-const RETENTION_POLICY_ENCODED_BYTES: usize = 8 + 2 + 16 + 8;
+const RETENTION_POLICY_V1_ENCODED_BYTES: usize = 8 + 2 + 16 + 8;
+const RETENTION_POLICY_ENCODED_BYTES: usize = 8 + 2 + 16 + 8 + 8;
+const LEGACY_RETAINED_RECORD_LIMIT: u64 = u64::MAX;
 const RETENTION_RECLAMATION_RECEIPT_MAGIC: [u8; 8] = *b"POSAUR01";
 const RETENTION_RECLAMATION_RECEIPT_VERSION: u16 = 1;
 const RETENTION_RECLAMATION_RECEIPT_ENCODED_BYTES: usize = 8 + 2 + 16 + 8 + 8 + 32;
@@ -235,16 +238,22 @@ impl AuditRetentionTrust {
 pub struct SystemAuditRetentionPolicy {
     instance: InstanceId,
     generation: u64,
+    retained_record_limit: u64,
 }
 
 impl SystemAuditRetentionPolicy {
-    pub fn new(instance: InstanceId, generation: u64) -> Result<Self, CatalogFailure> {
-        if generation == 0 {
+    pub fn new(
+        instance: InstanceId,
+        generation: u64,
+        retained_record_limit: u64,
+    ) -> Result<Self, CatalogFailure> {
+        if generation == 0 || retained_record_limit == 0 {
             return Err(CatalogFailure::new(CatalogFailureCode::InvalidInput));
         }
         Ok(Self {
             instance,
             generation,
+            retained_record_limit,
         })
     }
 
@@ -256,6 +265,12 @@ impl SystemAuditRetentionPolicy {
     #[must_use]
     pub const fn generation(self) -> u64 {
         self.generation
+    }
+
+    /// The Administration-selected number of most-recent audit records to retain.
+    #[must_use]
+    pub const fn retained_record_limit(self) -> u64 {
+        self.retained_record_limit
     }
 
     /// Produces the immutable Catalog object that Administration includes in
@@ -270,12 +285,19 @@ impl SystemAuditRetentionPolicy {
         encoded.extend_from_slice(&RETENTION_POLICY_VERSION.to_be_bytes());
         encoded.extend_from_slice(&self.instance.0);
         encoded.extend_from_slice(&self.generation.to_be_bytes());
+        encoded.extend_from_slice(&self.retained_record_limit.to_be_bytes());
         encoded
     }
 
     fn decode(encoded: &[u8]) -> Result<Self, CatalogFailure> {
-        if encoded.len() != RETENTION_POLICY_ENCODED_BYTES
-            || encoded.get(..8) != Some(RETENTION_POLICY_MAGIC.as_slice())
+        let legacy = encoded.get(..8) == Some(RETENTION_POLICY_V1_MAGIC.as_slice());
+        let expected_length = if legacy {
+            RETENTION_POLICY_V1_ENCODED_BYTES
+        } else {
+            RETENTION_POLICY_ENCODED_BYTES
+        };
+        if encoded.len() != expected_length
+            || (!legacy && encoded.get(..8) != Some(RETENTION_POLICY_MAGIC.as_slice()))
             || encoded.get(8..10) != Some(RETENTION_POLICY_VERSION.to_be_bytes().as_slice())
         {
             return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
@@ -290,14 +312,25 @@ impl SystemAuditRetentionPolicy {
             .map(u64::from_be_bytes)
             .filter(|generation| *generation != 0)
             .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::IntegrityCorruption))?;
+        let retained_record_limit = if legacy {
+            LEGACY_RETAINED_RECORD_LIMIT
+        } else {
+            encoded
+                .get(34..42)
+                .and_then(|bytes| bytes.try_into().ok())
+                .map(u64::from_be_bytes)
+                .filter(|limit| *limit != 0)
+                .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::IntegrityCorruption))?
+        };
         Ok(Self {
             instance,
             generation,
+            retained_record_limit,
         })
     }
 
     pub(super) fn is_encoded(bytes: &[u8]) -> bool {
-        bytes.starts_with(&RETENTION_POLICY_MAGIC)
+        bytes.starts_with(&RETENTION_POLICY_V1_MAGIC) || bytes.starts_with(&RETENTION_POLICY_MAGIC)
     }
 }
 
@@ -418,6 +451,29 @@ impl AuditRetentionAnchor {
             system_policy_generation: trust.system_policy_generation,
             position: record.position,
             record_hash: record.hash,
+            public_key: signer.public_key(),
+            signature: signer.sign(&message)?,
+        })
+    }
+
+    pub(super) fn rebind(
+        &self,
+        signer: &AuditCheckpointSigner,
+        trust: AuditRetentionTrust,
+    ) -> Result<Self, CatalogFailure> {
+        if signer.public_key() != trust.integrity_public_key {
+            return Err(CatalogFailure::new(
+                CatalogFailureCode::AuthenticationFailed,
+            ));
+        }
+        let message =
+            retention_signing_message(trust, self.position, self.record_hash, signer.public_key())?;
+        Ok(Self {
+            instance: trust.instance,
+            integrity_key_fingerprint: trust.integrity_key_fingerprint,
+            system_policy_generation: trust.system_policy_generation,
+            position: self.position,
+            record_hash: self.record_hash,
             public_key: signer.public_key(),
             signature: signer.sign(&message)?,
         })

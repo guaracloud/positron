@@ -15,6 +15,7 @@ mod schema_lifecycle_support;
 mod schema_maintenance;
 mod schema_replay_integrity;
 mod schema_routes;
+mod system_audit_retention;
 mod tenant_aliases;
 mod tenant_credentials;
 mod tenant_provisioning;

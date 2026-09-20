@@ -301,14 +301,16 @@ fn unauthorized_and_exact_replayed_migrations_do_not_close_data_admission()
             CompatibilityHints::none(),
         )
     };
-    let committed = instance.migrate_catalog_to_epoch_two(administrator()?, key)?;
+    let first_administrator = administrator()?;
+    let committed = instance.migrate_catalog_to_epoch_two(first_administrator, key)?;
     let (ingest_closed_tx, ingest_closed_rx) = std::sync::mpsc::channel();
     let (query_closed_tx, query_closed_rx) = std::sync::mpsc::channel();
     instance.install_lifecycle_transition_observer(ingest_closed_tx)?;
     instance.install_lifecycle_query_transition_observer(query_closed_tx)?;
 
+    let replay_administrator = administrator()?;
     assert_eq!(
-        instance.migrate_catalog_to_epoch_two(administrator()?, key)?,
+        instance.migrate_catalog_to_epoch_two(replay_administrator, key)?,
         committed,
         "exact replay resolves the committed migration"
     );

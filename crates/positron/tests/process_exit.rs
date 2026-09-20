@@ -67,14 +67,24 @@ fn first_os_signal_drains_and_exits_successfully() -> Result<(), Box<dyn std::er
     fs::create_dir_all(&secrets).map_err(|error| format!("create secrets: {error}"))?;
     fs::set_permissions(&secrets, fs::Permissions::from_mode(0o700))
         .map_err(|error| format!("protect secrets: {error}"))?;
-    let [operations_port, api_port, otlp_http_port] = available_ports()?;
+    let [
+        operations_port,
+        api_port,
+        otlp_grpc_port,
+        otlp_http_port,
+        loki_push_port,
+    ] = available_ports()?;
     let configuration = process_configuration(
         &root,
         &data,
         &secrets,
-        operations_port,
-        api_port,
-        otlp_http_port,
+        [
+            operations_port,
+            api_port,
+            otlp_grpc_port,
+            otlp_http_port,
+            loki_push_port,
+        ],
     );
     let config_path = root.join("positron.toml");
     fs::write(&config_path, configuration)
@@ -108,14 +118,24 @@ fn fenced_native_process_stays_alive_until_signal_and_retains_ownership()
     let root = std::env::temp_dir().join(format!("positron-fenced-{}-{nonce}", std::process::id()));
     let roots = ChildRoots::new(&root)?;
     fs::write(roots.data.join("foreign"), b"ambiguous")?;
-    let [operations_port, api_port, otlp_http_port] = available_ports()?;
+    let [
+        operations_port,
+        api_port,
+        otlp_grpc_port,
+        otlp_http_port,
+        loki_push_port,
+    ] = available_ports()?;
     let configuration = process_configuration(
         &root,
         &roots.data,
         &roots.secrets,
-        operations_port,
-        api_port,
-        otlp_http_port,
+        [
+            operations_port,
+            api_port,
+            otlp_grpc_port,
+            otlp_http_port,
+            loki_push_port,
+        ],
     );
     let config_path = root.join("positron.toml");
     fs::write(&config_path, configuration)?;

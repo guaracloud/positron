@@ -79,6 +79,29 @@ pub struct Identity {
 }
 
 impl Identity {
+    /// Authorizes a system-wide Governance Audit retention mutation. Tenant
+    /// scopes and data-plane credentials never acquire this authority.
+    pub fn authorize_system_audit_retention(
+        &self,
+        context: AuthorizedContext,
+    ) -> Result<PrincipalId, AttributionFailure> {
+        if context.authority == self.instance
+            && context.scope == Scope::SystemAdministration
+            && context.principal == self.principal
+            && context.tenant.is_none()
+            && (self.credentials.is_empty()
+                || self.credentials.iter().any(|credential| {
+                    credential.principal == context.principal
+                        && credential.scope == Scope::SystemAdministration
+                        && credential.active
+                }))
+        {
+            Ok(context.principal)
+        } else {
+            Err(AttributionFailure)
+        }
+    }
+
     /// Authorizes a retention preview or confirmed update for one tenant.
     /// Tenant administrators are bound to their own active or read-only
     /// tenant; system administration is reserved for in-process governance

@@ -470,6 +470,44 @@ impl GovernanceAuditEntry {
                 },
             ));
         }
+        if intent.starts_with(&SYSTEM_AUDIT_RETENTION_MAGIC) {
+            let mut cursor = Cursor::new(intent);
+            if cursor.take_array::<8>()? != SYSTEM_AUDIT_RETENTION_MAGIC {
+                return Err(IdentityFailure);
+            }
+            let ingest_time_unix_seconds = cursor.take_u64()?;
+            let idempotency_key = AdministrativeIdempotencyKey::new(cursor.take_array()?)
+                .map_err(|_| IdentityFailure)?;
+            let actor =
+                PrincipalId::from_bytes(cursor.take_array()?).map_err(|_| IdentityFailure)?;
+            let expected_generation =
+                ResourceGeneration::new(cursor.take_u64()?).map_err(|_| IdentityFailure)?;
+            let generation =
+                ResourceGeneration::new(cursor.take_u64()?).map_err(|_| IdentityFailure)?;
+            let retained_record_limit = cursor.take_u64()?;
+            let request_digest = cursor.take_array()?;
+            if ingest_time_unix_seconds == 0
+                || idempotency_key.to_bytes() != transaction_id
+                || expected_generation.get().checked_add(1) != Some(generation.get())
+                || retained_record_limit == 0
+                || request_digest.iter().all(|byte| *byte == 0)
+                || !cursor.is_empty()
+            {
+                return Err(IdentityFailure);
+            }
+            return Ok(Self::SystemAuditRetentionUpdate(
+                SystemAuditRetentionUpdateAuditEntry {
+                    position,
+                    ingest_time_unix_seconds,
+                    actor,
+                    expected_generation,
+                    generation,
+                    retained_record_limit,
+                    request_digest,
+                    idempotency_key,
+                },
+            ));
+        }
         if intent.starts_with(&TENANT_ALIAS_MAGIC) {
             let mut cursor = Cursor::new(intent);
             if cursor.take_array::<8>()? != TENANT_ALIAS_MAGIC {

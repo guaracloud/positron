@@ -33,6 +33,7 @@ const TENANT_CREATION_MAGIC: [u8; 8] = *b"POSTNA01";
 const FORMAT_MIGRATION_MAGIC: [u8; 8] = *b"POSFMT01";
 const TENANT_ALIAS_MAGIC: [u8; 8] = *b"POSALI01";
 const TENANT_RETENTION_MAGIC: [u8; 8] = *b"POSTRT01";
+const SYSTEM_AUDIT_RETENTION_MAGIC: [u8; 8] = *b"POSAR001";
 
 /// Bounded, non-secret metadata for the initial instance operation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -81,6 +82,45 @@ pub enum GovernanceAuditEntry {
     CatalogFormatMigration(CatalogFormatMigrationAuditEntry),
     TenantAliasBinding(TenantAliasBindingAuditEntry),
     TenantRetentionUpdate(TenantRetentionUpdateAuditEntry),
+    SystemAuditRetentionUpdate(SystemAuditRetentionUpdateAuditEntry),
+}
+
+/// Redacted evidence for a system-controlled Governance Audit retention update.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SystemAuditRetentionUpdateAuditEntry {
+    position: u64,
+    ingest_time_unix_seconds: u64,
+    actor: PrincipalId,
+    expected_generation: ResourceGeneration,
+    generation: ResourceGeneration,
+    retained_record_limit: u64,
+    request_digest: [u8; 32],
+    idempotency_key: AdministrativeIdempotencyKey,
+}
+
+pub(crate) struct SystemAuditRetentionAuditIntent {
+    pub(crate) ingest_time_unix_seconds: u64,
+    pub(crate) idempotency_key: AdministrativeIdempotencyKey,
+    pub(crate) actor: PrincipalId,
+    pub(crate) expected_generation: ResourceGeneration,
+    pub(crate) generation: ResourceGeneration,
+    pub(crate) retained_record_limit: u64,
+    pub(crate) request_digest: [u8; 32],
+}
+
+impl SystemAuditRetentionAuditIntent {
+    pub(crate) fn encode(self) -> Vec<u8> {
+        let mut intent = Vec::with_capacity(104);
+        intent.extend_from_slice(&SYSTEM_AUDIT_RETENTION_MAGIC);
+        intent.extend_from_slice(&self.ingest_time_unix_seconds.to_be_bytes());
+        intent.extend_from_slice(&self.idempotency_key.to_bytes());
+        intent.extend_from_slice(&self.actor.to_bytes());
+        intent.extend_from_slice(&self.expected_generation.get().to_be_bytes());
+        intent.extend_from_slice(&self.generation.get().to_be_bytes());
+        intent.extend_from_slice(&self.retained_record_limit.to_be_bytes());
+        intent.extend_from_slice(&self.request_digest);
+        intent
+    }
 }
 
 /// Redacted evidence for a retention successor. The duration and impact
@@ -572,6 +612,7 @@ impl GovernanceAuditEntry {
             Self::CatalogFormatMigration(entry) => entry.position,
             Self::TenantAliasBinding(entry) => entry.position,
             Self::TenantRetentionUpdate(entry) => entry.position,
+            Self::SystemAuditRetentionUpdate(entry) => entry.position,
         }
     }
 
@@ -594,6 +635,7 @@ impl GovernanceAuditEntry {
             Self::CatalogFormatMigration(_) => None,
             Self::TenantAliasBinding(entry) => Some(entry.tenant),
             Self::TenantRetentionUpdate(entry) => Some(entry.tenant),
+            Self::SystemAuditRetentionUpdate(_) => None,
         }
     }
 
@@ -617,6 +659,7 @@ impl GovernanceAuditEntry {
             Self::CatalogFormatMigration(_) => "catalog.format.migrate",
             Self::TenantAliasBinding(_) => "tenant.alias.bind",
             Self::TenantRetentionUpdate(_) => "tenant.retention.update",
+            Self::SystemAuditRetentionUpdate(_) => "system.audit-retention.update",
         }
     }
 
@@ -636,6 +679,7 @@ impl GovernanceAuditEntry {
             Self::CatalogFormatMigration(_) => "succeeded",
             Self::TenantAliasBinding(_) => "succeeded",
             Self::TenantRetentionUpdate(_) => "succeeded",
+            Self::SystemAuditRetentionUpdate(_) => "succeeded",
         }
     }
 
@@ -654,7 +698,8 @@ impl GovernanceAuditEntry {
             | Self::TenantCreation(_)
             | Self::CatalogFormatMigration(_)
             | Self::TenantAliasBinding(_)
-            | Self::TenantRetentionUpdate(_) => None,
+            | Self::TenantRetentionUpdate(_)
+            | Self::SystemAuditRetentionUpdate(_) => None,
         }
     }
 
@@ -673,7 +718,8 @@ impl GovernanceAuditEntry {
             | Self::TenantCreation(_)
             | Self::CatalogFormatMigration(_)
             | Self::TenantAliasBinding(_)
-            | Self::TenantRetentionUpdate(_) => None,
+            | Self::TenantRetentionUpdate(_)
+            | Self::SystemAuditRetentionUpdate(_) => None,
         }
     }
 
@@ -692,7 +738,8 @@ impl GovernanceAuditEntry {
             | Self::TenantCreation(_)
             | Self::CatalogFormatMigration(_)
             | Self::TenantAliasBinding(_)
-            | Self::TenantRetentionUpdate(_) => None,
+            | Self::TenantRetentionUpdate(_)
+            | Self::SystemAuditRetentionUpdate(_) => None,
         }
     }
 
@@ -711,7 +758,8 @@ impl GovernanceAuditEntry {
             | Self::TenantCreation(_)
             | Self::CatalogFormatMigration(_)
             | Self::TenantAliasBinding(_)
-            | Self::TenantRetentionUpdate(_) => None,
+            | Self::TenantRetentionUpdate(_)
+            | Self::SystemAuditRetentionUpdate(_) => None,
         }
     }
 
@@ -730,7 +778,8 @@ impl GovernanceAuditEntry {
             | Self::TenantCreation(_)
             | Self::CatalogFormatMigration(_)
             | Self::TenantAliasBinding(_)
-            | Self::TenantRetentionUpdate(_) => None,
+            | Self::TenantRetentionUpdate(_)
+            | Self::SystemAuditRetentionUpdate(_) => None,
         }
     }
 
@@ -749,7 +798,8 @@ impl GovernanceAuditEntry {
             | Self::TenantCreation(_)
             | Self::CatalogFormatMigration(_)
             | Self::TenantAliasBinding(_)
-            | Self::TenantRetentionUpdate(_) => None,
+            | Self::TenantRetentionUpdate(_)
+            | Self::SystemAuditRetentionUpdate(_) => None,
         }
     }
 
@@ -768,7 +818,8 @@ impl GovernanceAuditEntry {
             | Self::TenantCreation(_)
             | Self::CatalogFormatMigration(_)
             | Self::TenantAliasBinding(_)
-            | Self::TenantRetentionUpdate(_) => None,
+            | Self::TenantRetentionUpdate(_)
+            | Self::SystemAuditRetentionUpdate(_) => None,
         }
     }
 
@@ -789,7 +840,8 @@ impl GovernanceAuditEntry {
             | Self::TenantCreation(_)
             | Self::CatalogFormatMigration(_)
             | Self::TenantAliasBinding(_)
-            | Self::TenantRetentionUpdate(_) => None,
+            | Self::TenantRetentionUpdate(_)
+            | Self::SystemAuditRetentionUpdate(_) => None,
         }
     }
 
@@ -809,7 +861,49 @@ impl GovernanceAuditEntry {
             | Self::TenantCreation(_)
             | Self::CatalogFormatMigration(_)
             | Self::TenantAliasBinding(_) => None,
+            Self::SystemAuditRetentionUpdate(_) => None,
         }
+    }
+
+    #[must_use]
+    pub const fn as_system_audit_retention_update(
+        &self,
+    ) -> Option<&SystemAuditRetentionUpdateAuditEntry> {
+        match self {
+            Self::SystemAuditRetentionUpdate(entry) => Some(entry),
+            _ => None,
+        }
+    }
+}
+
+impl SystemAuditRetentionUpdateAuditEntry {
+    #[must_use]
+    pub const fn position(&self) -> u64 {
+        self.position
+    }
+    #[must_use]
+    pub const fn actor_id(&self) -> PrincipalId {
+        self.actor
+    }
+    #[must_use]
+    pub const fn expected_generation(&self) -> ResourceGeneration {
+        self.expected_generation
+    }
+    #[must_use]
+    pub const fn generation(&self) -> ResourceGeneration {
+        self.generation
+    }
+    #[must_use]
+    pub const fn retained_record_limit(&self) -> u64 {
+        self.retained_record_limit
+    }
+    #[must_use]
+    pub const fn request_digest(&self) -> [u8; 32] {
+        self.request_digest
+    }
+    #[must_use]
+    pub const fn idempotency_key(&self) -> AdministrativeIdempotencyKey {
+        self.idempotency_key
     }
 }
 

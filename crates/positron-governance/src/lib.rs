@@ -18,6 +18,7 @@ mod identity;
 mod listener_transport_administration;
 mod policy_administration;
 mod quota_administration;
+mod system_audit_retention_administration;
 mod tenant_administration;
 mod tenant_alias_administration;
 mod tenant_lifecycle_administration;
@@ -34,7 +35,8 @@ pub use audit::{
     GovernanceAuditEntry, IngestPolicyActivationAuditEntry, InitialAuditMetadata,
     InitializationAuditEntry, ListenerTransportAuditEntry, ListenerTransportAuditRequest,
     ListenerTransportConfigurationProvenance, SchemaCheckpointAuditEntry,
-    TenantDisplayNameUpdateAuditEntry, TenantQuotaUpdateAuditEntry, schema_checkpoint_audit_intent,
+    SystemAuditRetentionUpdateAuditEntry, TenantDisplayNameUpdateAuditEntry,
+    TenantQuotaUpdateAuditEntry, schema_checkpoint_audit_intent,
 };
 pub use format_migration_administration::{
     CatalogFormatMigration, CatalogFormatMigrationAdministration, CatalogFormatMigrationFailure,
@@ -56,6 +58,10 @@ pub use quota_administration::{
     TenantQuotaAdministration, TenantQuotaAdministrationFailure,
     TenantQuotaAdministrationFailureCode, TenantQuotaGenerationConflict, TenantQuotaUpdate,
     TenantQuotaUpdateRequest,
+};
+pub use system_audit_retention_administration::{
+    SystemAuditRetentionAdministration, SystemAuditRetentionAdministrationFailure,
+    SystemAuditRetentionRequest, SystemAuditRetentionUpdate,
 };
 pub use tenant_administration::{
     TenantAdministration, TenantAdministrationFailure, TenantCreateConfiguration,

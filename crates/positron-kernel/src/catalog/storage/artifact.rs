@@ -22,9 +22,15 @@ const ENVELOPE_CONTEXT_DOMAIN: &[u8] = b"positron-catalog-key-envelope-context-v
 pub(super) enum ArtifactKind {
     Object,
     Audit,
-    AuditCheckpoint,
     Commit,
     Prepared,
+    AuditCheckpoint,
+    /// Artifacts written while `AuditCheckpoint` occupied tag 3. These
+    /// variants are decode-only: the tag is part of the authenticated
+    /// envelope context and therefore cannot be silently reinterpreted.
+    TransitionalCommit,
+    TransitionalPrepared,
+    TransitionalAuditCheckpoint,
 }
 
 impl ArtifactKind {
@@ -32,16 +38,27 @@ impl ArtifactKind {
         match self {
             Self::Object => 1,
             Self::Audit => 2,
-            Self::AuditCheckpoint => 3,
-            Self::Commit => 4,
-            Self::Prepared => 5,
+            // These values predate audit checkpoints and are part of the
+            // authenticated on-disk envelope context.
+            Self::Commit => 3,
+            Self::Prepared => 4,
+            Self::AuditCheckpoint => 5,
+            Self::TransitionalCommit => 4,
+            Self::TransitionalPrepared => 5,
+            Self::TransitionalAuditCheckpoint => 3,
         }
     }
 
     const fn system_kind(self) -> SystemObjectKind {
         match self {
-            Self::Object | Self::Commit | Self::Prepared => SystemObjectKind::Catalog,
-            Self::Audit | Self::AuditCheckpoint => SystemObjectKind::GovernanceAudit,
+            Self::Object
+            | Self::Commit
+            | Self::Prepared
+            | Self::TransitionalCommit
+            | Self::TransitionalPrepared => SystemObjectKind::Catalog,
+            Self::Audit | Self::AuditCheckpoint | Self::TransitionalAuditCheckpoint => {
+                SystemObjectKind::GovernanceAudit
+            },
         }
     }
 }
@@ -117,7 +134,7 @@ pub(super) fn open_artifact(
     let (header, frame) = encoded
         .split_at_checked(ARTIFACT_HEADER_BYTES)
         .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::IntegrityCorruption))?;
-    let decoded = decode_header(header, kind)?;
+    let (decoded, encoded_kind) = decode_header(header, kind)?;
     let wrapping = wrapping_key_for_header(secret, &decoded)?;
     if decoded.key_epoch != DATA_KEY_EPOCH {
         return Err(CatalogFailure::new(
@@ -126,7 +143,7 @@ pub(super) fn open_artifact(
     }
     let expected_context = envelope_context_digest(
         instance,
-        kind,
+        encoded_kind,
         content_identity,
         format_epoch,
         decoded.key_id,
@@ -137,11 +154,11 @@ pub(super) fn open_artifact(
             CatalogFailureCode::AuthenticationFailed,
         ));
     }
-    let object = artifact_context(kind, expected_context, format_epoch)?;
+    let object = artifact_context(encoded_kind, expected_context, format_epoch)?;
     let wrapping_key = contextual_wrapping_key(wrapping, expected_context)?;
     let key_context = wrapped_key_context(
         instance,
-        kind,
+        encoded_kind,
         decoded.key_id,
         decoded.key_epoch,
         expected_context,
@@ -177,24 +194,52 @@ struct DecodedHeader {
     wrapped_payload: [u8; WRAPPED_PAYLOAD_BYTES],
 }
 
-fn decode_header(header: &[u8], kind: ArtifactKind) -> Result<DecodedHeader, CatalogFailure> {
-    if header.get(..8) != Some(ARTIFACT_MAGIC.as_slice()) || header.get(10) != Some(&kind.tag()) {
+fn decode_header(
+    header: &[u8],
+    expected_kind: ArtifactKind,
+) -> Result<(DecodedHeader, ArtifactKind), CatalogFailure> {
+    if header.get(..8) != Some(ARTIFACT_MAGIC.as_slice()) {
         return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
     }
+    let encoded_kind = match header.get(10).copied() {
+        Some(tag) if tag == expected_kind.tag() => expected_kind,
+        Some(tag)
+            if expected_kind == ArtifactKind::Commit
+                && tag == ArtifactKind::TransitionalCommit.tag() =>
+        {
+            ArtifactKind::TransitionalCommit
+        },
+        Some(tag)
+            if expected_kind == ArtifactKind::Prepared
+                && tag == ArtifactKind::TransitionalPrepared.tag() =>
+        {
+            ArtifactKind::TransitionalPrepared
+        },
+        Some(tag)
+            if expected_kind == ArtifactKind::AuditCheckpoint
+                && tag == ArtifactKind::TransitionalAuditCheckpoint.tag() =>
+        {
+            ArtifactKind::TransitionalAuditCheckpoint
+        },
+        _ => return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption)),
+    };
     if header.get(8..10) != Some(ARTIFACT_VERSION.to_be_bytes().as_slice())
         || header.get(11..13) != Some(LOCAL_PROVIDER.to_be_bytes().as_slice())
         || header.get(13..15) != Some(AES_256_KWP_ALGORITHM.to_be_bytes().as_slice())
     {
         return Err(CatalogFailure::new(CatalogFailureCode::UnsupportedFormat));
     }
-    Ok(DecodedHeader {
-        provider_key_reference: array(header, 15, 31)?,
-        root_key_epoch: u64::from_be_bytes(array(header, 31, 39)?),
-        key_id: array(header, 39, 71)?,
-        key_epoch: u64::from_be_bytes(array(header, 71, 79)?),
-        context_digest: array(header, 79, 111)?,
-        wrapped_payload: array(header, 111, 247)?,
-    })
+    Ok((
+        DecodedHeader {
+            provider_key_reference: array(header, 15, 31)?,
+            root_key_epoch: u64::from_be_bytes(array(header, 31, 39)?),
+            key_id: array(header, 39, 71)?,
+            key_epoch: u64::from_be_bytes(array(header, 71, 79)?),
+            context_digest: array(header, 79, 111)?,
+            wrapped_payload: array(header, 111, 247)?,
+        },
+        encoded_kind,
+    ))
 }
 
 fn array<const N: usize>(
@@ -310,7 +355,7 @@ pub(super) fn rewrap_artifact_envelope(
     let (header, ciphertext) = encoded
         .split_at_checked(ARTIFACT_HEADER_BYTES)
         .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::IntegrityCorruption))?;
-    let decoded = decode_header(header, kind)?;
+    let (decoded, encoded_kind) = decode_header(header, kind)?;
     if decoded.provider_key_reference != current.provider_key_reference
         || decoded.root_key_epoch != current.key_epoch
         || decoded.key_epoch != DATA_KEY_EPOCH
@@ -321,7 +366,7 @@ pub(super) fn rewrap_artifact_envelope(
     }
     let context = envelope_context_digest(
         instance,
-        kind,
+        encoded_kind,
         content_identity,
         format_epoch,
         decoded.key_id,
@@ -332,9 +377,14 @@ pub(super) fn rewrap_artifact_envelope(
             CatalogFailureCode::AuthenticationFailed,
         ));
     }
-    let object = artifact_context(kind, context, format_epoch)?;
-    let key_context =
-        wrapped_key_context(instance, kind, decoded.key_id, decoded.key_epoch, context)?;
+    let object = artifact_context(encoded_kind, context, format_epoch)?;
+    let key_context = wrapped_key_context(
+        instance,
+        encoded_kind,
+        decoded.key_id,
+        decoded.key_epoch,
+        context,
+    )?;
     let current_wrapping_key = contextual_wrapping_key(current, context)?;
     let object_key = DataProtection::unwrap_key_payload(
         &current_wrapping_key,
@@ -350,7 +400,7 @@ pub(super) fn rewrap_artifact_envelope(
     let mut rewrapped = Vec::with_capacity(encoded.len());
     rewrapped.extend_from_slice(&ARTIFACT_MAGIC);
     rewrapped.extend_from_slice(&ARTIFACT_VERSION.to_be_bytes());
-    rewrapped.push(kind.tag());
+    rewrapped.push(encoded_kind.tag());
     rewrapped.extend_from_slice(&LOCAL_PROVIDER.to_be_bytes());
     rewrapped.extend_from_slice(&AES_256_KWP_ALGORITHM.to_be_bytes());
     rewrapped.extend_from_slice(&replacement.provider_key_reference);

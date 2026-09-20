@@ -377,6 +377,7 @@ fn governance_inspection_rejects_forged_and_data_plane_contexts_with_one_shape()
         .expect("system credential")
         .active = false;
     assert!(identity.inspect(system, &[]).is_err());
+    assert!(identity.authorize_system_audit_retention(system).is_err());
 }
 
 #[test]

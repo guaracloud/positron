@@ -125,7 +125,7 @@ fn system_administrator_publishes_and_verifies_a_bootstrap_bound_audit_checkpoin
 
 #[cfg(feature = "test-support")]
 #[test]
-fn read_only_transition_is_durable_idempotent_and_preserves_query_access()
+fn historical_read_only_replay_does_not_restore_suspended_query_access()
 -> Result<(), Box<dyn Error>> {
     let roots = Roots::new()?;
     let paths = roots.paths().map_err(|code| format!("paths: {code:?}"))?;
@@ -232,11 +232,16 @@ fn read_only_transition_is_durable_idempotent_and_preserves_query_access()
             )
             .is_err()
     );
-    reopened.attribute(
-        PresentedCredential::parse(&query_secret)?,
-        RequestedIntent::Query,
-        CompatibilityHints::none(),
-    )?;
+    assert!(
+        reopened
+            .attribute(
+                PresentedCredential::parse(&query_secret)?,
+                RequestedIntent::Query,
+                CompatibilityHints::none(),
+            )
+            .is_err(),
+        "a historical read-only replay cannot reopen query access after suspension"
+    );
     Ok(())
 }
 
