@@ -183,8 +183,12 @@ impl GovernanceAuditEntry {
                 transaction_id,
             )));
         }
-        if intent.starts_with(&KEY_LIFECYCLE_MAGIC) || intent.starts_with(&KEY_LIFECYCLE_V2_MAGIC) {
+        if intent.starts_with(&KEY_LIFECYCLE_MAGIC)
+            || intent.starts_with(&KEY_LIFECYCLE_V2_MAGIC)
+            || intent.starts_with(&KEY_LIFECYCLE_V3_MAGIC)
+        {
             let version_two = intent.starts_with(&KEY_LIFECYCLE_V2_MAGIC);
+            let version_three = intent.starts_with(&KEY_LIFECYCLE_V3_MAGIC);
             let fields = 9;
             let action = match *intent.get(8).ok_or(IdentityFailure)? {
                 1 => ApiKeyLifecycleAction::Create,
@@ -192,10 +196,36 @@ impl GovernanceAuditEntry {
                 3 => ApiKeyLifecycleAction::Revoke,
                 _ => return Err(IdentityFailure),
             };
-            let expected_length = fields + 89 + if version_two { 32 } else { 0 };
+            let request_digest_end =
+                fields + 89 + if version_two || version_three { 32 } else { 0 };
+            let tenant = if version_three {
+                match *intent.get(request_digest_end).ok_or(IdentityFailure)? {
+                    0 => None,
+                    1 => Some(
+                        TenantId::from_bytes(
+                            intent
+                                .get(request_digest_end + 1..request_digest_end + 17)
+                                .and_then(|bytes| bytes.try_into().ok())
+                                .ok_or(IdentityFailure)?,
+                        )
+                        .map_err(|_| IdentityFailure)?,
+                    ),
+                    _ => return Err(IdentityFailure),
+                }
+            } else {
+                None
+            };
+            let expected_length = request_digest_end
+                + if version_three {
+                    1 + tenant.map_or(0, |_| 16)
+                } else {
+                    0
+                };
             if intent.len() != expected_length
                 || intent.get(..8)
-                    != Some(if version_two {
+                    != Some(if version_three {
+                        KEY_LIFECYCLE_V3_MAGIC.as_slice()
+                    } else if version_two {
                         KEY_LIFECYCLE_V2_MAGIC.as_slice()
                     } else {
                         KEY_LIFECYCLE_MAGIC.as_slice()
@@ -256,7 +286,7 @@ impl GovernanceAuditEntry {
                     .ok_or(IdentityFailure)?,
             )
             .map_err(|_| IdentityFailure)?;
-            let request_digest = version_two
+            let request_digest = (version_two || version_three)
                 .then(|| intent.get(fields + 89..fields + 121))
                 .flatten()
                 .map(|bytes| bytes.try_into().map_err(|_| IdentityFailure))
@@ -280,6 +310,7 @@ impl GovernanceAuditEntry {
                 idempotency_key: AdministrativeIdempotencyKey::new(transaction_id)
                     .map_err(|_| IdentityFailure)?,
                 request_digest,
+                tenant,
             }));
         }
         if intent.starts_with(&TENANT_CREATION_MAGIC) {

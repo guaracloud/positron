@@ -8,10 +8,10 @@ use std::thread;
 
 use positron_kernel::{
     AdmissionFailureCode, AuditCheckpointSigner, AuditIntent, Catalog, CatalogFailureCode,
-    CatalogObject, CatalogProposal, CatalogSecret, CatalogWrappingKey, FormatEpoch,
-    GovernanceFixtureObject, GovernanceFixtureTarget, InstanceId, MountQualification,
+    CatalogObject, CatalogProposal, CatalogPublicationFault, CatalogSecret, CatalogWrappingKey,
+    FormatEpoch, GovernanceFixtureObject, GovernanceFixtureTarget, InstanceId, MountQualification,
     PrimaryDataVolume, RecoveryWorkClaim, RecoveryWorkKind, ResourceDimension,
-    SystemAuditRetentionPolicy, TransactionId,
+    SystemAuditRetentionPolicy, TransactionId, with_catalog_publication_fault_after,
 };
 
 use super::support::{catalog_recovery_claim, establish_catalog_authority};
@@ -345,7 +345,7 @@ fn signed_retention_anchor_authorizes_only_its_contiguous_audit_suffix()
             Some(AuditIntent::new(action.to_vec())?),
         )?;
     }
-    let records = catalog.governance_audit_records()?;
+    let all_records = catalog.governance_audit_records()?;
     let unanchored_view = Catalog::read_current_view(
         &authority,
         instance,
@@ -353,18 +353,22 @@ fn signed_retention_anchor_authorizes_only_its_contiguous_audit_suffix()
     )?;
     assert!(
         unanchored_view
-            .verify_retained_audit_suffix(&records[2..])
+            .verify_retained_audit_suffix(&all_records[2..])
             .is_err()
     );
     let other_signer = AuditCheckpointSigner::from_seed(Box::new([0x49; 32]))?;
     let failure = catalog
-        .publish_audit_retention_anchor(TransactionId::new([0x55; 16])?, &other_signer, &records[1])
+        .publish_audit_retention_anchor(
+            TransactionId::new([0x55; 16])?,
+            &other_signer,
+            &all_records[1],
+        )
         .expect_err("a signer outside the authenticated integrity-key history must be rejected");
     assert_eq!(failure.code(), CatalogFailureCode::AuthenticationFailed);
     let anchor = catalog.publish_audit_retention_anchor(
         TransactionId::new([0x56; 16])?,
         &signer,
-        &records[1],
+        &all_records[1],
     )?;
 
     let view = Catalog::read_current_view(
@@ -373,8 +377,11 @@ fn signed_retention_anchor_authorizes_only_its_contiguous_audit_suffix()
         CatalogSecret::from_owned(Box::new([0x63; 32]), Box::new([0xd3; 32])),
     )?;
     assert_eq!(view.audit_retention_anchor(), Some(&anchor));
-    view.verify_retained_audit_suffix(&records[2..])?;
-    assert!(view.verify_retained_audit_suffix(&records[1..]).is_err());
+    view.verify_retained_audit_suffix(&all_records[2..])?;
+    assert!(
+        view.verify_retained_audit_suffix(&all_records[1..])
+            .is_err()
+    );
     assert!(view.verify_retained_audit_suffix(&[]).is_err());
 
     let legacy_view = Catalog::read_current_view(
@@ -395,30 +402,55 @@ fn signed_retention_anchor_authorizes_only_its_contiguous_audit_suffix()
         instance,
         CatalogSecret::from_owned(Box::new([0x63; 32]), Box::new([0xd3; 32])),
     )?;
-    view.verify_retained_audit_suffix(&records[2..])?;
+    view.verify_retained_audit_suffix(&all_records[2..])?;
 
     let successor = catalog.publish_system_audit_retention_policy(
         TransactionId::new([0x57; 16])?,
         &signer,
         SystemAuditRetentionPolicy::new(instance, 8)?,
-        &records[1],
+        &all_records[1],
         AuditIntent::new(b"action=update-system-audit-retention".to_vec())?,
     )?;
     assert_eq!(successor.system_policy_generation(), 8);
-    let records = catalog.governance_audit_records()?;
+    let retained = catalog.governance_audit_records()?;
     let view = Catalog::read_current_view(
         &authority,
         instance,
         CatalogSecret::from_owned(Box::new([0x63; 32]), Box::new([0xd3; 32])),
     )?;
     assert_eq!(view.audit_retention_anchor(), Some(&successor));
-    view.verify_retained_audit_suffix(&records[2..])?;
+    assert_eq!(retained.first(), all_records.get(2));
+    assert_eq!(
+        retained.len(),
+        2,
+        "the retention publication audit remains visible"
+    );
+    assert_eq!(retained[1].position(), 4);
+    view.verify_retained_audit_suffix(&retained)?;
+    catalog.replace_governance_fixture(&governance_fixture(
+        instance,
+        signer.public_key(),
+        [0x95; 32],
+        9,
+    )?)?;
+    let interrupted =
+        with_catalog_publication_fault_after(CatalogPublicationFault::ReclaimAudit, 1, || {
+            catalog.publish_system_audit_retention_policy(
+                TransactionId::new([0x5a; 16])?,
+                &signer,
+                SystemAuditRetentionPolicy::new(instance, 9)?,
+                &retained[1],
+                AuditIntent::new(b"action=retry-system-audit-retention".to_vec())?,
+            )
+        });
+    let interrupted = interrupted.expect_err("the post-receipt reclamation fault must surface");
+    assert_eq!(interrupted.code(), CatalogFailureCode::StorageUnavailable);
     let wrong_instance = catalog
         .publish_system_audit_retention_policy(
             TransactionId::new([0x59; 16])?,
             &signer,
             SystemAuditRetentionPolicy::new(InstanceId::new([0x78; 16])?, 9)?,
-            &records[2],
+            &all_records[2],
             AuditIntent::new(b"action=invalid-instance".to_vec())?,
         )
         .expect_err("an anchor policy for another instance must be rejected");
@@ -432,36 +464,6 @@ fn signed_retention_anchor_authorizes_only_its_contiguous_audit_suffix()
     drop(legacy_view);
     drop(catalog);
     drop(authority);
-    let mut expired_frames = Vec::new();
-    for position in [1_u64, 2] {
-        let prefix = format!("{position:020}-");
-        let frame = fs::read_dir(root.path().join("catalog/governance-audit"))?
-            .find_map(|entry| {
-                let entry = entry.ok()?;
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(&prefix)
-                    .then_some(entry.path())
-            })
-            .ok_or("published audit frame")?;
-        expired_frames.push(frame);
-    }
-    let first = expired_frames.first().ok_or("first expired audit frame")?;
-    fs::remove_file(first)?;
-    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
-    let authority = establish_catalog_authority(volume)?;
-    let failure = Catalog::open(
-        &authority,
-        instance,
-        CatalogSecret::from_owned(Box::new([0x63; 32]), Box::new([0xd3; 32])),
-    )
-    .expect_err("a partially missing anchored prefix must fence recovery");
-    assert_eq!(failure.code(), CatalogFailureCode::IntegrityCorruption);
-    drop(authority);
-    for frame in expired_frames.iter().skip(1) {
-        fs::remove_file(frame)?;
-    }
     let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
     let authority = establish_catalog_authority(volume)?;
     let catalog = Catalog::open(
@@ -469,18 +471,59 @@ fn signed_retention_anchor_authorizes_only_its_contiguous_audit_suffix()
         instance,
         CatalogSecret::from_owned(Box::new([0x63; 32]), Box::new([0xd3; 32])),
     )?;
-    let retained = catalog.governance_audit_records()?;
-    assert_eq!(retained, records[2..]);
+    catalog.complete_audit_retention_reclamation()?;
+    let retained_after_restart = catalog.governance_audit_records()?;
+    assert_eq!(retained_after_restart.len(), 1);
+    assert_eq!(retained_after_restart[0].position(), 5);
     let view = Catalog::read_current_view(
         &authority,
         instance,
         CatalogSecret::from_owned(Box::new([0x63; 32]), Box::new([0xd3; 32])),
     )?;
-    view.verify_retained_audit_suffix(&retained)?;
+    view.verify_retained_audit_suffix(&retained_after_restart)?;
+
+    catalog.replace_governance_fixture(&governance_fixture(
+        instance,
+        signer.public_key(),
+        [0x95; 32],
+        10,
+    )?)?;
+    let directory_sync = with_catalog_publication_fault_after(
+        CatalogPublicationFault::SynchronizeReclaimedAuditDirectory,
+        0,
+        || {
+            catalog.publish_system_audit_retention_policy(
+                TransactionId::new([0x5b; 16])?,
+                &signer,
+                SystemAuditRetentionPolicy::new(instance, 10)?,
+                &retained_after_restart[0],
+                AuditIntent::new(b"action=complete-system-audit-retention".to_vec())?,
+            )
+        },
+    )
+    .expect_err("the post-unlink directory-sync fault must surface");
+    assert_eq!(
+        directory_sync.code(),
+        CatalogFailureCode::StorageUnavailable
+    );
 
     // A policy object written outside the atomic policy-and-anchor transition
     // becomes incompatible with the previous signature and fences recovery.
-    replace_system_audit_retention_policy(&catalog, instance, 9, 0x58)?;
+    drop(view);
+    drop(catalog);
+    drop(authority);
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_catalog_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        instance,
+        CatalogSecret::from_owned(Box::new([0x63; 32]), Box::new([0xd3; 32])),
+    )?;
+    catalog.complete_audit_retention_reclamation()?;
+    let retained_after_directory_sync = catalog.governance_audit_records()?;
+    assert_eq!(retained_after_directory_sync.len(), 1);
+    assert_eq!(retained_after_directory_sync[0].position(), 6);
+    replace_system_audit_retention_policy(&catalog, instance, 11, 0x58)?;
     let failure = match Catalog::read_current_view(
         &authority,
         instance,

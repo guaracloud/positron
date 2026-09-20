@@ -15,6 +15,9 @@ const RETENTION_SIGNING_DOMAIN: &[u8] = b"positron-governance-audit-retention-an
 const RETENTION_POLICY_MAGIC: [u8; 8] = *b"POSAUP01";
 const RETENTION_POLICY_VERSION: u16 = 1;
 const RETENTION_POLICY_ENCODED_BYTES: usize = 8 + 2 + 16 + 8;
+const RETENTION_RECLAMATION_RECEIPT_MAGIC: [u8; 8] = *b"POSAUR01";
+const RETENTION_RECLAMATION_RECEIPT_VERSION: u16 = 1;
+const RETENTION_RECLAMATION_RECEIPT_ENCODED_BYTES: usize = 8 + 2 + 16 + 8 + 8 + 32;
 
 /// Opaque custody of an Instance Integrity Key for Governance Audit checkpoints.
 ///
@@ -311,6 +314,91 @@ pub struct AuditRetentionAnchor {
     signature: [u8; SIGNATURE_BYTES],
 }
 
+/// A Catalog-reachable, immutable instruction to finish reclaiming the audit
+/// prefix authorized by its signed retention anchor.  The receipt is written
+/// before any frame is removed, so a restarted maintenance run can finish a
+/// partially reclaimed prefix without inventing an audit boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AuditRetentionReclamationReceipt {
+    instance: InstanceId,
+    system_policy_generation: u64,
+    position: u64,
+    record_hash: [u8; 32],
+}
+
+impl AuditRetentionReclamationReceipt {
+    pub(crate) fn new(anchor: &AuditRetentionAnchor) -> Self {
+        Self {
+            instance: anchor.instance,
+            system_policy_generation: anchor.system_policy_generation,
+            position: anchor.position,
+            record_hash: anchor.record_hash,
+        }
+    }
+
+    pub(crate) fn matches_anchor(&self, anchor: &AuditRetentionAnchor) -> bool {
+        self.instance == anchor.instance
+            && self.system_policy_generation == anchor.system_policy_generation
+            && self.position == anchor.position
+            && self.record_hash == anchor.record_hash
+    }
+
+    pub(crate) fn is_encoded(bytes: &[u8]) -> bool {
+        bytes.starts_with(&RETENTION_RECLAMATION_RECEIPT_MAGIC)
+    }
+
+    pub(crate) fn encode(self) -> Vec<u8> {
+        let mut encoded = Vec::with_capacity(RETENTION_RECLAMATION_RECEIPT_ENCODED_BYTES);
+        encoded.extend_from_slice(&RETENTION_RECLAMATION_RECEIPT_MAGIC);
+        encoded.extend_from_slice(&RETENTION_RECLAMATION_RECEIPT_VERSION.to_be_bytes());
+        encoded.extend_from_slice(&self.instance.0);
+        encoded.extend_from_slice(&self.system_policy_generation.to_be_bytes());
+        encoded.extend_from_slice(&self.position.to_be_bytes());
+        encoded.extend_from_slice(&self.record_hash);
+        encoded
+    }
+
+    pub(crate) fn decode(encoded: &[u8]) -> Result<Self, CatalogFailure> {
+        if encoded.len() != RETENTION_RECLAMATION_RECEIPT_ENCODED_BYTES
+            || encoded.get(..8) != Some(RETENTION_RECLAMATION_RECEIPT_MAGIC.as_slice())
+            || encoded.get(8..10)
+                != Some(
+                    RETENTION_RECLAMATION_RECEIPT_VERSION
+                        .to_be_bytes()
+                        .as_slice(),
+                )
+        {
+            return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
+        }
+        let instance = array(encoded, 10, 26).and_then(|bytes| {
+            InstanceId::new(bytes)
+                .map_err(|_| CatalogFailure::new(CatalogFailureCode::IntegrityCorruption))
+        })?;
+        let system_policy_generation = encoded
+            .get(26..34)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(u64::from_be_bytes)
+            .filter(|generation| *generation != 0)
+            .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::IntegrityCorruption))?;
+        let position = encoded
+            .get(34..42)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(u64::from_be_bytes)
+            .filter(|position| *position != 0)
+            .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::IntegrityCorruption))?;
+        let record_hash = array(encoded, 42, RETENTION_RECLAMATION_RECEIPT_ENCODED_BYTES)?;
+        if record_hash.iter().all(|byte| *byte == 0) {
+            return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
+        }
+        Ok(Self {
+            instance,
+            system_policy_generation,
+            position,
+            record_hash,
+        })
+    }
+}
+
 impl AuditRetentionAnchor {
     pub(super) fn create(
         signer: &AuditCheckpointSigner,
@@ -529,6 +617,23 @@ pub(super) fn retention_policy(
         }
         let policy = SystemAuditRetentionPolicy::decode(object)?;
         if found.replace(policy).is_some() {
+            return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
+        }
+    }
+    Ok(found)
+}
+
+pub(super) fn retention_reclamation_receipt(
+    snapshot: &super::CatalogSnapshot,
+    anchor: &AuditRetentionAnchor,
+) -> Result<Option<AuditRetentionReclamationReceipt>, CatalogFailure> {
+    let mut found = None;
+    for object in snapshot.plaintext_objects() {
+        if !AuditRetentionReclamationReceipt::is_encoded(object) {
+            continue;
+        }
+        let receipt = AuditRetentionReclamationReceipt::decode(object)?;
+        if !receipt.matches_anchor(anchor) || found.replace(receipt).is_some() {
             return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
         }
     }

@@ -908,7 +908,7 @@ impl<'authority> Catalog<'authority> {
         let anchor = AuditRetentionAnchor::create(signer, trust, last_removed)?;
         let capacity = basis
             .plaintext_object_count()
-            .checked_add(2)
+            .checked_add(3)
             .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?;
         let mut objects = Vec::new();
         objects
@@ -920,6 +920,7 @@ impl<'authority> Catalog<'authority> {
                 .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::StorageUnavailable))?;
             if AuditRetentionAnchor::is_encoded(object)
                 || SystemAuditRetentionPolicy::is_encoded(object)
+                || audit_checkpoint::AuditRetentionReclamationReceipt::is_encoded(object)
             {
                 continue;
             }
@@ -927,6 +928,9 @@ impl<'authority> Catalog<'authority> {
         }
         objects.push(policy.into_catalog_object()?);
         objects.push(CatalogObject::new(anchor.encode())?);
+        objects.push(CatalogObject::new(
+            audit_checkpoint::AuditRetentionReclamationReceipt::new(&anchor).encode(),
+        )?);
         let format_epoch = basis
             .format_epoch()
             .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::UnsupportedFormat))?;
@@ -957,7 +961,60 @@ impl<'authority> Catalog<'authority> {
             storage::after_ambiguous_publication(self);
         }
         result?;
+        self.complete_audit_retention_reclamation()?;
         Ok(anchor)
+    }
+
+    /// Completes an already-published, receipt-bound Governance Audit
+    /// reclamation. This is safe to retry after interruption: the receipt and
+    /// signed anchor are durable before any exact frame is unlinked.
+    pub fn complete_audit_retention_reclamation(&self) -> Result<(), CatalogFailure> {
+        let _operation = self
+            .operation
+            .lock()
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
+        let secret = self
+            .secret
+            .lock()
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
+        let anchor = audit_checkpoint::retention_anchor(&state.current)?
+            .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::InvalidInput))?;
+        let trust = audit_checkpoint::retention_trust(&state.current, self.instance)?;
+        anchor.verify(trust)?;
+        if audit_checkpoint::retention_reclamation_receipt(&state.current, &anchor)?.is_none() {
+            return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
+        }
+        for record in state
+            .audit
+            .iter()
+            .filter(|record| record.position() <= anchor.position())
+        {
+            if self
+                .storage
+                .audit_exists(record.position(), record.record_hash())?
+            {
+                let encoded = self.storage.read_audit(
+                    &secret,
+                    self.instance,
+                    record.position(),
+                    record.record_hash(),
+                )?;
+                if codec::decode_audit(&encoded)? != *record {
+                    return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
+                }
+                self.storage
+                    .reclaim_audit(record.position(), record.record_hash())?;
+            }
+        }
+        self.storage.synchronize_reclaimed_audit()?;
+        state
+            .audit
+            .retain(|record| record.position() > anchor.position());
+        Ok(())
     }
 
     pub(crate) fn refresh_state(&self) -> Result<(), CatalogFailure> {

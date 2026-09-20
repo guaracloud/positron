@@ -40,8 +40,8 @@ pub use format_migration_administration::{
     CatalogFormatMigration, CatalogFormatMigrationAdministration, CatalogFormatMigrationFailure,
 };
 pub use identity::{
-    AttributionFailure, AuthorizedContext, CompatibilityHints, GovernanceInspection, Identity,
-    IdentityFailure, PresentedCredential, RequestedIntent,
+    AttributionFailure, AuthorizedContext, CompatibilityHints, GovernanceAuditInspection,
+    GovernanceInspection, Identity, IdentityFailure, PresentedCredential, RequestedIntent,
 };
 pub use listener_transport_administration::{
     ListenerTransportActivation, ListenerTransportAdministration,

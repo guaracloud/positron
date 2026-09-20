@@ -88,11 +88,21 @@ pub(super) fn recover(
     // the only authority that can replace re-reading the prefix audit frames.
     let current = load_snapshot(storage, secret, instance, latest_record)?;
     let retained_anchor = audit_retention_anchor(&current, instance, &chain)?;
-    let missing_retained_prefix = retained_anchor
-        .as_ref()
-        .map(|anchor| retained_prefix_is_absent(storage, &chain, anchor))
-        .transpose()?
-        .unwrap_or(false);
+    let missing_retained_prefix = match retained_anchor.as_ref() {
+        None => false,
+        Some(anchor) => match retained_prefix_presence(storage, &chain, anchor)? {
+            RetainedPrefixPresence::Complete => false,
+            RetainedPrefixPresence::Reclaimed => true,
+            RetainedPrefixPresence::Partial => {
+                if super::audit_checkpoint::retention_reclamation_receipt(&current, anchor)?
+                    .is_none()
+                {
+                    return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
+                }
+                true
+            },
+        },
+    };
     let mut predecessor_generation = CatalogGenerationId::ORIGIN;
     let mut predecessor_number = 0_u64;
     let mut predecessor_audit = AuditFrontier::ORIGIN;
@@ -214,28 +224,42 @@ fn audit_retention_anchor(
     Ok(Some(anchor))
 }
 
-fn retained_prefix_is_absent(
+enum RetainedPrefixPresence {
+    Complete,
+    Reclaimed,
+    Partial,
+}
+
+fn retained_prefix_presence(
     storage: &CatalogStorage,
     chain: &[CommitRecord],
     anchor: &super::AuditRetentionAnchor,
-) -> Result<bool, CatalogFailure> {
+) -> Result<RetainedPrefixPresence, CatalogFailure> {
     let mut previous = AuditFrontier::ORIGIN;
-    let mut present = None;
+    let mut present = 0_usize;
+    let mut absent = 0_usize;
     for record in chain {
         if record.audit_frontier != previous && record.audit_frontier.position <= anchor.position()
         {
             let frame_present =
                 storage.audit_exists(record.audit_frontier.position, record.audit_frontier.hash)?;
-            if present
-                .replace(frame_present)
-                .is_some_and(|expected| expected != frame_present)
-            {
-                return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
+            if frame_present {
+                present = present
+                    .checked_add(1)
+                    .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?;
+            } else {
+                absent = absent
+                    .checked_add(1)
+                    .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?;
             }
         }
         previous = record.audit_frontier;
     }
-    Ok(present == Some(false))
+    match (present, absent) {
+        (0, 0) | (_, 0) => Ok(RetainedPrefixPresence::Complete),
+        (0, _) => Ok(RetainedPrefixPresence::Reclaimed),
+        (_, _) => Ok(RetainedPrefixPresence::Partial),
+    }
 }
 
 pub(super) fn load_snapshot(

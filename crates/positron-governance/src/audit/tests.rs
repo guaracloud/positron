@@ -147,6 +147,27 @@ fn version_two_lifecycle_audits_bind_the_canonical_request_digest() {
             .request_digest(),
         Some(request_digest)
     );
+    assert_eq!(entry.tenant_id(), None);
+
+    let tenant = TenantId::from_bytes([42; 16]).expect("tenant");
+    let mut api_key_v3 = api_key.clone();
+    api_key_v3[..8].copy_from_slice(b"POSKEY03");
+    api_key_v3.push(1);
+    api_key_v3.extend_from_slice(&tenant.to_bytes());
+    let entry = GovernanceAuditEntry::decode_fields(6, transaction, &api_key_v3)
+        .expect("tenant-bound API key audit");
+    assert_eq!(entry.tenant_id(), Some(tenant));
+    assert_eq!(
+        entry
+            .as_api_key_lifecycle()
+            .expect("typed lifecycle audit")
+            .request_digest(),
+        Some(request_digest)
+    );
+    let mut malformed_tenant_scope = api_key_v3.clone();
+    malformed_tenant_scope[130] = 2;
+    assert!(GovernanceAuditEntry::decode_fields(6, transaction, &malformed_tenant_scope).is_err());
+    assert!(GovernanceAuditEntry::decode_fields(6, transaction, &api_key_v3[..130]).is_err());
 
     let mut lifecycle = b"POSTEN02".to_vec();
     lifecycle.extend_from_slice(&1_725_000_002_u64.to_be_bytes());

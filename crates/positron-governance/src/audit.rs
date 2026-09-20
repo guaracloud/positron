@@ -23,6 +23,7 @@ const POLICY_ACTIVATION_MAGIC: [u8; 8] = *b"POSPOL02";
 const TENANT_QUOTA_MAGIC: [u8; 8] = *b"POSQUO01";
 const KEY_LIFECYCLE_MAGIC: [u8; 8] = *b"POSKEY01";
 const KEY_LIFECYCLE_V2_MAGIC: [u8; 8] = *b"POSKEY02";
+const KEY_LIFECYCLE_V3_MAGIC: [u8; 8] = *b"POSKEY03";
 const LISTENER_TRANSPORT_MAGIC: [u8; 8] = *b"POSTPT01";
 const LISTENER_TRANSPORT_V2_MAGIC: [u8; 8] = *b"POSTPT02";
 const LISTENER_TRANSPORT_REQUEST_DOMAIN: &[u8] = b"positron.listener-transport.request.v1\0";
@@ -123,6 +124,7 @@ pub struct ApiKeyLifecycleAuditEntry {
     generation: ResourceGeneration,
     idempotency_key: AdministrativeIdempotencyKey,
     request_digest: Option<[u8; 32]>,
+    tenant: Option<TenantId>,
 }
 
 /// Redacted evidence for one committed tenant registry entry.
@@ -573,6 +575,28 @@ impl GovernanceAuditEntry {
         }
     }
 
+    /// Returns the explicit tenant scope carried by this redacted record.
+    /// System-wide and legacy records without a tenant field never become
+    /// visible through a tenant-scoped inspection.
+    #[must_use]
+    pub const fn tenant_id(&self) -> Option<TenantId> {
+        match self {
+            Self::Initialization(entry) => entry.tenant_id(),
+            Self::CatalogRootRotation(_) => None,
+            Self::IngestPolicyActivation(entry) => Some(entry.tenant),
+            Self::TenantQuotaUpdate(entry) => Some(entry.tenant),
+            Self::TenantDisplayNameUpdate(entry) => Some(entry.tenant),
+            Self::SchemaCheckpoint(entry) => Some(entry.tenant_id()),
+            Self::ApiKeyLifecycle(entry) => entry.tenant_id(),
+            Self::ListenerTransport(_) => None,
+            Self::TenantLifecycle(entry) => Some(entry.tenant),
+            Self::TenantCreation(entry) => Some(entry.tenant),
+            Self::CatalogFormatMigration(_) => None,
+            Self::TenantAliasBinding(entry) => Some(entry.tenant),
+            Self::TenantRetentionUpdate(entry) => Some(entry.tenant),
+        }
+    }
+
     #[must_use]
     pub fn action(&self) -> &str {
         match self {
@@ -971,6 +995,13 @@ impl ApiKeyLifecycleAuditEntry {
     #[must_use]
     pub const fn request_digest(&self) -> Option<[u8; 32]> {
         self.request_digest
+    }
+
+    /// The tenant explicitly bound into current API-key lifecycle evidence.
+    /// Legacy records omit this binding and remain system-only readable.
+    #[must_use]
+    pub const fn tenant_id(&self) -> Option<TenantId> {
+        self.tenant
     }
 }
 

@@ -35,8 +35,8 @@ pub(super) fn commit(
         audit_position,
         request_digest,
     })?);
-    let mut audit = Vec::with_capacity(130);
-    audit.extend_from_slice(b"POSKEY02");
+    let mut audit = Vec::with_capacity(147);
+    audit.extend_from_slice(b"POSKEY03");
     audit.push(match audit_fields.action {
         ApiKeyLifecycleAction::Create => 1,
         ApiKeyLifecycleAction::Rotate => 2,
@@ -56,6 +56,13 @@ pub(super) fn commit(
     audit.extend_from_slice(&audit_fields.generation.get().to_be_bytes());
     audit.extend_from_slice(&audit_fields.idempotency.to_bytes());
     audit.extend_from_slice(&request_digest);
+    match audit_fields.tenant {
+        Some(tenant) => {
+            audit.push(1);
+            audit.extend_from_slice(&tenant.to_bytes());
+        },
+        None => audit.push(0),
+    }
     let proposal = CatalogProposal::new(
         TransactionId::new(audit_fields.idempotency.to_bytes()).map_err(map_catalog)?,
         snapshot

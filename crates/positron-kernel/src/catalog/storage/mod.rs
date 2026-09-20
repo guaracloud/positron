@@ -595,6 +595,30 @@ impl CatalogStorage {
         entry_exists(&self.audit, &audit_name(position, hash))
     }
 
+    /// Removes one exact audit frame after its Catalog-reachable reclamation
+    /// receipt has been authenticated by the caller. Missing frames are an
+    /// idempotent result because a previous interrupted maintenance run may
+    /// already have removed them.
+    pub(super) fn reclaim_audit(
+        &self,
+        position: u64,
+        hash: [u8; 32],
+    ) -> Result<bool, CatalogFailure> {
+        let name = audit_name(position, hash);
+        if !entry_exists(&self.audit, &name)? {
+            return Ok(false);
+        }
+        emit_event(CatalogFileEvent::ReclaimAudit)?;
+        unix_fs::unlinkat(&self.audit, &name, rustix::fs::AtFlags::empty())
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::StorageUnavailable))?;
+        Ok(true)
+    }
+
+    pub(super) fn synchronize_reclaimed_audit(&self) -> Result<(), CatalogFailure> {
+        emit_event(CatalogFileEvent::SynchronizeReclaimedAuditDirectory)?;
+        synchronize(&self.audit)
+    }
+
     pub(super) fn publish_audit_checkpoint(
         &self,
         secret: &CatalogSecret,
