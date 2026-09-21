@@ -12,7 +12,10 @@ use sha2::{Digest, Sha256};
 
 use crate::identity::IdentityFailure;
 use crate::tenant_profile_administration::TENANT_DISPLAY_MAGIC;
-use crate::{AdministrativeIdempotencyKey, ResourceGeneration};
+use crate::{
+    AdministrativeIdempotencyKey, DurableOperationKind, DurableOperationPhase,
+    DurableOperationStatus, OperationId, ResourceGeneration,
+};
 
 pub use rotation::{CatalogRootRotationAuditEntry, CatalogRootRotationStage};
 
@@ -34,6 +37,7 @@ const FORMAT_MIGRATION_MAGIC: [u8; 8] = *b"POSFMT01";
 const TENANT_ALIAS_MAGIC: [u8; 8] = *b"POSALI01";
 const TENANT_RETENTION_MAGIC: [u8; 8] = *b"POSTRT01";
 const SYSTEM_AUDIT_RETENTION_MAGIC: [u8; 8] = *b"POSAR001";
+const DURABLE_OPERATION_AUDIT_MAGIC: [u8; 8] = *b"POSOPA01";
 
 /// Extracts a terminal receipt's idempotency key only after its owning codec
 /// has recognized the supported receipt version and key location. Callers use
@@ -110,6 +114,25 @@ pub enum GovernanceAuditEntry {
     TenantAliasBinding(TenantAliasBindingAuditEntry),
     TenantRetentionUpdate(TenantRetentionUpdateAuditEntry),
     SystemAuditRetentionUpdate(SystemAuditRetentionUpdateAuditEntry),
+    DurableOperation(DurableOperationAuditEntry),
+}
+
+/// Redacted jointly committed evidence for one durable-operation state transition.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DurableOperationAuditEntry {
+    position: u64,
+    operation_id: OperationId,
+    kind: DurableOperationKind,
+    status: DurableOperationStatus,
+    phase: DurableOperationPhase,
+    revision: u64,
+}
+
+impl DurableOperationAuditEntry {
+    #[must_use]
+    pub const fn operation_id(&self) -> OperationId {
+        self.operation_id
+    }
 }
 
 /// Redacted evidence for a system-controlled Governance Audit retention update.
@@ -729,6 +752,7 @@ impl GovernanceAuditEntry {
             Self::TenantAliasBinding(entry) => entry.position,
             Self::TenantRetentionUpdate(entry) => entry.position,
             Self::SystemAuditRetentionUpdate(entry) => entry.position,
+            Self::DurableOperation(entry) => entry.position,
         }
     }
 
@@ -752,6 +776,7 @@ impl GovernanceAuditEntry {
             Self::TenantAliasBinding(entry) => Some(entry.tenant),
             Self::TenantRetentionUpdate(entry) => Some(entry.tenant),
             Self::SystemAuditRetentionUpdate(_) => None,
+            Self::DurableOperation(_) => None,
         }
     }
 
@@ -776,6 +801,7 @@ impl GovernanceAuditEntry {
             Self::TenantAliasBinding(_) => "tenant.alias.bind",
             Self::TenantRetentionUpdate(_) => "tenant.retention.update",
             Self::SystemAuditRetentionUpdate(_) => "system.audit-retention.update",
+            Self::DurableOperation(_) => "durable-operation.transition",
         }
     }
 
@@ -796,6 +822,11 @@ impl GovernanceAuditEntry {
             Self::TenantAliasBinding(_) => "succeeded",
             Self::TenantRetentionUpdate(_) => "succeeded",
             Self::SystemAuditRetentionUpdate(_) => "succeeded",
+            Self::DurableOperation(entry) => match entry.status {
+                DurableOperationStatus::Failed => "failed",
+                DurableOperationStatus::Cancelled => "cancelled",
+                _ => "succeeded",
+            },
         }
     }
 
@@ -815,7 +846,8 @@ impl GovernanceAuditEntry {
             | Self::CatalogFormatMigration(_)
             | Self::TenantAliasBinding(_)
             | Self::TenantRetentionUpdate(_)
-            | Self::SystemAuditRetentionUpdate(_) => None,
+            | Self::SystemAuditRetentionUpdate(_)
+            | Self::DurableOperation(_) => None,
         }
     }
 
@@ -835,7 +867,8 @@ impl GovernanceAuditEntry {
             | Self::CatalogFormatMigration(_)
             | Self::TenantAliasBinding(_)
             | Self::TenantRetentionUpdate(_)
-            | Self::SystemAuditRetentionUpdate(_) => None,
+            | Self::SystemAuditRetentionUpdate(_)
+            | Self::DurableOperation(_) => None,
         }
     }
 
@@ -855,7 +888,8 @@ impl GovernanceAuditEntry {
             | Self::CatalogFormatMigration(_)
             | Self::TenantAliasBinding(_)
             | Self::TenantRetentionUpdate(_)
-            | Self::SystemAuditRetentionUpdate(_) => None,
+            | Self::SystemAuditRetentionUpdate(_)
+            | Self::DurableOperation(_) => None,
         }
     }
 
@@ -875,7 +909,8 @@ impl GovernanceAuditEntry {
             | Self::CatalogFormatMigration(_)
             | Self::TenantAliasBinding(_)
             | Self::TenantRetentionUpdate(_)
-            | Self::SystemAuditRetentionUpdate(_) => None,
+            | Self::SystemAuditRetentionUpdate(_)
+            | Self::DurableOperation(_) => None,
         }
     }
 
@@ -895,7 +930,8 @@ impl GovernanceAuditEntry {
             | Self::CatalogFormatMigration(_)
             | Self::TenantAliasBinding(_)
             | Self::TenantRetentionUpdate(_)
-            | Self::SystemAuditRetentionUpdate(_) => None,
+            | Self::SystemAuditRetentionUpdate(_)
+            | Self::DurableOperation(_) => None,
         }
     }
 
@@ -915,7 +951,8 @@ impl GovernanceAuditEntry {
             | Self::CatalogFormatMigration(_)
             | Self::TenantAliasBinding(_)
             | Self::TenantRetentionUpdate(_)
-            | Self::SystemAuditRetentionUpdate(_) => None,
+            | Self::SystemAuditRetentionUpdate(_)
+            | Self::DurableOperation(_) => None,
         }
     }
 
@@ -935,7 +972,8 @@ impl GovernanceAuditEntry {
             | Self::CatalogFormatMigration(_)
             | Self::TenantAliasBinding(_)
             | Self::TenantRetentionUpdate(_)
-            | Self::SystemAuditRetentionUpdate(_) => None,
+            | Self::SystemAuditRetentionUpdate(_)
+            | Self::DurableOperation(_) => None,
         }
     }
 
@@ -957,7 +995,8 @@ impl GovernanceAuditEntry {
             | Self::CatalogFormatMigration(_)
             | Self::TenantAliasBinding(_)
             | Self::TenantRetentionUpdate(_)
-            | Self::SystemAuditRetentionUpdate(_) => None,
+            | Self::SystemAuditRetentionUpdate(_)
+            | Self::DurableOperation(_) => None,
         }
     }
 
@@ -977,7 +1016,7 @@ impl GovernanceAuditEntry {
             | Self::TenantCreation(_)
             | Self::CatalogFormatMigration(_)
             | Self::TenantAliasBinding(_) => None,
-            Self::SystemAuditRetentionUpdate(_) => None,
+            Self::SystemAuditRetentionUpdate(_) | Self::DurableOperation(_) => None,
         }
     }
 

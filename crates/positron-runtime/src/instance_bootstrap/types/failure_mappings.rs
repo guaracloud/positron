@@ -219,6 +219,24 @@ pub(super) fn map_catalog_format_migration_failure(
     BootstrapFailure::new(code)
 }
 
+pub(super) fn map_durable_operation_failure(failure: DurableOperationFailure) -> BootstrapFailure {
+    let code = match failure {
+        DurableOperationFailure::Unauthorized => BootstrapFailureCode::ApiKeyUnauthorized,
+        DurableOperationFailure::IdempotencyConflict => {
+            BootstrapFailureCode::ApiKeyIdempotencyConflict
+        },
+        DurableOperationFailure::CapacityExceeded => BootstrapFailureCode::ResourceUnavailable,
+        DurableOperationFailure::InvalidInput
+        | DurableOperationFailure::UnknownOperation
+        | DurableOperationFailure::InvalidState
+        | DurableOperationFailure::CancellationUnavailable
+        | DurableOperationFailure::PersistenceUnavailable => {
+            BootstrapFailureCode::CatalogUnavailable
+        },
+    };
+    BootstrapFailure::new(code)
+}
+
 pub(super) fn map_listener_transport_failure(
     failure: ListenerTransportAdministrationFailure,
 ) -> BootstrapFailure {

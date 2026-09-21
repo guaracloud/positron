@@ -64,6 +64,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "durable_operation_record"
+path = "fuzz_targets/durable_operation_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "active_segment_ledger_stateful"
 path = "fuzz_targets/active_segment_ledger_stateful.rs"
 test = false

@@ -8,6 +8,29 @@ impl GovernanceAuditEntry {
         transaction_id: [u8; 16],
         intent: &[u8],
     ) -> Result<Self, IdentityFailure> {
+        if intent.starts_with(&DURABLE_OPERATION_AUDIT_MAGIC) {
+            let mut cursor = Cursor::new(intent);
+            if cursor.take_array::<8>()? != DURABLE_OPERATION_AUDIT_MAGIC {
+                return Err(IdentityFailure);
+            }
+            let operation_id =
+                OperationId::from_bytes(cursor.take_array()?).map_err(|_| IdentityFailure)?;
+            let kind = DurableOperationKind::from_audit_code(cursor.take_u8()?)?;
+            let status = DurableOperationStatus::from_audit_code(cursor.take_u8()?)?;
+            let phase = DurableOperationPhase::from_audit_code(cursor.take_u8()?)?;
+            let revision = cursor.take_u64()?;
+            if revision == 0 || !cursor.is_empty() || transaction_id.iter().all(|byte| *byte == 0) {
+                return Err(IdentityFailure);
+            }
+            return Ok(Self::DurableOperation(DurableOperationAuditEntry {
+                position,
+                operation_id,
+                kind,
+                status,
+                phase,
+                revision,
+            }));
+        }
         if intent.starts_with(MAGIC_V1.as_slice()) || intent.starts_with(MAGIC_V2.as_slice()) {
             return InitializationAuditEntry::decode_intent(position, intent)
                 .map(Self::Initialization);

@@ -390,7 +390,8 @@ fn receipt_for_pruned_entry(
     let (object, kind, key) = match entry {
         GovernanceAuditEntry::Initialization(_)
         | GovernanceAuditEntry::CatalogRootRotation(_)
-        | GovernanceAuditEntry::SchemaCheckpoint(_) => return Ok(None),
+        | GovernanceAuditEntry::SchemaCheckpoint(_)
+        | GovernanceAuditEntry::DurableOperation(_) => return Ok(None),
         GovernanceAuditEntry::TenantCreation(entry) => (
             crate::tenant_administration::legacy_receipt_object(entry)
                 .map_err(|_| SystemAuditRetentionAdministrationFailure::PersistenceUnavailable)?,

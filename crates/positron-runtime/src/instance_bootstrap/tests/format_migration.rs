@@ -12,7 +12,10 @@ use positron_governance::{
     AdministrativeIdempotencyKey, CatalogFormatMigrationAdministration, CompatibilityHints,
     PresentedCredential, RequestedIntent, ResourceGeneration,
 };
-use positron_governance::{Identity, IngestPolicyAdministration};
+use positron_governance::{
+    DurableOperationAdministration, DurableOperationFailure, DurableOperationRequest, Identity,
+    IngestPolicyAdministration,
+};
 use positron_ingest::{IngestPolicy, PolicyAction, PolicyRule};
 use positron_kernel::Catalog;
 use positron_kernel::FormatEpoch;
@@ -332,6 +335,161 @@ fn unauthorized_and_exact_replayed_migrations_do_not_close_data_admission()
             .enter_query_execution_for(instance.default_tenant_id(), QueryCancellation::new())
             .expect("query remains admitted after replay"),
     );
+    Ok(())
+}
+
+#[test]
+fn durable_format_migration_survives_restart_with_stable_terminal_operation()
+-> Result<(), Box<dyn Error>> {
+    let fixture = LegacyFixtureRoots::from_f9_fixture()?;
+    let paths = fixture.paths()?;
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    let key = AdministrativeIdempotencyKey::new([0xc4; 16])?;
+    let operation = instance.migrate_catalog_to_epoch_two_as_operation(
+        instance.attribute(
+            PresentedCredential::parse(claim.secret())?,
+            RequestedIntent::SystemAdministration,
+            CompatibilityHints::none(),
+        )?,
+        key,
+    )?;
+    assert_eq!(
+        operation.status(),
+        positron_governance::DurableOperationStatus::Succeeded
+    );
+    assert_eq!(operation.progress_percent(), 100);
+    assert_eq!(
+        operation.irreversible_boundary(),
+        positron_governance::DurableOperationBoundary::CatalogGenerationPublished
+    );
+    assert!(
+        !format!("{operation:?}").contains(claim.secret()),
+        "durable operation inspection must never retain or expose an API-key secret"
+    );
+    drop(instance);
+
+    let reopened = InstanceBootstrap::reopen(&paths)?;
+    let replay = reopened.migrate_catalog_to_epoch_two_as_operation(
+        reopened.attribute(
+            PresentedCredential::parse(claim.secret())?,
+            RequestedIntent::SystemAdministration,
+            CompatibilityHints::none(),
+        )?,
+        key,
+    )?;
+    assert_eq!(replay.operation_id(), operation.operation_id());
+    assert_eq!(
+        replay.status(),
+        positron_governance::DurableOperationStatus::Succeeded
+    );
+    Ok(())
+}
+
+#[test]
+fn durable_operation_cancels_before_drain_and_rejects_a_changed_same_key_request()
+-> Result<(), Box<dyn Error>> {
+    let fixture = LegacyFixtureRoots::from_f9_fixture()?;
+    let paths = fixture.paths()?;
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    let actor = instance.attribute(
+        PresentedCredential::parse(claim.secret())?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let catalog = Catalog::open(
+        &instance._authority,
+        instance.instance,
+        instance.key.catalog_secret(instance.instance)?,
+    )?;
+    let key = AdministrativeIdempotencyKey::new([0xc5; 16])?;
+    let accepted_generation = catalog.pin()?.number();
+    let request = DurableOperationRequest::catalog_format_migration(
+        actor.principal_id(),
+        key,
+        accepted_generation,
+        17,
+    )?;
+    let accepted =
+        DurableOperationAdministration::accept_catalog_format_migration(&catalog, actor, request)?;
+    assert_eq!(
+        DurableOperationAdministration::accept_catalog_format_migration(
+            &catalog,
+            actor,
+            DurableOperationRequest::catalog_format_migration(
+                actor.principal_id(),
+                key,
+                accepted_generation.saturating_add(1),
+                18,
+            )?,
+        )
+        .expect_err("a changed target generation cannot reuse an accepted key"),
+        DurableOperationFailure::IdempotencyConflict
+    );
+    let cancelled =
+        DurableOperationAdministration::cancel(&catalog, actor, accepted.operation_id(), 18)?;
+    assert_eq!(
+        cancelled.status(),
+        positron_governance::DurableOperationStatus::Cancelled
+    );
+    assert_eq!(
+        cancelled.cancellation(),
+        positron_governance::DurableOperationCancellation::Cancelled
+    );
+    Ok(())
+}
+
+#[test]
+fn durable_operation_reattaches_a_persisted_running_checkpoint_after_restart()
+-> Result<(), Box<dyn Error>> {
+    let fixture = LegacyFixtureRoots::from_f9_fixture()?;
+    let paths = fixture.paths()?;
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    let actor = instance.attribute(
+        PresentedCredential::parse(claim.secret())?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let catalog = Catalog::open(
+        &instance._authority,
+        instance.instance,
+        instance.key.catalog_secret(instance.instance)?,
+    )?;
+    let key = AdministrativeIdempotencyKey::new([0xc6; 16])?;
+    let request = DurableOperationRequest::catalog_format_migration(
+        actor.principal_id(),
+        key,
+        catalog.pin()?.number(),
+        17,
+    )?;
+    let accepted =
+        DurableOperationAdministration::accept_catalog_format_migration(&catalog, actor, request)?;
+    let running =
+        DurableOperationAdministration::begin(&catalog, actor, accepted.operation_id(), 18)?;
+    assert_eq!(
+        running.status(),
+        positron_governance::DurableOperationStatus::Running
+    );
+    drop(catalog);
+    drop(instance);
+
+    let reopened = InstanceBootstrap::reopen(&paths)?;
+    let completed = reopened.migrate_catalog_to_epoch_two_as_operation(
+        reopened.attribute(
+            PresentedCredential::parse(claim.secret())?,
+            RequestedIntent::SystemAdministration,
+            CompatibilityHints::none(),
+        )?,
+        key,
+    )?;
+    assert_eq!(completed.operation_id(), accepted.operation_id());
+    assert_eq!(
+        completed.status(),
+        positron_governance::DurableOperationStatus::Succeeded
+    );
+    assert_eq!(completed.progress_percent(), 100);
     Ok(())
 }
 

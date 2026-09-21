@@ -13,6 +13,7 @@ use positron_domain::identity::{ExternalTenantAlias, PrincipalId, TenantId, Tena
 
 mod api_key_administration;
 mod audit;
+mod durable_operation_administration;
 mod format_migration_administration;
 mod identity;
 mod listener_transport_administration;
@@ -37,6 +38,14 @@ pub use audit::{
     ListenerTransportConfigurationProvenance, SchemaCheckpointAuditEntry,
     SystemAuditRetentionUpdateAuditEntry, TenantDisplayNameUpdateAuditEntry,
     TenantQuotaUpdateAuditEntry, schema_checkpoint_audit_intent,
+};
+#[cfg(fuzzing)]
+pub use durable_operation_administration::fuzz_durable_operation_record;
+pub use durable_operation_administration::{
+    DurableOperation, DurableOperationAdministration, DurableOperationBoundary,
+    DurableOperationCancellation, DurableOperationFailure, DurableOperationKind,
+    DurableOperationLookupRetention, DurableOperationPhase, DurableOperationRequest,
+    DurableOperationReservation, DurableOperationRetry, DurableOperationStatus, OperationId,
 };
 pub use format_migration_administration::{
     CatalogFormatMigration, CatalogFormatMigrationAdministration, CatalogFormatMigrationFailure,

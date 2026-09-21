@@ -1,6 +1,103 @@
 use super::*;
 
 impl InitializedInstance {
+    /// Accepts, checkpoints, and resumes the existing catalog-format handler.
+    ///
+    /// Cancellation is possible only while the record remains `Pending`.
+    /// Once data admission has drained, the operation records that cancellation
+    /// cannot undo a future published Catalog generation. Every checkpoint and
+    /// the handler publication acquire the kernel's catalog-commit recovery
+    /// reservation; restart reattaches by the original idempotency key.
+    pub fn migrate_catalog_to_epoch_two_as_operation(
+        &self,
+        actor: AuthorizedContext,
+        idempotency: AdministrativeIdempotencyKey,
+    ) -> Result<DurableOperation, BootstrapFailure> {
+        let secret = self
+            .key
+            .catalog_secret(self.instance)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
+        let catalog = Catalog::open(&self._authority, self.instance, secret)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        let now = self.operation_time_seconds()?;
+        let operation =
+            match DurableOperationAdministration::inspect_by_idempotency(&catalog, idempotency)
+                .map_err(map_durable_operation_failure)?
+            {
+                Some(existing) => {
+                    if existing.request().principal() != actor.principal_id() {
+                        return Err(BootstrapFailure::new(
+                            BootstrapFailureCode::ApiKeyIdempotencyConflict,
+                        ));
+                    }
+                    existing
+                },
+                None => {
+                    let generation = catalog
+                        .pin()
+                        .map_err(|_| {
+                            BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable)
+                        })?
+                        .number();
+                    let request = DurableOperationRequest::catalog_format_migration(
+                        actor.principal_id(),
+                        idempotency,
+                        generation,
+                        now,
+                    )
+                    .map_err(map_durable_operation_failure)?;
+                    DurableOperationAdministration::accept_catalog_format_migration(
+                        &catalog, actor, request,
+                    )
+                    .map_err(map_durable_operation_failure)?
+                },
+            };
+        if operation.status().is_terminal() {
+            return Ok(operation);
+        }
+        let operation = if operation.status() == DurableOperationStatus::Pending {
+            DurableOperationAdministration::begin(&catalog, actor, operation.operation_id(), now)
+                .map_err(map_durable_operation_failure)?
+        } else {
+            operation
+        };
+        let _drain = self.tenant_drains.close_all_and_drain()?;
+        let operation =
+            if operation.phase() == positron_governance::DurableOperationPhase::Preflight {
+                DurableOperationAdministration::mark_drained(
+                    &catalog,
+                    actor,
+                    operation.operation_id(),
+                    now,
+                )
+                .map_err(map_durable_operation_failure)?
+            } else {
+                operation
+            };
+        CatalogFormatMigrationAdministration::migrate_to_epoch_two(
+            &catalog,
+            self.administrator,
+            actor,
+            idempotency,
+        )
+        .map_err(map_catalog_format_migration_failure)?;
+        DurableOperationAdministration::succeed_catalog_format_migration(
+            &catalog,
+            actor,
+            operation.operation_id(),
+            now,
+        )
+        .map_err(map_durable_operation_failure)
+    }
+
+    fn operation_time_seconds(&self) -> Result<u64, BootstrapFailure> {
+        let scope =
+            positron_kernel::SegmentScope::new(self.tenant, SignalKind::Logs, self.logs_shard);
+        self.retention_time
+            .governance_time_seconds(scope)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))
+    }
+
     /// Publishes the concrete V1-to-V2 Catalog transformation while both
     /// native data admission gates are closed. Broader upgrade orchestration
     /// remains outside this narrowly scoped format transition.
