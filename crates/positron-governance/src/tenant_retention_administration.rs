@@ -456,6 +456,10 @@ pub(crate) fn legacy_receipt_object(
     CatalogObject::new(bytes).map_err(map_catalog)
 }
 
+pub(crate) fn retention_terminal_key(bytes: &[u8]) -> Result<Option<[u8; 16]>, ()> {
+    crate::audit::terminal_receipt_key(bytes, &[(RECEIPT_MAGIC, RECEIPT_BYTES, 8)])
+}
+
 fn decode_receipt(bytes: &[u8]) -> Result<RetentionReceipt, TenantRetentionAdministrationFailure> {
     if bytes.len() != RECEIPT_BYTES {
         return Err(TenantRetentionAdministrationFailure::PersistenceUnavailable);

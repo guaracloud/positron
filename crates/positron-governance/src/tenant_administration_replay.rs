@@ -157,6 +157,10 @@ pub(crate) fn legacy_receipt_object(
     .map_err(map_catalog)
 }
 
+pub(crate) fn retention_terminal_key(bytes: &[u8]) -> Result<Option<[u8; 16]>, ()> {
+    crate::audit::terminal_receipt_key(bytes, &[(TENANT_RECEIPT_MAGIC, 112, 8)])
+}
+
 fn encode_terminal_receipt(
     idempotency: AdministrativeIdempotencyKey,
     actor: PrincipalId,

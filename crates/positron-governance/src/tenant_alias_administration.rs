@@ -424,6 +424,10 @@ pub(crate) fn legacy_receipt_object(
     CatalogObject::new(encoded).map_err(map_catalog)
 }
 
+pub(crate) fn retention_terminal_key(bytes: &[u8]) -> Result<Option<[u8; 16]>, ()> {
+    crate::audit::terminal_receipt_key(bytes, &[(RECEIPT_MAGIC_V2, RECEIPT_V2_BYTES, 16)])
+}
+
 fn replay(
     catalog: &Catalog<'_>,
     snapshot: &CatalogSnapshot,

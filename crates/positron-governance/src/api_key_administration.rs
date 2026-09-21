@@ -41,6 +41,13 @@ pub(crate) fn legacy_receipt_object(
     })
 }
 
+pub(crate) fn retention_terminal_key(bytes: &[u8]) -> Result<Option<[u8; 16]>, ()> {
+    crate::audit::terminal_receipt_key(
+        bytes,
+        &[(api_key_administration_receipt::RECEIPT_MAGIC, 156, 8)],
+    )
+}
+
 pub(crate) struct TenantCredentialIdentity {
     pub(crate) tenant: TenantId,
     pub(crate) credentials: Vec<CatalogCredential>,

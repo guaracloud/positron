@@ -86,6 +86,7 @@ impl Identity {
         context: AuthorizedContext,
     ) -> Result<PrincipalId, AttributionFailure> {
         if context.authority == self.instance
+            && context.generation == self.generation
             && context.scope == Scope::SystemAdministration
             && context.principal == self.principal
             && context.tenant.is_none()
@@ -120,7 +121,7 @@ impl Identity {
         tenant: TenantId,
     ) -> Result<PrincipalId, AttributionFailure> {
         let lifecycle = self.tenant_lifecycle(tenant).ok_or(AttributionFailure)?;
-        if context.authority != self.instance {
+        if context.authority != self.instance || context.generation != self.generation {
             return Err(AttributionFailure);
         }
         match context.scope {
@@ -541,6 +542,7 @@ impl Identity {
             || context.scope != Scope::SystemAdministration
             || context.tenant.is_some()
             || context.authority != self.instance
+            || context.generation != self.generation
             || !self.credentials.iter().any(|credential| {
                 credential.principal == context.principal
                     && credential.scope == Scope::SystemAdministration

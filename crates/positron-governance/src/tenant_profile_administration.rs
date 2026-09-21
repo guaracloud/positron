@@ -519,6 +519,17 @@ pub(crate) fn legacy_receipt_object(
     .map_err(map_catalog)
 }
 
+pub(crate) fn retention_terminal_key(bytes: &[u8]) -> Result<Option<[u8; 16]>, ()> {
+    crate::audit::terminal_receipt_key(
+        bytes,
+        &[(
+            TENANT_DISPLAY_RECEIPT_MAGIC,
+            TENANT_DISPLAY_RECEIPT_BYTES,
+            8,
+        )],
+    )
+}
+
 const fn unavailable() -> TenantProfileAdministrationFailure {
     TenantProfileAdministrationFailure::new(
         TenantProfileAdministrationFailureCode::PersistenceUnavailable,

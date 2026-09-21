@@ -43,6 +43,17 @@ pub(crate) fn legacy_receipt_object(
     })
 }
 
+pub(crate) fn retention_terminal_key(bytes: &[u8]) -> Result<Option<[u8; 16]>, ()> {
+    crate::audit::terminal_receipt_key(
+        bytes,
+        &[(
+            tenant_lifecycle_administration_receipt::RECEIPT_MAGIC,
+            122,
+            8,
+        )],
+    )
+}
+
 /// The result of one durably published tenant lifecycle transition.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TenantLifecycleTransition {

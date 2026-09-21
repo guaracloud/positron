@@ -6,9 +6,12 @@ use positron_governance::{
     AdministrativeIdempotencyKey, CompatibilityHints, PresentedCredential, RequestedIntent,
     ResourceGeneration,
 };
-use positron_kernel::{CatalogPublicationFault, with_catalog_publication_fault_after};
+use positron_kernel::{
+    CatalogObject, CatalogProposal, CatalogPublicationFault, FormatEpoch, TransactionId,
+    with_catalog_publication_fault_after,
+};
 
-use super::schema_maintenance::Fixture;
+use super::schema_maintenance::{Fixture, open_catalog};
 use crate::BootstrapFailureCode;
 
 #[test]
@@ -171,6 +174,120 @@ fn retained_audit_verifier_accepts_the_prior_trusted_anchor_and_rejects_a_foreig
         .verify_governance_audit_history(actor, Some(&foreign_checkpoint))
         .expect_err("a trusted checkpoint from another instance is rollback evidence");
     assert_eq!(failure.code(), BootstrapFailureCode::CatalogUnavailable);
+    Ok(())
+}
+
+#[test]
+fn system_audit_contexts_are_identity_generation_bound_but_survive_unrelated_catalog_changes()
+-> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let (initialized, _, _, administrator_secret) = fixture.initialized_with_admin()?;
+    let stale = initialized.attribute(
+        PresentedCredential::parse(&administrator_secret)?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    initialized.create_api_key(
+        stale,
+        Scope::Query,
+        None,
+        ResourceGeneration::new(1)?,
+        AdministrativeIdempotencyKey::new([0xe1; 16])?,
+    )?;
+
+    let rejected_reader = initialized
+        .inspect_governance_audit_history(stale)
+        .expect_err("a system context predating an identity successor cannot read audit history");
+    assert_eq!(
+        rejected_reader.code(),
+        BootstrapFailureCode::ApiKeyUnauthorized
+    );
+    let rejected_retention = initialized
+        .update_system_audit_retention(
+            stale,
+            NonZeroU64::new(2).ok_or("nonzero retained audit-record limit")?,
+            ResourceGeneration::new(1)?,
+            AdministrativeIdempotencyKey::new([0xe2; 16])?,
+        )
+        .expect_err("a system context predating an identity successor cannot mutate retention");
+    assert_eq!(
+        rejected_retention.code(),
+        BootstrapFailureCode::SystemAuditRetentionUnauthorized
+    );
+
+    let current = initialized.attribute(
+        PresentedCredential::parse(&administrator_secret)?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    initialized.update_system_audit_retention(
+        current,
+        NonZeroU64::new(2).ok_or("nonzero retained audit-record limit")?,
+        ResourceGeneration::new(1)?,
+        AdministrativeIdempotencyKey::new([0xe3; 16])?,
+    )?;
+    assert!(
+        !initialized
+            .inspect_governance_audit_history(current)?
+            .records()
+            .is_empty(),
+        "a catalog-only audit-retention successor does not invalidate its identity context"
+    );
+    Ok(())
+}
+
+#[test]
+fn tenant_audit_context_is_identity_generation_bound() -> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let (initialized, _, _, administrator_secret) = fixture.initialized_with_admin()?;
+    let system = initialized.attribute(
+        PresentedCredential::parse(&administrator_secret)?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let tenant_key = initialized.create_api_key_for_tenant(
+        system,
+        initialized.default_tenant_id(),
+        Scope::TenantAdministration,
+        None,
+        ResourceGeneration::new(1)?,
+        AdministrativeIdempotencyKey::new([0xe4; 16])?,
+    )?;
+    let tenant_secret = tenant_key.secret().ok_or("tenant administrator secret")?;
+    let stale_tenant = initialized.attribute(
+        PresentedCredential::parse(tenant_secret)?,
+        RequestedIntent::TenantAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let system = initialized.attribute(
+        PresentedCredential::parse(&administrator_secret)?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    initialized.create_api_key(
+        system,
+        Scope::Query,
+        None,
+        ResourceGeneration::new(2)?,
+        AdministrativeIdempotencyKey::new([0xe5; 16])?,
+    )?;
+
+    let denied = initialized
+        .inspect_governance_audit_history(stale_tenant)
+        .expect_err("an active tenant credential still requires a current identity context");
+    assert_eq!(denied.code(), BootstrapFailureCode::ApiKeyUnauthorized);
+    let current_tenant = initialized.attribute(
+        PresentedCredential::parse(tenant_secret)?,
+        RequestedIntent::TenantAdministration,
+        CompatibilityHints::none(),
+    )?;
+    assert!(
+        initialized
+            .inspect_governance_audit_history(current_tenant)?
+            .records()
+            .iter()
+            .all(|entry| entry.tenant_id() == Some(initialized.default_tenant_id()))
+    );
     Ok(())
 }
 
@@ -392,5 +509,179 @@ fn committed_system_audit_retention_replay_finishes_interrupted_reclamation_afte
     )?;
     assert_eq!(replay.policy_generation(), ResourceGeneration::new(3)?);
     assert_eq!(reopened.governance_audit_for_test()?.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn retention_rejects_a_mismatched_legacy_terminal_receipt_without_publishing()
+-> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let (initialized, _, _, administrator_secret) = fixture.initialized_with_admin()?;
+    let actor = initialized.attribute(
+        PresentedCredential::parse(&administrator_secret)?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    initialized.update_system_audit_retention(
+        actor,
+        NonZeroU64::new(2).ok_or("nonzero retained audit-record limit")?,
+        ResourceGeneration::new(1)?,
+        AdministrativeIdempotencyKey::new([0xe6; 16])?,
+    )?;
+    replace_system_retention_receipt_for_test(&initialized, false, [0xe7; 16])?;
+    let generation_before = initialized.catalog_generation();
+    let audit_before = initialized.governance_audit_for_test()?;
+
+    let failure = initialized
+        .update_system_audit_retention(
+            actor,
+            NonZeroU64::new(1).ok_or("nonzero retained audit-record limit")?,
+            ResourceGeneration::new(2)?,
+            AdministrativeIdempotencyKey::new([0xe8; 16])?,
+        )
+        .expect_err("a mismatched retained terminal result cannot authorize audit pruning");
+    assert_eq!(failure.code(), BootstrapFailureCode::CatalogUnavailable);
+    assert_eq!(initialized.catalog_generation(), generation_before);
+    assert_eq!(initialized.governance_audit_for_test()?, audit_before);
+    Ok(())
+}
+
+#[test]
+fn retention_rejects_duplicate_terminal_receipts_without_publishing() -> Result<(), Box<dyn Error>>
+{
+    let fixture = Fixture::new()?;
+    let (initialized, _, _, administrator_secret) = fixture.initialized_with_admin()?;
+    let actor = initialized.attribute(
+        PresentedCredential::parse(&administrator_secret)?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    initialized.update_system_audit_retention(
+        actor,
+        NonZeroU64::new(2).ok_or("nonzero retained audit-record limit")?,
+        ResourceGeneration::new(1)?,
+        AdministrativeIdempotencyKey::new([0xe9; 16])?,
+    )?;
+    replace_system_retention_receipt_for_test(&initialized, true, [0xea; 16])?;
+    let generation_before = initialized.catalog_generation();
+    let audit_before = initialized.governance_audit_for_test()?;
+
+    let failure = initialized
+        .update_system_audit_retention(
+            actor,
+            NonZeroU64::new(1).ok_or("nonzero retained audit-record limit")?,
+            ResourceGeneration::new(2)?,
+            AdministrativeIdempotencyKey::new([0xeb; 16])?,
+        )
+        .expect_err("duplicate retained terminal results cannot authorize audit pruning");
+    assert_eq!(failure.code(), BootstrapFailureCode::CatalogUnavailable);
+    assert_eq!(initialized.catalog_generation(), generation_before);
+    assert_eq!(initialized.governance_audit_for_test()?, audit_before);
+    Ok(())
+}
+
+#[test]
+fn retention_capacity_refusal_does_not_publish_a_partial_successor() -> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let (initialized, _, _, administrator_secret) = fixture.initialized_with_admin()?;
+    let actor = initialized.attribute(
+        PresentedCredential::parse(&administrator_secret)?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    fill_catalog_to_object_limit_for_test(&initialized, [0xec; 16])?;
+    let generation_before = initialized.catalog_generation();
+    let audit_before = initialized.governance_audit_for_test()?;
+
+    let failure = initialized
+        .update_system_audit_retention(
+            actor,
+            NonZeroU64::new(1).ok_or("nonzero retained audit-record limit")?,
+            ResourceGeneration::new(1)?,
+            AdministrativeIdempotencyKey::new([0xed; 16])?,
+        )
+        .expect_err("a full catalog must refuse the entire retention successor before migration");
+    assert_eq!(failure.code(), BootstrapFailureCode::CatalogUnavailable);
+    assert_eq!(initialized.catalog_generation(), generation_before);
+    assert_eq!(initialized.governance_audit_for_test()?, audit_before);
+    Ok(())
+}
+
+fn replace_system_retention_receipt_for_test(
+    initialized: &crate::InitializedInstance,
+    retain_original: bool,
+    transaction: [u8; 16],
+) -> Result<(), Box<dyn Error>> {
+    let catalog = open_catalog(initialized)?;
+    let basis = catalog.pin()?;
+    let receipt = basis
+        .object_identities()
+        .find_map(|identity| {
+            basis
+                .object(identity)
+                .ok()
+                .flatten()
+                .filter(|bytes| bytes.starts_with(b"POSARR01"))
+                .map(|bytes| (identity, bytes.to_vec()))
+        })
+        .ok_or("system audit-retention receipt")?;
+    let mut altered = receipt.1;
+    let last = altered.last_mut().ok_or("nonempty terminal receipt")?;
+    *last ^= 0x01;
+    let mut objects = basis
+        .object_identities()
+        .filter(|identity| retain_original || *identity != receipt.0)
+        .map(|identity| {
+            basis
+                .object(identity)?
+                .ok_or_else(|| "catalog object".into())
+                .and_then(|bytes| CatalogObject::new(bytes.to_vec()).map_err(Into::into))
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    objects.push(CatalogObject::new(altered)?);
+    catalog.commit(
+        basis.identity(),
+        CatalogProposal::new(
+            TransactionId::new(transaction)?,
+            FormatEpoch::CATALOG_V1,
+            objects,
+        )?,
+        None,
+    )?;
+    Ok(())
+}
+
+fn fill_catalog_to_object_limit_for_test(
+    initialized: &crate::InitializedInstance,
+    transaction: [u8; 16],
+) -> Result<(), Box<dyn Error>> {
+    const CATALOG_OBJECT_LIMIT: usize = 1_024;
+
+    let catalog = open_catalog(initialized)?;
+    let basis = catalog.pin()?;
+    let mut objects = basis
+        .object_identities()
+        .map(|identity| {
+            basis
+                .object(identity)?
+                .ok_or_else(|| "catalog object".into())
+                .and_then(|bytes| CatalogObject::new(bytes.to_vec()).map_err(Into::into))
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    objects.try_reserve_exact(CATALOG_OBJECT_LIMIT.saturating_sub(objects.len()))?;
+    while objects.len() < CATALOG_OBJECT_LIMIT {
+        let mut bytes = b"retention-capacity-fixture\0".to_vec();
+        bytes.extend_from_slice(&(objects.len() as u64).to_be_bytes());
+        objects.push(CatalogObject::new(bytes)?);
+    }
+    catalog.commit(
+        basis.identity(),
+        CatalogProposal::new(
+            TransactionId::new(transaction)?,
+            FormatEpoch::CATALOG_V1,
+            objects,
+        )?,
+        None,
+    )?;
     Ok(())
 }

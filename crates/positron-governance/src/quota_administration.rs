@@ -16,7 +16,7 @@ mod quota_administration_flow;
 mod quota_administration_publication;
 #[path = "quota_administration_receipt.rs"]
 mod quota_administration_receipt;
-pub(crate) use quota_administration_receipt::legacy_receipt_object;
+pub(crate) use quota_administration_receipt::{legacy_receipt_object, retention_terminal_key};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TenantQuotaUpdate {

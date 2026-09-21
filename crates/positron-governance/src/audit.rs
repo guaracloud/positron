@@ -35,6 +35,33 @@ const TENANT_ALIAS_MAGIC: [u8; 8] = *b"POSALI01";
 const TENANT_RETENTION_MAGIC: [u8; 8] = *b"POSTRT01";
 const SYSTEM_AUDIT_RETENTION_MAGIC: [u8; 8] = *b"POSAR001";
 
+/// Extracts a terminal receipt's idempotency key only after its owning codec
+/// has recognized the supported receipt version and key location. Callers use
+/// the key solely to locate a candidate; the Catalog object identity then
+/// proves the complete typed terminal result.
+pub(crate) fn terminal_receipt_key(
+    bytes: &[u8],
+    versions: &[([u8; 8], usize, usize)],
+) -> Result<Option<[u8; 16]>, ()> {
+    let Some((_, encoded_bytes, key_offset)) = versions
+        .iter()
+        .find(|(magic, _, _)| bytes.starts_with(magic))
+    else {
+        return Ok(None);
+    };
+    if bytes.len() != *encoded_bytes {
+        return Err(());
+    }
+    let key: [u8; 16] = bytes
+        .get(*key_offset..key_offset.saturating_add(16))
+        .and_then(|value| value.try_into().ok())
+        .ok_or(())?;
+    if key.iter().all(|byte| *byte == 0) {
+        return Err(());
+    }
+    Ok(Some(key))
+}
+
 /// Bounded, non-secret metadata for the initial instance operation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InitialAuditMetadata {

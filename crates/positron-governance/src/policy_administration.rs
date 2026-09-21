@@ -11,8 +11,8 @@ use positron_kernel::{
 use positron_policy::IngestPolicy;
 
 mod codec;
-pub(crate) use codec::legacy_receipt_object;
 use codec::{ActivationSemantics, encode_audit, encode_receipt, find_receipt, request_digest};
+pub(crate) use codec::{legacy_receipt_object, retention_terminal_key};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ResourceGeneration(u64);

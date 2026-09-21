@@ -51,9 +51,9 @@ pub use storage::{
     with_catalog_publication_ambiguity_hook_after, with_catalog_publication_fault_after,
     with_catalog_publication_fault_sequence_after, with_catalog_publication_hook_after,
 };
-use types::AuditFrontier;
 #[cfg(feature = "test-support")]
 pub use types::GovernanceFixtureObject;
+use types::{AuditFrontier, MAX_CATALOG_OBJECTS};
 pub use types::{
     AuditIntent, CatalogCommit, CatalogFailure, CatalogFailureCode, CatalogGenerationId,
     CatalogObject, CatalogObjectId, CatalogProposal, CatalogRotation, CatalogSecret,
@@ -88,6 +88,38 @@ const MAX_GENERATIONS: usize = storage::MAX_GENERATIONS;
 const MAX_RETAINED_HISTORY_BYTES: usize = 16_777_216;
 const MAX_RECOVERY_MEMORY_BYTES: u64 = 70_000_000;
 const MAX_RECOVERY_ITEMS: u64 = 65_540;
+
+impl CatalogSnapshot {
+    /// Returns the exact number of supplemental terminal receipts that can be
+    /// included in the next system audit-retention publication. The policy,
+    /// retention anchor, and reclamation receipt are replaced atomically, so
+    /// they do not consume capacity from the successor proposal.
+    pub fn system_audit_retention_receipt_capacity(
+        &self,
+        will_reclaim_audit: bool,
+    ) -> Result<usize, CatalogFailure> {
+        let existing_anchor = audit_checkpoint::retention_anchor(self)?.is_some();
+        let removed = self
+            .plaintext_objects()
+            .filter(|object| {
+                AuditRetentionAnchor::is_encoded(object)
+                    || SystemAuditRetentionPolicy::is_encoded(object)
+                    || audit_checkpoint::AuditRetentionReclamationReceipt::is_encoded(object)
+            })
+            .count();
+        let retained = self
+            .plaintext_object_count()
+            .checked_sub(removed)
+            .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::IntegrityCorruption))?;
+        let replacement = 1_usize
+            .checked_add(usize::from(existing_anchor || will_reclaim_audit).saturating_mul(2))
+            .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?;
+        MAX_CATALOG_OBJECTS
+            .checked_sub(retained)
+            .and_then(|capacity| capacity.checked_sub(replacement))
+            .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::LimitExceeded))
+    }
+}
 
 /// The only Release 1 authority that publishes Catalog Generations.
 pub struct Catalog<'authority> {

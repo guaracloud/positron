@@ -1,5 +1,6 @@
 //! Administration-owned intent and durable replay for system audit retention.
 
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::num::NonZeroU64;
@@ -142,7 +143,19 @@ impl SystemAuditRetentionAdministration {
             .map_err(|_| SystemAuditRetentionAdministrationFailure::CapacityExceeded)?;
         let excess = records.len().saturating_add(1).saturating_sub(limit);
         let last_removed = excess.checked_sub(1).and_then(|index| records.get(index));
-        let migrated_receipts = migrate_pruned_receipts(&snapshot, &records[..excess])?;
+        let supplemental_capacity = snapshot
+            .system_audit_retention_receipt_capacity(last_removed.is_some())
+            .map_err(map_catalog)?;
+        let migration_capacity = supplemental_capacity
+            .checked_sub(1)
+            .ok_or(SystemAuditRetentionAdministrationFailure::CapacityExceeded)?;
+        let receipt_index = terminal_receipt_index(&snapshot)?;
+        let migrated_receipts = migrate_pruned_receipts(
+            &snapshot,
+            &records[..excess],
+            &receipt_index,
+            migration_capacity,
+        )?;
         let audit_position = snapshot
             .governance_audit_frontier()
             .checked_add(1)
@@ -192,13 +205,18 @@ impl SystemAuditRetentionAdministration {
 fn migrate_pruned_receipts(
     snapshot: &CatalogSnapshot,
     records: &[positron_kernel::GovernanceAuditRecord],
+    index: &TerminalReceiptIndex,
+    capacity: usize,
 ) -> Result<Vec<CatalogObject>, SystemAuditRetentionAdministrationFailure> {
     let mut migrated = Vec::new();
+    migrated
+        .try_reserve_exact(records.len().min(capacity))
+        .map_err(|_| SystemAuditRetentionAdministrationFailure::CapacityExceeded)?;
     for record in records {
         let entry = GovernanceAuditEntry::decode(record)
             .map_err(|_| SystemAuditRetentionAdministrationFailure::PersistenceUnavailable)?;
         if let GovernanceAuditEntry::SystemAuditRetentionUpdate(entry) = &entry {
-            if has_system_retention_receipt(snapshot, entry)? {
+            if has_system_retention_receipt(snapshot, entry, index)? {
                 continue;
             }
             return Err(SystemAuditRetentionAdministrationFailure::PersistenceUnavailable);
@@ -206,8 +224,11 @@ fn migrate_pruned_receipts(
         let Some(receipt) = receipt_for_pruned_entry(&entry, record.transaction())? else {
             continue;
         };
-        if has_exact_terminal_receipt(snapshot, &receipt)? {
+        if index.has_exact(&receipt)? {
             continue;
+        }
+        if migrated.len() == capacity {
+            return Err(SystemAuditRetentionAdministrationFailure::CapacityExceeded);
         }
         migrated.push(receipt.object);
     }
@@ -217,10 +238,19 @@ fn migrate_pruned_receipts(
 fn has_system_retention_receipt(
     snapshot: &CatalogSnapshot,
     entry: &crate::audit::SystemAuditRetentionUpdateAuditEntry,
+    index: &TerminalReceiptIndex,
 ) -> Result<bool, SystemAuditRetentionAdministrationFailure> {
-    let Some(receipt) = find_receipt(snapshot, entry.idempotency_key())? else {
+    let Some(identity) = index.get(
+        TerminalReceiptKind::SystemAuditRetention,
+        entry.idempotency_key().to_bytes(),
+    ) else {
         return Ok(false);
     };
+    let bytes = snapshot
+        .object(identity)
+        .map_err(map_catalog)?
+        .ok_or(SystemAuditRetentionAdministrationFailure::PersistenceUnavailable)?;
+    let (_, receipt) = decode_receipt(bytes)?;
     if receipt.actor != entry.actor_id()
         || receipt.expected_generation != entry.expected_generation()
         || receipt.generation != entry.generation()
@@ -235,66 +265,172 @@ fn has_system_retention_receipt(
 
 struct MigratedReceipt {
     object: CatalogObject,
-    magic: [u8; 8],
+    kind: TerminalReceiptKind,
     key: [u8; 16],
-    key_offset: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum TerminalReceiptKind {
+    SystemAuditRetention,
+    TenantCreation,
+    TenantDisplayName,
+    CatalogFormatMigration,
+    IngestPolicyActivation,
+    TenantQuota,
+    TenantAlias,
+    TenantRetention,
+    ListenerTransport,
+    ApiKeyLifecycle,
+    TenantLifecycle,
+}
+
+impl TerminalReceiptKind {
+    const ALL: [Self; 11] = [
+        Self::SystemAuditRetention,
+        Self::TenantCreation,
+        Self::TenantDisplayName,
+        Self::CatalogFormatMigration,
+        Self::IngestPolicyActivation,
+        Self::TenantQuota,
+        Self::TenantAlias,
+        Self::TenantRetention,
+        Self::ListenerTransport,
+        Self::ApiKeyLifecycle,
+        Self::TenantLifecycle,
+    ];
+
+    fn key(
+        self,
+        bytes: &[u8],
+    ) -> Result<Option<[u8; 16]>, SystemAuditRetentionAdministrationFailure> {
+        let key = match self {
+            Self::SystemAuditRetention => {
+                crate::audit::terminal_receipt_key(bytes, &[(RECEIPT_MAGIC, RECEIPT_BYTES, 8)])
+            },
+            Self::TenantCreation => crate::tenant_administration::retention_terminal_key(bytes),
+            Self::TenantDisplayName => {
+                crate::tenant_profile_administration::retention_terminal_key(bytes)
+            },
+            Self::CatalogFormatMigration => {
+                crate::format_migration_administration::retention_terminal_key(bytes)
+            },
+            Self::IngestPolicyActivation => {
+                crate::policy_administration::retention_terminal_key(bytes)
+            },
+            Self::TenantQuota => crate::quota_administration::retention_terminal_key(bytes),
+            Self::TenantAlias => crate::tenant_alias_administration::retention_terminal_key(bytes),
+            Self::TenantRetention => {
+                crate::tenant_retention_administration::retention_terminal_key(bytes)
+            },
+            Self::ListenerTransport => {
+                crate::listener_transport_administration::retention_terminal_key(bytes)
+            },
+            Self::ApiKeyLifecycle => crate::api_key_administration::retention_terminal_key(bytes),
+            Self::TenantLifecycle => {
+                crate::tenant_lifecycle_administration::retention_terminal_key(bytes)
+            },
+        };
+        key.map_err(|_| SystemAuditRetentionAdministrationFailure::PersistenceUnavailable)
+    }
+}
+
+struct TerminalReceiptIndex {
+    entries: HashMap<(TerminalReceiptKind, [u8; 16]), positron_kernel::CatalogObjectId>,
+}
+
+impl TerminalReceiptIndex {
+    fn get(
+        &self,
+        kind: TerminalReceiptKind,
+        key: [u8; 16],
+    ) -> Option<positron_kernel::CatalogObjectId> {
+        self.entries.get(&(kind, key)).copied()
+    }
+
+    fn has_exact(
+        &self,
+        expected: &MigratedReceipt,
+    ) -> Result<bool, SystemAuditRetentionAdministrationFailure> {
+        match self.get(expected.kind, expected.key) {
+            None => Ok(false),
+            Some(identity) if identity == expected.object.identity() => Ok(true),
+            Some(_) => Err(SystemAuditRetentionAdministrationFailure::PersistenceUnavailable),
+        }
+    }
+}
+
+fn terminal_receipt_index(
+    snapshot: &CatalogSnapshot,
+) -> Result<TerminalReceiptIndex, SystemAuditRetentionAdministrationFailure> {
+    let mut entries = HashMap::new();
+    entries
+        .try_reserve(snapshot.object_count())
+        .map_err(|_| SystemAuditRetentionAdministrationFailure::CapacityExceeded)?;
+    for identity in snapshot.object_identities() {
+        let bytes = snapshot
+            .object(identity)
+            .map_err(map_catalog)?
+            .ok_or(SystemAuditRetentionAdministrationFailure::PersistenceUnavailable)?;
+        for kind in TerminalReceiptKind::ALL {
+            let Some(key) = kind.key(bytes)? else {
+                continue;
+            };
+            if entries.insert((kind, key), identity).is_some() {
+                return Err(SystemAuditRetentionAdministrationFailure::PersistenceUnavailable);
+            }
+        }
+    }
+    Ok(TerminalReceiptIndex { entries })
 }
 
 fn receipt_for_pruned_entry(
     entry: &GovernanceAuditEntry,
     transaction: TransactionId,
 ) -> Result<Option<MigratedReceipt>, SystemAuditRetentionAdministrationFailure> {
-    let (object, magic, key_offset, key) = match entry {
+    let (object, kind, key) = match entry {
         GovernanceAuditEntry::Initialization(_)
         | GovernanceAuditEntry::CatalogRootRotation(_)
         | GovernanceAuditEntry::SchemaCheckpoint(_) => return Ok(None),
         GovernanceAuditEntry::TenantCreation(entry) => (
             crate::tenant_administration::legacy_receipt_object(entry)
                 .map_err(|_| SystemAuditRetentionAdministrationFailure::PersistenceUnavailable)?,
-            *b"POSTRR01",
-            8,
+            TerminalReceiptKind::TenantCreation,
             entry.idempotency_key().to_bytes(),
         ),
         GovernanceAuditEntry::TenantDisplayNameUpdate(entry) => (
             crate::tenant_profile_administration::legacy_receipt_object(entry)
                 .map_err(|_| SystemAuditRetentionAdministrationFailure::PersistenceUnavailable)?,
-            *b"POSTDR01",
-            8,
+            TerminalReceiptKind::TenantDisplayName,
             entry.idempotency_key().to_bytes(),
         ),
         GovernanceAuditEntry::CatalogFormatMigration(entry) => (
             crate::format_migration_administration::legacy_receipt_object(entry)
                 .map_err(|_| SystemAuditRetentionAdministrationFailure::PersistenceUnavailable)?,
-            *b"POSFMR01",
-            8,
+            TerminalReceiptKind::CatalogFormatMigration,
             entry.idempotency_key().to_bytes(),
         ),
         GovernanceAuditEntry::IngestPolicyActivation(entry) => (
             crate::policy_administration::legacy_receipt_object(entry)
                 .map_err(|_| SystemAuditRetentionAdministrationFailure::PersistenceUnavailable)?,
-            *b"POSPID02",
-            8,
+            TerminalReceiptKind::IngestPolicyActivation,
             entry.idempotency_key().to_bytes(),
         ),
         GovernanceAuditEntry::TenantQuotaUpdate(entry) => (
             crate::quota_administration::legacy_receipt_object(entry)
                 .map_err(|_| SystemAuditRetentionAdministrationFailure::PersistenceUnavailable)?,
-            *b"POSQUR02",
-            8,
+            TerminalReceiptKind::TenantQuota,
             entry.idempotency_key().to_bytes(),
         ),
         GovernanceAuditEntry::TenantAliasBinding(entry) => (
             crate::tenant_alias_administration::legacy_receipt_object(entry)
                 .map_err(|_| SystemAuditRetentionAdministrationFailure::PersistenceUnavailable)?,
-            *b"POSALR02",
-            16,
+            TerminalReceiptKind::TenantAlias,
             entry.idempotency_key().to_bytes(),
         ),
         GovernanceAuditEntry::TenantRetentionUpdate(entry) => (
             crate::tenant_retention_administration::legacy_receipt_object(entry)
                 .map_err(|_| SystemAuditRetentionAdministrationFailure::PersistenceUnavailable)?,
-            *b"POSTTR01",
-            8,
+            TerminalReceiptKind::TenantRetention,
             entry.idempotency_key().to_bytes(),
         ),
         GovernanceAuditEntry::ListenerTransport(entry) => {
@@ -308,23 +444,20 @@ fn receipt_for_pruned_entry(
                 crate::listener_transport_administration::legacy_receipt_object(entry).map_err(
                     |_| SystemAuditRetentionAdministrationFailure::PersistenceUnavailable,
                 )?,
-                *b"POSLTR01",
-                8,
+                TerminalReceiptKind::ListenerTransport,
                 key,
             )
         },
         GovernanceAuditEntry::ApiKeyLifecycle(entry) => (
             crate::api_key_administration::legacy_receipt_object(entry)
                 .map_err(|_| SystemAuditRetentionAdministrationFailure::PersistenceUnavailable)?,
-            *b"POSKRR01",
-            8,
+            TerminalReceiptKind::ApiKeyLifecycle,
             entry.idempotency_key().to_bytes(),
         ),
         GovernanceAuditEntry::TenantLifecycle(entry) => (
             crate::tenant_lifecycle_administration::legacy_receipt_object(entry)
                 .map_err(|_| SystemAuditRetentionAdministrationFailure::PersistenceUnavailable)?,
-            *b"POSLRR01",
-            8,
+            TerminalReceiptKind::TenantLifecycle,
             entry.idempotency_key().to_bytes(),
         ),
         // A system-retention record is handled above: its existing compact
@@ -333,56 +466,7 @@ fn receipt_for_pruned_entry(
             return Err(SystemAuditRetentionAdministrationFailure::PersistenceUnavailable);
         },
     };
-    Ok(Some(MigratedReceipt {
-        object,
-        magic,
-        key,
-        key_offset,
-    }))
-}
-
-fn has_exact_terminal_receipt(
-    snapshot: &CatalogSnapshot,
-    expected: &MigratedReceipt,
-) -> Result<bool, SystemAuditRetentionAdministrationFailure> {
-    let expected_identity = expected.object.identity();
-    let mut found = false;
-    for identity in snapshot.object_identities() {
-        let bytes = snapshot
-            .object(identity)
-            .map_err(map_catalog)?
-            .ok_or(SystemAuditRetentionAdministrationFailure::PersistenceUnavailable)?;
-        let matched = receipt_identity_matches(expected, expected_identity, identity, bytes)?;
-        if !matched {
-            continue;
-        }
-        if found {
-            return Err(SystemAuditRetentionAdministrationFailure::PersistenceUnavailable);
-        }
-        found = true;
-    }
-    Ok(found)
-}
-
-fn receipt_identity_matches(
-    expected: &MigratedReceipt,
-    expected_identity: positron_kernel::CatalogObjectId,
-    identity: positron_kernel::CatalogObjectId,
-    bytes: &[u8],
-) -> Result<bool, SystemAuditRetentionAdministrationFailure> {
-    if bytes.get(..8) != Some(expected.magic.as_slice()) {
-        return Ok(false);
-    }
-    let key = bytes
-        .get(expected.key_offset..expected.key_offset + 16)
-        .ok_or(SystemAuditRetentionAdministrationFailure::PersistenceUnavailable)?;
-    if key != expected.key {
-        return Ok(false);
-    }
-    if identity != expected_identity {
-        return Err(SystemAuditRetentionAdministrationFailure::PersistenceUnavailable);
-    }
-    Ok(true)
+    Ok(Some(MigratedReceipt { object, kind, key }))
 }
 
 #[derive(Clone, Copy)]
@@ -525,35 +609,5 @@ fn map_catalog(
             SystemAuditRetentionAdministrationFailure::CapacityExceeded
         },
         _ => SystemAuditRetentionAdministrationFailure::PersistenceUnavailable,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn receipt_match_rejects_a_same_key_receipt_with_a_different_terminal_result() {
-        let key = [7; 16];
-        let expected_bytes = [b"POSTRR01".as_slice(), key.as_slice(), &[3; 88]].concat();
-        let expected_object = CatalogObject::new(expected_bytes).expect("bounded receipt");
-        let expected = MigratedReceipt {
-            object: expected_object,
-            magic: *b"POSTRR01",
-            key,
-            key_offset: 8,
-        };
-        let corrupted_bytes = [b"POSTRR01".as_slice(), key.as_slice(), &[4; 88]].concat();
-        let corrupted = CatalogObject::new(corrupted_bytes.clone()).expect("bounded receipt");
-
-        assert!(matches!(
-            receipt_identity_matches(
-                &expected,
-                expected.object.identity(),
-                corrupted.identity(),
-                &corrupted_bytes,
-            ),
-            Err(SystemAuditRetentionAdministrationFailure::PersistenceUnavailable)
-        ));
     }
 }

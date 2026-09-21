@@ -22,7 +22,7 @@ pub use tenant_administration_registry::{
     TenantInspection, TenantInspectionPage, TenantListContinuation,
 };
 pub(crate) use tenant_administration_registry_codec::is_registry;
-pub(crate) use tenant_administration_replay::legacy_receipt_object;
+pub(crate) use tenant_administration_replay::{legacy_receipt_object, retention_terminal_key};
 
 /// Public redacted outcome of a tenant creation publication.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
