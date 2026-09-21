@@ -9,6 +9,9 @@ use positron_kernel::{
 use crate::audit::plaintext_api_transport_audit_intent_v2;
 use crate::{GovernanceAuditEntry, ListenerTransportAuditRequest};
 
+const RECEIPT_MAGIC: [u8; 8] = *b"POSLTR01";
+const RECEIPT_BYTES: usize = 80;
+
 /// Administration-owned activation of the explicitly selected public
 /// plaintext API transport profile.
 pub enum ListenerTransportAdministration {}
@@ -50,6 +53,12 @@ impl ListenerTransportAdministration {
         let request_digest = request.digest_for(instance.to_bytes());
         let transaction = TransactionId::new(request.transaction_id_for(instance.to_bytes()))
             .map_err(map_catalog)?;
+        let snapshot = catalog.pin().map_err(map_catalog)?;
+        if let Some(audit_position) =
+            find_receipt(&snapshot, instance, transaction, request_digest)?
+        {
+            return Ok(ListenerTransportActivation { audit_position });
+        }
         let mut existing = None;
         for record in catalog.governance_audit_records().map_err(map_catalog)? {
             let entry = GovernanceAuditEntry::decode(&record)
@@ -71,8 +80,21 @@ impl ListenerTransportAdministration {
             return Ok(ListenerTransportActivation { audit_position });
         }
 
-        let snapshot = catalog.pin().map_err(map_catalog)?;
         let objects = retained_objects(&snapshot)?;
+        let audit_position = snapshot
+            .governance_audit_frontier()
+            .checked_add(1)
+            .ok_or(ListenerTransportAdministrationFailure::PersistenceUnavailable)?;
+        let mut objects = objects;
+        objects.push(
+            CatalogObject::new(encode_receipt(
+                instance,
+                transaction,
+                request_digest,
+                audit_position,
+            ))
+            .map_err(map_catalog)?,
+        );
         let audit = AuditIntent::new(plaintext_api_transport_audit_intent_v2(
             instance.to_bytes(),
             request,
@@ -102,6 +124,7 @@ impl ListenerTransportAdministration {
                 && transport.request_digest() == Some(request_digest)
                 && transport.request_id() == Some(transaction.to_bytes())
         }) && record.transaction() == transaction
+            && record.position() == audit_position
         {
             Ok(ListenerTransportActivation {
                 audit_position: record.position(),
@@ -110,6 +133,100 @@ impl ListenerTransportAdministration {
             Err(ListenerTransportAdministrationFailure::CorruptState)
         }
     }
+}
+
+fn find_receipt(
+    snapshot: &CatalogSnapshot,
+    instance: InstanceId,
+    transaction: TransactionId,
+    request_digest: [u8; 32],
+) -> Result<Option<u64>, ListenerTransportAdministrationFailure> {
+    let mut found = None;
+    for identity in snapshot.object_identities() {
+        let bytes = snapshot
+            .object(identity)
+            .map_err(map_catalog)?
+            .ok_or(ListenerTransportAdministrationFailure::PersistenceUnavailable)?;
+        if !bytes.starts_with(&RECEIPT_MAGIC) {
+            continue;
+        }
+        if bytes.len() != RECEIPT_BYTES {
+            return Err(ListenerTransportAdministrationFailure::CorruptState);
+        }
+        let stored_transaction: [u8; 16] = bytes
+            .get(8..24)
+            .ok_or(ListenerTransportAdministrationFailure::CorruptState)?
+            .try_into()
+            .map_err(|_| ListenerTransportAdministrationFailure::CorruptState)?;
+        if stored_transaction != transaction.to_bytes() {
+            continue;
+        }
+        let stored_instance: [u8; 16] = bytes
+            .get(24..40)
+            .ok_or(ListenerTransportAdministrationFailure::CorruptState)?
+            .try_into()
+            .map_err(|_| ListenerTransportAdministrationFailure::CorruptState)?;
+        let stored_digest: [u8; 32] = bytes
+            .get(40..72)
+            .ok_or(ListenerTransportAdministrationFailure::CorruptState)?
+            .try_into()
+            .map_err(|_| ListenerTransportAdministrationFailure::CorruptState)?;
+        let audit_position = u64::from_be_bytes(
+            bytes
+                .get(72..80)
+                .ok_or(ListenerTransportAdministrationFailure::CorruptState)?
+                .try_into()
+                .map_err(|_| ListenerTransportAdministrationFailure::CorruptState)?,
+        );
+        if stored_instance != instance.to_bytes()
+            || stored_digest != request_digest
+            || audit_position == 0
+        {
+            return Err(ListenerTransportAdministrationFailure::CorruptState);
+        }
+        if found.replace(audit_position).is_some() {
+            return Err(ListenerTransportAdministrationFailure::CorruptState);
+        }
+    }
+    Ok(found)
+}
+
+fn encode_receipt(
+    instance: InstanceId,
+    transaction: TransactionId,
+    request_digest: [u8; 32],
+    audit_position: u64,
+) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(RECEIPT_BYTES);
+    bytes.extend_from_slice(&RECEIPT_MAGIC);
+    bytes.extend_from_slice(&transaction.to_bytes());
+    bytes.extend_from_slice(&instance.to_bytes());
+    bytes.extend_from_slice(&request_digest);
+    bytes.extend_from_slice(&audit_position.to_be_bytes());
+    bytes
+}
+
+pub(crate) fn legacy_receipt_object(
+    entry: &crate::audit::ListenerTransportAuditEntry,
+) -> Result<CatalogObject, ListenerTransportAdministrationFailure> {
+    let request_id = entry
+        .request_id()
+        .ok_or(ListenerTransportAdministrationFailure::CorruptState)?;
+    let request_digest = entry
+        .request_digest()
+        .filter(|digest| digest.iter().any(|byte| *byte != 0))
+        .ok_or(ListenerTransportAdministrationFailure::CorruptState)?;
+    if entry.position() == 0 {
+        return Err(ListenerTransportAdministrationFailure::CorruptState);
+    }
+    let transaction = TransactionId::new(request_id).map_err(map_catalog)?;
+    CatalogObject::new(encode_receipt(
+        InstanceId::new(entry.instance_id()).map_err(map_catalog)?,
+        transaction,
+        request_digest,
+        entry.position(),
+    ))
+    .map_err(map_catalog)
 }
 
 fn retained_objects(

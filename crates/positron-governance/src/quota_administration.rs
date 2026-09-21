@@ -16,6 +16,7 @@ mod quota_administration_flow;
 mod quota_administration_publication;
 #[path = "quota_administration_receipt.rs"]
 mod quota_administration_receipt;
+pub(crate) use quota_administration_receipt::legacy_receipt_object;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TenantQuotaUpdate {
@@ -281,9 +282,10 @@ mod tests {
             weight: 1,
             resources: [1; 11],
             request_digest: [4; 32],
+            audit_position: 1,
         };
         let encoded = encode(RECEIPT_MAGIC, semantics);
-        assert_eq!(encoded.len(), 196);
+        assert_eq!(encoded.len(), 204);
         assert!(decode(&encoded).is_ok());
         for length in 0..encoded.len() {
             assert!(

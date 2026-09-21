@@ -22,6 +22,27 @@ use crate::{
 mod tenant_lifecycle_administration_receipt;
 use tenant_lifecycle_administration_receipt::*;
 
+pub(crate) fn legacy_receipt_object(
+    entry: &crate::audit::TenantLifecycleAuditEntry,
+) -> Result<CatalogObject, TenantLifecycleAdministrationFailure> {
+    let request_digest = entry
+        .request_digest()
+        .filter(|digest| digest.iter().any(|byte| *byte != 0))
+        .ok_or(TenantLifecycleAdministrationFailure::PersistenceUnavailable)?;
+    object_for_fields(ReceiptFields {
+        key: entry.idempotency_key(),
+        actor: entry.actor_id(),
+        tenant: entry.tenant_id(),
+        from: entry.from(),
+        to: entry.to(),
+        expected: entry.expected_generation(),
+        generation: entry.generation(),
+        audit_position: entry.position(),
+        audit_time: entry.ingest_time_unix_seconds(),
+        request_digest,
+    })
+}
+
 /// The result of one durably published tenant lifecycle transition.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TenantLifecycleTransition {

@@ -82,6 +82,30 @@ fn corrupt(path: &Path, selector: usize) {
     }
 }
 
+/// Corrupt every bounded artifact in one Catalog directory.  An audit-retention
+/// publication stores its signed anchor and reclamation receipt as separate,
+/// encrypted Catalog objects, so selecting one filename would not prove that
+/// both authenticated objects fence recovery.
+fn corrupt_catalog_artifacts(root: &Path, directory: &str, selector: usize) -> bool {
+    let directory = root.join(directory);
+    let Ok(entries) = fs::read_dir(directory) else {
+        return false;
+    };
+    let mut paths = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .collect::<Vec<_>>();
+    paths.sort();
+    if paths.is_empty() || paths.len() > 64 {
+        return false;
+    }
+    for (index, path) in paths.iter().enumerate() {
+        corrupt(path, selector.wrapping_add(index));
+    }
+    true
+}
+
 fn heterogeneous_rotation_entries(data: &[u8], first_position: u64) -> Vec<GovernanceAuditEntry> {
     let mut provider_key_reference = [0_u8; 16];
     let provider_bytes = data.get(..data.len().min(16)).unwrap_or_default();
@@ -234,7 +258,9 @@ fuzz_target!(|data: &[u8]| {
     let mut lifecycle_generation = 1_u64;
     let mut alias_generation = 1_u64;
     let mut retention_generation = 1_u64;
+    let mut audit_retention_generation = 1_u64;
     let mut secondary_tenant = None;
+    let mut storage_tampered = false;
     for (index, command) in data.iter().copied().enumerate() {
         match command & 15 {
             0 | 1 => {
@@ -276,8 +302,14 @@ fuzz_target!(|data: &[u8]| {
                 },
                 Err(_) => {},
             },
-            4 => corrupt(&roots.secrets.join("bootstrap-claim.v1"), index),
-            5 => corrupt(&roots.data.join(".positron-bootstrap.initialized"), index),
+            4 => {
+                corrupt(&roots.secrets.join("bootstrap-claim.v1"), index);
+                storage_tampered = true;
+            },
+            5 => {
+                corrupt(&roots.data.join(".positron-bootstrap.initialized"), index);
+                storage_tampered = true;
+            },
             6 => {
                 if let (Some(secret), Ok(instance)) =
                     (credential.as_deref(), InstanceBootstrap::reopen(&paths))
@@ -847,7 +879,134 @@ fuzz_target!(|data: &[u8]| {
                 }
             },
             _ => {
-                let _ = InstanceBootstrap::classify(&paths);
+                if let (Some(root_secret), Ok(instance)) =
+                    (credential.as_deref(), InstanceBootstrap::reopen(&paths))
+                {
+                    let Ok(administrator) = instance.attribute(
+                        PresentedCredential::parse(root_secret)
+                            .expect("claimed credential remains canonical"),
+                        RequestedIntent::SystemAdministration,
+                        CompatibilityHints::none(),
+                    ) else {
+                        continue;
+                    };
+                    let limit = NonZeroU64::new(u64::from(command >> 4).max(1))
+                        .expect("bounded nonzero audit retention limit");
+                    let key = AdministrativeIdempotencyKey::new(
+                        [u8::try_from(index).expect("bounded input") + 0x80; 16],
+                    )
+                    .expect("nonzero idempotency");
+                    let expected = ResourceGeneration::new(audit_retention_generation)
+                        .expect("bounded audit-retention generation");
+                    let fault_injected = command & 0x20 != 0;
+                    let updated =
+                        positron_kernel::fuzz_compaction_publication_fault(fault_injected, || {
+                            instance.update_system_audit_retention(
+                                administrator,
+                                limit,
+                                expected,
+                                key,
+                            )
+                        });
+                    if let Ok(updated) = updated {
+                        assert_eq!(
+                            updated.policy_generation().get(),
+                            audit_retention_generation + 1
+                        );
+                        // This selector reaches the two new Catalog objects
+                        // (the signed anchor and its reclamation receipt) only
+                        // after their atomic publication.  Recovery must fence
+                        // the tampered retained history.
+                        if command & 0x80 != 0 && command & 0x40 == 0 {
+                            assert!(corrupt_catalog_artifacts(
+                                &roots.data,
+                                "catalog/objects",
+                                index,
+                            ));
+                            storage_tampered = true;
+                        }
+                        // A restart must release the live primary-volume
+                        // authority first.  Retaining this instance turns the
+                        // probe into an unsupported concurrent open rather
+                        // than durable recovery.
+                        drop(instance);
+                        let reopened = match InstanceBootstrap::reopen(&paths) {
+                            Ok(reopened) => reopened,
+                            Err(_) if fault_injected || storage_tampered => continue,
+                            Err(failure) => panic!(
+                                "a normal committed retention successor must reopen: {failure:?}"
+                            ),
+                        };
+                        let replay = reopened.update_system_audit_retention(
+                            reopened
+                                .attribute(
+                                    PresentedCredential::parse(root_secret).expect("claim syntax"),
+                                    RequestedIntent::SystemAdministration,
+                                    CompatibilityHints::none(),
+                                )
+                                .expect("bootstrap credential remains administrator"),
+                            limit,
+                            expected,
+                            key,
+                        );
+                        assert_eq!(replay.expect("exact audit-retention retry"), updated);
+                        reopened
+                            .verify_governance_audit_history(
+                                reopened
+                                    .attribute(
+                                        PresentedCredential::parse(root_secret)
+                                            .expect("claim syntax"),
+                                        RequestedIntent::SystemAdministration,
+                                        CompatibilityHints::none(),
+                                    )
+                                    .expect("bootstrap credential remains administrator"),
+                                None,
+                            )
+                            .expect("retained anchor and suffix remain verified after replay");
+                        if command & 0x40 != 0 {
+                            let checkpoint = reopened
+                                .publish_governance_audit_checkpoint(
+                                    reopened
+                                        .attribute(
+                                            PresentedCredential::parse(root_secret)
+                                                .expect("claim syntax"),
+                                            RequestedIntent::SystemAdministration,
+                                            CompatibilityHints::none(),
+                                        )
+                                        .expect("bootstrap credential remains administrator"),
+                                )
+                                .expect("retained audit checkpoint publishes");
+                            reopened
+                                .verify_governance_audit_history(
+                                    reopened
+                                        .attribute(
+                                            PresentedCredential::parse(root_secret)
+                                                .expect("claim syntax"),
+                                            RequestedIntent::SystemAdministration,
+                                            CompatibilityHints::none(),
+                                        )
+                                        .expect("bootstrap credential remains administrator"),
+                                    Some(&checkpoint),
+                                )
+                                .expect("signed checkpoint verifies the retained suffix");
+                            // A checkpoint has its own authenticated frame,
+                            // separate from Catalog objects.  This selector
+                            // exercises recovery's checkpoint fence after a
+                            // retention anchor already exists.
+                            if command & 0x80 != 0 {
+                                assert!(corrupt_catalog_artifacts(
+                                    &roots.data,
+                                    "catalog/governance-audit-checkpoints",
+                                    index,
+                                ));
+                                assert!(InstanceBootstrap::reopen(&paths).is_err());
+                            }
+                        }
+                        audit_retention_generation = audit_retention_generation.saturating_add(1);
+                    }
+                } else {
+                    let _ = InstanceBootstrap::classify(&paths);
+                }
             },
         }
     }

@@ -1,4 +1,5 @@
 use std::error::Error;
+use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use positron_domain::identity::Scope;
@@ -103,6 +104,66 @@ fn system_administrator_binds_an_immutable_alias_with_an_exact_replay() -> Resul
             )
             .is_err(),
         "the bootstrap alias cannot remain an alternate routing selector after a bind"
+    );
+    Ok(())
+}
+
+#[test]
+fn alias_retry_survives_audit_reclamation_and_reopen() -> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let (initialized, _, _, administrator_secret) = fixture.initialized_with_admin()?;
+    let actor = initialized.attribute(
+        PresentedCredential::parse(&administrator_secret)?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let alias = ExternalTenantAlias::parse("loki.retained-replay")?;
+    let key = AdministrativeIdempotencyKey::new([0xb0; 16])?;
+    let bound = initialized.bind_tenant_alias(
+        actor,
+        initialized.default_tenant_id(),
+        alias.clone(),
+        ResourceGeneration::new(1)?,
+        key,
+    )?;
+    initialized.update_system_audit_retention(
+        actor,
+        NonZeroU64::new(1).ok_or("nonzero retained audit-record limit")?,
+        ResourceGeneration::new(1)?,
+        AdministrativeIdempotencyKey::new([0xb9; 16])?,
+    )?;
+    assert_eq!(initialized.governance_audit_for_test()?.len(), 1);
+    drop(initialized);
+
+    let reopened = fixture.reopen()?;
+    let actor = reopened.attribute(
+        PresentedCredential::parse(&administrator_secret)?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    assert_eq!(
+        reopened.bind_tenant_alias(
+            actor,
+            reopened.default_tenant_id(),
+            alias,
+            ResourceGeneration::new(1)?,
+            key,
+        )?,
+        bound,
+        "a pruned audit record must not erase the alias terminal result"
+    );
+    assert_eq!(
+        reopened
+            .bind_tenant_alias(
+                actor,
+                reopened.default_tenant_id(),
+                ExternalTenantAlias::parse("loki.changed-body")?,
+                ResourceGeneration::new(1)?,
+                key,
+            )
+            .expect_err("a changed alias under the retained key must conflict")
+            .code(),
+        BootstrapFailureCode::TenantAliasIdempotencyConflict
     );
     Ok(())
 }

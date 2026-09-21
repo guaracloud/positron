@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::num::NonZeroU64;
 
-use positron_domain::identity::Scope;
+use positron_domain::identity::{Scope, TenantId, TenantSlug};
 use positron_governance::{
     AdministrativeIdempotencyKey, CompatibilityHints, PresentedCredential, RequestedIntent,
     ResourceGeneration,
@@ -83,6 +83,182 @@ fn system_audit_retention_replays_an_immutable_receipt_after_successor_compactio
     );
     assert_eq!(reopened.catalog_generation(), generation_before);
     assert_eq!(reopened.governance_audit_for_test()?.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn retained_governance_audit_history_verifies_after_reopen() -> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let (initialized, _, _, administrator_secret) = fixture.initialized_with_admin()?;
+    let actor = initialized.attribute(
+        PresentedCredential::parse(&administrator_secret)?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    initialized.update_system_audit_retention(
+        actor,
+        NonZeroU64::new(1).ok_or("nonzero retained audit-record limit")?,
+        ResourceGeneration::new(1)?,
+        AdministrativeIdempotencyKey::new([0xda; 16])?,
+    )?;
+    drop(initialized);
+
+    let reopened = fixture.reopen()?;
+    let actor = reopened.attribute(
+        PresentedCredential::parse(&administrator_secret)?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    reopened.verify_governance_audit_history(actor, None)?;
+    let history = reopened.inspect_governance_audit_history(actor)?;
+    assert!(history.retention_anchor_position().is_some());
+    assert_eq!(
+        history.earliest_visible_position(),
+        history
+            .records()
+            .first()
+            .ok_or("retained audit record")?
+            .position()
+    );
+    Ok(())
+}
+
+#[test]
+fn retained_audit_verifier_accepts_the_prior_trusted_anchor_and_rejects_a_foreign_checkpoint()
+-> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let (initialized, _, _, administrator_secret) = fixture.initialized_with_admin()?;
+    let actor = initialized.attribute(
+        PresentedCredential::parse(&administrator_secret)?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let checkpoint = initialized.publish_governance_audit_checkpoint(actor)?;
+    let actor = initialized.attribute(
+        PresentedCredential::parse(&administrator_secret)?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    initialized.update_system_audit_retention(
+        actor,
+        NonZeroU64::new(1).ok_or("nonzero retained audit-record limit")?,
+        ResourceGeneration::new(1)?,
+        AdministrativeIdempotencyKey::new([0xde; 16])?,
+    )?;
+    drop(initialized);
+    let reopened = fixture.reopen()?;
+    let actor = reopened.attribute(
+        PresentedCredential::parse(&administrator_secret)?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    reopened.verify_governance_audit_history(actor, Some(&checkpoint))?;
+
+    let foreign = Fixture::new()?;
+    let (foreign_instance, _, _, foreign_secret) = foreign.initialized_with_admin()?;
+    let foreign_actor = foreign_instance.attribute(
+        PresentedCredential::parse(&foreign_secret)?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let foreign_checkpoint = foreign_instance.publish_governance_audit_checkpoint(foreign_actor)?;
+    let actor = reopened.attribute(
+        PresentedCredential::parse(&administrator_secret)?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let failure = reopened
+        .verify_governance_audit_history(actor, Some(&foreign_checkpoint))
+        .expect_err("a trusted checkpoint from another instance is rollback evidence");
+    assert_eq!(failure.code(), BootstrapFailureCode::CatalogUnavailable);
+    Ok(())
+}
+
+#[test]
+fn public_audit_history_is_scoped_and_rejects_data_plane_contexts() -> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let (initialized, ingest_secret, _, administrator_secret) = fixture.initialized_with_admin()?;
+    let system = initialized.attribute(
+        PresentedCredential::parse(&administrator_secret)?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let foreign_tenant = TenantId::from_bytes([0xdc; 16])?;
+    initialized.create_tenant(
+        system,
+        foreign_tenant,
+        positron_governance::TenantCreateConfiguration::new(
+            TenantSlug::parse_canonical("audit-history-foreign")?,
+            "Foreign audit tenant",
+            2_592_000,
+            1,
+            [
+                32_000_000, 32, 32, 5_000_000, 2_048, 32, 32, 32, 32, 32, 2_000_000,
+            ],
+        ),
+        AdministrativeIdempotencyKey::new([0xdc; 16])?,
+    )?;
+    let system = initialized.attribute(
+        PresentedCredential::parse(&administrator_secret)?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+
+    let tenant_key = initialized.create_api_key_for_tenant(
+        system,
+        initialized.default_tenant_id(),
+        Scope::TenantAdministration,
+        None,
+        ResourceGeneration::new(1)?,
+        AdministrativeIdempotencyKey::new([0xdb; 16])?,
+    )?;
+    let tenant_secret = tenant_key.secret().ok_or("tenant administrator secret")?;
+    let system = initialized.attribute(
+        PresentedCredential::parse(&administrator_secret)?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let all = initialized.inspect_governance_audit_history(system)?;
+    assert!(!all.records().is_empty());
+    let tenant = initialized.attribute(
+        PresentedCredential::parse(tenant_secret)?,
+        RequestedIntent::TenantAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let scoped = initialized.inspect_governance_audit_history(tenant)?;
+    assert!(
+        scoped
+            .records()
+            .iter()
+            .all(|entry| { entry.tenant_id() == Some(initialized.default_tenant_id()) })
+    );
+    assert!(scoped.records().len() <= all.records().len());
+
+    initialized.revoke_api_key(
+        system,
+        tenant_key.principal_id(),
+        initialized
+            .list_api_keys(system)?
+            .into_iter()
+            .find(|key| key.principal_id() == tenant_key.principal_id())
+            .map(positron_governance::ApiKeyDescriptor::generation)
+            .ok_or("current tenant administrator descriptor")?,
+        AdministrativeIdempotencyKey::new([0xdd; 16])?,
+    )?;
+    let revoked = initialized
+        .inspect_governance_audit_history(tenant)
+        .expect_err("a revoked administrative context cannot inspect audit history");
+    assert_eq!(revoked.code(), BootstrapFailureCode::ApiKeyUnauthorized);
+
+    let ingest = initialized.attribute(
+        PresentedCredential::parse(&ingest_secret)?,
+        RequestedIntent::Ingest,
+        CompatibilityHints::none(),
+    )?;
+    let denied = initialized
+        .inspect_governance_audit_history(ingest)
+        .expect_err("data-plane contexts cannot inspect governance audit history");
+    assert_eq!(denied.code(), BootstrapFailureCode::ApiKeyUnauthorized);
     Ok(())
 }
 

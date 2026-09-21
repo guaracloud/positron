@@ -17,6 +17,30 @@ use crate::{
 
 const TENANT_KEYRING_MAGIC: [u8; 8] = *b"POSTKC01";
 
+pub(crate) fn legacy_receipt_object(
+    entry: &ApiKeyLifecycleAuditEntry,
+) -> Result<CatalogObject, ApiKeyAdministrationFailure> {
+    let request_digest = entry
+        .request_digest()
+        .filter(|digest| digest.iter().any(|byte| *byte != 0))
+        .ok_or(ApiKeyAdministrationFailure::PersistenceUnavailable)?;
+    object(ReceiptFields {
+        key: entry.idempotency_key(),
+        actor: entry.actor_id(),
+        tenant: entry.tenant_id(),
+        action: entry.action(),
+        scope: scope_code(entry.scope())
+            .ok_or(ApiKeyAdministrationFailure::PersistenceUnavailable)?,
+        expires_at_unix_seconds: entry.expires_at_unix_seconds(),
+        expected: entry.expected_generation(),
+        generation: entry.generation(),
+        principal: entry.principal_id(),
+        target: entry.target_principal_id(),
+        audit_position: entry.position(),
+        request_digest,
+    })
+}
+
 pub(crate) struct TenantCredentialIdentity {
     pub(crate) tenant: TenantId,
     pub(crate) credentials: Vec<CatalogCredential>,

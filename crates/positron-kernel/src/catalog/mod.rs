@@ -910,14 +910,16 @@ impl<'authority> Catalog<'authority> {
             policy,
             Some(last_removed),
             audit,
-            None,
+            Vec::new(),
         )?
         .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::IntegrityCorruption))
     }
 
     /// Publishes a system retention successor together with an Administration
-    /// receipt. The receipt is an opaque immutable object retained across later
-    /// policy replacements; it never grants Catalog mutation authority.
+    /// receipts. The receipts are opaque immutable objects retained across later
+    /// policy replacements; they never grant Catalog mutation authority. The
+    /// administration layer may also atomically migrate compact terminal replay
+    /// receipts for records about to be reclaimed.
     pub fn publish_system_audit_retention_policy_with_receipt(
         &self,
         transaction: TransactionId,
@@ -925,7 +927,7 @@ impl<'authority> Catalog<'authority> {
         policy: SystemAuditRetentionPolicy,
         last_removed: Option<&GovernanceAuditRecord>,
         audit: AuditIntent,
-        receipt: Option<CatalogObject>,
+        receipts: Vec<CatalogObject>,
     ) -> Result<Option<AuditRetentionAnchor>, CatalogFailure> {
         let basis = self.pin()?;
         let trust = audit_checkpoint::retention_trust_for_policy(&basis, self.instance, policy)?;
@@ -946,7 +948,8 @@ impl<'authority> Catalog<'authority> {
         };
         let capacity = basis
             .plaintext_object_count()
-            .checked_add(3 + usize::from(receipt.is_some()))
+            .checked_add(3)
+            .and_then(|value| value.checked_add(receipts.len()))
             .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?;
         let mut objects = Vec::new();
         objects
@@ -971,7 +974,7 @@ impl<'authority> Catalog<'authority> {
                 audit_checkpoint::AuditRetentionReclamationReceipt::new(anchor).encode(),
             )?);
         }
-        if let Some(receipt) = receipt {
+        for receipt in receipts {
             objects.push(receipt);
         }
         let format_epoch = basis

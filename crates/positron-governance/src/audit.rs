@@ -497,6 +497,95 @@ impl TenantDisplayNameUpdateAuditEntry {
     }
 }
 
+impl TenantCreationAuditEntry {
+    #[must_use]
+    pub const fn position(&self) -> u64 {
+        self.position
+    }
+    #[must_use]
+    pub const fn idempotency_key(&self) -> AdministrativeIdempotencyKey {
+        self.idempotency_key
+    }
+    #[must_use]
+    pub const fn actor_id(&self) -> PrincipalId {
+        self.actor
+    }
+    #[must_use]
+    pub const fn tenant_id(&self) -> TenantId {
+        self.tenant
+    }
+    #[must_use]
+    pub const fn expected_generation(&self) -> ResourceGeneration {
+        self.expected_generation
+    }
+    #[must_use]
+    pub const fn generation(&self) -> ResourceGeneration {
+        self.generation
+    }
+    #[must_use]
+    pub const fn request_digest(&self) -> [u8; 32] {
+        self.request_digest
+    }
+}
+
+impl CatalogFormatMigrationAuditEntry {
+    #[must_use]
+    pub const fn position(&self) -> u64 {
+        self.position
+    }
+    #[must_use]
+    pub const fn idempotency_key(&self) -> AdministrativeIdempotencyKey {
+        self.idempotency_key
+    }
+    #[must_use]
+    pub const fn actor_id(&self) -> PrincipalId {
+        self.actor
+    }
+    #[must_use]
+    pub const fn from(&self) -> u32 {
+        self.from
+    }
+    #[must_use]
+    pub const fn to(&self) -> u32 {
+        self.to
+    }
+}
+
+impl TenantAliasBindingAuditEntry {
+    #[must_use]
+    pub const fn position(&self) -> u64 {
+        self.position
+    }
+    #[must_use]
+    pub const fn ingest_time_unix_seconds(&self) -> u64 {
+        self.ingest_time_unix_seconds
+    }
+    #[must_use]
+    pub const fn actor_id(&self) -> PrincipalId {
+        self.actor
+    }
+    #[must_use]
+    pub const fn tenant_id(&self) -> TenantId {
+        self.tenant
+    }
+    #[must_use]
+    pub const fn expected_generation(&self) -> ResourceGeneration {
+        self.expected_generation
+    }
+    #[must_use]
+    pub const fn generation(&self) -> ResourceGeneration {
+        self.generation
+    }
+    #[must_use]
+    pub const fn request_digest(&self) -> [u8; 32] {
+        self.request_digest
+    }
+    #[must_use]
+    pub const fn idempotency_key(&self) -> AdministrativeIdempotencyKey {
+        self.idempotency_key
+    }
+}
+
 impl TenantQuotaUpdateAuditEntry {
     #[must_use]
     pub const fn position(&self) -> u64 {
@@ -1039,6 +1128,11 @@ const fn lifecycle_state(code: u8) -> Result<TenantLifecycleState, IdentityFailu
 }
 
 impl ApiKeyLifecycleAuditEntry {
+    #[must_use]
+    pub const fn position(&self) -> u64 {
+        self.position
+    }
+
     #[must_use]
     pub const fn actor_id(&self) -> PrincipalId {
         self.actor

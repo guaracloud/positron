@@ -68,6 +68,10 @@ impl TenantAdministration {
                 .ok_or(TenantAdministrationFailure::InvalidInput)?,
         )
         .map_err(|_| TenantAdministrationFailure::InvalidInput)?;
+        let audit_position = snapshot
+            .governance_audit_frontier()
+            .checked_add(1)
+            .ok_or(TenantAdministrationFailure::PersistenceUnavailable)?;
         let mut objects = Vec::new();
         for identity in snapshot.object_identities() {
             let bytes = snapshot
@@ -111,6 +115,7 @@ impl TenantAdministration {
                 registry.generation,
                 generation,
                 digest,
+                audit_position,
             ))
             .map_err(map_catalog)?,
         );
@@ -135,10 +140,13 @@ impl TenantAdministration {
                 digest,
             )
             .map_err(map_catalog)?;
-        let audit_position = commit
+        let committed_audit_position = commit
             .governance_audit_record()
             .ok_or(TenantAdministrationFailure::PersistenceUnavailable)?
             .position();
+        if committed_audit_position != audit_position {
+            return Err(TenantAdministrationFailure::PersistenceUnavailable);
+        }
         Ok(TenantCreation::new(
             candidate.tenant,
             generation,

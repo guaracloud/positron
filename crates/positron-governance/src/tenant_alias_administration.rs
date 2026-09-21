@@ -16,8 +16,9 @@ use crate::{
     TenantAdministrationFailure,
 };
 
-const RECEIPT_MAGIC: [u8; 8] = *b"POSALR01";
+const RECEIPT_MAGIC_V2: [u8; 8] = *b"POSALR02";
 const AUDIT_MAGIC: [u8; 8] = *b"POSALI01";
+const RECEIPT_V2_BYTES: usize = 120;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TenantAliasBinding {
@@ -113,6 +114,9 @@ impl TenantAliasAdministration {
         request: TenantAliasBindRequest,
     ) -> Result<Option<TenantAliasBinding>, TenantAliasAdministrationFailure> {
         validate_snapshot(view.snapshot().clone(), administrator, &request)?;
+        if let Some(replay) = replay_receipt(view.snapshot(), &request)? {
+            return Ok(Some(replay));
+        }
         replay_records(view.governance_audit_records(), &request)
     }
 
@@ -126,10 +130,7 @@ impl TenantAliasAdministration {
         F: FnOnce() -> Result<u64, TenantAliasAdministrationFailure>,
     {
         let snapshot = validate_request(catalog, administrator, &request)?;
-        if let Some(replay) = replay_records(
-            &catalog.governance_audit_records().map_err(map_catalog)?,
-            &request,
-        )? {
+        if let Some(replay) = replay(catalog, &snapshot, &request)? {
             return Ok(replay);
         }
         let digest = request_digest(&request);
@@ -211,18 +212,16 @@ impl TenantAliasAdministration {
             )
             .map_err(map_tenant_record)?
         };
-        let audit = encode(
-            AUDIT_MAGIC,
+        let audit = encode_audit(audit_ingest_time_unix_seconds, &request, generation, digest)?;
+        let audit_position = snapshot
+            .governance_audit_frontier()
+            .checked_add(1)
+            .ok_or(TenantAliasAdministrationFailure::CapacityExceeded)?;
+        let receipt = CatalogObject::new(encode_receipt(
             audit_ingest_time_unix_seconds,
             &request,
             generation,
-            digest,
-        )?;
-        let receipt = CatalogObject::new(encode(
-            RECEIPT_MAGIC,
-            audit_ingest_time_unix_seconds,
-            &request,
-            generation,
+            audit_position,
             digest,
         )?)
         .map_err(map_catalog)?;
@@ -247,17 +246,18 @@ impl TenantAliasAdministration {
         ) {
             Ok(commit) => commit,
             Err(failure) if failure.code() == CatalogFailureCode::IdempotencyConflict => {
-                return replay_records(
-                    &catalog.governance_audit_records().map_err(map_catalog)?,
-                    &request,
-                )?
-                .ok_or(TenantAliasAdministrationFailure::IdempotencyConflict);
+                let replayed = catalog.pin().map_err(map_catalog)?;
+                return replay(catalog, &replayed, &request)?
+                    .ok_or(TenantAliasAdministrationFailure::IdempotencyConflict);
             },
             Err(failure) => return Err(map_catalog(failure)),
         };
         let record = commit
             .governance_audit_record()
             .ok_or(TenantAliasAdministrationFailure::PersistenceUnavailable)?;
+        if record.position() != audit_position {
+            return Err(TenantAliasAdministrationFailure::PersistenceUnavailable);
+        }
         Ok(TenantAliasBinding {
             tenant: request.tenant,
             generation,
@@ -351,8 +351,7 @@ fn request_digest(request: &TenantAliasBindRequest) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-fn encode(
-    magic: [u8; 8],
+fn encode_audit(
     time: u64,
     request: &TenantAliasBindRequest,
     generation: ResourceGeneration,
@@ -362,7 +361,7 @@ fn encode(
     encoded
         .try_reserve_exact(112)
         .map_err(|_| TenantAliasAdministrationFailure::CapacityExceeded)?;
-    encoded.extend_from_slice(&magic);
+    encoded.extend_from_slice(&AUDIT_MAGIC);
     encoded.extend_from_slice(&time.to_be_bytes());
     encoded.extend_from_slice(&request.idempotency.to_bytes());
     encoded.extend_from_slice(&request.actor.principal_id().to_bytes());
@@ -371,6 +370,169 @@ fn encode(
     encoded.extend_from_slice(&generation.get().to_be_bytes());
     encoded.extend_from_slice(&digest);
     Ok(encoded)
+}
+
+fn encode_receipt(
+    time: u64,
+    request: &TenantAliasBindRequest,
+    generation: ResourceGeneration,
+    audit_position: u64,
+    digest: [u8; 32],
+) -> Result<Vec<u8>, TenantAliasAdministrationFailure> {
+    if time == 0 || audit_position == 0 {
+        return Err(TenantAliasAdministrationFailure::PersistenceUnavailable);
+    }
+    let mut encoded = Vec::new();
+    encoded
+        .try_reserve_exact(RECEIPT_V2_BYTES)
+        .map_err(|_| TenantAliasAdministrationFailure::CapacityExceeded)?;
+    encoded.extend_from_slice(&RECEIPT_MAGIC_V2);
+    encoded.extend_from_slice(&time.to_be_bytes());
+    encoded.extend_from_slice(&request.idempotency.to_bytes());
+    encoded.extend_from_slice(&request.actor.principal_id().to_bytes());
+    encoded.extend_from_slice(&request.tenant.to_bytes());
+    encoded.extend_from_slice(&request.expected.get().to_be_bytes());
+    encoded.extend_from_slice(&generation.get().to_be_bytes());
+    encoded.extend_from_slice(&audit_position.to_be_bytes());
+    encoded.extend_from_slice(&digest);
+    Ok(encoded)
+}
+
+pub(crate) fn legacy_receipt_object(
+    entry: &crate::audit::TenantAliasBindingAuditEntry,
+) -> Result<CatalogObject, TenantAliasAdministrationFailure> {
+    if entry.ingest_time_unix_seconds() == 0
+        || entry.position() == 0
+        || entry.expected_generation().get().checked_add(1) != Some(entry.generation().get())
+        || entry.request_digest().iter().all(|byte| *byte == 0)
+    {
+        return Err(TenantAliasAdministrationFailure::PersistenceUnavailable);
+    }
+    let mut encoded = Vec::new();
+    encoded
+        .try_reserve_exact(RECEIPT_V2_BYTES)
+        .map_err(|_| TenantAliasAdministrationFailure::CapacityExceeded)?;
+    encoded.extend_from_slice(&RECEIPT_MAGIC_V2);
+    encoded.extend_from_slice(&entry.ingest_time_unix_seconds().to_be_bytes());
+    encoded.extend_from_slice(&entry.idempotency_key().to_bytes());
+    encoded.extend_from_slice(&entry.actor_id().to_bytes());
+    encoded.extend_from_slice(&entry.tenant_id().to_bytes());
+    encoded.extend_from_slice(&entry.expected_generation().get().to_be_bytes());
+    encoded.extend_from_slice(&entry.generation().get().to_be_bytes());
+    encoded.extend_from_slice(&entry.position().to_be_bytes());
+    encoded.extend_from_slice(&entry.request_digest());
+    CatalogObject::new(encoded).map_err(map_catalog)
+}
+
+fn replay(
+    catalog: &Catalog<'_>,
+    snapshot: &CatalogSnapshot,
+    request: &TenantAliasBindRequest,
+) -> Result<Option<TenantAliasBinding>, TenantAliasAdministrationFailure> {
+    if let Some(replay) = replay_receipt(snapshot, request)? {
+        return Ok(Some(replay));
+    }
+    replay_records(
+        &catalog.governance_audit_records().map_err(map_catalog)?,
+        request,
+    )
+}
+
+fn replay_receipt(
+    snapshot: &CatalogSnapshot,
+    request: &TenantAliasBindRequest,
+) -> Result<Option<TenantAliasBinding>, TenantAliasAdministrationFailure> {
+    let mut found = None;
+    for identity in snapshot.object_identities() {
+        let bytes = snapshot
+            .object(identity)
+            .map_err(map_catalog)?
+            .ok_or(TenantAliasAdministrationFailure::PersistenceUnavailable)?;
+        if !bytes.starts_with(&RECEIPT_MAGIC_V2) {
+            continue;
+        }
+        let receipt = decode_receipt(bytes)?;
+        if receipt.key == request.idempotency && found.replace(receipt).is_some() {
+            return Err(TenantAliasAdministrationFailure::PersistenceUnavailable);
+        }
+    }
+    let Some(receipt) = found else {
+        return Ok(None);
+    };
+    if receipt.actor != request.actor.principal_id()
+        || receipt.tenant != request.tenant
+        || receipt.expected != request.expected
+        || receipt.digest != request_digest(request)
+    {
+        return Err(TenantAliasAdministrationFailure::IdempotencyConflict);
+    }
+    Ok(Some(TenantAliasBinding {
+        tenant: receipt.tenant,
+        generation: receipt.generation,
+        audit_position: receipt.audit_position,
+        audit_ingest_time_unix_seconds: receipt.time,
+    }))
+}
+
+#[derive(Clone, Copy)]
+struct AliasReceipt {
+    key: AdministrativeIdempotencyKey,
+    actor: PrincipalId,
+    tenant: TenantId,
+    expected: ResourceGeneration,
+    generation: ResourceGeneration,
+    audit_position: u64,
+    time: u64,
+    digest: [u8; 32],
+}
+
+fn decode_receipt(bytes: &[u8]) -> Result<AliasReceipt, TenantAliasAdministrationFailure> {
+    if bytes.len() != RECEIPT_V2_BYTES {
+        return Err(TenantAliasAdministrationFailure::PersistenceUnavailable);
+    }
+    let array = |start| {
+        bytes
+            .get(start..start + 16)
+            .and_then(|value| value.try_into().ok())
+            .ok_or(TenantAliasAdministrationFailure::PersistenceUnavailable)
+    };
+    let long = |start| {
+        bytes
+            .get(start..start + 8)
+            .and_then(|value| value.try_into().ok())
+            .map(u64::from_be_bytes)
+            .ok_or(TenantAliasAdministrationFailure::PersistenceUnavailable)
+    };
+    let key = AdministrativeIdempotencyKey::new(array(16)?)
+        .map_err(|_| TenantAliasAdministrationFailure::PersistenceUnavailable)?;
+    let actor = PrincipalId::from_bytes(array(32)?)
+        .map_err(|_| TenantAliasAdministrationFailure::PersistenceUnavailable)?;
+    let tenant = TenantId::from_bytes(array(48)?)
+        .map_err(|_| TenantAliasAdministrationFailure::PersistenceUnavailable)?;
+    let expected = ResourceGeneration::new(long(64)?)
+        .map_err(|_| TenantAliasAdministrationFailure::PersistenceUnavailable)?;
+    let generation = ResourceGeneration::new(long(72)?)
+        .map_err(|_| TenantAliasAdministrationFailure::PersistenceUnavailable)?;
+    let audit_position = long(80)?;
+    let digest = bytes
+        .get(88..120)
+        .and_then(|value| value.try_into().ok())
+        .filter(|value: &[u8; 32]| value.iter().any(|byte| *byte != 0))
+        .ok_or(TenantAliasAdministrationFailure::PersistenceUnavailable)?;
+    let time = long(8)?;
+    if time == 0 || audit_position == 0 || expected.get().checked_add(1) != Some(generation.get()) {
+        return Err(TenantAliasAdministrationFailure::PersistenceUnavailable);
+    }
+    Ok(AliasReceipt {
+        key,
+        actor,
+        tenant,
+        expected,
+        generation,
+        audit_position,
+        time,
+        digest,
+    })
 }
 
 fn replay_records(

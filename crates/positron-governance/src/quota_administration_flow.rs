@@ -109,7 +109,11 @@ impl TenantQuotaAdministration {
             }
             return Ok(TenantQuotaUpdate {
                 generation,
-                audit_position: audit_position(catalog, request.key)?,
+                audit_position: if receipt.audit_position == 0 {
+                    audit_position(catalog, request.key)?
+                } else {
+                    receipt.audit_position
+                },
             });
         }
         let mut objects = match tenant_quota_state(&snapshot, request.tenant)
@@ -146,6 +150,14 @@ impl TenantQuotaAdministration {
             weight: request.weight,
             resources: request.resources,
             request_digest,
+            audit_position: snapshot
+                .governance_audit_frontier()
+                .checked_add(1)
+                .ok_or_else(|| {
+                    TenantQuotaAdministrationFailure::new(
+                        TenantQuotaAdministrationFailureCode::PersistenceUnavailable,
+                    )
+                })?,
         };
         objects.push(CatalogObject::new(encode(RECEIPT_MAGIC, semantics)).map_err(map_catalog)?);
         let staged = authority
@@ -183,6 +195,11 @@ impl TenantQuotaAdministration {
                 )
             })?
             .position();
+        if audit_position != semantics.audit_position {
+            return Err(TenantQuotaAdministrationFailure::new(
+                TenantQuotaAdministrationFailureCode::PersistenceUnavailable,
+            ));
+        }
         staged.publish();
         Ok(TenantQuotaUpdate {
             generation,

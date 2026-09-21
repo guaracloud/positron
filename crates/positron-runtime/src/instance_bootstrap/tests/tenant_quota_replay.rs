@@ -7,6 +7,7 @@ use positron_kernel::{
     Catalog, CatalogPublicationFault, ResourceAmounts, ResourceDimension, WorkClaim, WorkKind,
     with_catalog_publication_fault_after,
 };
+use std::num::NonZeroU64;
 
 use super::super::{InitializationPlan, InstanceBootstrap};
 use super::support::Roots;
@@ -57,6 +58,80 @@ fn quota_replay_returns_its_original_result_without_restoring_an_obsolete_limit(
             ResourceAmounts::only(ResourceDimension::MemoryBytes, 2)?,
         )?)?;
     drop(reservation);
+    Ok(())
+}
+
+#[test]
+fn quota_replay_survives_audit_reclamation_and_reopen() -> Result<(), Box<dyn std::error::Error>> {
+    let roots = Roots::new()?;
+    let paths = roots.paths();
+    drop(InstanceBootstrap::initialize(
+        &paths,
+        InitializationPlan::non_interactive(),
+    )?);
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let initialized = InstanceBootstrap::reopen(&paths)?;
+    let system = initialized.attribute(
+        PresentedCredential::parse(claim.secret())?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let credential = initialized.create_api_key(
+        system,
+        positron_domain::identity::Scope::TenantAdministration,
+        None,
+        ResourceGeneration::new(1)?,
+        AdministrativeIdempotencyKey::new([0xe1; 16])?,
+    )?;
+    let tenant_secret = credential
+        .secret()
+        .ok_or("tenant administration secret")?
+        .to_owned();
+    let actor = initialized.attribute(
+        PresentedCredential::parse(&tenant_secret)?,
+        RequestedIntent::TenantAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let key = AdministrativeIdempotencyKey::new([0xe2; 16])?;
+    let update = initialized.update_tenant_quota(
+        actor,
+        initialized.tenant,
+        ResourceGeneration::new(1)?,
+        key,
+        1,
+        [2; 11],
+    )?;
+    let system = initialized.attribute(
+        PresentedCredential::parse(claim.secret())?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    initialized.update_system_audit_retention(
+        system,
+        NonZeroU64::new(1).ok_or("nonzero audit retention")?,
+        ResourceGeneration::new(1)?,
+        AdministrativeIdempotencyKey::new([0xe3; 16])?,
+    )?;
+    drop(initialized);
+
+    let reopened = InstanceBootstrap::reopen(&paths)?;
+    let actor = reopened.attribute(
+        PresentedCredential::parse(&tenant_secret)?,
+        RequestedIntent::TenantAdministration,
+        CompatibilityHints::none(),
+    )?;
+    assert_eq!(
+        reopened.update_tenant_quota(
+            actor,
+            reopened.tenant,
+            ResourceGeneration::new(1)?,
+            key,
+            1,
+            [2; 11],
+        )?,
+        update,
+        "the terminal quota receipt retains the original result after pruning"
+    );
     Ok(())
 }
 

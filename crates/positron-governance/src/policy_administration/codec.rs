@@ -1,5 +1,5 @@
 use positron_domain::identity::{PrincipalId, TenantId};
-use positron_kernel::CatalogSnapshot;
+use positron_kernel::{CatalogObject, CatalogSnapshot};
 use sha2::{Digest, Sha256};
 
 use super::{
@@ -7,7 +7,8 @@ use super::{
     ResourceGeneration, map_catalog,
 };
 
-const RECEIPT_MAGIC: [u8; 8] = *b"POSPID01";
+const RECEIPT_MAGIC_V1: [u8; 8] = *b"POSPID01";
+const RECEIPT_MAGIC: [u8; 8] = *b"POSPID02";
 const AUDIT_MAGIC: [u8; 8] = *b"POSPOL02";
 
 #[derive(Clone, Copy)]
@@ -19,6 +20,7 @@ pub(super) struct ActivationSemantics {
     pub(super) generation: ResourceGeneration,
     pub(super) digest: [u8; 32],
     pub(super) request_digest: [u8; 32],
+    pub(super) audit_position: u64,
 }
 
 pub(super) struct Receipt {
@@ -28,6 +30,7 @@ pub(super) struct Receipt {
     pub(super) generation: ResourceGeneration,
     pub(super) digest: [u8; 32],
     pub(super) request_digest: [u8; 32],
+    pub(super) audit_position: u64,
 }
 
 pub(super) fn request_digest(
@@ -50,11 +53,32 @@ pub(super) fn request_digest(
 }
 
 pub(super) fn encode_receipt(semantics: ActivationSemantics) -> Vec<u8> {
-    encode_semantics(RECEIPT_MAGIC, semantics)
+    let mut bytes = encode_semantics(RECEIPT_MAGIC, semantics);
+    bytes.extend_from_slice(&semantics.audit_position.to_be_bytes());
+    bytes
 }
 
 pub(super) fn encode_audit(semantics: ActivationSemantics) -> Vec<u8> {
     encode_semantics(AUDIT_MAGIC, semantics)
+}
+
+pub(crate) fn legacy_receipt_object(
+    entry: &crate::audit::IngestPolicyActivationAuditEntry,
+) -> Result<CatalogObject, PolicyAdministrationFailure> {
+    if entry.position() == 0 {
+        return Err(corrupt());
+    }
+    CatalogObject::new(encode_receipt(ActivationSemantics {
+        key: entry.idempotency_key(),
+        principal: entry.principal_id(),
+        tenant: entry.tenant_id(),
+        expected: entry.expected_generation(),
+        generation: entry.generation(),
+        digest: entry.digest(),
+        request_digest: entry.request_digest(),
+        audit_position: entry.position(),
+    }))
+    .map_err(map_catalog)
 }
 
 fn encode_semantics(magic: [u8; 8], semantics: ActivationSemantics) -> Vec<u8> {
@@ -80,7 +104,7 @@ pub(super) fn find_receipt(
             .object(identity)
             .map_err(map_catalog)?
             .ok_or_else(corrupt)?;
-        if !bytes.starts_with(&RECEIPT_MAGIC) {
+        if !bytes.starts_with(&RECEIPT_MAGIC) && !bytes.starts_with(&RECEIPT_MAGIC_V1) {
             continue;
         }
         let receipt = decode_receipt(bytes)?;
@@ -92,7 +116,10 @@ pub(super) fn find_receipt(
 }
 
 fn decode_receipt(bytes: &[u8]) -> Result<Receipt, PolicyAdministrationFailure> {
-    if bytes.len() != 136 {
+    let version_two = bytes.starts_with(&RECEIPT_MAGIC);
+    if (!version_two && !bytes.starts_with(&RECEIPT_MAGIC_V1))
+        || bytes.len() != if version_two { 144 } else { 136 }
+    {
         return Err(corrupt());
     }
     let array = |start: usize| -> Result<[u8; 16], PolicyAdministrationFailure> {
@@ -114,6 +141,10 @@ fn decode_receipt(bytes: &[u8]) -> Result<Receipt, PolicyAdministrationFailure> 
             .and_then(|value| value.try_into().ok())
             .ok_or_else(corrupt)
     };
+    let audit_position = if version_two { long(136)? } else { 0 };
+    if version_two && audit_position == 0 {
+        return Err(corrupt());
+    }
     Ok(Receipt {
         principal: PrincipalId::from_bytes(array(24)?).map_err(|_| corrupt())?,
         tenant: TenantId::from_bytes(array(40)?).map_err(|_| corrupt())?,
@@ -121,6 +152,7 @@ fn decode_receipt(bytes: &[u8]) -> Result<Receipt, PolicyAdministrationFailure> 
         generation: ResourceGeneration::new(long(64)?)?,
         digest: digest(72)?,
         request_digest: digest(104)?,
+        audit_position,
     })
 }
 

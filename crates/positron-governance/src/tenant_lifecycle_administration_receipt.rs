@@ -31,7 +31,16 @@ pub(super) fn object(
         .governance_audit_frontier()
         .checked_add(1)
         .ok_or(TenantLifecycleAdministrationFailure::CapacityExceeded)?;
-    if fields.audit_time == 0 || fields.request_digest.iter().all(|byte| *byte == 0) {
+    object_for_fields(fields)
+}
+
+pub(super) fn object_for_fields(
+    fields: ReceiptFields,
+) -> Result<CatalogObject, TenantLifecycleAdministrationFailure> {
+    if fields.audit_position == 0
+        || fields.audit_time == 0
+        || fields.request_digest.iter().all(|byte| *byte == 0)
+    {
         return Err(TenantLifecycleAdministrationFailure::PersistenceUnavailable);
     }
     let mut encoded = Vec::new();

@@ -32,6 +32,42 @@ use positron_governance::{
 };
 use positron_query::QueryCancellation;
 
+/// A bounded, authorization-filtered Governance Audit history. When an audit
+/// retention anchor is present, records before that signed position are no
+/// longer claimed to be available by this response.
+#[derive(Debug)]
+pub struct GovernanceAuditHistory {
+    records: Vec<positron_governance::GovernanceAuditEntry>,
+    retention_anchor_position: Option<u64>,
+}
+
+impl GovernanceAuditHistory {
+    #[must_use]
+    pub fn records(&self) -> &[positron_governance::GovernanceAuditEntry] {
+        &self.records
+    }
+
+    /// Returns the signed boundary preceding the retained suffix, if system
+    /// policy has reclaimed an older audit prefix.
+    #[must_use]
+    pub const fn retention_anchor_position(&self) -> Option<u64> {
+        self.retention_anchor_position
+    }
+
+    /// Returns the first position that this bounded response can contain.
+    #[must_use]
+    pub fn earliest_visible_position(&self) -> u64 {
+        self.records
+            .first()
+            .map(positron_governance::GovernanceAuditEntry::position)
+            .or_else(|| {
+                self.retention_anchor_position
+                    .and_then(|position| position.checked_add(1))
+            })
+            .unwrap_or(1)
+    }
+}
+
 /// Read-only, generation-bound retention-reduction evidence for one tenant.
 pub struct TenantRetentionImpactPreview {
     tenant: TenantId,

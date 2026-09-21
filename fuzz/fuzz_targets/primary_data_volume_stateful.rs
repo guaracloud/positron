@@ -52,7 +52,10 @@ fn install_bounded_layout(root: &Path, data: &[u8]) {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::symlink;
-                let _ = symlink(root.join("missing-lock-target"), root.join(".positron-volume.lock"));
+                let _ = symlink(
+                    root.join("missing-lock-target"),
+                    root.join(".positron-volume.lock"),
+                );
             }
         },
         6 => {
@@ -92,14 +95,12 @@ fuzz_target!(|data: &[u8]| {
         Ok(first) => {
             assert!(!root.0.join(".positron-volume-probe").exists());
             if data.get(1).copied().unwrap_or_default() & 1 == 0 {
-                let second =
-                    PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost);
+                let second = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost);
                 assert!(second.is_err());
             }
             drop(first);
             if data.get(1).copied().unwrap_or_default() & 2 != 0 {
-                let reopened =
-                    PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost);
+                let reopened = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost);
                 assert!(reopened.is_ok());
             }
         },

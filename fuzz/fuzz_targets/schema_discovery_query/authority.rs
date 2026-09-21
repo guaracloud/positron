@@ -80,15 +80,8 @@ fn establish_with_compaction_pool(
     } else {
         small
     };
-    let pools = RecoveryPoolCapacities::new(
-        durability,
-        small,
-        compaction,
-        small,
-        large,
-        small,
-        small,
-    )?;
+    let pools =
+        RecoveryPoolCapacities::new(durability, small, compaction, small, large, small, small)?;
     Ok(StorageKernelResourceAuthority::establish(
         volume,
         ResourceGovernorConfiguration::new(inventory, policy, pools)?,

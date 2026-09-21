@@ -370,7 +370,9 @@ fn run_once(data: &[u8], root: &std::path::Path) -> Result<(), Box<dyn Error>> {
         tenant,
         scope.shard_id(),
         data[0],
-        next_ingest_time.checked_add(1).ok_or("fixture ingest time overflow")?,
+        next_ingest_time
+            .checked_add(1)
+            .ok_or("fixture ingest time overflow")?,
         0xd0,
     )?;
     expected.insert(
@@ -1293,7 +1295,8 @@ fn exercise_service_relationship_fixture<'kernel>(
             "storefront".to_owned(),
         )));
     }
-    let (child_attributes, expected_child_identity, expected_child_namespace_identity) = match case {
+    let (child_attributes, expected_child_identity, expected_child_namespace_identity) = match case
+    {
         0 => (
             vec![
                 name(CandidateAttributeValue::string("inventory".to_owned())),
@@ -1495,10 +1498,7 @@ fn transformed_service_identity_policy(case: u8) -> Result<Option<IngestPolicy>,
     )?))
 }
 
-fn assert_service_identity(
-    actual: TraceServiceIdentity<'_>,
-    expected: ExpectedServiceIdentity,
-) {
+fn assert_service_identity(actual: TraceServiceIdentity<'_>, expected: ExpectedServiceIdentity) {
     match expected {
         ExpectedServiceIdentity::Missing => assert_eq!(actual, TraceServiceIdentity::Missing),
         ExpectedServiceIdentity::Exact(value) => {
@@ -1512,9 +1512,7 @@ fn assert_service_identity(
     }
 }
 
-fn expected_service_identity_state(
-    identity: ExpectedServiceIdentity,
-) -> TraceServiceIdentityState {
+fn expected_service_identity_state(identity: ExpectedServiceIdentity) -> TraceServiceIdentityState {
     match identity {
         ExpectedServiceIdentity::Missing => TraceServiceIdentityState::Missing,
         ExpectedServiceIdentity::Exact(_) => TraceServiceIdentityState::Exact,

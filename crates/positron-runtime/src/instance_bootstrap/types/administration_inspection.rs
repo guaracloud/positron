@@ -1,6 +1,39 @@
 use super::*;
 
 impl InitializedInstance {
+    /// Returns the bounded, decoded Governance Audit history visible to this
+    /// authenticated principal. System administrators receive the complete
+    /// retained history; tenant administrators receive only entries with an
+    /// explicit matching tenant attribution.
+    pub fn inspect_governance_audit_history(
+        &self,
+        actor: positron_governance::AuthorizedContext,
+    ) -> Result<GovernanceAuditHistory, BootstrapFailure> {
+        let secret = self
+            .key
+            .catalog_secret(self.instance)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
+        let view = Catalog::read_current_view(&self._authority, self.instance, secret)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        let identity = positron_governance::Identity::open(view.snapshot())
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
+        let audit = view
+            .governance_audit_records()
+            .iter()
+            .map(positron_governance::GovernanceAuditEntry::decode)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
+        let inspection = identity
+            .inspect_audit(actor, &audit)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ApiKeyUnauthorized))?;
+        Ok(GovernanceAuditHistory {
+            records: inspection.audit_records().cloned().collect(),
+            retention_anchor_position: view
+                .audit_retention_anchor()
+                .map(positron_kernel::AuditRetentionAnchor::position),
+        })
+    }
+
     /// Publishes a signed checkpoint for the complete currently visible
     /// Governance Audit chain. Only the authenticated system administrator may
     /// request this system-governance maintenance action.
@@ -71,6 +104,40 @@ impl InitializedInstance {
             return Err(BootstrapFailure::new(
                 BootstrapFailureCode::IdentityMismatch,
             ));
+        }
+        if let Some(anchor) = view.audit_retention_anchor() {
+            view.verify_retained_audit_suffix(view.governance_audit_records())
+                .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+            if let Some(checkpoint) = trusted_checkpoint {
+                checkpoint
+                    .verify(governance.integrity_public_key())
+                    .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+                if checkpoint.instance() != self.instance {
+                    return Err(BootstrapFailure::new(
+                        BootstrapFailureCode::CatalogUnavailable,
+                    ));
+                }
+                let checkpoint_hash = if checkpoint.position() == anchor.position() {
+                    Some(anchor.record_hash())
+                } else {
+                    checkpoint
+                        .position()
+                        .checked_sub(anchor.position())
+                        .and_then(|offset| offset.checked_sub(1))
+                        .and_then(|offset| usize::try_from(offset).ok())
+                        .and_then(|offset| {
+                            view.governance_audit_records()
+                                .get(offset)
+                                .map(positron_kernel::GovernanceAuditRecord::record_hash)
+                        })
+                };
+                if checkpoint_hash != Some(checkpoint.record_hash()) {
+                    return Err(BootstrapFailure::new(
+                        BootstrapFailureCode::CatalogUnavailable,
+                    ));
+                }
+            }
+            return Ok(());
         }
         let stored = view
             .latest_audit_checkpoint()

@@ -6,8 +6,9 @@ use std::path::{Path, PathBuf};
 use positron_domain::identity::{PrincipalId, Scope};
 use positron_domain::routing::{SignalKind, VirtualShardId};
 use positron_governance::{
-    CatalogRootRotationStage, CompatibilityHints, InitialAuditContext, InitialGovernanceIntent,
-    InitialTenantIntent, PresentedCredential, RequestedIntent,
+    AdministrativeIdempotencyKey, CatalogRootRotationStage, CompatibilityHints,
+    InitialAuditContext, InitialGovernanceIntent, InitialTenantIntent, PresentedCredential,
+    RequestedIntent, ResourceGeneration,
 };
 use positron_kernel::{
     ActiveSegmentLedger, AuditIntent, Catalog, CatalogObject, CatalogProposal,
@@ -222,6 +223,45 @@ fn plaintext_api_transport_activation_replays_only_the_exact_bound_startup_inten
             .expect("changed plaintext transport audit")
             .listener_target(),
         Some(changed_target.api_bind_address())
+    );
+    Ok(())
+}
+
+#[test]
+fn plaintext_listener_activation_replays_after_audit_reclamation_and_reopen()
+-> Result<(), Box<dyn std::error::Error>> {
+    let roots = Roots::new()?;
+    let paths = roots.paths();
+    drop(InstanceBootstrap::initialize(
+        &paths,
+        InitializationPlan::non_interactive(),
+    )?);
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let initialized = InstanceBootstrap::reopen(&paths)?;
+    let configured = PublicPlaintextApiStartupIntent::configuration_file(SocketAddr::from((
+        Ipv4Addr::new(198, 51, 100, 25),
+        8_080,
+    )));
+    initialized.activate_public_plaintext_api_transport(configured)?;
+    let system = initialized.attribute(
+        PresentedCredential::parse(claim.secret())?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    initialized.update_system_audit_retention(
+        system,
+        NonZeroU64::new(1).ok_or("nonzero audit retention")?,
+        ResourceGeneration::new(1)?,
+        AdministrativeIdempotencyKey::new([0xf3; 16])?,
+    )?;
+    drop(initialized);
+
+    let reopened = InstanceBootstrap::reopen(&paths)?;
+    reopened.activate_public_plaintext_api_transport(configured)?;
+    assert_eq!(
+        reopened.governance_audit_for_test()?.len(),
+        1,
+        "the compact listener receipt preserves its original terminal position after pruning"
     );
     Ok(())
 }

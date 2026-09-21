@@ -15,16 +15,16 @@ use positron_domain::value::{
 use positron_governance::{InitialAuditContext, InitialGovernanceIntent, InitialTenantIntent};
 use positron_kernel::{
     ActiveSegmentLedger, Catalog, CatalogObject, CatalogProposal, CatalogSecret, FormatEpoch,
-    InstanceId, ResourceAmounts, ResourceDimension, RetentionTimeAuthority,
-    SegmentId, SegmentProtectionKey, SegmentScope, StoreBlockIdentity, WorkClaim, WorkKind,
+    InstanceId, ResourceAmounts, ResourceDimension, RetentionTimeAuthority, SegmentId,
+    SegmentProtectionKey, SegmentScope, StoreBlockIdentity, WorkClaim, WorkKind,
 };
 use positron_policy::{
     IngestPolicy, NativeLogAttribute, NativeLogCandidate, PolicyEvaluation, PolicyReceiver,
 };
 use positron_signals::{
-    LogMetadata, LogRecord, LogRetentionPolicy, LogScan, LogStore, ScanCancellation, ScanLimit,
-    OccurrenceSelector, ScanObservationFailureCode, ScanObserver, SchemaBudget, SchemaPath,
-    SchemaQuery, SchemaSessionStore, SchemaValue,
+    LogMetadata, LogRecord, LogRetentionPolicy, LogScan, LogStore, OccurrenceSelector,
+    ScanCancellation, ScanLimit, ScanObservationFailureCode, ScanObserver, SchemaBudget,
+    SchemaPath, SchemaQuery, SchemaSessionStore, SchemaValue,
 };
 
 #[path = "schema_discovery_query/authority.rs"]
@@ -82,9 +82,8 @@ fn run_once(
     )?;
     install_policy(&catalog, instance, tenant)?;
     const BUCKET_NANOS: u64 = 3_600_000_000_000;
-    let (retention_time, elapsed) = RetentionTimeAuthority::establish_with_manual_elapsed(
-        UnixNanoseconds::new(1_000_000_000),
-    );
+    let (retention_time, elapsed) =
+        RetentionTimeAuthority::establish_with_manual_elapsed(UnixNanoseconds::new(1_000_000_000));
     let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(61)?);
     let key = || SegmentProtectionKey::from_owned(Box::new([0x64; 32]));
     let store = LogStore::new();
@@ -241,16 +240,20 @@ fn run_once(
         7,
         "deterministic bucket fixture must expose every mixed, alternate, and active record"
     );
-    let segment_for = |identity: StoreBlockIdentity| -> Result<SegmentId, Box<dyn std::error::Error>> {
-        before_snapshot
-            .blocks()
-            .iter()
-            .find(|block| block.identity() == identity)
-            .map(|block| block.segment_id())
-            .ok_or_else(|| format!("missing segment for fuzz block {identity:?}").into())
-    };
+    let segment_for =
+        |identity: StoreBlockIdentity| -> Result<SegmentId, Box<dyn std::error::Error>> {
+            before_snapshot
+                .blocks()
+                .iter()
+                .find(|block| block.identity() == identity)
+                .map(|block| block.segment_id())
+                .ok_or_else(|| format!("missing segment for fuzz block {identity:?}").into())
+        };
     let mixed_segment = segment_for(StoreBlockIdentity::new([0x70; 16])?)?;
-    assert_eq!(segment_for(StoreBlockIdentity::new([0x71; 16])?)?, mixed_segment);
+    assert_eq!(
+        segment_for(StoreBlockIdentity::new([0x71; 16])?)?,
+        mixed_segment
+    );
     let bucket_one_segments = BTreeSet::from([
         segment_for(StoreBlockIdentity::new([0x72; 16])?)?,
         segment_for(StoreBlockIdentity::new([0x73; 16])?)?,
@@ -315,33 +318,12 @@ fn run_once(
     let fault_mode = data.first().map_or(0, |byte| (byte >> 1) % 3);
     let attempt = match fault_mode {
         1 => positron_kernel::fuzz_compaction_storage_fault(true, || {
-            store.compact_observed(
-                &ledger,
-                tenant,
-                policy,
-                bucket,
-                &cancelled,
-                &Unobserved,
-            )
+            store.compact_observed(&ledger, tenant, policy, bucket, &cancelled, &Unobserved)
         }),
         2 => positron_kernel::fuzz_compaction_publication_fault(true, || {
-            store.compact_observed(
-                &ledger,
-                tenant,
-                policy,
-                bucket,
-                &cancelled,
-                &Unobserved,
-            )
+            store.compact_observed(&ledger, tenant, policy, bucket, &cancelled, &Unobserved)
         }),
-        _ => store.compact_observed(
-            &ledger,
-            tenant,
-            policy,
-            bucket,
-            &cancelled,
-            &Unobserved,
-        ),
+        _ => store.compact_observed(&ledger, tenant, policy, bucket, &cancelled, &Unobserved),
     };
     if cancelled.is_cancelled() {
         if attempt.is_ok() {
@@ -431,10 +413,7 @@ fn run_once(
     };
     for marker in other_markers {
         let identity = StoreBlockIdentity::new([marker; 16])?;
-        assert_eq!(
-            segment_for_after(identity)?,
-            segment_for(identity)?
-        );
+        assert_eq!(segment_for_after(identity)?, segment_for(identity)?);
     }
     let schema_after = store.scan_schema(
         authority.governor(),
@@ -451,12 +430,20 @@ fn run_once(
         before
             .records()
             .iter()
-            .map(|record| (record.commit_position(), record.record_ordinal(), record.record().body()))
+            .map(|record| (
+                record.commit_position(),
+                record.record_ordinal(),
+                record.record().body()
+            ))
             .collect::<Vec<_>>(),
         after
             .records()
             .iter()
-            .map(|record| (record.commit_position(), record.record_ordinal(), record.record().body()))
+            .map(|record| (
+                record.commit_position(),
+                record.record_ordinal(),
+                record.record().body()
+            ))
             .collect::<Vec<_>>()
     );
     assert_eq!(
@@ -505,7 +492,10 @@ fn run_once(
         &reopened_schema,
         &schema_query,
     )?;
-    assert_eq!(restarted_schema.records(), expected_schema_records.as_slice());
+    assert_eq!(
+        restarted_schema.records(),
+        expected_schema_records.as_slice()
+    );
     Ok(())
 }
 
@@ -524,7 +514,10 @@ fn append_fuzz_block<'authority, 'catalog>(
     let delta = schema.stage_group(&mut records)?;
     let block = store
         .prepare(
-            ledger.begin_store_block(ingest_capacity(authority, ledger.scope().tenant_id())?, identity)?,
+            ledger.begin_store_block(
+                ingest_capacity(authority, ledger.scope().tenant_id())?,
+                identity,
+            )?,
             records,
         )?
         .into_store_block();
@@ -539,11 +532,7 @@ fn fuzz_record(
     data: &[u8],
     segment: u8,
 ) -> Result<LogRecord, Box<dyn std::error::Error>> {
-    let selector = data
-        .get(usize::from(segment))
-        .copied()
-        .unwrap_or(segment)
-        % 8;
+    let selector = data.get(usize::from(segment)).copied().unwrap_or(segment) % 8;
     let mut body_bytes = data.to_vec();
     body_bytes.truncate(128);
     let body = match selector {
@@ -553,7 +542,9 @@ fn fuzz_record(
         3 => Some(CandidateAttributeValue::signed_integer(i64::from(
             data.first().copied().unwrap_or(7),
         ))),
-        4 => Some(CandidateAttributeValue::floating_point_bits(1.5_f64.to_bits())),
+        4 => Some(CandidateAttributeValue::floating_point_bits(
+            1.5_f64.to_bits(),
+        )),
         5 => Some(CandidateAttributeValue::string(
             String::from_utf8_lossy(&body_bytes).into_owned(),
         )),
@@ -578,7 +569,9 @@ fn fuzz_record(
         NativeLogAttribute::new(
             AttributeNamespace::Record,
             "fuzz.overflow".to_owned(),
-            vec![CandidateAttributeValue::array(vec![CandidateAttributeValue::null()])],
+            vec![CandidateAttributeValue::array(vec![
+                CandidateAttributeValue::null(),
+            ])],
         ),
     ];
     let candidate = NativeLogCandidate::new(

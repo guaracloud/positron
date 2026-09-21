@@ -1,12 +1,13 @@
 use std::error::Error;
 use std::fs;
+use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use positron_governance::{
     AdministrativeIdempotencyKey, CompatibilityHints, PresentedCredential, RequestedIntent,
-    TenantAdministration,
+    ResourceGeneration, TenantAdministration,
 };
 use positron_ingest::IngestPolicy;
 use positron_kernel::{FormatEpoch, MountQualification};
@@ -39,8 +40,8 @@ fn legacy_queries_remain_compatible_after_epoch_two_migration_without_policy_inj
         RequestedIntent::SystemAdministration,
         CompatibilityHints::none(),
     )?;
-    initialized
-        .migrate_catalog_to_epoch_two(system, AdministrativeIdempotencyKey::new([0xd3; 16])?)?;
+    let migration_key = AdministrativeIdempotencyKey::new([0xd3; 16])?;
+    let migration = initialized.migrate_catalog_to_epoch_two(system, migration_key)?;
     assert_eq!(
         initialized.catalog_format_epoch()?,
         Some(FormatEpoch::CATALOG_V2)
@@ -66,8 +67,29 @@ fn legacy_queries_remain_compatible_after_epoch_two_migration_without_policy_inj
     );
     drop(snapshot);
     drop(catalog);
+    let system = initialized.attribute(
+        PresentedCredential::parse(&administrator_secret)?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    initialized.update_system_audit_retention(
+        system,
+        NonZeroU64::new(1).ok_or("retained audit-record limit")?,
+        ResourceGeneration::new(1)?,
+        AdministrativeIdempotencyKey::new([0xd4; 16])?,
+    )?;
     drop(initialized);
     let reopened = Arc::new(InstanceBootstrap::reopen(&paths)?);
+    let system = reopened.attribute(
+        PresentedCredential::parse(&administrator_secret)?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    assert_eq!(
+        reopened.migrate_catalog_to_epoch_two(system, migration_key)?,
+        migration,
+        "the terminal migration receipt survives reclamation of its audit record"
+    );
     let services = ServiceHandle::new(Arc::clone(&reopened))?;
     assert_eq!(
         services.query_log_bodies(
