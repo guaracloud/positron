@@ -17,6 +17,8 @@ use crate::{
 };
 
 pub(crate) const TENANT_DISPLAY_MAGIC: [u8; 8] = *b"POSTDP01";
+const TENANT_DISPLAY_RECEIPT_MAGIC: [u8; 8] = *b"POSTDR01";
+const TENANT_DISPLAY_RECEIPT_BYTES: usize = 112;
 
 /// A successful, redacted display-name successor publication.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -181,10 +183,17 @@ impl TenantProfileAdministration {
                 )
             })?;
         let digest = request_digest(principal, &request, successor);
-        if let Some(replay) = replay(catalog, principal, &request, successor, digest)? {
+        let snapshot = catalog.pin().map_err(map_catalog)?;
+        if let Some(replay) = replay_receipt(&snapshot, principal, &request, successor, digest)? {
             return Ok(replay);
         }
-        let snapshot = catalog.pin().map_err(map_catalog)?;
+        if let Some(replay) = replay_records(catalog, principal, &request, successor, digest)? {
+            return Ok(replay);
+        }
+        let audit_position = snapshot
+            .governance_audit_frontier()
+            .checked_add(1)
+            .ok_or_else(unavailable)?;
         let (governance_id, governance) = snapshot.governance_object().map_err(map_catalog)?;
         let objects = if governance.tenant() == request.tenant {
             let current =
@@ -201,7 +210,7 @@ impl TenantProfileAdministration {
                 ));
             }
             let mut objects = retained_objects(&snapshot, governance_id)?;
-            objects.try_reserve(1).map_err(|_| unavailable())?;
+            objects.try_reserve(2).map_err(|_| unavailable())?;
             objects.push(
                 CatalogObject::new(
                     governance
@@ -238,6 +247,17 @@ impl TenantProfileAdministration {
             )
             .map_err(map_record)?
         };
+        let mut objects = objects;
+        objects.push(
+            CatalogObject::new(encode_receipt(
+                principal,
+                &request,
+                successor,
+                digest,
+                audit_position,
+            ))
+            .map_err(map_catalog)?,
+        );
         let audit = encode_audit(principal, &request, successor, digest);
         let commit = catalog
             .commit(
@@ -251,17 +271,21 @@ impl TenantProfileAdministration {
                 Some(AuditIntent::new(audit).map_err(map_catalog)?),
             )
             .map_err(map_catalog)?;
+        let committed_audit_position = commit
+            .governance_audit_record()
+            .ok_or_else(unavailable)?
+            .position();
+        if committed_audit_position != audit_position {
+            return Err(unavailable());
+        }
         Ok(TenantDisplayNameUpdate {
             generation: successor,
-            audit_position: commit
-                .governance_audit_record()
-                .ok_or_else(unavailable)?
-                .position(),
+            audit_position,
         })
     }
 }
 
-fn replay(
+fn replay_records(
     catalog: &Catalog<'_>,
     principal: positron_domain::identity::PrincipalId,
     request: &TenantDisplayNameUpdateRequest,
@@ -298,6 +322,96 @@ fn replay(
         }));
     }
     Ok(None)
+}
+
+fn replay_receipt(
+    snapshot: &CatalogSnapshot,
+    principal: positron_domain::identity::PrincipalId,
+    request: &TenantDisplayNameUpdateRequest,
+    successor: ResourceGeneration,
+    digest: [u8; 32],
+) -> Result<Option<TenantDisplayNameUpdate>, TenantProfileAdministrationFailure> {
+    let mut found = None;
+    for identity in snapshot.object_identities() {
+        let bytes = snapshot
+            .object(identity)
+            .map_err(map_catalog)?
+            .ok_or_else(unavailable)?;
+        if !bytes.starts_with(&TENANT_DISPLAY_RECEIPT_MAGIC) {
+            continue;
+        }
+        if bytes.len() != TENANT_DISPLAY_RECEIPT_BYTES {
+            return Err(unavailable());
+        }
+        if bytes.get(8..24) != Some(request.idempotency.to_bytes().as_slice()) {
+            continue;
+        }
+        let stored_principal = positron_domain::identity::PrincipalId::from_bytes(
+            bytes
+                .get(24..40)
+                .ok_or_else(unavailable)?
+                .try_into()
+                .map_err(|_| unavailable())?,
+        )
+        .map_err(|_| unavailable())?;
+        let stored_tenant = TenantId::from_bytes(
+            bytes
+                .get(40..56)
+                .ok_or_else(unavailable)?
+                .try_into()
+                .map_err(|_| unavailable())?,
+        )
+        .map_err(|_| unavailable())?;
+        let expected = ResourceGeneration::new(u64::from_be_bytes(
+            bytes
+                .get(56..64)
+                .ok_or_else(unavailable)?
+                .try_into()
+                .map_err(|_| unavailable())?,
+        ))
+        .map_err(|_| unavailable())?;
+        let generation = ResourceGeneration::new(u64::from_be_bytes(
+            bytes
+                .get(64..72)
+                .ok_or_else(unavailable)?
+                .try_into()
+                .map_err(|_| unavailable())?,
+        ))
+        .map_err(|_| unavailable())?;
+        let stored_digest: [u8; 32] = bytes
+            .get(72..104)
+            .ok_or_else(unavailable)?
+            .try_into()
+            .map_err(|_| unavailable())?;
+        let audit_position = u64::from_be_bytes(
+            bytes
+                .get(104..112)
+                .ok_or_else(unavailable)?
+                .try_into()
+                .map_err(|_| unavailable())?,
+        );
+        if stored_principal != principal
+            || stored_tenant != request.tenant
+            || expected != request.expected
+            || generation != successor
+            || stored_digest != digest
+            || audit_position == 0
+        {
+            return Err(TenantProfileAdministrationFailure::new(
+                TenantProfileAdministrationFailureCode::IdempotencyConflict,
+            ));
+        }
+        if found
+            .replace(TenantDisplayNameUpdate {
+                generation,
+                audit_position,
+            })
+            .is_some()
+        {
+            return Err(unavailable());
+        }
+    }
+    Ok(found)
 }
 
 fn retained_objects(
@@ -349,6 +463,71 @@ fn encode_audit(
     bytes.extend_from_slice(&successor.get().to_be_bytes());
     bytes.extend_from_slice(&digest);
     bytes
+}
+
+fn encode_receipt(
+    principal: positron_domain::identity::PrincipalId,
+    request: &TenantDisplayNameUpdateRequest,
+    successor: ResourceGeneration,
+    digest: [u8; 32],
+    audit_position: u64,
+) -> Vec<u8> {
+    encode_terminal_receipt(
+        request.idempotency,
+        principal,
+        request.tenant,
+        request.expected,
+        successor,
+        digest,
+        audit_position,
+    )
+}
+
+fn encode_terminal_receipt(
+    idempotency: AdministrativeIdempotencyKey,
+    principal: positron_domain::identity::PrincipalId,
+    tenant: TenantId,
+    expected: ResourceGeneration,
+    successor: ResourceGeneration,
+    digest: [u8; 32],
+    audit_position: u64,
+) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(TENANT_DISPLAY_RECEIPT_BYTES);
+    bytes.extend_from_slice(&TENANT_DISPLAY_RECEIPT_MAGIC);
+    bytes.extend_from_slice(&idempotency.to_bytes());
+    bytes.extend_from_slice(&principal.to_bytes());
+    bytes.extend_from_slice(&tenant.to_bytes());
+    bytes.extend_from_slice(&expected.get().to_be_bytes());
+    bytes.extend_from_slice(&successor.get().to_be_bytes());
+    bytes.extend_from_slice(&digest);
+    bytes.extend_from_slice(&audit_position.to_be_bytes());
+    bytes
+}
+
+pub(crate) fn legacy_receipt_object(
+    entry: &crate::TenantDisplayNameUpdateAuditEntry,
+) -> Result<CatalogObject, TenantProfileAdministrationFailure> {
+    CatalogObject::new(encode_terminal_receipt(
+        entry.idempotency_key(),
+        entry.principal_id(),
+        entry.tenant_id(),
+        entry.expected_generation(),
+        entry.generation(),
+        entry.request_digest(),
+        entry.position(),
+    ))
+    .map_err(map_catalog)
+}
+
+pub(crate) fn retention_terminal_key(bytes: &[u8]) -> Result<Option<[u8; 16]>, ()> {
+    crate::audit::terminal_receipt_key(
+        bytes,
+        &[(
+            TENANT_DISPLAY_RECEIPT_MAGIC,
+            TENANT_DISPLAY_RECEIPT_BYTES,
+            8,
+        )],
+    )
 }
 
 const fn unavailable() -> TenantProfileAdministrationFailure {

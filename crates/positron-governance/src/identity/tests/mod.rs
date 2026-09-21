@@ -5,7 +5,10 @@ use super::codec::decode_initial_identity;
 use super::{
     AttributionFailure, AuthorizedContext, CompatibilityHints, PresentedCredential, RequestedIntent,
 };
-use crate::{InitialAuditContext, InitialGovernanceIntent, InitialTenantIntent};
+use crate::{
+    GovernanceAuditEntry, InitialAuditContext, InitialGovernanceIntent, InitialTenantIntent,
+    schema_checkpoint_audit_intent,
+};
 
 fn encoded_identity() -> Vec<u8> {
     let intent = InitialTenantIntent::new(
@@ -300,7 +303,7 @@ fn credential_and_alias_parsers_are_bounded_canonical_and_redacted() {
 
 #[test]
 fn governance_inspection_rejects_forged_and_data_plane_contexts_with_one_shape() {
-    let identity = decode_initial_identity(&encoded_identity()).expect("identity");
+    let mut identity = decode_initial_identity(&encoded_identity()).expect("identity");
     let expected = AttributionFailure.to_string();
     for context in [
         AuthorizedContext {
@@ -358,4 +361,156 @@ fn governance_inspection_rejects_forged_and_data_plane_contexts_with_one_shape()
             expected
         );
     }
+    let system = AuthorizedContext {
+        principal: identity.principal,
+        scope: Scope::SystemAdministration,
+        tenant: None,
+        authority: identity.instance,
+        generation: identity.generation,
+        lifecycle: identity.lifecycle,
+        proxy_actor: None,
+    };
+    identity
+        .credentials
+        .iter_mut()
+        .find(|credential| credential.scope == Scope::SystemAdministration)
+        .expect("system credential")
+        .active = false;
+    assert!(identity.inspect(system, &[]).is_err());
+    assert!(identity.authorize_system_audit_retention(system).is_err());
+}
+
+#[test]
+fn audit_inspection_is_bounded_to_authorized_tenant_audit_meaning() {
+    let mut identity = decode_initial_identity(&encoded_identity()).expect("identity");
+    identity.credentials.push(super::CredentialIdentity {
+        principal: identity.principal,
+        scope: Scope::TenantAdministration,
+        active: true,
+        expires_at_unix_seconds: None,
+        salt: [21; 32],
+        hash: [22; 32],
+    });
+    let other_tenant = TenantId::from_bytes([23; 16]).expect("other tenant");
+    let own = GovernanceAuditEntry::decode_fields(
+        1,
+        [24; 16],
+        &schema_checkpoint_audit_intent(identity.tenant, b"own checkpoint").expect("own audit"),
+    )
+    .expect("own entry");
+    let other = GovernanceAuditEntry::decode_fields(
+        2,
+        [25; 16],
+        &schema_checkpoint_audit_intent(other_tenant, b"other checkpoint").expect("other audit"),
+    )
+    .expect("other entry");
+    let audit = [own, other];
+    let tenant = TenantAttribution::new(
+        identity.principal,
+        Scope::TenantAdministration,
+        identity.tenant,
+    )
+    .expect("tenant attribution");
+    let tenant_context = AuthorizedContext {
+        principal: tenant.principal_id(),
+        scope: Scope::TenantAdministration,
+        tenant: Some(tenant),
+        authority: identity.instance,
+        generation: identity.generation,
+        lifecycle: identity.lifecycle,
+        proxy_actor: None,
+    };
+    let tenant_positions = identity
+        .inspect_audit(tenant_context, &audit)
+        .expect("tenant audit read")
+        .audit_records()
+        .map(GovernanceAuditEntry::position)
+        .collect::<Vec<_>>();
+    assert_eq!(tenant_positions, vec![1]);
+
+    let system_positions = identity
+        .inspect_audit(
+            AuthorizedContext {
+                principal: identity.principal,
+                scope: Scope::SystemAdministration,
+                tenant: None,
+                authority: identity.instance,
+                generation: identity.generation,
+                lifecycle: identity.lifecycle,
+                proxy_actor: None,
+            },
+            &audit,
+        )
+        .expect("system audit read")
+        .audit_records()
+        .map(GovernanceAuditEntry::position)
+        .collect::<Vec<_>>();
+    assert_eq!(system_positions, vec![1, 2]);
+
+    for context in [
+        AuthorizedContext {
+            principal: identity.query.as_ref().expect("query credential").principal,
+            scope: Scope::Query,
+            tenant: Some(
+                TenantAttribution::new(
+                    identity.query.as_ref().expect("query credential").principal,
+                    Scope::Query,
+                    identity.tenant,
+                )
+                .expect("query attribution"),
+            ),
+            authority: identity.instance,
+            generation: identity.generation,
+            lifecycle: identity.lifecycle,
+            proxy_actor: None,
+        },
+        AuthorizedContext {
+            principal: identity
+                .ingest
+                .as_ref()
+                .expect("ingest credential")
+                .principal,
+            scope: Scope::Ingest,
+            tenant: Some(
+                TenantAttribution::new(
+                    identity
+                        .ingest
+                        .as_ref()
+                        .expect("ingest credential")
+                        .principal,
+                    Scope::Ingest,
+                    identity.tenant,
+                )
+                .expect("ingest attribution"),
+            ),
+            authority: identity.instance,
+            generation: identity.generation,
+            lifecycle: identity.lifecycle,
+            proxy_actor: None,
+        },
+        AuthorizedContext {
+            principal: identity.principal,
+            scope: Scope::TenantAdministration,
+            tenant: Some(
+                TenantAttribution::new(
+                    identity.principal,
+                    Scope::TenantAdministration,
+                    other_tenant,
+                )
+                .expect("other tenant attribution"),
+            ),
+            authority: identity.instance,
+            generation: identity.generation,
+            lifecycle: identity.lifecycle,
+            proxy_actor: None,
+        },
+    ] {
+        assert!(identity.inspect_audit(context, &audit).is_err());
+    }
+    identity
+        .credentials
+        .last_mut()
+        .expect("tenant administration credential")
+        .active = false;
+    assert!(identity.inspect_audit(tenant_context, &audit).is_err());
 }

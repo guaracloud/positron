@@ -86,7 +86,7 @@ pub(super) fn prepare_audit(
     Ok((record.clone(), encode_audit(&record)))
 }
 
-fn audit_hash(
+pub(super) fn audit_hash(
     position: u64,
     predecessor_hash: [u8; 32],
     transaction: TransactionId,

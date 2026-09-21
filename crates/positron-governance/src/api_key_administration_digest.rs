@@ -112,3 +112,28 @@ pub(super) fn rotate_request_digest(
     digest.update(expected.get().to_be_bytes());
     Ok(digest.finalize().into())
 }
+
+pub(super) fn revoke_request_digest(
+    idempotency: AdministrativeIdempotencyKey,
+    actor: PrincipalId,
+    principal: PrincipalId,
+    scope: u8,
+    expires_at_unix_seconds: Option<u64>,
+    expected: ResourceGeneration,
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"positron-api-key-revoke-request-v1");
+    digest.update(idempotency.to_bytes());
+    digest.update(actor.to_bytes());
+    digest.update(principal.to_bytes());
+    digest.update([scope]);
+    match expires_at_unix_seconds {
+        Some(value) => {
+            digest.update([1]);
+            digest.update(value.to_be_bytes());
+        },
+        None => digest.update([0]),
+    }
+    digest.update(expected.get().to_be_bytes());
+    digest.finalize().into()
+}

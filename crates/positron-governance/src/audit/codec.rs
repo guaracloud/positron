@@ -139,6 +139,37 @@ impl GovernanceAuditEntry {
             return SchemaCheckpointAuditEntry::decode_intent(position, transaction_id, intent)
                 .map(Self::SchemaCheckpoint);
         }
+        if intent.starts_with(&LISTENER_TRANSPORT_V2_MAGIC) {
+            let mut cursor = Cursor::new(intent);
+            if cursor.take_array::<8>()? != LISTENER_TRANSPORT_V2_MAGIC {
+                return Err(IdentityFailure);
+            }
+            let instance = cursor.take_array()?;
+            let listener_target = decode_listener_target(&mut cursor)?;
+            let configuration_provenance =
+                ListenerTransportConfigurationProvenance::from_code(cursor.take_u8()?)?;
+            let request_id = cursor.take_array()?;
+            let request_digest = cursor.take_array()?;
+            let request = ListenerTransportAuditRequest::configuration_file(listener_target);
+            if request.configuration_provenance() != configuration_provenance {
+                return Err(IdentityFailure);
+            }
+            if request_id != transaction_id
+                || request_id != request.transaction_id_for(instance)
+                || request_digest != request.digest_for(instance)
+                || !cursor.is_empty()
+            {
+                return Err(IdentityFailure);
+            }
+            return Ok(Self::ListenerTransport(ListenerTransportAuditEntry::bound(
+                position,
+                instance,
+                listener_target,
+                configuration_provenance,
+                request_id,
+                request_digest,
+            )));
+        }
         if intent.starts_with(&LISTENER_TRANSPORT_MAGIC) {
             if intent.len() != LISTENER_TRANSPORT_MAGIC.len() + 16
                 || intent.get(..8) != Some(LISTENER_TRANSPORT_MAGIC.as_slice())
@@ -152,7 +183,12 @@ impl GovernanceAuditEntry {
                 transaction_id,
             )));
         }
-        if intent.starts_with(&KEY_LIFECYCLE_MAGIC) {
+        if intent.starts_with(&KEY_LIFECYCLE_MAGIC)
+            || intent.starts_with(&KEY_LIFECYCLE_V2_MAGIC)
+            || intent.starts_with(&KEY_LIFECYCLE_V3_MAGIC)
+        {
+            let version_two = intent.starts_with(&KEY_LIFECYCLE_V2_MAGIC);
+            let version_three = intent.starts_with(&KEY_LIFECYCLE_V3_MAGIC);
             let fields = 9;
             let action = match *intent.get(8).ok_or(IdentityFailure)? {
                 1 => ApiKeyLifecycleAction::Create,
@@ -160,8 +196,40 @@ impl GovernanceAuditEntry {
                 3 => ApiKeyLifecycleAction::Revoke,
                 _ => return Err(IdentityFailure),
             };
-            if intent.len() != fields + 89
-                || intent.get(..8) != Some(KEY_LIFECYCLE_MAGIC.as_slice())
+            let request_digest_end =
+                fields + 89 + if version_two || version_three { 32 } else { 0 };
+            let tenant = if version_three {
+                match *intent.get(request_digest_end).ok_or(IdentityFailure)? {
+                    0 => None,
+                    1 => Some(
+                        TenantId::from_bytes(
+                            intent
+                                .get(request_digest_end + 1..request_digest_end + 17)
+                                .and_then(|bytes| bytes.try_into().ok())
+                                .ok_or(IdentityFailure)?,
+                        )
+                        .map_err(|_| IdentityFailure)?,
+                    ),
+                    _ => return Err(IdentityFailure),
+                }
+            } else {
+                None
+            };
+            let expected_length = request_digest_end
+                + if version_three {
+                    1 + tenant.map_or(0, |_| 16)
+                } else {
+                    0
+                };
+            if intent.len() != expected_length
+                || intent.get(..8)
+                    != Some(if version_three {
+                        KEY_LIFECYCLE_V3_MAGIC.as_slice()
+                    } else if version_two {
+                        KEY_LIFECYCLE_V2_MAGIC.as_slice()
+                    } else {
+                        KEY_LIFECYCLE_MAGIC.as_slice()
+                    })
                 || intent.get(fields + 73..fields + 89) != Some(transaction_id.as_slice())
             {
                 return Err(IdentityFailure);
@@ -218,7 +286,15 @@ impl GovernanceAuditEntry {
                     .ok_or(IdentityFailure)?,
             )
             .map_err(|_| IdentityFailure)?;
-            if expected_generation.get().checked_add(1) != Some(generation.get()) {
+            let request_digest = (version_two || version_three)
+                .then(|| intent.get(fields + 89..fields + 121))
+                .flatten()
+                .map(|bytes| bytes.try_into().map_err(|_| IdentityFailure))
+                .transpose()?;
+            if expected_generation.get().checked_add(1) != Some(generation.get())
+                || request_digest
+                    .is_some_and(|digest: [u8; 32]| digest.iter().all(|byte| *byte == 0))
+            {
                 return Err(IdentityFailure);
             }
             return Ok(Self::ApiKeyLifecycle(ApiKeyLifecycleAuditEntry {
@@ -233,6 +309,8 @@ impl GovernanceAuditEntry {
                 generation,
                 idempotency_key: AdministrativeIdempotencyKey::new(transaction_id)
                     .map_err(|_| IdentityFailure)?,
+                request_digest,
+                tenant,
             }));
         }
         if intent.starts_with(&TENANT_CREATION_MAGIC) {
@@ -296,9 +374,18 @@ impl GovernanceAuditEntry {
                 },
             ));
         }
-        if intent.starts_with(&TENANT_LIFECYCLE_MAGIC) {
+        if intent.starts_with(&TENANT_LIFECYCLE_MAGIC)
+            || intent.starts_with(&TENANT_LIFECYCLE_V2_MAGIC)
+        {
+            let version_two = intent.starts_with(&TENANT_LIFECYCLE_V2_MAGIC);
             let mut cursor = Cursor::new(intent);
-            if cursor.take_array::<8>()? != TENANT_LIFECYCLE_MAGIC {
+            if cursor.take_array::<8>()?
+                != if version_two {
+                    TENANT_LIFECYCLE_V2_MAGIC
+                } else {
+                    TENANT_LIFECYCLE_MAGIC
+                }
+            {
                 return Err(IdentityFailure);
             }
             let ingest_time_unix_seconds = cursor.take_u64()?;
@@ -319,7 +406,14 @@ impl GovernanceAuditEntry {
                 ResourceGeneration::new(cursor.take_u64()?).map_err(|_| IdentityFailure)?;
             let generation =
                 ResourceGeneration::new(cursor.take_u64()?).map_err(|_| IdentityFailure)?;
+            let request_digest = if version_two {
+                Some(cursor.take_array()?)
+            } else {
+                None
+            };
             if expected_generation.get().checked_add(1) != Some(generation.get())
+                || request_digest
+                    .is_some_and(|digest: [u8; 32]| digest.iter().all(|byte| *byte == 0))
                 || !cursor.is_empty()
             {
                 return Err(IdentityFailure);
@@ -334,6 +428,7 @@ impl GovernanceAuditEntry {
                 expected_generation,
                 generation,
                 idempotency_key,
+                request_digest,
             }));
         }
         if intent.starts_with(&TENANT_RETENTION_MAGIC) {
@@ -370,6 +465,44 @@ impl GovernanceAuditEntry {
                     tenant,
                     expected_generation,
                     generation,
+                    request_digest,
+                    idempotency_key,
+                },
+            ));
+        }
+        if intent.starts_with(&SYSTEM_AUDIT_RETENTION_MAGIC) {
+            let mut cursor = Cursor::new(intent);
+            if cursor.take_array::<8>()? != SYSTEM_AUDIT_RETENTION_MAGIC {
+                return Err(IdentityFailure);
+            }
+            let ingest_time_unix_seconds = cursor.take_u64()?;
+            let idempotency_key = AdministrativeIdempotencyKey::new(cursor.take_array()?)
+                .map_err(|_| IdentityFailure)?;
+            let actor =
+                PrincipalId::from_bytes(cursor.take_array()?).map_err(|_| IdentityFailure)?;
+            let expected_generation =
+                ResourceGeneration::new(cursor.take_u64()?).map_err(|_| IdentityFailure)?;
+            let generation =
+                ResourceGeneration::new(cursor.take_u64()?).map_err(|_| IdentityFailure)?;
+            let retained_record_limit = cursor.take_u64()?;
+            let request_digest = cursor.take_array()?;
+            if ingest_time_unix_seconds == 0
+                || idempotency_key.to_bytes() != transaction_id
+                || expected_generation.get().checked_add(1) != Some(generation.get())
+                || retained_record_limit == 0
+                || request_digest.iter().all(|byte| *byte == 0)
+                || !cursor.is_empty()
+            {
+                return Err(IdentityFailure);
+            }
+            return Ok(Self::SystemAuditRetentionUpdate(
+                SystemAuditRetentionUpdateAuditEntry {
+                    position,
+                    ingest_time_unix_seconds,
+                    actor,
+                    expected_generation,
+                    generation,
+                    retained_record_limit,
                     request_digest,
                     idempotency_key,
                 },

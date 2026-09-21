@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use positron_kernel::OwnedPrimaryDataVolume;
@@ -17,12 +18,32 @@ pub enum InitializationMode {
     InitializeIfEmpty,
 }
 
+/// A configuration-file-only plaintext API selection carried from the
+/// composition root into startup. It is deliberately separate from public
+/// administration and has no actor or credential.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PublicPlaintextApiStartupIntent {
+    api_bind_address: SocketAddr,
+}
+
+impl PublicPlaintextApiStartupIntent {
+    #[must_use]
+    pub const fn configuration_file(api_bind_address: SocketAddr) -> Self {
+        Self { api_bind_address }
+    }
+
+    #[must_use]
+    pub const fn api_bind_address(self) -> SocketAddr {
+        self.api_bind_address
+    }
+}
+
 /// Fully typed inputs needed to establish the M1 database authorities.
 pub struct ServeConfiguration {
     paths: BootstrapPaths,
     initialization: InitializationMode,
     max_registered_tenants: u16,
-    public_plaintext_api_warning: bool,
+    public_plaintext_api_intent: Option<PublicPlaintextApiStartupIntent>,
     admission_group_planner: Option<Arc<dyn positron_ingest::AdmissionGroupPlanner>>,
 }
 
@@ -33,7 +54,7 @@ impl ServeConfiguration {
             paths,
             initialization,
             max_registered_tenants: 2,
-            public_plaintext_api_warning: false,
+            public_plaintext_api_intent: None,
             admission_group_planner: None,
         }
     }
@@ -57,8 +78,11 @@ impl ServeConfiguration {
     /// Keeps the process ready while making an explicit public plaintext API
     /// selection continuously visible through its health state.
     #[must_use]
-    pub const fn with_public_plaintext_api_warning(mut self) -> Self {
-        self.public_plaintext_api_warning = true;
+    pub const fn with_public_plaintext_api_intent(
+        mut self,
+        intent: PublicPlaintextApiStartupIntent,
+    ) -> Self {
+        self.public_plaintext_api_intent = Some(intent);
         self
     }
 }
@@ -71,8 +95,8 @@ impl std::fmt::Debug for ServeConfiguration {
             .field("initialization", &self.initialization)
             .field("max_registered_tenants", &self.max_registered_tenants)
             .field(
-                "public_plaintext_api_warning",
-                &self.public_plaintext_api_warning,
+                "public_plaintext_api_intent",
+                &self.public_plaintext_api_intent,
             )
             .field(
                 "admission_group_planner",

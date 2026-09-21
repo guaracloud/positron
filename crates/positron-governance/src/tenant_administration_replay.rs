@@ -24,6 +24,11 @@ impl TenantAdministration {
         let Some(replay) = replay_snapshot(view.snapshot(), &request)? else {
             return Ok(None);
         };
+        if replay.audit_position() != 0 {
+            return Ok(Some(replay));
+        }
+        // Receipts written before durable terminal audit positions were added
+        // need their still-retained audit record for their legacy result.
         let audit_position = view
             .governance_audit_records()
             .iter()
@@ -121,16 +126,59 @@ pub(super) fn encode_receipt(
     prior_generation: ResourceGeneration,
     generation: ResourceGeneration,
     digest: [u8; 32],
+    audit_position: u64,
+) -> Vec<u8> {
+    encode_terminal_receipt(
+        candidate.request.idempotency,
+        candidate.request.actor.principal_id(),
+        candidate.tenant,
+        prior_generation,
+        generation,
+        digest,
+        audit_position,
+    )
+}
+
+pub(crate) fn legacy_receipt_object(
+    entry: &crate::audit::TenantCreationAuditEntry,
+) -> Result<positron_kernel::CatalogObject, TenantAdministrationFailure> {
+    if entry.position() == 0 {
+        return Err(TenantAdministrationFailure::PersistenceUnavailable);
+    }
+    positron_kernel::CatalogObject::new(encode_terminal_receipt(
+        entry.idempotency_key(),
+        entry.actor_id(),
+        entry.tenant_id(),
+        entry.expected_generation(),
+        entry.generation(),
+        entry.request_digest(),
+        entry.position(),
+    ))
+    .map_err(map_catalog)
+}
+
+pub(crate) fn retention_terminal_key(bytes: &[u8]) -> Result<Option<[u8; 16]>, ()> {
+    crate::audit::terminal_receipt_key(bytes, &[(TENANT_RECEIPT_MAGIC, 112, 8)])
+}
+
+fn encode_terminal_receipt(
+    idempotency: AdministrativeIdempotencyKey,
+    actor: PrincipalId,
+    tenant: TenantId,
+    prior_generation: ResourceGeneration,
+    generation: ResourceGeneration,
+    digest: [u8; 32],
+    audit_position: u64,
 ) -> Vec<u8> {
     let mut encoded = Vec::with_capacity(112);
     encoded.extend_from_slice(&TENANT_RECEIPT_MAGIC);
-    encoded.extend_from_slice(&candidate.request.idempotency.to_bytes());
-    encoded.extend_from_slice(&candidate.request.actor.principal_id().to_bytes());
-    encoded.extend_from_slice(&candidate.tenant.to_bytes());
+    encoded.extend_from_slice(&idempotency.to_bytes());
+    encoded.extend_from_slice(&actor.to_bytes());
+    encoded.extend_from_slice(&tenant.to_bytes());
     encoded.extend_from_slice(&prior_generation.get().to_be_bytes());
     encoded.extend_from_slice(&generation.get().to_be_bytes());
     encoded.extend_from_slice(&digest);
-    encoded.extend_from_slice(&0_u64.to_be_bytes());
+    encoded.extend_from_slice(&audit_position.to_be_bytes());
     encoded
 }
 fn receipt_for(

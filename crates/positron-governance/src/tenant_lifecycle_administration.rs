@@ -18,6 +18,42 @@ use crate::{
     TenantAdministration,
 };
 
+#[path = "tenant_lifecycle_administration_receipt.rs"]
+mod tenant_lifecycle_administration_receipt;
+use tenant_lifecycle_administration_receipt::*;
+
+pub(crate) fn legacy_receipt_object(
+    entry: &crate::audit::TenantLifecycleAuditEntry,
+) -> Result<CatalogObject, TenantLifecycleAdministrationFailure> {
+    let request_digest = entry
+        .request_digest()
+        .filter(|digest| digest.iter().any(|byte| *byte != 0))
+        .ok_or(TenantLifecycleAdministrationFailure::PersistenceUnavailable)?;
+    object_for_fields(ReceiptFields {
+        key: entry.idempotency_key(),
+        actor: entry.actor_id(),
+        tenant: entry.tenant_id(),
+        from: entry.from(),
+        to: entry.to(),
+        expected: entry.expected_generation(),
+        generation: entry.generation(),
+        audit_position: entry.position(),
+        audit_time: entry.ingest_time_unix_seconds(),
+        request_digest,
+    })
+}
+
+pub(crate) fn retention_terminal_key(bytes: &[u8]) -> Result<Option<[u8; 16]>, ()> {
+    crate::audit::terminal_receipt_key(
+        bytes,
+        &[(
+            tenant_lifecycle_administration_receipt::RECEIPT_MAGIC,
+            122,
+            8,
+        )],
+    )
+}
+
 /// The result of one durably published tenant lifecycle transition.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TenantLifecycleTransition {
@@ -136,14 +172,7 @@ impl TenantLifecycleAdministration {
         request: TenantLifecycleTransitionRequest,
     ) -> Result<Option<TenantLifecycleTransition>, TenantLifecycleAdministrationFailure> {
         validate_request(catalog, administrator, request)?;
-        replay(
-            catalog,
-            request.idempotency,
-            request.actor.principal_id(),
-            request.tenant,
-            request.target,
-            request.expected,
-        )
+        replay(catalog, request)
     }
 
     /// Resolves an exact committed retry from one immutable read-only Catalog
@@ -154,14 +183,7 @@ impl TenantLifecycleAdministration {
         request: TenantLifecycleTransitionRequest,
     ) -> Result<Option<TenantLifecycleTransition>, TenantLifecycleAdministrationFailure> {
         validate_snapshot(view.snapshot().clone(), administrator, request)?;
-        replay_records(
-            view.governance_audit_records(),
-            request.idempotency,
-            request.actor.principal_id(),
-            request.tenant,
-            request.target,
-            request.expected,
-        )
+        replay_snapshot(view.snapshot(), view.governance_audit_records(), request)
     }
 
     /// Validates a non-replay transition against one pinned read-only Catalog
@@ -190,14 +212,7 @@ impl TenantLifecycleAdministration {
     {
         let snapshot = validate_request(catalog, administrator, request)?;
         let (_, governance) = snapshot.governance_object().map_err(map_catalog)?;
-        if let Some(replay) = replay(
-            catalog,
-            request.idempotency,
-            request.actor.principal_id(),
-            request.tenant,
-            request.target,
-            request.expected,
-        )? {
+        if let Some(replay) = replay(catalog, request)? {
             return Ok(replay);
         }
         if let Some(resumed) = resume_prepared(catalog, request)? {
@@ -231,9 +246,22 @@ impl TenantLifecycleAdministration {
             to: request.target,
             expected_generation: request.expected,
             generation,
+            request_digest: request_digest(request),
         }
         .encode();
-        let commit = commit(catalog, &snapshot, replacement, request, audit)?;
+        let receipt = ReceiptFields {
+            key: request.idempotency,
+            actor: request.actor.principal_id(),
+            tenant: request.tenant,
+            from,
+            to: request.target,
+            expected: request.expected,
+            generation,
+            audit_position: 0,
+            audit_time: audit_ingest_time_unix_seconds,
+            request_digest: request_digest(request),
+        };
+        let commit = commit(catalog, &snapshot, replacement, request, audit, receipt)?;
         let record = commit
             .governance_audit_record()
             .ok_or(TenantLifecycleAdministrationFailure::PersistenceUnavailable)?;
@@ -294,9 +322,22 @@ where
         to: request.target,
         expected_generation: request.expected,
         generation,
+        request_digest: request_digest(request),
     }
     .encode();
-    let commit = commit_objects(catalog, snapshot, objects, request, audit)?;
+    let receipt = ReceiptFields {
+        key: request.idempotency,
+        actor: request.actor.principal_id(),
+        tenant: request.tenant,
+        from: current.state,
+        to: request.target,
+        expected: request.expected,
+        generation,
+        audit_position: 0,
+        audit_time: audit_ingest_time_unix_seconds,
+        request_digest: request_digest(request),
+    };
+    let commit = commit_objects(catalog, snapshot, objects, request, audit, receipt)?;
     transition_from_commit(
         commit,
         request.tenant,
@@ -387,26 +428,45 @@ fn validate_lifecycle_transition(
 
 fn replay(
     catalog: &Catalog<'_>,
-    idempotency: AdministrativeIdempotencyKey,
-    actor: PrincipalId,
-    tenant: TenantId,
-    target: TenantLifecycleState,
-    expected: ResourceGeneration,
+    request: TenantLifecycleTransitionRequest,
 ) -> Result<Option<TenantLifecycleTransition>, TenantLifecycleAdministrationFailure> {
+    let snapshot = catalog.pin().map_err(map_catalog)?;
     let records = catalog.governance_audit_records().map_err(map_catalog)?;
-    replay_records(&records, idempotency, actor, tenant, target, expected)
+    replay_snapshot(&snapshot, &records, request)
+}
+
+fn replay_snapshot(
+    snapshot: &CatalogSnapshot,
+    records: &[GovernanceAuditRecord],
+    request: TenantLifecycleTransitionRequest,
+) -> Result<Option<TenantLifecycleTransition>, TenantLifecycleAdministrationFailure> {
+    if let Some(receipt) = find(snapshot, request.idempotency)? {
+        if receipt.actor != request.actor.principal_id()
+            || receipt.tenant != request.tenant
+            || receipt.to != request.target
+            || receipt.expected != request.expected
+            || receipt.request_digest != request_digest(request)
+        {
+            return Err(TenantLifecycleAdministrationFailure::IdempotencyConflict);
+        }
+        return Ok(Some(TenantLifecycleTransition {
+            tenant: receipt.tenant,
+            from: receipt.from,
+            to: receipt.to,
+            generation: receipt.generation,
+            audit_position: receipt.audit_position,
+            audit_ingest_time_unix_seconds: receipt.audit_time,
+        }));
+    }
+    replay_records(records, request)
 }
 
 fn replay_records(
     records: &[GovernanceAuditRecord],
-    idempotency: AdministrativeIdempotencyKey,
-    actor: PrincipalId,
-    tenant: TenantId,
-    target: TenantLifecycleState,
-    expected: ResourceGeneration,
+    request: TenantLifecycleTransitionRequest,
 ) -> Result<Option<TenantLifecycleTransition>, TenantLifecycleAdministrationFailure> {
     for record in records {
-        if record.transaction().to_bytes() != idempotency.to_bytes() {
+        if record.transaction().to_bytes() != request.idempotency.to_bytes() {
             continue;
         }
         let entry = GovernanceAuditEntry::decode(record)
@@ -414,15 +474,18 @@ fn replay_records(
         let lifecycle = entry
             .as_tenant_lifecycle()
             .ok_or(TenantLifecycleAdministrationFailure::IdempotencyConflict)?;
-        if lifecycle.actor_id() != actor
-            || lifecycle.tenant_id() != tenant
-            || lifecycle.to() != target
-            || lifecycle.expected_generation() != expected
+        if lifecycle.actor_id() != request.actor.principal_id()
+            || lifecycle.tenant_id() != request.tenant
+            || lifecycle.to() != request.target
+            || lifecycle.expected_generation() != request.expected
+            || lifecycle
+                .request_digest()
+                .is_some_and(|actual| actual != request_digest(request))
         {
             return Err(TenantLifecycleAdministrationFailure::IdempotencyConflict);
         }
         return Ok(Some(TenantLifecycleTransition {
-            tenant,
+            tenant: request.tenant,
             from: lifecycle.from(),
             to: lifecycle.to(),
             generation: lifecycle.generation(),
@@ -450,16 +513,9 @@ fn resume_prepared(
             let record = commit
                 .governance_audit_record()
                 .ok_or(TenantLifecycleAdministrationFailure::PersistenceUnavailable)?;
-            replay_records(
-                std::slice::from_ref(record),
-                request.idempotency,
-                request.actor.principal_id(),
-                request.tenant,
-                request.target,
-                request.expected,
-            )?
-            .ok_or(TenantLifecycleAdministrationFailure::PersistenceUnavailable)
-            .map(Some)
+            replay_records(std::slice::from_ref(record), request)?
+                .ok_or(TenantLifecycleAdministrationFailure::PersistenceUnavailable)
+                .map(Some)
         },
     }
 }
@@ -494,6 +550,7 @@ fn commit(
     replacement: Vec<u8>,
     request: TenantLifecycleTransitionRequest,
     audit: Vec<u8>,
+    receipt: ReceiptFields,
 ) -> Result<positron_kernel::CatalogCommit, TenantLifecycleAdministrationFailure> {
     let mut objects = Vec::new();
     for object_id in snapshot.object_identities() {
@@ -506,16 +563,19 @@ fn commit(
         }
     }
     objects.push(CatalogObject::new(replacement).map_err(map_catalog)?);
-    commit_objects(catalog, snapshot, objects, request, audit)
+    commit_objects(catalog, snapshot, objects, request, audit, receipt)
 }
 
 fn commit_objects(
     catalog: &Catalog<'_>,
     snapshot: &CatalogSnapshot,
-    objects: Vec<CatalogObject>,
+    mut objects: Vec<CatalogObject>,
     request: TenantLifecycleTransitionRequest,
     audit: Vec<u8>,
+    receipt: ReceiptFields,
 ) -> Result<positron_kernel::CatalogCommit, TenantLifecycleAdministrationFailure> {
+    let receipt = object(snapshot, receipt)?;
+    objects.push(receipt);
     let proposal = CatalogProposal::new(
         TransactionId::new(request.idempotency.to_bytes()).map_err(map_catalog)?,
         snapshot
@@ -524,14 +584,27 @@ fn commit_objects(
         objects,
     )
     .map_err(map_catalog)?;
-    catalog
+    let commit = catalog
         .commit_prepared(
             snapshot.identity(),
             proposal,
             AuditIntent::new(audit).map_err(map_catalog)?,
             request_digest(request),
         )
-        .map_err(map_catalog)
+        .map_err(map_catalog)?;
+    if commit
+        .governance_audit_record()
+        .map(|record| record.position())
+        != Some(
+            snapshot
+                .governance_audit_frontier()
+                .checked_add(1)
+                .ok_or(TenantLifecycleAdministrationFailure::CapacityExceeded)?,
+        )
+    {
+        return Err(TenantLifecycleAdministrationFailure::PersistenceUnavailable);
+    }
+    Ok(commit)
 }
 
 fn request_digest(request: TenantLifecycleTransitionRequest) -> [u8; 32] {

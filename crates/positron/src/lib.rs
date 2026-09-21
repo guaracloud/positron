@@ -12,8 +12,8 @@ use positron_config::{
 use positron_kernel::MountQualification;
 use positron_runtime::{
     ApiTransportProfile, ApplicationRuntime, BootstrapPaths, ExitOutcome, HostInputs,
-    InitializationMode, NativeBindings, NativeHost, RecoveryAttempt, RecoveryAttemptHost,
-    RecoveryDecision, ServeConfiguration, ShutdownTrigger,
+    InitializationMode, NativeBindings, NativeHost, PublicPlaintextApiStartupIntent,
+    RecoveryAttempt, RecoveryAttemptHost, RecoveryDecision, ServeConfiguration, ShutdownTrigger,
 };
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
@@ -128,14 +128,13 @@ fn run(
     let host = NativeHost::new(bindings);
     let recovery =
         NativeRecovery::new(Signals::new([SIGINT, SIGTERM]).map_err(|_| LaunchFailure::Signal)?);
-    let configuration = if effective.api_transport() == ApiTransport::PlaintextOptOut {
-        ServeConfiguration::new(paths, arguments.initialization)
-            .with_max_registered_tenants(effective.max_registered_tenants())
-            .with_public_plaintext_api_warning()
-    } else {
-        ServeConfiguration::new(paths, arguments.initialization)
-            .with_max_registered_tenants(effective.max_registered_tenants())
-    };
+    let mut configuration = ServeConfiguration::new(paths, arguments.initialization)
+        .with_max_registered_tenants(effective.max_registered_tenants());
+    if let Some(plaintext) = effective.public_plaintext_api_configuration() {
+        configuration = configuration.with_public_plaintext_api_intent(
+            PublicPlaintextApiStartupIntent::configuration_file(plaintext.api_bind_address()),
+        );
+    }
     let process = match ApplicationRuntime::start(
         configuration,
         HostInputs::with_recovery(&host, &host, &recovery),

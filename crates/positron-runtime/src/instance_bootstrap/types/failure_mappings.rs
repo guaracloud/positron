@@ -112,6 +112,23 @@ pub(super) fn map_tenant_retention_failure(
     BootstrapFailure::new(code)
 }
 
+pub(super) fn map_system_audit_retention_failure(
+    failure: positron_governance::SystemAuditRetentionAdministrationFailure,
+) -> BootstrapFailure {
+    use positron_governance::SystemAuditRetentionAdministrationFailure as Failure;
+    let code = match failure {
+        Failure::Unauthorized => BootstrapFailureCode::SystemAuditRetentionUnauthorized,
+        Failure::StaleGeneration => BootstrapFailureCode::SystemAuditRetentionStaleGeneration,
+        Failure::IdempotencyConflict => {
+            BootstrapFailureCode::SystemAuditRetentionIdempotencyConflict
+        },
+        Failure::InvalidInput | Failure::CapacityExceeded | Failure::PersistenceUnavailable => {
+            BootstrapFailureCode::CatalogUnavailable
+        },
+    };
+    BootstrapFailure::new(code)
+}
+
 pub(super) fn map_tenant_quota_failure(
     failure: positron_governance::TenantQuotaAdministrationFailure,
 ) -> BootstrapFailure {

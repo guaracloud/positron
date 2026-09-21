@@ -4,8 +4,8 @@ mod attribution;
 pub(super) mod codec;
 
 pub use attribution::{
-    AttributionFailure, AuthorizedContext, CompatibilityHints, GovernanceInspection,
-    IdentityFailure, PresentedCredential, RequestedIntent,
+    AttributionFailure, AuthorizedContext, CompatibilityHints, GovernanceAuditInspection,
+    GovernanceInspection, IdentityFailure, PresentedCredential, RequestedIntent,
 };
 
 #[cfg(test)]
@@ -79,6 +79,30 @@ pub struct Identity {
 }
 
 impl Identity {
+    /// Authorizes a system-wide Governance Audit retention mutation. Tenant
+    /// scopes and data-plane credentials never acquire this authority.
+    pub fn authorize_system_audit_retention(
+        &self,
+        context: AuthorizedContext,
+    ) -> Result<PrincipalId, AttributionFailure> {
+        if context.authority == self.instance
+            && context.generation == self.generation
+            && context.scope == Scope::SystemAdministration
+            && context.principal == self.principal
+            && context.tenant.is_none()
+            && (self.credentials.is_empty()
+                || self.credentials.iter().any(|credential| {
+                    credential.principal == context.principal
+                        && credential.scope == Scope::SystemAdministration
+                        && credential.active
+                }))
+        {
+            Ok(context.principal)
+        } else {
+            Err(AttributionFailure)
+        }
+    }
+
     /// Authorizes a retention preview or confirmed update for one tenant.
     /// Tenant administrators are bound to their own active or read-only
     /// tenant; system administration is reserved for in-process governance
@@ -97,7 +121,7 @@ impl Identity {
         tenant: TenantId,
     ) -> Result<PrincipalId, AttributionFailure> {
         let lifecycle = self.tenant_lifecycle(tenant).ok_or(AttributionFailure)?;
-        if context.authority != self.instance {
+        if context.authority != self.instance || context.generation != self.generation {
             return Err(AttributionFailure);
         }
         match context.scope {
@@ -115,7 +139,12 @@ impl Identity {
                         attribution.principal_id() == context.principal
                             && attribution.scope() == Scope::TenantAdministration
                             && attribution.tenant_id() == tenant
-                    }) =>
+                    })
+                    && self.active_tenant_credential(
+                        tenant,
+                        context.principal,
+                        Scope::TenantAdministration,
+                    ) =>
             {
                 Ok(context.principal)
             },
@@ -513,6 +542,12 @@ impl Identity {
             || context.scope != Scope::SystemAdministration
             || context.tenant.is_some()
             || context.authority != self.instance
+            || context.generation != self.generation
+            || !self.credentials.iter().any(|credential| {
+                credential.principal == context.principal
+                    && credential.scope == Scope::SystemAdministration
+                    && credential.active
+            })
         {
             return Err(AttributionFailure);
         }
@@ -521,6 +556,29 @@ impl Identity {
             &self.tenant_slug,
             audit,
         ))
+    }
+
+    /// Authorizes a read-only Governance Audit view. System administrators see
+    /// every decoded record; tenant administrators see only the records whose
+    /// immutable audit meaning explicitly names their attributed tenant.
+    pub fn inspect_audit<'audit>(
+        &self,
+        context: AuthorizedContext,
+        audit: &'audit [GovernanceAuditEntry],
+    ) -> Result<GovernanceAuditInspection<'audit>, AttributionFailure> {
+        if context.scope() == Scope::SystemAdministration {
+            self.inspect(context, audit)?;
+            return Ok(GovernanceAuditInspection::system(audit));
+        }
+        if context.scope() != Scope::TenantAdministration {
+            return Err(AttributionFailure);
+        }
+        let tenant = context
+            .tenant_attribution()
+            .ok_or(AttributionFailure)?
+            .tenant_id();
+        self.authorize_policy_activation(context, tenant)?;
+        Ok(GovernanceAuditInspection::tenant(audit, tenant))
     }
 }
 

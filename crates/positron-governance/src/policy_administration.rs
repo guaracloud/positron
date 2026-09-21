@@ -12,6 +12,7 @@ use positron_policy::IngestPolicy;
 
 mod codec;
 use codec::{ActivationSemantics, encode_audit, encode_receipt, find_receipt, request_digest};
+pub(crate) use codec::{legacy_receipt_object, retention_terminal_key};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ResourceGeneration(u64);
@@ -187,7 +188,11 @@ impl IngestPolicyAdministration {
             return Ok(IngestPolicyActivation {
                 generation: requested,
                 digest: candidate.digest(),
-                audit_position: audit_position(catalog, key)?,
+                audit_position: if receipt.audit_position == 0 {
+                    audit_position(catalog, key)?
+                } else {
+                    receipt.audit_position
+                },
             });
         }
         let current = Self::activated(&snapshot, tenant)?;
@@ -207,6 +212,14 @@ impl IngestPolicyAdministration {
             generation: requested,
             digest: candidate.digest(),
             request_digest,
+            audit_position: snapshot
+                .governance_audit_frontier()
+                .checked_add(1)
+                .ok_or_else(|| {
+                    PolicyAdministrationFailure::new(
+                        PolicyAdministrationFailureCode::PersistenceUnavailable,
+                    )
+                })?,
         };
         objects.push(CatalogObject::new(encode_receipt(semantics)).map_err(map_catalog)?);
         let audit = encode_audit(semantics);
@@ -235,6 +248,11 @@ impl IngestPolicyAdministration {
                 )
             })?
             .position();
+        if audit_position != semantics.audit_position {
+            return Err(PolicyAdministrationFailure::new(
+                PolicyAdministrationFailureCode::PersistenceUnavailable,
+            ));
+        }
         Ok(IngestPolicyActivation {
             generation: requested,
             digest: candidate.digest(),

@@ -55,6 +55,70 @@ fn confirmed_retention_reduction_replays_after_its_successor() -> Result<(), Box
 }
 
 #[test]
+fn retention_retry_survives_audit_reclamation_and_reopen() -> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let (initialized, _, _, administrator_secret) = fixture.initialized_with_admin()?;
+    let actor = initialized.attribute(
+        PresentedCredential::parse(&administrator_secret)?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let tenant = initialized.default_tenant_id();
+    let proposed = NonZeroU64::new(2_700_000).ok_or("nonzero retention")?;
+    let key = AdministrativeIdempotencyKey::new([0xc0; 16])?;
+    let updated = initialized.update_tenant_retention(
+        actor,
+        tenant,
+        proposed,
+        ResourceGeneration::new(1)?,
+        None,
+        key,
+    )?;
+    initialized.update_system_audit_retention(
+        actor,
+        NonZeroU64::new(1).ok_or("nonzero retained audit-record limit")?,
+        ResourceGeneration::new(1)?,
+        AdministrativeIdempotencyKey::new([0xc9; 16])?,
+    )?;
+    assert_eq!(initialized.governance_audit_for_test()?.len(), 1);
+    drop(initialized);
+
+    let reopened = fixture.reopen()?;
+    let actor = reopened.attribute(
+        PresentedCredential::parse(&administrator_secret)?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    assert_eq!(
+        reopened.update_tenant_retention(
+            actor,
+            tenant,
+            proposed,
+            ResourceGeneration::new(1)?,
+            None,
+            key,
+        )?,
+        updated,
+        "a pruned audit record must not erase the retention terminal result"
+    );
+    assert_eq!(
+        reopened
+            .update_tenant_retention(
+                actor,
+                tenant,
+                NonZeroU64::new(2_800_000).ok_or("nonzero changed retention")?,
+                ResourceGeneration::new(1)?,
+                None,
+                key,
+            )
+            .expect_err("a changed retention request under the retained key must conflict")
+            .code(),
+        crate::BootstrapFailureCode::TenantRetentionIdempotencyConflict
+    );
+    Ok(())
+}
+
+#[test]
 fn retention_confirmation_uses_the_preview_instant_but_rechecks_current_impact()
 -> Result<(), Box<dyn Error>> {
     let fixture = Fixture::new()?;

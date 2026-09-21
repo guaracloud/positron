@@ -1,4 +1,5 @@
 use positron_domain::identity::{PrincipalId, TenantId, TenantSlug};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use super::{
     CatalogRootRotationStage, GovernanceAuditEntry, InitializationAuditEntry,
@@ -6,7 +7,8 @@ use super::{
 };
 use crate::{
     ApiKeyLifecycleAction, InitialAuditContext, InitialGovernanceIntent, InitialTenantIntent,
-    ListenerTransportAuditEntry, ResourceGeneration,
+    ListenerTransportAuditEntry, ListenerTransportAuditRequest,
+    ListenerTransportConfigurationProvenance, ResourceGeneration,
 };
 
 #[test]
@@ -34,6 +36,49 @@ fn public_plaintext_api_transport_audit_is_redacted_exact_and_strict() {
     let mut trailing = intent;
     trailing.push(0);
     assert!(GovernanceAuditEntry::decode_fields(7, transaction, &trailing).is_err());
+}
+
+#[test]
+fn version_two_plaintext_transport_audit_binds_target_provenance_and_request_identity() {
+    let instance = [19; 16];
+    let request = ListenerTransportAuditRequest::configuration_file(SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::new(198, 51, 100, 23)),
+        8_080,
+    ));
+    let transaction = request.transaction_id_for(instance);
+    let intent = crate::audit::plaintext_api_transport_audit_intent_v2(instance, request);
+
+    let entry = GovernanceAuditEntry::decode_fields(8, transaction, &intent)
+        .expect("bound plaintext transport audit");
+    let transport = entry
+        .as_listener_transport()
+        .expect("typed transport audit");
+    assert_eq!(transport.instance_id(), instance);
+    assert_eq!(transport.listener_target(), Some(request.listener_target()));
+    assert_eq!(
+        transport.configuration_provenance(),
+        Some(ListenerTransportConfigurationProvenance::ConfigurationFile)
+    );
+    assert_eq!(transport.request_id(), Some(transaction));
+    assert_eq!(
+        transport.request_digest(),
+        Some(request.digest_for(instance))
+    );
+    assert!(transport.is_configuration_file_intent());
+
+    let changed_target = ListenerTransportAuditRequest::configuration_file(SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::new(198, 51, 100, 23)),
+        8_081,
+    ));
+    assert_ne!(changed_target.transaction_id_for(instance), transaction);
+    assert_ne!(
+        changed_target.digest_for(instance),
+        request.digest_for(instance)
+    );
+
+    let mut changed_encoded_target = intent;
+    changed_encoded_target[30] = 24;
+    assert!(GovernanceAuditEntry::decode_fields(8, transaction, &changed_encoded_target).is_err());
 }
 
 #[test]
@@ -77,6 +122,78 @@ fn api_key_lifecycle_audit_is_redacted_exact_and_strict() {
     let mut trailing = intent;
     trailing.push(0);
     assert!(GovernanceAuditEntry::decode_fields(6, transaction, &trailing).is_err());
+}
+
+#[test]
+fn version_two_lifecycle_audits_bind_the_canonical_request_digest() {
+    let transaction = [9; 16];
+    let request_digest = [41; 32];
+    let mut api_key = b"POSKEY02".to_vec();
+    api_key.push(2);
+    api_key.extend_from_slice(&[1; 16]);
+    api_key.extend_from_slice(&[2; 16]);
+    api_key.extend_from_slice(&[3; 16]);
+    api_key.push(2);
+    api_key.extend_from_slice(&77_u64.to_be_bytes());
+    api_key.extend_from_slice(&4_u64.to_be_bytes());
+    api_key.extend_from_slice(&5_u64.to_be_bytes());
+    api_key.extend_from_slice(&transaction);
+    api_key.extend_from_slice(&request_digest);
+    let entry = GovernanceAuditEntry::decode_fields(6, transaction, &api_key).expect("audit");
+    assert_eq!(
+        entry
+            .as_api_key_lifecycle()
+            .expect("typed lifecycle audit")
+            .request_digest(),
+        Some(request_digest)
+    );
+    assert_eq!(entry.tenant_id(), None);
+
+    let tenant = TenantId::from_bytes([42; 16]).expect("tenant");
+    let mut api_key_v3 = api_key.clone();
+    api_key_v3[..8].copy_from_slice(b"POSKEY03");
+    api_key_v3.push(1);
+    api_key_v3.extend_from_slice(&tenant.to_bytes());
+    let entry = GovernanceAuditEntry::decode_fields(6, transaction, &api_key_v3)
+        .expect("tenant-bound API key audit");
+    assert_eq!(entry.tenant_id(), Some(tenant));
+    assert_eq!(
+        entry
+            .as_api_key_lifecycle()
+            .expect("typed lifecycle audit")
+            .request_digest(),
+        Some(request_digest)
+    );
+    let mut malformed_tenant_scope = api_key_v3.clone();
+    malformed_tenant_scope[130] = 2;
+    assert!(GovernanceAuditEntry::decode_fields(6, transaction, &malformed_tenant_scope).is_err());
+    assert!(GovernanceAuditEntry::decode_fields(6, transaction, &api_key_v3[..130]).is_err());
+
+    let mut lifecycle = b"POSTEN02".to_vec();
+    lifecycle.extend_from_slice(&1_725_000_002_u64.to_be_bytes());
+    lifecycle.extend_from_slice(&transaction);
+    lifecycle.extend_from_slice(&[1; 16]);
+    lifecycle.extend_from_slice(&[2; 16]);
+    lifecycle.extend_from_slice(&1_u8.to_be_bytes());
+    lifecycle.extend_from_slice(&2_u8.to_be_bytes());
+    lifecycle.extend_from_slice(&4_u64.to_be_bytes());
+    lifecycle.extend_from_slice(&5_u64.to_be_bytes());
+    lifecycle.extend_from_slice(&request_digest);
+    let entry = GovernanceAuditEntry::decode_fields(7, transaction, &lifecycle).expect("audit");
+    assert_eq!(
+        entry
+            .as_tenant_lifecycle()
+            .expect("typed lifecycle audit")
+            .request_digest(),
+        Some(request_digest)
+    );
+
+    for malformed in [
+        &api_key[..api_key.len() - 1],
+        &lifecycle[..lifecycle.len() - 1],
+    ] {
+        assert!(GovernanceAuditEntry::decode_fields(6, transaction, malformed).is_err());
+    }
 }
 
 fn audit_intent() -> Vec<u8> {

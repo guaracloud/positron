@@ -7,7 +7,7 @@ pub(super) fn commit(
     snapshot: &CatalogSnapshot,
     replacement: Vec<u8>,
     audit_fields: MutationAudit,
-    prepared_request: Option<[u8; 32]>,
+    request_digest: [u8; 32],
 ) -> Result<(), ApiKeyAdministrationFailure> {
     let mut objects = Vec::new();
     for object_id in snapshot.object_identities() {
@@ -20,8 +20,23 @@ pub(super) fn commit(
         }
     }
     objects.push(CatalogObject::new(replacement).map_err(map_catalog)?);
-    let mut audit = Vec::with_capacity(98);
-    audit.extend_from_slice(b"POSKEY01");
+    let audit_position = next_audit_position(snapshot)?;
+    objects.push(object(ReceiptFields {
+        key: audit_fields.idempotency,
+        actor: audit_fields.actor,
+        tenant: audit_fields.tenant,
+        action: audit_fields.action,
+        scope: audit_fields.scope,
+        expires_at_unix_seconds: audit_fields.expires_at_unix_seconds,
+        expected: audit_fields.expected,
+        generation: audit_fields.generation,
+        principal: audit_fields.principal,
+        target: audit_fields.target,
+        audit_position,
+        request_digest,
+    })?);
+    let mut audit = Vec::with_capacity(147);
+    audit.extend_from_slice(b"POSKEY03");
     audit.push(match audit_fields.action {
         ApiKeyLifecycleAction::Create => 1,
         ApiKeyLifecycleAction::Rotate => 2,
@@ -40,6 +55,14 @@ pub(super) fn commit(
     audit.extend_from_slice(&audit_fields.expected.get().to_be_bytes());
     audit.extend_from_slice(&audit_fields.generation.get().to_be_bytes());
     audit.extend_from_slice(&audit_fields.idempotency.to_bytes());
+    audit.extend_from_slice(&request_digest);
+    match audit_fields.tenant {
+        Some(tenant) => {
+            audit.push(1);
+            audit.extend_from_slice(&tenant.to_bytes());
+        },
+        None => audit.push(0),
+    }
     let proposal = CatalogProposal::new(
         TransactionId::new(audit_fields.idempotency.to_bytes()).map_err(map_catalog)?,
         snapshot
@@ -49,20 +72,23 @@ pub(super) fn commit(
     )
     .map_err(map_catalog)?;
     let audit = AuditIntent::new(audit).map_err(map_catalog)?;
-    match prepared_request {
-        Some(request_digest) => catalog
-            .commit_prepared(snapshot.identity(), proposal, audit, request_digest)
-            .map_err(map_catalog)?,
-        None => catalog
-            .commit(snapshot.identity(), proposal, Some(audit))
-            .map_err(map_catalog)?,
-    };
+    let commit = catalog
+        .commit_prepared(snapshot.identity(), proposal, audit, request_digest)
+        .map_err(map_catalog)?;
+    if commit
+        .governance_audit_record()
+        .map(|record| record.position())
+        != Some(audit_position)
+    {
+        return Err(ApiKeyAdministrationFailure::PersistenceUnavailable);
+    }
     Ok(())
 }
 
 pub(super) struct MutationAudit {
     pub(super) idempotency: AdministrativeIdempotencyKey,
     pub(super) actor: PrincipalId,
+    pub(super) tenant: Option<TenantId>,
     pub(super) principal: PrincipalId,
     pub(super) target: PrincipalId,
     pub(super) scope: u8,

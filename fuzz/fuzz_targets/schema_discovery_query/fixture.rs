@@ -23,8 +23,8 @@ use positron_kernel::{
 };
 use positron_runtime::{BootstrapPaths, InitializationPlan, InstanceBootstrap};
 use positron_signals::{
-    AttributeRepresentation, LogScan, LogStore, OccurrenceSelector, ScanLimit, SchemaCatalog,
-    SchemaPath, SchemaQuery, SchemaValue, ScannedLogRecord,
+    AttributeRepresentation, LogScan, LogStore, OccurrenceSelector, ScanLimit, ScannedLogRecord,
+    SchemaCatalog, SchemaPath, SchemaQuery, SchemaValue,
 };
 use prost::Message;
 
@@ -118,12 +118,9 @@ impl FuzzFixture {
         let Ok(path) = SchemaPath::root(AttributeNamespace::Record, key.clone()) else {
             return;
         };
-        let _ = self.session.record_query_use(
-            self.tenant,
-            &path,
-            &snapshot,
-            self.authority.governor(),
-        );
+        let _ =
+            self.session
+                .record_query_use(self.tenant, &path, &snapshot, self.authority.governor());
         let Ok(checkpoint) = self.session.checkpoint() else {
             return;
         };
@@ -150,11 +147,7 @@ impl FuzzFixture {
             OccurrenceSelector::Any,
             OccurrenceSelector::All,
         ] {
-            let exact_query = SchemaQuery::value(
-                path.clone(),
-                selector,
-                exact_value.clone(),
-            );
+            let exact_query = SchemaQuery::value(path.clone(), selector, exact_value.clone());
             let Ok(exact_result) = LogStore::new().scan_schema(
                 self.authority.governor(),
                 self.tenant,
@@ -176,21 +169,20 @@ impl FuzzFixture {
                 .iter()
                 .map(ScannedLogRecord::commit_position)
                 .collect::<Vec<_>>();
-            assert_eq!(actual, expected, "exact scalar query changed logical results");
-            let expected_reduced = reference_reduced_pruning(
-                &catalog,
-                all_result.records(),
-                &path,
-                &exact_value,
+            assert_eq!(
+                actual, expected,
+                "exact scalar query changed logical results"
             );
+            let expected_reduced =
+                reference_reduced_pruning(&catalog, all_result.records(), &path, &exact_value);
             assert_eq!(
                 exact_result.reduced_pruning(),
                 expected_reduced,
                 "scalar query changed independent pruning classification"
             );
         }
-        let fallback_path = SchemaPath::root(AttributeNamespace::Record, FALLBACK_KEY.to_owned())
-            .ok();
+        let fallback_path =
+            SchemaPath::root(AttributeNamespace::Record, FALLBACK_KEY.to_owned()).ok();
         if let Some(fallback_path) = fallback_path {
             let fallback_query = SchemaQuery::value(
                 fallback_path,
@@ -349,9 +341,9 @@ fn reference_matches(
         OccurrenceSelector::Any => values.any(|value| reference_value_matches(value, expected)),
         OccurrenceSelector::All => {
             let mut found = false;
-            let matches = values.inspect(|_| found = true).all(|value| {
-                reference_value_matches(value, expected)
-            });
+            let matches = values
+                .inspect(|_| found = true)
+                .all(|value| reference_value_matches(value, expected));
             found && matches
         },
     }

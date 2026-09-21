@@ -7,16 +7,16 @@ use libfuzzer_sys::fuzz_target;
 use positron_domain::identity::TenantId;
 use positron_domain::routing::{SignalKind, VirtualShardId};
 use positron_domain::time::UnixNanoseconds;
+use positron_fuzz::truncate_utf8;
 use positron_kernel::{
     ActiveSegmentLedger, Catalog, CatalogSecret, FixedLifecycleClockSource, InstanceId,
-    LifecycleClock, SegmentProtectionKey, SegmentScope, StoreBlockIdentity, WorkClaim, WorkKind,
-    ResourceAmounts, ResourceDimension,
+    LifecycleClock, ResourceAmounts, ResourceDimension, SegmentProtectionKey, SegmentScope,
+    StoreBlockIdentity, WorkClaim, WorkKind,
 };
 use positron_signals::{
     LogScan, LogStore, ScanCancellation, ScanLimit, ScanObservationFailureCode, ScanObserver,
     SchemaBudget, SchemaCatalog, TextSearchCandidate,
 };
-use positron_fuzz::truncate_utf8;
 
 #[path = "schema_discovery_query/authority.rs"]
 mod authority;
@@ -83,9 +83,10 @@ fn run_once(
     let mut schema = SchemaCatalog::new(tenant, SchemaBudget::release_1()?)?;
     let store = LogStore::new();
     let amounts = ResourceAmounts::only(ResourceDimension::MemoryBytes, 1_048_576)?;
-    let capacity = authority
-        .governor()
-        .reserve(WorkClaim::tenant(tenant, WorkKind::Ingest, amounts)?)?;
+    let capacity =
+        authority
+            .governor()
+            .reserve(WorkClaim::tenant(tenant, WorkKind::Ingest, amounts)?)?;
     let clock = LifecycleClock::new(FixedLifecycleClockSource::new(UnixNanoseconds::new(100)));
     let identity = StoreBlockIdentity::new([0x65; 16])?;
     let (prepared, delta) = store.prepare_with_schema_delta(
@@ -102,8 +103,8 @@ fn run_once(
     ledger.append(block)?;
     store.apply_schema_delta(&mut schema, delta, identity, digest)?;
     let snapshot = ledger.snapshot()?;
-    let candidate = TextSearchCandidate::literal("needle")?
-        .ok_or("literal candidate unexpectedly generic")?;
+    let candidate =
+        TextSearchCandidate::literal("needle")?.ok_or("literal candidate unexpectedly generic")?;
     let result = store.scan_text_observed(
         authority.governor(),
         tenant,

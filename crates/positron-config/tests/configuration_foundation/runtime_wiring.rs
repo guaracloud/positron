@@ -101,6 +101,14 @@ fn api_transport_profile_allows_explicit_public_tls_and_plaintext() {
         plaintext.security_warnings(),
         [positron_config::ConfigurationWarning::PublicPlaintextApi]
     );
+    assert_eq!(
+        plaintext
+            .public_plaintext_api_configuration()
+            .expect("configuration-file plaintext opt-out")
+            .api_bind_address()
+            .to_string(),
+        "192.0.2.1:8080"
+    );
     assert!(
         plaintext
             .redacted_reference()

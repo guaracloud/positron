@@ -103,6 +103,31 @@ pub(super) fn replay_tenant_creation(
     let tenant = request
         .tenant
         .ok_or(ApiKeyAdministrationFailure::IdempotencyConflict)?;
+    if let Some(receipt) = find(snapshot, request.idempotency)? {
+        let digest = tenant_create_request_digest(
+            request.idempotency,
+            request.actor.principal_id(),
+            tenant,
+            request.scope,
+            request.expires_at_unix_seconds,
+            request.expected,
+        )?;
+        if receipt.tenant != Some(tenant)
+            || receipt.action != ApiKeyLifecycleAction::Create
+            || receipt.actor != request.actor.principal_id()
+            || receipt.scope
+                != scope_code(request.scope).ok_or(ApiKeyAdministrationFailure::Unauthorized)?
+            || receipt.expires_at_unix_seconds != request.expires_at_unix_seconds
+            || receipt.expected != request.expected
+            || receipt.request_digest != digest
+        {
+            return Err(ApiKeyAdministrationFailure::IdempotencyConflict);
+        }
+        return Ok(Some(ApiKeyCreation {
+            principal: receipt.principal,
+            secret: None,
+        }));
+    }
     let keyring = tenant_keyring(snapshot, tenant)?;
     let Some(audit) = replay_entry(catalog, request.idempotency)? else {
         return Ok(None);

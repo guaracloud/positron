@@ -1,11 +1,12 @@
 use positron_domain::identity::{PrincipalId, TenantId};
-use positron_kernel::CatalogSnapshot;
+use positron_kernel::{CatalogObject, CatalogSnapshot};
 use sha2::{Digest, Sha256};
 
 use super::{TenantQuotaAdministrationFailure, corrupt, map_catalog};
 use crate::{AdministrativeIdempotencyKey, ResourceGeneration};
 
-pub(super) const RECEIPT_MAGIC: [u8; 8] = *b"POSQUR01";
+const RECEIPT_MAGIC_V1: [u8; 8] = *b"POSQUR01";
+pub(super) const RECEIPT_MAGIC: [u8; 8] = *b"POSQUR02";
 pub(super) const AUDIT_MAGIC: [u8; 8] = *b"POSQUO01";
 
 #[derive(Clone, Copy)]
@@ -18,6 +19,7 @@ pub(super) struct QuotaSemantics {
     pub(super) weight: u32,
     pub(super) resources: [u64; 11],
     pub(super) request_digest: [u8; 32],
+    pub(super) audit_position: u64,
 }
 
 pub(super) struct Receipt {
@@ -28,6 +30,7 @@ pub(super) struct Receipt {
     pub(super) weight: u32,
     pub(super) resources: [u64; 11],
     pub(super) request_digest: [u8; 32],
+    pub(super) audit_position: u64,
 }
 
 pub(super) fn request_digest(
@@ -66,7 +69,40 @@ pub(super) fn encode(magic: [u8; 8], semantics: QuotaSemantics) -> Vec<u8> {
         bytes.extend_from_slice(&resource.to_be_bytes());
     }
     bytes.extend_from_slice(&semantics.request_digest);
+    if magic == RECEIPT_MAGIC {
+        bytes.extend_from_slice(&semantics.audit_position.to_be_bytes());
+    }
     bytes
+}
+
+pub(crate) fn legacy_receipt_object(
+    entry: &crate::audit::TenantQuotaUpdateAuditEntry,
+) -> Result<CatalogObject, TenantQuotaAdministrationFailure> {
+    if entry.position() == 0 {
+        return Err(corrupt());
+    }
+    CatalogObject::new(encode(
+        RECEIPT_MAGIC,
+        QuotaSemantics {
+            key: entry.idempotency_key(),
+            principal: entry.principal_id(),
+            tenant: entry.tenant_id(),
+            expected: entry.expected_generation(),
+            generation: entry.generation(),
+            weight: entry.weight(),
+            resources: entry.resources(),
+            request_digest: entry.request_digest(),
+            audit_position: entry.position(),
+        },
+    ))
+    .map_err(map_catalog)
+}
+
+pub(crate) fn retention_terminal_key(bytes: &[u8]) -> Result<Option<[u8; 16]>, ()> {
+    crate::audit::terminal_receipt_key(
+        bytes,
+        &[(RECEIPT_MAGIC_V1, 196, 8), (RECEIPT_MAGIC, 204, 8)],
+    )
 }
 
 pub(super) fn find_receipt(
@@ -79,7 +115,7 @@ pub(super) fn find_receipt(
             .object(identity)
             .map_err(map_catalog)?
             .ok_or_else(corrupt)?;
-        if !bytes.starts_with(&RECEIPT_MAGIC) {
+        if !bytes.starts_with(&RECEIPT_MAGIC) && !bytes.starts_with(&RECEIPT_MAGIC_V1) {
             continue;
         }
         let receipt = decode(bytes)?;
@@ -91,7 +127,10 @@ pub(super) fn find_receipt(
 }
 
 pub(super) fn decode(bytes: &[u8]) -> Result<Receipt, TenantQuotaAdministrationFailure> {
-    if bytes.len() != 196 {
+    let version_two = bytes.starts_with(&RECEIPT_MAGIC);
+    if (!version_two && !bytes.starts_with(&RECEIPT_MAGIC_V1))
+        || bytes.len() != if version_two { 204 } else { 196 }
+    {
         return Err(corrupt());
     }
     let array = |start| {
@@ -135,6 +174,10 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Receipt, TenantQuotaAdministrationF
         .and_then(|value| value.try_into().ok())
         .filter(|value: &[u8; 32]| !value.iter().all(|byte| *byte == 0))
         .ok_or_else(corrupt)?;
+    let audit_position = if version_two { long(196)? } else { 0 };
+    if version_two && audit_position == 0 {
+        return Err(corrupt());
+    }
     Ok(Receipt {
         principal,
         tenant,
@@ -143,5 +186,6 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Receipt, TenantQuotaAdministrationF
         weight,
         resources,
         request_digest,
+        audit_position,
     })
 }

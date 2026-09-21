@@ -17,6 +17,37 @@ use crate::{
 
 const TENANT_KEYRING_MAGIC: [u8; 8] = *b"POSTKC01";
 
+pub(crate) fn legacy_receipt_object(
+    entry: &ApiKeyLifecycleAuditEntry,
+) -> Result<CatalogObject, ApiKeyAdministrationFailure> {
+    let request_digest = entry
+        .request_digest()
+        .filter(|digest| digest.iter().any(|byte| *byte != 0))
+        .ok_or(ApiKeyAdministrationFailure::PersistenceUnavailable)?;
+    object(ReceiptFields {
+        key: entry.idempotency_key(),
+        actor: entry.actor_id(),
+        tenant: entry.tenant_id(),
+        action: entry.action(),
+        scope: scope_code(entry.scope())
+            .ok_or(ApiKeyAdministrationFailure::PersistenceUnavailable)?,
+        expires_at_unix_seconds: entry.expires_at_unix_seconds(),
+        expected: entry.expected_generation(),
+        generation: entry.generation(),
+        principal: entry.principal_id(),
+        target: entry.target_principal_id(),
+        audit_position: entry.position(),
+        request_digest,
+    })
+}
+
+pub(crate) fn retention_terminal_key(bytes: &[u8]) -> Result<Option<[u8; 16]>, ()> {
+    crate::audit::terminal_receipt_key(
+        bytes,
+        &[(api_key_administration_receipt::RECEIPT_MAGIC, 156, 8)],
+    )
+}
+
 pub(crate) struct TenantCredentialIdentity {
     pub(crate) tenant: TenantId,
     pub(crate) credentials: Vec<CatalogCredential>,
@@ -191,6 +222,10 @@ use api_key_administration_support::*;
 #[path = "api_key_administration_replay.rs"]
 mod api_key_administration_replay;
 use api_key_administration_replay::*;
+
+#[path = "api_key_administration_receipt.rs"]
+mod api_key_administration_receipt;
+use api_key_administration_receipt::*;
 
 #[path = "api_key_administration_keyring.rs"]
 mod api_key_administration_keyring;

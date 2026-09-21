@@ -120,10 +120,7 @@ fn add_amount(total: &mut [u64; 11], amounts: ResourceAmounts) {
     }
 }
 
-fn assert_conservation(
-    governor: &ResourceGovernor<'_>,
-    slots: &[Option<Slot<'_>>; SLOT_COUNT],
-) {
+fn assert_conservation(governor: &ResourceGovernor<'_>, slots: &[Option<Slot<'_>>; SLOT_COUNT]) {
     let snapshot = governor
         .inspect()
         .expect("public operations must preserve inspectable state");

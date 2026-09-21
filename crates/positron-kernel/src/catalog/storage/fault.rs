@@ -23,6 +23,11 @@ pub(crate) enum CatalogFileEvent {
     PartialAuditWrite,
     SynchronizeAudit,
     SynchronizeAuditDirectory,
+    ReclaimAudit,
+    SynchronizeReclaimedAuditDirectory,
+    PartialAuditCheckpointWrite,
+    SynchronizeAuditCheckpoint,
+    SynchronizeAuditCheckpointDirectory,
     WriteCommit,
     PartialCommitWrite,
     SynchronizeCommit,
@@ -194,6 +199,8 @@ pub(crate) fn before_lease_marker_basis(
 #[cfg(feature = "test-support")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CatalogPublicationFault {
+    ReclaimAudit,
+    SynchronizeReclaimedAuditDirectory,
     SynchronizeCommit,
     SynchronizeGenerationDirectory,
 }
@@ -202,6 +209,10 @@ pub enum CatalogPublicationFault {
 impl CatalogPublicationFault {
     const fn storage_event(self) -> CatalogFileEvent {
         match self {
+            Self::ReclaimAudit => CatalogFileEvent::ReclaimAudit,
+            Self::SynchronizeReclaimedAuditDirectory => {
+                CatalogFileEvent::SynchronizeReclaimedAuditDirectory
+            },
             Self::SynchronizeCommit => CatalogFileEvent::SynchronizeCommit,
             Self::SynchronizeGenerationDirectory => {
                 CatalogFileEvent::SynchronizeGenerationDirectory

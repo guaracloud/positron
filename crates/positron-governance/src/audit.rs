@@ -3,10 +3,12 @@ mod rotation;
 mod schema_checkpoint;
 
 use std::fmt::{Display, Formatter};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use positron_domain::identity::{ExternalTenantAlias, PrincipalId, Scope, TenantId, TenantSlug};
 use positron_domain::lifecycle::TenantLifecycleState;
 use positron_kernel::GovernanceAuditRecord;
+use sha2::{Digest, Sha256};
 
 use crate::identity::IdentityFailure;
 use crate::tenant_profile_administration::TENANT_DISPLAY_MAGIC;
@@ -20,12 +22,45 @@ const ROOT_ROTATION_MAGIC: &[u8] = b"catalog-root-rotation-v1\0";
 const POLICY_ACTIVATION_MAGIC: [u8; 8] = *b"POSPOL02";
 const TENANT_QUOTA_MAGIC: [u8; 8] = *b"POSQUO01";
 const KEY_LIFECYCLE_MAGIC: [u8; 8] = *b"POSKEY01";
+const KEY_LIFECYCLE_V2_MAGIC: [u8; 8] = *b"POSKEY02";
+const KEY_LIFECYCLE_V3_MAGIC: [u8; 8] = *b"POSKEY03";
 const LISTENER_TRANSPORT_MAGIC: [u8; 8] = *b"POSTPT01";
+const LISTENER_TRANSPORT_V2_MAGIC: [u8; 8] = *b"POSTPT02";
+const LISTENER_TRANSPORT_REQUEST_DOMAIN: &[u8] = b"positron.listener-transport.request.v1\0";
 const TENANT_LIFECYCLE_MAGIC: [u8; 8] = *b"POSTEN01";
+const TENANT_LIFECYCLE_V2_MAGIC: [u8; 8] = *b"POSTEN02";
 const TENANT_CREATION_MAGIC: [u8; 8] = *b"POSTNA01";
 const FORMAT_MIGRATION_MAGIC: [u8; 8] = *b"POSFMT01";
 const TENANT_ALIAS_MAGIC: [u8; 8] = *b"POSALI01";
 const TENANT_RETENTION_MAGIC: [u8; 8] = *b"POSTRT01";
+const SYSTEM_AUDIT_RETENTION_MAGIC: [u8; 8] = *b"POSAR001";
+
+/// Extracts a terminal receipt's idempotency key only after its owning codec
+/// has recognized the supported receipt version and key location. Callers use
+/// the key solely to locate a candidate; the Catalog object identity then
+/// proves the complete typed terminal result.
+pub(crate) fn terminal_receipt_key(
+    bytes: &[u8],
+    versions: &[([u8; 8], usize, usize)],
+) -> Result<Option<[u8; 16]>, ()> {
+    let Some((_, encoded_bytes, key_offset)) = versions
+        .iter()
+        .find(|(magic, _, _)| bytes.starts_with(magic))
+    else {
+        return Ok(None);
+    };
+    if bytes.len() != *encoded_bytes {
+        return Err(());
+    }
+    let key: [u8; 16] = bytes
+        .get(*key_offset..key_offset.saturating_add(16))
+        .and_then(|value| value.try_into().ok())
+        .ok_or(())?;
+    if key.iter().all(|byte| *byte == 0) {
+        return Err(());
+    }
+    Ok(Some(key))
+}
 
 /// Bounded, non-secret metadata for the initial instance operation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -74,6 +109,45 @@ pub enum GovernanceAuditEntry {
     CatalogFormatMigration(CatalogFormatMigrationAuditEntry),
     TenantAliasBinding(TenantAliasBindingAuditEntry),
     TenantRetentionUpdate(TenantRetentionUpdateAuditEntry),
+    SystemAuditRetentionUpdate(SystemAuditRetentionUpdateAuditEntry),
+}
+
+/// Redacted evidence for a system-controlled Governance Audit retention update.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SystemAuditRetentionUpdateAuditEntry {
+    position: u64,
+    ingest_time_unix_seconds: u64,
+    actor: PrincipalId,
+    expected_generation: ResourceGeneration,
+    generation: ResourceGeneration,
+    retained_record_limit: u64,
+    request_digest: [u8; 32],
+    idempotency_key: AdministrativeIdempotencyKey,
+}
+
+pub(crate) struct SystemAuditRetentionAuditIntent {
+    pub(crate) ingest_time_unix_seconds: u64,
+    pub(crate) idempotency_key: AdministrativeIdempotencyKey,
+    pub(crate) actor: PrincipalId,
+    pub(crate) expected_generation: ResourceGeneration,
+    pub(crate) generation: ResourceGeneration,
+    pub(crate) retained_record_limit: u64,
+    pub(crate) request_digest: [u8; 32],
+}
+
+impl SystemAuditRetentionAuditIntent {
+    pub(crate) fn encode(self) -> Vec<u8> {
+        let mut intent = Vec::with_capacity(104);
+        intent.extend_from_slice(&SYSTEM_AUDIT_RETENTION_MAGIC);
+        intent.extend_from_slice(&self.ingest_time_unix_seconds.to_be_bytes());
+        intent.extend_from_slice(&self.idempotency_key.to_bytes());
+        intent.extend_from_slice(&self.actor.to_bytes());
+        intent.extend_from_slice(&self.expected_generation.get().to_be_bytes());
+        intent.extend_from_slice(&self.generation.get().to_be_bytes());
+        intent.extend_from_slice(&self.retained_record_limit.to_be_bytes());
+        intent.extend_from_slice(&self.request_digest);
+        intent
+    }
 }
 
 /// Redacted evidence for a retention successor. The duration and impact
@@ -116,6 +190,8 @@ pub struct ApiKeyLifecycleAuditEntry {
     expected_generation: ResourceGeneration,
     generation: ResourceGeneration,
     idempotency_key: AdministrativeIdempotencyKey,
+    request_digest: Option<[u8; 32]>,
+    tenant: Option<TenantId>,
 }
 
 /// Redacted evidence for one committed tenant registry entry.
@@ -159,6 +235,7 @@ pub struct TenantLifecycleAuditEntry {
     expected_generation: ResourceGeneration,
     generation: ResourceGeneration,
     idempotency_key: AdministrativeIdempotencyKey,
+    request_digest: Option<[u8; 32]>,
 }
 
 /// Redacted evidence that the active API listener uses the explicit plaintext
@@ -167,12 +244,42 @@ pub struct TenantLifecycleAuditEntry {
 pub struct ListenerTransportAuditEntry {
     position: u64,
     instance: [u8; 16],
+    listener_target: Option<SocketAddr>,
+    configuration_provenance: Option<ListenerTransportConfigurationProvenance>,
+    request_id: Option<[u8; 16]>,
+    request_digest: Option<[u8; 32]>,
 }
 
 impl ListenerTransportAuditEntry {
     #[must_use]
     pub const fn new(position: u64, instance: [u8; 16]) -> Self {
-        Self { position, instance }
+        Self {
+            position,
+            instance,
+            listener_target: None,
+            configuration_provenance: None,
+            request_id: None,
+            request_digest: None,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn bound(
+        position: u64,
+        instance: [u8; 16],
+        listener_target: SocketAddr,
+        configuration_provenance: ListenerTransportConfigurationProvenance,
+        request_id: [u8; 16],
+        request_digest: [u8; 32],
+    ) -> Self {
+        Self {
+            position,
+            instance,
+            listener_target: Some(listener_target),
+            configuration_provenance: Some(configuration_provenance),
+            request_id: Some(request_id),
+            request_digest: Some(request_digest),
+        }
     }
 
     #[must_use]
@@ -183,6 +290,42 @@ impl ListenerTransportAuditEntry {
     #[must_use]
     pub const fn instance_id(&self) -> [u8; 16] {
         self.instance
+    }
+
+    /// Returns the exact listener target for current bound records.
+    /// Legacy records retain their original, unbound representation.
+    #[must_use]
+    pub const fn listener_target(&self) -> Option<SocketAddr> {
+        self.listener_target
+    }
+
+    /// Returns the resolved Configuration Contract source for current bound
+    /// records. Legacy records retain no fabricated source identity.
+    #[must_use]
+    pub const fn configuration_provenance(
+        &self,
+    ) -> Option<ListenerTransportConfigurationProvenance> {
+        self.configuration_provenance
+    }
+
+    /// Returns the deterministic request identity for current bound records.
+    #[must_use]
+    pub const fn request_id(&self) -> Option<[u8; 16]> {
+        self.request_id
+    }
+
+    /// Returns the canonical binding digest for current bound records.
+    #[must_use]
+    pub const fn request_digest(&self) -> Option<[u8; 32]> {
+        self.request_digest
+    }
+
+    #[must_use]
+    pub const fn is_configuration_file_intent(&self) -> bool {
+        matches!(
+            self.configuration_provenance,
+            Some(ListenerTransportConfigurationProvenance::ConfigurationFile)
+        )
     }
 
     #[must_use]
@@ -196,11 +339,119 @@ impl ListenerTransportAuditEntry {
     }
 }
 
-pub(crate) fn plaintext_api_transport_audit_intent(instance: [u8; 16]) -> Vec<u8> {
-    let mut intent = Vec::with_capacity(LISTENER_TRANSPORT_MAGIC.len() + instance.len());
-    intent.extend_from_slice(&LISTENER_TRANSPORT_MAGIC);
+/// The only accepted Configuration Contract source for the plaintext
+/// startup-only opt-out.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ListenerTransportConfigurationProvenance {
+    ConfigurationFile,
+}
+
+impl ListenerTransportConfigurationProvenance {
+    const fn code(self) -> u8 {
+        match self {
+            Self::ConfigurationFile => 1,
+        }
+    }
+
+    const fn from_code(code: u8) -> Result<Self, IdentityFailure> {
+        match code {
+            1 => Ok(Self::ConfigurationFile),
+            _ => Err(IdentityFailure),
+        }
+    }
+}
+
+/// A closed startup-only intent from the Configuration Contract. It is not a
+/// public administration request and accepts no caller-controlled identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ListenerTransportAuditRequest {
+    listener_target: SocketAddr,
+    configuration_provenance: ListenerTransportConfigurationProvenance,
+}
+
+impl ListenerTransportAuditRequest {
+    #[must_use]
+    pub const fn configuration_file(listener_target: SocketAddr) -> Self {
+        Self {
+            listener_target,
+            configuration_provenance: ListenerTransportConfigurationProvenance::ConfigurationFile,
+        }
+    }
+
+    #[must_use]
+    pub const fn listener_target(self) -> SocketAddr {
+        self.listener_target
+    }
+
+    #[must_use]
+    pub const fn configuration_provenance(self) -> ListenerTransportConfigurationProvenance {
+        self.configuration_provenance
+    }
+
+    #[must_use]
+    pub fn digest_for(self, instance: [u8; 16]) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(LISTENER_TRANSPORT_REQUEST_DOMAIN);
+        hasher.update(instance);
+        hasher.update([self.configuration_provenance.code()]);
+        hasher.update(listener_target_bytes(self.listener_target));
+        hasher.finalize().into()
+    }
+
+    #[must_use]
+    pub fn transaction_id_for(self, instance: [u8; 16]) -> [u8; 16] {
+        let digest = self.digest_for(instance);
+        let mut request_id = [0_u8; 16];
+        request_id.copy_from_slice(&digest[..16]);
+        if request_id.iter().all(|byte| *byte == 0) {
+            request_id[0] = 1;
+        }
+        request_id
+    }
+}
+
+pub(crate) fn plaintext_api_transport_audit_intent_v2(
+    instance: [u8; 16],
+    request: ListenerTransportAuditRequest,
+) -> Vec<u8> {
+    let digest = request.digest_for(instance);
+    let request_id = request.transaction_id_for(instance);
+    let mut intent = Vec::with_capacity(76);
+    intent.extend_from_slice(&LISTENER_TRANSPORT_V2_MAGIC);
     intent.extend_from_slice(&instance);
+    intent.extend_from_slice(&listener_target_bytes(request.listener_target()));
+    intent.push(request.configuration_provenance().code());
+    intent.extend_from_slice(&request_id);
+    intent.extend_from_slice(&digest);
     intent
+}
+
+fn listener_target_bytes(target: SocketAddr) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(19);
+    match target.ip() {
+        IpAddr::V4(address) => {
+            encoded.push(4);
+            encoded.extend_from_slice(&address.octets());
+        },
+        IpAddr::V6(address) => {
+            encoded.push(6);
+            encoded.extend_from_slice(&address.octets());
+        },
+    }
+    encoded.extend_from_slice(&target.port().to_be_bytes());
+    encoded
+}
+
+fn decode_listener_target(cursor: &mut Cursor<'_>) -> Result<SocketAddr, IdentityFailure> {
+    let address = match cursor.take_u8()? {
+        4 => IpAddr::V4(Ipv4Addr::from(cursor.take_array::<4>()?)),
+        6 => IpAddr::V6(Ipv6Addr::from(cursor.take_array::<16>()?)),
+        _ => return Err(IdentityFailure),
+    };
+    Ok(SocketAddr::new(
+        address,
+        u16::from_be_bytes(cursor.take_array()?),
+    ))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -270,6 +521,95 @@ impl TenantDisplayNameUpdateAuditEntry {
     #[must_use]
     pub const fn request_digest(&self) -> [u8; 32] {
         self.request_digest
+    }
+}
+
+impl TenantCreationAuditEntry {
+    #[must_use]
+    pub const fn position(&self) -> u64 {
+        self.position
+    }
+    #[must_use]
+    pub const fn idempotency_key(&self) -> AdministrativeIdempotencyKey {
+        self.idempotency_key
+    }
+    #[must_use]
+    pub const fn actor_id(&self) -> PrincipalId {
+        self.actor
+    }
+    #[must_use]
+    pub const fn tenant_id(&self) -> TenantId {
+        self.tenant
+    }
+    #[must_use]
+    pub const fn expected_generation(&self) -> ResourceGeneration {
+        self.expected_generation
+    }
+    #[must_use]
+    pub const fn generation(&self) -> ResourceGeneration {
+        self.generation
+    }
+    #[must_use]
+    pub const fn request_digest(&self) -> [u8; 32] {
+        self.request_digest
+    }
+}
+
+impl CatalogFormatMigrationAuditEntry {
+    #[must_use]
+    pub const fn position(&self) -> u64 {
+        self.position
+    }
+    #[must_use]
+    pub const fn idempotency_key(&self) -> AdministrativeIdempotencyKey {
+        self.idempotency_key
+    }
+    #[must_use]
+    pub const fn actor_id(&self) -> PrincipalId {
+        self.actor
+    }
+    #[must_use]
+    pub const fn from(&self) -> u32 {
+        self.from
+    }
+    #[must_use]
+    pub const fn to(&self) -> u32 {
+        self.to
+    }
+}
+
+impl TenantAliasBindingAuditEntry {
+    #[must_use]
+    pub const fn position(&self) -> u64 {
+        self.position
+    }
+    #[must_use]
+    pub const fn ingest_time_unix_seconds(&self) -> u64 {
+        self.ingest_time_unix_seconds
+    }
+    #[must_use]
+    pub const fn actor_id(&self) -> PrincipalId {
+        self.actor
+    }
+    #[must_use]
+    pub const fn tenant_id(&self) -> TenantId {
+        self.tenant
+    }
+    #[must_use]
+    pub const fn expected_generation(&self) -> ResourceGeneration {
+        self.expected_generation
+    }
+    #[must_use]
+    pub const fn generation(&self) -> ResourceGeneration {
+        self.generation
+    }
+    #[must_use]
+    pub const fn request_digest(&self) -> [u8; 32] {
+        self.request_digest
+    }
+    #[must_use]
+    pub const fn idempotency_key(&self) -> AdministrativeIdempotencyKey {
+        self.idempotency_key
     }
 }
 
@@ -388,6 +728,30 @@ impl GovernanceAuditEntry {
             Self::CatalogFormatMigration(entry) => entry.position,
             Self::TenantAliasBinding(entry) => entry.position,
             Self::TenantRetentionUpdate(entry) => entry.position,
+            Self::SystemAuditRetentionUpdate(entry) => entry.position,
+        }
+    }
+
+    /// Returns the explicit tenant scope carried by this redacted record.
+    /// System-wide and legacy records without a tenant field never become
+    /// visible through a tenant-scoped inspection.
+    #[must_use]
+    pub const fn tenant_id(&self) -> Option<TenantId> {
+        match self {
+            Self::Initialization(entry) => entry.tenant_id(),
+            Self::CatalogRootRotation(_) => None,
+            Self::IngestPolicyActivation(entry) => Some(entry.tenant),
+            Self::TenantQuotaUpdate(entry) => Some(entry.tenant),
+            Self::TenantDisplayNameUpdate(entry) => Some(entry.tenant),
+            Self::SchemaCheckpoint(entry) => Some(entry.tenant_id()),
+            Self::ApiKeyLifecycle(entry) => entry.tenant_id(),
+            Self::ListenerTransport(_) => None,
+            Self::TenantLifecycle(entry) => Some(entry.tenant),
+            Self::TenantCreation(entry) => Some(entry.tenant),
+            Self::CatalogFormatMigration(_) => None,
+            Self::TenantAliasBinding(entry) => Some(entry.tenant),
+            Self::TenantRetentionUpdate(entry) => Some(entry.tenant),
+            Self::SystemAuditRetentionUpdate(_) => None,
         }
     }
 
@@ -411,6 +775,7 @@ impl GovernanceAuditEntry {
             Self::CatalogFormatMigration(_) => "catalog.format.migrate",
             Self::TenantAliasBinding(_) => "tenant.alias.bind",
             Self::TenantRetentionUpdate(_) => "tenant.retention.update",
+            Self::SystemAuditRetentionUpdate(_) => "system.audit-retention.update",
         }
     }
 
@@ -430,6 +795,7 @@ impl GovernanceAuditEntry {
             Self::CatalogFormatMigration(_) => "succeeded",
             Self::TenantAliasBinding(_) => "succeeded",
             Self::TenantRetentionUpdate(_) => "succeeded",
+            Self::SystemAuditRetentionUpdate(_) => "succeeded",
         }
     }
 
@@ -448,7 +814,8 @@ impl GovernanceAuditEntry {
             | Self::TenantCreation(_)
             | Self::CatalogFormatMigration(_)
             | Self::TenantAliasBinding(_)
-            | Self::TenantRetentionUpdate(_) => None,
+            | Self::TenantRetentionUpdate(_)
+            | Self::SystemAuditRetentionUpdate(_) => None,
         }
     }
 
@@ -467,7 +834,8 @@ impl GovernanceAuditEntry {
             | Self::TenantCreation(_)
             | Self::CatalogFormatMigration(_)
             | Self::TenantAliasBinding(_)
-            | Self::TenantRetentionUpdate(_) => None,
+            | Self::TenantRetentionUpdate(_)
+            | Self::SystemAuditRetentionUpdate(_) => None,
         }
     }
 
@@ -486,7 +854,8 @@ impl GovernanceAuditEntry {
             | Self::TenantCreation(_)
             | Self::CatalogFormatMigration(_)
             | Self::TenantAliasBinding(_)
-            | Self::TenantRetentionUpdate(_) => None,
+            | Self::TenantRetentionUpdate(_)
+            | Self::SystemAuditRetentionUpdate(_) => None,
         }
     }
 
@@ -505,7 +874,8 @@ impl GovernanceAuditEntry {
             | Self::TenantCreation(_)
             | Self::CatalogFormatMigration(_)
             | Self::TenantAliasBinding(_)
-            | Self::TenantRetentionUpdate(_) => None,
+            | Self::TenantRetentionUpdate(_)
+            | Self::SystemAuditRetentionUpdate(_) => None,
         }
     }
 
@@ -524,7 +894,8 @@ impl GovernanceAuditEntry {
             | Self::TenantCreation(_)
             | Self::CatalogFormatMigration(_)
             | Self::TenantAliasBinding(_)
-            | Self::TenantRetentionUpdate(_) => None,
+            | Self::TenantRetentionUpdate(_)
+            | Self::SystemAuditRetentionUpdate(_) => None,
         }
     }
 
@@ -543,7 +914,8 @@ impl GovernanceAuditEntry {
             | Self::TenantCreation(_)
             | Self::CatalogFormatMigration(_)
             | Self::TenantAliasBinding(_)
-            | Self::TenantRetentionUpdate(_) => None,
+            | Self::TenantRetentionUpdate(_)
+            | Self::SystemAuditRetentionUpdate(_) => None,
         }
     }
 
@@ -562,7 +934,8 @@ impl GovernanceAuditEntry {
             | Self::TenantCreation(_)
             | Self::CatalogFormatMigration(_)
             | Self::TenantAliasBinding(_)
-            | Self::TenantRetentionUpdate(_) => None,
+            | Self::TenantRetentionUpdate(_)
+            | Self::SystemAuditRetentionUpdate(_) => None,
         }
     }
 
@@ -583,7 +956,8 @@ impl GovernanceAuditEntry {
             | Self::TenantCreation(_)
             | Self::CatalogFormatMigration(_)
             | Self::TenantAliasBinding(_)
-            | Self::TenantRetentionUpdate(_) => None,
+            | Self::TenantRetentionUpdate(_)
+            | Self::SystemAuditRetentionUpdate(_) => None,
         }
     }
 
@@ -603,7 +977,49 @@ impl GovernanceAuditEntry {
             | Self::TenantCreation(_)
             | Self::CatalogFormatMigration(_)
             | Self::TenantAliasBinding(_) => None,
+            Self::SystemAuditRetentionUpdate(_) => None,
         }
+    }
+
+    #[must_use]
+    pub const fn as_system_audit_retention_update(
+        &self,
+    ) -> Option<&SystemAuditRetentionUpdateAuditEntry> {
+        match self {
+            Self::SystemAuditRetentionUpdate(entry) => Some(entry),
+            _ => None,
+        }
+    }
+}
+
+impl SystemAuditRetentionUpdateAuditEntry {
+    #[must_use]
+    pub const fn position(&self) -> u64 {
+        self.position
+    }
+    #[must_use]
+    pub const fn actor_id(&self) -> PrincipalId {
+        self.actor
+    }
+    #[must_use]
+    pub const fn expected_generation(&self) -> ResourceGeneration {
+        self.expected_generation
+    }
+    #[must_use]
+    pub const fn generation(&self) -> ResourceGeneration {
+        self.generation
+    }
+    #[must_use]
+    pub const fn retained_record_limit(&self) -> u64 {
+        self.retained_record_limit
+    }
+    #[must_use]
+    pub const fn request_digest(&self) -> [u8; 32] {
+        self.request_digest
+    }
+    #[must_use]
+    pub const fn idempotency_key(&self) -> AdministrativeIdempotencyKey {
+        self.idempotency_key
     }
 }
 
@@ -679,6 +1095,13 @@ impl TenantLifecycleAuditEntry {
     pub const fn idempotency_key(&self) -> AdministrativeIdempotencyKey {
         self.idempotency_key
     }
+
+    /// Returns the canonical request binding for current durable records.
+    /// Legacy v1 records intentionally decode without rewriting their bytes.
+    #[must_use]
+    pub const fn request_digest(&self) -> Option<[u8; 32]> {
+        self.request_digest
+    }
 }
 
 pub(crate) struct TenantLifecycleAuditIntent {
@@ -690,12 +1113,13 @@ pub(crate) struct TenantLifecycleAuditIntent {
     pub(crate) to: TenantLifecycleState,
     pub(crate) expected_generation: ResourceGeneration,
     pub(crate) generation: ResourceGeneration,
+    pub(crate) request_digest: [u8; 32],
 }
 
 impl TenantLifecycleAuditIntent {
     pub(crate) fn encode(self) -> Vec<u8> {
-        let mut intent = Vec::with_capacity(82);
-        intent.extend_from_slice(&TENANT_LIFECYCLE_MAGIC);
+        let mut intent = Vec::with_capacity(114);
+        intent.extend_from_slice(&TENANT_LIFECYCLE_V2_MAGIC);
         intent.extend_from_slice(&self.ingest_time_unix_seconds.to_be_bytes());
         intent.extend_from_slice(&self.idempotency_key.to_bytes());
         intent.extend_from_slice(&self.actor.to_bytes());
@@ -704,6 +1128,7 @@ impl TenantLifecycleAuditIntent {
         intent.push(lifecycle_state_code(self.to));
         intent.extend_from_slice(&self.expected_generation.get().to_be_bytes());
         intent.extend_from_slice(&self.generation.get().to_be_bytes());
+        intent.extend_from_slice(&self.request_digest);
         intent
     }
 }
@@ -730,6 +1155,11 @@ const fn lifecycle_state(code: u8) -> Result<TenantLifecycleState, IdentityFailu
 }
 
 impl ApiKeyLifecycleAuditEntry {
+    #[must_use]
+    pub const fn position(&self) -> u64 {
+        self.position
+    }
+
     #[must_use]
     pub const fn actor_id(&self) -> PrincipalId {
         self.actor
@@ -773,6 +1203,20 @@ impl ApiKeyLifecycleAuditEntry {
     #[must_use]
     pub const fn idempotency_key(&self) -> AdministrativeIdempotencyKey {
         self.idempotency_key
+    }
+
+    /// Returns the canonical request binding for current durable records.
+    /// Legacy v1 records intentionally decode without rewriting their bytes.
+    #[must_use]
+    pub const fn request_digest(&self) -> Option<[u8; 32]> {
+        self.request_digest
+    }
+
+    /// The tenant explicitly bound into current API-key lifecycle evidence.
+    /// Legacy records omit this binding and remain system-only readable.
+    #[must_use]
+    pub const fn tenant_id(&self) -> Option<TenantId> {
+        self.tenant
     }
 }
 

@@ -18,6 +18,8 @@ use crate::{
 };
 
 const AUDIT_MAGIC: [u8; 8] = *b"POSTRT01";
+const RECEIPT_MAGIC: [u8; 8] = *b"POSTTR01";
+const RECEIPT_BYTES: usize = 120;
 
 /// Redacted outcome of one confirmed retention successor publication.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -230,7 +232,7 @@ impl TenantRetentionAdministration {
             .checked_add(1)
             .and_then(|value| ResourceGeneration::new(value).ok())
             .ok_or(TenantRetentionAdministrationFailure::CapacityExceeded)?;
-        let replacement = if let Some(profile) = objects {
+        let mut replacement = if let Some(profile) = objects {
             replace_tenant_profile_record(
                 &snapshot,
                 request.tenant,
@@ -256,6 +258,21 @@ impl TenantRetentionAdministration {
         }
         let digest = request_digest(principal, request, generation);
         let audit = encode_audit(time, principal, request, generation, digest)?;
+        let audit_position = snapshot
+            .governance_audit_frontier()
+            .checked_add(1)
+            .ok_or(TenantRetentionAdministrationFailure::CapacityExceeded)?;
+        replacement
+            .try_reserve(1)
+            .map_err(|_| TenantRetentionAdministrationFailure::CapacityExceeded)?;
+        replacement.push(receipt_object(
+            request,
+            principal,
+            generation,
+            time,
+            audit_position,
+            digest,
+        )?);
         let commit = catalog
             .commit_prepared(
                 snapshot.identity(),
@@ -274,6 +291,9 @@ impl TenantRetentionAdministration {
         let record = commit
             .governance_audit_record()
             .ok_or(TenantRetentionAdministrationFailure::PersistenceUnavailable)?;
+        if record.position() != audit_position {
+            return Err(TenantRetentionAdministrationFailure::PersistenceUnavailable);
+        }
         Ok(TenantRetentionUpdate {
             tenant: request.tenant,
             generation,
@@ -299,12 +319,9 @@ fn resume_prepared(
         PreparedTransactionResolution::Unavailable => {
             Err(TenantRetentionAdministrationFailure::PersistenceUnavailable)
         },
-        PreparedTransactionResolution::Resumed(commit) => {
-            let record = commit
-                .governance_audit_record()
-                .ok_or(TenantRetentionAdministrationFailure::PersistenceUnavailable)?;
-            decode_replay(record, principal, request).map(Some)
-        },
+        PreparedTransactionResolution::Resumed(_) => replay(catalog, principal, request)?
+            .ok_or(TenantRetentionAdministrationFailure::PersistenceUnavailable)
+            .map(Some),
     }
 }
 
@@ -323,12 +340,173 @@ fn replay(
     principal: PrincipalId,
     request: TenantRetentionUpdateRequest,
 ) -> Result<Option<TenantRetentionUpdate>, TenantRetentionAdministrationFailure> {
+    let snapshot = catalog.pin().map_err(map_catalog)?;
+    if let Some(replay) = replay_receipt(&snapshot, principal, request)? {
+        return Ok(Some(replay));
+    }
     for record in catalog.governance_audit_records().map_err(map_catalog)? {
         if record.transaction().to_bytes() == request.idempotency.to_bytes() {
             return decode_replay(&record, principal, request).map(Some);
         }
     }
     Ok(None)
+}
+
+fn replay_receipt(
+    snapshot: &CatalogSnapshot,
+    principal: PrincipalId,
+    request: TenantRetentionUpdateRequest,
+) -> Result<Option<TenantRetentionUpdate>, TenantRetentionAdministrationFailure> {
+    let mut found = None;
+    for identity in snapshot.object_identities() {
+        let bytes = snapshot
+            .object(identity)
+            .map_err(map_catalog)?
+            .ok_or(TenantRetentionAdministrationFailure::PersistenceUnavailable)?;
+        if !bytes.starts_with(&RECEIPT_MAGIC) {
+            continue;
+        }
+        let receipt = decode_receipt(bytes)?;
+        if receipt.key == request.idempotency && found.replace(receipt).is_some() {
+            return Err(TenantRetentionAdministrationFailure::PersistenceUnavailable);
+        }
+    }
+    let Some(receipt) = found else {
+        return Ok(None);
+    };
+    let expected_generation = successor_generation(request.expected)?;
+    if receipt.actor != principal
+        || receipt.tenant != request.tenant
+        || receipt.expected != request.expected
+        || receipt.generation != expected_generation
+        || receipt.digest != request_digest(principal, request, expected_generation)
+    {
+        return Err(TenantRetentionAdministrationFailure::IdempotencyConflict);
+    }
+    Ok(Some(TenantRetentionUpdate {
+        tenant: receipt.tenant,
+        generation: receipt.generation,
+        audit_position: receipt.audit_position,
+        audit_ingest_time_unix_seconds: receipt.time,
+    }))
+}
+
+#[derive(Clone, Copy)]
+struct RetentionReceipt {
+    key: AdministrativeIdempotencyKey,
+    actor: PrincipalId,
+    tenant: TenantId,
+    expected: ResourceGeneration,
+    generation: ResourceGeneration,
+    time: u64,
+    audit_position: u64,
+    digest: [u8; 32],
+}
+
+fn receipt_object(
+    request: TenantRetentionUpdateRequest,
+    actor: PrincipalId,
+    generation: ResourceGeneration,
+    time: u64,
+    audit_position: u64,
+    digest: [u8; 32],
+) -> Result<CatalogObject, TenantRetentionAdministrationFailure> {
+    if time == 0 || audit_position == 0 {
+        return Err(TenantRetentionAdministrationFailure::PersistenceUnavailable);
+    }
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(RECEIPT_BYTES)
+        .map_err(|_| TenantRetentionAdministrationFailure::CapacityExceeded)?;
+    bytes.extend_from_slice(&RECEIPT_MAGIC);
+    bytes.extend_from_slice(&request.idempotency.to_bytes());
+    bytes.extend_from_slice(&actor.to_bytes());
+    bytes.extend_from_slice(&request.tenant.to_bytes());
+    bytes.extend_from_slice(&request.expected.get().to_be_bytes());
+    bytes.extend_from_slice(&generation.get().to_be_bytes());
+    bytes.extend_from_slice(&time.to_be_bytes());
+    bytes.extend_from_slice(&audit_position.to_be_bytes());
+    bytes.extend_from_slice(&digest);
+    CatalogObject::new(bytes).map_err(map_catalog)
+}
+
+pub(crate) fn legacy_receipt_object(
+    entry: &crate::audit::TenantRetentionUpdateAuditEntry,
+) -> Result<CatalogObject, TenantRetentionAdministrationFailure> {
+    if entry.ingest_time_unix_seconds() == 0
+        || entry.position() == 0
+        || entry.expected_generation().get().checked_add(1) != Some(entry.generation().get())
+        || entry.request_digest().iter().all(|byte| *byte == 0)
+    {
+        return Err(TenantRetentionAdministrationFailure::PersistenceUnavailable);
+    }
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(RECEIPT_BYTES)
+        .map_err(|_| TenantRetentionAdministrationFailure::CapacityExceeded)?;
+    bytes.extend_from_slice(&RECEIPT_MAGIC);
+    bytes.extend_from_slice(&entry.idempotency_key().to_bytes());
+    bytes.extend_from_slice(&entry.actor_id().to_bytes());
+    bytes.extend_from_slice(&entry.tenant_id().to_bytes());
+    bytes.extend_from_slice(&entry.expected_generation().get().to_be_bytes());
+    bytes.extend_from_slice(&entry.generation().get().to_be_bytes());
+    bytes.extend_from_slice(&entry.ingest_time_unix_seconds().to_be_bytes());
+    bytes.extend_from_slice(&entry.position().to_be_bytes());
+    bytes.extend_from_slice(&entry.request_digest());
+    CatalogObject::new(bytes).map_err(map_catalog)
+}
+
+pub(crate) fn retention_terminal_key(bytes: &[u8]) -> Result<Option<[u8; 16]>, ()> {
+    crate::audit::terminal_receipt_key(bytes, &[(RECEIPT_MAGIC, RECEIPT_BYTES, 8)])
+}
+
+fn decode_receipt(bytes: &[u8]) -> Result<RetentionReceipt, TenantRetentionAdministrationFailure> {
+    if bytes.len() != RECEIPT_BYTES {
+        return Err(TenantRetentionAdministrationFailure::PersistenceUnavailable);
+    }
+    let array = |start| {
+        bytes
+            .get(start..start + 16)
+            .and_then(|value| value.try_into().ok())
+            .ok_or(TenantRetentionAdministrationFailure::PersistenceUnavailable)
+    };
+    let long = |start| {
+        bytes
+            .get(start..start + 8)
+            .and_then(|value| value.try_into().ok())
+            .map(u64::from_be_bytes)
+            .ok_or(TenantRetentionAdministrationFailure::PersistenceUnavailable)
+    };
+    let key = AdministrativeIdempotencyKey::new(array(8)?)
+        .map_err(|_| TenantRetentionAdministrationFailure::PersistenceUnavailable)?;
+    let actor = PrincipalId::from_bytes(array(24)?)
+        .map_err(|_| TenantRetentionAdministrationFailure::PersistenceUnavailable)?;
+    let tenant = TenantId::from_bytes(array(40)?)
+        .map_err(|_| TenantRetentionAdministrationFailure::PersistenceUnavailable)?;
+    let expected = ResourceGeneration::new(long(56)?)
+        .map_err(|_| TenantRetentionAdministrationFailure::PersistenceUnavailable)?;
+    let generation = ResourceGeneration::new(long(64)?)
+        .map_err(|_| TenantRetentionAdministrationFailure::PersistenceUnavailable)?;
+    let time = long(72)?;
+    let audit_position = long(80)?;
+    let digest = bytes
+        .get(88..120)
+        .and_then(|value| value.try_into().ok())
+        .filter(|value: &[u8; 32]| value.iter().any(|byte| *byte != 0))
+        .ok_or(TenantRetentionAdministrationFailure::PersistenceUnavailable)?;
+    if time == 0 || audit_position == 0 || expected.get().checked_add(1) != Some(generation.get()) {
+        return Err(TenantRetentionAdministrationFailure::PersistenceUnavailable);
+    }
+    Ok(RetentionReceipt {
+        key,
+        actor,
+        tenant,
+        expected,
+        generation,
+        time,
+        audit_position,
+        digest,
+    })
 }
 
 fn decode_replay(

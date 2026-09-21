@@ -1,4 +1,5 @@
 use std::error::Error;
+use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use positron_domain::identity::Scope;
@@ -82,6 +83,135 @@ fn system_administrator_inspects_default_and_provisioned_tenants_without_secret_
     assert_eq!(inspection.display_name(), "Inspection tenant");
     assert_eq!(inspection.display_generation().get(), 1);
     assert_eq!(inspection.retention_generation().get(), 1);
+    Ok(())
+}
+
+#[test]
+fn tenant_creation_replay_survives_audit_reclamation_and_reopen() -> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let (initialized, _, _, administrator_secret) = fixture.initialized_with_admin()?;
+    let system = initialized.attribute(
+        PresentedCredential::parse(&administrator_secret)?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let tenant = TenantId::from_bytes([0xa2; 16])?;
+    let key = AdministrativeIdempotencyKey::new([0xa2; 16])?;
+    let configuration = positron_governance::TenantCreateConfiguration::new(
+        TenantSlug::parse_canonical("retained-create")?,
+        "Retained creation",
+        2_592_000,
+        1,
+        [
+            32_000_000, 32, 32, 5_000_000, 2_048, 32, 32, 32, 32, 32, 2_000_000,
+        ],
+    );
+    let created = initialized.create_tenant(system, tenant, configuration.clone(), key)?;
+    let system = initialized.attribute(
+        PresentedCredential::parse(&administrator_secret)?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    initialized.update_system_audit_retention(
+        system,
+        NonZeroU64::new(1).ok_or("retained audit-record limit")?,
+        ResourceGeneration::new(1)?,
+        AdministrativeIdempotencyKey::new([0xa3; 16])?,
+    )?;
+    drop(initialized);
+
+    let reopened = fixture.reopen()?;
+    let system = reopened.attribute(
+        PresentedCredential::parse(&administrator_secret)?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    assert_eq!(
+        reopened.create_tenant(system, tenant, configuration.clone(), key)?,
+        created
+    );
+    let conflict = reopened
+        .create_tenant(
+            system,
+            tenant,
+            positron_governance::TenantCreateConfiguration::new(
+                TenantSlug::parse_canonical("retained-create")?,
+                "Changed retry",
+                2_592_000,
+                1,
+                [
+                    32_000_000, 32, 32, 5_000_000, 2_048, 32, 32, 32, 32, 32, 2_000_000,
+                ],
+            ),
+            key,
+        )
+        .expect_err("a changed tenant-create retry must conflict after reclamation");
+    assert_eq!(
+        conflict.code(),
+        BootstrapFailureCode::ApiKeyIdempotencyConflict
+    );
+    Ok(())
+}
+
+#[test]
+fn display_name_replay_survives_audit_reclamation_and_reopen() -> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let (initialized, _, _, administrator_secret) = fixture.initialized_with_admin()?;
+    let system = initialized.attribute(
+        PresentedCredential::parse(&administrator_secret)?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let key = AdministrativeIdempotencyKey::new([0xa4; 16])?;
+    let updated = initialized.update_tenant_display_name(
+        system,
+        initialized.default_tenant_id(),
+        ResourceGeneration::new(1)?,
+        "Retention-safe display name",
+        key,
+    )?;
+    let system = initialized.attribute(
+        PresentedCredential::parse(&administrator_secret)?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    initialized.update_system_audit_retention(
+        system,
+        NonZeroU64::new(1).ok_or("retained audit-record limit")?,
+        ResourceGeneration::new(1)?,
+        AdministrativeIdempotencyKey::new([0xa5; 16])?,
+    )?;
+    drop(initialized);
+
+    let reopened = fixture.reopen()?;
+    let system = reopened.attribute(
+        PresentedCredential::parse(&administrator_secret)?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    assert_eq!(
+        reopened.update_tenant_display_name(
+            system,
+            reopened.default_tenant_id(),
+            ResourceGeneration::new(1)?,
+            "Retention-safe display name",
+            key,
+        )?,
+        updated
+    );
+    let conflict = reopened
+        .update_tenant_display_name(
+            system,
+            reopened.default_tenant_id(),
+            ResourceGeneration::new(1)?,
+            "Changed retry",
+            key,
+        )
+        .expect_err("a changed display-name retry must conflict after reclamation");
+    assert_eq!(
+        conflict.code(),
+        BootstrapFailureCode::TenantDisplayNameIdempotencyConflict
+    );
     Ok(())
 }
 

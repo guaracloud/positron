@@ -9,6 +9,7 @@ use positron_kernel::{
     AuditIntent, Catalog, CatalogObject, CatalogProposal, CatalogPublicationFault, FormatEpoch,
     TransactionId, with_catalog_publication_fault_after,
 };
+use std::num::NonZeroU64;
 
 use super::super::{InitializationPlan, InitializedInstance, InstanceBootstrap};
 use super::support::Roots;
@@ -78,6 +79,105 @@ fn tenant_administrator_can_activate_its_prospective_ingest_policy()
         administration.serving().pin()?.generation(),
         2,
         "activation affects only subsequently pinned policy snapshots"
+    );
+    Ok(())
+}
+
+#[test]
+fn policy_activation_replays_after_audit_reclamation_and_reopen()
+-> Result<(), Box<dyn std::error::Error>> {
+    let roots = Roots::new()?;
+    let paths = roots.paths();
+    drop(InstanceBootstrap::initialize(
+        &paths,
+        InitializationPlan::non_interactive(),
+    )?);
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let initialized = InstanceBootstrap::reopen(&paths)?;
+    let system = initialized.attribute(
+        PresentedCredential::parse(claim.secret())?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let tenant_key = initialized.create_api_key(
+        system,
+        Scope::TenantAdministration,
+        None,
+        ResourceGeneration::new(1)?,
+        AdministrativeIdempotencyKey::new([0xe4; 16])?,
+    )?;
+    let tenant_secret = tenant_key
+        .secret()
+        .ok_or("tenant administration secret")?
+        .to_owned();
+    let actor = initialized.attribute(
+        PresentedCredential::parse(&tenant_secret)?,
+        RequestedIntent::TenantAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let catalog = Catalog::open(
+        &initialized._authority,
+        initialized.instance,
+        initialized.key.catalog_secret(initialized.instance)?,
+    )?;
+    let identity = Identity::open(&catalog.pin()?)?;
+    let administration = IngestPolicyAdministration::open(&catalog, initialized.tenant)?;
+    let key = AdministrativeIdempotencyKey::new([0xe5; 16])?;
+    let policy = IngestPolicy::compile(
+        2,
+        vec![PolicyRule::new(
+            "retained-policy-replay",
+            Vec::new(),
+            PolicyAction::Accept,
+        )?],
+    )?;
+    let activation = administration.activate(
+        &catalog,
+        &identity,
+        actor,
+        ResourceGeneration::new(1)?,
+        key,
+        policy.clone(),
+    )?;
+    drop(catalog);
+    let system = initialized.attribute(
+        PresentedCredential::parse(claim.secret())?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    initialized.update_system_audit_retention(
+        system,
+        NonZeroU64::new(1).ok_or("nonzero audit retention")?,
+        ResourceGeneration::new(1)?,
+        AdministrativeIdempotencyKey::new([0xe6; 16])?,
+    )?;
+    drop(initialized);
+
+    let reopened = InstanceBootstrap::reopen(&paths)?;
+    let catalog = Catalog::open(
+        &reopened._authority,
+        reopened.instance,
+        reopened.key.catalog_secret(reopened.instance)?,
+    )?;
+    let identity = Identity::open(&catalog.pin()?)?;
+    let actor = identity.attribute(
+        &reopened.key,
+        PresentedCredential::parse(&tenant_secret)?,
+        RequestedIntent::TenantAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let administration = IngestPolicyAdministration::open(&catalog, reopened.tenant)?;
+    assert_eq!(
+        administration.activate(
+            &catalog,
+            &identity,
+            actor,
+            ResourceGeneration::new(1)?,
+            key,
+            policy,
+        )?,
+        activation,
+        "the terminal policy receipt retains the original activation after pruning"
     );
     Ok(())
 }

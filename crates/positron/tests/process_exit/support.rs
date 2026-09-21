@@ -155,15 +155,15 @@ pub(super) fn wait_for_child(
 }
 
 #[cfg(unix)]
-pub(super) fn available_ports() -> Result<[u16; 3], Box<dyn std::error::Error>> {
-    let mut probes = Vec::with_capacity(3);
-    for _ in 0..3 {
+pub(super) fn available_ports() -> Result<[u16; 5], Box<dyn std::error::Error>> {
+    let mut probes = Vec::with_capacity(5);
+    for _ in 0..5 {
         probes.push(
             std::net::TcpListener::bind(("127.0.0.1", 0))
                 .map_err(|error| format!("bind port probe: {error}"))?,
         );
     }
-    let mut ports = [0; 3];
+    let mut ports = [0; 5];
     for (port, probe) in ports.iter_mut().zip(&probes) {
         *port = probe
             .local_addr()
@@ -178,10 +178,15 @@ pub(super) fn process_configuration(
     root: &std::path::Path,
     data: &std::path::Path,
     secrets: &std::path::Path,
-    operations_port: u16,
-    api_port: u16,
-    otlp_http_port: u16,
+    ports: [u16; 5],
 ) -> String {
+    let [
+        operations_port,
+        api_port,
+        otlp_grpc_port,
+        otlp_http_port,
+        loki_push_port,
+    ] = ports;
     let crate_directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let runtime_directory = crate_directory
         .parent()
@@ -190,7 +195,7 @@ pub(super) fn process_configuration(
     let certificate = runtime_directory.join("api-test-cert.pem");
     let private_key = runtime_directory.join("api-test-key.pem");
     format!(
-        "schema_version = 1\n[runtime]\nshutdown_grace_seconds = 2\n[listener]\ncontrol_path = \"{}\"\noperations_bind_address = \"127.0.0.1:{operations_port}\"\napi_bind_address = \"127.0.0.1:{api_port}\"\napi_transport = \"tls\"\napi_tls_certificate_file = \"{}\"\napi_tls_private_key_file = \"{}\"\notlp_http_bind_address = \"127.0.0.1:{otlp_http_port}\"\n[storage]\ndata_directory = \"{}\"\nsecrets_directory = \"{}\"\n[security]\nlocal_key_file = \"{}\"\n",
+        "schema_version = 1\n[runtime]\nshutdown_grace_seconds = 2\n[listener]\ncontrol_path = \"{}\"\noperations_bind_address = \"127.0.0.1:{operations_port}\"\napi_bind_address = \"127.0.0.1:{api_port}\"\napi_transport = \"tls\"\napi_tls_certificate_file = \"{}\"\napi_tls_private_key_file = \"{}\"\notlp_grpc_bind_address = \"127.0.0.1:{otlp_grpc_port}\"\notlp_http_bind_address = \"127.0.0.1:{otlp_http_port}\"\nloki_push_bind_address = \"127.0.0.1:{loki_push_port}\"\n[storage]\ndata_directory = \"{}\"\nsecrets_directory = \"{}\"\n[security]\nlocal_key_file = \"{}\"\n",
         std::path::Path::new("/tmp")
             .join(root.file_name().unwrap_or_default())
             .with_extension("sock")

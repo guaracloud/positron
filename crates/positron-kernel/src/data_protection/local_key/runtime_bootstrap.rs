@@ -2,8 +2,9 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::path::Path;
 
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
+use crate::AuditCheckpointSigner;
 use crate::catalog::{CatalogSecret, InstanceId};
 use crate::data_protection::{
     DataProtection, FrameLimits, FrameSequence, ObjectDataKey, SecretKeyBytes, SecretKeyInput,
@@ -484,6 +485,27 @@ impl BootstrapKeyCustody {
             public_key,
             fingerprint,
         })
+    }
+
+    /// Opens the wrapped Instance Integrity Key into an opaque checkpoint-only
+    /// signing capability. The seed is never returned to the caller.
+    pub fn audit_checkpoint_signer(
+        &self,
+        instance: InstanceId,
+        protected_integrity_key: &[u8],
+    ) -> Result<AuditCheckpointSigner, BootstrapKeyFailure> {
+        let mut plaintext = self.open_object(
+            instance,
+            BootstrapObjectPurpose::Initialized,
+            protected_integrity_key,
+        )?;
+        let seed: [u8; 32] = plaintext
+            .as_slice()
+            .try_into()
+            .map_err(|_| BootstrapKeyFailure::Authentication)?;
+        plaintext.zeroize();
+        AuditCheckpointSigner::from_seed(Box::new(seed))
+            .map_err(|_| BootstrapKeyFailure::Authentication)
     }
 }
 

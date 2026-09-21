@@ -19,8 +19,8 @@ use positron_kernel::MountQualification;
 use positron_query::QueryBudget;
 use positron_runtime::{
     ApiTransportProfile, ApplicationRuntime, BootstrapPaths, HostInputs, InitializationMode,
-    InstanceBootstrap, NativeBindings, NativeHost, ServeConfiguration, ShutdownTrigger,
-    TrustedProxy,
+    InstanceBootstrap, NativeBindings, NativeHost, PublicPlaintextApiStartupIntent,
+    ServeConfiguration, ShutdownTrigger, TrustedProxy,
 };
 use prost::Message;
 

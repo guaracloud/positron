@@ -106,6 +106,14 @@ impl Catalog<'_> {
                     outcome.record.generation,
                 )?;
             }
+            if let Some(checkpoint) = state.audit_checkpoint.as_ref() {
+                self.storage.rewrap_audit_checkpoint(
+                    current,
+                    &replacement,
+                    self.instance,
+                    checkpoint,
+                )?;
+            }
             if secret.predecessor.is_none() {
                 let predecessor = std::mem::replace(&mut secret.wrapping, replacement);
                 secret.predecessor = Some(predecessor);

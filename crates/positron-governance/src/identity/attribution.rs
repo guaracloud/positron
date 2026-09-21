@@ -292,6 +292,41 @@ pub struct GovernanceInspection<'identity, 'audit> {
     audit: &'audit [GovernanceAuditEntry],
 }
 
+/// An authorized, bounded Governance Audit read result. Tenant-scoped
+/// inspection contains only records that carry the same explicit Tenant ID;
+/// system administration receives the complete decoded history.
+#[derive(Clone, Copy, Debug)]
+pub struct GovernanceAuditInspection<'audit> {
+    audit: &'audit [GovernanceAuditEntry],
+    tenant: Option<TenantId>,
+}
+
+impl<'audit> GovernanceAuditInspection<'audit> {
+    pub(super) const fn system(audit: &'audit [GovernanceAuditEntry]) -> Self {
+        Self {
+            audit,
+            tenant: None,
+        }
+    }
+
+    pub(super) const fn tenant(audit: &'audit [GovernanceAuditEntry], tenant: TenantId) -> Self {
+        Self {
+            audit,
+            tenant: Some(tenant),
+        }
+    }
+
+    /// Iterates the already-bounded recovered audit view without copying or
+    /// decoding records. Tenant scope is matched only against typed Tenant ID
+    /// semantics, never textual audit content.
+    pub fn audit_records(&self) -> impl Iterator<Item = &'audit GovernanceAuditEntry> {
+        self.audit.iter().filter(move |entry| {
+            self.tenant
+                .is_none_or(|tenant| entry.tenant_id() == Some(tenant))
+        })
+    }
+}
+
 impl GovernanceInspection<'_, '_> {
     pub(super) fn new<'slug, 'audit>(
         identity_tenant: TenantId,

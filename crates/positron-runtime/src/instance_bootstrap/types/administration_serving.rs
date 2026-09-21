@@ -142,15 +142,24 @@ impl InitializedInstance {
 
     /// Records the active explicit plaintext API transport selection through
     /// the Catalog's single joint governance-audit publication path.
-    pub(crate) fn activate_public_plaintext_api_transport(&self) -> Result<(), BootstrapFailure> {
+    pub(crate) fn activate_public_plaintext_api_transport(
+        &self,
+        intent: crate::PublicPlaintextApiStartupIntent,
+    ) -> Result<(), BootstrapFailure> {
         let secret = self
             .key
             .catalog_secret(self.instance)
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
         let catalog = Catalog::open(&self._authority, self.instance, secret)
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
-        ListenerTransportAdministration::activate_public_plaintext_api(&catalog, self.instance)
-            .map(|_| ())
-            .map_err(map_listener_transport_failure)
+        ListenerTransportAdministration::activate_public_plaintext_api(
+            &catalog,
+            self.instance,
+            positron_governance::ListenerTransportAuditRequest::configuration_file(
+                intent.api_bind_address(),
+            ),
+        )
+        .map(|_| ())
+        .map_err(map_listener_transport_failure)
     }
 }

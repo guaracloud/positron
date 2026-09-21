@@ -31,8 +31,8 @@ pub use native_host::{
 };
 pub use process::{
     ApplicationRuntime, CleanupFailure, CleanupPrimary, CleanupRole, DrainingProcess, ExitOutcome,
-    HostInputs, InitializationMode, RecoveryAttempt, RecoveryAttemptHost, RecoveryDecision,
-    RunningProcess, ServeConfiguration, ShutdownTrigger,
+    HostInputs, InitializationMode, PublicPlaintextApiStartupIntent, RecoveryAttempt,
+    RecoveryAttemptHost, RecoveryDecision, RunningProcess, ServeConfiguration, ShutdownTrigger,
 };
 pub use services::{ServiceFailure, ServiceHandle};
 pub use task::{

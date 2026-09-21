@@ -9,7 +9,7 @@ use positron_kernel::{Catalog, CatalogObject, CatalogProposal, FormatEpoch, Tran
 use super::super::super::{InitializationPlan, InstanceBootstrap};
 use super::super::support::Roots;
 
-const RECEIPT_MAGIC: &[u8] = b"POSPID01";
+const RECEIPT_MAGIC: &[u8] = b"POSPID02";
 
 #[test]
 fn malformed_current_activation_fails_closed_during_administration_open()

@@ -1,4 +1,16 @@
 use super::*;
+use std::net::{Ipv4Addr, SocketAddr};
+
+struct ExhaustOnFailure;
+
+impl positron_runtime::RecoveryAttemptHost for ExhaustOnFailure {
+    fn after_failure(
+        &self,
+        _attempt: positron_runtime::RecoveryAttempt,
+    ) -> positron_runtime::RecoveryDecision {
+        positron_runtime::RecoveryDecision::Exhausted
+    }
+}
 
 #[test]
 fn explicit_plaintext_api_transport_stays_ready_with_a_persistent_health_warning()
@@ -11,7 +23,12 @@ fn explicit_plaintext_api_transport_stays_ready_with_a_persistent_health_warning
             plaintext_roots.bootstrap_paths()?,
             InitializationMode::InitializeIfEmpty,
         )
-        .with_public_plaintext_api_warning(),
+        .with_public_plaintext_api_intent(
+            PublicPlaintextApiStartupIntent::configuration_file(SocketAddr::from((
+                Ipv4Addr::LOCALHOST,
+                8_080,
+            ))),
+        ),
         HostInputs::new(&plaintext_listeners, &plaintext_tasks),
     )?;
     assert_eq!(plaintext.health().readiness(), Readiness::Ready);
@@ -39,6 +56,59 @@ fn explicit_plaintext_api_transport_stays_ready_with_a_persistent_health_warning
     assert_eq!(
         tls.shutdown(ShutdownTrigger::FirstSignal),
         positron_runtime::ExitOutcome::Graceful
+    );
+    Ok(())
+}
+
+#[test]
+fn plaintext_audit_write_failure_prevents_data_listener_serving()
+-> Result<(), Box<dyn std::error::Error>> {
+    let roots = TestRoots::new("plaintext-audit-write-failure")?;
+    let paths = roots.bootstrap_paths()?;
+    drop(positron_runtime::InstanceBootstrap::initialize(
+        &paths,
+        positron_runtime::InitializationPlan::non_interactive(),
+    )?);
+    let listeners = ObservingListeners::default();
+    let tasks = ObservingTasks::default();
+    let recovery = ExhaustOnFailure;
+    let outcome = positron_kernel::with_catalog_publication_fault_after(
+        positron_kernel::CatalogPublicationFault::SynchronizeCommit,
+        2,
+        || {
+            ApplicationRuntime::start(
+                ServeConfiguration::new(paths.clone(), InitializationMode::ExistingOnly)
+                    .with_public_plaintext_api_intent(
+                        PublicPlaintextApiStartupIntent::configuration_file(SocketAddr::from((
+                            Ipv4Addr::new(198, 51, 100, 23),
+                            8_080,
+                        ))),
+                    ),
+                HostInputs::with_recovery(&listeners, &tasks, &recovery),
+            )
+        },
+    )
+    .expect_err("audit persistence must fail startup before data listeners bind");
+
+    assert_eq!(
+        outcome,
+        positron_runtime::ExitOutcome::StartupUnavailable(
+            positron_runtime::BootstrapFailureCode::CatalogUnavailable
+        )
+    );
+    assert!(listeners.bound.borrow().iter().all(|role| {
+        matches!(
+            role,
+            positron_runtime::ListenerRole::Control | positron_runtime::ListenerRole::Operations
+        )
+    }));
+    assert!(
+        !tasks
+            .events
+            .borrow()
+            .iter()
+            .any(|event| matches!(event, TaskEvent::Spawned(positron_runtime::TaskRole::Api))),
+        "the failed plaintext audit must precede API task activation"
     );
     Ok(())
 }

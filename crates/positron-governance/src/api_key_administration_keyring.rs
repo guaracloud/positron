@@ -203,8 +203,23 @@ pub(super) fn commit_tenant_keyring(
         objects.push(CatalogObject::new(bytes.to_vec()).map_err(map_catalog)?);
     }
     objects.push(CatalogObject::new(replacement).map_err(map_catalog)?);
-    let mut audit = Vec::with_capacity(98);
-    audit.extend_from_slice(b"POSKEY01");
+    let audit_position = super::next_audit_position(snapshot)?;
+    objects.push(super::object(super::ReceiptFields {
+        key: audit_fields.idempotency,
+        actor: audit_fields.actor,
+        tenant: Some(tenant),
+        action: audit_fields.action,
+        scope: audit_fields.scope,
+        expires_at_unix_seconds: audit_fields.expires_at_unix_seconds,
+        expected: audit_fields.expected,
+        generation: audit_fields.generation,
+        principal: audit_fields.principal,
+        target: audit_fields.target,
+        audit_position,
+        request_digest,
+    })?);
+    let mut audit = Vec::with_capacity(147);
+    audit.extend_from_slice(b"POSKEY03");
     audit.push(match audit_fields.action {
         ApiKeyLifecycleAction::Create => 1,
         ApiKeyLifecycleAction::Rotate => 2,
@@ -223,7 +238,10 @@ pub(super) fn commit_tenant_keyring(
     audit.extend_from_slice(&audit_fields.expected.get().to_be_bytes());
     audit.extend_from_slice(&audit_fields.generation.get().to_be_bytes());
     audit.extend_from_slice(&audit_fields.idempotency.to_bytes());
-    catalog
+    audit.extend_from_slice(&request_digest);
+    audit.push(1);
+    audit.extend_from_slice(&tenant.to_bytes());
+    let commit = catalog
         .commit_prepared(
             snapshot.identity(),
             CatalogProposal::new(
@@ -238,5 +256,12 @@ pub(super) fn commit_tenant_keyring(
             request_digest,
         )
         .map_err(map_catalog)?;
+    if commit
+        .governance_audit_record()
+        .map(|record| record.position())
+        != Some(audit_position)
+    {
+        return Err(ApiKeyAdministrationFailure::PersistenceUnavailable);
+    }
     Ok(())
 }

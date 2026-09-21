@@ -1,6 +1,68 @@
 use super::*;
 
 impl InitializedInstance {
+    /// Replaces the system-controlled Governance Audit record-count policy.
+    /// The Storage Kernel selects and durably reclaims the exact old prefix;
+    /// Administration owns authorization, idempotency, and retention intent.
+    pub fn update_system_audit_retention(
+        &self,
+        actor: AuthorizedContext,
+        retained_record_limit: NonZeroU64,
+        expected: ResourceGeneration,
+        idempotency: AdministrativeIdempotencyKey,
+    ) -> Result<positron_governance::SystemAuditRetentionUpdate, BootstrapFailure> {
+        let secret = self
+            .key
+            .catalog_secret(self.instance)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
+        let catalog = Catalog::open(&self._authority, self.instance, secret)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        let snapshot = catalog
+            .pin()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        let identity = positron_governance::Identity::open(&snapshot)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
+        let (_, governance) = snapshot
+            .governance_object()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
+        if governance.integrity_key_fingerprint() != self.integrity_key_fingerprint {
+            return Err(BootstrapFailure::new(
+                BootstrapFailureCode::IdentityMismatch,
+            ));
+        }
+        let signer = self
+            .key
+            .audit_checkpoint_signer(self.instance, governance.protected_integrity_key())
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
+        if signer.public_key() != governance.integrity_public_key() {
+            return Err(BootstrapFailure::new(
+                BootstrapFailureCode::IdentityMismatch,
+            ));
+        }
+        let audit_scope =
+            positron_kernel::SegmentScope::new(self.tenant, SignalKind::Logs, self.logs_shard);
+        let audit_ingest_time_unix_seconds = self
+            .retention_time
+            .governance_time_seconds(audit_scope)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?;
+        let request = positron_governance::SystemAuditRetentionRequest::new(
+            actor,
+            retained_record_limit,
+            expected,
+            idempotency,
+            audit_ingest_time_unix_seconds,
+        )
+        .map_err(map_system_audit_retention_failure)?;
+        positron_governance::SystemAuditRetentionAdministration::update(
+            &catalog,
+            self.instance,
+            &identity,
+            &signer,
+            request,
+        )
+        .map_err(map_system_audit_retention_failure)
+    }
+
     /// Reads bounded canonical segment evidence without publishing a retention change.
     pub fn inspect_tenant_retention_impact(
         &self,

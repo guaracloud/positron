@@ -13,12 +13,10 @@ use positron_domain::value::ValueLimitProfile;
 use positron_governance::{InitialAuditContext, InitialGovernanceIntent, InitialTenantIntent};
 use positron_kernel::{
     ActiveSegmentLedger, Catalog, CatalogObject, CatalogProposal, CatalogSecret, FormatEpoch,
-    InstanceId, ResourceAmounts, ResourceDimension, RetentionTimeAuthority,
-    SegmentProtectionKey, SegmentScope, StoreBlockIdentity, WorkClaim, WorkKind,
+    InstanceId, ResourceAmounts, ResourceDimension, RetentionTimeAuthority, SegmentProtectionKey,
+    SegmentScope, StoreBlockIdentity, WorkClaim, WorkKind,
 };
-use positron_policy::{
-    IngestPolicy, NativeTraceCandidate, PolicyReceiver, TracePolicyEvaluation,
-};
+use positron_policy::{IngestPolicy, NativeTraceCandidate, PolicyReceiver, TracePolicyEvaluation};
 use positron_signals::{
     EvaluatedSpanObservationInput, SamplingDecision, ScanCancellation, ScanLimit,
     ScanObservationFailureCode, ScanObserver, SpanKind, SpanObservation, SpanObservationDetails,
@@ -110,9 +108,8 @@ fn run_once(data: &[u8], root: &Path) -> Result<(), Box<dyn Error>> {
         CatalogSecret::from_owned(Box::new([0x52; 32]), Box::new([0x53; 32])),
     )?;
     install_retention(&catalog, instance, tenant)?;
-    let (retention_time, elapsed) = RetentionTimeAuthority::establish_with_manual_elapsed(
-        UnixNanoseconds::new(1_000_000_000),
-    );
+    let (retention_time, elapsed) =
+        RetentionTimeAuthority::establish_with_manual_elapsed(UnixNanoseconds::new(1_000_000_000));
     let scope = SegmentScope::new(tenant, SignalKind::Traces, VirtualShardId::new(51)?);
     let key = || SegmentProtectionKey::from_owned(Box::new([0x54; 32]));
     let store = TraceStore::new();
@@ -127,14 +124,7 @@ fn run_once(data: &[u8], root: &Path) -> Result<(), Box<dyn Error>> {
             scope,
             key(),
         )?;
-        append_observation(
-            &sealed,
-            &authority,
-            &store,
-            tenant,
-            marker,
-            data,
-        )?;
+        append_observation(&sealed, &authority, &store, tenant, marker, data)?;
         sealed.seal()?;
     }
     let active = ActiveSegmentLedger::open_with_retention_time(
@@ -148,7 +138,11 @@ fn run_once(data: &[u8], root: &Path) -> Result<(), Box<dyn Error>> {
 
     let pinned_before = active.snapshot()?;
     let expected = observed_spans(&store, authority.governor(), tenant, &pinned_before)?;
-    assert_eq!(expected.len(), 3, "fixture must expose sealed and active spans");
+    assert_eq!(
+        expected.len(),
+        3,
+        "fixture must expose sealed and active spans"
+    );
     let current_catalog = catalog.pin()?;
     let policy = TraceRetentionPolicy::from_catalog(&current_catalog)?;
     if pinned_before.blocks().is_empty() {
@@ -161,20 +155,10 @@ fn run_once(data: &[u8], root: &Path) -> Result<(), Box<dyn Error>> {
 
     let cancellation = CancelAfterPolls::new(data.first().copied().unwrap_or(2) & 0x03);
     let cancelled = store
-        .compact_observed(
-            &active,
-            tenant,
-            policy,
-            bucket,
-            &cancellation,
-            &Unobserved,
-        )
+        .compact_observed(&active, tenant, policy, bucket, &cancellation, &Unobserved)
         .expect_err("cancelled Trace compaction must reject before publication");
     assert_eq!(cancelled.code(), TraceStoreFailureCode::Cancelled);
-    assert_eq!(
-        catalog.pin()?.identity(),
-        prior_generation
-    );
+    assert_eq!(catalog.pin()?.identity(), prior_generation);
     assert_eq!(
         active.snapshot()?.blocks().len(),
         pinned_before.blocks().len(),
@@ -184,7 +168,10 @@ fn run_once(data: &[u8], root: &Path) -> Result<(), Box<dyn Error>> {
         store.compact(&active, tenant, policy, bucket)
     })
     .expect_err("publication failure must retain the Trace manifest");
-    assert_eq!(publication_failure.code(), TraceStoreFailureCode::StorageUnavailable);
+    assert_eq!(
+        publication_failure.code(),
+        TraceStoreFailureCode::StorageUnavailable
+    );
     assert_eq!(catalog.pin()?.identity(), prior_generation);
     assert_eq!(
         observed_spans(&store, authority.governor(), tenant, &active.snapshot()?)?,
@@ -193,7 +180,10 @@ fn run_once(data: &[u8], root: &Path) -> Result<(), Box<dyn Error>> {
     );
 
     let compacted = store.compact(&active, tenant, policy, bucket)?;
-    assert_eq!((compacted.input_segments(), compacted.output_segments()), (2, 1));
+    assert_eq!(
+        (compacted.input_segments(), compacted.output_segments()),
+        (2, 1)
+    );
     assert_eq!(compacted.input_blocks(), 2);
     assert_eq!(
         observed_spans(&store, authority.governor(), tenant, &active.snapshot()?)?,
@@ -206,7 +196,10 @@ fn run_once(data: &[u8], root: &Path) -> Result<(), Box<dyn Error>> {
         "pinned snapshots must preserve pre-compaction visibility"
     );
     let repeated = store.compact(&active, tenant, policy, bucket)?;
-    assert_eq!((repeated.input_segments(), repeated.output_segments()), (0, 0));
+    assert_eq!(
+        (repeated.input_segments(), repeated.output_segments()),
+        (0, 0)
+    );
 
     // Retention acts on sealed ingest-time segments only. The active block is
     // still public after the old compacted output becomes unreachable.
@@ -261,14 +254,7 @@ fn run_once(data: &[u8], root: &Path) -> Result<(), Box<dyn Error>> {
     );
     drop(reopened);
 
-    exercise_malformed_sealed_block(
-        data,
-        &authority,
-        &retention_time,
-        &catalog,
-        tenant,
-        &store,
-    )
+    exercise_malformed_sealed_block(data, &authority, &retention_time, &catalog, tenant, &store)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -290,7 +276,10 @@ fn exercise_malformed_sealed_block(
         scope,
         key(),
     )?;
-    let preparation = corrupt.begin_store_block(capacity(authority, tenant)?, StoreBlockIdentity::new([0x71; 16])?)?;
+    let preparation = corrupt.begin_store_block(
+        capacity(authority, tenant)?,
+        StoreBlockIdentity::new([0x71; 16])?,
+    )?;
     let bucket = policy.bucket(tenant, preparation.ingest_time())?;
     let mut malformed = legacy_v1_block(tenant, preparation.ingest_time().instant().value());
     malformed[0] ^= data.first().copied().unwrap_or(0).max(1);
@@ -347,7 +336,10 @@ fn append_observation<'authority, 'catalog>(
     );
     let observation = observation(marker, name)?;
     let prepared = store.prepare(
-        ledger.begin_store_block(capacity(authority, tenant)?, StoreBlockIdentity::new([marker; 16])?)?,
+        ledger.begin_store_block(
+            capacity(authority, tenant)?,
+            StoreBlockIdentity::new([marker; 16])?,
+        )?,
         vec![observation],
     )?;
     ledger.append(prepared.into_store_block())?;
@@ -360,7 +352,12 @@ fn observed_spans(
     tenant: TenantId,
     snapshot: &positron_kernel::LedgerSnapshot<'_>,
 ) -> Result<Vec<([u8; 8], String, positron_kernel::IngestTime)>, Box<dyn Error>> {
-    let scan = store.scan_physical(governor, tenant, snapshot, TraceScan::all(ScanLimit::new(8)?))?;
+    let scan = store.scan_physical(
+        governor,
+        tenant,
+        snapshot,
+        TraceScan::all(ScanLimit::new(8)?),
+    )?;
     Ok(scan
         .observations()
         .iter()
@@ -389,7 +386,10 @@ fn observation(marker: u8, name: String) -> Result<SpanObservation, Box<dyn Erro
             span_id: [marker; 8],
             parent_span_id: None,
             name,
-            start_time: EventTime::received(UnixNanoseconds::new(i64::from(marker)), SourceTimeQuality::Usable)?,
+            start_time: EventTime::received(
+                UnixNanoseconds::new(i64::from(marker)),
+                SourceTimeQuality::Usable,
+            )?,
             end_time: EventTime::missing(),
             kind: SpanKind::Server,
             sampling: SamplingDecision::Sampled,

@@ -50,6 +50,9 @@ pub enum BootstrapFailureCode {
     TenantRetentionInvalidConfirmation,
     TenantRetentionStaleGeneration,
     TenantRetentionIdempotencyConflict,
+    SystemAuditRetentionUnauthorized,
+    SystemAuditRetentionStaleGeneration,
+    SystemAuditRetentionIdempotencyConflict,
     TenantCreateConflict,
 }
 
