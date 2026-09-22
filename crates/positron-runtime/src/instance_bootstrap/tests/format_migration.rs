@@ -509,7 +509,19 @@ fn compatibility_retry_completes_a_post_publication_durable_migration() -> Resul
         .filter(|entry| entry.action() == "catalog.format.migrate")
         .count();
 
-    let replay = instance.migrate_catalog_to_epoch_two(actor, key)?;
+    let replay = instance
+        .migrate_catalog_to_epoch_two(actor, key)
+        .map_err(|failure| {
+            format!(
+                "post-publication compatibility retry failed: code={:?}, operation={:02x?}, stored_principal={:02x?}, retry_principal={:02x?}, accepted_generation={}, phase={:?}",
+                failure.code(),
+                pending.operation_id().to_bytes(),
+                pending.request().principal().to_bytes(),
+                actor.principal_id().to_bytes(),
+                pending.request().accepted_generation(),
+                pending.phase(),
+            )
+        })?;
     let completed = instance
         .get_durable_operation(actor, pending.operation_id())?
         .ok_or("completed migration operation")?;
