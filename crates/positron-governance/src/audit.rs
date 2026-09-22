@@ -37,7 +37,8 @@ const FORMAT_MIGRATION_MAGIC: [u8; 8] = *b"POSFMT01";
 const TENANT_ALIAS_MAGIC: [u8; 8] = *b"POSALI01";
 const TENANT_RETENTION_MAGIC: [u8; 8] = *b"POSTRT01";
 const SYSTEM_AUDIT_RETENTION_MAGIC: [u8; 8] = *b"POSAR001";
-const DURABLE_OPERATION_AUDIT_MAGIC: [u8; 8] = *b"POSOPA01";
+const DURABLE_OPERATION_AUDIT_MAGIC: [u8; 8] = *b"POSOPA02";
+const DURABLE_OPERATION_AUDIT_MAGIC_V1: [u8; 8] = *b"POSOPA01";
 
 /// Extracts a terminal receipt's idempotency key only after its owning codec
 /// has recognized the supported receipt version and key location. Callers use
@@ -122,9 +123,14 @@ pub enum GovernanceAuditEntry {
 pub struct DurableOperationAuditEntry {
     position: u64,
     operation_id: OperationId,
-    kind: DurableOperationKind,
-    status: DurableOperationStatus,
+    actor: Option<PrincipalId>,
+    applicable_tenant: Option<TenantId>,
+    action: DurableOperationKind,
+    outcome: DurableOperationStatus,
     phase: DurableOperationPhase,
+    request_id: Option<AdministrativeIdempotencyKey>,
+    accepted_generation: Option<u64>,
+    progress_percent: Option<u8>,
     revision: u64,
 }
 
@@ -132,6 +138,46 @@ impl DurableOperationAuditEntry {
     #[must_use]
     pub const fn operation_id(&self) -> OperationId {
         self.operation_id
+    }
+
+    #[must_use]
+    pub const fn acting_principal(&self) -> Option<PrincipalId> {
+        self.actor
+    }
+
+    #[must_use]
+    pub const fn applicable_tenant(&self) -> Option<TenantId> {
+        self.applicable_tenant
+    }
+
+    #[must_use]
+    pub const fn action(&self) -> DurableOperationKind {
+        self.action
+    }
+
+    #[must_use]
+    pub const fn target(&self) -> OperationId {
+        self.operation_id
+    }
+
+    #[must_use]
+    pub const fn outcome(&self) -> DurableOperationStatus {
+        self.outcome
+    }
+
+    #[must_use]
+    pub const fn request_id(&self) -> Option<AdministrativeIdempotencyKey> {
+        self.request_id
+    }
+
+    #[must_use]
+    pub const fn accepted_generation(&self) -> Option<u64> {
+        self.accepted_generation
+    }
+
+    #[must_use]
+    pub const fn progress_percent(&self) -> Option<u8> {
+        self.progress_percent
     }
 }
 
@@ -822,7 +868,7 @@ impl GovernanceAuditEntry {
             Self::TenantAliasBinding(_) => "succeeded",
             Self::TenantRetentionUpdate(_) => "succeeded",
             Self::SystemAuditRetentionUpdate(_) => "succeeded",
-            Self::DurableOperation(entry) => match entry.status {
+            Self::DurableOperation(entry) => match entry.outcome {
                 DurableOperationStatus::Failed => "failed",
                 DurableOperationStatus::Cancelled => "cancelled",
                 _ => "succeeded",

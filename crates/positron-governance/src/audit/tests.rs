@@ -6,10 +6,44 @@ use super::{
     schema_checkpoint_audit_intent,
 };
 use crate::{
-    ApiKeyLifecycleAction, InitialAuditContext, InitialGovernanceIntent, InitialTenantIntent,
-    ListenerTransportAuditEntry, ListenerTransportAuditRequest,
-    ListenerTransportConfigurationProvenance, ResourceGeneration,
+    ApiKeyLifecycleAction, DurableOperationKind, DurableOperationPhase, DurableOperationStatus,
+    InitialAuditContext, InitialGovernanceIntent, InitialTenantIntent, ListenerTransportAuditEntry,
+    ListenerTransportAuditRequest, ListenerTransportConfigurationProvenance, ResourceGeneration,
 };
+
+#[test]
+fn legacy_durable_operation_audit_remains_readable() {
+    let transaction = [0x11; 16];
+    let mut intent = b"POSOPA01".to_vec();
+    intent.extend_from_slice(&[0x22; 16]);
+    intent.push(1); // catalog-format migration
+    intent.push(4); // failed
+    intent.push(3); // draining
+    intent.extend_from_slice(&7_u64.to_be_bytes());
+
+    let entry = GovernanceAuditEntry::decode_fields(5, transaction, &intent)
+        .expect("legacy durable-operation audit");
+    let GovernanceAuditEntry::DurableOperation(operation) = entry else {
+        panic!("typed durable audit");
+    };
+    assert_eq!(operation.operation_id().to_bytes(), [0x22; 16]);
+    assert_eq!(operation.acting_principal(), None);
+    assert_eq!(operation.applicable_tenant(), None);
+    assert_eq!(
+        operation.action(),
+        DurableOperationKind::CatalogFormatMigration
+    );
+    assert_eq!(operation.outcome(), DurableOperationStatus::Failed);
+    assert_eq!(operation.phase, DurableOperationPhase::Draining);
+    assert_eq!(operation.request_id(), None);
+    assert_eq!(operation.accepted_generation(), None);
+    assert_eq!(operation.progress_percent(), None);
+    assert_eq!(operation.revision, 7);
+
+    let mut malformed = intent;
+    malformed[8..24].fill(0);
+    assert!(GovernanceAuditEntry::decode_fields(5, transaction, &malformed).is_err());
+}
 
 #[test]
 fn public_plaintext_api_transport_audit_is_redacted_exact_and_strict() {

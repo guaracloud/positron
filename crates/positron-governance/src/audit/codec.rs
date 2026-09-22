@@ -15,8 +15,52 @@ impl GovernanceAuditEntry {
             }
             let operation_id =
                 OperationId::from_bytes(cursor.take_array()?).map_err(|_| IdentityFailure)?;
-            let kind = DurableOperationKind::from_audit_code(cursor.take_u8()?)?;
-            let status = DurableOperationStatus::from_audit_code(cursor.take_u8()?)?;
+            let actor =
+                PrincipalId::from_bytes(cursor.take_array()?).map_err(|_| IdentityFailure)?;
+            let applicable_tenant = match cursor.take_u8()? {
+                0 => None,
+                1 => Some(TenantId::from_bytes(cursor.take_array()?).map_err(|_| IdentityFailure)?),
+                _ => return Err(IdentityFailure),
+            };
+            let action = DurableOperationKind::from_audit_code(cursor.take_u8()?)?;
+            let outcome = DurableOperationStatus::from_audit_code(cursor.take_u8()?)?;
+            let phase = DurableOperationPhase::from_audit_code(cursor.take_u8()?)?;
+            let request_id = AdministrativeIdempotencyKey::new(cursor.take_array()?)
+                .map_err(|_| IdentityFailure)?;
+            let accepted_generation = cursor.take_u64()?;
+            let progress_percent = cursor.take_u8()?;
+            let revision = cursor.take_u64()?;
+            if accepted_generation == 0
+                || progress_percent > 100
+                || revision == 0
+                || !cursor.is_empty()
+                || transaction_id.iter().all(|byte| *byte == 0)
+            {
+                return Err(IdentityFailure);
+            }
+            return Ok(Self::DurableOperation(DurableOperationAuditEntry {
+                position,
+                operation_id,
+                actor: Some(actor),
+                applicable_tenant,
+                action,
+                outcome,
+                phase,
+                request_id: Some(request_id),
+                accepted_generation: Some(accepted_generation),
+                progress_percent: Some(progress_percent),
+                revision,
+            }));
+        }
+        if intent.starts_with(&DURABLE_OPERATION_AUDIT_MAGIC_V1) {
+            let mut cursor = Cursor::new(intent);
+            if cursor.take_array::<8>()? != DURABLE_OPERATION_AUDIT_MAGIC_V1 {
+                return Err(IdentityFailure);
+            }
+            let operation_id =
+                OperationId::from_bytes(cursor.take_array()?).map_err(|_| IdentityFailure)?;
+            let action = DurableOperationKind::from_audit_code(cursor.take_u8()?)?;
+            let outcome = DurableOperationStatus::from_audit_code(cursor.take_u8()?)?;
             let phase = DurableOperationPhase::from_audit_code(cursor.take_u8()?)?;
             let revision = cursor.take_u64()?;
             if revision == 0 || !cursor.is_empty() || transaction_id.iter().all(|byte| *byte == 0) {
@@ -25,9 +69,14 @@ impl GovernanceAuditEntry {
             return Ok(Self::DurableOperation(DurableOperationAuditEntry {
                 position,
                 operation_id,
-                kind,
-                status,
+                actor: None,
+                applicable_tenant: None,
+                action,
+                outcome,
                 phase,
+                request_id: None,
+                accepted_generation: None,
+                progress_percent: None,
                 revision,
             }));
         }

@@ -228,6 +228,7 @@ pub(super) fn map_durable_operation_failure(failure: DurableOperationFailure) ->
         DurableOperationFailure::CapacityExceeded => BootstrapFailureCode::ResourceUnavailable,
         DurableOperationFailure::InvalidInput
         | DurableOperationFailure::UnknownOperation
+        | DurableOperationFailure::CompletedLookupExpired
         | DurableOperationFailure::InvalidState
         | DurableOperationFailure::CancellationUnavailable
         | DurableOperationFailure::PersistenceUnavailable => {

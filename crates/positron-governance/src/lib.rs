@@ -33,11 +33,11 @@ pub use api_key_administration::{
 };
 pub use audit::{
     ApiKeyLifecycleAction, CatalogRootRotationAuditEntry, CatalogRootRotationStage,
-    GovernanceAuditEntry, IngestPolicyActivationAuditEntry, InitialAuditMetadata,
-    InitializationAuditEntry, ListenerTransportAuditEntry, ListenerTransportAuditRequest,
-    ListenerTransportConfigurationProvenance, SchemaCheckpointAuditEntry,
-    SystemAuditRetentionUpdateAuditEntry, TenantDisplayNameUpdateAuditEntry,
-    TenantQuotaUpdateAuditEntry, schema_checkpoint_audit_intent,
+    DurableOperationAuditEntry, GovernanceAuditEntry, IngestPolicyActivationAuditEntry,
+    InitialAuditMetadata, InitializationAuditEntry, ListenerTransportAuditEntry,
+    ListenerTransportAuditRequest, ListenerTransportConfigurationProvenance,
+    SchemaCheckpointAuditEntry, SystemAuditRetentionUpdateAuditEntry,
+    TenantDisplayNameUpdateAuditEntry, TenantQuotaUpdateAuditEntry, schema_checkpoint_audit_intent,
 };
 #[cfg(fuzzing)]
 pub use durable_operation_administration::fuzz_durable_operation_record;
@@ -45,7 +45,7 @@ pub use durable_operation_administration::{
     DurableOperation, DurableOperationAdministration, DurableOperationBoundary,
     DurableOperationCancellation, DurableOperationFailure, DurableOperationKind,
     DurableOperationLookupRetention, DurableOperationPhase, DurableOperationRequest,
-    DurableOperationReservation, DurableOperationRetry, DurableOperationStatus, OperationId,
+    DurableOperationRetry, DurableOperationStatus, DurableOperationTerminalError, OperationId,
 };
 pub use format_migration_administration::{
     CatalogFormatMigration, CatalogFormatMigrationAdministration, CatalogFormatMigrationFailure,
