@@ -413,6 +413,132 @@ fn compatibility_migration_publishes_a_durable_operation_transition() -> Result<
 }
 
 #[test]
+fn compatibility_replays_a_legacy_receipt_without_creating_a_durable_operation()
+-> Result<(), Box<dyn Error>> {
+    let fixture = LegacyFixtureRoots::from_f9_fixture()?;
+    let paths = fixture.paths()?;
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    let actor = instance.attribute(
+        PresentedCredential::parse(claim.secret())?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let key = AdministrativeIdempotencyKey::new([0xcc; 16])?;
+    let catalog = Catalog::open(
+        &instance._authority,
+        instance.instance,
+        instance.key.catalog_secret(instance.instance)?,
+    )?;
+    let legacy = CatalogFormatMigrationAdministration::migrate_to_epoch_two(
+        &catalog,
+        instance.administrator,
+        actor,
+        key,
+    )?;
+    drop(catalog);
+    let audits_before_replay = instance.governance_audit_for_test()?;
+
+    assert_eq!(instance.migrate_catalog_to_epoch_two(actor, key)?, legacy);
+
+    let catalog = Catalog::open(
+        &instance._authority,
+        instance.instance,
+        instance.key.catalog_secret(instance.instance)?,
+    )?;
+    assert!(
+        DurableOperationAdministration::inspect_by_idempotency(&catalog, key)?.is_none(),
+        "a legacy receipt remains a receipt instead of creating a retroactive durable operation"
+    );
+    drop(catalog);
+    assert_eq!(
+        instance.governance_audit_for_test()?,
+        audits_before_replay,
+        "legacy receipt replay does not repeat the migration or publish a new transition"
+    );
+    Ok(())
+}
+
+#[test]
+fn compatibility_retry_completes_a_post_publication_durable_migration() -> Result<(), Box<dyn Error>>
+{
+    let fixture = LegacyFixtureRoots::from_f9_fixture()?;
+    let paths = fixture.paths()?;
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    let actor = instance.attribute(
+        PresentedCredential::parse(claim.secret())?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let key = AdministrativeIdempotencyKey::new([0xcb; 16])?;
+
+    with_catalog_publication_fault_after(CatalogPublicationFault::SynchronizeCommit, 4, || {
+        instance.migrate_catalog_to_epoch_two_as_operation(actor, key)
+    })
+    .expect_err("the terminal durable checkpoint is unavailable after the V2 handler publishes");
+
+    let catalog = Catalog::open(
+        &instance._authority,
+        instance.instance,
+        instance.key.catalog_secret(instance.instance)?,
+    )?;
+    let operation_id = DurableOperationAdministration::inspect_by_idempotency(&catalog, key)?
+        .ok_or("published migration operation")?
+        .operation_id();
+    drop(catalog);
+    let pending = instance
+        .get_durable_operation(actor, operation_id)?
+        .ok_or("published migration operation")?;
+    assert_eq!(
+        pending.status(),
+        DurableOperationStatus::Running,
+        "the published handler must remain recoverable until its terminal checkpoint commits"
+    );
+    assert_eq!(
+        pending.phase(),
+        positron_governance::DurableOperationPhase::CatalogPublication
+    );
+    assert_eq!(
+        instance.catalog_format_epoch()?,
+        Some(FormatEpoch::CATALOG_V2)
+    );
+    let audits_before_retry = instance.governance_audit_for_test()?;
+    let migration_audits_before_retry = audits_before_retry
+        .iter()
+        .filter(|entry| entry.action() == "catalog.format.migrate")
+        .count();
+
+    let replay = instance.migrate_catalog_to_epoch_two(actor, key)?;
+    let completed = instance
+        .get_durable_operation(actor, pending.operation_id())?
+        .ok_or("completed migration operation")?;
+    assert_eq!(completed.status(), DurableOperationStatus::Succeeded);
+    assert_eq!(
+        completed.phase(),
+        positron_governance::DurableOperationPhase::Published
+    );
+    assert_eq!(replay.from(), FormatEpoch::CATALOG_V1);
+    assert_eq!(replay.to(), FormatEpoch::CATALOG_V2);
+    let audits_after_retry = instance.governance_audit_for_test()?;
+    assert_eq!(
+        audits_after_retry
+            .iter()
+            .filter(|entry| entry.action() == "catalog.format.migrate")
+            .count(),
+        migration_audits_before_retry,
+        "the retry resolves the existing V2 receipt without repeating the migration"
+    );
+    assert!(
+        audits_after_retry.iter().any(|entry| {
+            entry.action() == "durable-operation.transition" && entry.outcome() == "succeeded"
+        }),
+        "the recovered terminal transition publishes its bound governance audit"
+    );
+    Ok(())
+}
+
+#[test]
 fn durable_operation_cancels_before_drain_and_rejects_a_changed_same_key_request()
 -> Result<(), Box<dyn Error>> {
     let fixture = LegacyFixtureRoots::from_f9_fixture()?;

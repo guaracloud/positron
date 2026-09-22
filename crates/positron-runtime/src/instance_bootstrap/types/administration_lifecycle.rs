@@ -130,6 +130,21 @@ impl InitializedInstance {
             }
         }
         if let Some(replay) = self.catalog_migration_preflight(actor, idempotency)? {
+            if DurableOperationAdministration::inspect_by_idempotency(
+                &self.open_operation_catalog()?,
+                idempotency,
+            )
+            .map_err(map_durable_operation_failure)?
+            .is_some()
+            {
+                let operation =
+                    self.migrate_catalog_to_epoch_two_as_operation(actor, idempotency)?;
+                if operation.status() != DurableOperationStatus::Succeeded {
+                    return Err(BootstrapFailure::new(
+                        BootstrapFailureCode::CatalogUnavailable,
+                    ));
+                }
+            }
             return Ok(replay);
         }
         let operation = self.migrate_catalog_to_epoch_two_as_operation(actor, idempotency)?;
