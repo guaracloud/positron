@@ -115,8 +115,8 @@ pub use data_protection::{
     QUERY_CURSOR_MAX_PAYLOAD_BYTES, QueryResultDigest,
 };
 pub use export_output::{
-    ExportBatchReceipt, ExportOutput, ExportOutputBinding, ExportOutputCheckpoint,
-    ExportOutputFailure, ExportOutputFailureCode,
+    ExportBatchReceipt, ExportOutput, ExportOutputBatchReservation, ExportOutputBinding,
+    ExportOutputCheckpoint, ExportOutputFailure, ExportOutputFailureCode,
 };
 
 pub use instance_bootstrap_storage::{

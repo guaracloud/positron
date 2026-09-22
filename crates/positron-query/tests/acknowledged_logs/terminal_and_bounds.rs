@@ -1,5 +1,6 @@
 use std::error::Error;
 
+use positron_domain::identity::Scope;
 use positron_governance::{CompatibilityHints, PresentedCredential, RequestedIntent};
 use positron_kernel::{ResourceAmounts, ResourceDimension, WorkClaim, WorkKind};
 use positron_query::{
@@ -932,6 +933,61 @@ impl QueryFixture {
         &self,
     ) -> Result<positron_kernel::ExportManifestSigner, Box<dyn Error>> {
         Ok(self.instance.export_manifest_signer_for_test()?)
+    }
+
+    pub(crate) fn revoke_query_context(&self) -> Result<(), Box<dyn Error>> {
+        let descriptor = self
+            .instance
+            .list_api_keys(self.administrator)?
+            .into_iter()
+            .find(|descriptor| descriptor.principal_id() == self.context.principal_id())
+            .ok_or("query credential descriptor missing")?;
+        self.instance.revoke_api_key(
+            self.administrator,
+            self.context.principal_id(),
+            descriptor.generation(),
+            positron_governance::AdministrativeIdempotencyKey::new([0x94; 16])?,
+        )?;
+        self.instance
+            .governance_fixture_for_test()?
+            .replace_into(self.kernel.catalog_for_test())?;
+        Ok(())
+    }
+
+    pub(crate) fn additional_query_context(
+        &self,
+    ) -> Result<positron_governance::AuthorizedContext, Box<dyn Error>> {
+        let expected = self
+            .instance
+            .list_api_keys(self.administrator)?
+            .into_iter()
+            .find(|descriptor| descriptor.principal_id() == self.context.principal_id())
+            .ok_or("query credential descriptor missing")?
+            .generation();
+        let created = self.instance.create_api_key(
+            self.administrator,
+            Scope::Query,
+            None,
+            expected,
+            positron_governance::AdministrativeIdempotencyKey::new([0x96; 16])?,
+        )?;
+        let context = self.instance.attribute(
+            PresentedCredential::parse(created.secret().ok_or("query secret missing")?)?,
+            RequestedIntent::Query,
+            CompatibilityHints::none(),
+        )?;
+        self.instance
+            .governance_fixture_for_test()?
+            .replace_into(self.kernel.catalog_for_test())?;
+        Ok(context)
+    }
+
+    pub(crate) fn suspend_query_tenant(&self) -> Result<(), Box<dyn Error>> {
+        self.instance
+            .governance_fixture_for_test()?
+            .with_lifecycle(positron_domain::lifecycle::TenantLifecycleState::Suspended)?
+            .replace_into(self.kernel.catalog_for_test())?;
+        Ok(())
     }
 
     pub(crate) fn correlation_service(

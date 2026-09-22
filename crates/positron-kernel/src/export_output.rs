@@ -17,6 +17,7 @@ const PAYLOAD_MAGIC: [u8; 8] = *b"POEXBAT1";
 const MANIFEST_MAGIC: [u8; 8] = *b"POEXMAN1";
 const EXPORT_DIRECTORY: &str = "exports";
 const PAYLOAD_NAME: &str = "payload";
+const INITIAL_CURSOR_NAME: &str = "initial";
 const MANIFEST_NAME: &str = "manifest";
 const MAX_EXPORT_BATCHES: u64 = 1_024;
 const MAX_EXPORT_BATCH_BYTES: usize = 1_048_576;
@@ -30,8 +31,11 @@ const MAX_EXPORT_BYTES: u64 = 1_073_741_824;
 const MAX_PROTECTED_RECORD_BYTES: usize =
     MAX_EXPORT_BATCH_BYTES + MAX_CONTINUATION_CURSOR_BYTES + 512;
 const PAYLOAD_FIXED_BYTES: usize = 54;
+const INITIAL_CURSOR_FIXED_BYTES: usize = 10;
 const MANIFEST_FIXED_BYTES: usize = 12;
 const MAX_PROTECTED_MANIFEST_BYTES: usize = MAX_EXPORT_MANIFEST_BYTES + 512;
+const MAX_PROTECTED_INITIAL_CURSOR_BYTES: usize = MAX_CONTINUATION_CURSOR_BYTES + 512;
+const INITIAL_CURSOR_MAGIC: [u8; 8] = *b"POEXINI1";
 const DESCRIPTOR_BYTES: usize = 248;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -178,6 +182,17 @@ pub struct ExportOutputCheckpoint {
     receipt: ExportBatchReceipt,
     continuation_cursor: Option<Vec<u8>>,
 }
+
+/// A Kernel Resource Governor grant held from export-batch serialization
+/// through durable append. Query acquires it before materializing canonical
+/// bytes so serialization cannot bypass output admission.
+#[must_use = "a pre-serialization export reservation must remain held through append"]
+pub struct ExportOutputBatchReservation<'authority> {
+    output_identity: [u8; 16],
+    tenant: TenantId,
+    payload_bytes: usize,
+    _capacity: crate::ResourceReservation<'authority>,
+}
 impl ExportOutputCheckpoint {
     #[must_use]
     pub const fn receipt(&self) -> ExportBatchReceipt {
@@ -233,7 +248,13 @@ impl ExportOutput {
                 return Err(fail(ExportOutputFailureCode::IntegrityCorruption));
             }
         }
-        Ok(found)
+        if let Some(output) = found {
+            let _capacity = output.reserve_scan(catalog)?;
+            scan_records(catalog, &output, |_, _| Ok(()))?;
+            Ok(Some(output))
+        } else {
+            Ok(None)
+        }
     }
     pub fn create(
         catalog: &Catalog<'_>,
@@ -256,6 +277,58 @@ impl ExportOutput {
                     last_digest: [0; 32],
                     manifest_digest: [0; 32],
                 };
+                ensure_payload_file(catalog, identity, true)?;
+                output.publish(catalog)?;
+                Ok(output)
+            },
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Creates an output only after its original authenticated Query cursor is
+    /// protected. An exact retry can therefore restore the bound snapshot even
+    /// if the descriptor publication was interrupted or later Catalog state
+    /// has advanced.
+    pub fn create_with_initial_cursor(
+        catalog: &Catalog<'_>,
+        binding: ExportOutputBinding,
+        initial_cursor: &[u8],
+    ) -> Result<Self, ExportOutputFailure> {
+        if initial_cursor.is_empty() || initial_cursor.len() > MAX_CONTINUATION_CURSOR_BYTES {
+            return Err(fail(ExportOutputFailureCode::LimitExceeded));
+        }
+        let identity = output_identity(binding);
+        let _operation = catalog
+            .export_output_operation
+            .lock()
+            .map_err(|_| fail(ExportOutputFailureCode::ConcurrentWriter))?;
+        match Self::reopen_unlocked(catalog, identity) {
+            Ok(existing) if existing.binding == binding => {
+                let stored = read_unpublished_initial_cursor(catalog, identity)?
+                    .ok_or_else(|| fail(ExportOutputFailureCode::IntegrityCorruption))?;
+                if stored == initial_cursor {
+                    Ok(existing)
+                } else {
+                    Err(fail(ExportOutputFailureCode::IdempotencyConflict))
+                }
+            },
+            Ok(_) => Err(fail(ExportOutputFailureCode::IdempotencyConflict)),
+            Err(error) if error.code() == ExportOutputFailureCode::StorageUnavailable => {
+                let output = Self {
+                    identity,
+                    binding,
+                    next_sequence: 0,
+                    retained_bytes: 0,
+                    last_digest: [0; 32],
+                    manifest_digest: [0; 32],
+                };
+                match read_unpublished_initial_cursor(catalog, identity)? {
+                    Some(stored) if stored != initial_cursor => {
+                        return Err(fail(ExportOutputFailureCode::IdempotencyConflict));
+                    },
+                    Some(_) => {},
+                    None => write_initial_cursor(catalog, &output, initial_cursor)?,
+                }
                 ensure_payload_file(catalog, identity, true)?;
                 output.publish(catalog)?;
                 Ok(output)
@@ -291,7 +364,10 @@ impl ExportOutput {
                 return Err(fail(ExportOutputFailureCode::IntegrityCorruption));
             }
         }
-        found.ok_or_else(|| fail(ExportOutputFailureCode::StorageUnavailable))
+        let output = found.ok_or_else(|| fail(ExportOutputFailureCode::StorageUnavailable))?;
+        let _capacity = output.reserve_scan(catalog)?;
+        scan_records(catalog, &output, |_, _| Ok(()))?;
+        Ok(output)
     }
     pub fn append_batch(
         &mut self,
@@ -303,35 +379,141 @@ impl ExportOutput {
         continuation_cursor: Option<&[u8]>,
     ) -> Result<ExportBatchReceipt, ExportOutputFailure> {
         self.require_live(observed_at)?;
-        if bytes.is_empty()
-            || bytes.len() > MAX_EXPORT_BATCH_BYTES
-            || digest == [0; 32]
-            || continuation_cursor
-                .is_some_and(|cursor| cursor.len() > MAX_CONTINUATION_CURSOR_BYTES)
-        {
+        self.validate_batch(digest, bytes, continuation_cursor)?;
+        let reservation = self.reserve_append(catalog, bytes.len())?;
+        self.append_batch_reserved(
+            catalog,
+            observed_at,
+            sequence,
+            digest,
+            bytes,
+            continuation_cursor,
+            reservation,
+        )
+    }
+
+    /// Reserves the bounded worst-case batch working set before Query
+    /// serializes a canonical Result Batch.
+    pub fn reserve_next_batch<'authority>(
+        &self,
+        catalog: &'authority Catalog<'_>,
+    ) -> Result<ExportOutputBatchReservation<'authority>, ExportOutputFailure> {
+        if self.next_sequence >= MAX_EXPORT_BATCHES {
             return Err(fail(ExportOutputFailureCode::LimitExceeded));
         }
+        let payload_bytes = MAX_EXPORT_BATCH_BYTES
+            .checked_add(MAX_EXPORT_BATCH_BYTES)
+            .and_then(|bytes| bytes.checked_add(MAX_PROTECTED_RECORD_BYTES))
+            .and_then(|bytes| bytes.checked_add(MAX_PROTECTED_RECORD_BYTES))
+            .ok_or_else(|| fail(ExportOutputFailureCode::LimitExceeded))?;
+        let capacity = catalog
+            .reserve_export_output(
+                self.binding.tenant,
+                payload_bytes,
+                MAX_PROTECTED_RECORD_BYTES,
+            )
+            .map_err(map_catalog_failure)?;
+        Ok(ExportOutputBatchReservation {
+            output_identity: self.identity,
+            tenant: self.binding.tenant,
+            payload_bytes,
+            _capacity: capacity,
+        })
+    }
+
+    /// Appends a canonical batch beneath a reservation acquired before
+    /// serialization. The grant is consumed on every terminal path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_batch_reserved(
+        &mut self,
+        catalog: &Catalog<'_>,
+        observed_at: u64,
+        sequence: u64,
+        digest: [u8; 32],
+        bytes: &[u8],
+        continuation_cursor: Option<&[u8]>,
+        reservation: ExportOutputBatchReservation<'_>,
+    ) -> Result<ExportBatchReceipt, ExportOutputFailure> {
+        self.require_live(observed_at)?;
+        self.validate_batch(digest, bytes, continuation_cursor)?;
+        let required_payload_bytes = bytes
+            .len()
+            .checked_add(MAX_EXPORT_BATCH_BYTES)
+            .and_then(|value| value.checked_add(MAX_PROTECTED_RECORD_BYTES))
+            .and_then(|value| value.checked_add(MAX_PROTECTED_RECORD_BYTES))
+            .ok_or_else(|| fail(ExportOutputFailureCode::LimitExceeded))?;
+        if reservation.output_identity != self.identity
+            || reservation.tenant != self.binding.tenant
+            || reservation.payload_bytes < required_payload_bytes
+        {
+            return Err(fail(ExportOutputFailureCode::ResourceAdmissionRefused));
+        }
+        self.append_batch_with_reservation(
+            catalog,
+            sequence,
+            digest,
+            bytes,
+            continuation_cursor,
+            reservation,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn append_batch_with_reservation(
+        &mut self,
+        catalog: &Catalog<'_>,
+        sequence: u64,
+        digest: [u8; 32],
+        bytes: &[u8],
+        continuation_cursor: Option<&[u8]>,
+        _reservation: ExportOutputBatchReservation<'_>,
+    ) -> Result<ExportBatchReceipt, ExportOutputFailure> {
         let _operation = catalog
             .export_output_operation
             .lock()
             .map_err(|_| fail(ExportOutputFailureCode::ConcurrentWriter))?;
-        let records = read_records(catalog, self)?;
-        let count = u64::try_from(records.len())
-            .map_err(|_| fail(ExportOutputFailureCode::LimitExceeded))?;
-        if count < self.next_sequence {
-            return Err(fail(ExportOutputFailureCode::IntegrityCorruption));
+        if sequence < self.next_sequence {
+            let mut existing = None;
+            scan_records(catalog, self, |record_sequence, record| {
+                if record_sequence == sequence {
+                    existing = Some(record.clone());
+                }
+                Ok(())
+            })?;
+            let existing =
+                existing.ok_or_else(|| fail(ExportOutputFailureCode::IntegrityCorruption))?;
+            return if existing.digest == digest
+                && existing.bytes == bytes
+                && existing.continuation_cursor.as_deref() == continuation_cursor
+            {
+                Ok(ExportBatchReceipt { sequence, digest })
+            } else {
+                Err(fail(ExportOutputFailureCode::IdempotencyConflict))
+            };
         }
+        let tail = inspect_payload_tail(catalog, self)?;
+        let count = self
+            .next_sequence
+            .checked_add(u64::from(tail.orphan.is_some()))
+            .ok_or_else(|| fail(ExportOutputFailureCode::LimitExceeded))?;
         if sequence < count {
-            let existing = records
-                .get(
-                    usize::try_from(sequence)
-                        .map_err(|_| fail(ExportOutputFailureCode::LimitExceeded))?,
-                )
+            let existing = tail
+                .orphan
                 .ok_or_else(|| fail(ExportOutputFailureCode::IntegrityCorruption))?;
             return if existing.digest == digest
                 && existing.bytes == bytes
                 && existing.continuation_cursor.as_deref() == continuation_cursor
             {
+                if sequence == self.next_sequence {
+                    let mut successor = self.clone();
+                    successor.next_sequence = sequence
+                        .checked_add(1)
+                        .ok_or_else(|| fail(ExportOutputFailureCode::LimitExceeded))?;
+                    successor.retained_bytes = tail.length;
+                    successor.last_digest = digest;
+                    successor.publish(catalog)?;
+                    *self = successor;
+                }
                 Ok(ExportBatchReceipt { sequence, digest })
             } else {
                 Err(fail(ExportOutputFailureCode::IdempotencyConflict))
@@ -355,16 +537,14 @@ impl ExportOutput {
             .len()
             .checked_add(4)
             .ok_or_else(|| fail(ExportOutputFailureCode::LimitExceeded))?;
-        let next_bytes = total_record_bytes(&records)?
+        let next_bytes = tail
+            .length
             .checked_add(
                 u64::try_from(durable_bytes)
                     .map_err(|_| fail(ExportOutputFailureCode::LimitExceeded))?,
             )
             .filter(|total| *total <= MAX_EXPORT_BYTES)
             .ok_or_else(|| fail(ExportOutputFailureCode::LimitExceeded))?;
-        let _capacity = catalog
-            .reserve_export_output(self.binding.tenant, bytes.len(), durable_bytes)
-            .map_err(map_catalog_failure)?;
         let mut payload = ensure_payload_file(catalog, self.identity, false)?;
         payload.seek(SeekFrom::End(0)).map_err(map_io_failure)?;
         payload
@@ -456,6 +636,21 @@ impl ExportOutput {
         }
         Ok(Some(read_manifest_unlocked(catalog, self)?))
     }
+
+    /// Reads the authenticated original Query cursor retained before this
+    /// output descriptor became visible.
+    pub fn initial_cursor(
+        &self,
+        catalog: &Catalog<'_>,
+        observed_at: u64,
+    ) -> Result<Option<Vec<u8>>, ExportOutputFailure> {
+        self.require_live(observed_at)?;
+        let _operation = catalog
+            .export_output_operation
+            .lock()
+            .map_err(|_| fail(ExportOutputFailureCode::ConcurrentWriter))?;
+        read_unpublished_initial_cursor(catalog, self.identity)
+    }
     pub fn read_batch(
         &self,
         catalog: &Catalog<'_>,
@@ -467,13 +662,18 @@ impl ExportOutput {
             .export_output_operation
             .lock()
             .map_err(|_| fail(ExportOutputFailureCode::ConcurrentWriter))?;
-        read_records(catalog, self)?
-            .get(
-                usize::try_from(sequence)
-                    .map_err(|_| fail(ExportOutputFailureCode::LimitExceeded))?,
-            )
-            .map(|record| record.bytes.clone())
-            .ok_or_else(|| fail(ExportOutputFailureCode::StorageUnavailable))
+        if sequence >= self.next_sequence {
+            return Err(fail(ExportOutputFailureCode::StorageUnavailable));
+        }
+        let _capacity = self.reserve_scan(catalog)?;
+        let mut selected = None;
+        scan_records(catalog, self, |record_sequence, record| {
+            if record_sequence == sequence {
+                selected = Some(record.bytes.clone());
+            }
+            Ok(())
+        })?;
+        selected.ok_or_else(|| fail(ExportOutputFailureCode::IntegrityCorruption))
     }
     pub fn latest_checkpoint(
         &self,
@@ -485,7 +685,9 @@ impl ExportOutput {
             .export_output_operation
             .lock()
             .map_err(|_| fail(ExportOutputFailureCode::ConcurrentWriter))?;
-        let Some(record) = read_records(catalog, self)?.pop() else {
+        let _capacity = self.reserve_scan(catalog)?;
+        let scan = scan_records(catalog, self, |_, _| Ok(()))?;
+        let Some(record) = scan.committed else {
             return Ok(None);
         };
         let sequence = self
@@ -513,18 +715,23 @@ impl ExportOutput {
             .export_output_operation
             .lock()
             .map_err(|_| fail(ExportOutputFailureCode::ConcurrentWriter))?;
-        let records = read_records(catalog, self)?;
         let mut receipts = Vec::new();
         receipts
-            .try_reserve_exact(records.len())
-            .map_err(|_| fail(ExportOutputFailureCode::LimitExceeded))?;
-        for (index, record) in records.iter().enumerate() {
-            receipts.push(ExportBatchReceipt {
-                sequence: u64::try_from(index)
+            .try_reserve_exact(
+                usize::try_from(self.next_sequence)
                     .map_err(|_| fail(ExportOutputFailureCode::LimitExceeded))?,
-                digest: record.digest,
-            });
-        }
+            )
+            .map_err(|_| fail(ExportOutputFailureCode::LimitExceeded))?;
+        let _capacity = self.reserve_scan(catalog)?;
+        scan_records(catalog, self, |sequence, record| {
+            if sequence < self.next_sequence {
+                receipts.push(ExportBatchReceipt {
+                    sequence,
+                    digest: record.digest,
+                });
+            }
+            Ok(())
+        })?;
         Ok(receipts)
     }
     #[must_use]
@@ -562,6 +769,69 @@ impl ExportOutput {
             Ok(())
         }
     }
+
+    fn validate_batch(
+        &self,
+        digest: [u8; 32],
+        bytes: &[u8],
+        continuation_cursor: Option<&[u8]>,
+    ) -> Result<(), ExportOutputFailure> {
+        if bytes.is_empty()
+            || bytes.len() > MAX_EXPORT_BATCH_BYTES
+            || digest == [0; 32]
+            || continuation_cursor
+                .is_some_and(|cursor| cursor.len() > MAX_CONTINUATION_CURSOR_BYTES)
+        {
+            Err(fail(ExportOutputFailureCode::LimitExceeded))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn reserve_append<'authority>(
+        &self,
+        catalog: &'authority Catalog<'_>,
+        canonical_bytes: usize,
+    ) -> Result<ExportOutputBatchReservation<'authority>, ExportOutputFailure> {
+        let payload_bytes = canonical_bytes
+            .checked_add(MAX_EXPORT_BATCH_BYTES)
+            .and_then(|bytes| bytes.checked_add(MAX_PROTECTED_RECORD_BYTES))
+            .and_then(|bytes| bytes.checked_add(MAX_PROTECTED_RECORD_BYTES))
+            .ok_or_else(|| fail(ExportOutputFailureCode::LimitExceeded))?;
+        let capacity = catalog
+            .reserve_export_output(
+                self.binding.tenant,
+                payload_bytes,
+                MAX_PROTECTED_RECORD_BYTES,
+            )
+            .map_err(map_catalog_failure)?;
+        Ok(ExportOutputBatchReservation {
+            output_identity: self.identity,
+            tenant: self.binding.tenant,
+            payload_bytes,
+            _capacity: capacity,
+        })
+    }
+
+    fn reserve_scan<'authority>(
+        &self,
+        catalog: &'authority Catalog<'_>,
+    ) -> Result<ExportOutputBatchReservation<'authority>, ExportOutputFailure> {
+        let payload_bytes = MAX_EXPORT_BATCH_BYTES
+            .checked_add(MAX_PROTECTED_RECORD_BYTES)
+            .and_then(|bytes| bytes.checked_add(MAX_PROTECTED_RECORD_BYTES))
+            .ok_or_else(|| fail(ExportOutputFailureCode::LimitExceeded))?;
+        let capacity = catalog
+            .reserve_export_output(self.binding.tenant, payload_bytes, 0)
+            .map_err(map_catalog_failure)?;
+        Ok(ExportOutputBatchReservation {
+            output_identity: self.identity,
+            tenant: self.binding.tenant,
+            payload_bytes,
+            _capacity: capacity,
+        })
+    }
+
     fn publish(&self, catalog: &Catalog<'_>) -> Result<(), ExportOutputFailure> {
         let snapshot = catalog.pin().map_err(map_catalog_failure)?;
         let mut objects = Vec::new();
@@ -592,29 +862,100 @@ impl ExportOutput {
     }
 }
 
+#[derive(Clone)]
 struct PayloadRecord {
     digest: [u8; 32],
     bytes: Vec<u8>,
     continuation_cursor: Option<Vec<u8>>,
     durable_bytes: u64,
 }
-fn read_records(
+#[derive(Clone)]
+struct PayloadRecordMetadata {
+    digest: [u8; 32],
+    continuation_cursor: Option<Vec<u8>>,
+}
+
+struct PayloadScan {
+    committed: Option<PayloadRecordMetadata>,
+}
+
+struct PayloadTail {
+    length: u64,
+    orphan: Option<PayloadRecord>,
+}
+
+fn inspect_payload_tail(
     catalog: &Catalog<'_>,
     output: &ExportOutput,
-) -> Result<Vec<PayloadRecord>, ExportOutputFailure> {
+) -> Result<PayloadTail, ExportOutputFailure> {
+    let mut file = ensure_payload_file(catalog, output.identity, false)?;
+    let length = file.metadata().map_err(map_io_failure)?.len();
+    if length > MAX_EXPORT_BYTES || length < output.retained_bytes {
+        return Err(fail(ExportOutputFailureCode::IntegrityCorruption));
+    }
+    if length == output.retained_bytes {
+        return Ok(PayloadTail {
+            length,
+            orphan: None,
+        });
+    }
+    let remaining = length
+        .checked_sub(output.retained_bytes)
+        .ok_or_else(|| fail(ExportOutputFailureCode::IntegrityCorruption))?;
+    if remaining <= 4 {
+        return Err(fail(ExportOutputFailureCode::IntegrityCorruption));
+    }
+    file.seek(SeekFrom::Start(output.retained_bytes))
+        .map_err(map_io_failure)?;
+    let mut prefix = [0; 4];
+    file.read_exact(&mut prefix)
+        .map_err(|_| fail(ExportOutputFailureCode::IntegrityCorruption))?;
+    let encoded_length = usize::try_from(u32::from_be_bytes(prefix))
+        .map_err(|_| fail(ExportOutputFailureCode::LimitExceeded))?;
+    if encoded_length == 0 || encoded_length > MAX_PROTECTED_RECORD_BYTES {
+        return Err(fail(ExportOutputFailureCode::IntegrityCorruption));
+    }
+    let expected = u64::try_from(encoded_length)
+        .map_err(|_| fail(ExportOutputFailureCode::LimitExceeded))?
+        .checked_add(4)
+        .ok_or_else(|| fail(ExportOutputFailureCode::LimitExceeded))?;
+    if expected != remaining {
+        return Err(fail(ExportOutputFailureCode::IntegrityCorruption));
+    }
+    let mut encrypted = vec![0; encoded_length];
+    file.read_exact(&mut encrypted)
+        .map_err(|_| fail(ExportOutputFailureCode::IntegrityCorruption))?;
+    let plaintext = catalog
+        .open_export_output(
+            payload_identity(output.identity, output.next_sequence),
+            FormatEpoch::CATALOG_V2,
+            &encrypted,
+        )
+        .map_err(map_catalog_failure)?;
+    let mut orphan = decode_payload(output.next_sequence, &plaintext)?;
+    orphan.durable_bytes = expected;
+    Ok(PayloadTail {
+        length,
+        orphan: Some(orphan),
+    })
+}
+
+fn scan_records(
+    catalog: &Catalog<'_>,
+    output: &ExportOutput,
+    mut inspect: impl FnMut(u64, &PayloadRecord) -> Result<(), ExportOutputFailure>,
+) -> Result<PayloadScan, ExportOutputFailure> {
     let mut file = ensure_payload_file(catalog, output.identity, false)?;
     let length = file.metadata().map_err(map_io_failure)?.len();
     if length > MAX_EXPORT_BYTES {
         return Err(fail(ExportOutputFailureCode::LimitExceeded));
     }
     file.seek(SeekFrom::Start(0)).map_err(map_io_failure)?;
-    let mut records = Vec::new();
+    let mut count = 0_u64;
     let mut consumed = 0_u64;
+    let mut committed = None;
     while consumed < length {
-        if records.len()
-            >= usize::try_from(MAX_EXPORT_BATCHES)
-                .map_err(|_| fail(ExportOutputFailureCode::LimitExceeded))?
-        {
+        if count >= MAX_EXPORT_BATCHES {
             return Err(fail(ExportOutputFailureCode::LimitExceeded));
         }
         let mut prefix = [0; 4];
@@ -637,8 +978,7 @@ fn read_records(
         let mut encrypted = vec![0; encoded_length];
         file.read_exact(&mut encrypted)
             .map_err(|_| fail(ExportOutputFailureCode::IntegrityCorruption))?;
-        let sequence = u64::try_from(records.len())
-            .map_err(|_| fail(ExportOutputFailureCode::LimitExceeded))?;
+        let sequence = count;
         let plaintext = catalog
             .open_export_output(
                 payload_identity(output.identity, sequence),
@@ -651,31 +991,32 @@ fn read_records(
             .map_err(|_| fail(ExportOutputFailureCode::LimitExceeded))?
             .checked_add(4)
             .ok_or_else(|| fail(ExportOutputFailureCode::LimitExceeded))?;
-        records.push(record);
+        if sequence == output.next_sequence.checked_sub(1).unwrap_or(u64::MAX) {
+            committed = Some(PayloadRecordMetadata {
+                digest: record.digest,
+                continuation_cursor: record.continuation_cursor.clone(),
+            });
+        }
+        inspect(sequence, &record)?;
+        count = count
+            .checked_add(1)
+            .ok_or_else(|| fail(ExportOutputFailureCode::LimitExceeded))?;
     }
-    let count =
-        u64::try_from(records.len()).map_err(|_| fail(ExportOutputFailureCode::LimitExceeded))?;
     if consumed != length
         || count < output.next_sequence
         || count > output.next_sequence.saturating_add(1)
     {
         return Err(fail(ExportOutputFailureCode::IntegrityCorruption));
     }
-    if count == output.next_sequence && total_record_bytes(&records)? != output.retained_bytes {
+    if count == output.next_sequence && consumed != output.retained_bytes {
         return Err(fail(ExportOutputFailureCode::IntegrityCorruption));
     }
     if output.next_sequence > 0
-        && records
-            .get(
-                usize::try_from(output.next_sequence - 1)
-                    .map_err(|_| fail(ExportOutputFailureCode::LimitExceeded))?,
-            )
-            .map(|record| record.digest)
-            != Some(output.last_digest)
+        && committed.as_ref().map(|record| record.digest) != Some(output.last_digest)
     {
         return Err(fail(ExportOutputFailureCode::IntegrityCorruption));
     }
-    Ok(records)
+    Ok(PayloadScan { committed })
 }
 fn ensure_payload_file(
     catalog: &Catalog<'_>,
@@ -735,6 +1076,130 @@ fn create_manifest_file(
     root.sync_all().map_err(map_io_failure)?;
     Ok(())
 }
+
+fn write_initial_cursor(
+    catalog: &Catalog<'_>,
+    output: &ExportOutput,
+    cursor: &[u8],
+) -> Result<(), ExportOutputFailure> {
+    let plaintext = encode_initial_cursor(cursor)?;
+    let protected = catalog
+        .protect_export_output(
+            initial_cursor_identity(output.identity),
+            FormatEpoch::CATALOG_V2,
+            &plaintext,
+        )
+        .map_err(map_catalog_failure)?;
+    if protected.len() > MAX_PROTECTED_INITIAL_CURSOR_BYTES {
+        return Err(fail(ExportOutputFailureCode::LimitExceeded));
+    }
+    let _capacity = catalog
+        .reserve_export_output(output.binding.tenant, cursor.len(), protected.len())
+        .map_err(map_catalog_failure)?;
+    create_named_protected_file(catalog, output.identity, INITIAL_CURSOR_NAME, &protected)
+}
+
+fn create_named_protected_file(
+    catalog: &Catalog<'_>,
+    identity: [u8; 16],
+    name: &str,
+    protected: &[u8],
+) -> Result<(), ExportOutputFailure> {
+    let root = catalog.export_output_root().map_err(map_catalog_failure)?;
+    let exports = open_directory(&root, EXPORT_DIRECTORY, true)?;
+    let output = open_directory(&exports, &hex(identity), true)?;
+    let mut file = unix_fs::openat(
+        &output,
+        name,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+    )
+    .map(File::from)
+    .map_err(map_errno)?;
+    file.write_all(protected).map_err(map_io_failure)?;
+    file.sync_all().map_err(map_io_failure)?;
+    output.sync_all().map_err(map_io_failure)?;
+    exports.sync_all().map_err(map_io_failure)?;
+    root.sync_all().map_err(map_io_failure)?;
+    Ok(())
+}
+
+fn read_unpublished_initial_cursor(
+    catalog: &Catalog<'_>,
+    identity: [u8; 16],
+) -> Result<Option<Vec<u8>>, ExportOutputFailure> {
+    let Some(protected) = read_named_protected_file(
+        catalog,
+        identity,
+        INITIAL_CURSOR_NAME,
+        MAX_PROTECTED_INITIAL_CURSOR_BYTES,
+    )?
+    else {
+        return Ok(None);
+    };
+    let plaintext = catalog
+        .open_export_output(
+            initial_cursor_identity(identity),
+            FormatEpoch::CATALOG_V2,
+            &protected,
+        )
+        .map_err(map_catalog_failure)?;
+    Ok(Some(decode_initial_cursor(&plaintext)?))
+}
+
+fn read_named_protected_file(
+    catalog: &Catalog<'_>,
+    identity: [u8; 16],
+    name: &str,
+    maximum_bytes: usize,
+) -> Result<Option<Vec<u8>>, ExportOutputFailure> {
+    let root = catalog.export_output_root().map_err(map_catalog_failure)?;
+    let exports = match open_directory(&root, EXPORT_DIRECTORY, false) {
+        Ok(directory) => directory,
+        Err(error) if error.code() == ExportOutputFailureCode::StorageUnavailable => {
+            return Ok(None);
+        },
+        Err(error) => return Err(error),
+    };
+    let output = match open_directory(&exports, &hex(identity), false) {
+        Ok(directory) => directory,
+        Err(error) if error.code() == ExportOutputFailureCode::StorageUnavailable => {
+            return Ok(None);
+        },
+        Err(error) => return Err(error),
+    };
+    let file = match unix_fs::openat(
+        &output,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(file) => File::from(file),
+        Err(rustix::io::Errno::NOENT) => return Ok(None),
+        Err(error) => return Err(map_errno(error)),
+    };
+    let metadata = file.metadata().map_err(map_io_failure)?;
+    if !metadata.file_type().is_file()
+        || metadata.len() == 0
+        || metadata.len() > maximum_bytes as u64
+    {
+        return Err(fail(ExportOutputFailureCode::IntegrityCorruption));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            return Err(fail(ExportOutputFailureCode::IntegrityCorruption));
+        }
+    }
+    let length = usize::try_from(metadata.len())
+        .map_err(|_| fail(ExportOutputFailureCode::LimitExceeded))?;
+    let mut protected = vec![0; length];
+    let mut reader = file;
+    reader.read_exact(&mut protected).map_err(map_io_failure)?;
+    Ok(Some(protected))
+}
+
 fn read_unpublished_manifest(
     catalog: &Catalog<'_>,
     identity: [u8; 16],
@@ -838,6 +1303,49 @@ fn decode_manifest(bytes: &[u8]) -> Result<Vec<u8>, ExportOutputFailure> {
     }
     Ok(bytes[MANIFEST_FIXED_BYTES..].to_vec())
 }
+
+fn encode_initial_cursor(cursor: &[u8]) -> Result<Vec<u8>, ExportOutputFailure> {
+    if cursor.is_empty() || cursor.len() > MAX_CONTINUATION_CURSOR_BYTES {
+        return Err(fail(ExportOutputFailureCode::LimitExceeded));
+    }
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(
+            INITIAL_CURSOR_FIXED_BYTES
+                .checked_add(cursor.len())
+                .ok_or_else(|| fail(ExportOutputFailureCode::LimitExceeded))?,
+        )
+        .map_err(|_| fail(ExportOutputFailureCode::LimitExceeded))?;
+    bytes.extend_from_slice(&INITIAL_CURSOR_MAGIC);
+    bytes.extend_from_slice(
+        &u16::try_from(cursor.len())
+            .map_err(|_| fail(ExportOutputFailureCode::LimitExceeded))?
+            .to_be_bytes(),
+    );
+    bytes.extend_from_slice(cursor);
+    Ok(bytes)
+}
+
+fn decode_initial_cursor(bytes: &[u8]) -> Result<Vec<u8>, ExportOutputFailure> {
+    if bytes.len() < INITIAL_CURSOR_FIXED_BYTES
+        || bytes.get(..8) != Some(INITIAL_CURSOR_MAGIC.as_slice())
+    {
+        return Err(fail(ExportOutputFailureCode::IntegrityCorruption));
+    }
+    let length = usize::from(u16::from_be_bytes(
+        bytes[8..10]
+            .try_into()
+            .map_err(|_| fail(ExportOutputFailureCode::IntegrityCorruption))?,
+    ));
+    if length == 0
+        || length > MAX_CONTINUATION_CURSOR_BYTES
+        || bytes.len() != INITIAL_CURSOR_FIXED_BYTES.saturating_add(length)
+    {
+        return Err(fail(ExportOutputFailureCode::IntegrityCorruption));
+    }
+    Ok(bytes[INITIAL_CURSOR_FIXED_BYTES..].to_vec())
+}
+
 fn open_directory(parent: &File, name: &str, create: bool) -> Result<File, ExportOutputFailure> {
     if create {
         match unix_fs::mkdirat(parent, name, Mode::RUSR | Mode::WUSR | Mode::XUSR) {
@@ -1064,6 +1572,12 @@ fn manifest_identity(output: [u8; 16]) -> [u8; 32] {
     hash.update(output);
     hash.finalize().into()
 }
+fn initial_cursor_identity(output: [u8; 16]) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(b"positron.export-output.initial-cursor.v1\0");
+    hash.update(output);
+    hash.finalize().into()
+}
 fn digest_bytes(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
@@ -1085,13 +1599,6 @@ fn transaction_identity(output: &ExportOutput) -> [u8; 16] {
     let mut identity = [0; 16];
     identity.copy_from_slice(&digest[..16]);
     identity
-}
-fn total_record_bytes(records: &[PayloadRecord]) -> Result<u64, ExportOutputFailure> {
-    records.iter().try_fold(0_u64, |total, record| {
-        total
-            .checked_add(record.durable_bytes)
-            .ok_or_else(|| fail(ExportOutputFailureCode::LimitExceeded))
-    })
 }
 fn hex<const N: usize>(bytes: [u8; N]) -> String {
     let mut value = String::with_capacity(N * 2);

@@ -1,8 +1,13 @@
 use std::error::Error;
 
-use positron_query::{ExportDestination, ExportManifest, ExportSink, QueryBatch, QueryBudget};
+use positron_query::{
+    ExportDestination, ExportManifest, ExportSink, QueryBatch, QueryBudget, QueryFailureCode,
+};
 
-use super::terminal_and_bounds::QueryFixture;
+use super::{
+    support::{TestClock, zero_work_clock_service},
+    terminal_and_bounds::QueryFixture,
+};
 
 #[derive(Default)]
 struct RecordingSink {
@@ -129,6 +134,21 @@ fn durable_export_records_a_catalog_backed_terminal_operation_after_the_signed_m
         positron_kernel::ExportOutput::reopen(fixture.kernel.catalog_for_test(), output_identity)
             .map_err(|failure| format!("reopen durable payload: {failure:?}"))?;
     assert_eq!(output.binding().destination(), destination.identity());
+    assert_eq!(
+        receipt.manifest().snapshot().identity(),
+        output.binding().snapshot_identity(),
+        "the signed receipt must identify the exact protected snapshot"
+    );
+    assert_eq!(
+        receipt.manifest().snapshot().generation(),
+        output.binding().snapshot_generation(),
+        "the signed receipt must identify the exact protected generation"
+    );
+    assert_eq!(
+        receipt.manifest().snapshot().frontier(),
+        output.binding().snapshot_frontier(),
+        "the signed receipt must identify the exact protected frontier"
+    );
     assert_eq!(output.batch_count(), 1);
     let bytes = output
         .read_batch(fixture.kernel.catalog_for_test(), 100, 0)
@@ -338,4 +358,346 @@ fn durable_export_resumes_the_original_snapshot_and_cumulative_cursor_after_inte
         positron_governance::DurableOperationStatus::Succeeded
     );
     Ok(())
+}
+
+#[test]
+fn another_same_tenant_query_principal_cannot_resume_or_terminally_mutate_an_owners_export()
+-> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("durable-export-other-principal")?;
+    fixture.kernel.append_log("first", 20, 1)?;
+    fixture.kernel.append_log("second", 21, 2)?;
+    let service = fixture.service(1)?;
+    let signer = fixture.export_manifest_signer()?;
+    let destination = ExportDestination::new([0x91; 16])?;
+    let source = "logs | range query_time -100 100 | limit 2";
+    let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 16_384, 60)?;
+    let generation = fixture.kernel.catalog_for_test().pin()?.number();
+    service
+        .export_pipeline_as_operation(
+            fixture.kernel.catalog_for_test(),
+            &signer,
+            fixture.context,
+            source,
+            budget,
+            destination,
+            &mut InterruptingSink { writes: 0 },
+        )
+        .expect_err("checkpointed observer failure");
+    let operation_id = export_operation_id(&fixture, destination, source, budget, generation)?;
+    let other_context = fixture.additional_query_context()?;
+    let audit_before = fixture
+        .kernel
+        .catalog_for_test()
+        .governance_audit_records()?
+        .len();
+
+    assert_eq!(
+        service
+            .resume_durable_export(
+                fixture.kernel.catalog_for_test(),
+                &signer,
+                other_context,
+                operation_id,
+                source,
+                budget,
+                destination,
+                &mut RecordingSink::default(),
+            )
+            .expect_err("a different valid query principal is not the export owner")
+            .code(),
+        QueryFailureCode::Unauthorized
+    );
+    assert_eq!(
+        positron_governance::DurableOperationAdministration::inspect(
+            fixture.kernel.catalog_for_test(),
+            operation_id,
+        )?
+        .ok_or("operation missing")?
+        .status(),
+        positron_governance::DurableOperationStatus::Running
+    );
+    assert_eq!(
+        fixture
+            .kernel
+            .catalog_for_test()
+            .governance_audit_records()?
+            .len(),
+        audit_before,
+        "a rejected different principal must not append an owner operation transition"
+    );
+    Ok(())
+}
+
+#[test]
+fn expired_lease_after_checkpoint_and_service_restart_fails_once_without_leaving_running()
+-> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("durable-export-expired-restart")?;
+    fixture.kernel.append_log("first", 20, 1)?;
+    fixture.kernel.append_log("second", 21, 2)?;
+    let clock = TestClock::shared(100);
+    let service = zero_work_clock_service(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+        clock.clone(),
+    );
+    let signer = fixture.export_manifest_signer()?;
+    let destination = ExportDestination::new([0x92; 16])?;
+    let source = "logs | range query_time -100 100 | limit 2";
+    let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 16_384, 60)?;
+    let generation = fixture.kernel.catalog_for_test().pin()?.number();
+    service
+        .export_pipeline_as_operation(
+            fixture.kernel.catalog_for_test(),
+            &signer,
+            fixture.context,
+            source,
+            budget,
+            destination,
+            &mut InterruptingSink { writes: 0 },
+        )
+        .expect_err("checkpointed observer failure");
+    let operation_id = export_operation_id(&fixture, destination, source, budget, generation)?;
+    let tenant = fixture
+        .context
+        .tenant_attribution()
+        .ok_or("query context lacks tenant")?
+        .tenant_id();
+    let output = positron_kernel::ExportOutput::find_for_request(
+        fixture.kernel.catalog_for_test(),
+        tenant,
+        destination.identity(),
+        export_request_digest(&fixture, destination, source, budget)?,
+    )
+    .map_err(|failure| format!("find checkpointed durable output: {failure:?}"))?
+    .ok_or("checkpointed durable output missing")?;
+    assert!(
+        output
+            .latest_checkpoint(fixture.kernel.catalog_for_test(), 100)
+            .map_err(|failure| format!("read protected checkpoint: {failure:?}"))?
+            .is_some(),
+        "the interrupted first batch must have a protected recovery checkpoint"
+    );
+
+    let audit_before_expiry = fixture
+        .kernel
+        .catalog_for_test()
+        .governance_audit_records()?
+        .len();
+    clock.set(161);
+    let restarted_service = zero_work_clock_service(
+        fixture.kernel.authority.governor(),
+        fixture.kernel.ledger()?,
+        1,
+        clock,
+    );
+    assert_eq!(
+        restarted_service
+            .resume_durable_export(
+                fixture.kernel.catalog_for_test(),
+                &signer,
+                fixture.context,
+                operation_id,
+                source,
+                budget,
+                destination,
+                &mut RecordingSink::default(),
+            )
+            .expect_err("the persisted snapshot lease has expired after restart")
+            .code(),
+        QueryFailureCode::SnapshotExpired
+    );
+    assert_eq!(
+        positron_governance::DurableOperationAdministration::inspect(
+            fixture.kernel.catalog_for_test(),
+            operation_id,
+        )?
+        .ok_or("operation missing")?
+        .status(),
+        positron_governance::DurableOperationStatus::Failed
+    );
+    let audit_after_failure = fixture
+        .kernel
+        .catalog_for_test()
+        .governance_audit_records()?
+        .len();
+    assert_eq!(
+        audit_after_failure,
+        audit_before_expiry + 1,
+        "expiry must produce one audited terminal failure"
+    );
+    assert_eq!(
+        restarted_service
+            .resume_durable_export(
+                fixture.kernel.catalog_for_test(),
+                &signer,
+                fixture.context,
+                operation_id,
+                source,
+                budget,
+                destination,
+                &mut RecordingSink::default(),
+            )
+            .expect_err("a terminal expired export cannot be resumed")
+            .code(),
+        QueryFailureCode::SnapshotExpired
+    );
+    assert_eq!(
+        fixture
+            .kernel
+            .catalog_for_test()
+            .governance_audit_records()?
+            .len(),
+        audit_after_failure,
+        "repeating expiry recovery must not duplicate its audit transition"
+    );
+    Ok(())
+}
+
+#[test]
+fn revoked_owner_closes_its_checkpointed_export_with_an_audited_terminal_state()
+-> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("durable-export-revoked-owner")?;
+    fixture.kernel.append_log("first", 20, 1)?;
+    fixture.kernel.append_log("second", 21, 2)?;
+    let service = fixture.service(1)?;
+    let signer = fixture.export_manifest_signer()?;
+    let destination = ExportDestination::new([0x93; 16])?;
+    let source = "logs | range query_time -100 100 | limit 2";
+    let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 16_384, 60)?;
+    let generation = fixture.kernel.catalog_for_test().pin()?.number();
+    service
+        .export_pipeline_as_operation(
+            fixture.kernel.catalog_for_test(),
+            &signer,
+            fixture.context,
+            source,
+            budget,
+            destination,
+            &mut InterruptingSink { writes: 0 },
+        )
+        .expect_err("checkpointed observer failure");
+    let operation_id = export_operation_id(&fixture, destination, source, budget, generation)?;
+    fixture.revoke_query_context()?;
+    let failure = service
+        .resume_durable_export(
+            fixture.kernel.catalog_for_test(),
+            &signer,
+            fixture.context,
+            operation_id,
+            source,
+            budget,
+            destination,
+            &mut RecordingSink::default(),
+        )
+        .expect_err("revoked context");
+    assert_eq!(
+        positron_governance::DurableOperationAdministration::inspect(
+            fixture.kernel.catalog_for_test(),
+            operation_id
+        )?
+        .ok_or("operation missing")?
+        .status(),
+        positron_governance::DurableOperationStatus::Failed
+    );
+    assert_eq!(failure.code(), QueryFailureCode::AuthorizationChanged);
+    Ok(())
+}
+
+#[test]
+fn suspended_tenant_closes_its_checkpointed_export_with_an_audited_terminal_state()
+-> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("durable-export-suspended-tenant")?;
+    fixture.kernel.append_log("first", 20, 1)?;
+    fixture.kernel.append_log("second", 21, 2)?;
+    let service = fixture.service(1)?;
+    let signer = fixture.export_manifest_signer()?;
+    let destination = ExportDestination::new([0x95; 16])?;
+    let source = "logs | range query_time -100 100 | limit 2";
+    let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 16_384, 60)?;
+    let generation = fixture.kernel.catalog_for_test().pin()?.number();
+    service
+        .export_pipeline_as_operation(
+            fixture.kernel.catalog_for_test(),
+            &signer,
+            fixture.context,
+            source,
+            budget,
+            destination,
+            &mut InterruptingSink { writes: 0 },
+        )
+        .expect_err("checkpointed observer failure");
+    let operation_id = export_operation_id(&fixture, destination, source, budget, generation)?;
+    fixture.suspend_query_tenant()?;
+    let failure = service
+        .resume_durable_export(
+            fixture.kernel.catalog_for_test(),
+            &signer,
+            fixture.context,
+            operation_id,
+            source,
+            budget,
+            destination,
+            &mut RecordingSink::default(),
+        )
+        .expect_err("suspended tenant");
+    assert_eq!(
+        positron_governance::DurableOperationAdministration::inspect(
+            fixture.kernel.catalog_for_test(),
+            operation_id
+        )?
+        .ok_or("operation missing")?
+        .status(),
+        positron_governance::DurableOperationStatus::Failed
+    );
+    assert_eq!(failure.code(), QueryFailureCode::AuthorizationChanged);
+    Ok(())
+}
+
+fn export_operation_id(
+    fixture: &QueryFixture,
+    destination: ExportDestination,
+    source: &str,
+    budget: QueryBudget,
+    generation: u64,
+) -> Result<positron_governance::OperationId, Box<dyn Error>> {
+    let digest = export_request_digest(fixture, destination, source, budget)?;
+    let mut key = [0; 16];
+    key.copy_from_slice(&digest[..16]);
+    Ok(positron_governance::DurableOperationRequest::query_export(
+        fixture.context.principal_id(),
+        positron_governance::AdministrativeIdempotencyKey::new(key)?,
+        destination.identity(),
+        generation,
+        1,
+        digest,
+    )?
+    .operation_id())
+}
+
+fn export_request_digest(
+    fixture: &QueryFixture,
+    destination: ExportDestination,
+    source: &str,
+    budget: QueryBudget,
+) -> Result<[u8; 32], Box<dyn Error>> {
+    let mut payload = destination.identity().to_vec();
+    for limit in [
+        budget.scanned_bytes(),
+        budget.decoded_records(),
+        budget.output_rows(),
+        budget.output_bytes(),
+        budget.memory_bytes(),
+        budget.cpu_work_units(),
+        budget.wall_seconds(),
+        budget.maximum_time_range_nanoseconds(),
+    ] {
+        payload.extend_from_slice(&limit.to_be_bytes());
+    }
+    payload.extend_from_slice(source.as_bytes());
+    Ok(fixture
+        .kernel
+        .ledger()?
+        .control_tokens()
+        .digest_query_cursor(b"query-export-request-v1", &payload)?)
 }

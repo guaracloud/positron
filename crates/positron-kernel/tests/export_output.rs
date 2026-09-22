@@ -7,12 +7,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use positron_domain::identity::TenantId;
 use positron_kernel::{
-    Catalog, CatalogSecret, DiskPressureThresholds, ExportOutput, ExportOutputBinding,
-    GovernorPolicy, InstanceId, InventoryCardinalityLimits, MountQualification,
-    ObservedResourceEnvironment, OperatorLimits, OrdinaryPoolPolicy, PrimaryDataVolume,
-    RecoveryPoolCapacities, RecoveryReserve, RegisteredResourceBounds, ResourceAmounts,
-    ResourceDimension, ResourceGovernorConfiguration, ResourceInventory, SnapshotLeaseId,
-    StorageKernelResourceAuthority, TenantQuota,
+    Catalog, CatalogPublicationFault, CatalogSecret, DiskPressureThresholds, ExportOutput,
+    ExportOutputBinding, GovernorPolicy, InstanceId, InventoryCardinalityLimits,
+    MountQualification, ObservedResourceEnvironment, OperatorLimits, OrdinaryPoolPolicy,
+    PrimaryDataVolume, RecoveryPoolCapacities, RecoveryReserve, RegisteredResourceBounds,
+    ResourceAmounts, ResourceDimension, ResourceGovernorConfiguration, ResourceInventory,
+    SnapshotLeaseId, StorageKernelResourceAuthority, TenantQuota,
+    with_catalog_publication_fault_after,
 };
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
@@ -146,6 +147,264 @@ fn establish(
         .map_err(|error| format!("configuration: {error:?}"))?;
     StorageKernelResourceAuthority::establish(volume, configuration)
         .map_err(|error| format!("establish: {:?}", error.failure()).into())
+}
+
+#[test]
+fn exact_retry_publishes_a_payload_synced_before_its_descriptor_and_keeps_the_committed_checkpoint()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish(volume)?;
+    let instance = InstanceId::new([0x81; 16])?;
+    let secret = CatalogSecret::from_owned(Box::new([0x82; 32]), Box::new([0x83; 32]));
+    let catalog = Catalog::open(&authority, instance, secret)?;
+    let binding = ExportOutputBinding::new(
+        TenantId::from_bytes([0x41; 16])?,
+        [0x84; 16],
+        [0x85; 32],
+        [0x86; 32],
+        7,
+        9,
+        SnapshotLeaseId::new([0x87; 16])?,
+        100,
+        3_700,
+    )?;
+    let mut output = ExportOutput::create(&catalog, binding)?;
+
+    let interrupted =
+        with_catalog_publication_fault_after(CatalogPublicationFault::SynchronizeCommit, 0, || {
+            output.append_batch(
+                &catalog,
+                101,
+                0,
+                [0x88; 32],
+                b"payload-synced-before-descriptor",
+                Some(b"first cursor"),
+            )
+        });
+    assert!(matches!(
+        interrupted,
+        Err(error) if error.code() == positron_kernel::ExportOutputFailureCode::StorageUnavailable
+    ));
+    assert_eq!(output.batch_count(), 0);
+    assert_eq!(output.latest_checkpoint(&catalog, 101)?, None);
+
+    let receipt = output.append_batch(
+        &catalog,
+        101,
+        0,
+        [0x88; 32],
+        b"payload-synced-before-descriptor",
+        Some(b"first cursor"),
+    )?;
+    assert_eq!(receipt.sequence(), 0);
+    assert_eq!(output.batch_count(), 1);
+    assert_eq!(
+        output
+            .latest_checkpoint(&catalog, 101)?
+            .and_then(|checkpoint| checkpoint.continuation_cursor()),
+        Some(b"first cursor".to_vec())
+    );
+    assert!(matches!(
+        output.append_batch(
+            &catalog,
+            101,
+            0,
+            [0x89; 32],
+            b"substituted replay",
+            Some(b"first cursor"),
+        ),
+        Err(error) if error.code() == positron_kernel::ExportOutputFailureCode::IdempotencyConflict
+    ));
+
+    drop(catalog);
+    let catalog = Catalog::open(
+        &authority,
+        instance,
+        CatalogSecret::from_owned(Box::new([0x82; 32]), Box::new([0x83; 32])),
+    )?;
+    let recovered = ExportOutput::reopen(&catalog, output.identity())?;
+    assert_eq!(recovered.batch_count(), 1);
+    assert_eq!(recovered.latest_receipt(), Some(receipt));
+    Ok(())
+}
+
+#[test]
+fn initial_cursor_is_synced_before_descriptor_publication_and_recovered_by_exact_create_retry()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish(volume)?;
+    let instance = InstanceId::new([0x8a; 16])?;
+    let secret = CatalogSecret::from_owned(Box::new([0x8b; 32]), Box::new([0x8c; 32]));
+    let catalog = Catalog::open(&authority, instance, secret)?;
+    let binding = ExportOutputBinding::new(
+        TenantId::from_bytes([0x41; 16])?,
+        [0x8d; 16],
+        [0x8e; 32],
+        [0x8f; 32],
+        7,
+        9,
+        SnapshotLeaseId::new([0x90; 16])?,
+        100,
+        3_700,
+    )?;
+    let interrupted =
+        with_catalog_publication_fault_after(CatalogPublicationFault::SynchronizeCommit, 0, || {
+            ExportOutput::create_with_initial_cursor(&catalog, binding, b"original snapshot cursor")
+        });
+    assert!(matches!(
+        interrupted,
+        Err(error) if error.code() == positron_kernel::ExportOutputFailureCode::StorageUnavailable
+    ));
+
+    let output =
+        ExportOutput::create_with_initial_cursor(&catalog, binding, b"original snapshot cursor")?;
+    assert_eq!(
+        output.initial_cursor(&catalog, 101)?.as_deref(),
+        Some(b"original snapshot cursor" as &[u8])
+    );
+    assert!(matches!(
+        ExportOutput::create_with_initial_cursor(&catalog, binding, b"substituted cursor"),
+        Err(error) if error.code() == positron_kernel::ExportOutputFailureCode::IdempotencyConflict
+    ));
+    drop(catalog);
+    let catalog = Catalog::open(
+        &authority,
+        instance,
+        CatalogSecret::from_owned(Box::new([0x8b; 32]), Box::new([0x8c; 32])),
+    )?;
+    let recovered = ExportOutput::reopen(&catalog, output.identity())?;
+    assert_eq!(
+        recovered.initial_cursor(&catalog, 101)?.as_deref(),
+        Some(b"original snapshot cursor" as &[u8])
+    );
+    Ok(())
+}
+
+#[test]
+fn later_orphan_keeps_the_predecessor_checkpoint_until_its_exact_retry_publishes_it()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish(volume)?;
+    let instance = InstanceId::new([0x91; 16])?;
+    let secret = CatalogSecret::from_owned(Box::new([0x92; 32]), Box::new([0x93; 32]));
+    let catalog = Catalog::open(&authority, instance, secret)?;
+    let binding = ExportOutputBinding::new(
+        TenantId::from_bytes([0x41; 16])?,
+        [0x94; 16],
+        [0x95; 32],
+        [0x96; 32],
+        7,
+        9,
+        SnapshotLeaseId::new([0x97; 16])?,
+        100,
+        3_700,
+    )?;
+    let mut output = ExportOutput::create(&catalog, binding)?;
+    let first = output.append_batch(
+        &catalog,
+        101,
+        0,
+        [0x98; 32],
+        b"committed predecessor",
+        Some(b"predecessor cursor"),
+    )?;
+
+    let interrupted =
+        with_catalog_publication_fault_after(CatalogPublicationFault::SynchronizeCommit, 0, || {
+            output.append_batch(
+                &catalog,
+                102,
+                1,
+                [0x99; 32],
+                b"final payload-synced-before-descriptor",
+                Some(b"final cursor"),
+            )
+        });
+    assert!(matches!(
+        interrupted,
+        Err(error) if error.code() == positron_kernel::ExportOutputFailureCode::StorageUnavailable
+    ));
+    let checkpoint = output
+        .latest_checkpoint(&catalog, 102)?
+        .ok_or("the descriptor's committed predecessor checkpoint is retained")?;
+    assert_eq!(checkpoint.receipt(), first);
+    assert_eq!(
+        checkpoint.continuation_cursor().as_deref(),
+        Some(b"predecessor cursor" as &[u8])
+    );
+
+    let final_receipt = output.append_batch(
+        &catalog,
+        102,
+        1,
+        [0x99; 32],
+        b"final payload-synced-before-descriptor",
+        Some(b"final cursor"),
+    )?;
+    assert_eq!(
+        output.batch_receipts(&catalog, 102)?,
+        vec![first, final_receipt]
+    );
+    assert_eq!(
+        output
+            .latest_checkpoint(&catalog, 102)?
+            .ok_or("published final batch checkpoint missing")?
+            .receipt(),
+        final_receipt
+    );
+    Ok(())
+}
+
+#[test]
+fn output_admission_refuses_before_decrypting_a_corrupt_prior_payload() -> Result<(), Box<dyn Error>>
+{
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish(volume)?;
+    let instance = InstanceId::new([0xa1; 16])?;
+    let catalog = Catalog::open(
+        &authority,
+        instance,
+        CatalogSecret::from_owned(Box::new([0xa2; 32]), Box::new([0xa3; 32])),
+    )?;
+    let binding = ExportOutputBinding::new(
+        TenantId::from_bytes([0x41; 16])?,
+        [0xa4; 16],
+        [0xa5; 32],
+        [0xa6; 32],
+        7,
+        9,
+        SnapshotLeaseId::new([0xa7; 16])?,
+        100,
+        3_700,
+    )?;
+    let mut output = ExportOutput::create(&catalog, binding)?;
+    output.append_batch(&catalog, 101, 0, [0xa8; 32], b"committed", None)?;
+    let payload = payload_path(&root, output.identity());
+    let mut corrupted = fs::read(&payload)?;
+    let last = corrupted
+        .last_mut()
+        .ok_or("protected payload must contain one encrypted record")?;
+    *last ^= 0x01;
+    fs::write(payload, corrupted)?;
+
+    let reservation = output.reserve_next_batch(&catalog)?;
+    let failure = output
+        .append_batch(&catalog, 102, 1, [0xa9; 32], b"must-not-decrypt", None)
+        .expect_err("capacity exhaustion must stop before corrupt payload decrypt");
+    assert_eq!(
+        failure.code(),
+        positron_kernel::ExportOutputFailureCode::ResourceAdmissionRefused
+    );
+    drop(reservation);
+    assert!(matches!(
+        output.read_batch(&catalog, 102, 0),
+        Err(error) if matches!(error.code(), positron_kernel::ExportOutputFailureCode::AuthenticationFailed | positron_kernel::ExportOutputFailureCode::IntegrityCorruption)
+    ));
+    Ok(())
 }
 
 #[test]
@@ -286,9 +545,8 @@ fn corrupted_or_substituted_export_payload_fails_closed_after_reopen() -> Result
         instance,
         CatalogSecret::from_owned(Box::new([0x42; 32]), Box::new([0x43; 32])),
     )?;
-    let recovered = ExportOutput::reopen(&catalog, first.identity())?;
     assert!(
-        matches!(recovered.read_batch(&catalog, 102, 0), Err(error) if matches!(error.code(), positron_kernel::ExportOutputFailureCode::AuthenticationFailed | positron_kernel::ExportOutputFailureCode::IntegrityCorruption))
+        matches!(ExportOutput::reopen(&catalog, first.identity()), Err(error) if matches!(error.code(), positron_kernel::ExportOutputFailureCode::AuthenticationFailed | positron_kernel::ExportOutputFailureCode::IntegrityCorruption))
     );
     assert!(
         matches!(second.read_manifest(&catalog, 102), Err(error) if matches!(error.code(), positron_kernel::ExportOutputFailureCode::AuthenticationFailed | positron_kernel::ExportOutputFailureCode::IntegrityCorruption))

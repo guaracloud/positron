@@ -14,12 +14,24 @@ It also records only the next sequence, retained protected-byte total, last Quer
 Result Batch digest, and an optional terminal-manifest digest. The descriptor
 contains no batch payload, continuation cursor, or terminal manifest bytes.
 
+Before the descriptor becomes visible, the Kernel synchronizes one separately
+encrypted `initial` artifact containing the authenticated Query Cursor that
+starts the bound snapshot. It uses a distinct Export Output frame context and
+the same 8,192-byte cursor ceiling. An exact creation retry accepts only the
+same cursor, reuses that artifact, and publishes the descriptor. This keeps an
+interrupted first-batch export resumable against its original snapshot after
+the Catalog advances without placing cursor bytes in the fixed descriptor.
+
 The binding rejects sentinel identities and leases longer than the Release 1
 hard 3,600-second ceiling. Each output permits at most 1,024 batches, one
 1,048,576-byte canonical batch, one 8,192-byte opaque continuation cursor,
 and 1,073,741,824 protected bytes. Batch append reserves tenant
 `InteractiveQueryTail` memory, task, I/O, file-descriptor, and disk-headroom
-capacity before mutating the output.
+capacity before Query serializes, reads, decrypts, or mutates the output. The
+reservation covers canonical bytes and one bounded encrypted/plaintext record
+scan; ordinary append uses descriptor-retained payload length and reads only a
+possible one-record unpublished tail. Reopen and read paths stream-authenticate
+every record with the same bounded working set.
 
 ## Payload layout and publication
 
@@ -48,9 +60,12 @@ the payload, then publishes the fixed successor Catalog descriptor. A crash
 after payload sync but before descriptor publication leaves at most one extra
 fully authenticated record. Reopening scans and authenticates every record;
 retrying that sequence with identical digest, canonical bytes, and opaque
-cursor returns its original receipt exactly once. A changed replay fails with
-an idempotency conflict. A descriptor that claims data absent from the payload,
-or whose recorded last digest differs from the authenticated record, is
+cursor publishes that record's fixed successor descriptor and returns its
+original receipt exactly once. Until then, the committed checkpoint remains
+the descriptor's `next_sequence - 1` record; an empty descriptor has no
+checkpoint even when the first record is an orphan. A changed replay fails
+with an idempotency conflict. A descriptor that claims data absent from the
+payload, or whose recorded last digest differs from the authenticated record, is
 integrity corruption.
 
 The result-batch and continuation cursor bytes remain encrypted in the payload
