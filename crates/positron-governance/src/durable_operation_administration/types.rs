@@ -614,6 +614,7 @@ pub enum DurableOperationFailure {
     InvalidInput,
     Unauthorized,
     IdempotencyConflict,
+    StaleGeneration,
     UnknownOperation,
     CompletedLookupExpired,
     InvalidState,

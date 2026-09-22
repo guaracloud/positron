@@ -235,6 +235,7 @@ pub(super) fn map_durable_operation_failure(failure: DurableOperationFailure) ->
         },
         DurableOperationFailure::InvalidInput
         | DurableOperationFailure::InvalidState
+        | DurableOperationFailure::StaleGeneration
         | DurableOperationFailure::PersistenceUnavailable => {
             BootstrapFailureCode::CatalogUnavailable
         },

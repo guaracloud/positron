@@ -53,10 +53,21 @@ impl DurableOperationAdministration {
                 },
             };
         }
+        let operation = DurableOperation::accepted(request);
+        if let Some(resumed) = resume_prepared_operation(
+            catalog,
+            transition_transaction(operation)?,
+            transition_request_digest(operation),
+            operation.operation_id(),
+        )? {
+            return Ok(resumed);
+        }
         if snapshot.format_epoch() != Some(FormatEpoch::CATALOG_V1) {
             return Err(DurableOperationFailure::InvalidState);
         }
-        let operation = DurableOperation::accepted(request);
+        if snapshot.number() != request.accepted_generation() {
+            return Err(DurableOperationFailure::StaleGeneration);
+        }
         publish(catalog, &snapshot, operation)
     }
 
@@ -224,6 +235,7 @@ fn exact_replay(
 
 fn map_catalog(failure: positron_kernel::CatalogFailure) -> DurableOperationFailure {
     match failure.code() {
+        CatalogFailureCode::StaleGeneration => DurableOperationFailure::StaleGeneration,
         CatalogFailureCode::IdempotencyConflict => DurableOperationFailure::IdempotencyConflict,
         CatalogFailureCode::LimitExceeded => DurableOperationFailure::CapacityExceeded,
         _ => DurableOperationFailure::PersistenceUnavailable,
