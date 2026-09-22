@@ -135,7 +135,7 @@ impl InitializedInstance {
                 idempotency,
             )
             .map_err(map_durable_operation_failure)?
-            .is_some()
+            .is_some_and(|operation| operation.request().principal() == actor.principal_id())
             {
                 let operation =
                     self.migrate_catalog_to_epoch_two_as_operation(actor, idempotency)?;
