@@ -305,4 +305,107 @@ impl QueryRecord {
     pub(crate) fn attribute_projections(&self) -> &[AttributeProjection] {
         &self.attributes
     }
+
+    /// Appends the stable typed export representation of this result row.
+    ///
+    /// This remains adjacent to the private result-row representation so an
+    /// export cannot accidentally omit a selected native value or flatten its
+    /// type. The representation is self-delimiting and is only used inside
+    /// the kernel-protected export payload; the public result digest remains
+    /// the authoritative logical-result commitment.
+    pub(crate) fn append_export_encoding(&self, output: &mut Vec<u8>) -> Result<(), QueryFailure> {
+        append_export_bytes(output, &[u8::from(self.body_selected)])?;
+        append_export_optional_value(output, self.body.as_ref())?;
+        append_export_optional_i64(output, self.query_time.map(|value| value.instant().value()))?;
+        append_export_optional_i64(
+            output,
+            self.event_time
+                .and_then(|value| value.instant().map(UnixNanoseconds::value)),
+        )?;
+        append_export_optional_i64(
+            output,
+            self.ingest_time.map(|value| value.instant().value()),
+        )?;
+        append_export_bytes(output, &self.ordering_time.value().to_be_bytes())?;
+        append_export_bytes(output, &self.commit_position.value().to_be_bytes())?;
+        append_export_bytes(output, &self.record_ordinal.value().to_be_bytes())?;
+        append_export_bytes(output, &[u8::from(self.replayed)])?;
+        match self.count {
+            Some(count) => {
+                append_export_bytes(output, &[1])?;
+                append_export_bytes(output, &count.to_be_bytes())?;
+            },
+            None => append_export_bytes(output, &[0])?,
+        }
+        let projection_count = u16::try_from(self.attributes.len())
+            .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
+        append_export_bytes(output, &projection_count.to_be_bytes())?;
+        for projection in &self.attributes {
+            match projection {
+                AttributeProjection::Intrinsic => append_export_bytes(output, &[0])?,
+                AttributeProjection::Attribute(None) => append_export_bytes(output, &[1])?,
+                AttributeProjection::Attribute(Some(values)) => {
+                    append_export_bytes(output, &[2])?;
+                    let namespace = match values.namespace() {
+                        positron_domain::value::AttributeNamespace::Stream => 0,
+                        positron_domain::value::AttributeNamespace::Resource => 1,
+                        positron_domain::value::AttributeNamespace::InstrumentationScope => 2,
+                        positron_domain::value::AttributeNamespace::Record => 3,
+                    };
+                    append_export_bytes(output, &[namespace])?;
+                    let key = values.key().as_bytes();
+                    let key_length = u16::try_from(key.len())
+                        .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
+                    append_export_bytes(output, &key_length.to_be_bytes())?;
+                    append_export_bytes(output, key)?;
+                    let occurrence_count = u16::try_from(values.len())
+                        .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
+                    append_export_bytes(output, &occurrence_count.to_be_bytes())?;
+                    for index in 0..values.len() {
+                        let value = values.occurrence(index).ok_or(INTERNAL)?;
+                        value
+                            .append_canonical_encoding(output)
+                            .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
+                    }
+                },
+            }
+        }
+        Ok(())
+    }
+}
+
+fn append_export_bytes(output: &mut Vec<u8>, bytes: &[u8]) -> Result<(), QueryFailure> {
+    output
+        .try_reserve_exact(bytes.len())
+        .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
+    output.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn append_export_optional_value(
+    output: &mut Vec<u8>,
+    value: Option<&positron_domain::value::ValidatedAttributeValue>,
+) -> Result<(), QueryFailure> {
+    match value {
+        Some(value) => {
+            append_export_bytes(output, &[1])?;
+            value
+                .append_canonical_encoding(output)
+                .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))
+        },
+        None => append_export_bytes(output, &[0]),
+    }
+}
+
+fn append_export_optional_i64(
+    output: &mut Vec<u8>,
+    value: Option<i64>,
+) -> Result<(), QueryFailure> {
+    match value {
+        Some(value) => {
+            append_export_bytes(output, &[1])?;
+            append_export_bytes(output, &value.to_be_bytes())
+        },
+        None => append_export_bytes(output, &[0]),
+    }
 }

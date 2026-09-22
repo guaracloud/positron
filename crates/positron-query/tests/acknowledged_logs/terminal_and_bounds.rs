@@ -843,6 +843,7 @@ fn pipeline_token_scratch_is_charged_before_collecting_bounded_input() -> Result
 
 pub(crate) struct QueryFixture {
     _roots: TemporaryRoots,
+    instance: positron_runtime::InitializedInstance,
     pub(crate) kernel: KernelFixture,
     pub(crate) context: positron_governance::AuthorizedContext,
     administrator: positron_governance::AuthorizedContext,
@@ -874,6 +875,7 @@ impl QueryFixture {
             KernelFixture::new_with_identity(instance.default_tenant_id(), label, &governance)?;
         Ok(Self {
             _roots: roots,
+            instance,
             kernel,
             context,
             administrator,
@@ -908,6 +910,7 @@ impl QueryFixture {
         )?;
         Ok(Self {
             _roots: roots,
+            instance,
             kernel,
             context,
             administrator,
@@ -923,6 +926,12 @@ impl QueryFixture {
             self.kernel.ledger()?,
             batch_limit,
         ))
+    }
+
+    pub(crate) fn export_manifest_signer(
+        &self,
+    ) -> Result<positron_kernel::ExportManifestSigner, Box<dyn Error>> {
+        Ok(self.instance.export_manifest_signer_for_test()?)
     }
 
     pub(crate) fn correlation_service(

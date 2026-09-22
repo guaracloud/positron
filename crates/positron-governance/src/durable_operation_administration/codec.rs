@@ -9,12 +9,14 @@ use super::{
 };
 use crate::AdministrativeIdempotencyKey;
 
-const OPERATION_MAGIC: [u8; 8] = *b"POSOPR01";
-const EXPIRED_OPERATION_BINDING_MAGIC: [u8; 8] = *b"POSOPX01";
+const OPERATION_MAGIC_V1: [u8; 8] = *b"POSOPR01";
+const OPERATION_MAGIC: [u8; 8] = *b"POSOPR02";
+const EXPIRED_OPERATION_BINDING_MAGIC_V1: [u8; 8] = *b"POSOPX01";
+const EXPIRED_OPERATION_BINDING_MAGIC: [u8; 8] = *b"POSOPX02";
 const OPERATION_AUDIT_MAGIC: [u8; 8] = *b"POSOPA04";
 
 pub(super) fn encode_operation(operation: DurableOperation) -> Vec<u8> {
-    let mut encoded = Vec::with_capacity(169);
+    let mut encoded = Vec::with_capacity(201);
     encoded.extend_from_slice(&OPERATION_MAGIC);
     encoded.extend_from_slice(&operation.operation_id().to_bytes());
     encoded.extend_from_slice(&operation.request.principal.to_bytes());
@@ -23,6 +25,12 @@ pub(super) fn encode_operation(operation: DurableOperation) -> Vec<u8> {
     encoded.extend_from_slice(&operation.request.target_identity.unwrap_or([0; 16]));
     encoded.extend_from_slice(&operation.request.accepted_generation.to_be_bytes());
     encoded.extend_from_slice(&operation.request.accepted_at_unix_seconds.to_be_bytes());
+    encoded.extend_from_slice(
+        &operation
+            .request
+            .query_export_request_digest
+            .unwrap_or([0; 32]),
+    );
     encoded.extend_from_slice(&operation.request.digest);
     encoded.push(operation.status.code());
     encoded.push(operation.phase.code());
@@ -62,13 +70,14 @@ pub(crate) fn pending_operation_fixture(request: DurableOperationRequest) -> Vec
 }
 
 pub(super) fn encode_expired_binding(request: DurableOperationRequest) -> Vec<u8> {
-    let mut encoded = Vec::with_capacity(97);
+    let mut encoded = Vec::with_capacity(129);
     encoded.extend_from_slice(&EXPIRED_OPERATION_BINDING_MAGIC);
     encoded.extend_from_slice(&request.principal.to_bytes());
     encoded.extend_from_slice(&request.idempotency.to_bytes());
     encoded.push(request.kind.code());
     encoded.extend_from_slice(&request.target_identity.unwrap_or([0; 16]));
     encoded.extend_from_slice(&request.accepted_generation.to_be_bytes());
+    encoded.extend_from_slice(&request.query_export_request_digest.unwrap_or([0; 32]));
     encoded.extend_from_slice(&request.digest);
     encoded
 }
@@ -76,10 +85,11 @@ pub(super) fn encode_expired_binding(request: DurableOperationRequest) -> Vec<u8
 pub(super) fn decode_expired_binding(
     encoded: &[u8],
 ) -> Result<Option<ExpiredOperationBinding>, DurableOperationFailure> {
-    if !encoded.starts_with(&EXPIRED_OPERATION_BINDING_MAGIC) {
+    let v2 = encoded.starts_with(&EXPIRED_OPERATION_BINDING_MAGIC);
+    if !v2 && !encoded.starts_with(&EXPIRED_OPERATION_BINDING_MAGIC_V1) {
         return Ok(None);
     }
-    if encoded.len() != 97 {
+    if encoded.len() != if v2 { 129 } else { 97 } {
         return Err(DurableOperationFailure::PersistenceUnavailable);
     }
     let mut offset = 8_usize;
@@ -93,6 +103,12 @@ pub(super) fn decode_expired_binding(
         (!target.iter().all(|byte| *byte == 0)).then_some(target)
     };
     let accepted_generation = take_u64(encoded, &mut offset)?;
+    let query_export_request_digest = if v2 {
+        let digest = take_array(encoded, &mut offset)?;
+        (!digest.iter().all(|byte| *byte == 0)).then_some(digest)
+    } else {
+        None
+    };
     let digest = take_array(encoded, &mut offset)?;
     if accepted_generation == 0 || digest.iter().all(|byte| *byte == 0) || offset != encoded.len() {
         return Err(DurableOperationFailure::PersistenceUnavailable);
@@ -105,6 +121,7 @@ pub(super) fn decode_expired_binding(
             target_identity,
             accepted_generation,
             accepted_at_unix_seconds: 1,
+            query_export_request_digest,
             digest,
         },
     }))
@@ -113,10 +130,11 @@ pub(super) fn decode_expired_binding(
 pub(super) fn decode_operation(
     encoded: &[u8],
 ) -> Result<Option<DurableOperation>, DurableOperationFailure> {
-    if !encoded.starts_with(&OPERATION_MAGIC) {
+    let v2 = encoded.starts_with(&OPERATION_MAGIC);
+    if !v2 && !encoded.starts_with(&OPERATION_MAGIC_V1) {
         return Ok(None);
     }
-    if encoded.len() != 169 {
+    if encoded.len() != if v2 { 201 } else { 169 } {
         return Err(DurableOperationFailure::PersistenceUnavailable);
     }
     let mut offset = 8_usize;
@@ -130,6 +148,12 @@ pub(super) fn decode_operation(
     let target_identity = (!target.iter().all(|byte| *byte == 0)).then_some(target);
     let accepted_generation = take_u64(encoded, &mut offset)?;
     let accepted_at_unix_seconds = take_u64(encoded, &mut offset)?;
+    let query_export_request_digest = if v2 {
+        let digest = take_array(encoded, &mut offset)?;
+        (!digest.iter().all(|byte| *byte == 0)).then_some(digest)
+    } else {
+        None
+    };
     let digest = take_array(encoded, &mut offset)?;
     let request = DurableOperationRequest {
         principal,
@@ -138,6 +162,7 @@ pub(super) fn decode_operation(
         target_identity,
         accepted_generation,
         accepted_at_unix_seconds,
+        query_export_request_digest,
         digest,
     };
     if request.operation_id().to_bytes() != operation_id

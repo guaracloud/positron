@@ -71,6 +71,7 @@ mod active_segment_ledger;
 mod catalog;
 #[allow(dead_code)]
 mod data_protection;
+mod export_output;
 mod instance_bootstrap_storage;
 mod lifecycle_clock;
 mod resource_governor;
@@ -110,7 +111,12 @@ pub use active_segment_ledger::{
 pub use data_protection::{
     BootstrapIntegrityIdentity, BootstrapKeyCustody, BootstrapKeyFailure, BootstrapKeyIdentity,
     BootstrapObjectPurpose, ControlTokenAuthentication, ControlTokenFailure, ControlTokenProtector,
-    QueryResultDigest,
+    ExportManifestSignature, ExportManifestSignatureFailure, ExportManifestSigner,
+    QUERY_CURSOR_MAX_PAYLOAD_BYTES, QueryResultDigest,
+};
+pub use export_output::{
+    ExportBatchReceipt, ExportOutput, ExportOutputBinding, ExportOutputCheckpoint,
+    ExportOutputFailure, ExportOutputFailureCode,
 };
 
 pub use instance_bootstrap_storage::{
@@ -165,6 +171,10 @@ pub use catalog::fuzz_catalog_stateful;
 #[cfg(fuzzing)]
 #[doc(hidden)]
 pub use active_segment_ledger::{fuzz_active_segment_stateful, fuzz_retention_prepared_block};
+
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub use export_output::fuzz_export_output_record;
 
 #[cfg(fuzzing)]
 #[doc(hidden)]

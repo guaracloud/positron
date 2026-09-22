@@ -6,6 +6,8 @@ mod compaction_semantics;
 mod correlation;
 #[path = "acknowledged_logs/cursor.rs"]
 mod cursor;
+#[path = "acknowledged_logs/durable_export.rs"]
+mod durable_export;
 #[path = "acknowledged_logs/lifecycle.rs"]
 mod lifecycle;
 #[path = "acknowledged_logs/parity.rs"]

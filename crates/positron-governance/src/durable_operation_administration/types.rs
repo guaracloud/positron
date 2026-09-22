@@ -16,6 +16,8 @@ const COMPLETED_LOOKUP_RETENTION_SECONDS: u64 = 2_592_000;
 pub enum DurableOperationKind {
     /// The existing V1-to-V2 Catalog migration handler.
     CatalogFormatMigration,
+    /// A tenant-scoped Query export whose output manifest is the irreversible receipt.
+    QueryExport,
 }
 
 impl DurableOperationKind {
@@ -24,18 +26,21 @@ impl DurableOperationKind {
     pub const fn declared_irreversible_boundary(self) -> DurableOperationBoundary {
         match self {
             Self::CatalogFormatMigration => DurableOperationBoundary::CatalogGenerationPublished,
+            Self::QueryExport => DurableOperationBoundary::ExportManifestPublished,
         }
     }
 
     pub(super) const fn code(self) -> u8 {
         match self {
             Self::CatalogFormatMigration => 1,
+            Self::QueryExport => 2,
         }
     }
 
     pub(super) fn from_code(code: u8) -> Result<Self, DurableOperationFailure> {
         match code {
             1 => Ok(Self::CatalogFormatMigration),
+            2 => Ok(Self::QueryExport),
             _ => Err(DurableOperationFailure::PersistenceUnavailable),
         }
     }
@@ -87,6 +92,10 @@ pub struct DurableOperationRequest {
     pub(super) target_identity: Option<[u8; 16]>,
     pub(super) accepted_generation: u64,
     pub(super) accepted_at_unix_seconds: u64,
+    /// Full Query-owned request binding for a Query export. The generic
+    /// administrative idempotency key is only 128 bits, so it is not enough
+    /// to stand in for this authenticated 256-bit request commitment.
+    pub(super) query_export_request_digest: Option<[u8; 32]>,
     pub(super) digest: [u8; 32],
 }
 
@@ -94,13 +103,13 @@ impl DurableOperationRequest {
     pub(crate) fn operation_id_for_audit(
         principal: PrincipalId,
         idempotency: AdministrativeIdempotencyKey,
+        kind: DurableOperationKind,
         target_identity: Option<[u8; 16]>,
         accepted_generation: u64,
     ) -> Result<OperationId, DurableOperationFailure> {
         if accepted_generation == 0 {
             return Err(DurableOperationFailure::InvalidInput);
         }
-        let kind = DurableOperationKind::CatalogFormatMigration;
         let mut hasher = Sha256::new();
         hasher.update(REQUEST_DOMAIN);
         hasher.update(principal.to_bytes());
@@ -118,6 +127,7 @@ impl DurableOperationRequest {
             target_identity,
             accepted_generation,
             accepted_at_unix_seconds: 1,
+            query_export_request_digest: None,
             digest,
         }))
     }
@@ -139,6 +149,7 @@ impl DurableOperationRequest {
         let operation_id = Self::operation_id_for_audit(
             principal,
             idempotency,
+            kind,
             Some(target_identity),
             accepted_generation,
         )?;
@@ -157,11 +168,52 @@ impl DurableOperationRequest {
             target_identity: Some(target_identity),
             accepted_generation,
             accepted_at_unix_seconds,
+            query_export_request_digest: None,
             digest,
         };
         if request.operation_id() != operation_id {
             return Err(DurableOperationFailure::PersistenceUnavailable);
         }
+        Ok(request)
+    }
+
+    /// Constructs a tenant-query export operation. `target_identity` is the
+    /// immutable protected output identity, never a path or credential.
+    pub fn query_export(
+        principal: PrincipalId,
+        idempotency: AdministrativeIdempotencyKey,
+        target_identity: [u8; 16],
+        accepted_generation: u64,
+        accepted_at_unix_seconds: u64,
+        query_export_request_digest: [u8; 32],
+    ) -> Result<Self, DurableOperationFailure> {
+        if accepted_generation == 0
+            || accepted_at_unix_seconds == 0
+            || target_identity.iter().all(|byte| *byte == 0)
+            || query_export_request_digest.iter().all(|byte| *byte == 0)
+        {
+            return Err(DurableOperationFailure::InvalidInput);
+        }
+        let kind = DurableOperationKind::QueryExport;
+        let mut hasher = Sha256::new();
+        hasher.update(REQUEST_DOMAIN);
+        hasher.update(principal.to_bytes());
+        hasher.update(idempotency.to_bytes());
+        hasher.update([kind.code()]);
+        hasher.update(target_identity);
+        hasher.update(accepted_generation.to_be_bytes());
+        hasher.update(query_export_request_digest);
+        let digest: [u8; 32] = hasher.finalize().into();
+        let request = Self {
+            principal,
+            idempotency,
+            kind,
+            target_identity: Some(target_identity),
+            accepted_generation,
+            accepted_at_unix_seconds,
+            query_export_request_digest: Some(query_export_request_digest),
+            digest,
+        };
         Ok(request)
     }
 
@@ -204,12 +256,19 @@ impl DurableOperationRequest {
         self.digest
     }
 
+    /// Returns the full Query request commitment retained for durable resume.
+    #[must_use]
+    pub const fn query_export_request_digest(self) -> Option<[u8; 32]> {
+        self.query_export_request_digest
+    }
+
     pub(super) fn has_same_semantics(self, other: Self) -> bool {
         self.principal == other.principal
             && self.idempotency == other.idempotency
             && self.kind == other.kind
             && self.target_identity == other.target_identity
             && self.accepted_generation == other.accepted_generation
+            && self.query_export_request_digest == other.query_export_request_digest
             && self.digest == other.digest
     }
 
@@ -224,6 +283,20 @@ impl DurableOperationRequest {
                         target_identity,
                         self.accepted_generation,
                         self.accepted_at_unix_seconds,
+                    )
+                    .ok()
+                })
+                .is_some_and(|canonical| canonical == self),
+            DurableOperationKind::QueryExport => self
+                .target_identity
+                .and_then(|target_identity| {
+                    Self::query_export(
+                        self.principal,
+                        self.idempotency,
+                        target_identity,
+                        self.accepted_generation,
+                        self.accepted_at_unix_seconds,
+                        self.query_export_request_digest?,
                     )
                     .ok()
                 })
@@ -373,6 +446,7 @@ impl DurableOperationCancellation {
 pub enum DurableOperationBoundary {
     NotCrossed,
     CatalogGenerationPublished,
+    ExportManifestPublished,
 }
 
 impl DurableOperationBoundary {
@@ -380,6 +454,7 @@ impl DurableOperationBoundary {
         match self {
             Self::NotCrossed => 1,
             Self::CatalogGenerationPublished => 2,
+            Self::ExportManifestPublished => 3,
         }
     }
 
@@ -387,6 +462,7 @@ impl DurableOperationBoundary {
         match code {
             1 => Ok(Self::NotCrossed),
             2 => Ok(Self::CatalogGenerationPublished),
+            3 => Ok(Self::ExportManifestPublished),
             _ => Err(DurableOperationFailure::PersistenceUnavailable),
         }
     }
@@ -444,6 +520,10 @@ impl DurableOperation {
     #[must_use]
     pub fn operation_id(self) -> OperationId {
         self.request.operation_id()
+    }
+    #[must_use]
+    pub const fn kind(self) -> DurableOperationKind {
+        self.request.kind()
     }
     #[must_use]
     pub const fn status(self) -> DurableOperationStatus {
@@ -598,7 +678,7 @@ impl DurableOperation {
         self.progress_percent = 100;
         self.retry = DurableOperationRetry::Never;
         self.cancellation = DurableOperationCancellation::NotAllowedAfterDrain;
-        self.boundary = DurableOperationBoundary::CatalogGenerationPublished;
+        self.boundary = self.request.kind.declared_irreversible_boundary();
         self.terminal_error = None;
         self.updated_at_unix_seconds = now;
         self.completed_at_unix_seconds = Some(now);
@@ -718,7 +798,7 @@ impl DurableOperation {
                     && self.progress_percent == 100
                     && self.retry == DurableOperationRetry::Never
                     && self.cancellation == DurableOperationCancellation::NotAllowedAfterDrain
-                    && self.boundary == DurableOperationBoundary::CatalogGenerationPublished
+                    && self.boundary == self.request.kind.declared_irreversible_boundary()
                     && self.terminal_error.is_none()
                     && self.cancellation_idempotency.is_none()
                     && self.completed_at_unix_seconds == Some(self.updated_at_unix_seconds)

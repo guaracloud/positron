@@ -9,6 +9,7 @@ fn protected_artifacts_bind_kind_identity_epoch_and_secret() {
         ArtifactKind::Audit,
         ArtifactKind::AuditCheckpoint,
         ArtifactKind::Commit,
+        ArtifactKind::ExportOutput,
     ] {
         let first = protect_artifact(&secret(1), instance(1), kind, identity, epoch, b"plaintext")
             .expect("valid artifact must protect");
@@ -50,6 +51,7 @@ fn protected_artifacts_bind_kind_identity_epoch_and_secret() {
             ArtifactKind::Audit
             | ArtifactKind::AuditCheckpoint
             | ArtifactKind::Commit
+            | ArtifactKind::ExportOutput
             | ArtifactKind::Prepared
             | ArtifactKind::TransitionalCommit
             | ArtifactKind::TransitionalPrepared

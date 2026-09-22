@@ -56,5 +56,9 @@ path = "tests/catalog_generation.rs"
 name = "active_segment_ledger"
 path = "tests/active_segment_ledger.rs"
 
+[[test]]
+name = "export_output"
+path = "tests/export_output.rs"
+
 [lints]
 workspace = true

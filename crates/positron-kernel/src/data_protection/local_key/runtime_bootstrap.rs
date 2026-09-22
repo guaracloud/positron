@@ -4,11 +4,11 @@ use std::path::Path;
 
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::AuditCheckpointSigner;
 use crate::catalog::{CatalogSecret, InstanceId};
 use crate::data_protection::{
     DataProtection, FrameLimits, FrameSequence, ObjectDataKey, SecretKeyBytes, SecretKeyInput,
 };
+use crate::{AuditCheckpointSigner, ExportManifestSigner};
 use crate::{SegmentProtectionKey, SegmentScope};
 use positron_domain::identity::TenantId;
 
@@ -113,6 +113,41 @@ pub struct BootstrapIntegrityIdentity {
 }
 
 impl BootstrapIntegrityIdentity {
+    /// Reconstructs the identity only when its externally pinned fingerprint
+    /// matches the supplied Instance Integrity public key.
+    pub fn from_pinned(
+        public_key: [u8; 32],
+        fingerprint: [u8; 32],
+    ) -> Result<Self, BootstrapKeyFailure> {
+        if public_key.iter().all(|byte| *byte == 0) || fingerprint.iter().all(|byte| *byte == 0) {
+            return Err(BootstrapKeyFailure::Authentication);
+        }
+        let mut input = Vec::new();
+        input
+            .try_reserve_exact(72)
+            .map_err(|_| BootstrapKeyFailure::Authentication)?;
+        input.extend_from_slice(b"positron-instance-integrity-key-fingerprint-v1\0");
+        input.extend_from_slice(&public_key);
+        let expected = DataProtection::hash(&input).map_err(map_frame)?;
+        if fingerprint != expected {
+            return Err(BootstrapKeyFailure::Authentication);
+        }
+        Ok(Self {
+            public_key,
+            fingerprint,
+        })
+    }
+
+    pub(crate) const fn new_for_integrity_signing(
+        public_key: [u8; 32],
+        fingerprint: [u8; 32],
+    ) -> Self {
+        Self {
+            public_key,
+            fingerprint,
+        }
+    }
+
     #[must_use]
     pub const fn public_key(self) -> [u8; 32] {
         self.public_key
@@ -487,8 +522,27 @@ impl BootstrapKeyCustody {
         })
     }
 
-    /// Opens the wrapped Instance Integrity Key into an opaque checkpoint-only
-    /// signing capability. The seed is never returned to the caller.
+    /// Opens the wrapped Instance Integrity Key into an opaque Query export
+    /// manifest signing capability. The seed never leaves Kernel custody.
+    pub fn export_manifest_signer(
+        &self,
+        instance: InstanceId,
+        protected_integrity_key: &[u8],
+    ) -> Result<ExportManifestSigner, BootstrapKeyFailure> {
+        let mut plaintext = self.open_object(
+            instance,
+            BootstrapObjectPurpose::Initialized,
+            protected_integrity_key,
+        )?;
+        let seed: [u8; 32] = plaintext
+            .as_slice()
+            .try_into()
+            .map_err(|_| BootstrapKeyFailure::Authentication)?;
+        plaintext.zeroize();
+        ExportManifestSigner::from_seed(Box::new(seed))
+            .map_err(|_| BootstrapKeyFailure::Authentication)
+    }
+
     pub fn audit_checkpoint_signer(
         &self,
         instance: InstanceId,

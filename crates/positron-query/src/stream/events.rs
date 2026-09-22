@@ -97,6 +97,14 @@ impl CorrelationOutcomes {
     pub(crate) fn get(&self, index: usize) -> Option<CorrelationOutcome> {
         self.outcomes.get(index).copied()
     }
+
+    pub(crate) fn len(&self) -> usize {
+        self.outcomes.len()
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &CorrelationOutcome> {
+        self.outcomes.iter()
+    }
 }
 
 /// `ArcInner` retains two atomics before its payload. Keeping this separate
@@ -203,6 +211,77 @@ impl QueryBatch {
     pub const fn digest(&self) -> [u8; 32] {
         self.digest
     }
+
+    /// Produces the bounded, self-delimiting typed payload persisted by a
+    /// durable export. This is deliberately distinct from the batch digest:
+    /// callers need the actual rows, while the digest commits their logical
+    /// query result.
+    pub(crate) fn canonical_export_bytes(&self) -> Result<Vec<u8>, QueryFailure> {
+        const MAGIC: &[u8; 8] = b"POSQBT01";
+        let count = u32::try_from(self.records.len())
+            .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
+        let mut output = Vec::new();
+        output
+            .try_reserve_exact(MAGIC.len() + 8 + 32 + 32 + 4)
+            .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
+        output.extend_from_slice(MAGIC);
+        output.extend_from_slice(&self.sequence.to_be_bytes());
+        output.extend_from_slice(&self.prior_digest);
+        output.extend_from_slice(&self.digest);
+        output.extend_from_slice(&count.to_be_bytes());
+        for record in self.records.iter() {
+            record.append_export_encoding(&mut output)?;
+        }
+        if let Some(correlations) = &self.correlations {
+            let correlation_count = u32::try_from(correlations.len())
+                .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
+            output
+                .try_reserve_exact(1 + 4)
+                .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
+            output.push(1);
+            output.extend_from_slice(&correlation_count.to_be_bytes());
+            for outcome in correlations.iter() {
+                append_correlation_export_encoding(&mut output, outcome)?;
+            }
+        } else {
+            output
+                .try_reserve_exact(1)
+                .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
+            output.push(0);
+        }
+        Ok(output)
+    }
+}
+
+fn append_correlation_export_encoding(
+    output: &mut Vec<u8>,
+    outcome: &CorrelationOutcome,
+) -> Result<(), QueryFailure> {
+    let (tag, trace, span) = match outcome {
+        CorrelationOutcome::MissingLogTraceId => {
+            output
+                .try_reserve_exact(1)
+                .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
+            output.push(0);
+            return Ok(());
+        },
+        CorrelationOutcome::MissingTraceTarget { trace_id, span_id } => (1, trace_id, span_id),
+        CorrelationOutcome::Matched { trace_id, span_id } => (2, trace_id, span_id),
+        CorrelationOutcome::Ambiguous { trace_id, span_id } => (3, trace_id, span_id),
+    };
+    output
+        .try_reserve_exact(1 + 16 + 1 + usize::from(span.is_some()) * 8)
+        .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
+    output.push(tag);
+    output.extend_from_slice(trace);
+    match span {
+        Some(span) => {
+            output.push(1);
+            output.extend_from_slice(span);
+        },
+        None => output.push(0),
+    }
+    Ok(())
 }
 
 impl Clone for QueryBatch {
@@ -373,6 +452,173 @@ impl QueryStats {
     pub const fn reduced_pruning(self) -> bool {
         self.reduced_pruning
     }
+
+    /// Appends the fixed-size terminal statistics retained beside a durable
+    /// export manifest. The output format is private to the Query module.
+    pub(crate) fn append_durable_export_encoding(
+        self,
+        output: &mut Vec<u8>,
+    ) -> Result<(), QueryFailure> {
+        const BYTES: usize = 179;
+        output
+            .try_reserve_exact(BYTES)
+            .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
+        for value in [
+            self.records,
+            self.scanned_bytes,
+            self.decoded_records,
+            self.output_bytes,
+            self.memory_peak_bytes,
+            self.cpu_work_units,
+            self.wall_seconds,
+        ] {
+            output.extend_from_slice(&value.to_be_bytes());
+        }
+        match self.last_sequence {
+            Some(sequence) => {
+                output.push(1);
+                output.extend_from_slice(&sequence.to_be_bytes());
+            },
+            None => {
+                output.push(0);
+                output.extend_from_slice(&0_u64.to_be_bytes());
+            },
+        }
+        output.extend_from_slice(&self.result_digest);
+        for value in [
+            self.cumulative_budget.scanned_bytes(),
+            self.cumulative_budget.decoded_records(),
+            self.cumulative_budget.output_rows(),
+            self.cumulative_budget.output_bytes(),
+            self.cumulative_budget.memory_bytes(),
+            self.cumulative_budget.cpu_work_units(),
+            self.cumulative_budget.wall_seconds(),
+            self.cumulative_budget.maximum_time_range_nanoseconds(),
+            self.resume_count,
+            self.repeated_batch_count,
+        ] {
+            output.extend_from_slice(&value.to_be_bytes());
+        }
+        output.push(encode_budget_dimension(self.limiting_budget));
+        output.push(u8::from(self.reduced_pruning));
+        Ok(())
+    }
+
+    pub(crate) fn from_durable_export_encoding(
+        bytes: &[u8],
+        offset: &mut usize,
+    ) -> Result<Self, QueryFailure> {
+        let records = read_export_u64(bytes, offset)?;
+        let scanned_bytes = read_export_u64(bytes, offset)?;
+        let decoded_records = read_export_u64(bytes, offset)?;
+        let output_bytes = read_export_u64(bytes, offset)?;
+        let memory_peak_bytes = read_export_u64(bytes, offset)?;
+        let cpu_work_units = read_export_u64(bytes, offset)?;
+        let wall_seconds = read_export_u64(bytes, offset)?;
+        let last_sequence = match read_export_byte(bytes, offset)? {
+            0 => {
+                let _reserved = read_export_u64(bytes, offset)?;
+                None
+            },
+            1 => Some(read_export_u64(bytes, offset)?),
+            _ => return Err(QueryFailure::new(QueryFailureCode::MalformedPersistentData)),
+        };
+        let result_digest = read_export_array(bytes, offset)?;
+        let budget = crate::QueryBudget::new(
+            read_export_u64(bytes, offset)?,
+            read_export_u64(bytes, offset)?,
+            read_export_u64(bytes, offset)?,
+            read_export_u64(bytes, offset)?,
+            read_export_u64(bytes, offset)?,
+            read_export_u64(bytes, offset)?,
+        )?
+        .with_cpu_work_units(read_export_u64(bytes, offset)?)?
+        .with_maximum_time_range_nanoseconds(read_export_u64(bytes, offset)?)?;
+        let resume_count = read_export_u64(bytes, offset)?;
+        let repeated_batch_count = read_export_u64(bytes, offset)?;
+        let limiting_budget = decode_budget_dimension(read_export_byte(bytes, offset)?)?;
+        let reduced_pruning = match read_export_byte(bytes, offset)? {
+            0 => false,
+            1 => true,
+            _ => return Err(QueryFailure::new(QueryFailureCode::MalformedPersistentData)),
+        };
+        Ok(Self {
+            records,
+            scanned_bytes,
+            decoded_records,
+            output_bytes,
+            memory_peak_bytes,
+            cpu_work_units,
+            wall_seconds,
+            last_sequence,
+            result_digest,
+            cumulative_budget: budget,
+            resume_count,
+            repeated_batch_count,
+            limiting_budget,
+            reduced_pruning,
+        })
+    }
+}
+
+fn encode_budget_dimension(value: Option<QueryBudgetDimension>) -> u8 {
+    match value {
+        None => 0,
+        Some(QueryBudgetDimension::ScannedBytes) => 1,
+        Some(QueryBudgetDimension::DecodedRecords) => 2,
+        Some(QueryBudgetDimension::OutputRows) => 3,
+        Some(QueryBudgetDimension::OutputBytes) => 4,
+        Some(QueryBudgetDimension::MemoryBytes) => 5,
+        Some(QueryBudgetDimension::CpuWorkUnits) => 6,
+        Some(QueryBudgetDimension::WallSeconds) => 7,
+        Some(QueryBudgetDimension::MaximumTimeRangeNanoseconds) => 8,
+    }
+}
+
+fn decode_budget_dimension(value: u8) -> Result<Option<QueryBudgetDimension>, QueryFailure> {
+    match value {
+        0 => Ok(None),
+        1 => Ok(Some(QueryBudgetDimension::ScannedBytes)),
+        2 => Ok(Some(QueryBudgetDimension::DecodedRecords)),
+        3 => Ok(Some(QueryBudgetDimension::OutputRows)),
+        4 => Ok(Some(QueryBudgetDimension::OutputBytes)),
+        5 => Ok(Some(QueryBudgetDimension::MemoryBytes)),
+        6 => Ok(Some(QueryBudgetDimension::CpuWorkUnits)),
+        7 => Ok(Some(QueryBudgetDimension::WallSeconds)),
+        8 => Ok(Some(QueryBudgetDimension::MaximumTimeRangeNanoseconds)),
+        _ => Err(QueryFailure::new(QueryFailureCode::MalformedPersistentData)),
+    }
+}
+
+fn read_export_byte(bytes: &[u8], offset: &mut usize) -> Result<u8, QueryFailure> {
+    let byte = *bytes
+        .get(*offset)
+        .ok_or_else(|| QueryFailure::new(QueryFailureCode::MalformedPersistentData))?;
+    *offset = offset
+        .checked_add(1)
+        .ok_or_else(|| QueryFailure::new(QueryFailureCode::MalformedPersistentData))?;
+    Ok(byte)
+}
+
+fn read_export_array<const N: usize>(
+    bytes: &[u8],
+    offset: &mut usize,
+) -> Result<[u8; N], QueryFailure> {
+    let end = offset
+        .checked_add(N)
+        .ok_or_else(|| QueryFailure::new(QueryFailureCode::MalformedPersistentData))?;
+    let slice = bytes
+        .get(*offset..end)
+        .ok_or_else(|| QueryFailure::new(QueryFailureCode::MalformedPersistentData))?;
+    let value = slice
+        .try_into()
+        .map_err(|_| QueryFailure::new(QueryFailureCode::MalformedPersistentData))?;
+    *offset = end;
+    Ok(value)
+}
+
+fn read_export_u64(bytes: &[u8], offset: &mut usize) -> Result<u64, QueryFailure> {
+    Ok(u64::from_be_bytes(read_export_array(bytes, offset)?))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

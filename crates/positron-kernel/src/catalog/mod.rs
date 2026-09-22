@@ -17,6 +17,7 @@ mod types;
 mod tests;
 
 use std::collections::BTreeMap;
+use std::fs::File;
 use std::sync::{Arc, Mutex};
 
 use budget::{
@@ -34,7 +35,10 @@ use storage::{CatalogStorage, PreparedLookup};
 
 use crate::data_protection::ControlTokenProtector;
 use crate::resource_governor::CatalogWriterLease;
-use crate::{RecoveryWorkClaim, RecoveryWorkKind, StorageKernelResourceAuthority};
+use crate::{
+    RecoveryWorkClaim, RecoveryWorkKind, ResourceAmounts, StorageKernelResourceAuthority,
+    WorkClaim, WorkKind,
+};
 
 pub use audit_checkpoint::{
     AuditCheckpointSigner, AuditRetentionAnchor, AuditRetentionTrust, GovernanceAuditCheckpoint,
@@ -129,6 +133,7 @@ pub struct Catalog<'authority> {
     secret: Mutex<CatalogSecret>,
     storage: CatalogStorage,
     operation: Mutex<()>,
+    pub(crate) export_output_operation: Mutex<()>,
     state: Mutex<CatalogState>,
 }
 
@@ -282,6 +287,7 @@ impl<'authority> Catalog<'authority> {
             secret: Mutex::new(secret),
             storage,
             operation: Mutex::new(()),
+            export_output_operation: Mutex::new(()),
             state: Mutex::new(state),
         })
     }
@@ -363,6 +369,72 @@ impl<'authority> Catalog<'authority> {
             .lock()
             .map(|state| state.current.clone())
             .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))
+    }
+
+    pub(crate) fn export_output_root(&self) -> Result<File, CatalogFailure> {
+        self.authority
+            .primary_data_volume()
+            .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::ResourceAdmissionRefused))?
+            ._root
+            .try_clone()
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::StorageUnavailable))
+    }
+
+    pub(crate) fn protect_export_output(
+        &self,
+        content_identity: [u8; 32],
+        format_epoch: FormatEpoch,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, CatalogFailure> {
+        let secret = self
+            .secret
+            .lock()
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
+        storage::artifact::protect_export_output(
+            &secret,
+            self.instance,
+            content_identity,
+            format_epoch,
+            plaintext,
+        )
+    }
+
+    pub(crate) fn open_export_output(
+        &self,
+        content_identity: [u8; 32],
+        format_epoch: FormatEpoch,
+        encoded: &[u8],
+    ) -> Result<Vec<u8>, CatalogFailure> {
+        let secret = self
+            .secret
+            .lock()
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
+        storage::artifact::open_export_output(
+            &secret,
+            self.instance,
+            content_identity,
+            format_epoch,
+            encoded,
+        )
+    }
+
+    pub(crate) fn reserve_export_output(
+        &self,
+        tenant: positron_domain::identity::TenantId,
+        payload_bytes: usize,
+        durable_bytes: usize,
+    ) -> Result<crate::ResourceReservation<'_>, CatalogFailure> {
+        let payload = u64::try_from(payload_bytes)
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?;
+        let durable = u64::try_from(durable_bytes)
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?;
+        let amounts = ResourceAmounts::new([payload, 0, 1, payload, 1, 0, 0, 1, 0, 1, durable]);
+        let claim = WorkClaim::tenant(tenant, WorkKind::InteractiveQueryTail, amounts)
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?;
+        self.authority
+            .governor()
+            .reserve(claim)
+            .map_err(CatalogFailure::admission)
     }
 
     /// Publishes one complete Catalog Proposal and optional Administration-owned audit intent.

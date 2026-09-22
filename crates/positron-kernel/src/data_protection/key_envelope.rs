@@ -268,5 +268,6 @@ const fn key_kind(kind: SystemObjectKind) -> u64 {
         SystemObjectKind::GovernanceAudit => 3,
         SystemObjectKind::BackupMetadata => 4,
         SystemObjectKind::InstanceBootstrap => 5,
+        SystemObjectKind::ExportOutput => 6,
     }
 }

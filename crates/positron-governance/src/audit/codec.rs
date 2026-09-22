@@ -69,6 +69,7 @@ impl GovernanceAuditEntry {
             let canonical_operation_id = DurableOperationRequest::operation_id_for_audit(
                 actor,
                 request_id,
+                action,
                 target_identity,
                 accepted_generation,
             )

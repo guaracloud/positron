@@ -9,6 +9,7 @@ mod cursor;
 mod execution;
 mod execution_state;
 mod execution_support;
+mod export;
 mod failure;
 #[cfg(fuzzing)]
 mod fuzzing;
@@ -38,6 +39,10 @@ mod transform;
 pub use budget::{QueryBudget, QueryBudgetDimension};
 pub use cancellation::QueryCancellation;
 pub use cursor::QueryCursor;
+pub use export::{
+    DurableExportReceipt, ExportBatch, ExportDestination, ExportManifest, ExportSink,
+    ExportTerminal,
+};
 pub use failure::{QueryFailure, QueryFailureCode};
 pub use plan::{LogicalPlan, OrderDirection, PlannedQuery, TemporalAxis, TemporalRange};
 pub use query_service::QueryService;
