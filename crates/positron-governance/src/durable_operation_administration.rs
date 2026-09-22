@@ -6,7 +6,7 @@
 use positron_domain::identity::{PrincipalId, Scope};
 use positron_kernel::{
     AuditIntent, Catalog, CatalogFailureCode, CatalogObject, CatalogProposal, CatalogSnapshot,
-    FormatEpoch, TransactionId,
+    FormatEpoch, PreparedTransactionResolution, TransactionId,
 };
 use sha2::{Digest, Sha256};
 
@@ -235,6 +235,16 @@ fn publish(
     snapshot: &CatalogSnapshot,
     operation: DurableOperation,
 ) -> Result<DurableOperation, DurableOperationFailure> {
+    let transaction = transition_transaction(operation)?;
+    let request_digest = transition_request_digest(operation);
+    if let Some(resumed) = resume_prepared_operation(
+        catalog,
+        transaction,
+        request_digest,
+        operation.operation_id(),
+    )? {
+        return Ok(resumed);
+    }
     let mut objects = retained_objects(
         snapshot,
         operation.operation_id(),
@@ -245,22 +255,85 @@ fn publish(
         .map_err(|_| DurableOperationFailure::CapacityExceeded)?;
     objects.push(CatalogObject::new(encode_operation(operation)).map_err(map_catalog)?);
     let audit = AuditIntent::new(encode_audit(operation)).map_err(map_catalog)?;
-    let transaction = transition_transaction(operation)?;
-    catalog
-        .commit(
-            snapshot.identity(),
-            CatalogProposal::new(
+    let proposal = CatalogProposal::new(
+        transaction,
+        snapshot
+            .format_epoch()
+            .ok_or(DurableOperationFailure::PersistenceUnavailable)?,
+        objects,
+    )
+    .map_err(map_catalog)?;
+    match catalog.commit_prepared(snapshot.identity(), proposal, audit, request_digest) {
+        Ok(commit) => operation_from_snapshot(commit.snapshot(), operation.operation_id()),
+        Err(failure) if failure.code() == CatalogFailureCode::IdempotencyConflict => {
+            resume_prepared_operation(
+                catalog,
                 transaction,
-                snapshot
-                    .format_epoch()
-                    .ok_or(DurableOperationFailure::PersistenceUnavailable)?,
-                objects,
-            )
-            .map_err(map_catalog)?,
-            Some(audit),
-        )
-        .map_err(map_catalog)?;
-    Ok(operation)
+                request_digest,
+                operation.operation_id(),
+            )?
+            .ok_or(DurableOperationFailure::IdempotencyConflict)
+        },
+        Err(failure) => Err(map_catalog(failure)),
+    }
+}
+
+fn resume_prepared_operation(
+    catalog: &Catalog<'_>,
+    transaction: TransactionId,
+    request_digest: [u8; 32],
+    operation_id: OperationId,
+) -> Result<Option<DurableOperation>, DurableOperationFailure> {
+    match catalog
+        .resume_prepared(transaction, request_digest)
+        .map_err(map_catalog)?
+    {
+        PreparedTransactionResolution::Absent => Ok(None),
+        PreparedTransactionResolution::Unavailable => {
+            Err(DurableOperationFailure::PersistenceUnavailable)
+        },
+        PreparedTransactionResolution::Resumed(commit) => {
+            operation_from_snapshot(commit.snapshot(), operation_id).map(Some)
+        },
+    }
+}
+
+fn operation_from_snapshot(
+    snapshot: &CatalogSnapshot,
+    operation_id: OperationId,
+) -> Result<DurableOperation, DurableOperationFailure> {
+    find_by_id(snapshot, operation_id)?.ok_or(DurableOperationFailure::PersistenceUnavailable)
+}
+
+fn transition_request_digest(operation: DurableOperation) -> [u8; 32] {
+    // The prepared proposal owns its first transition timestamp. Bind every
+    // semantic transition field while leaving that timestamp free to reattach
+    // the exact staged payload after an acknowledgement-ambiguous failure.
+    let mut hasher = Sha256::new();
+    hasher.update(b"positron.durable-operation.transition-request.v1\0");
+    hasher.update(operation.operation_id().to_bytes());
+    hasher.update(operation.revision.to_be_bytes());
+    hasher.update(operation.request.canonical_digest());
+    hasher.update([operation.status.code()]);
+    hasher.update([operation.phase.code()]);
+    hasher.update([operation.progress_percent]);
+    hasher.update([operation.retry.code()]);
+    hasher.update([operation.cancellation.code()]);
+    hasher.update([operation.boundary.code()]);
+    hasher.update(
+        operation
+            .terminal_error
+            .map_or(0, DurableOperationTerminalError::code)
+            .to_be_bytes(),
+    );
+    match operation.cancellation_idempotency {
+        Some(idempotency) => {
+            hasher.update([1]);
+            hasher.update(idempotency.to_bytes());
+        },
+        None => hasher.update([0]),
+    }
+    hasher.finalize().into()
 }
 
 fn retained_objects(
