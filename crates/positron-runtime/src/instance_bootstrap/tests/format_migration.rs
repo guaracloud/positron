@@ -471,7 +471,7 @@ fn compatibility_retry_completes_a_post_publication_durable_migration() -> Resul
         RequestedIntent::SystemAdministration,
         CompatibilityHints::none(),
     )?;
-    let key = AdministrativeIdempotencyKey::new([0xa5; 16])?;
+    let key = AdministrativeIdempotencyKey::new([0xcb; 16])?;
 
     with_catalog_publication_fault_after(CatalogPublicationFault::SynchronizeCommit, 4, || {
         instance.migrate_catalog_to_epoch_two_as_operation(actor, key)
