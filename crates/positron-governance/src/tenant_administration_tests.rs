@@ -6,6 +6,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use sha2::{Digest, Sha256};
 
+use crate::{
+    DurableOperationAdministration, DurableOperationFailure, DurableOperationRequest,
+    DurableOperationStatus,
+};
+
 use positron_kernel::{
     AuditIntent, BootstrapKeyCustody, Catalog, CatalogObject, CatalogProposal, DiskObservation,
     DiskPressureThresholds, GovernorPolicy, InventoryCardinalityLimits, MountQualification,
@@ -16,6 +21,7 @@ use positron_kernel::{
 };
 
 use super::{
+    super::durable_operation_administration::pending_operation_fixture,
     tenant_administration_proposal::encode_record,
     tenant_administration_registry_codec::{
         TENANT_REGISTRY_V2_MAGIC, decode_registry, is_registry, registry_object,
@@ -132,6 +138,233 @@ fn tenant(index: u16) -> Result<TenantId, TenantAdministrationFailure> {
     let mut bytes = [0_u8; 16];
     bytes[..2].copy_from_slice(&index.to_be_bytes());
     TenantId::from_bytes(bytes).map_err(|_| TenantAdministrationFailure::InvalidInput)
+}
+
+#[test]
+fn durable_operation_capacity_replaces_existing_record_before_rejecting_a_new_one()
+-> Result<(), Box<dyn Error>> {
+    let root = PagedCatalogRoot::new()?;
+    let instance = positron_kernel::InstanceId::new([0xd1; 16])?;
+    let default_tenant = tenant(1)?;
+    let authority = fixture_authority(
+        PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?,
+        default_tenant,
+    )?;
+    let keys = BootstrapKeyCustody::initialize(&root.secrets())?;
+    let catalog = Catalog::open(&authority, instance, keys.catalog_secret(instance)?)?;
+    let administrator = PrincipalId::from_bytes([0xd2; 16])?;
+    let secret = [0xd3; 32];
+    let salt = [0xd4; 32];
+    let hash = keys.salted_secret_hash(&salt, &secret)?;
+    let initial = crate::InitialGovernanceIntent::create_tenant(crate::InitialTenantIntent::new(
+        instance.to_bytes(),
+        default_tenant,
+        TenantSlug::parse_canonical("default")?,
+        "Default tenant",
+        administrator,
+        salt,
+        hash,
+        PrincipalId::from_bytes([0xd5; 16])?,
+        [0xd6; 32],
+        [0xd7; 32],
+        PrincipalId::from_bytes([0xd8; 16])?,
+        [0xd9; 32],
+        [0xda; 32],
+        [0xdb; 32],
+        [0xdc; 32],
+        vec![0xdd; 48],
+        keys.tenant_key_envelope(instance, default_tenant)?,
+        2_592_000,
+        1,
+        1,
+        [16; 11],
+        crate::InitialAuditContext::new(17, [0xde; 16], true)?,
+    )?)?;
+    let (governance, audit) = initial.into_parts();
+    catalog.commit(
+        catalog.pin()?.identity(),
+        CatalogProposal::new(
+            TransactionId::new([0xdf; 16])?,
+            positron_kernel::FormatEpoch::CATALOG_V1,
+            vec![CatalogObject::new(governance)?],
+        )?,
+        Some(AuditIntent::new(audit)?),
+    )?;
+    let actor = crate::Identity::open(&catalog.pin()?)?.attribute(
+        &keys,
+        crate::PresentedCredential::parse(&format!("pos_{}", "d3".repeat(32)))?,
+        crate::RequestedIntent::SystemAdministration,
+        crate::CompatibilityHints::none(),
+    )?;
+    let basis = catalog.pin()?;
+    let mut objects = basis
+        .object_identities()
+        .map(|identity| {
+            basis
+                .object(identity)?
+                .map(|bytes| CatalogObject::new(bytes.to_vec()))
+                .transpose()?
+                .ok_or_else(|| Box::<dyn Error>::from("catalog object"))
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    let mut first_request = None;
+    for ordinal in 1_u16..=1_023 {
+        let mut key = [0_u8; 16];
+        key[..2].copy_from_slice(&ordinal.to_be_bytes());
+        let request = DurableOperationRequest::catalog_format_migration(
+            actor.principal_id(),
+            AdministrativeIdempotencyKey::new(key)?,
+            [0x44; 16],
+            basis.number(),
+            17,
+        )?;
+        if first_request.is_none() {
+            first_request = Some(request);
+        }
+        objects.push(CatalogObject::new(pending_operation_fixture(request))?);
+    }
+    catalog.commit(
+        basis.identity(),
+        CatalogProposal::new(
+            TransactionId::new([0xe0; 16])?,
+            positron_kernel::FormatEpoch::CATALOG_V1,
+            objects,
+        )?,
+        None,
+    )?;
+    let first_request = first_request.ok_or("first durable operation")?;
+    let accepted = DurableOperationAdministration::accept_catalog_format_migration(
+        &catalog,
+        actor,
+        first_request,
+    )?;
+    assert_eq!(
+        DurableOperationAdministration::begin(&catalog, actor, accepted.operation_id(), 18)?
+            .status(),
+        DurableOperationStatus::Running
+    );
+    assert_eq!(
+        DurableOperationAdministration::accept_catalog_format_migration(
+            &catalog,
+            actor,
+            DurableOperationRequest::catalog_format_migration(
+                actor.principal_id(),
+                AdministrativeIdempotencyKey::new([0xe1; 16])?,
+                [0x44; 16],
+                catalog.pin()?.number(),
+                19,
+            )?,
+        )
+        .expect_err("a new durable operation exceeds the fixed record capacity"),
+        DurableOperationFailure::CapacityExceeded
+    );
+    Ok(())
+}
+
+#[test]
+fn stale_catalog_generation_rejects_durable_operation_acceptance_without_publication()
+-> Result<(), Box<dyn Error>> {
+    // Public seam: accept a request built from the pinned generation. A later
+    // serialized Catalog mutation must make that request stale before it can
+    // create an operation record or governance audit entry.
+    let root = PagedCatalogRoot::new()?;
+    let instance = positron_kernel::InstanceId::new([0xe1; 16])?;
+    let default_tenant = tenant(1)?;
+    let authority = fixture_authority(
+        PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?,
+        default_tenant,
+    )?;
+    let keys = BootstrapKeyCustody::initialize(&root.secrets())?;
+    let catalog = Catalog::open(&authority, instance, keys.catalog_secret(instance)?)?;
+    let administrator = PrincipalId::from_bytes([0xe2; 16])?;
+    let secret = [0xe3; 32];
+    let salt = [0xe4; 32];
+    let hash = keys.salted_secret_hash(&salt, &secret)?;
+    let initial = crate::InitialGovernanceIntent::create_tenant(crate::InitialTenantIntent::new(
+        instance.to_bytes(),
+        default_tenant,
+        TenantSlug::parse_canonical("default")?,
+        "Default tenant",
+        administrator,
+        salt,
+        hash,
+        PrincipalId::from_bytes([0xe5; 16])?,
+        [0xe6; 32],
+        [0xe7; 32],
+        PrincipalId::from_bytes([0xe8; 16])?,
+        [0xe9; 32],
+        [0xea; 32],
+        [0xeb; 32],
+        [0xec; 32],
+        vec![0xed; 48],
+        keys.tenant_key_envelope(instance, default_tenant)?,
+        2_592_000,
+        1,
+        1,
+        [16; 11],
+        crate::InitialAuditContext::new(17, [0xee; 16], true)?,
+    )?)?;
+    let (governance, audit) = initial.into_parts();
+    catalog.commit(
+        catalog.pin()?.identity(),
+        CatalogProposal::new(
+            TransactionId::new([0xef; 16])?,
+            positron_kernel::FormatEpoch::CATALOG_V1,
+            vec![CatalogObject::new(governance)?],
+        )?,
+        Some(AuditIntent::new(audit)?),
+    )?;
+    let actor = crate::Identity::open(&catalog.pin()?)?.attribute(
+        &keys,
+        crate::PresentedCredential::parse(&format!("pos_{}", "e3".repeat(32)))?,
+        crate::RequestedIntent::SystemAdministration,
+        crate::CompatibilityHints::none(),
+    )?;
+    let requested = catalog.pin()?;
+    let request = DurableOperationRequest::catalog_format_migration(
+        actor.principal_id(),
+        AdministrativeIdempotencyKey::new([0xf0; 16])?,
+        instance.to_bytes(),
+        requested.number(),
+        18,
+    )?;
+    let mut objects = requested
+        .object_identities()
+        .map(|identity| {
+            requested
+                .object(identity)?
+                .map(|bytes| CatalogObject::new(bytes.to_vec()))
+                .transpose()?
+                .ok_or_else(|| Box::<dyn Error>::from("catalog object"))
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    objects.push(CatalogObject::new(vec![0xf1])?);
+    catalog.commit(
+        requested.identity(),
+        CatalogProposal::new(
+            TransactionId::new([0xf2; 16])?,
+            positron_kernel::FormatEpoch::CATALOG_V1,
+            objects,
+        )?,
+        None,
+    )?;
+    let audit_before = catalog.governance_audit_records()?.len();
+
+    assert_eq!(
+        DurableOperationAdministration::accept_catalog_format_migration(&catalog, actor, request)
+            .expect_err("a stale request cannot accept a durable operation"),
+        DurableOperationFailure::StaleGeneration
+    );
+    assert_eq!(catalog.pin()?.number(), requested.number() + 1);
+    assert_eq!(
+        DurableOperationAdministration::inspect_by_idempotency(
+            &catalog,
+            request.idempotency_key()
+        )?,
+        None
+    );
+    assert_eq!(catalog.governance_audit_records()?.len(), audit_before);
+    Ok(())
 }
 
 #[test]

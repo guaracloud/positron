@@ -123,6 +123,11 @@ pub(super) const fn classify_bootstrap_failure_code(
             ServiceFailure::InvalidRequest
         },
         crate::BootstrapFailureCode::TenantCreateConflict => ServiceFailure::InvalidRequest,
+        crate::BootstrapFailureCode::DurableOperationLookupExpired
+        | crate::BootstrapFailureCode::DurableOperationUnknown
+        | crate::BootstrapFailureCode::DurableOperationCancellationUnavailable => {
+            ServiceFailure::InvalidRequest
+        },
         crate::BootstrapFailureCode::KeyCustodyUnavailable => ServiceFailure::KeyUnavailable,
         crate::BootstrapFailureCode::ResourceUnavailable => ServiceFailure::CapacityUnavailable,
         crate::BootstrapFailureCode::CorruptState

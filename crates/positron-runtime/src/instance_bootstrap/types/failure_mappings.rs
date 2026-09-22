@@ -219,6 +219,30 @@ pub(super) fn map_catalog_format_migration_failure(
     BootstrapFailure::new(code)
 }
 
+pub(super) fn map_durable_operation_failure(failure: DurableOperationFailure) -> BootstrapFailure {
+    let code = match failure {
+        DurableOperationFailure::Unauthorized => BootstrapFailureCode::ApiKeyUnauthorized,
+        DurableOperationFailure::IdempotencyConflict => {
+            BootstrapFailureCode::ApiKeyIdempotencyConflict
+        },
+        DurableOperationFailure::CapacityExceeded => BootstrapFailureCode::ResourceUnavailable,
+        DurableOperationFailure::UnknownOperation => BootstrapFailureCode::DurableOperationUnknown,
+        DurableOperationFailure::CompletedLookupExpired => {
+            BootstrapFailureCode::DurableOperationLookupExpired
+        },
+        DurableOperationFailure::CancellationUnavailable => {
+            BootstrapFailureCode::DurableOperationCancellationUnavailable
+        },
+        DurableOperationFailure::InvalidInput
+        | DurableOperationFailure::InvalidState
+        | DurableOperationFailure::StaleGeneration
+        | DurableOperationFailure::PersistenceUnavailable => {
+            BootstrapFailureCode::CatalogUnavailable
+        },
+    };
+    BootstrapFailure::new(code)
+}
+
 pub(super) fn map_listener_transport_failure(
     failure: ListenerTransportAdministrationFailure,
 ) -> BootstrapFailure {
@@ -229,4 +253,25 @@ pub(super) fn map_listener_transport_failure(
         ListenerTransportAdministrationFailure::CorruptState => BootstrapFailureCode::CorruptState,
     };
     BootstrapFailure::new(code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn durable_operation_lookup_and_cancellation_failures_are_not_catalog_outages() {
+        assert_eq!(
+            map_durable_operation_failure(DurableOperationFailure::CompletedLookupExpired).code(),
+            BootstrapFailureCode::DurableOperationLookupExpired
+        );
+        assert_eq!(
+            map_durable_operation_failure(DurableOperationFailure::UnknownOperation).code(),
+            BootstrapFailureCode::DurableOperationUnknown
+        );
+        assert_eq!(
+            map_durable_operation_failure(DurableOperationFailure::CancellationUnavailable).code(),
+            BootstrapFailureCode::DurableOperationCancellationUnavailable
+        );
+    }
 }

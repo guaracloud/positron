@@ -20,6 +20,8 @@ use zeroize::Zeroizing;
 use positron_governance::{
     AdministrativeIdempotencyKey, ApiKeyAdministrationFailure, ApiKeyCreation, AuthorizedContext,
     CatalogFormatMigration, CatalogFormatMigrationAdministration, CatalogFormatMigrationFailure,
+    DurableOperation, DurableOperationAdministration, DurableOperationFailure,
+    DurableOperationRequest, DurableOperationStatus, DurableOperationTerminalError,
     ListenerTransportAdministration, ListenerTransportAdministrationFailure, ResourceGeneration,
     RetentionImpactConfirmation, TenantAliasAdministration, TenantAliasAdministrationFailure,
     TenantAliasBindRequest, TenantAliasBinding, TenantDisplayGenerationConflict,

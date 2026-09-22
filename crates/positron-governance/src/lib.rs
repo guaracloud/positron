@@ -13,6 +13,7 @@ use positron_domain::identity::{ExternalTenantAlias, PrincipalId, TenantId, Tena
 
 mod api_key_administration;
 mod audit;
+mod durable_operation_administration;
 mod format_migration_administration;
 mod identity;
 mod listener_transport_administration;
@@ -32,11 +33,19 @@ pub use api_key_administration::{
 };
 pub use audit::{
     ApiKeyLifecycleAction, CatalogRootRotationAuditEntry, CatalogRootRotationStage,
-    GovernanceAuditEntry, IngestPolicyActivationAuditEntry, InitialAuditMetadata,
-    InitializationAuditEntry, ListenerTransportAuditEntry, ListenerTransportAuditRequest,
-    ListenerTransportConfigurationProvenance, SchemaCheckpointAuditEntry,
-    SystemAuditRetentionUpdateAuditEntry, TenantDisplayNameUpdateAuditEntry,
-    TenantQuotaUpdateAuditEntry, schema_checkpoint_audit_intent,
+    DurableOperationAuditEntry, GovernanceAuditEntry, IngestPolicyActivationAuditEntry,
+    InitialAuditMetadata, InitializationAuditEntry, ListenerTransportAuditEntry,
+    ListenerTransportAuditRequest, ListenerTransportConfigurationProvenance,
+    SchemaCheckpointAuditEntry, SystemAuditRetentionUpdateAuditEntry,
+    TenantDisplayNameUpdateAuditEntry, TenantQuotaUpdateAuditEntry, schema_checkpoint_audit_intent,
+};
+#[cfg(fuzzing)]
+pub use durable_operation_administration::fuzz_durable_operation_record;
+pub use durable_operation_administration::{
+    DurableOperation, DurableOperationAdministration, DurableOperationBoundary,
+    DurableOperationCancellation, DurableOperationFailure, DurableOperationKind,
+    DurableOperationLookupRetention, DurableOperationPhase, DurableOperationRequest,
+    DurableOperationRetry, DurableOperationStatus, DurableOperationTerminalError, OperationId,
 };
 pub use format_migration_administration::{
     CatalogFormatMigration, CatalogFormatMigrationAdministration, CatalogFormatMigrationFailure,

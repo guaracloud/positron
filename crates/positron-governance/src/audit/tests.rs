@@ -6,10 +6,64 @@ use super::{
     schema_checkpoint_audit_intent,
 };
 use crate::{
-    ApiKeyLifecycleAction, InitialAuditContext, InitialGovernanceIntent, InitialTenantIntent,
-    ListenerTransportAuditEntry, ListenerTransportAuditRequest,
-    ListenerTransportConfigurationProvenance, ResourceGeneration,
+    ApiKeyLifecycleAction, DurableOperationKind, DurableOperationPhase, DurableOperationStatus,
+    InitialAuditContext, InitialGovernanceIntent, InitialTenantIntent, ListenerTransportAuditEntry,
+    ListenerTransportAuditRequest, ListenerTransportConfigurationProvenance, ResourceGeneration,
 };
+
+#[test]
+fn legacy_durable_operation_audit_remains_readable() {
+    let transaction = [0x11; 16];
+    let mut intent = b"POSOPA01".to_vec();
+    intent.extend_from_slice(&[0x22; 16]);
+    intent.push(1); // catalog-format migration
+    intent.push(4); // failed
+    intent.push(3); // draining
+    intent.extend_from_slice(&7_u64.to_be_bytes());
+
+    let entry = GovernanceAuditEntry::decode_fields(5, transaction, &intent)
+        .expect("legacy durable-operation audit");
+    let GovernanceAuditEntry::DurableOperation(operation) = entry else {
+        panic!("typed durable audit");
+    };
+    assert_eq!(operation.operation_id().to_bytes(), [0x22; 16]);
+    assert_eq!(operation.acting_principal(), None);
+    assert_eq!(operation.applicable_tenant(), None);
+    assert_eq!(
+        operation.action(),
+        DurableOperationKind::CatalogFormatMigration
+    );
+    assert_eq!(operation.outcome(), DurableOperationStatus::Failed);
+    assert_eq!(operation.phase, DurableOperationPhase::Draining);
+    assert_eq!(operation.request_id(), None);
+    assert_eq!(operation.accepted_generation(), None);
+    assert_eq!(operation.progress_percent(), None);
+    assert_eq!(operation.revision, 7);
+
+    let mut malformed = intent;
+    malformed[8..24].fill(0);
+    assert!(GovernanceAuditEntry::decode_fields(5, transaction, &malformed).is_err());
+}
+
+#[test]
+fn durable_operation_audit_rejects_a_structurally_valid_unbound_transaction() {
+    let mut intent = b"POSOPA02".to_vec();
+    intent.extend_from_slice(&[0x22; 16]); // operation
+    intent.extend_from_slice(&[0x33; 16]); // creator
+    intent.push(0); // system-wide
+    intent.push(1); // catalog-format migration
+    intent.push(2); // running
+    intent.push(2); // preflight
+    intent.extend_from_slice(&[0x44; 16]); // idempotency key
+    intent.extend_from_slice(&7_u64.to_be_bytes()); // accepted generation
+    intent.push(10); // progress
+    intent.extend_from_slice(&2_u64.to_be_bytes()); // revision
+
+    assert!(
+        GovernanceAuditEntry::decode_fields(5, [0x55; 16], &intent).is_err(),
+        "a durable-operation audit must bind its transaction to its canonical request"
+    );
+}
 
 #[test]
 fn public_plaintext_api_transport_audit_is_redacted_exact_and_strict() {

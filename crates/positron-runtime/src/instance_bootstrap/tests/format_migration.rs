@@ -8,14 +8,18 @@ use crate::{InitializationPlan, InstanceBootstrap};
 use positron_domain::identity::Scope;
 use positron_domain::identity::{TenantId, TenantSlug};
 use positron_domain::lifecycle::TenantLifecycleState;
+use positron_domain::time::UnixNanoseconds;
 use positron_governance::{
     AdministrativeIdempotencyKey, CatalogFormatMigrationAdministration, CompatibilityHints,
     PresentedCredential, RequestedIntent, ResourceGeneration,
 };
-use positron_governance::{Identity, IngestPolicyAdministration};
+use positron_governance::{
+    DurableOperationAdministration, DurableOperationFailure, DurableOperationRequest,
+    DurableOperationStatus, DurableOperationTerminalError, Identity, IngestPolicyAdministration,
+};
 use positron_ingest::{IngestPolicy, PolicyAction, PolicyRule};
-use positron_kernel::Catalog;
 use positron_kernel::FormatEpoch;
+use positron_kernel::{Catalog, RetentionTimeAuthority};
 use positron_kernel::{CatalogPublicationFault, with_catalog_publication_fault_after};
 use positron_query::QueryCancellation;
 
@@ -332,6 +336,839 @@ fn unauthorized_and_exact_replayed_migrations_do_not_close_data_admission()
             .enter_query_execution_for(instance.default_tenant_id(), QueryCancellation::new())
             .expect("query remains admitted after replay"),
     );
+    Ok(())
+}
+
+#[test]
+fn durable_format_migration_survives_restart_with_stable_terminal_operation()
+-> Result<(), Box<dyn Error>> {
+    let fixture = LegacyFixtureRoots::from_f9_fixture()?;
+    let paths = fixture.paths()?;
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    let key = AdministrativeIdempotencyKey::new([0xc4; 16])?;
+    let operation = instance.migrate_catalog_to_epoch_two_as_operation(
+        instance.attribute(
+            PresentedCredential::parse(claim.secret())?,
+            RequestedIntent::SystemAdministration,
+            CompatibilityHints::none(),
+        )?,
+        key,
+    )?;
+    assert_eq!(
+        operation.status(),
+        positron_governance::DurableOperationStatus::Succeeded
+    );
+    assert_eq!(operation.progress_percent(), 100);
+    assert_eq!(
+        operation.irreversible_boundary(),
+        positron_governance::DurableOperationBoundary::CatalogGenerationPublished
+    );
+    assert!(
+        !format!("{operation:?}").contains(claim.secret()),
+        "durable operation inspection must never retain or expose an API-key secret"
+    );
+    drop(instance);
+
+    let reopened = InstanceBootstrap::reopen(&paths)?;
+    let replay = reopened.migrate_catalog_to_epoch_two_as_operation(
+        reopened.attribute(
+            PresentedCredential::parse(claim.secret())?,
+            RequestedIntent::SystemAdministration,
+            CompatibilityHints::none(),
+        )?,
+        key,
+    )?;
+    assert_eq!(replay.operation_id(), operation.operation_id());
+    assert_eq!(
+        replay.status(),
+        positron_governance::DurableOperationStatus::Succeeded
+    );
+    Ok(())
+}
+
+#[test]
+fn format_migration_declares_its_irreversible_boundary_before_crossing_it()
+-> Result<(), Box<dyn Error>> {
+    let fixture = LegacyFixtureRoots::from_f9_fixture()?;
+    let paths = fixture.paths()?;
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    let actor = instance.attribute(
+        PresentedCredential::parse(claim.secret())?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let catalog = Catalog::open(
+        &instance._authority,
+        instance.instance,
+        instance.key.catalog_secret(instance.instance)?,
+    )?;
+    let key = AdministrativeIdempotencyKey::new([0xcd; 16])?;
+    let accepted = DurableOperationAdministration::accept_catalog_format_migration(
+        &catalog,
+        actor,
+        DurableOperationRequest::catalog_format_migration(
+            actor.principal_id(),
+            key,
+            instance.instance.to_bytes(),
+            catalog.pin()?.number(),
+            17,
+        )?,
+    )?;
+    let preflight =
+        DurableOperationAdministration::begin(&catalog, actor, accepted.operation_id(), 18)?;
+    let declared_boundary = preflight.declared_irreversible_boundary();
+    assert_eq!(
+        declared_boundary,
+        positron_governance::DurableOperationBoundary::CatalogGenerationPublished,
+        "preflight presents the migration boundary before work begins"
+    );
+    assert_eq!(
+        preflight.irreversible_boundary(),
+        positron_governance::DurableOperationBoundary::NotCrossed,
+        "the persisted boundary remains the crossing fact during preflight"
+    );
+    drop(catalog);
+
+    let succeeded = instance.migrate_catalog_to_epoch_two_as_operation(actor, key)?;
+    assert_eq!(
+        succeeded.declared_irreversible_boundary(),
+        declared_boundary,
+        "the applicable boundary remains stable after completion"
+    );
+    assert_eq!(
+        succeeded.irreversible_boundary(),
+        positron_governance::DurableOperationBoundary::CatalogGenerationPublished,
+        "success records that the declared boundary was crossed"
+    );
+    Ok(())
+}
+
+#[test]
+fn compatibility_migration_publishes_a_durable_operation_transition() -> Result<(), Box<dyn Error>>
+{
+    let fixture = LegacyFixtureRoots::from_f9_fixture()?;
+    let paths = fixture.paths()?;
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    let key = AdministrativeIdempotencyKey::new([0xca; 16])?;
+    instance.migrate_catalog_to_epoch_two(
+        instance.attribute(
+            PresentedCredential::parse(claim.secret())?,
+            RequestedIntent::SystemAdministration,
+            CompatibilityHints::none(),
+        )?,
+        key,
+    )?;
+    assert!(
+        instance
+            .governance_audit_for_test()?
+            .iter()
+            .any(|entry| entry.action() == "durable-operation.transition"),
+        "the compatibility entry point must use the durable-operation authority"
+    );
+    Ok(())
+}
+
+#[test]
+fn compatibility_replays_a_legacy_receipt_without_creating_a_durable_operation()
+-> Result<(), Box<dyn Error>> {
+    let fixture = LegacyFixtureRoots::from_f9_fixture()?;
+    let paths = fixture.paths()?;
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    let actor = instance.attribute(
+        PresentedCredential::parse(claim.secret())?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let key = AdministrativeIdempotencyKey::new([0xcc; 16])?;
+    let catalog = Catalog::open(
+        &instance._authority,
+        instance.instance,
+        instance.key.catalog_secret(instance.instance)?,
+    )?;
+    let legacy = CatalogFormatMigrationAdministration::migrate_to_epoch_two(
+        &catalog,
+        instance.administrator,
+        actor,
+        key,
+    )?;
+    drop(catalog);
+    let audits_before_replay = instance.governance_audit_for_test()?;
+
+    assert_eq!(instance.migrate_catalog_to_epoch_two(actor, key)?, legacy);
+
+    let catalog = Catalog::open(
+        &instance._authority,
+        instance.instance,
+        instance.key.catalog_secret(instance.instance)?,
+    )?;
+    assert!(
+        DurableOperationAdministration::inspect_by_idempotency(&catalog, key)?.is_none(),
+        "a legacy receipt remains a receipt instead of creating a retroactive durable operation"
+    );
+    drop(catalog);
+    assert_eq!(
+        instance.governance_audit_for_test()?,
+        audits_before_replay,
+        "legacy receipt replay does not repeat the migration or publish a new transition"
+    );
+    Ok(())
+}
+
+#[test]
+fn compatibility_retry_completes_a_post_publication_durable_migration() -> Result<(), Box<dyn Error>>
+{
+    let fixture = LegacyFixtureRoots::from_f9_fixture()?;
+    let paths = fixture.paths()?;
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let mut instance = InstanceBootstrap::reopen(&paths)?;
+    let (retention_time, elapsed) =
+        RetentionTimeAuthority::establish_with_manual_elapsed(UnixNanoseconds::new(10_000_000_000));
+    instance.install_retention_time_for_test(retention_time)?;
+    let actor = instance.attribute(
+        PresentedCredential::parse(claim.secret())?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let key = AdministrativeIdempotencyKey::new([0xcb; 16])?;
+
+    with_catalog_publication_fault_after(CatalogPublicationFault::SynchronizeCommit, 5, || {
+        instance.migrate_catalog_to_epoch_two_as_operation(actor, key)
+    })
+    .expect_err("the terminal durable checkpoint is unavailable after the V2 handler publishes");
+
+    let catalog = Catalog::open(
+        &instance._authority,
+        instance.instance,
+        instance.key.catalog_secret(instance.instance)?,
+    )?;
+    let operation_id = DurableOperationAdministration::inspect_by_idempotency(&catalog, key)?
+        .ok_or("published migration operation")?
+        .operation_id();
+    drop(catalog);
+    let pending = instance
+        .get_durable_operation(actor, operation_id)?
+        .ok_or("published migration operation")?;
+    assert_eq!(
+        pending.status(),
+        DurableOperationStatus::Running,
+        "the published handler must remain recoverable until its terminal checkpoint commits"
+    );
+    assert_eq!(
+        pending.phase(),
+        positron_governance::DurableOperationPhase::CatalogPublication
+    );
+    assert_eq!(
+        instance.catalog_format_epoch()?,
+        Some(FormatEpoch::CATALOG_V2)
+    );
+    let audits_before_retry = instance.governance_audit_for_test()?;
+    let migration_audits_before_retry = audits_before_retry
+        .iter()
+        .filter(|entry| entry.action() == "catalog.format.migrate")
+        .count();
+    let successful_transitions_before_retry = audits_before_retry
+        .iter()
+        .filter(|entry| {
+            entry.action() == "durable-operation.transition" && entry.outcome() == "succeeded"
+        })
+        .count();
+    elapsed.advance(1_000_000_000)?;
+
+    let replay = instance.migrate_catalog_to_epoch_two(actor, key)?;
+    let completed = instance
+        .get_durable_operation(actor, pending.operation_id())?
+        .ok_or("completed migration operation")?;
+    assert_eq!(completed.status(), DurableOperationStatus::Succeeded);
+    assert_eq!(
+        completed.phase(),
+        positron_governance::DurableOperationPhase::Published
+    );
+    assert_eq!(completed.updated_at_unix_seconds(), 10);
+    assert_eq!(completed.completed_at_unix_seconds(), Some(10));
+    assert_eq!(replay.from(), FormatEpoch::CATALOG_V1);
+    assert_eq!(replay.to(), FormatEpoch::CATALOG_V2);
+    let audits_after_retry = instance.governance_audit_for_test()?;
+    assert_eq!(
+        audits_after_retry
+            .iter()
+            .filter(|entry| entry.action() == "catalog.format.migrate")
+            .count(),
+        migration_audits_before_retry,
+        "the retry resolves the existing V2 receipt without repeating the migration"
+    );
+    assert_eq!(
+        audits_after_retry
+            .iter()
+            .filter(|entry| {
+                entry.action() == "durable-operation.transition" && entry.outcome() == "succeeded"
+            })
+            .count(),
+        successful_transitions_before_retry + 1,
+        "the recovered terminal transition publishes its bound governance audit once"
+    );
+    Ok(())
+}
+
+#[test]
+fn durable_operation_cancels_before_drain_and_rejects_a_changed_same_key_request()
+-> Result<(), Box<dyn Error>> {
+    let fixture = LegacyFixtureRoots::from_f9_fixture()?;
+    let paths = fixture.paths()?;
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    let actor = instance.attribute(
+        PresentedCredential::parse(claim.secret())?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let catalog = Catalog::open(
+        &instance._authority,
+        instance.instance,
+        instance.key.catalog_secret(instance.instance)?,
+    )?;
+    let key = AdministrativeIdempotencyKey::new([0xc5; 16])?;
+    let accepted_generation = catalog.pin()?.number();
+    let request = DurableOperationRequest::catalog_format_migration(
+        actor.principal_id(),
+        key,
+        instance.instance.to_bytes(),
+        accepted_generation,
+        17,
+    )?;
+    let accepted =
+        DurableOperationAdministration::accept_catalog_format_migration(&catalog, actor, request)?;
+    assert_eq!(
+        DurableOperationAdministration::accept_catalog_format_migration(
+            &catalog,
+            actor,
+            DurableOperationRequest::catalog_format_migration(
+                actor.principal_id(),
+                key,
+                instance.instance.to_bytes(),
+                accepted_generation.saturating_add(1),
+                18,
+            )?,
+        )
+        .expect_err("a changed target generation cannot reuse an accepted key"),
+        DurableOperationFailure::IdempotencyConflict
+    );
+    let cancellation_key = AdministrativeIdempotencyKey::new([0xc4; 16])?;
+    let cancelled = DurableOperationAdministration::cancel(
+        &catalog,
+        actor,
+        accepted.operation_id(),
+        cancellation_key,
+        18,
+    )?;
+    assert_eq!(
+        cancelled.status(),
+        positron_governance::DurableOperationStatus::Cancelled
+    );
+    assert_eq!(
+        cancelled.cancellation(),
+        positron_governance::DurableOperationCancellation::Cancelled
+    );
+    assert_eq!(
+        DurableOperationAdministration::cancel(
+            &catalog,
+            actor,
+            accepted.operation_id(),
+            cancellation_key,
+            19,
+        )?,
+        cancelled,
+        "a lost cancellation response retries the original durable outcome"
+    );
+    Ok(())
+}
+
+#[test]
+fn recovered_preflight_operation_cancels_before_drain_and_stays_terminal()
+-> Result<(), Box<dyn Error>> {
+    let fixture = LegacyFixtureRoots::from_f9_fixture()?;
+    let paths = fixture.paths()?;
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    let actor = instance.attribute(
+        PresentedCredential::parse(claim.secret())?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let catalog = Catalog::open(
+        &instance._authority,
+        instance.instance,
+        instance.key.catalog_secret(instance.instance)?,
+    )?;
+    let operation_key = AdministrativeIdempotencyKey::new([0xd1; 16])?;
+    let accepted = DurableOperationAdministration::accept_catalog_format_migration(
+        &catalog,
+        actor,
+        DurableOperationRequest::catalog_format_migration(
+            actor.principal_id(),
+            operation_key,
+            instance.instance.to_bytes(),
+            catalog.pin()?.number(),
+            17,
+        )?,
+    )?;
+    let preflight =
+        DurableOperationAdministration::begin(&catalog, actor, accepted.operation_id(), 18)?;
+    assert_eq!(preflight.status(), DurableOperationStatus::Running);
+    assert_eq!(
+        preflight.phase(),
+        positron_governance::DurableOperationPhase::Preflight
+    );
+    assert_eq!(
+        preflight.cancellation(),
+        positron_governance::DurableOperationCancellation::AllowedBeforeDrain
+    );
+    assert_eq!(
+        preflight.irreversible_boundary(),
+        positron_governance::DurableOperationBoundary::NotCrossed
+    );
+    drop(catalog);
+    drop(instance);
+
+    let reopened = InstanceBootstrap::reopen(&paths)?;
+    let recovered_actor = reopened.attribute(
+        PresentedCredential::parse(claim.secret())?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let cancelled = reopened
+        .cancel_durable_operation(
+            recovered_actor,
+            accepted.operation_id(),
+            AdministrativeIdempotencyKey::new([0xd2; 16])?,
+        )
+        .map_err(|failure| format!("preflight cancellation: {failure:?}"))?;
+    assert_eq!(cancelled.status(), DurableOperationStatus::Cancelled);
+    assert_eq!(
+        reopened
+            .wait_for_durable_operation(recovered_actor, accepted.operation_id())
+            .map_err(|failure| format!("cancelled wait: {failure:?}"))?,
+        cancelled,
+        "a recovered cancellation remains terminal instead of resuming migration work"
+    );
+    assert_eq!(
+        reopened
+            .migrate_catalog_to_epoch_two_as_operation(recovered_actor, operation_key)
+            .map_err(|failure| format!("cancelled migration retry: {failure:?}"))?,
+        cancelled,
+        "the original migration retry reports the cancelled durable outcome"
+    );
+    Ok(())
+}
+
+#[test]
+fn public_cancellation_reattaches_an_ambiguous_transition_without_accepting_another_key()
+-> Result<(), Box<dyn Error>> {
+    let fixture = LegacyFixtureRoots::from_f9_fixture()?;
+    let paths = fixture.paths()?;
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let mut instance = InstanceBootstrap::reopen(&paths)?;
+    let (retention_time, elapsed) =
+        RetentionTimeAuthority::establish_with_manual_elapsed(UnixNanoseconds::new(10_000_000_000));
+    instance.install_retention_time_for_test(retention_time)?;
+    let actor = instance.attribute(
+        PresentedCredential::parse(claim.secret())?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let catalog = Catalog::open(
+        &instance._authority,
+        instance.instance,
+        instance.key.catalog_secret(instance.instance)?,
+    )?;
+    let operation_key = AdministrativeIdempotencyKey::new([0xc8; 16])?;
+    let accepted = DurableOperationAdministration::accept_catalog_format_migration(
+        &catalog,
+        actor,
+        DurableOperationRequest::catalog_format_migration(
+            actor.principal_id(),
+            operation_key,
+            instance.instance.to_bytes(),
+            catalog.pin()?.number(),
+            10,
+        )?,
+    )?;
+    drop(catalog);
+    let cancellation_key = AdministrativeIdempotencyKey::new([0xc9; 16])?;
+    with_catalog_publication_fault_after(CatalogPublicationFault::SynchronizeCommit, 0, || {
+        instance.cancel_durable_operation(actor, accepted.operation_id(), cancellation_key)
+    })
+    .expect_err("the first cancellation checkpoint acknowledgement is ambiguous");
+    elapsed.advance(1_000_000_000)?;
+
+    assert_eq!(
+        instance
+            .cancel_durable_operation(
+                actor,
+                accepted.operation_id(),
+                AdministrativeIdempotencyKey::new([0xca; 16])?,
+            )
+            .expect_err("a different cancellation key cannot claim the staged transition")
+            .code(),
+        crate::BootstrapFailureCode::ApiKeyIdempotencyConflict
+    );
+    let cancelled =
+        instance.cancel_durable_operation(actor, accepted.operation_id(), cancellation_key)?;
+    assert_eq!(cancelled.operation_id(), accepted.operation_id());
+    assert_eq!(cancelled.status(), DurableOperationStatus::Cancelled);
+    assert_eq!(cancelled.updated_at_unix_seconds(), 10);
+    assert_eq!(cancelled.completed_at_unix_seconds(), Some(10));
+    assert_eq!(
+        instance
+            .governance_audit_for_test()?
+            .iter()
+            .filter(|entry| {
+                entry.action() == "durable-operation.transition" && entry.outcome() == "cancelled"
+            })
+            .count(),
+        1,
+        "resuming the first staged cancellation publishes one audit"
+    );
+    Ok(())
+}
+
+#[test]
+fn durable_acceptance_reattaches_its_first_ambiguous_transition() -> Result<(), Box<dyn Error>> {
+    let fixture = LegacyFixtureRoots::from_f9_fixture()?;
+    let paths = fixture.paths()?;
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    let actor = instance.attribute(
+        PresentedCredential::parse(claim.secret())?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let catalog = Catalog::open(
+        &instance._authority,
+        instance.instance,
+        instance.key.catalog_secret(instance.instance)?,
+    )?;
+    let key = AdministrativeIdempotencyKey::new([0xcb; 16])?;
+    let accepted_generation = catalog.pin()?.number();
+    let audits_before_retry = catalog.governance_audit_records()?.len();
+    with_catalog_publication_fault_after(CatalogPublicationFault::SynchronizeCommit, 0, || {
+        DurableOperationAdministration::accept_catalog_format_migration(
+            &catalog,
+            actor,
+            DurableOperationRequest::catalog_format_migration(
+                actor.principal_id(),
+                key,
+                instance.instance.to_bytes(),
+                accepted_generation,
+                10,
+            )
+            .expect("valid first durable request"),
+        )
+    })
+    .expect_err("the first acceptance checkpoint acknowledgement is ambiguous");
+
+    let accepted = DurableOperationAdministration::accept_catalog_format_migration(
+        &catalog,
+        actor,
+        DurableOperationRequest::catalog_format_migration(
+            actor.principal_id(),
+            key,
+            instance.instance.to_bytes(),
+            accepted_generation,
+            11,
+        )?,
+    )?;
+    assert_eq!(accepted.updated_at_unix_seconds(), 10);
+    assert_eq!(accepted.request().accepted_at_unix_seconds(), 10);
+    assert_eq!(
+        DurableOperationAdministration::inspect_by_idempotency(&catalog, key)?,
+        Some(accepted)
+    );
+    assert_eq!(
+        catalog.governance_audit_records()?.len(),
+        audits_before_retry + 1,
+        "resuming the first staged acceptance publishes one audit"
+    );
+    Ok(())
+}
+
+#[test]
+fn durable_operation_persists_terminal_handler_rejection_and_runtime_accessors()
+-> Result<(), Box<dyn Error>> {
+    let fixture = LegacyFixtureRoots::from_f9_fixture()?;
+    let paths = fixture.paths()?;
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    let actor = instance.attribute(
+        PresentedCredential::parse(claim.secret())?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let catalog = Catalog::open(
+        &instance._authority,
+        instance.instance,
+        instance.key.catalog_secret(instance.instance)?,
+    )?;
+    let request = DurableOperationRequest::catalog_format_migration(
+        actor.principal_id(),
+        AdministrativeIdempotencyKey::new([0xc7; 16])?,
+        instance.instance.to_bytes(),
+        catalog.pin()?.number(),
+        17,
+    )?;
+    let accepted =
+        DurableOperationAdministration::accept_catalog_format_migration(&catalog, actor, request)?;
+    let running =
+        DurableOperationAdministration::begin(&catalog, actor, accepted.operation_id(), 18)?;
+    let draining =
+        DurableOperationAdministration::mark_draining(&catalog, actor, running.operation_id(), 19)?;
+    assert_eq!(
+        draining.phase(),
+        positron_governance::DurableOperationPhase::Draining,
+        "before closing admission, persisted status truthfully records the active drain"
+    );
+    assert_eq!(
+        DurableOperationAdministration::cancel(
+            &catalog,
+            actor,
+            draining.operation_id(),
+            AdministrativeIdempotencyKey::new([0xc2; 16])?,
+            20,
+        ),
+        Err(DurableOperationFailure::CancellationUnavailable),
+        "crossing into drain makes cancellation unavailable before catalog publication"
+    );
+    let publishing =
+        DurableOperationAdministration::mark_drained(&catalog, actor, draining.operation_id(), 20)?;
+    assert_eq!(
+        publishing.phase(),
+        positron_governance::DurableOperationPhase::CatalogPublication,
+        "after admission is drained, persisted status truthfully names the next handler boundary"
+    );
+    let failed = DurableOperationAdministration::fail_catalog_format_migration(
+        &catalog,
+        actor,
+        publishing.operation_id(),
+        21,
+        DurableOperationTerminalError::HandlerRejected,
+    )?;
+    assert_eq!(failed.status(), DurableOperationStatus::Failed);
+    assert_eq!(
+        failed.terminal_error(),
+        Some(DurableOperationTerminalError::HandlerRejected)
+    );
+    assert_eq!(
+        failed.earliest_lookup_expiry_unix_seconds(),
+        Some(2_592_021)
+    );
+    drop(catalog);
+
+    assert_eq!(
+        instance.get_durable_operation(actor, failed.operation_id())?,
+        Some(failed),
+        "authorized runtime inspection returns the persisted terminal error"
+    );
+    let audit = instance
+        .governance_audit_for_test()?
+        .into_iter()
+        .find(|entry| {
+            entry.action() == "durable-operation.transition" && entry.outcome() == "failed"
+        })
+        .ok_or("terminal durable-operation audit")?;
+    let positron_governance::GovernanceAuditEntry::DurableOperation(audit) = audit else {
+        return Err("wrong durable-operation audit type".into());
+    };
+    assert_eq!(audit.acting_principal(), Some(actor.principal_id()));
+    assert_eq!(audit.applicable_tenant(), None);
+    assert_eq!(audit.target(), failed.operation_id());
+    assert_eq!(audit.request_id(), Some(request.idempotency_key()));
+    assert_eq!(
+        audit.accepted_generation(),
+        Some(request.accepted_generation())
+    );
+    assert_eq!(
+        failed.target_identity(),
+        Some(instance.instance.to_bytes()),
+        "operation status exposes the authoritative instance target, not its catalog generation"
+    );
+    assert_eq!(
+        audit.progress_percent(),
+        Some(publishing.progress_percent())
+    );
+    assert_eq!(
+        instance.wait_for_durable_operation(actor, failed.operation_id())?,
+        failed,
+        "waiting a terminal operation does not fabricate a retry"
+    );
+    assert_eq!(
+        instance
+            .cancel_durable_operation(
+                actor,
+                failed.operation_id(),
+                AdministrativeIdempotencyKey::new([0xc3; 16])?,
+            )
+            .expect_err("a terminal failure cannot be cancelled")
+            .code(),
+        crate::BootstrapFailureCode::DurableOperationCancellationUnavailable
+    );
+    Ok(())
+}
+
+#[test]
+fn runtime_migration_persists_draining_while_admission_is_closed() -> Result<(), Box<dyn Error>> {
+    let fixture = LegacyFixtureRoots::from_f9_fixture()?;
+    let paths = fixture.paths()?;
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = Arc::new(InstanceBootstrap::reopen(&paths)?);
+    let actor = instance.attribute(
+        PresentedCredential::parse(claim.secret())?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let key = AdministrativeIdempotencyKey::new([0xca; 16])?;
+    let held_admission = instance.enter_ingest_finalization_for(instance.tenant)?;
+    let failed_drain = instance
+        .migrate_catalog_to_epoch_two_as_operation(actor, key)
+        .expect_err("held admitted work prevents migration drain completion");
+    assert_eq!(
+        failed_drain.code(),
+        crate::BootstrapFailureCode::ResourceUnavailable
+    );
+    let catalog = Catalog::open(
+        &instance._authority,
+        instance.instance,
+        instance.key.catalog_secret(instance.instance)?,
+    )?;
+    let persisted = DurableOperationAdministration::inspect_by_idempotency(&catalog, key)?
+        .ok_or("persisted durable operation")?;
+    assert_eq!(
+        persisted.phase(),
+        positron_governance::DurableOperationPhase::Draining,
+        "callers inspecting a migration blocked in drain see the current phase"
+    );
+
+    drop(held_admission);
+    Ok(())
+}
+
+#[test]
+fn expired_operation_lookup_keeps_its_idempotency_binding_without_reopening_work()
+-> Result<(), Box<dyn Error>> {
+    let fixture = LegacyFixtureRoots::from_f9_fixture()?;
+    let paths = fixture.paths()?;
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    let actor = instance.attribute(
+        PresentedCredential::parse(claim.secret())?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let catalog = Catalog::open(
+        &instance._authority,
+        instance.instance,
+        instance.key.catalog_secret(instance.instance)?,
+    )?;
+    let request = DurableOperationRequest::catalog_format_migration(
+        actor.principal_id(),
+        AdministrativeIdempotencyKey::new([0xc8; 16])?,
+        instance.instance.to_bytes(),
+        catalog.pin()?.number(),
+        17,
+    )?;
+    let accepted =
+        DurableOperationAdministration::accept_catalog_format_migration(&catalog, actor, request)?;
+    let running =
+        DurableOperationAdministration::begin(&catalog, actor, accepted.operation_id(), 18)?;
+    DurableOperationAdministration::fail_catalog_format_migration(
+        &catalog,
+        actor,
+        running.operation_id(),
+        19,
+        DurableOperationTerminalError::HandlerRejected,
+    )?;
+
+    let later = DurableOperationRequest::catalog_format_migration(
+        actor.principal_id(),
+        AdministrativeIdempotencyKey::new([0xc9; 16])?,
+        instance.instance.to_bytes(),
+        catalog.pin()?.number(),
+        2_592_019,
+    )?;
+    DurableOperationAdministration::accept_catalog_format_migration(&catalog, actor, later)?;
+    assert_eq!(
+        DurableOperationAdministration::accept_catalog_format_migration(&catalog, actor, request)
+            .expect_err("expired lookup remains bound to its original request"),
+        DurableOperationFailure::CompletedLookupExpired
+    );
+    let changed = DurableOperationRequest::catalog_format_migration(
+        actor.principal_id(),
+        request.idempotency_key(),
+        instance.instance.to_bytes(),
+        request.accepted_generation().saturating_add(1),
+        2_592_020,
+    )?;
+    assert_eq!(
+        DurableOperationAdministration::accept_catalog_format_migration(&catalog, actor, changed)
+            .expect_err("a changed request cannot reuse an expired operation key"),
+        DurableOperationFailure::IdempotencyConflict
+    );
+    Ok(())
+}
+
+#[test]
+fn durable_operation_reattaches_a_persisted_running_checkpoint_after_restart()
+-> Result<(), Box<dyn Error>> {
+    let fixture = LegacyFixtureRoots::from_f9_fixture()?;
+    let paths = fixture.paths()?;
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    let actor = instance.attribute(
+        PresentedCredential::parse(claim.secret())?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let catalog = Catalog::open(
+        &instance._authority,
+        instance.instance,
+        instance.key.catalog_secret(instance.instance)?,
+    )?;
+    let key = AdministrativeIdempotencyKey::new([0xc6; 16])?;
+    let request = DurableOperationRequest::catalog_format_migration(
+        actor.principal_id(),
+        key,
+        instance.instance.to_bytes(),
+        catalog.pin()?.number(),
+        17,
+    )?;
+    let accepted =
+        DurableOperationAdministration::accept_catalog_format_migration(&catalog, actor, request)?;
+    let running =
+        DurableOperationAdministration::begin(&catalog, actor, accepted.operation_id(), 18)?;
+    assert_eq!(
+        running.status(),
+        positron_governance::DurableOperationStatus::Running
+    );
+    drop(catalog);
+    drop(instance);
+
+    let reopened = InstanceBootstrap::reopen(&paths)?;
+    let completed = reopened.migrate_catalog_to_epoch_two_as_operation(
+        reopened.attribute(
+            PresentedCredential::parse(claim.secret())?,
+            RequestedIntent::SystemAdministration,
+            CompatibilityHints::none(),
+        )?,
+        key,
+    )?;
+    assert_eq!(completed.operation_id(), accepted.operation_id());
+    assert_eq!(
+        completed.status(),
+        positron_governance::DurableOperationStatus::Succeeded
+    );
+    assert_eq!(completed.progress_percent(), 100);
     Ok(())
 }
 

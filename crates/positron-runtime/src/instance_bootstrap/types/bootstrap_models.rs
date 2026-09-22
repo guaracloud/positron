@@ -54,6 +54,9 @@ pub enum BootstrapFailureCode {
     SystemAuditRetentionStaleGeneration,
     SystemAuditRetentionIdempotencyConflict,
     TenantCreateConflict,
+    DurableOperationLookupExpired,
+    DurableOperationUnknown,
+    DurableOperationCancellationUnavailable,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

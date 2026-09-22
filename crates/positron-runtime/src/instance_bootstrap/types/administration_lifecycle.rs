@@ -1,46 +1,226 @@
 use super::*;
 
 impl InitializedInstance {
-    /// Publishes the concrete V1-to-V2 Catalog transformation while both
-    /// native data admission gates are closed. Broader upgrade orchestration
-    /// remains outside this narrowly scoped format transition.
-    pub fn migrate_catalog_to_epoch_two(
+    /// Accepts, checkpoints, and resumes the existing catalog-format handler.
+    ///
+    /// Cancellation is possible until the durable preflight starts draining.
+    /// Once data admission has drained, the operation records that cancellation
+    /// cannot undo a future published Catalog generation. Every checkpoint and
+    /// the handler publication acquire the kernel's catalog-commit recovery
+    /// reservation; restart reattaches by the original idempotency key.
+    pub fn migrate_catalog_to_epoch_two_as_operation(
         &self,
         actor: AuthorizedContext,
         idempotency: AdministrativeIdempotencyKey,
-    ) -> Result<CatalogFormatMigration, BootstrapFailure> {
-        let preflight = self.catalog_migration_preflight(actor, idempotency)?;
-        if let Some(replay) = preflight {
-            return Ok(replay);
-        }
-        #[cfg(test)]
-        let catalog_migration_preflight_hook = self
-            .catalog_migration_preflight_hook
-            .lock()
-            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?
-            .clone();
-        #[cfg(test)]
-        if let Some(hook) = catalog_migration_preflight_hook {
-            hook();
-        }
-        let _drain = self.tenant_drains.close_all_and_drain()?;
-        let preflight = self.catalog_migration_preflight(actor, idempotency)?;
-        if let Some(replay) = preflight {
-            return Ok(replay);
-        }
+    ) -> Result<DurableOperation, BootstrapFailure> {
         let secret = self
             .key
             .catalog_secret(self.instance)
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
         let catalog = Catalog::open(&self._authority, self.instance, secret)
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
-        CatalogFormatMigrationAdministration::migrate_to_epoch_two(
+        let now = self.operation_time_seconds()?;
+        let operation =
+            match DurableOperationAdministration::inspect_by_idempotency(&catalog, idempotency)
+                .map_err(map_durable_operation_failure)?
+            {
+                Some(existing) => {
+                    if existing.request().principal() != actor.principal_id() {
+                        return Err(BootstrapFailure::new(
+                            BootstrapFailureCode::ApiKeyIdempotencyConflict,
+                        ));
+                    }
+                    existing
+                },
+                None => {
+                    let generation = catalog
+                        .pin()
+                        .map_err(|_| {
+                            BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable)
+                        })?
+                        .number();
+                    let request = DurableOperationRequest::catalog_format_migration(
+                        actor.principal_id(),
+                        idempotency,
+                        self.instance.to_bytes(),
+                        generation,
+                        now,
+                    )
+                    .map_err(map_durable_operation_failure)?;
+                    DurableOperationAdministration::accept_catalog_format_migration(
+                        &catalog, actor, request,
+                    )
+                    .map_err(map_durable_operation_failure)?
+                },
+            };
+        if operation.status().is_terminal() {
+            return Ok(operation);
+        }
+        let operation = if operation.status() == DurableOperationStatus::Pending {
+            DurableOperationAdministration::begin(&catalog, actor, operation.operation_id(), now)
+                .map_err(map_durable_operation_failure)?
+        } else {
+            operation
+        };
+        let operation =
+            if operation.phase() == positron_governance::DurableOperationPhase::Preflight {
+                DurableOperationAdministration::mark_draining(
+                    &catalog,
+                    actor,
+                    operation.operation_id(),
+                    now,
+                )
+                .map_err(map_durable_operation_failure)?
+            } else {
+                operation
+            };
+        let _drain = self.tenant_drains.close_all_and_drain()?;
+        let operation = if operation.phase() == positron_governance::DurableOperationPhase::Draining
+        {
+            DurableOperationAdministration::mark_drained(
+                &catalog,
+                actor,
+                operation.operation_id(),
+                now,
+            )
+            .map_err(map_durable_operation_failure)?
+        } else {
+            operation
+        };
+        let migration = CatalogFormatMigrationAdministration::migrate_to_epoch_two(
             &catalog,
             self.administrator,
             actor,
             idempotency,
+        );
+        if let Err(failure) = migration {
+            if failure != CatalogFormatMigrationFailure::PersistenceUnavailable {
+                DurableOperationAdministration::fail_catalog_format_migration(
+                    &catalog,
+                    actor,
+                    operation.operation_id(),
+                    now,
+                    DurableOperationTerminalError::HandlerRejected,
+                )
+                .map_err(map_durable_operation_failure)?;
+            }
+            return Err(map_catalog_format_migration_failure(failure));
+        }
+        DurableOperationAdministration::succeed_catalog_format_migration(
+            &catalog,
+            actor,
+            operation.operation_id(),
+            now,
         )
-        .map_err(map_catalog_format_migration_failure)
+        .map_err(map_durable_operation_failure)
+    }
+
+    fn operation_time_seconds(&self) -> Result<u64, BootstrapFailure> {
+        let scope =
+            positron_kernel::SegmentScope::new(self.tenant, SignalKind::Logs, self.logs_shard);
+        self.retention_time
+            .governance_time_seconds(scope)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))
+    }
+
+    /// Compatibility receipt for callers that predate the durable-operation
+    /// result. The operation authority remains the only execution path.
+    pub fn migrate_catalog_to_epoch_two(
+        &self,
+        actor: AuthorizedContext,
+        idempotency: AdministrativeIdempotencyKey,
+    ) -> Result<CatalogFormatMigration, BootstrapFailure> {
+        #[cfg(test)]
+        {
+            let hook = self
+                .catalog_migration_preflight_hook
+                .lock()
+                .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?
+                .clone();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        if let Some(replay) = self.catalog_migration_preflight(actor, idempotency)? {
+            if DurableOperationAdministration::inspect_by_idempotency(
+                &self.open_operation_catalog()?,
+                idempotency,
+            )
+            .map_err(map_durable_operation_failure)?
+            .is_some()
+            {
+                let operation =
+                    self.migrate_catalog_to_epoch_two_as_operation(actor, idempotency)?;
+                if operation.status() != DurableOperationStatus::Succeeded {
+                    return Err(BootstrapFailure::new(
+                        BootstrapFailureCode::CatalogUnavailable,
+                    ));
+                }
+            }
+            return Ok(replay);
+        }
+        let operation = self.migrate_catalog_to_epoch_two_as_operation(actor, idempotency)?;
+        if operation.status() != DurableOperationStatus::Succeeded {
+            return Err(BootstrapFailure::new(
+                BootstrapFailureCode::CatalogUnavailable,
+            ));
+        }
+        self.catalog_migration_preflight(actor, idempotency)?
+            .ok_or_else(|| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))
+    }
+
+    /// Returns one authorized durable operation without exposing Catalog state.
+    pub fn get_durable_operation(
+        &self,
+        actor: AuthorizedContext,
+        operation_id: positron_governance::OperationId,
+    ) -> Result<Option<DurableOperation>, BootstrapFailure> {
+        let catalog = self.open_operation_catalog()?;
+        DurableOperationAdministration::inspect_authorized(&catalog, actor, operation_id)
+            .map_err(map_durable_operation_failure)
+    }
+
+    /// Cooperatively resumes the concrete handler and returns its terminal or
+    /// current durable state; it never fabricates failure after an ambiguous stop.
+    pub fn wait_for_durable_operation(
+        &self,
+        actor: AuthorizedContext,
+        operation_id: positron_governance::OperationId,
+    ) -> Result<DurableOperation, BootstrapFailure> {
+        let operation = self
+            .get_durable_operation(actor, operation_id)?
+            .ok_or_else(|| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        if operation.status().is_terminal() {
+            return Ok(operation);
+        }
+        self.migrate_catalog_to_epoch_two_as_operation(actor, operation.request().idempotency_key())
+    }
+
+    /// Cancels an operation only at its persisted cooperative cancellation point.
+    pub fn cancel_durable_operation(
+        &self,
+        actor: AuthorizedContext,
+        operation_id: positron_governance::OperationId,
+        idempotency: AdministrativeIdempotencyKey,
+    ) -> Result<DurableOperation, BootstrapFailure> {
+        let catalog = self.open_operation_catalog()?;
+        DurableOperationAdministration::cancel(
+            &catalog,
+            actor,
+            operation_id,
+            idempotency,
+            self.operation_time_seconds()?,
+        )
+        .map_err(map_durable_operation_failure)
+    }
+
+    fn open_operation_catalog(&self) -> Result<Catalog<'_>, BootstrapFailure> {
+        let secret = self
+            .key
+            .catalog_secret(self.instance)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
+        Catalog::open(&self._authority, self.instance, secret)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))
     }
 
     fn catalog_migration_preflight(
