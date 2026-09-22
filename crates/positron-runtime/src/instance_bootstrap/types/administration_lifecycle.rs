@@ -3,7 +3,7 @@ use super::*;
 impl InitializedInstance {
     /// Accepts, checkpoints, and resumes the existing catalog-format handler.
     ///
-    /// Cancellation is possible only while the record remains `Pending`.
+    /// Cancellation is possible until the durable preflight starts draining.
     /// Once data admission has drained, the operation records that cancellation
     /// cannot undo a future published Catalog generation. Every checkpoint and
     /// the handler publication acquire the kernel's catalog-commit recovery

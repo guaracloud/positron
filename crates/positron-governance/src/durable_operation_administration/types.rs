@@ -606,14 +606,26 @@ impl DurableOperation {
                 .then_some(self)
                 .ok_or(DurableOperationFailure::IdempotencyConflict);
         }
-        if self.status != DurableOperationStatus::Pending
-            || self.boundary != DurableOperationBoundary::NotCrossed
-            || now < self.updated_at_unix_seconds
-        {
+        let cancellable = matches!(
+            (self.status, self.phase, self.cancellation, self.boundary,),
+            (
+                DurableOperationStatus::Pending,
+                DurableOperationPhase::Accepted,
+                DurableOperationCancellation::AllowedBeforeDrain,
+                DurableOperationBoundary::NotCrossed,
+            ) | (
+                DurableOperationStatus::Running,
+                DurableOperationPhase::Preflight,
+                DurableOperationCancellation::AllowedBeforeDrain,
+                DurableOperationBoundary::NotCrossed,
+            )
+        );
+        if !cancellable || now < self.updated_at_unix_seconds {
             return Err(DurableOperationFailure::CancellationUnavailable);
         }
         self.status = DurableOperationStatus::Cancelled;
         self.phase = DurableOperationPhase::Cancelled;
+        self.progress_percent = 0;
         self.retry = DurableOperationRetry::Never;
         self.cancellation = DurableOperationCancellation::Cancelled;
         self.cancellation_idempotency = Some(idempotency);

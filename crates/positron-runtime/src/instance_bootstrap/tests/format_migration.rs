@@ -629,6 +629,84 @@ fn durable_operation_cancels_before_drain_and_rejects_a_changed_same_key_request
 }
 
 #[test]
+fn recovered_preflight_operation_cancels_before_drain_and_stays_terminal()
+-> Result<(), Box<dyn Error>> {
+    let fixture = LegacyFixtureRoots::from_f9_fixture()?;
+    let paths = fixture.paths()?;
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    let actor = instance.attribute(
+        PresentedCredential::parse(claim.secret())?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let catalog = Catalog::open(
+        &instance._authority,
+        instance.instance,
+        instance.key.catalog_secret(instance.instance)?,
+    )?;
+    let operation_key = AdministrativeIdempotencyKey::new([0xd1; 16])?;
+    let accepted = DurableOperationAdministration::accept_catalog_format_migration(
+        &catalog,
+        actor,
+        DurableOperationRequest::catalog_format_migration(
+            actor.principal_id(),
+            operation_key,
+            instance.instance.to_bytes(),
+            catalog.pin()?.number(),
+            17,
+        )?,
+    )?;
+    let preflight =
+        DurableOperationAdministration::begin(&catalog, actor, accepted.operation_id(), 18)?;
+    assert_eq!(preflight.status(), DurableOperationStatus::Running);
+    assert_eq!(
+        preflight.phase(),
+        positron_governance::DurableOperationPhase::Preflight
+    );
+    assert_eq!(
+        preflight.cancellation(),
+        positron_governance::DurableOperationCancellation::AllowedBeforeDrain
+    );
+    assert_eq!(
+        preflight.irreversible_boundary(),
+        positron_governance::DurableOperationBoundary::NotCrossed
+    );
+    drop(catalog);
+    drop(instance);
+
+    let reopened = InstanceBootstrap::reopen(&paths)?;
+    let recovered_actor = reopened.attribute(
+        PresentedCredential::parse(claim.secret())?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let cancelled = reopened
+        .cancel_durable_operation(
+            recovered_actor,
+            accepted.operation_id(),
+            AdministrativeIdempotencyKey::new([0xd2; 16])?,
+        )
+        .map_err(|failure| format!("preflight cancellation: {failure:?}"))?;
+    assert_eq!(cancelled.status(), DurableOperationStatus::Cancelled);
+    assert_eq!(
+        reopened
+            .wait_for_durable_operation(recovered_actor, accepted.operation_id())
+            .map_err(|failure| format!("cancelled wait: {failure:?}"))?,
+        cancelled,
+        "a recovered cancellation remains terminal instead of resuming migration work"
+    );
+    assert_eq!(
+        reopened
+            .migrate_catalog_to_epoch_two_as_operation(recovered_actor, operation_key)
+            .map_err(|failure| format!("cancelled migration retry: {failure:?}"))?,
+        cancelled,
+        "the original migration retry reports the cancelled durable outcome"
+    );
+    Ok(())
+}
+
+#[test]
 fn public_cancellation_reattaches_an_ambiguous_transition_without_accepting_another_key()
 -> Result<(), Box<dyn Error>> {
     let fixture = LegacyFixtureRoots::from_f9_fixture()?;
@@ -793,6 +871,17 @@ fn durable_operation_persists_terminal_handler_rejection_and_runtime_accessors()
         draining.phase(),
         positron_governance::DurableOperationPhase::Draining,
         "before closing admission, persisted status truthfully records the active drain"
+    );
+    assert_eq!(
+        DurableOperationAdministration::cancel(
+            &catalog,
+            actor,
+            draining.operation_id(),
+            AdministrativeIdempotencyKey::new([0xc2; 16])?,
+            20,
+        ),
+        Err(DurableOperationFailure::CancellationUnavailable),
+        "crossing into drain makes cancellation unavailable before catalog publication"
     );
     let publishing =
         DurableOperationAdministration::mark_drained(&catalog, actor, draining.operation_id(), 20)?;
