@@ -388,6 +388,64 @@ fn durable_format_migration_survives_restart_with_stable_terminal_operation()
 }
 
 #[test]
+fn format_migration_declares_its_irreversible_boundary_before_crossing_it()
+-> Result<(), Box<dyn Error>> {
+    let fixture = LegacyFixtureRoots::from_f9_fixture()?;
+    let paths = fixture.paths()?;
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    let actor = instance.attribute(
+        PresentedCredential::parse(claim.secret())?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let catalog = Catalog::open(
+        &instance._authority,
+        instance.instance,
+        instance.key.catalog_secret(instance.instance)?,
+    )?;
+    let key = AdministrativeIdempotencyKey::new([0xcd; 16])?;
+    let accepted = DurableOperationAdministration::accept_catalog_format_migration(
+        &catalog,
+        actor,
+        DurableOperationRequest::catalog_format_migration(
+            actor.principal_id(),
+            key,
+            instance.instance.to_bytes(),
+            catalog.pin()?.number(),
+            17,
+        )?,
+    )?;
+    let preflight =
+        DurableOperationAdministration::begin(&catalog, actor, accepted.operation_id(), 18)?;
+    let declared_boundary = preflight.declared_irreversible_boundary();
+    assert_eq!(
+        declared_boundary,
+        positron_governance::DurableOperationBoundary::CatalogGenerationPublished,
+        "preflight presents the migration boundary before work begins"
+    );
+    assert_eq!(
+        preflight.irreversible_boundary(),
+        positron_governance::DurableOperationBoundary::NotCrossed,
+        "the persisted boundary remains the crossing fact during preflight"
+    );
+    drop(catalog);
+
+    let succeeded = instance.migrate_catalog_to_epoch_two_as_operation(actor, key)?;
+    assert_eq!(
+        succeeded.declared_irreversible_boundary(),
+        declared_boundary,
+        "the applicable boundary remains stable after completion"
+    );
+    assert_eq!(
+        succeeded.irreversible_boundary(),
+        positron_governance::DurableOperationBoundary::CatalogGenerationPublished,
+        "success records that the declared boundary was crossed"
+    );
+    Ok(())
+}
+
+#[test]
 fn compatibility_migration_publishes_a_durable_operation_transition() -> Result<(), Box<dyn Error>>
 {
     let fixture = LegacyFixtureRoots::from_f9_fixture()?;

@@ -19,6 +19,14 @@ pub enum DurableOperationKind {
 }
 
 impl DurableOperationKind {
+    /// Names this handler's applicable irreversible boundary before execution.
+    #[must_use]
+    pub const fn declared_irreversible_boundary(self) -> DurableOperationBoundary {
+        match self {
+            Self::CatalogFormatMigration => DurableOperationBoundary::CatalogGenerationPublished,
+        }
+    }
+
     pub(super) const fn code(self) -> u8 {
         match self {
             Self::CatalogFormatMigration => 1,
@@ -460,6 +468,11 @@ impl DurableOperation {
     #[must_use]
     pub const fn irreversible_boundary(self) -> DurableOperationBoundary {
         self.boundary
+    }
+    /// Returns the boundary declared by this operation's handler.
+    #[must_use]
+    pub const fn declared_irreversible_boundary(self) -> DurableOperationBoundary {
+        self.request.kind().declared_irreversible_boundary()
     }
     #[must_use]
     pub const fn terminal_error(self) -> Option<DurableOperationTerminalError> {
