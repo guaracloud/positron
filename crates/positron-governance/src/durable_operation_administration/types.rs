@@ -204,6 +204,24 @@ impl DurableOperationRequest {
             && self.accepted_generation == other.accepted_generation
             && self.digest == other.digest
     }
+
+    pub(super) fn is_valid_persisted_request(self) -> bool {
+        match self.kind {
+            DurableOperationKind::CatalogFormatMigration => self
+                .target_identity
+                .and_then(|target_identity| {
+                    Self::catalog_format_migration(
+                        self.principal,
+                        self.idempotency,
+                        target_identity,
+                        self.accepted_generation,
+                        self.accepted_at_unix_seconds,
+                    )
+                    .ok()
+                })
+                .is_some_and(|canonical| canonical == self),
+        }
+    }
 }
 
 /// Persisted terminal and non-terminal state of one durable operation.
@@ -523,11 +541,32 @@ impl DurableOperation {
     }
 
     pub(super) fn drained(mut self, now: u64) -> Result<Self, DurableOperationFailure> {
-        if self.status != DurableOperationStatus::Running || now < self.updated_at_unix_seconds {
+        if self.status != DurableOperationStatus::Running
+            || self.phase != DurableOperationPhase::Draining
+            || now < self.updated_at_unix_seconds
+        {
             return Err(DurableOperationFailure::InvalidState);
         }
         self.phase = DurableOperationPhase::CatalogPublication;
         self.progress_percent = 50;
+        self.cancellation = DurableOperationCancellation::NotAllowedAfterDrain;
+        self.updated_at_unix_seconds = now;
+        self.revision = self
+            .revision
+            .checked_add(1)
+            .ok_or(DurableOperationFailure::CapacityExceeded)?;
+        Ok(self)
+    }
+
+    pub(super) fn draining(mut self, now: u64) -> Result<Self, DurableOperationFailure> {
+        if self.status != DurableOperationStatus::Running
+            || self.phase != DurableOperationPhase::Preflight
+            || now < self.updated_at_unix_seconds
+        {
+            return Err(DurableOperationFailure::InvalidState);
+        }
+        self.phase = DurableOperationPhase::Draining;
+        self.progress_percent = 25;
         self.cancellation = DurableOperationCancellation::NotAllowedAfterDrain;
         self.updated_at_unix_seconds = now;
         self.revision = self
@@ -605,6 +644,82 @@ impl DurableOperation {
             .checked_add(1)
             .ok_or(DurableOperationFailure::CapacityExceeded)?;
         Ok(self)
+    }
+
+    pub(super) fn is_legal_persisted_state(self) -> bool {
+        if !self.request.is_valid_persisted_request()
+            || self.updated_at_unix_seconds < self.request.accepted_at_unix_seconds
+            || self.revision == 0
+        {
+            return false;
+        }
+
+        let active_checkpoint = match self.phase {
+            DurableOperationPhase::Preflight => {
+                Some((10, DurableOperationCancellation::AllowedBeforeDrain))
+            },
+            DurableOperationPhase::Draining => {
+                Some((25, DurableOperationCancellation::NotAllowedAfterDrain))
+            },
+            DurableOperationPhase::CatalogPublication => {
+                Some((50, DurableOperationCancellation::NotAllowedAfterDrain))
+            },
+            _ => None,
+        };
+        match self.status {
+            DurableOperationStatus::Pending => {
+                self.phase == DurableOperationPhase::Accepted
+                    && self.progress_percent == 0
+                    && self.retry == DurableOperationRetry::InspectByOperationId
+                    && self.cancellation == DurableOperationCancellation::AllowedBeforeDrain
+                    && self.boundary == DurableOperationBoundary::NotCrossed
+                    && self.terminal_error.is_none()
+                    && self.cancellation_idempotency.is_none()
+                    && self.completed_at_unix_seconds.is_none()
+            },
+            DurableOperationStatus::Running => {
+                active_checkpoint.is_some_and(|(progress, cancellation)| {
+                    self.progress_percent == progress
+                        && self.retry == DurableOperationRetry::InspectByOperationId
+                        && self.cancellation == cancellation
+                        && self.boundary == DurableOperationBoundary::NotCrossed
+                        && self.terminal_error.is_none()
+                        && self.cancellation_idempotency.is_none()
+                        && self.completed_at_unix_seconds.is_none()
+                })
+            },
+            DurableOperationStatus::Succeeded => {
+                self.phase == DurableOperationPhase::Published
+                    && self.progress_percent == 100
+                    && self.retry == DurableOperationRetry::Never
+                    && self.cancellation == DurableOperationCancellation::NotAllowedAfterDrain
+                    && self.boundary == DurableOperationBoundary::CatalogGenerationPublished
+                    && self.terminal_error.is_none()
+                    && self.cancellation_idempotency.is_none()
+                    && self.completed_at_unix_seconds == Some(self.updated_at_unix_seconds)
+            },
+            DurableOperationStatus::Failed => {
+                active_checkpoint.is_some_and(|(progress, cancellation)| {
+                    self.progress_percent == progress
+                        && self.retry == DurableOperationRetry::Never
+                        && self.cancellation == cancellation
+                        && self.boundary == DurableOperationBoundary::NotCrossed
+                        && self.terminal_error.is_some()
+                        && self.cancellation_idempotency.is_none()
+                        && self.completed_at_unix_seconds == Some(self.updated_at_unix_seconds)
+                })
+            },
+            DurableOperationStatus::Cancelled => {
+                self.phase == DurableOperationPhase::Cancelled
+                    && self.progress_percent == 0
+                    && self.retry == DurableOperationRetry::Never
+                    && self.cancellation == DurableOperationCancellation::Cancelled
+                    && self.boundary == DurableOperationBoundary::NotCrossed
+                    && self.terminal_error.is_none()
+                    && self.cancellation_idempotency.is_some()
+                    && self.completed_at_unix_seconds == Some(self.updated_at_unix_seconds)
+            },
+        }
     }
 }
 

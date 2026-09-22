@@ -117,7 +117,21 @@ impl DurableOperationAdministration {
         publish(catalog, &snapshot, operation.begin(now)?)
     }
 
-    /// Records the point after which cancellation cannot claim to reverse a migration.
+    /// Persists that the handler is closing admission before waiting for its drain.
+    pub fn mark_draining(
+        catalog: &Catalog<'_>,
+        actor: crate::AuthorizedContext,
+        operation_id: OperationId,
+        now: u64,
+    ) -> Result<DurableOperation, DurableOperationFailure> {
+        let snapshot = catalog.pin().map_err(map_catalog)?;
+        let operation = find_by_id(&snapshot, operation_id)?
+            .ok_or(DurableOperationFailure::UnknownOperation)?;
+        validate_system_actor(actor, operation.request.principal)?;
+        publish(catalog, &snapshot, operation.draining(now)?)
+    }
+
+    /// Records completion of admission drain before Catalog publication begins.
     pub fn mark_drained(
         catalog: &Catalog<'_>,
         actor: crate::AuthorizedContext,

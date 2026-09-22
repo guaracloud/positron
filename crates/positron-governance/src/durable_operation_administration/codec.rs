@@ -178,10 +178,7 @@ pub(super) fn decode_operation(
         ),
         _ => return Err(DurableOperationFailure::PersistenceUnavailable),
     };
-    if updated_at_unix_seconds < accepted_at_unix_seconds
-        || revision == 0
-        || offset != encoded.len()
-    {
+    if offset != encoded.len() {
         return Err(DurableOperationFailure::PersistenceUnavailable);
     }
     let completed_at_unix_seconds = if completed == 0 {
@@ -189,14 +186,7 @@ pub(super) fn decode_operation(
     } else {
         Some(completed)
     };
-    if status.is_terminal() != completed_at_unix_seconds.is_some()
-        || (status == DurableOperationStatus::Failed && terminal_error.is_none())
-        || (status != DurableOperationStatus::Failed && terminal_error.is_some())
-        || (status == DurableOperationStatus::Cancelled) != cancellation_idempotency.is_some()
-    {
-        return Err(DurableOperationFailure::PersistenceUnavailable);
-    }
-    Ok(Some(DurableOperation {
+    let operation = DurableOperation {
         request,
         status,
         phase,
@@ -209,7 +199,11 @@ pub(super) fn decode_operation(
         updated_at_unix_seconds,
         completed_at_unix_seconds,
         revision,
-    }))
+    };
+    if !operation.is_legal_persisted_state() {
+        return Err(DurableOperationFailure::PersistenceUnavailable);
+    }
+    Ok(Some(operation))
 }
 
 pub(super) fn take_array<const N: usize>(
@@ -284,5 +278,73 @@ impl ExpiredOperationBinding {
             .has_same_semantics(request)
             .then_some(())
             .ok_or(DurableOperationFailure::IdempotencyConflict)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TARGET_OFFSET: usize = 57;
+    const STATUS_OFFSET: usize = 121;
+    const PHASE_OFFSET: usize = 122;
+    const PROGRESS_OFFSET: usize = 123;
+    const RETRY_OFFSET: usize = 124;
+    const CANCELLATION_OFFSET: usize = 125;
+    const BOUNDARY_OFFSET: usize = 126;
+    const UPDATED_AT_OFFSET: usize = 128;
+    const COMPLETED_AT_OFFSET: usize = 136;
+
+    fn accepted_record() -> Vec<u8> {
+        pending_operation_fixture(
+            DurableOperationRequest::catalog_format_migration(
+                PrincipalId::from_bytes([0x11; 16]).expect("principal"),
+                AdministrativeIdempotencyKey::new([0x22; 16]).expect("idempotency key"),
+                [0x33; 16],
+                1,
+                17,
+            )
+            .expect("migration request"),
+        )
+    }
+
+    #[test]
+    fn durable_operation_decoder_rejects_impossible_semantic_state_combinations() {
+        let mut missing_migration_target = accepted_record();
+        missing_migration_target[TARGET_OFFSET..TARGET_OFFSET + 16].fill(0);
+
+        let mut pending_published = accepted_record();
+        pending_published[PHASE_OFFSET] = DurableOperationPhase::Published.code();
+        pending_published[PROGRESS_OFFSET] = 100;
+        pending_published[RETRY_OFFSET] = DurableOperationRetry::Never.code();
+        pending_published[CANCELLATION_OFFSET] =
+            DurableOperationCancellation::NotAllowedAfterDrain.code();
+        pending_published[BOUNDARY_OFFSET] =
+            DurableOperationBoundary::CatalogGenerationPublished.code();
+
+        let mut completed_before_acceptance = accepted_record();
+        completed_before_acceptance[STATUS_OFFSET] = DurableOperationStatus::Succeeded.code();
+        completed_before_acceptance[PHASE_OFFSET] = DurableOperationPhase::Published.code();
+        completed_before_acceptance[PROGRESS_OFFSET] = 100;
+        completed_before_acceptance[RETRY_OFFSET] = DurableOperationRetry::Never.code();
+        completed_before_acceptance[CANCELLATION_OFFSET] =
+            DurableOperationCancellation::NotAllowedAfterDrain.code();
+        completed_before_acceptance[BOUNDARY_OFFSET] =
+            DurableOperationBoundary::CatalogGenerationPublished.code();
+        completed_before_acceptance[UPDATED_AT_OFFSET..UPDATED_AT_OFFSET + 8]
+            .copy_from_slice(&17_u64.to_be_bytes());
+        completed_before_acceptance[COMPLETED_AT_OFFSET..COMPLETED_AT_OFFSET + 8]
+            .copy_from_slice(&1_u64.to_be_bytes());
+
+        for record in [
+            missing_migration_target,
+            pending_published,
+            completed_before_acceptance,
+        ] {
+            assert!(
+                decode_operation(&record).is_err(),
+                "persisted durable state must match a legal handler checkpoint"
+            );
+        }
     }
 }

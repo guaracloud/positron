@@ -477,7 +477,7 @@ fn compatibility_retry_completes_a_post_publication_durable_migration() -> Resul
     )?;
     let key = AdministrativeIdempotencyKey::new([0xcb; 16])?;
 
-    with_catalog_publication_fault_after(CatalogPublicationFault::SynchronizeCommit, 4, || {
+    with_catalog_publication_fault_after(CatalogPublicationFault::SynchronizeCommit, 5, || {
         instance.migrate_catalog_to_epoch_two_as_operation(actor, key)
     })
     .expect_err("the terminal durable checkpoint is unavailable after the V2 handler publishes");
@@ -787,8 +787,15 @@ fn durable_operation_persists_terminal_handler_rejection_and_runtime_accessors()
         DurableOperationAdministration::accept_catalog_format_migration(&catalog, actor, request)?;
     let running =
         DurableOperationAdministration::begin(&catalog, actor, accepted.operation_id(), 18)?;
+    let draining =
+        DurableOperationAdministration::mark_draining(&catalog, actor, running.operation_id(), 19)?;
+    assert_eq!(
+        draining.phase(),
+        positron_governance::DurableOperationPhase::Draining,
+        "before closing admission, persisted status truthfully records the active drain"
+    );
     let publishing =
-        DurableOperationAdministration::mark_drained(&catalog, actor, running.operation_id(), 19)?;
+        DurableOperationAdministration::mark_drained(&catalog, actor, draining.operation_id(), 20)?;
     assert_eq!(
         publishing.phase(),
         positron_governance::DurableOperationPhase::CatalogPublication,
@@ -798,7 +805,7 @@ fn durable_operation_persists_terminal_handler_rejection_and_runtime_accessors()
         &catalog,
         actor,
         publishing.operation_id(),
-        20,
+        21,
         DurableOperationTerminalError::HandlerRejected,
     )?;
     assert_eq!(failed.status(), DurableOperationStatus::Failed);
@@ -808,7 +815,7 @@ fn durable_operation_persists_terminal_handler_rejection_and_runtime_accessors()
     );
     assert_eq!(
         failed.earliest_lookup_expiry_unix_seconds(),
-        Some(2_592_020)
+        Some(2_592_021)
     );
     drop(catalog);
 
@@ -860,6 +867,43 @@ fn durable_operation_persists_terminal_handler_rejection_and_runtime_accessors()
             .code(),
         crate::BootstrapFailureCode::DurableOperationCancellationUnavailable
     );
+    Ok(())
+}
+
+#[test]
+fn runtime_migration_persists_draining_while_admission_is_closed() -> Result<(), Box<dyn Error>> {
+    let fixture = LegacyFixtureRoots::from_f9_fixture()?;
+    let paths = fixture.paths()?;
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = Arc::new(InstanceBootstrap::reopen(&paths)?);
+    let actor = instance.attribute(
+        PresentedCredential::parse(claim.secret())?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let key = AdministrativeIdempotencyKey::new([0xca; 16])?;
+    let held_admission = instance.enter_ingest_finalization_for(instance.tenant)?;
+    let failed_drain = instance
+        .migrate_catalog_to_epoch_two_as_operation(actor, key)
+        .expect_err("held admitted work prevents migration drain completion");
+    assert_eq!(
+        failed_drain.code(),
+        crate::BootstrapFailureCode::ResourceUnavailable
+    );
+    let catalog = Catalog::open(
+        &instance._authority,
+        instance.instance,
+        instance.key.catalog_secret(instance.instance)?,
+    )?;
+    let persisted = DurableOperationAdministration::inspect_by_idempotency(&catalog, key)?
+        .ok_or("persisted durable operation")?;
+    assert_eq!(
+        persisted.phase(),
+        positron_governance::DurableOperationPhase::Draining,
+        "callers inspecting a migration blocked in drain see the current phase"
+    );
+
+    drop(held_admission);
     Ok(())
 }
 

@@ -62,10 +62,9 @@ impl InitializedInstance {
         } else {
             operation
         };
-        let _drain = self.tenant_drains.close_all_and_drain()?;
         let operation =
             if operation.phase() == positron_governance::DurableOperationPhase::Preflight {
-                DurableOperationAdministration::mark_drained(
+                DurableOperationAdministration::mark_draining(
                     &catalog,
                     actor,
                     operation.operation_id(),
@@ -75,6 +74,19 @@ impl InitializedInstance {
             } else {
                 operation
             };
+        let _drain = self.tenant_drains.close_all_and_drain()?;
+        let operation = if operation.phase() == positron_governance::DurableOperationPhase::Draining
+        {
+            DurableOperationAdministration::mark_drained(
+                &catalog,
+                actor,
+                operation.operation_id(),
+                now,
+            )
+            .map_err(map_durable_operation_failure)?
+        } else {
+            operation
+        };
         let migration = CatalogFormatMigrationAdministration::migrate_to_epoch_two(
             &catalog,
             self.administrator,
