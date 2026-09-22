@@ -434,6 +434,7 @@ fn durable_operation_cancels_before_drain_and_rejects_a_changed_same_key_request
     let request = DurableOperationRequest::catalog_format_migration(
         actor.principal_id(),
         key,
+        instance.instance.to_bytes(),
         accepted_generation,
         17,
     )?;
@@ -446,6 +447,7 @@ fn durable_operation_cancels_before_drain_and_rejects_a_changed_same_key_request
             DurableOperationRequest::catalog_format_migration(
                 actor.principal_id(),
                 key,
+                instance.instance.to_bytes(),
                 accepted_generation.saturating_add(1),
                 18,
             )?,
@@ -453,8 +455,14 @@ fn durable_operation_cancels_before_drain_and_rejects_a_changed_same_key_request
         .expect_err("a changed target generation cannot reuse an accepted key"),
         DurableOperationFailure::IdempotencyConflict
     );
-    let cancelled =
-        DurableOperationAdministration::cancel(&catalog, actor, accepted.operation_id(), 18)?;
+    let cancellation_key = AdministrativeIdempotencyKey::new([0xc4; 16])?;
+    let cancelled = DurableOperationAdministration::cancel(
+        &catalog,
+        actor,
+        accepted.operation_id(),
+        cancellation_key,
+        18,
+    )?;
     assert_eq!(
         cancelled.status(),
         positron_governance::DurableOperationStatus::Cancelled
@@ -462,6 +470,17 @@ fn durable_operation_cancels_before_drain_and_rejects_a_changed_same_key_request
     assert_eq!(
         cancelled.cancellation(),
         positron_governance::DurableOperationCancellation::Cancelled
+    );
+    assert_eq!(
+        DurableOperationAdministration::cancel(
+            &catalog,
+            actor,
+            accepted.operation_id(),
+            cancellation_key,
+            19,
+        )?,
+        cancelled,
+        "a lost cancellation response retries the original durable outcome"
     );
     Ok(())
 }
@@ -486,6 +505,7 @@ fn durable_operation_persists_terminal_handler_rejection_and_runtime_accessors()
     let request = DurableOperationRequest::catalog_format_migration(
         actor.principal_id(),
         AdministrativeIdempotencyKey::new([0xc7; 16])?,
+        instance.instance.to_bytes(),
         catalog.pin()?.number(),
         17,
     )?;
@@ -493,11 +513,18 @@ fn durable_operation_persists_terminal_handler_rejection_and_runtime_accessors()
         DurableOperationAdministration::accept_catalog_format_migration(&catalog, actor, request)?;
     let running =
         DurableOperationAdministration::begin(&catalog, actor, accepted.operation_id(), 18)?;
+    let publishing =
+        DurableOperationAdministration::mark_drained(&catalog, actor, running.operation_id(), 19)?;
+    assert_eq!(
+        publishing.phase(),
+        positron_governance::DurableOperationPhase::CatalogPublication,
+        "after admission is drained, persisted status truthfully names the next handler boundary"
+    );
     let failed = DurableOperationAdministration::fail_catalog_format_migration(
         &catalog,
         actor,
-        running.operation_id(),
-        19,
+        publishing.operation_id(),
+        20,
         DurableOperationTerminalError::HandlerRejected,
     )?;
     assert_eq!(failed.status(), DurableOperationStatus::Failed);
@@ -507,7 +534,7 @@ fn durable_operation_persists_terminal_handler_rejection_and_runtime_accessors()
     );
     assert_eq!(
         failed.earliest_lookup_expiry_unix_seconds(),
-        Some(2_592_019)
+        Some(2_592_020)
     );
     drop(catalog);
 
@@ -534,7 +561,15 @@ fn durable_operation_persists_terminal_handler_rejection_and_runtime_accessors()
         audit.accepted_generation(),
         Some(request.accepted_generation())
     );
-    assert_eq!(audit.progress_percent(), Some(running.progress_percent()));
+    assert_eq!(
+        failed.target_identity(),
+        Some(instance.instance.to_bytes()),
+        "operation status exposes the authoritative instance target, not its catalog generation"
+    );
+    assert_eq!(
+        audit.progress_percent(),
+        Some(publishing.progress_percent())
+    );
     assert_eq!(
         instance.wait_for_durable_operation(actor, failed.operation_id())?,
         failed,
@@ -542,10 +577,14 @@ fn durable_operation_persists_terminal_handler_rejection_and_runtime_accessors()
     );
     assert_eq!(
         instance
-            .cancel_durable_operation(actor, failed.operation_id())
+            .cancel_durable_operation(
+                actor,
+                failed.operation_id(),
+                AdministrativeIdempotencyKey::new([0xc3; 16])?,
+            )
             .expect_err("a terminal failure cannot be cancelled")
             .code(),
-        crate::BootstrapFailureCode::CatalogUnavailable
+        crate::BootstrapFailureCode::DurableOperationCancellationUnavailable
     );
     Ok(())
 }
@@ -570,6 +609,7 @@ fn expired_operation_lookup_keeps_its_idempotency_binding_without_reopening_work
     let request = DurableOperationRequest::catalog_format_migration(
         actor.principal_id(),
         AdministrativeIdempotencyKey::new([0xc8; 16])?,
+        instance.instance.to_bytes(),
         catalog.pin()?.number(),
         17,
     )?;
@@ -588,6 +628,7 @@ fn expired_operation_lookup_keeps_its_idempotency_binding_without_reopening_work
     let later = DurableOperationRequest::catalog_format_migration(
         actor.principal_id(),
         AdministrativeIdempotencyKey::new([0xc9; 16])?,
+        instance.instance.to_bytes(),
         catalog.pin()?.number(),
         2_592_019,
     )?;
@@ -600,6 +641,7 @@ fn expired_operation_lookup_keeps_its_idempotency_binding_without_reopening_work
     let changed = DurableOperationRequest::catalog_format_migration(
         actor.principal_id(),
         request.idempotency_key(),
+        instance.instance.to_bytes(),
         request.accepted_generation().saturating_add(1),
         2_592_020,
     )?;
@@ -632,6 +674,7 @@ fn durable_operation_reattaches_a_persisted_running_checkpoint_after_restart()
     let request = DurableOperationRequest::catalog_format_migration(
         actor.principal_id(),
         key,
+        instance.instance.to_bytes(),
         catalog.pin()?.number(),
         17,
     )?;

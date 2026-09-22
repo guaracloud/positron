@@ -226,11 +226,15 @@ pub(super) fn map_durable_operation_failure(failure: DurableOperationFailure) ->
             BootstrapFailureCode::ApiKeyIdempotencyConflict
         },
         DurableOperationFailure::CapacityExceeded => BootstrapFailureCode::ResourceUnavailable,
+        DurableOperationFailure::UnknownOperation => BootstrapFailureCode::DurableOperationUnknown,
+        DurableOperationFailure::CompletedLookupExpired => {
+            BootstrapFailureCode::DurableOperationLookupExpired
+        },
+        DurableOperationFailure::CancellationUnavailable => {
+            BootstrapFailureCode::DurableOperationCancellationUnavailable
+        },
         DurableOperationFailure::InvalidInput
-        | DurableOperationFailure::UnknownOperation
-        | DurableOperationFailure::CompletedLookupExpired
         | DurableOperationFailure::InvalidState
-        | DurableOperationFailure::CancellationUnavailable
         | DurableOperationFailure::PersistenceUnavailable => {
             BootstrapFailureCode::CatalogUnavailable
         },
@@ -248,4 +252,25 @@ pub(super) fn map_listener_transport_failure(
         ListenerTransportAdministrationFailure::CorruptState => BootstrapFailureCode::CorruptState,
     };
     BootstrapFailure::new(code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn durable_operation_lookup_and_cancellation_failures_are_not_catalog_outages() {
+        assert_eq!(
+            map_durable_operation_failure(DurableOperationFailure::CompletedLookupExpired).code(),
+            BootstrapFailureCode::DurableOperationLookupExpired
+        );
+        assert_eq!(
+            map_durable_operation_failure(DurableOperationFailure::UnknownOperation).code(),
+            BootstrapFailureCode::DurableOperationUnknown
+        );
+        assert_eq!(
+            map_durable_operation_failure(DurableOperationFailure::CancellationUnavailable).code(),
+            BootstrapFailureCode::DurableOperationCancellationUnavailable
+        );
+    }
 }

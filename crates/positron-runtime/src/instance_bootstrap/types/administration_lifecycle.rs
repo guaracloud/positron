@@ -42,6 +42,7 @@ impl InitializedInstance {
                     let request = DurableOperationRequest::catalog_format_migration(
                         actor.principal_id(),
                         idempotency,
+                        self.instance.to_bytes(),
                         generation,
                         now,
                     )
@@ -173,12 +174,14 @@ impl InitializedInstance {
         &self,
         actor: AuthorizedContext,
         operation_id: positron_governance::OperationId,
+        idempotency: AdministrativeIdempotencyKey,
     ) -> Result<DurableOperation, BootstrapFailure> {
         let catalog = self.open_operation_catalog()?;
         DurableOperationAdministration::cancel(
             &catalog,
             actor,
             operation_id,
+            idempotency,
             self.operation_time_seconds()?,
         )
         .map_err(map_durable_operation_failure)

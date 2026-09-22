@@ -158,14 +158,44 @@ impl DurableOperationAdministration {
         catalog: &Catalog<'_>,
         actor: crate::AuthorizedContext,
         operation_id: OperationId,
+        idempotency: AdministrativeIdempotencyKey,
         now: u64,
     ) -> Result<DurableOperation, DurableOperationFailure> {
         let snapshot = catalog.pin().map_err(map_catalog)?;
         let operation = find_by_id(&snapshot, operation_id)?
             .ok_or(DurableOperationFailure::UnknownOperation)?;
         validate_system_actor(actor, operation.request.principal)?;
-        publish(catalog, &snapshot, operation.cancelled(now)?)
+        let cancelled = operation.cancelled(now, idempotency)?;
+        if cancelled == operation {
+            return Ok(operation);
+        }
+        if has_other_cancellation_key(&snapshot, operation_id, idempotency)? {
+            return Err(DurableOperationFailure::IdempotencyConflict);
+        }
+        publish(catalog, &snapshot, cancelled)
     }
+}
+
+fn has_other_cancellation_key(
+    snapshot: &CatalogSnapshot,
+    operation_id: OperationId,
+    idempotency: AdministrativeIdempotencyKey,
+) -> Result<bool, DurableOperationFailure> {
+    for identity in snapshot.object_identities() {
+        let bytes = snapshot
+            .object(identity)
+            .map_err(map_catalog)?
+            .ok_or(DurableOperationFailure::PersistenceUnavailable)?;
+        let Some(operation) = decode_operation(bytes)? else {
+            continue;
+        };
+        if operation.operation_id() != operation_id
+            && operation.cancellation_idempotency_key() == Some(idempotency)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn validate_system_actor(
@@ -334,13 +364,25 @@ fn find_by_key(
 fn transition_transaction(
     operation: DurableOperation,
 ) -> Result<TransactionId, DurableOperationFailure> {
+    TransactionId::new(transition_transaction_bytes(
+        operation.operation_id(),
+        operation.revision,
+    )?)
+    .map_err(map_catalog)
+}
+
+/// Returns the canonical transaction identity for one durable-operation transition.
+pub(crate) fn transition_transaction_bytes(
+    operation_id: OperationId,
+    revision: u64,
+) -> Result<[u8; 16], DurableOperationFailure> {
     let mut hasher = Sha256::new();
     hasher.update(b"positron.durable-operation.transition.v1\0");
-    hasher.update(operation.operation_id().to_bytes());
-    hasher.update(operation.revision.to_be_bytes());
+    hasher.update(operation_id.to_bytes());
+    hasher.update(revision.to_be_bytes());
     let digest: [u8; 32] = hasher.finalize().into();
     let Some(bytes) = digest.first_chunk::<16>() else {
         return Err(DurableOperationFailure::PersistenceUnavailable);
     };
-    TransactionId::new(*bytes).map_err(map_catalog)
+    Ok(*bytes)
 }

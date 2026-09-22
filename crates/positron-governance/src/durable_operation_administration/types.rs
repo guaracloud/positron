@@ -76,20 +76,20 @@ pub struct DurableOperationRequest {
     pub(super) principal: PrincipalId,
     pub(super) idempotency: AdministrativeIdempotencyKey,
     pub(super) kind: DurableOperationKind,
+    pub(super) target_identity: Option<[u8; 16]>,
     pub(super) accepted_generation: u64,
     pub(super) accepted_at_unix_seconds: u64,
     pub(super) digest: [u8; 32],
 }
 
 impl DurableOperationRequest {
-    /// Constructs the only currently registered operation request.
-    pub fn catalog_format_migration(
+    pub(crate) fn operation_id_for_audit(
         principal: PrincipalId,
         idempotency: AdministrativeIdempotencyKey,
+        target_identity: Option<[u8; 16]>,
         accepted_generation: u64,
-        accepted_at_unix_seconds: u64,
-    ) -> Result<Self, DurableOperationFailure> {
-        if accepted_generation == 0 || accepted_at_unix_seconds == 0 {
+    ) -> Result<OperationId, DurableOperationFailure> {
+        if accepted_generation == 0 {
             return Err(DurableOperationFailure::InvalidInput);
         }
         let kind = DurableOperationKind::CatalogFormatMigration;
@@ -98,16 +98,63 @@ impl DurableOperationRequest {
         hasher.update(principal.to_bytes());
         hasher.update(idempotency.to_bytes());
         hasher.update([kind.code()]);
+        if let Some(target_identity) = target_identity {
+            hasher.update(target_identity);
+        }
         hasher.update(accepted_generation.to_be_bytes());
         let digest: [u8; 32] = hasher.finalize().into();
-        Ok(Self {
+        Ok(OperationId::from_request(&Self {
             principal,
             idempotency,
             kind,
+            target_identity,
+            accepted_generation,
+            accepted_at_unix_seconds: 1,
+            digest,
+        }))
+    }
+    /// Constructs the only currently registered operation request.
+    pub fn catalog_format_migration(
+        principal: PrincipalId,
+        idempotency: AdministrativeIdempotencyKey,
+        target_identity: [u8; 16],
+        accepted_generation: u64,
+        accepted_at_unix_seconds: u64,
+    ) -> Result<Self, DurableOperationFailure> {
+        if accepted_generation == 0
+            || accepted_at_unix_seconds == 0
+            || target_identity.iter().all(|byte| *byte == 0)
+        {
+            return Err(DurableOperationFailure::InvalidInput);
+        }
+        let kind = DurableOperationKind::CatalogFormatMigration;
+        let operation_id = Self::operation_id_for_audit(
+            principal,
+            idempotency,
+            Some(target_identity),
+            accepted_generation,
+        )?;
+        let mut hasher = Sha256::new();
+        hasher.update(REQUEST_DOMAIN);
+        hasher.update(principal.to_bytes());
+        hasher.update(idempotency.to_bytes());
+        hasher.update([kind.code()]);
+        hasher.update(target_identity);
+        hasher.update(accepted_generation.to_be_bytes());
+        let digest: [u8; 32] = hasher.finalize().into();
+        let request = Self {
+            principal,
+            idempotency,
+            kind,
+            target_identity: Some(target_identity),
             accepted_generation,
             accepted_at_unix_seconds,
             digest,
-        })
+        };
+        if request.operation_id() != operation_id {
+            return Err(DurableOperationFailure::PersistenceUnavailable);
+        }
+        Ok(request)
     }
 
     #[must_use]
@@ -134,6 +181,10 @@ impl DurableOperationRequest {
     pub const fn accepted_generation(&self) -> u64 {
         self.accepted_generation
     }
+    #[must_use]
+    pub const fn target_identity(&self) -> Option<[u8; 16]> {
+        self.target_identity
+    }
 
     #[must_use]
     pub const fn accepted_at_unix_seconds(&self) -> u64 {
@@ -149,6 +200,7 @@ impl DurableOperationRequest {
         self.principal == other.principal
             && self.idempotency == other.idempotency
             && self.kind == other.kind
+            && self.target_identity == other.target_identity
             && self.accepted_generation == other.accepted_generation
             && self.digest == other.digest
     }
@@ -356,6 +408,7 @@ pub struct DurableOperation {
     pub(super) cancellation: DurableOperationCancellation,
     pub(super) boundary: DurableOperationBoundary,
     pub(super) terminal_error: Option<DurableOperationTerminalError>,
+    pub(super) cancellation_idempotency: Option<AdministrativeIdempotencyKey>,
     pub(super) updated_at_unix_seconds: u64,
     pub(super) completed_at_unix_seconds: Option<u64>,
     pub(super) revision: u64,
@@ -426,6 +479,14 @@ impl DurableOperation {
     pub const fn request(self) -> DurableOperationRequest {
         self.request
     }
+    #[must_use]
+    pub const fn target_identity(self) -> Option<[u8; 16]> {
+        self.request.target_identity()
+    }
+    #[must_use]
+    pub const fn cancellation_idempotency_key(self) -> Option<AdministrativeIdempotencyKey> {
+        self.cancellation_idempotency
+    }
 
     pub(super) fn accepted(request: DurableOperationRequest) -> Self {
         Self {
@@ -437,6 +498,7 @@ impl DurableOperation {
             cancellation: DurableOperationCancellation::AllowedBeforeDrain,
             boundary: DurableOperationBoundary::NotCrossed,
             terminal_error: None,
+            cancellation_idempotency: None,
             updated_at_unix_seconds: request.accepted_at_unix_seconds,
             completed_at_unix_seconds: None,
             revision: 1,
@@ -464,8 +526,8 @@ impl DurableOperation {
         if self.status != DurableOperationStatus::Running || now < self.updated_at_unix_seconds {
             return Err(DurableOperationFailure::InvalidState);
         }
-        self.phase = DurableOperationPhase::Draining;
-        self.progress_percent = 35;
+        self.phase = DurableOperationPhase::CatalogPublication;
+        self.progress_percent = 50;
         self.cancellation = DurableOperationCancellation::NotAllowedAfterDrain;
         self.updated_at_unix_seconds = now;
         self.revision = self
@@ -495,7 +557,16 @@ impl DurableOperation {
         Ok(self)
     }
 
-    pub(super) fn cancelled(mut self, now: u64) -> Result<Self, DurableOperationFailure> {
+    pub(super) fn cancelled(
+        mut self,
+        now: u64,
+        idempotency: AdministrativeIdempotencyKey,
+    ) -> Result<Self, DurableOperationFailure> {
+        if self.status == DurableOperationStatus::Cancelled {
+            return (self.cancellation_idempotency == Some(idempotency))
+                .then_some(self)
+                .ok_or(DurableOperationFailure::IdempotencyConflict);
+        }
         if self.status != DurableOperationStatus::Pending
             || self.boundary != DurableOperationBoundary::NotCrossed
             || now < self.updated_at_unix_seconds
@@ -506,6 +577,7 @@ impl DurableOperation {
         self.phase = DurableOperationPhase::Cancelled;
         self.retry = DurableOperationRetry::Never;
         self.cancellation = DurableOperationCancellation::Cancelled;
+        self.cancellation_idempotency = Some(idempotency);
         self.updated_at_unix_seconds = now;
         self.completed_at_unix_seconds = Some(now);
         self.revision = self

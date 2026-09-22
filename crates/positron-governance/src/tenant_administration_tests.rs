@@ -214,6 +214,7 @@ fn durable_operation_capacity_replaces_existing_record_before_rejecting_a_new_on
         let request = DurableOperationRequest::catalog_format_migration(
             actor.principal_id(),
             AdministrativeIdempotencyKey::new(key)?,
+            [0x44; 16],
             basis.number(),
             17,
         )?;
@@ -249,6 +250,7 @@ fn durable_operation_capacity_replaces_existing_record_before_rejecting_a_new_on
             DurableOperationRequest::catalog_format_migration(
                 actor.principal_id(),
                 AdministrativeIdempotencyKey::new([0xe1; 16])?,
+                [0x44; 16],
                 basis.number(),
                 19,
             )?,

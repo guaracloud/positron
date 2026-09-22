@@ -8,15 +8,34 @@ impl GovernanceAuditEntry {
         transaction_id: [u8; 16],
         intent: &[u8],
     ) -> Result<Self, IdentityFailure> {
-        if intent.starts_with(&DURABLE_OPERATION_AUDIT_MAGIC) {
+        if intent.starts_with(&DURABLE_OPERATION_AUDIT_MAGIC)
+            || intent.starts_with(&DURABLE_OPERATION_AUDIT_MAGIC_V3)
+            || intent.starts_with(&DURABLE_OPERATION_AUDIT_MAGIC_V4)
+        {
+            let is_v4 = intent.starts_with(&DURABLE_OPERATION_AUDIT_MAGIC_V4);
+            let is_current = is_v4 || intent.starts_with(&DURABLE_OPERATION_AUDIT_MAGIC_V3);
             let mut cursor = Cursor::new(intent);
-            if cursor.take_array::<8>()? != DURABLE_OPERATION_AUDIT_MAGIC {
+            if cursor.take_array::<8>()?
+                != if is_v4 {
+                    DURABLE_OPERATION_AUDIT_MAGIC_V4
+                } else if is_current {
+                    DURABLE_OPERATION_AUDIT_MAGIC_V3
+                } else {
+                    DURABLE_OPERATION_AUDIT_MAGIC
+                }
+            {
                 return Err(IdentityFailure);
             }
             let operation_id =
                 OperationId::from_bytes(cursor.take_array()?).map_err(|_| IdentityFailure)?;
             let actor =
                 PrincipalId::from_bytes(cursor.take_array()?).map_err(|_| IdentityFailure)?;
+            let target_identity = if is_v4 {
+                let target = cursor.take_array::<16>()?;
+                (!target.iter().all(|byte| *byte == 0)).then_some(target)
+            } else {
+                None
+            };
             let applicable_tenant = match cursor.take_u8()? {
                 0 => None,
                 1 => Some(TenantId::from_bytes(cursor.take_array()?).map_err(|_| IdentityFailure)?),
@@ -30,11 +49,46 @@ impl GovernanceAuditEntry {
             let accepted_generation = cursor.take_u64()?;
             let progress_percent = cursor.take_u8()?;
             let revision = cursor.take_u64()?;
+            let cancellation_request_id = if is_current {
+                match cursor.take_u8()? {
+                    0 => {
+                        if !cursor.take_array::<16>()?.iter().all(|byte| *byte == 0) {
+                            return Err(IdentityFailure);
+                        }
+                        None
+                    },
+                    1 => Some(
+                        AdministrativeIdempotencyKey::new(cursor.take_array()?)
+                            .map_err(|_| IdentityFailure)?,
+                    ),
+                    _ => return Err(IdentityFailure),
+                }
+            } else {
+                None
+            };
+            let canonical_operation_id = DurableOperationRequest::operation_id_for_audit(
+                actor,
+                request_id,
+                target_identity,
+                accepted_generation,
+            )
+            .map_err(|_| IdentityFailure)?;
+            let canonical_transaction =
+                crate::durable_operation_administration::transition_transaction_bytes(
+                    canonical_operation_id,
+                    revision,
+                )
+                .map_err(|_| IdentityFailure)?;
             if accepted_generation == 0
                 || progress_percent > 100
                 || revision == 0
                 || !cursor.is_empty()
                 || transaction_id.iter().all(|byte| *byte == 0)
+                || operation_id != canonical_operation_id
+                || transaction_id != canonical_transaction
+                || (is_current
+                    && (outcome == DurableOperationStatus::Cancelled)
+                        != cancellation_request_id.is_some())
             {
                 return Err(IdentityFailure);
             }
@@ -47,6 +101,7 @@ impl GovernanceAuditEntry {
                 outcome,
                 phase,
                 request_id: Some(request_id),
+                cancellation_request_id,
                 accepted_generation: Some(accepted_generation),
                 progress_percent: Some(progress_percent),
                 revision,
@@ -75,6 +130,7 @@ impl GovernanceAuditEntry {
                 outcome,
                 phase,
                 request_id: None,
+                cancellation_request_id: None,
                 accepted_generation: None,
                 progress_percent: None,
                 revision,

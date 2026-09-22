@@ -9,6 +9,7 @@ fn operation_identity_is_stable_for_an_exact_administrative_request()
     let request = DurableOperationRequest::catalog_format_migration(
         PrincipalId::from_bytes([0x11; 16])?,
         AdministrativeIdempotencyKey::new([0x22; 16])?,
+        [0x33; 16],
         1,
         17,
     )?;

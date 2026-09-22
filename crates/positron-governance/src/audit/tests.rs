@@ -46,6 +46,26 @@ fn legacy_durable_operation_audit_remains_readable() {
 }
 
 #[test]
+fn durable_operation_audit_rejects_a_structurally_valid_unbound_transaction() {
+    let mut intent = b"POSOPA02".to_vec();
+    intent.extend_from_slice(&[0x22; 16]); // operation
+    intent.extend_from_slice(&[0x33; 16]); // creator
+    intent.push(0); // system-wide
+    intent.push(1); // catalog-format migration
+    intent.push(2); // running
+    intent.push(2); // preflight
+    intent.extend_from_slice(&[0x44; 16]); // idempotency key
+    intent.extend_from_slice(&7_u64.to_be_bytes()); // accepted generation
+    intent.push(10); // progress
+    intent.extend_from_slice(&2_u64.to_be_bytes()); // revision
+
+    assert!(
+        GovernanceAuditEntry::decode_fields(5, [0x55; 16], &intent).is_err(),
+        "a durable-operation audit must bind its transaction to its canonical request"
+    );
+}
+
+#[test]
 fn public_plaintext_api_transport_audit_is_redacted_exact_and_strict() {
     let transaction = [19; 16];
     let mut intent = b"POSTPT01".to_vec();

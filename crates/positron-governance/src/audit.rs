@@ -14,7 +14,7 @@ use crate::identity::IdentityFailure;
 use crate::tenant_profile_administration::TENANT_DISPLAY_MAGIC;
 use crate::{
     AdministrativeIdempotencyKey, DurableOperationKind, DurableOperationPhase,
-    DurableOperationStatus, OperationId, ResourceGeneration,
+    DurableOperationRequest, DurableOperationStatus, OperationId, ResourceGeneration,
 };
 
 pub use rotation::{CatalogRootRotationAuditEntry, CatalogRootRotationStage};
@@ -38,6 +38,8 @@ const TENANT_ALIAS_MAGIC: [u8; 8] = *b"POSALI01";
 const TENANT_RETENTION_MAGIC: [u8; 8] = *b"POSTRT01";
 const SYSTEM_AUDIT_RETENTION_MAGIC: [u8; 8] = *b"POSAR001";
 const DURABLE_OPERATION_AUDIT_MAGIC: [u8; 8] = *b"POSOPA02";
+const DURABLE_OPERATION_AUDIT_MAGIC_V3: [u8; 8] = *b"POSOPA03";
+const DURABLE_OPERATION_AUDIT_MAGIC_V4: [u8; 8] = *b"POSOPA04";
 const DURABLE_OPERATION_AUDIT_MAGIC_V1: [u8; 8] = *b"POSOPA01";
 
 /// Extracts a terminal receipt's idempotency key only after its owning codec
@@ -129,6 +131,7 @@ pub struct DurableOperationAuditEntry {
     outcome: DurableOperationStatus,
     phase: DurableOperationPhase,
     request_id: Option<AdministrativeIdempotencyKey>,
+    cancellation_request_id: Option<AdministrativeIdempotencyKey>,
     accepted_generation: Option<u64>,
     progress_percent: Option<u8>,
     revision: u64,
@@ -168,6 +171,11 @@ impl DurableOperationAuditEntry {
     #[must_use]
     pub const fn request_id(&self) -> Option<AdministrativeIdempotencyKey> {
         self.request_id
+    }
+
+    #[must_use]
+    pub const fn cancellation_request_id(&self) -> Option<AdministrativeIdempotencyKey> {
+        self.cancellation_request_id
     }
 
     #[must_use]
