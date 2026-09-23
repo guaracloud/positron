@@ -82,278 +82,241 @@ fn casts_cover_all_native_scalar_sources_and_exact_float_bits() -> Result<(), Bo
                 Some("42")
             ]
         );
+        Ok(())
+    })?;
 
-        QueryFixture::scoped("query-cast-all-integer", |integers| {
-            integers.kernel.append_log_bodies(
-                vec![
-                    Some(CandidateAttributeValue::string("42".to_owned())),
-                    Some(CandidateAttributeValue::floating_point_bits(
-                        7.0_f64.to_bits(),
-                    )),
-                    Some(CandidateAttributeValue::boolean(true)),
-                ],
-                20,
-                1,
-            )?;
-            let events = execute(
-                integers,
-                "pipeline:v1 logs | range query_time -100 100 | cast body as int | limit 3",
-            )?;
-            let values = records(&events)
-                .into_iter()
-                .filter_map(|record| {
-                    record
-                        .body_value()
-                        .and_then(|value| value.as_signed_integer())
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(values, vec![42, 7, 1]);
+    QueryFixture::scoped("query-cast-all-integer", |integers| {
+        integers.kernel.append_log_bodies(
+            vec![
+                Some(CandidateAttributeValue::string("42".to_owned())),
+                Some(CandidateAttributeValue::floating_point_bits(
+                    7.0_f64.to_bits(),
+                )),
+                Some(CandidateAttributeValue::boolean(true)),
+            ],
+            20,
+            1,
+        )?;
+        let events = execute(
+            integers,
+            "pipeline:v1 logs | range query_time -100 100 | cast body as int | limit 3",
+        )?;
+        let values = records(&events)
+            .into_iter()
+            .filter_map(|record| {
+                record
+                    .body_value()
+                    .and_then(|value| value.as_signed_integer())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(values, vec![42, 7, 1]);
+        Ok(())
+    })?;
 
-            QueryFixture::scoped("query-cast-all-float", |floats| {
-                floats.kernel.append_log_bodies(
-                    vec![
-                        Some(CandidateAttributeValue::signed_integer(-3)),
-                        Some(CandidateAttributeValue::string("1.25".to_owned())),
-                        Some(CandidateAttributeValue::floating_point_bits(
-                            3.5_f64.to_bits(),
-                        )),
-                    ],
-                    20,
-                    1,
-                )?;
-                let events = execute(
-                    floats,
-                    "pipeline:v1 logs | range query_time -100 100 | cast body as float | limit 3",
-                )?;
-                let values = records(&events)
-                    .into_iter()
-                    .filter_map(|record| {
-                        record
-                            .body_value()
-                            .and_then(|value| value.as_floating_point_bits())
-                    })
-                    .collect::<Vec<_>>();
-                assert_eq!(
-                    values,
-                    vec![(-3.0_f64).to_bits(), 1.25_f64.to_bits(), 3.5_f64.to_bits()]
-                );
+    QueryFixture::scoped("query-cast-all-float", |floats| {
+        floats.kernel.append_log_bodies(
+            vec![
+                Some(CandidateAttributeValue::signed_integer(-3)),
+                Some(CandidateAttributeValue::string("1.25".to_owned())),
+                Some(CandidateAttributeValue::floating_point_bits(
+                    3.5_f64.to_bits(),
+                )),
+            ],
+            20,
+            1,
+        )?;
+        let events = execute(
+            floats,
+            "pipeline:v1 logs | range query_time -100 100 | cast body as float | limit 3",
+        )?;
+        let values = records(&events)
+            .into_iter()
+            .filter_map(|record| {
+                record
+                    .body_value()
+                    .and_then(|value| value.as_floating_point_bits())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            values,
+            vec![(-3.0_f64).to_bits(), 1.25_f64.to_bits(), 3.5_f64.to_bits()]
+        );
+        Ok(())
+    })?;
 
-                QueryFixture::scoped("query-cast-all-bool", |booleans| {
-                    booleans.kernel.append_log_bodies(
-                        vec![
-                            Some(CandidateAttributeValue::string("true".to_owned())),
-                            Some(CandidateAttributeValue::signed_integer(0)),
-                            Some(CandidateAttributeValue::signed_integer(1)),
-                            Some(CandidateAttributeValue::boolean(false)),
-                        ],
-                        20,
-                        1,
-                    )?;
-                    let events = execute(
-                        booleans,
-                        "pipeline:v1 logs | range query_time -100 100 | cast body as bool | limit 4",
-                    )?;
-                    let values = records(&events)
-                        .into_iter()
-                        .filter_map(|record| {
-                            record.body_value().and_then(|value| value.as_boolean())
-                        })
-                        .collect::<Vec<_>>();
-                    assert_eq!(values, vec![true, false, true, false]);
+    QueryFixture::scoped("query-cast-all-bool", |booleans| {
+        booleans.kernel.append_log_bodies(
+            vec![
+                Some(CandidateAttributeValue::string("true".to_owned())),
+                Some(CandidateAttributeValue::signed_integer(0)),
+                Some(CandidateAttributeValue::signed_integer(1)),
+                Some(CandidateAttributeValue::boolean(false)),
+            ],
+            20,
+            1,
+        )?;
+        let events = execute(
+            booleans,
+            "pipeline:v1 logs | range query_time -100 100 | cast body as bool | limit 4",
+        )?;
+        let values = records(&events)
+            .into_iter()
+            .filter_map(|record| record.body_value().and_then(|value| value.as_boolean()))
+            .collect::<Vec<_>>();
+        assert_eq!(values, vec![true, false, true, false]);
+        Ok(())
+    })?;
 
-                    QueryFixture::scoped(
-                        "query-cast-unsupported-sources",
-                        |unsupported_sources| {
-                            unsupported_sources.kernel.append_log_bodies(
-                                vec![Some(CandidateAttributeValue::bytes(vec![1, 2]))],
-                                20,
-                                1,
-                            )?;
-                            assert_unsupported(&execute(
-                                unsupported_sources,
-                                "pipeline:v1 logs | range query_time -100 100 | cast body as string | limit 1",
-                            )?);
+    QueryFixture::scoped("query-cast-unsupported-sources", |fixture| {
+        fixture.kernel.append_log_bodies(
+            vec![Some(CandidateAttributeValue::bytes(vec![1, 2]))],
+            20,
+            1,
+        )?;
+        assert_unsupported(&execute(
+            fixture,
+            "pipeline:v1 logs | range query_time -100 100 | cast body as string | limit 1",
+        )?);
+        Ok(())
+    })?;
 
-                            QueryFixture::scoped(
-                                "query-cast-out-of-range-integer",
-                                |unsupported_integer| {
-                                    unsupported_integer.kernel.append_log_bodies(
-                                        vec![Some(CandidateAttributeValue::floating_point_bits(
-                                            1e100_f64.to_bits(),
-                                        ))],
-                                        20,
-                                        1,
-                                    )?;
-                                    assert_unsupported(&execute(
-                                        unsupported_integer,
-                                        "pipeline:v1 logs | range query_time -100 100 | cast body as int | limit 1",
-                                    )?);
+    QueryFixture::scoped("query-cast-out-of-range-integer", |fixture| {
+        fixture.kernel.append_log_bodies(
+            vec![Some(CandidateAttributeValue::floating_point_bits(
+                1e100_f64.to_bits(),
+            ))],
+            20,
+            1,
+        )?;
+        assert_unsupported(&execute(
+            fixture,
+            "pipeline:v1 logs | range query_time -100 100 | cast body as int | limit 1",
+        )?);
+        Ok(())
+    })?;
 
-                                    QueryFixture::scoped(
-                                        "query-cast-fractional-integer",
-                                        |fractional_integer| {
-                                            fractional_integer.kernel.append_log_bodies(
-                                                vec![Some(
-                                                    CandidateAttributeValue::floating_point_bits(
-                                                        1.5_f64.to_bits(),
-                                                    ),
-                                                )],
-                                                20,
-                                                1,
-                                            )?;
-                                            assert_unsupported(&execute(
-                                                fractional_integer,
-                                                "pipeline:v1 logs | range query_time -100 100 | cast body as int | limit 1",
-                                            )?);
+    QueryFixture::scoped("query-cast-fractional-integer", |fixture| {
+        fixture.kernel.append_log_bodies(
+            vec![Some(CandidateAttributeValue::floating_point_bits(
+                1.5_f64.to_bits(),
+            ))],
+            20,
+            1,
+        )?;
+        assert_unsupported(&execute(
+            fixture,
+            "pipeline:v1 logs | range query_time -100 100 | cast body as int | limit 1",
+        )?);
+        Ok(())
+    })?;
 
-                                            QueryFixture::scoped(
-                                                "query-cast-null-float",
-                                                |unsupported_float| {
-                                                    unsupported_float.kernel.append_log_bodies(
-                                                        vec![Some(CandidateAttributeValue::null())],
-                                                        20,
-                                                        1,
-                                                    )?;
-                                                    assert_unsupported(&execute(
-                                                        unsupported_float,
-                                                        "pipeline:v1 logs | range query_time -100 100 | cast body as float | limit 1",
-                                                    )?);
+    QueryFixture::scoped("query-cast-null-float", |fixture| {
+        fixture
+            .kernel
+            .append_log_bodies(vec![Some(CandidateAttributeValue::null())], 20, 1)?;
+        assert_unsupported(&execute(
+            fixture,
+            "pipeline:v1 logs | range query_time -100 100 | cast body as float | limit 1",
+        )?);
+        Ok(())
+    })?;
 
-                                                    QueryFixture::scoped(
-                                                        "query-cast-invalid-bool",
-                                                        |unsupported_boolean| {
-                                                            unsupported_boolean.kernel.append_log_bodies(
-        vec![Some(CandidateAttributeValue::signed_integer(2))],
-        20,
-        1,
-    )?;
-                                                            assert_unsupported(&execute(
-                                                                unsupported_boolean,
-                                                                "pipeline:v1 logs | range query_time -100 100 | cast body as bool | limit 1",
-                                                            )?);
+    QueryFixture::scoped("query-cast-invalid-bool", |fixture| {
+        fixture.kernel.append_log_bodies(
+            vec![Some(CandidateAttributeValue::signed_integer(2))],
+            20,
+            1,
+        )?;
+        assert_unsupported(&execute(
+            fixture,
+            "pipeline:v1 logs | range query_time -100 100 | cast body as bool | limit 1",
+        )?);
+        Ok(())
+    })?;
 
-                                                            QueryFixture::scoped(
-                                                                "query-cast-null-bool",
-                                                                |null_boolean| {
-                                                                    null_boolean
-        .kernel
-        .append_log_bodies(vec![Some(CandidateAttributeValue::null())], 20, 1)?;
-                                                                    assert_unsupported(&execute(
-                                                                        null_boolean,
-                                                                        "pipeline:v1 logs | range query_time -100 100 | cast body as bool | limit 1",
-                                                                    )?);
+    QueryFixture::scoped("query-cast-null-bool", |fixture| {
+        fixture
+            .kernel
+            .append_log_bodies(vec![Some(CandidateAttributeValue::null())], 20, 1)?;
+        assert_unsupported(&execute(
+            fixture,
+            "pipeline:v1 logs | range query_time -100 100 | cast body as bool | limit 1",
+        )?);
+        Ok(())
+    })?;
 
-                                                                    QueryFixture::scoped(
-                                                                        "query-cast-false-text",
-                                                                        |false_text| {
-                                                                            false_text.kernel.append_log_bodies(
-        vec![Some(CandidateAttributeValue::string("false".to_owned()))],
-        20,
-        1,
-    )?;
-                                                                            let events = execute(
-                                                                                false_text,
-                                                                                "pipeline:v1 logs | range query_time -100 100 | cast body as bool | limit 1",
-                                                                            )?;
-                                                                            assert_eq!(
-                                                                                first_record(
-                                                                                    &events
-                                                                                )?
-                                                                                .body_value()
-                                                                                .and_then(|value| {
-                                                                                    value
-                                                                                        .as_boolean(
-                                                                                        )
-                                                                                }),
-                                                                                Some(false)
-                                                                            );
+    QueryFixture::scoped("query-cast-false-text", |fixture| {
+        fixture.kernel.append_log_bodies(
+            vec![Some(CandidateAttributeValue::string("false".to_owned()))],
+            20,
+            1,
+        )?;
+        let events = execute(
+            fixture,
+            "pipeline:v1 logs | range query_time -100 100 | cast body as bool | limit 1",
+        )?;
+        assert_eq!(
+            first_record(&events)?
+                .body_value()
+                .and_then(|value| value.as_boolean()),
+            Some(false)
+        );
+        Ok(())
+    })?;
 
-                                                                            QueryFixture::scoped(
-                                                                                "query-cast-invalid-bool-text",
-                                                                                |invalid_text| {
-                                                                                    invalid_text.kernel.append_log_bodies(
-        vec![Some(CandidateAttributeValue::string("maybe".to_owned()))],
-        20,
-        1,
-    )?;
-                                                                                    assert_unsupported(&execute(
-        invalid_text,
-        "pipeline:v1 logs | range query_time -100 100 | cast body as bool | limit 1",
-    )?);
+    QueryFixture::scoped("query-cast-invalid-bool-text", |fixture| {
+        fixture.kernel.append_log_bodies(
+            vec![Some(CandidateAttributeValue::string("maybe".to_owned()))],
+            20,
+            1,
+        )?;
+        assert_unsupported(&execute(
+            fixture,
+            "pipeline:v1 logs | range query_time -100 100 | cast body as bool | limit 1",
+        )?);
+        Ok(())
+    })?;
 
-                                                                                    QueryFixture::scoped("query-cast-nan-float", |non_finite| {
-    non_finite.kernel.append_log_bodies(
-        vec![Some(CandidateAttributeValue::string("NaN".to_owned()))],
-        20,
-        1,
-    )?;
-    assert_unsupported(&execute(
-        non_finite,
-        "pipeline:v1 logs | range query_time -100 100 | cast body as float | limit 1",
-    )?);
+    QueryFixture::scoped("query-cast-nan-float", |fixture| {
+        fixture.kernel.append_log_bodies(
+            vec![Some(CandidateAttributeValue::string("NaN".to_owned()))],
+            20,
+            1,
+        )?;
+        assert_unsupported(&execute(
+            fixture,
+            "pipeline:v1 logs | range query_time -100 100 | cast body as float | limit 1",
+        )?);
+        Ok(())
+    })?;
 
-    QueryFixture::scoped("query-cast-nan-string", |non_finite_string| {
-    non_finite_string.kernel.append_log_bodies(
-        vec![Some(CandidateAttributeValue::floating_point_bits(
-            f64::NAN.to_bits(),
-        ))],
-        20,
-        1,
-    )?;
-    assert_unsupported(&execute(
-        non_finite_string,
-        "pipeline:v1 logs | range query_time -100 100 | cast body as string | limit 1",
-    )?);
+    QueryFixture::scoped("query-cast-nan-string", |fixture| {
+        fixture.kernel.append_log_bodies(
+            vec![Some(CandidateAttributeValue::floating_point_bits(
+                f64::NAN.to_bits(),
+            ))],
+            20,
+            1,
+        )?;
+        assert_unsupported(&execute(
+            fixture,
+            "pipeline:v1 logs | range query_time -100 100 | cast body as string | limit 1",
+        )?);
+        Ok(())
+    })?;
 
-    QueryFixture::scoped("query-cast-input-limit", |oversized| {
-    oversized.kernel.append_log_bodies(
-        vec![Some(CandidateAttributeValue::string("x".repeat(65_537)))],
-        20,
-        1,
-    )?;
-    assert_unsupported(&execute(
-        oversized,
-        "pipeline:v1 logs | range query_time -100 100 | cast body as string | limit 1",
-    )?);
+    QueryFixture::scoped("query-cast-input-limit", |fixture| {
+        fixture.kernel.append_log_bodies(
+            vec![Some(CandidateAttributeValue::string("x".repeat(65_537)))],
+            20,
+            1,
+        )?;
+        assert_unsupported(&execute(
+            fixture,
+            "pipeline:v1 logs | range query_time -100 100 | cast body as string | limit 1",
+        )?);
+        Ok(())
+    })?;
+
     Ok(())
-
-})?;
-Ok::<(), Box<dyn Error>>(())
-})?;
-Ok::<(), Box<dyn Error>>(())
-})?;
-                                                                                    Ok::<(), Box<dyn Error>>(())
-                                                                                },
-                                                                            )?;
-                                                                            Ok::<(), Box<dyn Error>>(
-                                                                                (),
-                                                                            )
-                                                                        },
-                                                                    )?;
-                                                                    Ok::<(), Box<dyn Error>>(())
-                                                                },
-                                                            )?;
-                                                            Ok::<(), Box<dyn Error>>(())
-                                                        },
-                                                    )?;
-                                                    Ok::<(), Box<dyn Error>>(())
-                                                },
-                                            )?;
-                                            Ok::<(), Box<dyn Error>>(())
-                                        },
-                                    )?;
-                                    Ok::<(), Box<dyn Error>>(())
-                                },
-                            )?;
-                            Ok::<(), Box<dyn Error>>(())
-                        },
-                    )?;
-                    Ok::<(), Box<dyn Error>>(())
-                })?;
-                Ok::<(), Box<dyn Error>>(())
-            })?;
-            Ok::<(), Box<dyn Error>>(())
-        })?;
-        Ok::<(), Box<dyn Error>>(())
-    })
 }
