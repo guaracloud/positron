@@ -438,8 +438,13 @@ fn parse_export_identity(value: &str) -> Result<[u8; 16], ConfigurationFailure> 
     }
     let mut identity = [0_u8; 16];
     for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
-        let high = hexadecimal_nibble(pair[0])?;
-        let low = hexadecimal_nibble(pair[1])?;
+        let [high, low] = *pair else {
+            return Err(ConfigurationFailure::unsupported_value(
+                FailureSource::ExportDestinations,
+            ));
+        };
+        let high = hexadecimal_nibble(high)?;
+        let low = hexadecimal_nibble(low)?;
         let Some(slot) = identity.get_mut(index) else {
             return Err(ConfigurationFailure::unsupported_value(
                 FailureSource::ExportDestinations,

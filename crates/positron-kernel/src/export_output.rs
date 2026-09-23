@@ -1748,19 +1748,18 @@ fn decode_terminal_evidence(bytes: &[u8]) -> Result<Vec<u8>, ExportOutputFailure
     {
         return Err(fail(ExportOutputFailureCode::IntegrityCorruption));
     }
-    let length = usize::try_from(u32::from_be_bytes(
-        bytes[8..12]
-            .try_into()
-            .map_err(|_| fail(ExportOutputFailureCode::IntegrityCorruption))?,
-    ))
-    .map_err(|_| fail(ExportOutputFailureCode::LimitExceeded))?;
+    let length = usize::try_from(u32::from_be_bytes(bounded_array(bytes, 8)?))
+        .map_err(|_| fail(ExportOutputFailureCode::LimitExceeded))?;
     if length == 0
         || length > MAX_EXPORT_TERMINAL_EVIDENCE_BYTES
         || bytes.len() != TERMINAL_EVIDENCE_FIXED_BYTES.saturating_add(length)
     {
         return Err(fail(ExportOutputFailureCode::IntegrityCorruption));
     }
-    Ok(bytes[TERMINAL_EVIDENCE_FIXED_BYTES..].to_vec())
+    Ok(bytes
+        .get(TERMINAL_EVIDENCE_FIXED_BYTES..)
+        .ok_or_else(|| fail(ExportOutputFailureCode::IntegrityCorruption))?
+        .to_vec())
 }
 fn encode_manifest(bytes: &[u8]) -> Result<Vec<u8>, ExportOutputFailure> {
     if bytes.is_empty() || bytes.len() > MAX_EXPORT_MANIFEST_BYTES {
@@ -1783,19 +1782,18 @@ fn decode_manifest(bytes: &[u8]) -> Result<Vec<u8>, ExportOutputFailure> {
     if bytes.len() < MANIFEST_FIXED_BYTES || bytes.get(..8) != Some(MANIFEST_MAGIC.as_slice()) {
         return Err(fail(ExportOutputFailureCode::IntegrityCorruption));
     }
-    let length = usize::try_from(u32::from_be_bytes(
-        bytes[8..12]
-            .try_into()
-            .map_err(|_| fail(ExportOutputFailureCode::IntegrityCorruption))?,
-    ))
-    .map_err(|_| fail(ExportOutputFailureCode::LimitExceeded))?;
+    let length = usize::try_from(u32::from_be_bytes(bounded_array(bytes, 8)?))
+        .map_err(|_| fail(ExportOutputFailureCode::LimitExceeded))?;
     if length == 0
         || length > MAX_EXPORT_MANIFEST_BYTES
         || bytes.len() != MANIFEST_FIXED_BYTES.saturating_add(length)
     {
         return Err(fail(ExportOutputFailureCode::IntegrityCorruption));
     }
-    Ok(bytes[MANIFEST_FIXED_BYTES..].to_vec())
+    Ok(bytes
+        .get(MANIFEST_FIXED_BYTES..)
+        .ok_or_else(|| fail(ExportOutputFailureCode::IntegrityCorruption))?
+        .to_vec())
 }
 
 fn encode_initial_preparation(
@@ -1908,22 +1906,10 @@ fn decode_payload(sequence: u64, bytes: &[u8]) -> Result<PayloadRecord, ExportOu
     if bytes.len() < PAYLOAD_FIXED_BYTES || bytes.get(..8) != Some(PAYLOAD_MAGIC.as_slice()) {
         return Err(fail(ExportOutputFailureCode::IntegrityCorruption));
     }
-    let stored = u64::from_be_bytes(
-        bytes[8..16]
-            .try_into()
-            .map_err(|_| fail(ExportOutputFailureCode::IntegrityCorruption))?,
-    );
-    let cursor_length = usize::from(u16::from_be_bytes(
-        bytes[48..50]
-            .try_into()
-            .map_err(|_| fail(ExportOutputFailureCode::IntegrityCorruption))?,
-    ));
-    let len = usize::try_from(u32::from_be_bytes(
-        bytes[50..54]
-            .try_into()
-            .map_err(|_| fail(ExportOutputFailureCode::IntegrityCorruption))?,
-    ))
-    .map_err(|_| fail(ExportOutputFailureCode::LimitExceeded))?;
+    let stored = u64::from_be_bytes(bounded_array(bytes, 8)?);
+    let cursor_length = usize::from(u16::from_be_bytes(bounded_array(bytes, 48)?));
+    let len = usize::try_from(u32::from_be_bytes(bounded_array(bytes, 50)?))
+        .map_err(|_| fail(ExportOutputFailureCode::LimitExceeded))?;
     let expected = PAYLOAD_FIXED_BYTES
         .checked_add(cursor_length)
         .and_then(|value| value.checked_add(len))
@@ -1936,19 +1922,27 @@ fn decode_payload(sequence: u64, bytes: &[u8]) -> Result<PayloadRecord, ExportOu
     {
         return Err(fail(ExportOutputFailureCode::IntegrityCorruption));
     }
-    let mut digest = [0; 32];
-    digest.copy_from_slice(&bytes[16..48]);
+    let digest = bounded_array(bytes, 16)?;
     if digest == [0; 32] {
         return Err(fail(ExportOutputFailureCode::IntegrityCorruption));
     }
     let cursor_end = PAYLOAD_FIXED_BYTES
         .checked_add(cursor_length)
         .ok_or_else(|| fail(ExportOutputFailureCode::LimitExceeded))?;
-    let continuation_cursor =
-        (!cursor_length.eq(&0)).then(|| bytes[PAYLOAD_FIXED_BYTES..cursor_end].to_vec());
+    let continuation_cursor = (!cursor_length.eq(&0))
+        .then(|| {
+            bytes
+                .get(PAYLOAD_FIXED_BYTES..cursor_end)
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| fail(ExportOutputFailureCode::IntegrityCorruption))
+        })
+        .transpose()?;
     Ok(PayloadRecord {
         digest,
-        bytes: bytes[cursor_end..].to_vec(),
+        bytes: bytes
+            .get(cursor_end..)
+            .ok_or_else(|| fail(ExportOutputFailureCode::IntegrityCorruption))?
+            .to_vec(),
         continuation_cursor,
         durable_bytes: 0,
     })
@@ -1984,29 +1978,20 @@ fn decode_descriptor(bytes: &[u8]) -> Result<Option<ExportOutput>, ExportOutputF
     if bytes.len() != expected_bytes {
         return Err(fail(ExportOutputFailureCode::IntegrityCorruption));
     }
-    let mut identity = [0; 16];
-    identity.copy_from_slice(&bytes[8..24]);
-    let binding = decode_binding(&bytes[24..184])?;
-    let next = u64::from_be_bytes(
-        bytes[184..192]
-            .try_into()
-            .map_err(|_| fail(ExportOutputFailureCode::IntegrityCorruption))?,
-    );
-    let retained = u64::from_be_bytes(
-        bytes[192..200]
-            .try_into()
-            .map_err(|_| fail(ExportOutputFailureCode::IntegrityCorruption))?,
-    );
-    let mut last = [0; 32];
-    last.copy_from_slice(&bytes[200..232]);
-    let mut terminal_evidence_digest = [0; 32];
-    let mut manifest_digest = [0; 32];
-    if legacy {
-        manifest_digest.copy_from_slice(&bytes[232..264]);
+    let identity = bounded_array(bytes, 8)?;
+    let binding = decode_binding(
+        bytes
+            .get(24..184)
+            .ok_or_else(|| fail(ExportOutputFailureCode::IntegrityCorruption))?,
+    )?;
+    let next = u64::from_be_bytes(bounded_array(bytes, 184)?);
+    let retained = u64::from_be_bytes(bounded_array(bytes, 192)?);
+    let last = bounded_array(bytes, 200)?;
+    let (terminal_evidence_digest, manifest_digest) = if legacy {
+        ([0; 32], bounded_array(bytes, 232)?)
     } else {
-        terminal_evidence_digest.copy_from_slice(&bytes[232..264]);
-        manifest_digest.copy_from_slice(&bytes[264..296]);
-    }
+        (bounded_array(bytes, 232)?, bounded_array(bytes, 264)?)
+    };
     if identity != output_identity(binding)
         || next > MAX_EXPORT_BATCHES
         || retained > MAX_EXPORT_BYTES

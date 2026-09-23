@@ -2076,27 +2076,7 @@ fn durable_export_resumes_the_original_snapshot_and_cumulative_cursor_after_inte
         );
         assert_eq!(interrupted.writes, 1);
 
-        let mut request_payload = Vec::new();
-        request_payload.extend_from_slice(&[0x7a; 16]);
-        request_payload.push(1);
-        for limit in [
-            budget.scanned_bytes(),
-            budget.decoded_records(),
-            budget.output_rows(),
-            budget.output_bytes(),
-            budget.memory_bytes(),
-            budget.cpu_work_units(),
-            budget.wall_seconds(),
-            budget.maximum_time_range_nanoseconds(),
-        ] {
-            request_payload.extend_from_slice(&limit.to_be_bytes());
-        }
-        request_payload.extend_from_slice(source.as_bytes());
-        let request_digest = fixture
-            .kernel
-            .ledger()?
-            .control_tokens()
-            .digest_query_cursor(b"query-export-request-v1", &request_payload)?;
+        let request_digest = export_request_digest(fixture, destination, source, budget)?;
         let request = positron_governance::DurableOperationRequest::query_export(
             fixture.context.principal_id(),
             fixture
@@ -2242,7 +2222,7 @@ fn another_same_tenant_query_principal_cannot_resume_or_terminally_mutate_an_own
 }
 
 #[test]
-fn withdrawn_destination_after_checkpoint_fails_the_owners_exact_resume_once()
+fn withdrawn_destination_after_checkpoint_fails_the_owners_same_key_retry_once()
 -> Result<(), Box<dyn Error>> {
     QueryFixture::scoped("durable-export-withdrawn-destination", |fixture| {
         fixture.kernel.append_log("first", 20, 1)?;
@@ -2342,19 +2322,126 @@ fn withdrawn_destination_after_checkpoint_fails_the_owners_exact_resume_once()
             .service(1)?
             .with_export_destination_resolver(resolver.clone());
 
+        assert_eq!(
+            restarted
+                .export_pipeline_as_operation(
+                    fixture.kernel.catalog_for_test(),
+                    &signer,
+                    fixture.context,
+                    positron_governance::AdministrativeIdempotencyKey::new([0x84; 16])?,
+                    source,
+                    budget,
+                    destination,
+                    &mut RecordingSink::default(),
+                )
+                .expect_err("a withdrawn destination cannot accept a fresh export")
+                .code(),
+            QueryFailureCode::Unauthorized
+        );
+        assert!(
+            positron_governance::DurableOperationAdministration::inspect_by_idempotency(
+                fixture.kernel.catalog_for_test(),
+                positron_governance::AdministrativeIdempotencyKey::new([0x84; 16])?,
+            )?
+            .is_none(),
+            "a fresh key for a withdrawn destination must not create an operation"
+        );
+        assert_eq!(
+            fixture
+                .kernel
+                .catalog_for_test()
+                .governance_audit_records()?
+                .len(),
+            audit_before_withdrawal,
+            "a fresh withdrawn request must not append an audit record"
+        );
+
+        assert_eq!(
+            restarted
+                .export_pipeline_as_operation(
+                    fixture.kernel.catalog_for_test(),
+                    &signer,
+                    fixture.context,
+                    key,
+                    source,
+                    budget,
+                    "substituted-destination",
+                    &mut RecordingSink::default(),
+                )
+                .expect_err("a same key cannot substitute the accepted destination name")
+                .code(),
+            QueryFailureCode::IdempotencyConflict
+        );
+        assert_eq!(
+            positron_governance::DurableOperationAdministration::inspect(
+                fixture.kernel.catalog_for_test(),
+                operation_id,
+            )?
+            .ok_or("operation missing")?
+            .status(),
+            positron_governance::DurableOperationStatus::Running
+        );
+        assert_eq!(
+            fixture
+                .kernel
+                .catalog_for_test()
+                .governance_audit_records()?
+                .len(),
+            audit_before_withdrawal,
+            "a substituted destination name must not terminally mutate the export"
+        );
+
+        assert_eq!(
+            restarted
+                .export_sql_as_operation(
+                    fixture.kernel.catalog_for_test(),
+                    &signer,
+                    fixture.context,
+                    key,
+                    source,
+                    budget,
+                    destination,
+                    &mut RecordingSink::default(),
+                )
+                .expect_err("a same key cannot substitute the accepted query language")
+                .code(),
+            QueryFailureCode::IdempotencyConflict
+        );
+        assert_eq!(
+            positron_governance::DurableOperationAdministration::inspect(
+                fixture.kernel.catalog_for_test(),
+                operation_id,
+            )?
+            .ok_or("operation missing")?
+            .status(),
+            positron_governance::DurableOperationStatus::Running
+        );
+        assert_eq!(
+            fixture
+                .kernel
+                .catalog_for_test()
+                .governance_audit_records()?
+                .len(),
+            audit_before_withdrawal,
+            "a substituted query language must not terminally mutate the export"
+        );
+
+        let mut withdrawn_sink = RecordingSink::default();
         let withdrawn = restarted
-            .resume_durable_export(
+            .export_pipeline_as_operation(
                 fixture.kernel.catalog_for_test(),
                 &signer,
                 fixture.context,
-                operation_id,
+                key,
                 source,
                 budget,
                 destination,
-                &mut RecordingSink::default(),
+                &mut withdrawn_sink,
             )
-            .expect_err("withdrawn destination must end the checkpointed export explicitly");
+            .expect_err("a same-key retry must terminalize the checkpointed export explicitly");
         assert_eq!(withdrawn.code(), QueryFailureCode::AuthorizationChanged);
+        assert!(!withdrawn_sink.started);
+        assert!(withdrawn_sink.batches.is_empty());
         assert_eq!(
             positron_governance::DurableOperationAdministration::inspect(
                 fixture.kernel.catalog_for_test(),
@@ -2375,19 +2462,22 @@ fn withdrawn_destination_after_checkpoint_fails_the_owners_exact_resume_once()
             "destination withdrawal must publish one terminal audit"
         );
 
+        let mut retry_sink = RecordingSink::default();
         let retry = restarted
-            .resume_durable_export(
+            .export_pipeline_as_operation(
                 fixture.kernel.catalog_for_test(),
                 &signer,
                 fixture.context,
-                operation_id,
+                key,
                 source,
                 budget,
                 destination,
-                &mut RecordingSink::default(),
+                &mut retry_sink,
             )
             .expect_err("the original terminal destination failure must be stable");
         assert_eq!(retry, withdrawn);
+        assert!(!retry_sink.started);
+        assert!(retry_sink.batches.is_empty());
         assert_eq!(
             fixture
                 .kernel
@@ -2669,11 +2759,13 @@ fn export_operation_id(
 
 fn export_request_digest(
     fixture: &QueryFixture,
-    _destination: &str,
+    destination: &str,
     source: &str,
     budget: QueryBudget,
 ) -> Result<[u8; 32], Box<dyn Error>> {
     let mut payload = [0x7a; 16].to_vec();
+    payload.extend_from_slice(&u16::try_from(destination.len())?.to_be_bytes());
+    payload.extend_from_slice(destination.as_bytes());
     payload.push(1);
     for limit in [
         budget.scanned_bytes(),
@@ -2692,5 +2784,5 @@ fn export_request_digest(
         .kernel
         .ledger()?
         .control_tokens()
-        .digest_query_cursor(b"query-export-request-v1", &payload)?)
+        .digest_query_cursor(b"query-export-request-v2", &payload)?)
 }

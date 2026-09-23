@@ -7,7 +7,7 @@ use crate::{
     QueryTerminal,
 };
 
-const REQUEST_DOMAIN: &[u8] = b"query-export-request-v1";
+const REQUEST_DOMAIN: &[u8] = b"query-export-request-v2";
 const MANIFEST_DOMAIN: &[u8] = b"query-export-manifest-v1";
 const MAX_MANIFEST_BATCHES: usize = 1_024;
 const MANIFEST_WIRE_MAGIC: &[u8; 8] = b"POSQEM01";
@@ -981,11 +981,39 @@ impl<'kernel, 'catalog, 'ledger> crate::QueryService<'kernel, 'catalog, 'ledger>
         if signer.identity() != catalog_integrity_identity(catalog)? {
             return Err(QueryFailure::new(QueryFailureCode::Unauthorized));
         }
-        let destination = self.resolve_export_destination(context, destination_name)?;
         let tenant = self.validate_current_query_context(context)?;
-        let request_digest = self.export_request_digest(source, budget, destination, language)?;
-        let generation = self.current_query_catalog(context)?.2;
-        let accepted_at = self.now()?;
+        let existing = positron_governance::DurableOperationAdministration::inspect_by_idempotency(
+            catalog,
+            idempotency,
+        )
+        .map_err(map_operation_failure)?;
+        let (destination, generation, accepted_at) = match existing {
+            Some(operation) => {
+                if operation.kind() != positron_governance::DurableOperationKind::QueryExport
+                    || operation.request().principal() != context.principal_id()
+                    || operation.request().applicable_tenant() != Some(tenant)
+                {
+                    return Err(QueryFailure::new(QueryFailureCode::Unauthorized));
+                }
+                let destination = ExportDestination(
+                    operation
+                        .target_identity()
+                        .ok_or_else(|| QueryFailure::new(QueryFailureCode::Unauthorized))?,
+                );
+                (
+                    destination,
+                    operation.request().accepted_generation(),
+                    operation.request().accepted_at_unix_seconds(),
+                )
+            },
+            None => (
+                self.resolve_export_destination_for_tenant(tenant, destination_name)?,
+                self.current_query_catalog(context)?.2,
+                self.now()?,
+            ),
+        };
+        let request_digest =
+            self.export_request_digest(source, budget, destination_name, destination, language)?;
         let request = positron_governance::DurableOperationRequest::query_export(
             context.principal_id(),
             tenant,
@@ -1346,8 +1374,14 @@ impl<'kernel, 'catalog, 'ledger> crate::QueryService<'kernel, 'catalog, 'ledger>
                 .target_identity()
                 .ok_or_else(|| QueryFailure::new(QueryFailureCode::Unauthorized))?,
         );
-        let request_digest =
-            self.export_request_digest(source, budget, accepted_destination, language)?;
+        let current_request_digest = self.export_request_digest(
+            source,
+            budget,
+            destination_name,
+            accepted_destination,
+            language,
+        )?;
+        let request_digest = current_request_digest;
         if operation.request().query_export_request_digest() != Some(request_digest) {
             return Err(QueryFailure::new(QueryFailureCode::Unauthorized));
         }
@@ -1695,18 +1729,34 @@ impl<'kernel, 'catalog, 'ledger> crate::QueryService<'kernel, 'catalog, 'ledger>
         ExportDestination::configured(identity)
     }
 
+    /// Computes the current Query-export idempotency intent. It binds the
+    /// caller-supplied destination name as well as the configured protected
+    /// identity, language, cumulative budget, and source; global durable
+    /// operation and governance identities remain unchanged.
     fn export_request_digest(
         &self,
         source: &str,
         budget: crate::QueryBudget,
+        destination_name: &str,
         destination: ExportDestination,
         language: crate::query_service::QueryLanguage,
     ) -> Result<[u8; 32], QueryFailure> {
+        let destination_name_length = u16::try_from(destination_name.len())
+            .map_err(|_| QueryFailure::new(QueryFailureCode::UnsupportedQuery))?;
         let mut payload = Vec::new();
         payload
-            .try_reserve_exact(source.len() + destination.identity().len() + 64)
+            .try_reserve_exact(
+                source
+                    .len()
+                    .checked_add(destination_name.len())
+                    .and_then(|length| length.checked_add(destination.identity().len()))
+                    .and_then(|length| length.checked_add(66))
+                    .ok_or_else(|| QueryFailure::new(QueryFailureCode::ResourceExhausted))?,
+            )
             .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
         payload.extend_from_slice(&destination.identity());
+        payload.extend_from_slice(&destination_name_length.to_be_bytes());
+        payload.extend_from_slice(destination_name.as_bytes());
         payload.push(match language {
             crate::query_service::QueryLanguage::Pipeline => 1,
             crate::query_service::QueryLanguage::Sql => 2,
