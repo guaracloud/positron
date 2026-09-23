@@ -1137,6 +1137,7 @@ name = "positron-config"
 version = "0.0.0"
 dependencies = [
  "positron-domain",
+ "rustix",
  "toml",
 ]
 
