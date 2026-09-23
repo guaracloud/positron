@@ -52,7 +52,7 @@ positron config validate [--config PATH] [--set PATH=VALUE]
 positron config explain [--setting PATH]
 positron config effective --redacted [--config PATH] [--set PATH=VALUE]
 positron config diff --current PATH --candidate PATH
-positron config migrate --config PATH
+positron config migrate --config PATH --output PATH
 ```
 
 `validate` resolves the complete candidate and reports only its schema version
@@ -63,7 +63,10 @@ state followed by the source of every setting. `diff` resolves both canonical
 documents without environment or command-line overrides, reports only redacted
 semantic values and provenance, and derives one no-mutation lifecycle plan.
 
-The current contract supports schema version 1 only. `migrate` therefore
-performs a strict version-compatibility preflight and reports `changed=false`
-for version 1; unsupported versions are rejected without coercion or an
-invented transformation.
+The current contract supports schema version 1 only. `migrate` validates its
+source without environment or command-line overrides, then writes the validated
+source bytes to the explicitly named output candidate. The output is created
+with restrictive permissions and is never overwritten. This preserves protected
+file references and avoids materializing defaults or overrides. The command
+reports the deterministic zero semantic diff for version 1; unsupported
+versions are rejected without coercion or an invented transformation.

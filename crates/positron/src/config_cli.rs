@@ -1,9 +1,9 @@
 use std::{path::Path, process::ExitCode};
 
 use positron_config::{
-    ConfigurationFailure, ConfigurationInputFailure, ConfigurationInputs, SecrecyClass,
-    SettingDefinition, ValueDomain, render_toml_basic_string, resolve, setting_definitions,
-    setting_for_path,
+    ConfigurationCandidateFailure, ConfigurationFailure, ConfigurationInputFailure,
+    ConfigurationInputs, SecrecyClass, SettingDefinition, ValueDomain, render_toml_basic_string,
+    resolve, setting_definitions, setting_for_path, write_current_schema_candidate,
 };
 
 const EXIT_CONFIGURATION: u8 = 2;
@@ -42,40 +42,49 @@ fn execute(
         Command::Diff { current, candidate } => {
             let current = resolve_document(&current)?;
             let candidate = resolve_document(&candidate)?;
-            let diff = current.semantic_diff(&candidate);
-            let mut output = format!(
-                "plan = {}\nchange_count = {}\n",
-                render_toml_basic_string(diff.plan().as_str()),
-                diff.changes().len()
-            );
-            for change in diff.changes() {
-                let before_source = change
-                    .before_source()
-                    .map_or("unavailable", |source| source.as_str());
-                let after_source = change
-                    .after_source()
-                    .map_or("unavailable", |source| source.as_str());
-                output.push_str(&format!(
-                    "\n[[change]]\nsetting = {}\nbefore = {}\nbefore_source = {}\nafter = {}\nafter_source = {}\nmutability = {}\n",
-                    render_toml_basic_string(change.setting().path()),
-                    render_toml_basic_string(change.before()),
-                    render_toml_basic_string(before_source),
-                    render_toml_basic_string(change.after()),
-                    render_toml_basic_string(after_source),
-                    render_toml_basic_string(change.setting().mutability().as_str()),
-                ));
-            }
-            Ok(output)
+            Ok(render_diff(&current, &candidate))
         },
-        Command::Migrate(path) => {
-            let effective = resolve_document(&path)?;
+        Command::Migrate { source, output } => {
+            let effective = write_current_schema_candidate(Path::new(&source), Path::new(&output))
+                .map_err(OperatorFailure::Candidate)?;
             Ok(format!(
-                "status=compatible from_schema_version={} to_schema_version={} changed=false\n",
+                "status = \"candidate_written\"\nfrom_schema_version = {}\nto_schema_version = {}\n{}",
                 effective.schema_version(),
-                effective.schema_version()
+                effective.schema_version(),
+                render_diff(&effective, &effective)
             ))
         },
     }
+}
+
+fn render_diff(
+    current: &positron_config::EffectiveConfiguration,
+    candidate: &positron_config::EffectiveConfiguration,
+) -> String {
+    let diff = current.semantic_diff(candidate);
+    let mut output = format!(
+        "plan = {}\nchange_count = {}\n",
+        render_toml_basic_string(diff.plan().as_str()),
+        diff.changes().len()
+    );
+    for change in diff.changes() {
+        let before_source = change
+            .before_source()
+            .map_or("unavailable", |source| source.as_str());
+        let after_source = change
+            .after_source()
+            .map_or("unavailable", |source| source.as_str());
+        output.push_str(&format!(
+            "\n[[change]]\nsetting = {}\nbefore = {}\nbefore_source = {}\nafter = {}\nafter_source = {}\nmutability = {}\n",
+            render_toml_basic_string(change.setting().path()),
+            render_toml_basic_string(change.before()),
+            render_toml_basic_string(before_source),
+            render_toml_basic_string(change.after()),
+            render_toml_basic_string(after_source),
+            render_toml_basic_string(change.setting().mutability().as_str()),
+        ));
+    }
+    output
 }
 
 fn resolve_inputs(
@@ -165,7 +174,7 @@ enum Command {
     Explain(Option<String>),
     Effective(InputOptions),
     Diff { current: String, candidate: String },
-    Migrate(String),
+    Migrate { source: String, output: String },
 }
 
 #[derive(Default)]
@@ -248,10 +257,20 @@ fn parse_diff(mut arguments: impl Iterator<Item = String>) -> Result<Command, Op
 }
 
 fn parse_migrate(mut arguments: impl Iterator<Item = String>) -> Result<Command, OperatorFailure> {
-    match (arguments.next().as_deref(), arguments.next()) {
-        (Some("--config"), Some(path)) if arguments.next().is_none() => Ok(Command::Migrate(path)),
-        _ => Err(OperatorFailure::Usage),
+    let mut source = None;
+    let mut output = None;
+    while let Some(argument) = arguments.next() {
+        let value = arguments.next().ok_or(OperatorFailure::Usage)?;
+        match argument.as_str() {
+            "--config" if source.is_none() => source = Some(value),
+            "--output" if output.is_none() => output = Some(value),
+            _ => return Err(OperatorFailure::Usage),
+        }
     }
+    Ok(Command::Migrate {
+        source: source.ok_or(OperatorFailure::Usage)?,
+        output: output.ok_or(OperatorFailure::Usage)?,
+    })
 }
 
 enum OperatorFailure {
@@ -260,12 +279,13 @@ enum OperatorFailure {
     UnknownExplainSetting,
     Input(ConfigurationInputFailure),
     Configuration(ConfigurationFailure),
+    Candidate(ConfigurationCandidateFailure),
 }
 
 impl OperatorFailure {
     fn render(&self) -> String {
         match self {
-            Self::Usage => "usage: positron config validate [--config PATH] [--set PATH=VALUE] | explain [--setting PATH] | effective --redacted [--config PATH] [--set PATH=VALUE] | diff --current PATH --candidate PATH | migrate --config PATH".to_owned(),
+            Self::Usage => "usage: positron config validate [--config PATH] [--set PATH=VALUE] | explain [--setting PATH] | effective --redacted [--config PATH] [--set PATH=VALUE] | diff --current PATH --candidate PATH | migrate --config PATH --output PATH".to_owned(),
             Self::RedactionRequired => "effective configuration requires --redacted".to_owned(),
             Self::UnknownExplainSetting => "configuration_rejected code=unknown_setting retry=after_input_correction completion=rejected source=command_line_override".to_owned(),
             Self::Input(ConfigurationInputFailure::DocumentUnavailable) => "configuration_rejected code=configuration_document_unavailable retry=after_input_correction completion=rejected source=configuration_document".to_owned(),
@@ -283,6 +303,15 @@ impl OperatorFailure {
                 failure.completion_state().as_str(),
                 failure.source().as_str(),
             ),
+            Self::Candidate(ConfigurationCandidateFailure::Input(failure)) => {
+                Self::Input(*failure).render()
+            },
+            Self::Candidate(ConfigurationCandidateFailure::Configuration(failure)) => {
+                Self::Configuration(*failure).render()
+            },
+            Self::Candidate(ConfigurationCandidateFailure::DestinationExists) => "configuration_rejected code=candidate_destination_exists retry=after_input_correction completion=rejected source=configuration_document".to_owned(),
+            Self::Candidate(ConfigurationCandidateFailure::DestinationUnavailable) => "configuration_rejected code=candidate_destination_unavailable retry=after_input_correction completion=rejected source=configuration_document".to_owned(),
+            Self::Candidate(ConfigurationCandidateFailure::CleanupFailed) => "configuration_rejected code=candidate_cleanup_failed retry=after_input_correction completion=rejected source=configuration_document".to_owned(),
         }
     }
 }

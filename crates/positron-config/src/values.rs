@@ -80,8 +80,8 @@ pub struct ProtectedFileReference {
 }
 
 impl ProtectedFileReference {
-    pub(crate) fn parse(value: &str) -> Result<Self, ConfigurationFailure> {
-        validate_path(value, Setting::SecurityLocalKeyFile)?;
+    pub(crate) fn parse(value: &str, setting: Setting) -> Result<Self, ConfigurationFailure> {
+        validate_path(value, setting)?;
         Ok(Self {
             path: value.to_owned(),
         })

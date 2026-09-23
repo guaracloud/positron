@@ -453,11 +453,9 @@ impl EffectiveConfiguration {
 }
 
 fn hexadecimal_identity(identity: [u8; 16]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut rendered = String::with_capacity(32);
     for byte in identity {
-        rendered.push(char::from(HEX[usize::from(byte >> 4)]));
-        rendered.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        rendered.push_str(&format!("{byte:02x}"));
     }
     rendered
 }

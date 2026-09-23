@@ -1,6 +1,9 @@
-use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    os::unix::fs::{PermissionsExt, symlink},
+    path::{Path, PathBuf},
+};
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
 const MAX_ROOT_COLLISION_RETRIES: u64 = 64;
@@ -69,12 +72,145 @@ fn operator_commands_are_deterministic_and_never_start_the_runtime()
         "plan = \"restart_required\"\nchange_count = 2\n\n[[change]]\nsetting = \"diagnostics.log_level\"\nbefore = \"info\"\nbefore_source = \"configuration_file\"\nafter = \"debug\"\nafter_source = \"configuration_file\"\nmutability = \"live_reloadable\"\n\n[[change]]\nsetting = \"runtime.shutdown_grace_seconds\"\nbefore = \"30\"\nbefore_source = \"compiled_default\"\nafter = \"60\"\nafter_source = \"configuration_file\"\nmutability = \"restart_required\"\n"
     );
 
-    let migrate = run(["config", "migrate", "--config", path(&candidate)?]);
+    let migrated = root.join("migrated.toml");
+    let migrate = run([
+        "config",
+        "migrate",
+        "--config",
+        path(&candidate)?,
+        "--output",
+        path(&migrated)?,
+    ]);
     assert!(migrate.status.success(), "{migrate:?}");
     assert_eq!(
         stdout(&migrate)?,
-        "status=compatible from_schema_version=1 to_schema_version=1 changed=false\n"
+        "status = \"candidate_written\"\nfrom_schema_version = 1\nto_schema_version = 1\nplan = \"no_change\"\nchange_count = 0\n"
     );
+    assert_eq!(
+        std::fs::read_to_string(&migrated)?,
+        std::fs::read_to_string(&candidate)?
+    );
+    Ok(())
+}
+
+#[test]
+fn current_schema_migration_preserves_source_references_and_refuses_existing_outputs()
+-> Result<(), Box<dyn std::error::Error>> {
+    const CANARY: &str = "/private/positron-migration-reference-canary";
+    let root = temporary_root()?;
+    let source = root.join("source.toml");
+    let destination = root.join("candidate.toml");
+    let source_document = format!(
+        "schema_version = 1\n[diagnostics]\nlog_level = \"info\"\n[listener]\napi_tls_certificate_file = \"{CANARY}-certificate\"\napi_tls_private_key_file = \"{CANARY}-private-key\"\n[security]\nlocal_key_file = \"{CANARY}-local-key\"\n"
+    );
+    std::fs::write(&source, &source_document)?;
+
+    let migrated = run([
+        "config",
+        "migrate",
+        "--config",
+        path(&source)?,
+        "--output",
+        path(&destination)?,
+    ]);
+    assert!(migrated.status.success(), "{migrated:?}");
+    assert_eq!(std::fs::read_to_string(&source)?, source_document);
+    assert_eq!(std::fs::read_to_string(&destination)?, source_document);
+    assert_eq!(
+        std::fs::metadata(&destination)?.permissions().mode() & 0o077,
+        0
+    );
+    assert_redacted(&migrated, CANARY)?;
+    assert_eq!(
+        stdout(&migrated)?,
+        "status = \"candidate_written\"\nfrom_schema_version = 1\nto_schema_version = 1\nplan = \"no_change\"\nchange_count = 0\n"
+    );
+
+    let existing = run([
+        "config",
+        "migrate",
+        "--config",
+        path(&source)?,
+        "--output",
+        path(&destination)?,
+    ]);
+    assert!(!existing.status.success());
+    assert_eq!(std::fs::read_to_string(&destination)?, source_document);
+    assert_redacted(&existing, CANARY)?;
+    assert_eq!(
+        stderr(&existing)?,
+        "positron: configuration_rejected code=candidate_destination_exists retry=after_input_correction completion=rejected source=configuration_document\n"
+    );
+
+    let same_path = run([
+        "config",
+        "migrate",
+        "--config",
+        path(&source)?,
+        "--output",
+        path(&source)?,
+    ]);
+    assert!(!same_path.status.success());
+    assert_eq!(std::fs::read_to_string(&source)?, source_document);
+    assert_redacted(&same_path, CANARY)?;
+    assert_eq!(
+        stderr(&same_path)?,
+        "positron: configuration_rejected code=candidate_destination_exists retry=after_input_correction completion=rejected source=configuration_document\n"
+    );
+
+    let symlinked_destination = root.join("candidate-link.toml");
+    symlink(&source, &symlinked_destination)?;
+    let symlinked = run([
+        "config",
+        "migrate",
+        "--config",
+        path(&source)?,
+        "--output",
+        path(&symlinked_destination)?,
+    ]);
+    assert!(!symlinked.status.success());
+    assert_eq!(std::fs::read_to_string(&source)?, source_document);
+    assert_redacted(&symlinked, CANARY)?;
+    assert_eq!(
+        stderr(&symlinked)?,
+        "positron: configuration_rejected code=candidate_destination_exists retry=after_input_correction completion=rejected source=configuration_document\n"
+    );
+
+    let unavailable_destination = root.join("missing").join("candidate.toml");
+    let unavailable = run([
+        "config",
+        "migrate",
+        "--config",
+        path(&source)?,
+        "--output",
+        path(&unavailable_destination)?,
+    ]);
+    assert!(!unavailable.status.success());
+    assert!(!unavailable_destination.exists());
+    assert_redacted(&unavailable, CANARY)?;
+    assert_eq!(
+        stderr(&unavailable)?,
+        "positron: configuration_rejected code=candidate_destination_unavailable retry=after_input_correction completion=rejected source=configuration_document\n"
+    );
+
+    let environment_destination = root.join("environment-candidate.toml");
+    let environment = run_with_environment(
+        [
+            "config",
+            "migrate",
+            "--config",
+            path(&source)?,
+            "--output",
+            path(&environment_destination)?,
+        ],
+        [("POSITRON__DIAGNOSTICS__LOG_LEVEL", "debug")],
+    );
+    assert!(environment.status.success(), "{environment:?}");
+    assert_eq!(
+        std::fs::read_to_string(&environment_destination)?,
+        source_document
+    );
+    assert_redacted(&environment, CANARY)?;
     Ok(())
 }
 
@@ -146,8 +282,17 @@ fn migration_rejects_an_unsupported_schema_without_coercion()
     let unsupported = root.join("unsupported.toml");
     std::fs::write(&unsupported, "schema_version = 2\n")?;
 
-    let output = run(["config", "migrate", "--config", path(&unsupported)?]);
+    let candidate = root.join("candidate.toml");
+    let output = run([
+        "config",
+        "migrate",
+        "--config",
+        path(&unsupported)?,
+        "--output",
+        path(&candidate)?,
+    ]);
     assert!(!output.status.success());
+    assert!(!candidate.exists());
     assert_eq!(
         stderr(&output)?,
         "positron: configuration_rejected code=unsupported_value retry=after_input_correction completion=rejected source=schema_version\n"
@@ -371,13 +516,25 @@ fn non_regular_configuration_path_is_rejected_without_reading_it()
 }
 
 fn run(arguments: impl IntoIterator<Item = impl AsRef<str>>) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_positron"))
+    run_with_environment(arguments, [] as [(&str, &str); 0])
+}
+
+fn run_with_environment<'a>(
+    arguments: impl IntoIterator<Item = impl AsRef<str>>,
+    environment: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_positron"));
+    command
         .args(
             arguments
                 .into_iter()
                 .map(|argument| argument.as_ref().to_owned()),
         )
-        .env_clear()
+        .env_clear();
+    for (key, value) in environment {
+        command.env(key, value);
+    }
+    command
         .output()
         .expect("Positron configuration command should run")
 }
