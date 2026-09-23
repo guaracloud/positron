@@ -66,6 +66,49 @@ fn durable_operation_audit_rejects_a_structurally_valid_unbound_transaction() {
 }
 
 #[test]
+fn historical_v3_catalog_migration_audit_without_a_target_remains_readable() {
+    // This is a valid POSOPA03 record emitted before durable-operation audit
+    // records carried an explicit target identity. Its operation and transition
+    // identities are fixed historical bytes, derived by the shipped V3 format.
+    let operation_id = [
+        0x5a, 0xdf, 0xcf, 0xc8, 0xda, 0x52, 0x9c, 0x99, 0x90, 0xd7, 0xbc, 0xed, 0x8a, 0xa1, 0x82,
+        0x31,
+    ];
+    let transaction = [
+        0xc0, 0x3c, 0xe7, 0xee, 0x48, 0x6b, 0x9a, 0x31, 0xf5, 0x77, 0xf7, 0x88, 0xbf, 0x20, 0x3d,
+        0x77,
+    ];
+    let mut intent = b"POSOPA03".to_vec();
+    intent.extend_from_slice(&operation_id);
+    intent.extend_from_slice(&[0x61; 16]); // historical actor
+    intent.push(0); // system-wide
+    intent.push(1); // catalog-format migration
+    intent.push(2); // running
+    intent.push(2); // preflight
+    intent.extend_from_slice(&[0x62; 16]); // historical idempotency key
+    intent.extend_from_slice(&7_u64.to_be_bytes());
+    intent.push(10); // progress
+    intent.extend_from_slice(&2_u64.to_be_bytes()); // revision
+    intent.push(0); // no cancellation key
+    intent.extend_from_slice(&[0; 16]);
+
+    let entry = GovernanceAuditEntry::decode_fields(5, transaction, &intent)
+        .expect("historical target-less catalog migration audit");
+    let GovernanceAuditEntry::DurableOperation(operation) = entry else {
+        panic!("typed durable audit");
+    };
+    assert_eq!(operation.operation_id().to_bytes(), operation_id);
+    assert_eq!(
+        operation.action(),
+        DurableOperationKind::CatalogFormatMigration
+    );
+    assert_eq!(operation.applicable_tenant(), None);
+
+    intent[41] = 2; // query export cannot use the target-less historical format
+    assert!(GovernanceAuditEntry::decode_fields(5, transaction, &intent).is_err());
+}
+
+#[test]
 fn query_export_audit_binds_its_tenant_and_full_request_digest() {
     let principal = PrincipalId::from_bytes([0x31; 16]).expect("principal");
     let tenant = TenantId::from_bytes([0x32; 16]).expect("tenant");

@@ -113,7 +113,6 @@ impl DurableOperationRequest {
         if accepted_generation == 0 {
             return Err(DurableOperationFailure::InvalidInput);
         }
-        let target_identity = target_identity.ok_or(DurableOperationFailure::InvalidInput)?;
         let mut hasher = Sha256::new();
         hasher.update(REQUEST_DOMAIN);
         hasher.update(principal.to_bytes());
@@ -124,7 +123,9 @@ impl DurableOperationRequest {
                 if applicable_tenant.is_some() || query_export_request_digest.is_some() {
                     return Err(DurableOperationFailure::InvalidInput);
                 }
-                hasher.update(target_identity);
+                if let Some(target_identity) = target_identity {
+                    hasher.update(target_identity);
+                }
                 hasher.update(accepted_generation.to_be_bytes());
             },
             DurableOperationKind::QueryExport => {
@@ -133,7 +134,7 @@ impl DurableOperationRequest {
                         .ok_or(DurableOperationFailure::InvalidInput)?
                         .to_bytes(),
                 );
-                hasher.update(target_identity);
+                hasher.update(target_identity.ok_or(DurableOperationFailure::InvalidInput)?);
                 hasher.update(
                     query_export_request_digest.ok_or(DurableOperationFailure::InvalidInput)?,
                 );
@@ -144,7 +145,7 @@ impl DurableOperationRequest {
             principal,
             idempotency,
             kind,
-            target_identity: Some(target_identity),
+            target_identity,
             applicable_tenant,
             accepted_generation,
             accepted_at_unix_seconds: 1,

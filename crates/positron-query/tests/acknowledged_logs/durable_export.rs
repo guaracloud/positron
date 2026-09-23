@@ -382,6 +382,133 @@ fn a_new_caller_key_for_the_same_export_intent_creates_a_new_snapshot_and_output
 }
 
 #[test]
+fn durable_export_recovery_rejects_another_operation_output_before_terminal_mutation()
+-> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("durable-export-recovery-output-binding")?;
+    fixture.kernel.append_log("first", 20, 1)?;
+    fixture.kernel.append_log("second", 21, 2)?;
+    let service = fixture.service(1)?;
+    let signer = fixture.export_manifest_signer()?;
+    let destination = "configured";
+    let source = "logs | range query_time -100 100 | limit 2";
+    let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 16_384, 60)?;
+    let generation = fixture.kernel.catalog_for_test().pin()?.number();
+
+    service
+        .export_pipeline_as_operation(
+            fixture.kernel.catalog_for_test(),
+            &signer,
+            fixture.context,
+            positron_governance::AdministrativeIdempotencyKey::new([0x56; 16])?,
+            source,
+            budget,
+            destination,
+            &mut InterruptingSink { writes: 0 },
+        )
+        .expect_err("an interrupted export leaves a running operation to recover");
+    let interrupted_operation = export_operation_id(
+        &fixture,
+        destination,
+        source,
+        budget,
+        generation,
+        [0x56; 16],
+    )?;
+    let tenant = fixture
+        .context
+        .tenant_attribution()
+        .ok_or("query context lacks tenant")?
+        .tenant_id();
+    let interrupted_output = positron_kernel::ExportOutput::recover_initial(
+        fixture.kernel.catalog_for_test(),
+        positron_kernel::ExportOutputRequest::new(
+            interrupted_operation.to_bytes(),
+            tenant,
+            [0x7a; 16],
+            export_request_digest(&fixture, destination, source, budget)?,
+        )?,
+        100,
+    )?
+    .ok_or("interrupted export output missing")?;
+    let completed = service.export_pipeline_as_operation(
+        fixture.kernel.catalog_for_test(),
+        &signer,
+        fixture.context,
+        positron_governance::AdministrativeIdempotencyKey::new([0x57; 16])?,
+        source,
+        budget,
+        destination,
+        &mut RecordingSink::default(),
+    )?;
+    let substituted_output = completed
+        .manifest()
+        .output_identity()
+        .ok_or("completed export output missing")?;
+    let audit_before_rejection = fixture
+        .kernel
+        .catalog_for_test()
+        .governance_audit_records()?
+        .len();
+
+    assert_eq!(
+        service
+            .resolve_durable_export(
+                fixture.kernel.catalog_for_test(),
+                fixture.context,
+                interrupted_operation,
+                substituted_output,
+                destination,
+            )
+            .expect_err("another export output cannot settle this operation")
+            .code(),
+        QueryFailureCode::Unauthorized
+    );
+    assert_eq!(
+        positron_governance::DurableOperationAdministration::inspect(
+            fixture.kernel.catalog_for_test(),
+            interrupted_operation,
+        )?
+        .ok_or("interrupted operation missing")?
+        .status(),
+        positron_governance::DurableOperationStatus::Running
+    );
+    assert_eq!(
+        fixture
+            .kernel
+            .catalog_for_test()
+            .governance_audit_records()?
+            .len(),
+        audit_before_rejection,
+        "a rejected output substitution must not append an operation transition"
+    );
+
+    let resumed = service.resume_durable_export(
+        fixture.kernel.catalog_for_test(),
+        &signer,
+        fixture.context,
+        interrupted_operation,
+        source,
+        budget,
+        destination,
+        &mut RecordingSink::default(),
+    )?;
+    let recovered = service.resolve_durable_export(
+        fixture.kernel.catalog_for_test(),
+        fixture.context,
+        interrupted_operation,
+        interrupted_output.identity(),
+        destination,
+    )?;
+    assert_eq!(recovered.operation_id(), interrupted_operation);
+    assert_eq!(
+        recovered.manifest().result_digest(),
+        resumed.manifest().result_digest(),
+        "the original output remains recoverable after rejecting the substitution"
+    );
+    Ok(())
+}
+
+#[test]
 fn pipeline_and_sql_durable_exports_share_ordered_rows_and_budget_execution()
 -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("durable-export-sql-parity")?;

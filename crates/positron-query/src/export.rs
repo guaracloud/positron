@@ -912,8 +912,12 @@ impl<'kernel, 'catalog, 'ledger> crate::QueryService<'kernel, 'catalog, 'ledger>
         }
         let output = positron_kernel::ExportOutput::reopen(catalog, output_identity)
             .map_err(KernelExportSink::map_output_failure)?;
-        if output.binding().tenant() != tenant
+        if operation.request().applicable_tenant() != Some(tenant)
+            || output.binding().operation_id() != operation_id.to_bytes()
+            || output.binding().tenant() != tenant
             || output.binding().destination() != destination.identity()
+            || operation.request().query_export_request_digest()
+                != Some(output.binding().request_digest())
         {
             return Err(QueryFailure::new(QueryFailureCode::Unauthorized));
         }
@@ -924,6 +928,7 @@ impl<'kernel, 'catalog, 'ledger> crate::QueryService<'kernel, 'catalog, 'ledger>
         let manifest = durable_manifest_from_bytes(&manifest_bytes)?;
         if manifest.destination() != destination
             || manifest.output_identity() != Some(output_identity)
+            || manifest.request_digest() != output.binding().request_digest()
             || manifest.snapshot().identity() != output.binding().snapshot_identity()
             || manifest.snapshot().generation() != output.binding().snapshot_generation()
             || manifest.snapshot().frontier() != output.binding().snapshot_frontier()
