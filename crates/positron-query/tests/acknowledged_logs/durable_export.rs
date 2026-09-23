@@ -813,6 +813,130 @@ fn final_complete_batch_recovers_after_manifest_publication_failure_without_repl
 }
 
 #[test]
+fn final_incomplete_batch_recovers_after_manifest_publication_failure_without_replay()
+-> Result<(), Box<dyn Error>> {
+    QueryFixture::scoped("durable-export-final-incomplete-recovery", |fixture| {
+        fixture.kernel.append_log("first", 20, 1)?;
+        let service = fixture.service(1)?;
+        let signer = fixture.export_manifest_signer()?;
+        let source = "logs | range query_time -100 100 | limit 1";
+        let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 16_384, 60)?;
+        let key = positron_governance::AdministrativeIdempotencyKey::new([0x4b; 16])?;
+        let generation = fixture.kernel.catalog_for_test().pin()?.number();
+        let operation_id = export_operation_id(
+            fixture,
+            "configured",
+            source,
+            budget,
+            generation,
+            key.to_bytes(),
+        )?;
+        let mut interrupted_sink = InterruptingSink { writes: 0 };
+        let initial_failure = positron_query::with_cancellation_after_next_batch(|| {
+            service.export_pipeline_as_operation(
+                fixture.kernel.catalog_for_test(),
+                &signer,
+                fixture.context,
+                key,
+                source,
+                budget,
+                "configured",
+                &mut interrupted_sink,
+            )
+        })
+        .expect_err("the observer can fail after the incomplete final descriptor is published");
+        assert_eq!(initial_failure.code(), QueryFailureCode::InvalidBudget);
+        assert_eq!(interrupted_sink.writes, 1);
+
+        let tenant = fixture
+            .context
+            .tenant_attribution()
+            .ok_or("query context lacks tenant")?
+            .tenant_id();
+        let output = positron_kernel::ExportOutput::find_for_request(
+            fixture.kernel.catalog_for_test(),
+            tenant,
+            [0x7a; 16],
+            export_request_digest(fixture, "configured", source, budget)?,
+        )?
+        .ok_or("published final export output missing")?;
+        assert_eq!(output.batch_count(), 1);
+        assert!(
+            output
+                .latest_checkpoint(fixture.kernel.catalog_for_test(), 100)?
+                .ok_or("final batch checkpoint missing")?
+                .continuation_cursor()
+                .is_none()
+        );
+        assert!(
+            output
+                .read_manifest(fixture.kernel.catalog_for_test(), 100)?
+                .is_none()
+        );
+        let original_binding = output.binding();
+        let audit_before_recovery = fixture
+            .kernel
+            .catalog_for_test()
+            .governance_audit_records()?
+            .len();
+        fixture.kernel.append_log("later", 21, 2)?;
+
+        let mut retry_sink = RecordingSink::default();
+        let receipt = service.export_pipeline_as_operation(
+            fixture.kernel.catalog_for_test(),
+            &signer,
+            fixture.context,
+            key,
+            source,
+            budget,
+            "configured",
+            &mut retry_sink,
+        )?;
+
+        assert_eq!(receipt.operation_id(), operation_id);
+        assert!(retry_sink.batches.is_empty());
+        assert_eq!(receipt.manifest().batch_count(), 1);
+        assert_eq!(
+            receipt.manifest().snapshot().identity(),
+            original_binding.snapshot_identity()
+        );
+        assert_eq!(
+            receipt.manifest().snapshot().generation(),
+            original_binding.snapshot_generation()
+        );
+        assert_eq!(
+            receipt.manifest().terminal().stats().cumulative_budget(),
+            budget
+        );
+        assert_eq!(receipt.manifest().terminal().stats().resume_count(), 0);
+        assert!(matches!(
+            receipt.manifest().terminal(),
+            positron_query::ExportTerminal::Incomplete(incomplete)
+                if incomplete.code() == QueryFailureCode::Cancelled
+        ));
+        assert_eq!(output.batch_count(), 1);
+        assert_eq!(
+            fixture
+                .kernel
+                .catalog_for_test()
+                .governance_audit_records()?
+                .len(),
+            audit_before_recovery + 1
+        );
+        assert_eq!(
+            positron_governance::DurableOperationAdministration::inspect(
+                fixture.kernel.catalog_for_test(),
+                operation_id,
+            )?
+            .ok_or("recovered operation missing")?
+            .status(),
+            positron_governance::DurableOperationStatus::Failed
+        );
+        Ok(())
+    })
+}
+
+#[test]
 fn kernel_owned_export_output_recovers_the_same_batch_receipts_after_restart()
 -> Result<(), Box<dyn Error>> {
     QueryFixture::scoped("durable-export-output-restart", |fixture| {

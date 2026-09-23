@@ -55,6 +55,8 @@ pub use stream::{
     ResultSnapshot, ResultValueType, TailPhase,
 };
 pub use stream_lifecycle::QueryStream;
+#[cfg(feature = "test-support")]
+pub use stream_lifecycle::with_cancellation_after_next_batch;
 pub use tail::{
     TailCursor, TailCursorState, TailEvent, TailPosition, TailSession, TailSourceSet, TailStart,
     TailStats, TailTerminal,

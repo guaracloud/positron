@@ -2,6 +2,25 @@ use crate::{
     QueryEvent, QueryFailure, QueryFailureCode, QueryIncomplete, QueryStats, QueryTerminal,
 };
 use positron_kernel::TransferredResourceReservation;
+#[cfg(feature = "test-support")]
+use std::cell::Cell;
+
+#[cfg(feature = "test-support")]
+thread_local! {
+    static CANCEL_AFTER_NEXT_BATCH: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Cancels the active stream immediately after its next delivered Result
+/// Batch. This test-support-only seam exercises terminal delivery recovery.
+#[cfg(feature = "test-support")]
+pub fn with_cancellation_after_next_batch<T>(action: impl FnOnce() -> T) -> T {
+    CANCEL_AFTER_NEXT_BATCH.with(|slot| {
+        let previous = slot.replace(true);
+        let result = action();
+        slot.set(previous);
+        result
+    })
+}
 
 type LeaseRelease<'lease> = Box<dyn FnMut() -> Result<(), QueryFailure> + 'lease>;
 
@@ -158,6 +177,10 @@ impl Iterator for QueryStream<'_> {
         }
         if matches!(event, Some(QueryEvent::Batch(_))) {
             self.observed_stats = self.batch_stats;
+            #[cfg(feature = "test-support")]
+            if CANCEL_AFTER_NEXT_BATCH.with(|slot| slot.replace(false)) {
+                self.cancellation.cancel();
+            }
         }
         if matches!(
             event,
