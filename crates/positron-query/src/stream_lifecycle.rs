@@ -30,6 +30,7 @@ pub struct QueryStream<'lease> {
     releasing_terminal_observed: bool,
     release: Option<LeaseRelease<'lease>>,
     retain_for_resume: bool,
+    retain_after_terminal: bool,
     resumable_delivery_observed: bool,
     observed_stats: QueryStats,
     batch_stats: QueryStats,
@@ -60,6 +61,7 @@ impl<'lease> QueryStream<'lease> {
             releasing_terminal_observed: false,
             release,
             retain_for_resume,
+            retain_after_terminal: false,
             resumable_delivery_observed: false,
             observed_stats,
             batch_stats,
@@ -113,6 +115,12 @@ impl<'lease> QueryStream<'lease> {
                 Err(failure)
             },
         }
+    }
+
+    /// Keeps a cursor-backed lease through a failed durable-output commit so
+    /// the same immutable snapshot can be resumed before its bounded expiry.
+    pub(crate) fn retain_for_durable_recovery(&mut self) {
+        self.retain_after_terminal = true;
     }
 
     fn begin_cancellation(&mut self) {
@@ -205,7 +213,7 @@ impl Drop for QueryStream<'_> {
         }
         if !(self.retain_for_resume
             && self.resumable_delivery_observed
-            && !self.releasing_terminal_observed)
+            && (!self.releasing_terminal_observed || self.retain_after_terminal))
             && let Some(release) = self.release.as_mut()
         {
             match release() {
@@ -345,6 +353,96 @@ mod tests {
         assert_eq!(release_attempts.load(Ordering::SeqCst), 1);
         drop(stream);
         assert_eq!(release_attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn successful_resumable_terminal_releases_its_lease() {
+        let release_attempts = Arc::new(AtomicU64::new(0));
+        let attempts = Arc::clone(&release_attempts);
+        let release = Box::new(move || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        let stats = empty_stats();
+        let mut stream = QueryStream::new(
+            vec![
+                QueryEvent::Header(test_header()),
+                QueryEvent::Terminal(QueryTerminal::Complete(stats)),
+            ],
+            Some(release),
+            true,
+            stats,
+            stats,
+            crate::QueryCancellation::new(),
+            None,
+        );
+
+        stream.resumable_delivery_observed = true;
+        assert!(matches!(stream.next(), Some(QueryEvent::Header(_))));
+        assert!(matches!(
+            stream.next(),
+            Some(QueryEvent::Terminal(QueryTerminal::Complete(_)))
+        ));
+        drop(stream);
+        assert_eq!(release_attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn ambiguous_durable_terminal_output_keeps_the_resumable_lease() {
+        let release_attempts = Arc::new(AtomicU64::new(0));
+        let attempts = Arc::clone(&release_attempts);
+        let release = Box::new(move || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        let stats = empty_stats();
+        let mut stream = QueryStream::new(
+            vec![
+                QueryEvent::Header(test_header()),
+                QueryEvent::Terminal(QueryTerminal::Complete(stats)),
+            ],
+            Some(release),
+            true,
+            stats,
+            stats,
+            crate::QueryCancellation::new(),
+            None,
+        );
+
+        stream.resumable_delivery_observed = true;
+        assert!(matches!(stream.next(), Some(QueryEvent::Header(_))));
+        assert!(matches!(
+            stream.next(),
+            Some(QueryEvent::Terminal(QueryTerminal::Complete(_)))
+        ));
+        stream.retain_for_durable_recovery();
+        drop(stream);
+        assert_eq!(release_attempts.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn cancellation_releases_a_durable_recovery_lease() {
+        let release_attempts = Arc::new(AtomicU64::new(0));
+        let attempts = Arc::clone(&release_attempts);
+        let release = Box::new(move || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        let stats = empty_stats();
+        let mut stream = QueryStream::new(
+            vec![QueryEvent::Header(test_header())],
+            Some(release),
+            true,
+            stats,
+            stats,
+            crate::QueryCancellation::new(),
+            None,
+        );
+
+        stream.retain_for_durable_recovery();
+        stream.cancel().expect("cancellation releases the lease");
+        drop(stream);
+        assert_eq!(release_attempts.load(Ordering::SeqCst), 1);
     }
 
     fn empty_stats() -> QueryStats {

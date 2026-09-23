@@ -912,9 +912,20 @@ pub fn with_kernel_fixture<T>(
         &mut KernelFixture<'kernel, 'catalog>,
     ) -> Result<T, Box<dyn Error>>,
 ) -> Result<T, Box<dyn Error>> {
+    with_kernel_fixture_for_tenants(tenant, label, &[], action)
+}
+
+pub fn with_kernel_fixture_for_tenants<T>(
+    tenant: TenantId,
+    label: &str,
+    additional_tenants: &[TenantId],
+    action: impl for<'kernel, 'catalog> FnOnce(
+        &mut KernelFixture<'kernel, 'catalog>,
+    ) -> Result<T, Box<dyn Error>>,
+) -> Result<T, Box<dyn Error>> {
     let root = TemporaryRoots::new(label)?;
     let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
-    let authority = establish_authority(volume, tenant)?;
+    let authority = establish_authority(volume, tenant, additional_tenants)?;
     let catalog = Catalog::open(
         &authority,
         InstanceId::new([0x31; 16])?,
@@ -962,6 +973,21 @@ pub fn with_kernel_fixture_with_identity<T>(
     })
 }
 
+pub fn with_kernel_fixture_with_identity_for_tenants<T>(
+    tenant: TenantId,
+    label: &str,
+    additional_tenants: &[TenantId],
+    identity: &GovernanceTestFixture,
+    action: impl for<'kernel, 'catalog> FnOnce(
+        &mut KernelFixture<'kernel, 'catalog>,
+    ) -> Result<T, Box<dyn Error>>,
+) -> Result<T, Box<dyn Error>> {
+    with_kernel_fixture_for_tenants(tenant, label, additional_tenants, |fixture| {
+        identity.install_into(fixture)?;
+        action(fixture)
+    })
+}
+
 pub fn with_compaction_kernel_fixture_with_identity<T>(
     tenant: TenantId,
     label: &str,
@@ -972,7 +998,7 @@ pub fn with_compaction_kernel_fixture_with_identity<T>(
 ) -> Result<T, Box<dyn Error>> {
     let root = TemporaryRoots::new(label)?;
     let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
-    let authority = establish_authority(volume, tenant)?;
+    let authority = establish_authority(volume, tenant, &[])?;
     let catalog = Catalog::open(
         &authority,
         InstanceId::new([0x31; 16])?,
@@ -1734,8 +1760,14 @@ impl GovernanceFixtureTarget for KernelFixture<'_, '_> {
 fn establish_authority(
     volume: positron_kernel::OwnedPrimaryDataVolume,
     tenant: TenantId,
+    additional_tenants: &[TenantId],
 ) -> Result<StorageKernelResourceAuthority, Box<dyn Error>> {
-    let configuration = fixture_configuration(&volume, tenant, FixtureInventory::Declared)?;
+    let configuration = fixture_configuration(
+        &volume,
+        tenant,
+        additional_tenants,
+        FixtureInventory::Declared,
+    )?;
     StorageKernelResourceAuthority::establish(volume, configuration)
         .map_err(|_| "kernel authority establishment failed".into())
 }
@@ -1749,20 +1781,32 @@ enum FixtureInventory {
 fn fixture_configuration(
     volume: &positron_kernel::OwnedPrimaryDataVolume,
     tenant: TenantId,
+    additional_tenants: &[TenantId],
     detected_inventory: FixtureInventory,
 ) -> Result<ResourceGovernorConfiguration, Box<dyn Error>> {
-    let cardinality = InventoryCardinalityLimits::new(1, 24)?;
+    let tenant_count = additional_tenants
+        .len()
+        .checked_add(1)
+        .ok_or("fixture tenant count overflow")?;
+    let cardinality = InventoryCardinalityLimits::new(tenant_count, 24)?;
     let large = ResourceAmounts::new([
         90_000_000, 4, 4, 90_000_000, 70_000, 4, 4, 4, 4, 16, 40_000_000,
     ]);
     let small = uniform(2);
     let durability = add(add(large, large)?, large)?;
     let recovery_capacity = add(add(add(durability, large)?, large)?, uniform(12))?;
+    let recovery_capacity = if additional_tenants.is_empty() {
+        recovery_capacity
+    } else {
+        add(recovery_capacity, large)?
+    };
     let ordinary_capacity = ResourceAmounts::new([
         8_000_000, 32, 32, 8_000_000, 2_048, 32, 32, 32, 4_096, 32, 2_000_000,
     ]);
+    let ordinary_total = std::iter::repeat_n(ordinary_capacity, tenant_count)
+        .try_fold(ResourceAmounts::new([0; DIMENSIONS]), add)?;
     let raw = add(
-        add(recovery_capacity, ordinary_capacity)?,
+        add(recovery_capacity, ordinary_total)?,
         cardinality.governor_bootstrap_overhead(1)?,
     )?;
     let detected = match detected_inventory {
@@ -1784,17 +1828,33 @@ fn fixture_configuration(
             disk,
         )?,
     )?;
-    let policy = GovernorPolicy::new(
-        [TenantQuota::new(tenant, 1, ordinary_capacity)?],
-        OrdinaryPoolPolicy::new(
-            with_cpu(uniform(8), 1_024),
-            with_cpu(uniform(6), 1_024),
-            with_cpu(uniform(4), 1_024),
-            uniform(2),
-        )?,
+    let ordinary_policy = OrdinaryPoolPolicy::new(
+        with_cpu(uniform(8), 1_024),
+        with_cpu(uniform(6), 1_024),
+        with_cpu(uniform(4), 1_024),
+        uniform(2),
     )?;
+    let policy = match additional_tenants {
+        [] => GovernorPolicy::new(
+            [TenantQuota::new(tenant, 1, ordinary_capacity)?],
+            ordinary_policy,
+        )?,
+        [additional] if *additional != tenant => GovernorPolicy::new(
+            [
+                TenantQuota::new(tenant, 1, ordinary_capacity)?,
+                TenantQuota::new(*additional, 1, ordinary_capacity)?,
+            ],
+            ordinary_policy,
+        )?,
+        [..] => return Err("fixture supports one distinct additional tenant quota".into()),
+    };
+    let compaction = if additional_tenants.is_empty() {
+        small
+    } else {
+        large
+    };
     let recovery =
-        RecoveryPoolCapacities::new(durability, small, small, small, large, small, small)?;
+        RecoveryPoolCapacities::new(durability, small, compaction, small, large, small, small)?;
     Ok(ResourceGovernorConfiguration::new(
         inventory, policy, recovery,
     )?)
@@ -1849,6 +1909,7 @@ fn four_core_capacity_cannot_admit_the_declared_acknowledged_logs_fixture_quota(
     let failure = match fixture_configuration(
         &volume,
         TenantId::from_bytes([0xa1; 16])?,
+        &[],
         FixtureInventory::DetectedCpu(4_000),
     ) {
         Ok(_) => return Err("four logical CPUs unexpectedly admitted the fixture quota".into()),

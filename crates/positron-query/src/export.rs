@@ -1244,6 +1244,11 @@ impl<'kernel, 'catalog, 'ledger> crate::QueryService<'kernel, 'catalog, 'ledger>
         {
             return Err(QueryFailure::new(QueryFailureCode::Unauthorized));
         }
+        let output_boundary_crossed = match operation.phase() {
+            positron_governance::DurableOperationPhase::Preflight => false,
+            positron_governance::DurableOperationPhase::Draining => true,
+            _ => return Err(QueryFailure::new(QueryFailureCode::AuthorizationChanged)),
+        };
         let manifest = match output.read_manifest(catalog, self.now()?) {
             Ok(manifest) => manifest,
             Err(error) => {
@@ -1275,6 +1280,9 @@ impl<'kernel, 'catalog, 'ledger> crate::QueryService<'kernel, 'catalog, 'ledger>
             .read_terminal_evidence(catalog, self.now()?)
             .map_err(KernelExportSink::map_output_failure)?
         {
+            if !output_boundary_crossed {
+                return Err(QueryFailure::new(QueryFailureCode::MalformedPersistentData));
+            }
             let terminal = terminal_from_evidence(&evidence)?;
             let mut manifest = self.manifest_from_durable_terminal(
                 catalog,
@@ -1417,7 +1425,7 @@ impl<'kernel, 'catalog, 'ledger> crate::QueryService<'kernel, 'catalog, 'ledger>
             observer: sink,
             operation_id,
             context,
-            first_batch_started: true,
+            first_batch_started: output_boundary_crossed,
         };
         let mut manifest = self.export_stream(
             context,
@@ -1663,11 +1671,14 @@ impl<'kernel, 'catalog, 'ledger> crate::QueryService<'kernel, 'catalog, 'ledger>
                         if batch.sequence() != expected || batches.len() == MAX_MANIFEST_BATCHES {
                             return Err(QueryFailure::new(QueryFailureCode::Internal));
                         }
-                        sink.write_terminal_batch(
+                        if let Err(failure) = sink.write_terminal_batch(
                             destination,
                             &batch,
                             &ExportTerminal::Complete(stats),
-                        )?;
+                        ) {
+                            stream.retain_for_durable_recovery();
+                            return Err(failure);
+                        }
                         terminal_evidence_persisted = true;
                         batches.push(ExportBatch {
                             sequence: batch.sequence(),
@@ -1683,11 +1694,14 @@ impl<'kernel, 'catalog, 'ledger> crate::QueryService<'kernel, 'catalog, 'ledger>
                         if batch.sequence() != expected || batches.len() == MAX_MANIFEST_BATCHES {
                             return Err(QueryFailure::new(QueryFailureCode::Internal));
                         }
-                        sink.write_terminal_batch(
+                        if let Err(failure) = sink.write_terminal_batch(
                             destination,
                             &batch,
                             &ExportTerminal::Incomplete(incomplete.clone()),
-                        )?;
+                        ) {
+                            stream.retain_for_durable_recovery();
+                            return Err(failure);
+                        }
                         terminal_evidence_persisted = true;
                         batches.push(ExportBatch {
                             sequence: batch.sequence(),

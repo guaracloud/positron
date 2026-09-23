@@ -105,50 +105,54 @@ fn correlation_preserves_matched_truth_for_schema_overflow_log_records()
 #[test]
 fn correlation_rejects_target_scope_and_tenant_before_snapshot_admission()
 -> Result<(), Box<dyn Error>> {
-    QueryFixture::scoped("correlation-target-authorization", |fixture| {
-        let source = "pipeline:v1 logs | range query_time -100 100 | correlate trace | limit 1";
-        let baseline = fixture.kernel.authority.governor().inspect()?;
-        let wrong_scope = zero_work_service(
-            fixture.kernel.authority.governor(),
-            fixture.kernel.ledger()?,
-            1,
-        )
-        .with_trace_ledger(fixture.kernel.ledger()?);
-        let wrong_scope_query =
-            wrong_scope.plan_pipeline(fixture.context, source, super::budget())?;
-        assert_eq!(
-            wrong_scope
-                .execute(wrong_scope_query)
-                .expect_err("a Log Store cannot be admitted as a trace target")
-                .code(),
-            QueryFailureCode::MalformedPersistentData
-        );
+    let foreign_tenant = TenantId::from_bytes([0xaf; 16])?;
+    QueryFixture::scoped_with_tenants(
+        "correlation-target-authorization",
+        &[foreign_tenant],
+        |fixture| {
+            let source = "pipeline:v1 logs | range query_time -100 100 | correlate trace | limit 1";
+            let wrong_scope = zero_work_service(
+                fixture.kernel.authority.governor(),
+                fixture.kernel.ledger()?,
+                1,
+            )
+            .with_trace_ledger(fixture.kernel.ledger()?);
+            let wrong_scope_query =
+                wrong_scope.plan_pipeline(fixture.context, source, super::budget())?;
+            assert_eq!(
+                wrong_scope
+                    .execute(wrong_scope_query)
+                    .expect_err("a Log Store cannot be admitted as a trace target")
+                    .code(),
+                QueryFailureCode::MalformedPersistentData
+            );
 
-        let foreign_tenant = TenantId::from_bytes([0xaf; 16])?;
-        let foreign = ActiveSegmentLedger::open(
-            fixture.kernel.authority,
-            fixture.kernel.catalog_for_test(),
-            SegmentScope::new(foreign_tenant, SignalKind::Traces, VirtualShardId::new(2)?),
-            SegmentProtectionKey::from_owned(Box::new([0x36; 32])),
-        )?;
-        let wrong_tenant = zero_work_service(
-            fixture.kernel.authority.governor(),
-            fixture.kernel.ledger()?,
-            1,
-        )
-        .with_trace_ledger(&foreign);
-        let wrong_tenant_query =
-            wrong_tenant.plan_pipeline(fixture.context, source, super::budget())?;
-        assert_eq!(
-            wrong_tenant
-                .execute(wrong_tenant_query)
-                .expect_err("a foreign tenant trace target must be rejected")
-                .code(),
-            QueryFailureCode::Unauthorized
-        );
-        assert_eq!(fixture.kernel.authority.governor().inspect()?, baseline);
-        Ok(())
-    })
+            let foreign = ActiveSegmentLedger::open(
+                fixture.kernel.authority,
+                fixture.kernel.catalog_for_test(),
+                SegmentScope::new(foreign_tenant, SignalKind::Traces, VirtualShardId::new(2)?),
+                SegmentProtectionKey::from_owned(Box::new([0x36; 32])),
+            )?;
+            let wrong_tenant = zero_work_service(
+                fixture.kernel.authority.governor(),
+                fixture.kernel.ledger()?,
+                1,
+            )
+            .with_trace_ledger(&foreign);
+            let baseline = fixture.kernel.authority.governor().inspect()?;
+            let wrong_tenant_query =
+                wrong_tenant.plan_pipeline(fixture.context, source, super::budget())?;
+            assert_eq!(
+                wrong_tenant
+                    .execute(wrong_tenant_query)
+                    .expect_err("a foreign tenant trace target must be rejected")
+                    .code(),
+                QueryFailureCode::Unauthorized
+            );
+            assert_eq!(fixture.kernel.authority.governor().inspect()?, baseline);
+            Ok(())
+        },
+    )
 }
 
 #[test]
