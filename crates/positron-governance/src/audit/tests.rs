@@ -66,6 +66,114 @@ fn durable_operation_audit_rejects_a_structurally_valid_unbound_transaction() {
 }
 
 #[test]
+fn historical_v3_catalog_migration_audit_without_a_target_remains_readable() {
+    // This is a valid POSOPA03 record emitted before durable-operation audit
+    // records carried an explicit target identity. Its operation and transition
+    // identities are fixed historical bytes, derived by the shipped V3 format.
+    let operation_id = [
+        0x5a, 0xdf, 0xcf, 0xc8, 0xda, 0x52, 0x9c, 0x99, 0x90, 0xd7, 0xbc, 0xed, 0x8a, 0xa1, 0x82,
+        0x31,
+    ];
+    let transaction = [
+        0xc0, 0x3c, 0xe7, 0xee, 0x48, 0x6b, 0x9a, 0x31, 0xf5, 0x77, 0xf7, 0x88, 0xbf, 0x20, 0x3d,
+        0x77,
+    ];
+    let mut intent = b"POSOPA03".to_vec();
+    intent.extend_from_slice(&operation_id);
+    intent.extend_from_slice(&[0x61; 16]); // historical actor
+    intent.push(0); // system-wide
+    intent.push(1); // catalog-format migration
+    intent.push(2); // running
+    intent.push(2); // preflight
+    intent.extend_from_slice(&[0x62; 16]); // historical idempotency key
+    intent.extend_from_slice(&7_u64.to_be_bytes());
+    intent.push(10); // progress
+    intent.extend_from_slice(&2_u64.to_be_bytes()); // revision
+    intent.push(0); // no cancellation key
+    intent.extend_from_slice(&[0; 16]);
+
+    let entry = GovernanceAuditEntry::decode_fields(5, transaction, &intent)
+        .expect("historical target-less catalog migration audit");
+    let GovernanceAuditEntry::DurableOperation(operation) = entry else {
+        panic!("typed durable audit");
+    };
+    assert_eq!(operation.operation_id().to_bytes(), operation_id);
+    assert_eq!(
+        operation.action(),
+        DurableOperationKind::CatalogFormatMigration
+    );
+    assert_eq!(operation.applicable_tenant(), None);
+
+    intent[41] = 2; // query export cannot use the target-less historical format
+    assert!(GovernanceAuditEntry::decode_fields(5, transaction, &intent).is_err());
+}
+
+#[test]
+fn query_export_audit_binds_its_tenant_and_full_request_digest() {
+    let principal = PrincipalId::from_bytes([0x31; 16]).expect("principal");
+    let tenant = TenantId::from_bytes([0x32; 16]).expect("tenant");
+    let key = crate::AdministrativeIdempotencyKey::new([0x33; 16]).expect("key");
+    let digest = [0x34; 32];
+    let request = crate::DurableOperationRequest::query_export(
+        principal, tenant, key, [0x35; 16], 7, 1, digest,
+    )
+    .expect("query export request");
+    let operation_id = request.operation_id();
+    let transaction =
+        crate::durable_operation_administration::transition_transaction_bytes(operation_id, 2)
+            .expect("transition transaction");
+    let mut intent = b"POSOPA05".to_vec();
+    intent.extend_from_slice(&operation_id.to_bytes());
+    intent.extend_from_slice(&principal.to_bytes());
+    intent.extend_from_slice(&[0x35; 16]);
+    intent.push(1);
+    intent.extend_from_slice(&tenant.to_bytes());
+    intent.push(2); // query export
+    intent.push(2); // running
+    intent.push(2); // preflight
+    intent.extend_from_slice(&key.to_bytes());
+    intent.extend_from_slice(&7_u64.to_be_bytes());
+    intent.extend_from_slice(&digest);
+    intent.push(10); // progress
+    intent.extend_from_slice(&2_u64.to_be_bytes());
+    intent.push(0); // no cancellation key
+    intent.extend_from_slice(&[0; 16]);
+
+    let entry = GovernanceAuditEntry::decode_fields(6, transaction, &intent)
+        .expect("tenant-bound query-export audit");
+    let GovernanceAuditEntry::DurableOperation(audit) = entry else {
+        panic!("typed durable audit");
+    };
+    assert_eq!(audit.operation_id(), operation_id);
+    assert_eq!(audit.applicable_tenant(), Some(tenant));
+    assert_eq!(audit.request_id(), Some(key));
+
+    let mut changed_digest = intent;
+    changed_digest[100] ^= 1;
+    assert!(GovernanceAuditEntry::decode_fields(6, transaction, &changed_digest).is_err());
+}
+
+#[test]
+fn legacy_query_export_audit_without_its_tenant_and_digest_fails_closed() {
+    let mut intent = b"POSOPA04".to_vec();
+    intent.extend_from_slice(&[0x41; 16]);
+    intent.extend_from_slice(&[0x42; 16]);
+    intent.extend_from_slice(&[0x43; 16]);
+    intent.push(0); // old records carry no tenant
+    intent.push(2); // query export
+    intent.push(2); // running
+    intent.push(2); // preflight
+    intent.extend_from_slice(&[0x44; 16]);
+    intent.extend_from_slice(&7_u64.to_be_bytes());
+    intent.push(10);
+    intent.extend_from_slice(&2_u64.to_be_bytes());
+    intent.push(0);
+    intent.extend_from_slice(&[0; 16]);
+
+    assert!(GovernanceAuditEntry::decode_fields(6, [0x45; 16], &intent).is_err());
+}
+
+#[test]
 fn public_plaintext_api_transport_audit_is_redacted_exact_and_strict() {
     let transaction = [19; 16];
     let mut intent = b"POSTPT01".to_vec();

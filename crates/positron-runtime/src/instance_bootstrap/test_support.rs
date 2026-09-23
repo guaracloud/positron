@@ -51,6 +51,42 @@ impl GovernanceTestFixture {
 }
 
 impl InitializedInstance {
+    /// Opens the narrow Instance Integrity signing capability used by a
+    /// durable Query export integration test. Product entry points obtain the
+    /// same capability through their authenticated runtime composition.
+    #[doc(hidden)]
+    pub fn export_manifest_signer_for_test(
+        &self,
+    ) -> Result<positron_kernel::ExportManifestSigner, BootstrapFailure> {
+        let secret = self
+            .key
+            .catalog_secret(self.instance)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
+        let catalog = Catalog::open(&self._authority, self.instance, secret)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        let snapshot = catalog
+            .pin()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        let (_, governance) = snapshot
+            .governance_object()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
+        if governance.integrity_key_fingerprint() != self.integrity_key_fingerprint {
+            return Err(BootstrapFailure::new(
+                BootstrapFailureCode::IdentityMismatch,
+            ));
+        }
+        let signer = self
+            .key
+            .export_manifest_signer(self.instance, governance.protected_integrity_key())
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
+        if signer.identity().public_key() != governance.integrity_public_key() {
+            return Err(BootstrapFailure::new(
+                BootstrapFailureCode::IdentityMismatch,
+            ));
+        }
+        Ok(signer)
+    }
+
     /// Derives test-fixture segment protection from the same authenticated
     /// tenant envelope as ordinary service paths.
     #[doc(hidden)]

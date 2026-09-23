@@ -40,6 +40,7 @@ const SYSTEM_AUDIT_RETENTION_MAGIC: [u8; 8] = *b"POSAR001";
 const DURABLE_OPERATION_AUDIT_MAGIC: [u8; 8] = *b"POSOPA02";
 const DURABLE_OPERATION_AUDIT_MAGIC_V3: [u8; 8] = *b"POSOPA03";
 const DURABLE_OPERATION_AUDIT_MAGIC_V4: [u8; 8] = *b"POSOPA04";
+const DURABLE_OPERATION_AUDIT_MAGIC_V5: [u8; 8] = *b"POSOPA05";
 const DURABLE_OPERATION_AUDIT_MAGIC_V1: [u8; 8] = *b"POSOPA01";
 
 /// Extracts a terminal receipt's idempotency key only after its owning codec
@@ -830,7 +831,7 @@ impl GovernanceAuditEntry {
             Self::TenantAliasBinding(entry) => Some(entry.tenant),
             Self::TenantRetentionUpdate(entry) => Some(entry.tenant),
             Self::SystemAuditRetentionUpdate(_) => None,
-            Self::DurableOperation(_) => None,
+            Self::DurableOperation(entry) => entry.applicable_tenant(),
         }
     }
 

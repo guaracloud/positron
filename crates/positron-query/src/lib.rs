@@ -9,6 +9,7 @@ mod cursor;
 mod execution;
 mod execution_state;
 mod execution_support;
+mod export;
 mod failure;
 #[cfg(fuzzing)]
 mod fuzzing;
@@ -38,9 +39,13 @@ mod transform;
 pub use budget::{QueryBudget, QueryBudgetDimension};
 pub use cancellation::QueryCancellation;
 pub use cursor::QueryCursor;
+pub use export::{
+    DurableExportReceipt, ExportBatch, ExportDestination, ExportManifest, ExportSink,
+    ExportTerminal,
+};
 pub use failure::{QueryFailure, QueryFailureCode};
 pub use plan::{LogicalPlan, OrderDirection, PlannedQuery, TemporalAxis, TemporalRange};
-pub use query_service::QueryService;
+pub use query_service::{ExportDestinationResolver, QueryService};
 pub use runtime::{
     QueryClock, QueryClockFailure, QueryWorkFailure, QueryWorkMeter, QueryWorkStage,
 };
@@ -50,6 +55,8 @@ pub use stream::{
     ResultSnapshot, ResultValueType, TailPhase,
 };
 pub use stream_lifecycle::QueryStream;
+#[cfg(feature = "test-support")]
+pub use stream_lifecycle::with_cancellation_after_next_batch;
 pub use tail::{
     TailCursor, TailCursorState, TailEvent, TailPosition, TailSession, TailSourceSet, TailStart,
     TailStats, TailTerminal,
@@ -296,6 +303,12 @@ pub fn fuzz_query_cursor(data: &[u8]) {
             }
         }
     }
+}
+
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub fn fuzz_durable_export_records(data: &[u8]) {
+    export::fuzz_durable_export_records(data);
 }
 
 #[cfg(fuzzing)]

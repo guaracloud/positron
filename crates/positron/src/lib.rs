@@ -4,6 +4,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use positron_config::{
@@ -11,9 +12,10 @@ use positron_config::{
 };
 use positron_kernel::MountQualification;
 use positron_runtime::{
-    ApiTransportProfile, ApplicationRuntime, BootstrapPaths, ExitOutcome, HostInputs,
-    InitializationMode, NativeBindings, NativeHost, PublicPlaintextApiStartupIntent,
-    RecoveryAttempt, RecoveryAttemptHost, RecoveryDecision, ServeConfiguration, ShutdownTrigger,
+    ApiTransportProfile, ApplicationRuntime, BootstrapPaths, ConfiguredExportDestinationResolver,
+    ExitOutcome, HostInputs, InitializationMode, NativeBindings, NativeHost,
+    PublicPlaintextApiStartupIntent, RecoveryAttempt, RecoveryAttemptHost, RecoveryDecision,
+    ServeConfiguration, ShutdownTrigger,
 };
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
@@ -128,8 +130,12 @@ fn run(
     let host = NativeHost::new(bindings);
     let recovery =
         NativeRecovery::new(Signals::new([SIGINT, SIGTERM]).map_err(|_| LaunchFailure::Signal)?);
+    let resolver = Arc::new(ConfiguredExportDestinationResolver::new(Arc::new(
+        effective.clone(),
+    )));
     let mut configuration = ServeConfiguration::new(paths, arguments.initialization)
-        .with_max_registered_tenants(effective.max_registered_tenants());
+        .with_max_registered_tenants(effective.max_registered_tenants())
+        .with_export_destination_resolver(resolver);
     if let Some(plaintext) = effective.public_plaintext_api_configuration() {
         configuration = configuration.with_public_plaintext_api_intent(
             PublicPlaintextApiStartupIntent::configuration_file(plaintext.api_bind_address()),

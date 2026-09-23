@@ -22,3 +22,23 @@ Precedence: compiled defaults, TOML file, non-secret POSITRON__ overrides, then 
 | `storage.data_directory` | string | `/var/lib/positron` | absolute path; at most 256 bytes | public | compiled default, configuration file | immutable after initialization |
 | `storage.secrets_directory` | string | `/var/lib/positron-secrets` | absolute path; at most 256 bytes | public | compiled default, configuration file | immutable after initialization |
 | `security.local_key_file` | string | `<redacted protected-file reference>` | protected absolute path under `storage.secrets_directory`, named `local-root-key.v1`; at most 256 bytes | secret-bearing (redacted) | compiled default, protected configuration-file reference | immutable after initialization |
+| `export.destination` | array of tables | disabled | at most 8 named destinations; each has a lowercase `name` of at most 63 bytes, a nonzero 16-byte lowercase hexadecimal `identity`, and one to 8 unique canonical `allowed_tenants` | public | compiled default, configuration file | immutable after initialization |
+
+## Durable export destinations
+
+Durable export is disabled unless the selected TOML file includes one or more
+`[[export.destination]]` entries. Environment and command-line overrides are
+rejected. A destination may be selected only by an authenticated tenant named
+in its `allowed_tenants`; its opaque `identity` is passed internally to the
+protected Kernel output directory and is not supplied by an API caller.
+
+```toml
+[[export.destination]]
+name = "regulated-archive"
+identity = "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
+allowed_tenants = ["11111111-1111-1111-1111-111111111111"]
+```
+
+Destination names and identities must be unique. The complete candidate is
+validated before publication; changing this immutable setting requires the
+explicit initialization or restore workflow rather than live reload.

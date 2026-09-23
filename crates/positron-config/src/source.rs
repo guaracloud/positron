@@ -84,7 +84,11 @@ fn content_before_comment(line: &str) -> Result<&str, ConfigurationFailure> {
 
 fn preflight_table_header(line: &str) -> Result<(), ConfigurationFailure> {
     if line.starts_with("[[") {
-        return Err(document_failure(ConfigurationFailureCode::Malformed));
+        return if line == "[[export.destination]]" {
+            Ok(())
+        } else {
+            Err(document_failure(ConfigurationFailureCode::Malformed))
+        };
     }
     if !line.ends_with(']') {
         return Err(document_failure(ConfigurationFailureCode::Malformed));
@@ -153,7 +157,14 @@ fn preflight_scalar(value: &str) -> Result<(), ConfigurationFailure> {
     if value.is_empty() {
         return Err(document_failure(ConfigurationFailureCode::Malformed));
     }
-    if matches!(value.as_bytes().first(), Some(b'[' | b'{')) {
+    if value.starts_with('[') {
+        return if value.len() <= 512 {
+            Ok(())
+        } else {
+            Err(document_failure(ConfigurationFailureCode::ResourceLimit))
+        };
+    }
+    if value.starts_with('{') {
         return Err(document_failure(ConfigurationFailureCode::Malformed));
     }
     let scalar_bytes = if let Some(inner) = value
@@ -240,6 +251,10 @@ pub(super) fn apply_toml(
         let toml::Value::Table(settings) = value else {
             return Err(document_failure(ConfigurationFailureCode::UnknownSetting));
         };
+        if section == "export" {
+            apply_export_destinations(candidate, settings)?;
+            continue;
+        }
         for (key, setting_value) in settings {
             let mut path = String::with_capacity(section.len() + key.len() + 1);
             path.push_str(section);
@@ -258,6 +273,9 @@ pub(super) fn apply_toml(
 }
 
 fn is_known_toml_section(section: &str) -> bool {
+    if section == "export" {
+        return true;
+    }
     contract::SETTING_DEFINITIONS
         .iter()
         .filter_map(|definition| definition.path().split_once('.'))
@@ -278,9 +296,176 @@ fn apply_toml_value(
         (SettingKind::String, toml::Value::String(value)) => {
             candidate.apply(setting, value, SettingSource::ConfigurationFile)
         },
+        (SettingKind::ExportDestinations, _) => Err(ConfigurationFailure::new(
+            ConfigurationFailureCode::Malformed,
+            FailureSource::ExportDestinations,
+        )),
         _ => Err(ConfigurationFailure::new(
             ConfigurationFailureCode::Malformed,
             FailureSource::ConfigurationDocument,
+        )),
+    }
+}
+
+fn apply_export_destinations(
+    candidate: &mut Candidate,
+    table: &toml::map::Map<String, toml::Value>,
+) -> Result<(), ConfigurationFailure> {
+    if table.len() != 1 {
+        return Err(document_failure(ConfigurationFailureCode::UnknownSetting));
+    }
+    let Some(toml::Value::Array(entries)) = table.get("destination") else {
+        return Err(document_failure(ConfigurationFailureCode::UnknownSetting));
+    };
+    let ValueDomain::ExportDestinations(maximum_destinations, maximum_name_bytes, maximum_tenants) =
+        setting_definition(Setting::ExportDestinations).domain()
+    else {
+        return Err(ConfigurationFailure::new(
+            ConfigurationFailureCode::Malformed,
+            FailureSource::ExportDestinations,
+        ));
+    };
+    if entries.len() > maximum_destinations {
+        return Err(ConfigurationFailure::unsupported_value(
+            FailureSource::ExportDestinations,
+        ));
+    }
+
+    let mut destinations = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let toml::Value::Table(entry) = entry else {
+            return Err(ConfigurationFailure::unsupported_value(
+                FailureSource::ExportDestinations,
+            ));
+        };
+        let destination = parse_export_destination(entry, maximum_name_bytes, maximum_tenants)?;
+        if destinations
+            .iter()
+            .any(|existing: &ExportDestinationDefinition| {
+                existing.name == destination.name || existing.identity == destination.identity
+            })
+        {
+            return Err(ConfigurationFailure::unsupported_value(
+                FailureSource::ExportDestinations,
+            ));
+        }
+        destinations.push(destination);
+    }
+    candidate.apply_export_destinations(destinations)
+}
+
+fn parse_export_destination(
+    entry: &toml::map::Map<String, toml::Value>,
+    maximum_name_bytes: usize,
+    maximum_tenants: usize,
+) -> Result<ExportDestinationDefinition, ConfigurationFailure> {
+    if entry.len() != 3
+        || entry
+            .keys()
+            .any(|key| !matches!(key.as_str(), "name" | "identity" | "allowed_tenants"))
+    {
+        return Err(document_failure(ConfigurationFailureCode::UnknownSetting));
+    }
+    let Some(toml::Value::String(name)) = entry.get("name") else {
+        return Err(ConfigurationFailure::unsupported_value(
+            FailureSource::ExportDestinations,
+        ));
+    };
+    if !valid_export_destination_name(name, maximum_name_bytes) {
+        return Err(ConfigurationFailure::unsupported_value(
+            FailureSource::ExportDestinations,
+        ));
+    }
+    let Some(toml::Value::String(identity)) = entry.get("identity") else {
+        return Err(ConfigurationFailure::unsupported_value(
+            FailureSource::ExportDestinations,
+        ));
+    };
+    let identity = parse_export_identity(identity)?;
+    let Some(toml::Value::Array(tenant_values)) = entry.get("allowed_tenants") else {
+        return Err(ConfigurationFailure::unsupported_value(
+            FailureSource::ExportDestinations,
+        ));
+    };
+    if tenant_values.is_empty() || tenant_values.len() > maximum_tenants {
+        return Err(ConfigurationFailure::unsupported_value(
+            FailureSource::ExportDestinations,
+        ));
+    }
+    let mut allowed_tenants = Vec::with_capacity(tenant_values.len());
+    for value in tenant_values {
+        let toml::Value::String(value) = value else {
+            return Err(ConfigurationFailure::unsupported_value(
+                FailureSource::ExportDestinations,
+            ));
+        };
+        let tenant = TenantId::parse_canonical(value).map_err(|_| {
+            ConfigurationFailure::unsupported_value(FailureSource::ExportDestinations)
+        })?;
+        if allowed_tenants.contains(&tenant) {
+            return Err(ConfigurationFailure::unsupported_value(
+                FailureSource::ExportDestinations,
+            ));
+        }
+        allowed_tenants.push(tenant);
+    }
+    Ok(ExportDestinationDefinition {
+        name: name.to_owned(),
+        identity,
+        allowed_tenants,
+    })
+}
+
+fn valid_export_destination_name(value: &str, maximum_bytes: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= maximum_bytes
+        && !value.starts_with('-')
+        && !value.ends_with('-')
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+fn parse_export_identity(value: &str) -> Result<[u8; 16], ConfigurationFailure> {
+    if value.len() != 32
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(ConfigurationFailure::unsupported_value(
+            FailureSource::ExportDestinations,
+        ));
+    }
+    let mut identity = [0_u8; 16];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let [high, low] = *pair else {
+            return Err(ConfigurationFailure::unsupported_value(
+                FailureSource::ExportDestinations,
+            ));
+        };
+        let high = hexadecimal_nibble(high)?;
+        let low = hexadecimal_nibble(low)?;
+        let Some(slot) = identity.get_mut(index) else {
+            return Err(ConfigurationFailure::unsupported_value(
+                FailureSource::ExportDestinations,
+            ));
+        };
+        *slot = (high << 4) | low;
+    }
+    if identity.iter().all(|byte| *byte == 0) {
+        return Err(ConfigurationFailure::unsupported_value(
+            FailureSource::ExportDestinations,
+        ));
+    }
+    Ok(identity)
+}
+
+fn hexadecimal_nibble(value: u8) -> Result<u8, ConfigurationFailure> {
+    match value {
+        b'0'..=b'9' => Ok(value - b'0'),
+        b'a'..=b'f' => Ok(value - b'a' + 10),
+        _ => Err(ConfigurationFailure::unsupported_value(
+            FailureSource::ExportDestinations,
         )),
     }
 }

@@ -44,6 +44,7 @@ pub struct ServeConfiguration {
     initialization: InitializationMode,
     max_registered_tenants: u16,
     public_plaintext_api_intent: Option<PublicPlaintextApiStartupIntent>,
+    export_destination_resolver: Option<Arc<dyn positron_query::ExportDestinationResolver>>,
     admission_group_planner: Option<Arc<dyn positron_ingest::AdmissionGroupPlanner>>,
 }
 
@@ -55,6 +56,7 @@ impl ServeConfiguration {
             initialization,
             max_registered_tenants: 2,
             public_plaintext_api_intent: None,
+            export_destination_resolver: None,
             admission_group_planner: None,
         }
     }
@@ -85,6 +87,15 @@ impl ServeConfiguration {
         self.public_plaintext_api_intent = Some(intent);
         self
     }
+
+    #[must_use]
+    pub fn with_export_destination_resolver(
+        mut self,
+        resolver: Arc<dyn positron_query::ExportDestinationResolver>,
+    ) -> Self {
+        self.export_destination_resolver = Some(resolver);
+        self
+    }
 }
 
 impl std::fmt::Debug for ServeConfiguration {
@@ -101,6 +112,10 @@ impl std::fmt::Debug for ServeConfiguration {
             .field(
                 "admission_group_planner",
                 &self.admission_group_planner.is_some(),
+            )
+            .field(
+                "export_destination_resolver",
+                &self.export_destination_resolver.is_some(),
             )
             .finish()
     }

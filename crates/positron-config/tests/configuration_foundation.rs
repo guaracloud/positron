@@ -19,6 +19,7 @@ struct GeneratedConfigurationFixture {
 }
 
 include!("configuration_foundation/contract.rs");
+include!("configuration_foundation/export_destinations.rs");
 include!("configuration_foundation/resolution.rs");
 include!("configuration_foundation/planning.rs");
 include!("configuration_foundation/bounds.rs");

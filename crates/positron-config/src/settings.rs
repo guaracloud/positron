@@ -42,6 +42,8 @@ pub enum SettingKind {
     Integer,
     /// A TOML string.
     String,
+    /// A bounded list of named durable-export destination scopes.
+    ExportDestinations,
 }
 
 /// The closed value domain owned by one setting definition.
@@ -61,6 +63,8 @@ pub enum ValueDomain {
     AbsolutePath(usize),
     /// A secret-bearing absolute normalized path with a byte ceiling.
     ProtectedAbsolutePath(usize),
+    /// Bounded named durable-export destination definitions.
+    ExportDestinations(usize, usize, usize),
 }
 
 /// The exact source policy declared for one setting.
@@ -162,6 +166,7 @@ pub enum Setting {
     StorageDataDirectory,
     StorageSecretsDirectory,
     SecurityLocalKeyFile,
+    ExportDestinations,
 }
 
 impl Setting {
@@ -201,6 +206,7 @@ pub const fn setting_definition(setting: Setting) -> SettingDefinition {
         storage_data_directory,
         storage_secrets_directory,
         security_local_key_file,
+        export_destinations,
     ] = contract::SETTING_DEFINITIONS;
     match setting {
         Setting::SchemaVersion => schema_version,
@@ -219,5 +225,6 @@ pub const fn setting_definition(setting: Setting) -> SettingDefinition {
         Setting::StorageDataDirectory => storage_data_directory,
         Setting::StorageSecretsDirectory => storage_secrets_directory,
         Setting::SecurityLocalKeyFile => security_local_key_file,
+        Setting::ExportDestinations => export_destinations,
     }
 }

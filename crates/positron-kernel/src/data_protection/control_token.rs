@@ -13,6 +13,8 @@ const CONTROL_TOKEN_DOMAIN: &[u8] = b"positron-authenticated-control-token-v1\0"
 const MAX_PURPOSE_BYTES: usize = 64;
 const MAX_PAYLOAD_BYTES: usize = 4_096;
 pub const QUERY_CURSOR_MAX_PAYLOAD_BYTES: usize = 8_192;
+/// Dedicated terminal-export manifest bound; generic control tokens remain 4 KiB.
+pub const EXPORT_MANIFEST_MAX_PAYLOAD_BYTES: usize = 42_496;
 const QUERY_PLAN_DIGEST_MAX_PAYLOAD_BYTES: usize = 65_536;
 const QUERY_RESULT_DIGEST_PURPOSE: &[u8] = b"query-result-batch-v1";
 
@@ -71,6 +73,16 @@ impl<'key> ControlTokenProtector<'key> {
         self.authenticate_bounded(purpose, payload, QUERY_CURSOR_MAX_PAYLOAD_BYTES)
     }
 
+    /// Authenticates a bounded Query-owned terminal export manifest. This is a
+    /// MAC, not a public signature; Query defines and verifies its payload.
+    pub fn authenticate_export_manifest(
+        &self,
+        purpose: &[u8],
+        payload: &[u8],
+    ) -> Result<ControlTokenAuthentication, ControlTokenFailure> {
+        self.authenticate_bounded(purpose, payload, EXPORT_MANIFEST_MAX_PAYLOAD_BYTES)
+    }
+
     fn authenticate_bounded(
         &self,
         purpose: &[u8],
@@ -109,6 +121,21 @@ impl<'key> ControlTokenProtector<'key> {
             payload,
             authentication,
             QUERY_CURSOR_MAX_PAYLOAD_BYTES,
+        )
+    }
+
+    /// Verifies a bounded Query-owned terminal export manifest MAC.
+    pub fn verify_export_manifest(
+        &self,
+        purpose: &[u8],
+        payload: &[u8],
+        authentication: ControlTokenAuthentication,
+    ) -> Result<(), ControlTokenFailure> {
+        self.verify_bounded(
+            purpose,
+            payload,
+            authentication,
+            EXPORT_MANIFEST_MAX_PAYLOAD_BYTES,
         )
     }
 
@@ -355,6 +382,22 @@ mod tests {
                     &vec![0; super::QUERY_CURSOR_MAX_PAYLOAD_BYTES + 1]
                 )
                 .expect_err("query cursor payload growth must remain bounded"),
+            super::ControlTokenFailure::LimitExceeded
+        );
+        let manifest = vec![0x61; super::EXPORT_MANIFEST_MAX_PAYLOAD_BYTES];
+        let manifest_auth = protector
+            .authenticate_export_manifest(b"query-export-manifest-v1", &manifest)
+            .expect("max-sized manifest MAC must work");
+        protector
+            .verify_export_manifest(b"query-export-manifest-v1", &manifest, manifest_auth)
+            .expect("manifest MAC must verify");
+        assert_eq!(
+            protector
+                .authenticate_export_manifest(
+                    b"query-export-manifest-v1",
+                    &vec![0; super::EXPORT_MANIFEST_MAX_PAYLOAD_BYTES + 1],
+                )
+                .expect_err("manifest growth must remain bounded"),
             super::ControlTokenFailure::LimitExceeded
         );
         assert_eq!(

@@ -145,9 +145,10 @@ impl ApplicationRuntime {
             ));
         }
         let instance = Arc::new(instance);
-        let services = match ServiceHandle::new_with_cancellation(
+        let services = match ServiceHandle::new_with_export_destination_resolver(
             Arc::clone(&instance),
             Some(&cancellation),
+            configuration.export_destination_resolver,
         ) {
             Ok(services) => services,
             Err(failure) => {

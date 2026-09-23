@@ -680,6 +680,19 @@ the same batch sequence and digest.
 `Complete` is a terminal fact, never an inferred absence of error. Every stream
 emits exactly one terminal status.
 
+Export creates a tenant Query `Durable Operation` before Snapshot admission.
+Its authenticated request digest binds the source, every cumulative Query Budget
+limit, and the configured destination. After the first protected Result Batch,
+the Kernel retains its opaque cursor beside the batch receipt. A process restart
+locates that output through the accepted operation, reauthenticates the current
+Query context, and resumes the original Query Snapshot and budget; it never
+starts a replacement query. The terminal manifest is signed with the
+Instance Integrity Key and published before the operation becomes terminal.
+If Query fails before protected output exists, Administration retains the
+bounded typed Query failure in that same authenticated Durable Operation so an
+exact, still-authorized retry returns the original failure without admission or
+execution; historical operation records retain their legacy terminal reason.
+
 ### 4.11 Storage Kernel
 
 The Storage Kernel is the shared database foundation and the deepest runtime
@@ -774,6 +787,10 @@ identities stable. The successor route remains overlapped with its predecessor
 through verification; only the durable completed generation authorizes
 predecessor retirement. Restart supplies both routes for a partial pass and
 retries the same operation idempotently.
+
+The Kernel-owned durable Query export payload layout, fixed descriptor, bounds,
+and crash replay rule are defined in
+[Durable export output format v1](export-output-format-v1.md).
 
 #### Resource Governor
 
@@ -1339,6 +1356,8 @@ flowchart TD
     app --> runtime
     app --> config
     app --> kernel
+
+    config --> domain
 
     runtime --> api
     runtime --> domain

@@ -34,7 +34,7 @@ pub use process::{
     HostInputs, InitializationMode, PublicPlaintextApiStartupIntent, RecoveryAttempt,
     RecoveryAttemptHost, RecoveryDecision, RunningProcess, ServeConfiguration, ShutdownTrigger,
 };
-pub use services::{ServiceFailure, ServiceHandle};
+pub use services::{ConfiguredExportDestinationResolver, ServiceFailure, ServiceHandle};
 pub use task::{
     RegisteredTask, RunningTask, TaskCancellation, TaskFailure, TaskJoinOutcome, TaskRegistrar,
     TaskRole,

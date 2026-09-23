@@ -5,6 +5,7 @@ use crate::QueryBudgetDimension;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QueryFailureCode {
     Unauthorized,
+    IdempotencyConflict,
     InvalidBudget,
     BudgetExhausted,
     InvalidCursor,

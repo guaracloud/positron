@@ -16,7 +16,7 @@ use super::types::{
     TransactionId,
 };
 
-mod artifact;
+pub(super) mod artifact;
 pub(crate) mod fault;
 mod inspection;
 mod io;

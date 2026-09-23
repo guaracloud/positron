@@ -1,4 +1,3 @@
-#[cfg(test)]
 use std::sync::Arc;
 #[cfg(test)]
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -197,6 +196,10 @@ pub(super) fn query_log_bodies(
     )
     .map_err(|failure| classify_ledger_failure_code(failure.code()))?;
     let service = QueryService::new(instance._authority.governor(), &ledger, 100);
+    let service = match &services.export_destination_resolver {
+        Some(resolver) => service.with_export_destination_resolver(Arc::clone(resolver)),
+        None => service,
+    };
     let query = service
         .plan_pipeline(context, source, budget)
         .map_err(|failure| map_query_failure(&failure))?;

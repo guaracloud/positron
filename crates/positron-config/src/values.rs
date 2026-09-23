@@ -138,6 +138,7 @@ pub enum FailureSource {
     StorageDataDirectory,
     StorageSecretsDirectory,
     SecurityLocalKeyFile,
+    ExportDestinations,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

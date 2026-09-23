@@ -15,6 +15,7 @@ mod backend;
 mod codec;
 mod context;
 mod control_token;
+mod export_manifest_signature;
 mod frame;
 mod key_envelope;
 mod local_key;
@@ -35,7 +36,11 @@ pub(crate) use context::{
 #[doc(hidden)]
 pub use control_token::fuzz_control_token_protector;
 pub use control_token::{
-    ControlTokenAuthentication, ControlTokenFailure, ControlTokenProtector, QueryResultDigest,
+    ControlTokenAuthentication, ControlTokenFailure, ControlTokenProtector,
+    QUERY_CURSOR_MAX_PAYLOAD_BYTES, QueryResultDigest,
+};
+pub use export_manifest_signature::{
+    ExportManifestSignature, ExportManifestSignatureFailure, ExportManifestSigner,
 };
 pub(crate) use frame::{EncryptedFrame, FrameFailure, FrameFailureCode, VerifiedFrame};
 pub(crate) use key_envelope::{SegmentEnvelopeRoute, WrappedKeyContext};

@@ -170,7 +170,8 @@ pub(super) const fn map_query_failure_code(code: QueryFailureCode) -> ServiceFai
         QueryFailureCode::Unauthorized | QueryFailureCode::AuthorizationChanged => {
             ServiceFailure::Unauthorized
         },
-        QueryFailureCode::InvalidBudget
+        QueryFailureCode::IdempotencyConflict
+        | QueryFailureCode::InvalidBudget
         | QueryFailureCode::InvalidCursor
         | QueryFailureCode::SnapshotExpired
         | QueryFailureCode::UnsupportedQuery => ServiceFailure::InvalidRequest,

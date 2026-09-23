@@ -10,9 +10,11 @@
 
 use std::net::SocketAddr;
 
+pub use positron_domain::identity::TenantId;
+
 const MAX_CONFIGURATION_BYTES: usize = 16 * 1024;
 const MAX_OVERRIDE_PAIRS: usize = 16;
-const MAX_TOML_ENTRIES: usize = 20;
+const MAX_TOML_ENTRIES: usize = 64;
 const MAX_KEY_BYTES: usize = 64;
 const MAX_VALUE_BYTES: usize = 256;
 
@@ -72,7 +74,8 @@ struct Candidate {
     data_directory: String,
     secrets_directory: String,
     local_key_file: ProtectedFileReference,
-    sources: [SettingSource; 16],
+    export_destinations: Vec<ExportDestinationDefinition>,
+    sources: [SettingSource; 17],
 }
 
 impl Candidate {
@@ -125,7 +128,8 @@ impl Candidate {
             data_directory: checked_path(data, Setting::StorageDataDirectory)?,
             secrets_directory: checked_path(secrets, Setting::StorageSecretsDirectory)?,
             local_key_file: ProtectedFileReference::parse(local_key)?,
-            sources: [SettingSource::CompiledDefault; 16],
+            export_destinations: Vec::new(),
+            sources: [SettingSource::CompiledDefault; 17],
         })
     }
 
@@ -191,6 +195,12 @@ impl Candidate {
             Setting::SecurityLocalKeyFile => {
                 self.local_key_file = ProtectedFileReference::parse(value)?
             },
+            Setting::ExportDestinations => {
+                return Err(ConfigurationFailure::new(
+                    ConfigurationFailureCode::Malformed,
+                    FailureSource::ExportDestinations,
+                ));
+            },
         }
         let Some(entry) = self.sources.get_mut(setting_index(setting)) else {
             return Err(ConfigurationFailure::new(
@@ -199,6 +209,24 @@ impl Candidate {
             ));
         };
         *entry = source;
+        Ok(())
+    }
+
+    fn apply_export_destinations(
+        &mut self,
+        destinations: Vec<ExportDestinationDefinition>,
+    ) -> Result<(), ConfigurationFailure> {
+        self.export_destinations = destinations;
+        let Some(entry) = self
+            .sources
+            .get_mut(setting_index(Setting::ExportDestinations))
+        else {
+            return Err(ConfigurationFailure::new(
+                ConfigurationFailureCode::Malformed,
+                FailureSource::ConfigurationDocument,
+            ));
+        };
+        *entry = SettingSource::ConfigurationFile;
         Ok(())
     }
 
@@ -226,6 +254,7 @@ impl Candidate {
             data_directory: self.data_directory,
             secrets_directory: self.secrets_directory,
             local_key_file: self.local_key_file,
+            export_destinations: self.export_destinations,
             sources: self.sources,
         })
     }
@@ -385,6 +414,7 @@ const fn setting_index(setting: Setting) -> usize {
         Setting::StorageDataDirectory => 13,
         Setting::StorageSecretsDirectory => 14,
         Setting::SecurityLocalKeyFile => 15,
+        Setting::ExportDestinations => 16,
     }
 }
 
@@ -413,5 +443,6 @@ const fn failure_source(setting: Setting) -> FailureSource {
         Setting::StorageDataDirectory => FailureSource::StorageDataDirectory,
         Setting::StorageSecretsDirectory => FailureSource::StorageSecretsDirectory,
         Setting::SecurityLocalKeyFile => FailureSource::SecurityLocalKeyFile,
+        Setting::ExportDestinations => FailureSource::ExportDestinations,
     }
 }

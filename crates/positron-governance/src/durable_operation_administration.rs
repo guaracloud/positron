@@ -21,7 +21,8 @@ pub use types::{
     DurableOperation, DurableOperationBoundary, DurableOperationCancellation,
     DurableOperationFailure, DurableOperationKind, DurableOperationLookupRetention,
     DurableOperationPhase, DurableOperationRequest, DurableOperationRetry, DurableOperationStatus,
-    DurableOperationTerminalError, OperationId,
+    DurableOperationTerminalError, DurableQueryBudgetDimension, DurableQueryExportFailure,
+    DurableQueryExportFailureCode, OperationId,
 };
 
 use crate::AdministrativeIdempotencyKey;
@@ -64,6 +65,45 @@ impl DurableOperationAdministration {
         }
         if snapshot.format_epoch() != Some(FormatEpoch::CATALOG_V1) {
             return Err(DurableOperationFailure::InvalidState);
+        }
+        if snapshot.number() != request.accepted_generation() {
+            return Err(DurableOperationFailure::StaleGeneration);
+        }
+        publish(catalog, &snapshot, operation)
+    }
+
+    /// Accepts or exactly replays an authenticated tenant Query export.
+    ///
+    /// The Query module owns the typed plan, snapshot, output receipt, and
+    /// resume checkpoint. Administration owns the durable operation lifecycle
+    /// and its jointly committed governance evidence.
+    pub fn accept_query_export(
+        catalog: &Catalog<'_>,
+        actor: crate::AuthorizedContext,
+        request: DurableOperationRequest,
+    ) -> Result<DurableOperation, DurableOperationFailure> {
+        validate_query_actor(actor, request.principal, request.applicable_tenant)?;
+        if request.kind != DurableOperationKind::QueryExport {
+            return Err(DurableOperationFailure::InvalidInput);
+        }
+        let snapshot = catalog.pin().map_err(map_catalog)?;
+        if let Some(existing) = find_by_key(&snapshot, request.idempotency)? {
+            return match existing {
+                OperationKeyLookup::Operation(operation) => exact_replay(operation, request),
+                OperationKeyLookup::Expired(binding) => {
+                    binding.exact_replay(request)?;
+                    Err(DurableOperationFailure::CompletedLookupExpired)
+                },
+            };
+        }
+        let operation = DurableOperation::accepted(request);
+        if let Some(resumed) = resume_prepared_operation(
+            catalog,
+            transition_transaction(operation)?,
+            transition_request_digest(operation),
+            operation.operation_id(),
+        )? {
+            return Ok(resumed);
         }
         if snapshot.number() != request.accepted_generation() {
             return Err(DurableOperationFailure::StaleGeneration);
@@ -117,6 +157,51 @@ impl DurableOperationAdministration {
         publish(catalog, &snapshot, operation.begin(now)?)
     }
 
+    /// Begins an accepted tenant Query export after its caller has supplied a
+    /// current tenant-query authorization context.
+    pub fn begin_query_export(
+        catalog: &Catalog<'_>,
+        actor: crate::AuthorizedContext,
+        operation_id: OperationId,
+        now: u64,
+    ) -> Result<DurableOperation, DurableOperationFailure> {
+        let snapshot = catalog.pin().map_err(map_catalog)?;
+        let operation = find_by_id(&snapshot, operation_id)?
+            .ok_or(DurableOperationFailure::UnknownOperation)?;
+        validate_query_actor(
+            actor,
+            operation.request.principal,
+            operation.request.applicable_tenant,
+        )?;
+        if operation.request.kind != DurableOperationKind::QueryExport {
+            return Err(DurableOperationFailure::InvalidState);
+        }
+        publish(catalog, &snapshot, operation.begin(now)?)
+    }
+
+    /// Crosses the Query-export cancellation boundary immediately before the
+    /// first protected result batch becomes durable. This transition contains
+    /// no payload; the Query module retains ownership of payload writes.
+    pub fn drain_query_export(
+        catalog: &Catalog<'_>,
+        actor: crate::AuthorizedContext,
+        operation_id: OperationId,
+        now: u64,
+    ) -> Result<DurableOperation, DurableOperationFailure> {
+        let snapshot = catalog.pin().map_err(map_catalog)?;
+        let operation = find_by_id(&snapshot, operation_id)?
+            .ok_or(DurableOperationFailure::UnknownOperation)?;
+        validate_query_actor(
+            actor,
+            operation.request.principal,
+            operation.request.applicable_tenant,
+        )?;
+        if operation.request.kind != DurableOperationKind::QueryExport {
+            return Err(DurableOperationFailure::InvalidState);
+        }
+        publish(catalog, &snapshot, operation.draining(now)?)
+    }
+
     /// Persists that the handler is closing admission before waiting for its drain.
     pub fn mark_draining(
         catalog: &Catalog<'_>,
@@ -162,6 +247,28 @@ impl DurableOperationAdministration {
         publish(catalog, &snapshot, operation.succeeded(now)?)
     }
 
+    /// Commits the terminal success transition after the Query module has
+    /// durably published its signed output manifest.
+    pub fn succeed_query_export(
+        catalog: &Catalog<'_>,
+        actor: crate::AuthorizedContext,
+        operation_id: OperationId,
+        now: u64,
+    ) -> Result<DurableOperation, DurableOperationFailure> {
+        let snapshot = catalog.pin().map_err(map_catalog)?;
+        let operation = find_by_id(&snapshot, operation_id)?
+            .ok_or(DurableOperationFailure::UnknownOperation)?;
+        validate_query_actor(
+            actor,
+            operation.request.principal,
+            operation.request.applicable_tenant,
+        )?;
+        if operation.request.kind != DurableOperationKind::QueryExport {
+            return Err(DurableOperationFailure::InvalidState);
+        }
+        publish(catalog, &snapshot, operation.succeeded(now)?)
+    }
+
     /// Persists a known terminal handler rejection. Ambiguous persistence and
     /// crash outcomes remain non-terminal so restart can reattach safely.
     pub fn fail_catalog_format_migration(
@@ -178,6 +285,57 @@ impl DurableOperationAdministration {
         publish(catalog, &snapshot, operation.failed(now, error)?)
     }
 
+    /// Persists a known terminal Query-export failure without converting an
+    /// ambiguous output acknowledgement into a false terminal result.
+    pub fn fail_query_export(
+        catalog: &Catalog<'_>,
+        actor: crate::AuthorizedContext,
+        operation_id: OperationId,
+        now: u64,
+        error: DurableOperationTerminalError,
+    ) -> Result<DurableOperation, DurableOperationFailure> {
+        let snapshot = catalog.pin().map_err(map_catalog)?;
+        let operation = find_by_id(&snapshot, operation_id)?
+            .ok_or(DurableOperationFailure::UnknownOperation)?;
+        validate_query_actor(
+            actor,
+            operation.request.principal,
+            operation.request.applicable_tenant,
+        )?;
+        if operation.request.kind != DurableOperationKind::QueryExport {
+            return Err(DurableOperationFailure::InvalidState);
+        }
+        publish(catalog, &snapshot, operation.failed(now, error)?)
+    }
+
+    /// Commits an incomplete terminal Query export only after its signed
+    /// manifest is durable, preserving that crossed publication boundary in
+    /// the public operation record.
+    pub fn fail_published_query_export(
+        catalog: &Catalog<'_>,
+        actor: crate::AuthorizedContext,
+        operation_id: OperationId,
+        now: u64,
+        error: DurableOperationTerminalError,
+    ) -> Result<DurableOperation, DurableOperationFailure> {
+        let snapshot = catalog.pin().map_err(map_catalog)?;
+        let operation = find_by_id(&snapshot, operation_id)?
+            .ok_or(DurableOperationFailure::UnknownOperation)?;
+        validate_query_actor(
+            actor,
+            operation.request.principal,
+            operation.request.applicable_tenant,
+        )?;
+        if operation.request.kind != DurableOperationKind::QueryExport {
+            return Err(DurableOperationFailure::InvalidState);
+        }
+        publish(
+            catalog,
+            &snapshot,
+            operation.failed_after_manifest_publication(now, error)?,
+        )
+    }
+
     /// Cancels only at the documented pre-drain cancellation point.
     pub fn cancel(
         catalog: &Catalog<'_>,
@@ -190,6 +348,36 @@ impl DurableOperationAdministration {
         let operation = find_by_id(&snapshot, operation_id)?
             .ok_or(DurableOperationFailure::UnknownOperation)?;
         validate_system_actor(actor, operation.request.principal)?;
+        let cancelled = operation.cancelled(now, idempotency)?;
+        if cancelled == operation {
+            return Ok(operation);
+        }
+        if has_other_cancellation_key(&snapshot, operation_id, idempotency)? {
+            return Err(DurableOperationFailure::IdempotencyConflict);
+        }
+        publish(catalog, &snapshot, cancelled)
+    }
+
+    /// Cancels a tenant Query export only before its irreversible output
+    /// publication boundary, with the same durable idempotency semantics.
+    pub fn cancel_query_export(
+        catalog: &Catalog<'_>,
+        actor: crate::AuthorizedContext,
+        operation_id: OperationId,
+        idempotency: AdministrativeIdempotencyKey,
+        now: u64,
+    ) -> Result<DurableOperation, DurableOperationFailure> {
+        let snapshot = catalog.pin().map_err(map_catalog)?;
+        let operation = find_by_id(&snapshot, operation_id)?
+            .ok_or(DurableOperationFailure::UnknownOperation)?;
+        validate_query_actor(
+            actor,
+            operation.request.principal,
+            operation.request.applicable_tenant,
+        )?;
+        if operation.request.kind != DurableOperationKind::QueryExport {
+            return Err(DurableOperationFailure::InvalidState);
+        }
         let cancelled = operation.cancelled(now, idempotency)?;
         if cancelled == operation {
             return Ok(operation);
@@ -230,6 +418,23 @@ fn validate_system_actor(
     if actor.principal_id() != principal
         || actor.scope() != Scope::SystemAdministration
         || actor.tenant_attribution().is_some()
+    {
+        return Err(DurableOperationFailure::Unauthorized);
+    }
+    Ok(())
+}
+
+fn validate_query_actor(
+    actor: crate::AuthorizedContext,
+    principal: PrincipalId,
+    tenant: Option<positron_domain::identity::TenantId>,
+) -> Result<(), DurableOperationFailure> {
+    if actor.principal_id() != principal
+        || actor.scope() != Scope::Query
+        || actor
+            .tenant_attribution()
+            .map(|attribution| attribution.tenant_id())
+            != tenant
     {
         return Err(DurableOperationFailure::Unauthorized);
     }
@@ -346,12 +551,10 @@ fn transition_request_digest(operation: DurableOperation) -> [u8; 32] {
     hasher.update([operation.retry.code()]);
     hasher.update([operation.cancellation.code()]);
     hasher.update([operation.boundary.code()]);
-    hasher.update(
-        operation
-            .terminal_error
-            .map_or(0, DurableOperationTerminalError::code)
-            .to_be_bytes(),
-    );
+    let (terminal_error, terminal_detail) = operation
+        .terminal_error
+        .map_or((0, 0), DurableOperationTerminalError::encoded);
+    hasher.update([terminal_error, terminal_detail]);
     match operation.cancellation_idempotency {
         Some(idempotency) => {
             hasher.update([1]);

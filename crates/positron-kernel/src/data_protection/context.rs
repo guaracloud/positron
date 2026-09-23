@@ -100,6 +100,8 @@ pub(crate) enum SystemObjectKind {
     GovernanceAudit,
     /// Backup snapshot metadata.
     BackupMetadata,
+    /// Kernel-owned durable Query export payload.
+    ExportOutput,
 }
 
 impl SystemObjectKind {
@@ -110,6 +112,7 @@ impl SystemObjectKind {
             Self::GovernanceAudit => 4,
             Self::BackupMetadata => 5,
             Self::InstanceBootstrap => 6,
+            Self::ExportOutput => 7,
         }
     }
 
@@ -120,6 +123,7 @@ impl SystemObjectKind {
             Self::GovernanceAudit => 7,
             Self::BackupMetadata => 8,
             Self::InstanceBootstrap => 9,
+            Self::ExportOutput => 10,
         }
     }
 }

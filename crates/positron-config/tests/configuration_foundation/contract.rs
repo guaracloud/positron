@@ -341,6 +341,16 @@ fn exposes_the_complete_canonical_setting_contract_and_compiled_defaults()
             ProvenancePolicy::ProtectedConfigurationFileOnly,
             MutabilityClass::ImmutableAfterInitialization,
         ),
+        (
+            Setting::ExportDestinations,
+            "export.destination",
+            SettingKind::ExportDestinations,
+            "disabled",
+            ValueDomain::ExportDestinations(8, 63, 8),
+            SecrecyClass::Public,
+            ProvenancePolicy::ConfigurationFileOnly,
+            MutabilityClass::ImmutableAfterInitialization,
+        ),
     ];
 
     for (setting, path, kind, default, domain, secrecy, provenance, mutability) in expected {

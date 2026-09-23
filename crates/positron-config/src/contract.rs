@@ -31,7 +31,7 @@ macro_rules! define_settings {
     };
 }
 
-pub(crate) const SETTING_DEFINITIONS: [SettingDefinition; 16] = define_settings! {
+pub(crate) const SETTING_DEFINITIONS: [SettingDefinition; 17] = define_settings! {
     SchemaVersion | "schema_version" | Integer | "1" | ExactUnsignedInteger(1) | Public | ConfigurationFileOnly | ImmutableAfterInitialization;
     DiagnosticsLogLevel | "diagnostics.log_level" | String | "info" | StringEnumeration(&["error", "warn", "info", "debug"]) | Public | NonSecretOverrides | LiveReloadable;
     RuntimeShutdownGraceSeconds | "runtime.shutdown_grace_seconds" | Integer | "30" | UnsignedIntegerRange(1, 3600) | Public | NonSecretOverrides | RestartRequired;
@@ -48,4 +48,5 @@ pub(crate) const SETTING_DEFINITIONS: [SettingDefinition; 16] = define_settings!
     StorageDataDirectory | "storage.data_directory" | String | "/var/lib/positron" | AbsolutePath(256) | Public | ConfigurationFileOnly | ImmutableAfterInitialization;
     StorageSecretsDirectory | "storage.secrets_directory" | String | "/var/lib/positron-secrets" | AbsolutePath(256) | Public | ConfigurationFileOnly | ImmutableAfterInitialization;
     SecurityLocalKeyFile | "security.local_key_file" | String | "/var/lib/positron-secrets/local-root-key.v1" | ProtectedAbsolutePath(256) | SecretBearing | ProtectedConfigurationFileOnly | ImmutableAfterInitialization;
+    ExportDestinations | "export.destination" | ExportDestinations | "disabled" | ExportDestinations(8, 63, 8) | Public | ConfigurationFileOnly | ImmutableAfterInitialization;
 };

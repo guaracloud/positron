@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::error::Error;
 use std::fs;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
@@ -50,37 +51,6 @@ pub struct StepClock(AtomicU64);
 impl StepClock {
     pub fn shared(now: u64) -> Arc<Self> {
         Arc::new(Self(AtomicU64::new(now)))
-    }
-}
-
-pub struct LifecycleTransitionClock {
-    catalog: &'static Catalog<'static>,
-    state: u8,
-    transaction: u8,
-    transitioned: std::sync::atomic::AtomicBool,
-}
-
-impl LifecycleTransitionClock {
-    pub fn shared(catalog: &'static Catalog<'static>, state: u8, transaction: u8) -> Arc<Self> {
-        Arc::new(Self {
-            catalog,
-            state,
-            transaction,
-            transitioned: std::sync::atomic::AtomicBool::new(false),
-        })
-    }
-}
-
-impl positron_query::QueryClock for LifecycleTransitionClock {
-    fn now_seconds(&self) -> Result<u64, positron_query::QueryClockFailure> {
-        if !self
-            .transitioned
-            .swap(true, std::sync::atomic::Ordering::SeqCst)
-        {
-            publish_lifecycle_at_catalog_for_test(self.catalog, self.state, self.transaction)
-                .map_err(|_| positron_query::QueryClockFailure)?;
-        }
-        Ok(101)
     }
 }
 
@@ -876,16 +846,16 @@ impl Drop for TemporaryRoots {
     }
 }
 
-pub struct KernelFixture {
-    pub authority: &'static StorageKernelResourceAuthority,
-    retention_time: &'static RetentionTimeAuthority,
+pub struct KernelFixture<'kernel, 'catalog> {
+    pub authority: &'kernel StorageKernelResourceAuthority,
+    retention_time: &'kernel RetentionTimeAuthority,
     retention_enabled: bool,
-    catalog: &'static Catalog<'static>,
-    ledger: Option<ActiveSegmentLedger<'static, 'static>>,
-    trace_ledger: Option<ActiveSegmentLedger<'static, 'static>>,
+    catalog: &'catalog Catalog<'kernel>,
+    ledger: Option<ActiveSegmentLedger<'kernel, 'catalog>>,
+    trace_ledger: Option<ActiveSegmentLedger<'kernel, 'catalog>>,
     tenant: TenantId,
     shard: VirtualShardId,
-    _root: TemporaryRoots,
+    root: &'kernel TemporaryRoots,
 }
 
 pub fn publish_lifecycle_at_catalog_for_test(
@@ -935,106 +905,144 @@ pub fn publish_lifecycle_at_catalog_for_test(
     Ok(())
 }
 
-impl KernelFixture {
-    pub fn new(tenant: TenantId, label: &str) -> Result<Self, Box<dyn Error>> {
-        let root = TemporaryRoots::new(label)?;
-        let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
-        let authority = Box::leak(Box::new(establish_authority(volume, tenant)?));
-        let catalog = Box::leak(Box::new(Catalog::open(
-            authority,
-            InstanceId::new([0x31; 16])?,
-            CatalogSecret::from_owned(Box::new([0x32; 32]), Box::new([0x33; 32])),
-        )?));
-        let retention_time = Box::leak(Box::new(RetentionTimeAuthority::for_test_ingest_time(
-            UnixNanoseconds::new(50),
-        )));
-        let shard = VirtualShardId::new(1)?;
-        let ledger = ActiveSegmentLedger::open(
-            authority,
-            catalog,
-            SegmentScope::new(tenant, SignalKind::Logs, shard),
-            SegmentProtectionKey::from_owned(Box::new([0x34; 32])),
-        )?;
-        let trace_ledger = ActiveSegmentLedger::open(
-            authority,
-            catalog,
-            SegmentScope::new(tenant, SignalKind::Traces, shard),
-            SegmentProtectionKey::from_owned(Box::new([0x35; 32])),
-        )?;
-        Ok(Self {
-            authority,
-            retention_time,
-            retention_enabled: false,
-            catalog,
-            ledger: Some(ledger),
-            trace_ledger: Some(trace_ledger),
-            tenant,
-            shard,
-            _root: root,
-        })
-    }
+pub fn with_kernel_fixture<T>(
+    tenant: TenantId,
+    label: &str,
+    action: impl for<'kernel, 'catalog> FnOnce(
+        &mut KernelFixture<'kernel, 'catalog>,
+    ) -> Result<T, Box<dyn Error>>,
+) -> Result<T, Box<dyn Error>> {
+    with_kernel_fixture_for_tenants(tenant, label, &[], action)
+}
 
-    pub fn new_with_identity(
-        tenant: TenantId,
-        label: &str,
-        identity: &GovernanceTestFixture,
-    ) -> Result<Self, Box<dyn Error>> {
-        let fixture = Self::new(tenant, label)?;
-        identity.install_into(&fixture)?;
-        Ok(fixture)
-    }
+pub fn with_kernel_fixture_for_tenants<T>(
+    tenant: TenantId,
+    label: &str,
+    additional_tenants: &[TenantId],
+    action: impl for<'kernel, 'catalog> FnOnce(
+        &mut KernelFixture<'kernel, 'catalog>,
+    ) -> Result<T, Box<dyn Error>>,
+) -> Result<T, Box<dyn Error>> {
+    let root = TemporaryRoots::new(label)?;
+    let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
+    let authority = establish_authority(volume, tenant, additional_tenants)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x31; 16])?,
+        CatalogSecret::from_owned(Box::new([0x32; 32]), Box::new([0x33; 32])),
+    )?;
+    let retention_time = RetentionTimeAuthority::for_test_ingest_time(UnixNanoseconds::new(50));
+    let shard = VirtualShardId::new(1)?;
+    let ledger = ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        SegmentScope::new(tenant, SignalKind::Logs, shard),
+        SegmentProtectionKey::from_owned(Box::new([0x34; 32])),
+    )?;
+    let trace_ledger = ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        SegmentScope::new(tenant, SignalKind::Traces, shard),
+        SegmentProtectionKey::from_owned(Box::new([0x35; 32])),
+    )?;
+    let mut fixture = KernelFixture {
+        authority: &authority,
+        retention_time: &retention_time,
+        retention_enabled: false,
+        catalog: &catalog,
+        ledger: Some(ledger),
+        trace_ledger: Some(trace_ledger),
+        tenant,
+        shard,
+        root: &root,
+    };
+    action(&mut fixture)
+}
 
-    pub fn new_compaction_with_identity(
-        tenant: TenantId,
-        label: &str,
-        identity: &GovernanceTestFixture,
-    ) -> Result<Self, Box<dyn Error>> {
-        let roots = TemporaryRoots::new(label)?;
-        let volume = PrimaryDataVolume::acquire(&roots.0, MountQualification::LocalHost)?;
-        let authority = Box::leak(Box::new(establish_authority(volume, tenant)?));
-        let catalog = Box::leak(Box::new(Catalog::open(
-            authority,
-            InstanceId::new([0x31; 16])?,
-            CatalogSecret::from_owned(Box::new([0x32; 32]), Box::new([0x33; 32])),
-        )?));
-        let retention_time = Box::leak(Box::new(RetentionTimeAuthority::establish()?));
-        let shard = VirtualShardId::new(1)?;
-        let ledger = ActiveSegmentLedger::open_with_retention_time(
-            authority,
-            retention_time,
-            catalog,
-            SegmentScope::new(tenant, SignalKind::Logs, shard),
-            SegmentProtectionKey::from_owned(Box::new([0x34; 32])),
-        )?;
-        let trace_ledger = ActiveSegmentLedger::open_with_retention_time(
-            authority,
-            retention_time,
-            catalog,
-            SegmentScope::new(tenant, SignalKind::Traces, shard),
-            SegmentProtectionKey::from_owned(Box::new([0x35; 32])),
-        )?;
-        let fixture = Self {
-            authority,
-            retention_time,
-            retention_enabled: true,
-            catalog,
-            ledger: Some(ledger),
-            trace_ledger: Some(trace_ledger),
-            tenant,
-            shard,
-            _root: roots,
-        };
-        identity.install_into(&fixture)?;
-        Ok(fixture)
-    }
+pub fn with_kernel_fixture_with_identity<T>(
+    tenant: TenantId,
+    label: &str,
+    identity: &GovernanceTestFixture,
+    action: impl for<'kernel, 'catalog> FnOnce(
+        &mut KernelFixture<'kernel, 'catalog>,
+    ) -> Result<T, Box<dyn Error>>,
+) -> Result<T, Box<dyn Error>> {
+    with_kernel_fixture(tenant, label, |fixture| {
+        identity.install_into(fixture)?;
+        action(fixture)
+    })
+}
 
-    pub fn ledger(&self) -> Result<&ActiveSegmentLedger<'static, 'static>, Box<dyn Error>> {
+pub fn with_kernel_fixture_with_identity_for_tenants<T>(
+    tenant: TenantId,
+    label: &str,
+    additional_tenants: &[TenantId],
+    identity: &GovernanceTestFixture,
+    action: impl for<'kernel, 'catalog> FnOnce(
+        &mut KernelFixture<'kernel, 'catalog>,
+    ) -> Result<T, Box<dyn Error>>,
+) -> Result<T, Box<dyn Error>> {
+    with_kernel_fixture_for_tenants(tenant, label, additional_tenants, |fixture| {
+        identity.install_into(fixture)?;
+        action(fixture)
+    })
+}
+
+pub fn with_compaction_kernel_fixture_with_identity<T>(
+    tenant: TenantId,
+    label: &str,
+    identity: &GovernanceTestFixture,
+    action: impl for<'kernel, 'catalog> FnOnce(
+        &mut KernelFixture<'kernel, 'catalog>,
+    ) -> Result<T, Box<dyn Error>>,
+) -> Result<T, Box<dyn Error>> {
+    let root = TemporaryRoots::new(label)?;
+    let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
+    let authority = establish_authority(volume, tenant, &[])?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x31; 16])?,
+        CatalogSecret::from_owned(Box::new([0x32; 32]), Box::new([0x33; 32])),
+    )?;
+    let retention_time = RetentionTimeAuthority::establish()?;
+    let shard = VirtualShardId::new(1)?;
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        SegmentScope::new(tenant, SignalKind::Logs, shard),
+        SegmentProtectionKey::from_owned(Box::new([0x34; 32])),
+    )?;
+    let trace_ledger = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        SegmentScope::new(tenant, SignalKind::Traces, shard),
+        SegmentProtectionKey::from_owned(Box::new([0x35; 32])),
+    )?;
+    let mut fixture = KernelFixture {
+        authority: &authority,
+        retention_time: &retention_time,
+        retention_enabled: true,
+        catalog: &catalog,
+        ledger: Some(ledger),
+        trace_ledger: Some(trace_ledger),
+        tenant,
+        shard,
+        root: &root,
+    };
+    identity.install_into(&fixture)?;
+    action(&mut fixture)
+}
+
+impl<'kernel, 'catalog> KernelFixture<'kernel, 'catalog> {
+    pub fn ledger(&self) -> Result<&ActiveSegmentLedger<'kernel, 'catalog>, Box<dyn Error>> {
         self.ledger
             .as_ref()
             .ok_or_else(|| "ledger unavailable".into())
     }
 
-    pub fn trace_ledger(&self) -> Result<&ActiveSegmentLedger<'static, 'static>, Box<dyn Error>> {
+    pub fn trace_ledger(&self) -> Result<&ActiveSegmentLedger<'kernel, 'catalog>, Box<dyn Error>> {
         self.trace_ledger
             .as_ref()
             .ok_or_else(|| "trace ledger unavailable".into())
@@ -1048,12 +1056,12 @@ impl KernelFixture {
         publish_lifecycle_at_catalog_for_test(self.catalog, state, transaction)
     }
 
-    pub fn catalog_for_test(&self) -> &'static Catalog<'static> {
+    pub fn catalog_for_test(&self) -> &Catalog<'kernel> {
         self.catalog
     }
 
     pub fn catalog_data_root_for_test(&self) -> PathBuf {
-        self._root.0.join("catalog")
+        self.root.0.join("catalog")
     }
 
     pub fn seal_and_reopen(&mut self) -> Result<(), Box<dyn Error>> {
@@ -1330,7 +1338,7 @@ impl KernelFixture {
 
     pub fn append_logs_to(
         &self,
-        ledger: &ActiveSegmentLedger<'static, 'static>,
+        ledger: &ActiveSegmentLedger<'kernel, 'catalog>,
         shard: VirtualShardId,
         candidates: Vec<(Option<i64>, Option<CandidateAttributeValue>)>,
         identity: u8,
@@ -1366,7 +1374,7 @@ impl KernelFixture {
 
     fn append_prepared_logs_to(
         &self,
-        ledger: &ActiveSegmentLedger<'static, 'static>,
+        ledger: &ActiveSegmentLedger<'kernel, 'catalog>,
         records: Vec<LogRecord>,
         identity: u8,
     ) -> Result<(), Box<dyn Error>> {
@@ -1740,7 +1748,7 @@ impl KernelFixture {
     }
 }
 
-impl GovernanceFixtureTarget for KernelFixture {
+impl GovernanceFixtureTarget for KernelFixture<'_, '_> {
     fn install_governance_fixture(
         &self,
         fixture: &GovernanceFixtureObject,
@@ -1752,8 +1760,14 @@ impl GovernanceFixtureTarget for KernelFixture {
 fn establish_authority(
     volume: positron_kernel::OwnedPrimaryDataVolume,
     tenant: TenantId,
+    additional_tenants: &[TenantId],
 ) -> Result<StorageKernelResourceAuthority, Box<dyn Error>> {
-    let configuration = fixture_configuration(&volume, tenant, FixtureInventory::Declared)?;
+    let configuration = fixture_configuration(
+        &volume,
+        tenant,
+        additional_tenants,
+        FixtureInventory::Declared,
+    )?;
     StorageKernelResourceAuthority::establish(volume, configuration)
         .map_err(|_| "kernel authority establishment failed".into())
 }
@@ -1767,20 +1781,32 @@ enum FixtureInventory {
 fn fixture_configuration(
     volume: &positron_kernel::OwnedPrimaryDataVolume,
     tenant: TenantId,
+    additional_tenants: &[TenantId],
     detected_inventory: FixtureInventory,
 ) -> Result<ResourceGovernorConfiguration, Box<dyn Error>> {
-    let cardinality = InventoryCardinalityLimits::new(1, 24)?;
+    let tenant_count = additional_tenants
+        .len()
+        .checked_add(1)
+        .ok_or("fixture tenant count overflow")?;
+    let cardinality = InventoryCardinalityLimits::new(tenant_count, 24)?;
     let large = ResourceAmounts::new([
         90_000_000, 4, 4, 90_000_000, 70_000, 4, 4, 4, 4, 16, 40_000_000,
     ]);
     let small = uniform(2);
     let durability = add(add(large, large)?, large)?;
     let recovery_capacity = add(add(add(durability, large)?, large)?, uniform(12))?;
+    let recovery_capacity = if additional_tenants.is_empty() {
+        recovery_capacity
+    } else {
+        add(recovery_capacity, large)?
+    };
     let ordinary_capacity = ResourceAmounts::new([
         8_000_000, 32, 32, 8_000_000, 2_048, 32, 32, 32, 4_096, 32, 2_000_000,
     ]);
+    let ordinary_total = std::iter::repeat_n(ordinary_capacity, tenant_count)
+        .try_fold(ResourceAmounts::new([0; DIMENSIONS]), add)?;
     let raw = add(
-        add(recovery_capacity, ordinary_capacity)?,
+        add(recovery_capacity, ordinary_total)?,
         cardinality.governor_bootstrap_overhead(1)?,
     )?;
     let detected = match detected_inventory {
@@ -1802,17 +1828,33 @@ fn fixture_configuration(
             disk,
         )?,
     )?;
-    let policy = GovernorPolicy::new(
-        [TenantQuota::new(tenant, 1, ordinary_capacity)?],
-        OrdinaryPoolPolicy::new(
-            with_cpu(uniform(8), 1_024),
-            with_cpu(uniform(6), 1_024),
-            with_cpu(uniform(4), 1_024),
-            uniform(2),
-        )?,
+    let ordinary_policy = OrdinaryPoolPolicy::new(
+        with_cpu(uniform(8), 1_024),
+        with_cpu(uniform(6), 1_024),
+        with_cpu(uniform(4), 1_024),
+        uniform(2),
     )?;
+    let policy = match additional_tenants {
+        [] => GovernorPolicy::new(
+            [TenantQuota::new(tenant, 1, ordinary_capacity)?],
+            ordinary_policy,
+        )?,
+        [additional] if *additional != tenant => GovernorPolicy::new(
+            [
+                TenantQuota::new(tenant, 1, ordinary_capacity)?,
+                TenantQuota::new(*additional, 1, ordinary_capacity)?,
+            ],
+            ordinary_policy,
+        )?,
+        [..] => return Err("fixture supports one distinct additional tenant quota".into()),
+    };
+    let compaction = if additional_tenants.is_empty() {
+        small
+    } else {
+        large
+    };
     let recovery =
-        RecoveryPoolCapacities::new(durability, small, small, small, large, small, small)?;
+        RecoveryPoolCapacities::new(durability, small, compaction, small, large, small, small)?;
     Ok(ResourceGovernorConfiguration::new(
         inventory, policy, recovery,
     )?)
@@ -1867,6 +1909,7 @@ fn four_core_capacity_cannot_admit_the_declared_acknowledged_logs_fixture_quota(
     let failure = match fixture_configuration(
         &volume,
         TenantId::from_bytes([0xa1; 16])?,
+        &[],
         FixtureInventory::DetectedCpu(4_000),
     ) {
         Ok(_) => return Err("four logical CPUs unexpectedly admitted the fixture quota".into()),
@@ -1883,9 +1926,53 @@ fn four_core_capacity_cannot_admit_the_declared_acknowledged_logs_fixture_quota(
 #[test]
 fn acknowledged_logs_fixture_uses_its_declared_inventory_instead_of_live_host_capacity()
 -> Result<(), Box<dyn Error>> {
-    let _fixture = KernelFixture::new(
+    with_kernel_fixture(
         TenantId::from_bytes([0xa2; 16])?,
         "deterministic-resource-inventory",
-    )?;
+        |_| Ok(()),
+    )
+}
+
+#[test]
+fn kernel_fixtures_release_their_volume_descriptors_on_drop() -> Result<(), Box<dyn Error>> {
+    const CHILD_ENVIRONMENT: &str = "POSITRON_ACKNOWLEDGED_LOGS_DESCRIPTOR_CHILD";
+    const TEST_NAME: &str = "support::kernel_fixtures_release_their_volume_descriptors_on_drop";
+
+    if std::env::var_os(CHILD_ENVIRONMENT).is_some() {
+        let before = open_descriptor_count()?;
+        for fixture in 0_u8..8 {
+            with_kernel_fixture(
+                TenantId::from_bytes([0xa3; 16])?,
+                &format!("descriptor-scope-{fixture}"),
+                |_| Ok(()),
+            )?;
+        }
+        let after = open_descriptor_count()?;
+        assert_eq!(
+            after, before,
+            "eight scoped fixtures must return every descriptor before the child exits"
+        );
+        return Ok(());
+    }
+
+    let status = Command::new(std::env::current_exe()?)
+        .env(CHILD_ENVIRONMENT, "1")
+        .arg("--exact")
+        .arg(TEST_NAME)
+        .arg("--nocapture")
+        .status()?;
+    assert!(
+        status.success(),
+        "descriptor regression child failed: {status}"
+    );
     Ok(())
+}
+
+fn open_descriptor_count() -> Result<usize, Box<dyn Error>> {
+    #[cfg(target_os = "linux")]
+    let directory = "/proc/self/fd";
+    #[cfg(not(target_os = "linux"))]
+    let directory = "/dev/fd";
+
+    Ok(fs::read_dir(directory)?.count())
 }
