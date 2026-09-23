@@ -419,6 +419,26 @@ impl ExportOutput {
             Ok(None)
         }
     }
+
+    /// Reopens the output canonically addressed by an accepted durable
+    /// operation and verifies every descriptor binding before terminal replay.
+    ///
+    /// A request digest is shared by distinct accepted operations, so it is
+    /// insufficient to locate terminal output. The operation-derived identity
+    /// selects one descriptor; the complete request remains authenticated as
+    /// the defense against a substituted descriptor.
+    pub fn reopen_for_request(
+        catalog: &Catalog<'_>,
+        request: ExportOutputRequest,
+    ) -> Result<Self, ExportOutputFailure> {
+        let output = Self::reopen(catalog, output_identity_for_operation(request.operation_id));
+        match output {
+            Ok(output) if output.binding.request() == request => Ok(output),
+            Ok(_) => Err(fail(ExportOutputFailureCode::AuthenticationFailed)),
+            Err(error) => Err(error),
+        }
+    }
+
     pub fn create(
         catalog: &Catalog<'_>,
         binding: ExportOutputBinding,

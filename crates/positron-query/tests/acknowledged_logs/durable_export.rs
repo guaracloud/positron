@@ -535,6 +535,124 @@ fn completed_export_replays_its_terminal_manifest_after_snapshot_lease_expiry()
 }
 
 #[test]
+fn terminal_replay_keeps_each_same_request_export_bound_to_its_accepted_operation()
+-> Result<(), Box<dyn Error>> {
+    QueryFixture::scoped("durable-export-terminal-operation-identity", |fixture| {
+        fixture.kernel.append_log("first", 20, 1)?;
+        let clock = TestClock::shared(100);
+        let service = zero_work_clock_service(
+            fixture.kernel.authority.governor(),
+            fixture.kernel.ledger()?,
+            1,
+            clock.clone(),
+        )
+        .with_export_destination_resolver(Arc::new(TestExportDestinationResolver));
+        let signer = fixture.export_manifest_signer()?;
+        let source = "logs | range query_time -100 100 | limit 1";
+        let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 16_384, 60)?;
+
+        let first = service.export_pipeline_as_operation(
+            fixture.kernel.catalog_for_test(),
+            &signer,
+            fixture.context,
+            positron_governance::AdministrativeIdempotencyKey::new([0xa7; 16])?,
+            source,
+            budget,
+            "configured",
+            &mut RecordingSink::default(),
+        )?;
+        let second = service.export_pipeline_as_operation(
+            fixture.kernel.catalog_for_test(),
+            &signer,
+            fixture.context,
+            positron_governance::AdministrativeIdempotencyKey::new([0xa8; 16])?,
+            source,
+            budget,
+            "configured",
+            &mut RecordingSink::default(),
+        )?;
+        let first_output = first
+            .manifest()
+            .output_identity()
+            .ok_or("first completed export output missing")?;
+        let second_output = second
+            .manifest()
+            .output_identity()
+            .ok_or("second completed export output missing")?;
+        assert_ne!(first.operation_id(), second.operation_id());
+        assert_ne!(first_output, second_output);
+        assert_eq!(
+            first.manifest().request_digest(),
+            second.manifest().request_digest()
+        );
+        assert_ne!(first.manifest().snapshot(), second.manifest().snapshot());
+        assert!(first.manifest().signature().is_some());
+        assert!(second.manifest().signature().is_some());
+        let audit_before_replay = fixture
+            .kernel
+            .catalog_for_test()
+            .governance_audit_records()?
+            .len();
+        clock.set(161);
+
+        let mut first_retry_sink = RecordingSink::default();
+        let first_retry = service.export_pipeline_as_operation(
+            fixture.kernel.catalog_for_test(),
+            &signer,
+            fixture.context,
+            positron_governance::AdministrativeIdempotencyKey::new([0xa7; 16])?,
+            source,
+            budget,
+            "configured",
+            &mut first_retry_sink,
+        )?;
+        let mut second_retry_sink = RecordingSink::default();
+        let second_retry = service.export_pipeline_as_operation(
+            fixture.kernel.catalog_for_test(),
+            &signer,
+            fixture.context,
+            positron_governance::AdministrativeIdempotencyKey::new([0xa8; 16])?,
+            source,
+            budget,
+            "configured",
+            &mut second_retry_sink,
+        )?;
+
+        assert_eq!(first_retry.operation_id(), first.operation_id());
+        assert_same_durable_manifest(first_retry.manifest(), first.manifest());
+        assert_eq!(second_retry.operation_id(), second.operation_id());
+        assert_same_durable_manifest(second_retry.manifest(), second.manifest());
+        assert!(!first_retry_sink.started);
+        assert!(first_retry_sink.batches.is_empty());
+        assert!(!second_retry_sink.started);
+        assert!(second_retry_sink.batches.is_empty());
+        assert_eq!(
+            service
+                .resolve_durable_export(
+                    fixture.kernel.catalog_for_test(),
+                    fixture.context,
+                    first.operation_id(),
+                    second_output,
+                    "configured",
+                )
+                .expect_err("a durable operation cannot resolve another operation's output")
+                .code(),
+            QueryFailureCode::Unauthorized
+        );
+        assert_eq!(
+            fixture
+                .kernel
+                .catalog_for_test()
+                .governance_audit_records()?
+                .len(),
+            audit_before_replay,
+            "terminal replay must not execute or publish duplicate audit or output state"
+        );
+        Ok(())
+    })
+}
+
+#[test]
 fn published_incomplete_export_replays_its_terminal_manifest_after_snapshot_lease_expiry()
 -> Result<(), Box<dyn Error>> {
     QueryFixture::scoped("durable-export-terminal-incomplete-expiry", |fixture| {

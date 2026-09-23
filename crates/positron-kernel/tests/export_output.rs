@@ -212,6 +212,48 @@ fn export_output_rejects_an_uninitialized_catalog_format_epoch() -> Result<(), B
 }
 
 #[test]
+fn operation_addressed_reopen_rejects_a_descriptor_with_changed_request_binding()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish(volume)?;
+    let catalog = open_export_catalog(
+        &authority,
+        InstanceId::new([0xd1; 16])?,
+        CatalogSecret::from_owned(Box::new([0xd2; 32]), Box::new([0xd3; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let request = ExportOutputRequest::new([0xd4; 16], tenant, [0xd5; 16], [0xd6; 32])?;
+    let binding = ExportOutputBinding::new_for_operation(
+        request,
+        [0xd7; 32],
+        7,
+        9,
+        SnapshotLeaseId::new([0xd8; 16])?,
+        100,
+        3_700,
+    )?;
+    let output = ExportOutput::create(&catalog, binding)?;
+
+    assert_eq!(
+        ExportOutput::reopen_for_request(&catalog, request)?.identity(),
+        output.identity()
+    );
+    let changed_request = ExportOutputRequest::new(
+        request.operation_id(),
+        tenant,
+        [0xd9; 16],
+        request.request_digest(),
+    )?;
+    assert!(matches!(
+        ExportOutput::reopen_for_request(&catalog, changed_request),
+        Err(error)
+            if error.code() == positron_kernel::ExportOutputFailureCode::AuthenticationFailed
+    ));
+    Ok(())
+}
+
+#[test]
 fn exact_retry_publishes_a_payload_synced_before_its_descriptor_and_keeps_the_committed_checkpoint()
 -> Result<(), Box<dyn Error>> {
     let root = TemporaryRoot::new()?;

@@ -1052,14 +1052,8 @@ impl<'kernel, 'catalog, 'ledger> crate::QueryService<'kernel, 'catalog, 'ledger>
             // descriptor-bound manifest. Its execution lease remains bounded,
             // but terminal lookup follows the Durable Operation retention
             // contract and must not re-enter unfinished snapshot recovery.
-            let output = positron_kernel::ExportOutput::find_for_request(
-                catalog,
-                output_request.tenant(),
-                output_request.destination(),
-                output_request.request_digest(),
-            )
-            .map_err(KernelExportSink::map_output_failure)?
-            .ok_or_else(|| QueryFailure::new(QueryFailureCode::StoreUnavailable))?;
+            let output = positron_kernel::ExportOutput::reopen_for_request(catalog, output_request)
+                .map_err(KernelExportSink::map_output_failure)?;
             return self.resolve_durable_export(
                 catalog,
                 context,
