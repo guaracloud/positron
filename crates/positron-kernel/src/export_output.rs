@@ -972,12 +972,15 @@ impl ExportOutput {
         Ok(())
     }
     /// Reads the authenticated durable terminal manifest, when publication completed.
+    ///
+    /// Query authorizes this descriptor-bound terminal lookup through the
+    /// Durable Operation retention contract. The execution lease still gates
+    /// payload, cursor, evidence, append, and recovery access.
     pub fn read_manifest(
         &self,
         catalog: &Catalog<'_>,
-        observed_at: u64,
+        _observed_at: u64,
     ) -> Result<Option<Vec<u8>>, ExportOutputFailure> {
-        self.require_live(observed_at)?;
         let _operation = catalog
             .export_output_operation
             .lock()

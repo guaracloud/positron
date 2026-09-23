@@ -959,7 +959,19 @@ fn durable_output_reopens_authenticated_incremental_payload_without_rewriting_pr
         Some(b"cursor".to_vec())
     );
     assert_eq!(recovered.read_batch(&catalog, 122, 0)?, b"first batch");
-    assert_eq!(recovered.read_manifest(&catalog, 126)?, Some(manifest));
+    assert_eq!(
+        recovered.read_manifest(&catalog, 126)?,
+        Some(manifest.clone())
+    );
+    assert!(matches!(
+        recovered.read_batch(&catalog, 3_701, 0),
+        Err(error) if error.code() == positron_kernel::ExportOutputFailureCode::Expired
+    ));
+    assert_eq!(
+        recovered.read_manifest(&catalog, 3_701)?,
+        Some(manifest),
+        "a published terminal manifest remains available after execution expiry"
+    );
     Ok(())
 }
 

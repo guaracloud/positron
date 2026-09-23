@@ -1036,37 +1036,41 @@ impl<'kernel, 'catalog, 'ledger> crate::QueryService<'kernel, 'catalog, 'ledger>
             request_digest,
         )
         .map_err(KernelExportSink::map_output_failure)?;
+        if accepted.status() == positron_governance::DurableOperationStatus::Failed
+            && let Some(failure) = accepted
+                .terminal_error()
+                .and_then(positron_governance::DurableOperationTerminalError::query_failure)
+        {
+            return Err(query_failure_from_durable(failure));
+        }
+        if matches!(
+            accepted.status(),
+            positron_governance::DurableOperationStatus::Succeeded
+                | positron_governance::DurableOperationStatus::Failed
+        ) {
+            // A terminal operation is resolved from its authenticated,
+            // descriptor-bound manifest. Its execution lease remains bounded,
+            // but terminal lookup follows the Durable Operation retention
+            // contract and must not re-enter unfinished snapshot recovery.
+            let output = positron_kernel::ExportOutput::find_for_request(
+                catalog,
+                output_request.tenant(),
+                output_request.destination(),
+                output_request.request_digest(),
+            )
+            .map_err(KernelExportSink::map_output_failure)?
+            .ok_or_else(|| QueryFailure::new(QueryFailureCode::StoreUnavailable))?;
+            return self.resolve_durable_export(
+                catalog,
+                context,
+                operation_id,
+                output.identity(),
+                destination_name,
+            );
+        }
         let recovered_output =
             positron_kernel::ExportOutput::recover_initial(catalog, output_request, self.now()?)
                 .map_err(KernelExportSink::map_output_failure)?;
-        if accepted.status() == positron_governance::DurableOperationStatus::Failed {
-            if let Some(failure) = accepted
-                .terminal_error()
-                .and_then(positron_governance::DurableOperationTerminalError::query_failure)
-            {
-                return Err(query_failure_from_durable(failure));
-            }
-            let output =
-                recovered_output.ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
-            return self.resolve_durable_export(
-                catalog,
-                context,
-                operation_id,
-                output.identity(),
-                destination_name,
-            );
-        }
-        if accepted.status() == positron_governance::DurableOperationStatus::Succeeded {
-            let output = recovered_output
-                .ok_or_else(|| QueryFailure::new(QueryFailureCode::StoreUnavailable))?;
-            return self.resolve_durable_export(
-                catalog,
-                context,
-                operation_id,
-                output.identity(),
-                destination_name,
-            );
-        }
         if accepted.status() == positron_governance::DurableOperationStatus::Running
             && recovered_output.is_some()
         {
