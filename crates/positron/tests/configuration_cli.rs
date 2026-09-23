@@ -236,6 +236,125 @@ fn public_cli_rejects_a_configuration_file_just_over_the_canonical_input_limit()
     Ok(())
 }
 
+#[test]
+fn export_destination_diff_is_complete_and_uses_canonical_membership_semantics()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = temporary_root()?;
+    let current = root.join("current.toml");
+    let membership_changed = root.join("membership-changed.toml");
+    let reordered = root.join("reordered.toml");
+    std::fs::write(
+        &current,
+        "schema_version = 1\n\
+         [[export.destination]]\n\
+         name = \"archive\"\n\
+         identity = \"a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1\"\n\
+         allowed_tenants = [\"11111111-1111-1111-1111-111111111111\", \"22222222-2222-2222-2222-222222222222\"]\n\
+         [[export.destination]]\n\
+         name = \"warehouse\"\n\
+         identity = \"b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2\"\n\
+         allowed_tenants = [\"33333333-3333-3333-3333-333333333333\"]\n",
+    )?;
+    std::fs::write(
+        &membership_changed,
+        "schema_version = 1\n\
+         [[export.destination]]\n\
+         name = \"archive\"\n\
+         identity = \"a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1\"\n\
+         allowed_tenants = [\"11111111-1111-1111-1111-111111111111\", \"33333333-3333-3333-3333-333333333333\"]\n\
+         [[export.destination]]\n\
+         name = \"warehouse\"\n\
+         identity = \"b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2\"\n\
+         allowed_tenants = [\"33333333-3333-3333-3333-333333333333\"]\n",
+    )?;
+    std::fs::write(
+        &reordered,
+        "schema_version = 1\n\
+         [[export.destination]]\n\
+         name = \"warehouse\"\n\
+         identity = \"b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2\"\n\
+         allowed_tenants = [\"33333333-3333-3333-3333-333333333333\"]\n\
+         [[export.destination]]\n\
+         name = \"archive\"\n\
+         identity = \"a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1\"\n\
+         allowed_tenants = [\"22222222-2222-2222-2222-222222222222\", \"11111111-1111-1111-1111-111111111111\"]\n",
+    )?;
+
+    let membership_diff = run([
+        "config",
+        "diff",
+        "--current",
+        path(&current)?,
+        "--candidate",
+        path(&membership_changed)?,
+    ]);
+    assert!(membership_diff.status.success(), "{membership_diff:?}");
+    let membership_report = stdout(&membership_diff)?;
+    assert!(membership_report.contains("plan = \"requires_migration\""));
+    assert!(membership_report.contains("change_count = 1"));
+    assert!(membership_report.contains(
+        "allowed_tenants=[11111111-1111-1111-1111-111111111111,22222222-2222-2222-2222-222222222222]"
+    ));
+    assert!(membership_report.contains(
+        "allowed_tenants=[11111111-1111-1111-1111-111111111111,33333333-3333-3333-3333-333333333333]"
+    ));
+
+    let reordered_diff = run([
+        "config",
+        "diff",
+        "--current",
+        path(&current)?,
+        "--candidate",
+        path(&reordered)?,
+    ]);
+    assert!(reordered_diff.status.success(), "{reordered_diff:?}");
+    assert_eq!(
+        stdout(&reordered_diff)?,
+        "plan = \"no_change\"\nchange_count = 0\n"
+    );
+
+    let reverse_reordered_diff = run([
+        "config",
+        "diff",
+        "--current",
+        path(&reordered)?,
+        "--candidate",
+        path(&current)?,
+    ]);
+    assert!(
+        reverse_reordered_diff.status.success(),
+        "{reverse_reordered_diff:?}"
+    );
+    assert_eq!(stdout(&reverse_reordered_diff)?, stdout(&reordered_diff)?);
+    std::fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[test]
+fn invalid_utf8_is_malformed_while_missing_configuration_is_unavailable()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = temporary_root()?;
+    let invalid_utf8 = root.join("invalid-utf8.toml");
+    let missing = root.join("missing.toml");
+    std::fs::write(&invalid_utf8, b"schema_version = 1\n\xff")?;
+
+    let malformed = run(["config", "validate", "--config", path(&invalid_utf8)?]);
+    assert!(!malformed.status.success());
+    assert_eq!(
+        stderr(&malformed)?,
+        "positron: configuration_rejected code=malformed retry=after_input_correction completion=rejected source=configuration_document\n"
+    );
+
+    let unavailable = run(["config", "validate", "--config", path(&missing)?]);
+    assert!(!unavailable.status.success());
+    assert_eq!(
+        stderr(&unavailable)?,
+        "positron: configuration_rejected code=configuration_document_unavailable retry=after_input_correction completion=rejected source=configuration_document\n"
+    );
+    std::fs::remove_dir_all(root)?;
+    Ok(())
+}
+
 fn run(arguments: impl IntoIterator<Item = impl AsRef<str>>) -> Output {
     Command::new(env!("CARGO_BIN_EXE_positron"))
         .args(

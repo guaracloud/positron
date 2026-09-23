@@ -433,11 +433,20 @@ impl EffectiveConfiguration {
         let mut rendered = String::new();
         for (index, destination) in self.export_destinations.iter().enumerate() {
             if index != 0 {
-                rendered.push(',');
+                rendered.push(';');
             }
+            rendered.push_str("name=");
             rendered.push_str(&destination.name);
-            rendered.push(':');
+            rendered.push_str(",identity=");
             rendered.push_str(&hexadecimal_identity(destination.identity));
+            rendered.push_str(",allowed_tenants=[");
+            for (tenant_index, tenant) in destination.allowed_tenants.iter().enumerate() {
+                if tenant_index != 0 {
+                    rendered.push(',');
+                }
+                rendered.push_str(&tenant.to_canonical_text());
+            }
+            rendered.push(']');
         }
         rendered
     }

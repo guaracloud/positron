@@ -167,7 +167,12 @@ fn read_configuration_document(reader: impl Read) -> Result<String, Configuratio
             ),
         ));
     }
-    String::from_utf8(bytes).map_err(|_| ConfigurationInputFailure::DocumentUnavailable)
+    String::from_utf8(bytes).map_err(|_| {
+        ConfigurationInputFailure::Configuration(ConfigurationFailure::new(
+            ConfigurationFailureCode::Malformed,
+            FailureSource::ConfigurationDocument,
+        ))
+    })
 }
 
 fn collect_pairs<K, V>(
@@ -245,5 +250,17 @@ mod tests {
                     && failure.source() == FailureSource::ConfigurationDocument
         ));
         assert_eq!(consumed.get(), MAX_CONFIGURATION_BYTES + 1);
+    }
+
+    #[test]
+    fn configuration_document_reader_classifies_invalid_utf8_as_malformed() {
+        let result = read_configuration_document(&b"schema_version = 1\n\xff"[..]);
+
+        assert!(matches!(
+            result,
+            Err(ConfigurationInputFailure::Configuration(failure))
+                if failure.code() == ConfigurationFailureCode::Malformed
+                    && failure.source() == FailureSource::ConfigurationDocument
+        ));
     }
 }
