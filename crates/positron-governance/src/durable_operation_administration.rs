@@ -307,6 +307,34 @@ impl DurableOperationAdministration {
         publish(catalog, &snapshot, operation.failed(now, error)?)
     }
 
+    /// Commits an incomplete terminal Query export only after its signed
+    /// manifest is durable, preserving that crossed publication boundary in
+    /// the public operation record.
+    pub fn fail_published_query_export(
+        catalog: &Catalog<'_>,
+        actor: crate::AuthorizedContext,
+        operation_id: OperationId,
+        now: u64,
+        error: DurableOperationTerminalError,
+    ) -> Result<DurableOperation, DurableOperationFailure> {
+        let snapshot = catalog.pin().map_err(map_catalog)?;
+        let operation = find_by_id(&snapshot, operation_id)?
+            .ok_or(DurableOperationFailure::UnknownOperation)?;
+        validate_query_actor(
+            actor,
+            operation.request.principal,
+            operation.request.applicable_tenant,
+        )?;
+        if operation.request.kind != DurableOperationKind::QueryExport {
+            return Err(DurableOperationFailure::InvalidState);
+        }
+        publish(
+            catalog,
+            &snapshot,
+            operation.failed_after_manifest_publication(now, error)?,
+        )
+    }
+
     /// Cancels only at the documented pre-drain cancellation point.
     pub fn cancel(
         catalog: &Catalog<'_>,

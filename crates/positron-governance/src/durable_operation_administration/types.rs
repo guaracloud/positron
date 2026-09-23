@@ -790,6 +790,36 @@ impl DurableOperation {
         Ok(self)
     }
 
+    /// Records a Query-export failure whose signed terminal manifest has
+    /// already become durable. The manifest is the operation's irreversible
+    /// boundary even when its Query terminal is incomplete.
+    pub(super) fn failed_after_manifest_publication(
+        mut self,
+        now: u64,
+        error: DurableOperationTerminalError,
+    ) -> Result<Self, DurableOperationFailure> {
+        if self.status != DurableOperationStatus::Running
+            || self.request.kind != DurableOperationKind::QueryExport
+            || now < self.updated_at_unix_seconds
+        {
+            return Err(DurableOperationFailure::InvalidState);
+        }
+        self.status = DurableOperationStatus::Failed;
+        self.phase = DurableOperationPhase::Published;
+        self.progress_percent = 100;
+        self.retry = DurableOperationRetry::Never;
+        self.cancellation = DurableOperationCancellation::NotAllowedAfterDrain;
+        self.boundary = DurableOperationBoundary::ExportManifestPublished;
+        self.terminal_error = Some(error);
+        self.updated_at_unix_seconds = now;
+        self.completed_at_unix_seconds = Some(now);
+        self.revision = self
+            .revision
+            .checked_add(1)
+            .ok_or(DurableOperationFailure::CapacityExceeded)?;
+        Ok(self)
+    }
+
     pub(super) fn is_legal_persisted_state(self) -> bool {
         if !self.request.is_valid_persisted_request()
             || self.updated_at_unix_seconds < self.request.accepted_at_unix_seconds
@@ -843,15 +873,24 @@ impl DurableOperation {
                     && self.completed_at_unix_seconds == Some(self.updated_at_unix_seconds)
             },
             DurableOperationStatus::Failed => {
-                active_checkpoint.is_some_and(|(progress, cancellation)| {
-                    self.progress_percent == progress
-                        && self.retry == DurableOperationRetry::Never
-                        && self.cancellation == cancellation
-                        && self.boundary == DurableOperationBoundary::NotCrossed
-                        && self.terminal_error.is_some()
-                        && self.cancellation_idempotency.is_none()
-                        && self.completed_at_unix_seconds == Some(self.updated_at_unix_seconds)
-                })
+                let failed_before_boundary =
+                    active_checkpoint.is_some_and(|(progress, cancellation)| {
+                        self.progress_percent == progress
+                            && self.retry == DurableOperationRetry::Never
+                            && self.cancellation == cancellation
+                            && self.boundary == DurableOperationBoundary::NotCrossed
+                    });
+                let failed_after_query_manifest = self.request.kind
+                    == DurableOperationKind::QueryExport
+                    && self.phase == DurableOperationPhase::Published
+                    && self.progress_percent == 100
+                    && self.retry == DurableOperationRetry::Never
+                    && self.cancellation == DurableOperationCancellation::NotAllowedAfterDrain
+                    && self.boundary == DurableOperationBoundary::ExportManifestPublished;
+                (failed_before_boundary || failed_after_query_manifest)
+                    && self.terminal_error.is_some()
+                    && self.cancellation_idempotency.is_none()
+                    && self.completed_at_unix_seconds == Some(self.updated_at_unix_seconds)
             },
             DurableOperationStatus::Cancelled => {
                 self.phase == DurableOperationPhase::Cancelled

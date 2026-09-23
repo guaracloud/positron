@@ -141,6 +141,10 @@ fn durable_export_records_a_catalog_backed_terminal_operation_after_the_signed_m
             operation.status(),
             positron_governance::DurableOperationStatus::Succeeded
         );
+        assert_eq!(
+            operation.irreversible_boundary(),
+            positron_governance::DurableOperationBoundary::ExportManifestPublished
+        );
         let output = positron_kernel::ExportOutput::reopen(
             fixture.kernel.catalog_for_test(),
             output_identity,
@@ -193,6 +197,53 @@ fn durable_export_records_a_catalog_backed_terminal_operation_after_the_signed_m
             )
             .expect_err("completed exports cannot be cancelled"),
             positron_governance::DurableOperationFailure::CancellationUnavailable
+        );
+        Ok(())
+    })
+}
+
+#[test]
+fn incomplete_durable_export_reports_its_published_manifest_boundary() -> Result<(), Box<dyn Error>>
+{
+    QueryFixture::scoped("durable-export-incomplete-boundary", |fixture| {
+        fixture.kernel.append_log("first", 20, 1)?;
+        fixture.kernel.append_log("second", 21, 2)?;
+        let service = fixture.service(1)?;
+        let signer = fixture.export_manifest_signer()?;
+        let key = positron_governance::AdministrativeIdempotencyKey::new([0x4c; 16])?;
+        let mut sink = RecordingSink::default();
+
+        let receipt = positron_query::with_cancellation_after_next_batch(|| {
+            service.export_pipeline_as_operation(
+                fixture.kernel.catalog_for_test(),
+                &signer,
+                fixture.context,
+                key,
+                "logs | range query_time -100 100 | limit 2",
+                QueryBudget::new(1_048_576, 16, 16, 1_048_576, 16_384, 60)
+                    .expect("valid export budget"),
+                "configured",
+                &mut sink,
+            )
+        })?;
+
+        assert!(matches!(
+            receipt.manifest().terminal(),
+            positron_query::ExportTerminal::Incomplete(incomplete)
+                if incomplete.code() == QueryFailureCode::Cancelled
+        ));
+        let operation = positron_governance::DurableOperationAdministration::inspect(
+            fixture.kernel.catalog_for_test(),
+            receipt.operation_id(),
+        )?
+        .ok_or("incomplete durable export operation missing")?;
+        assert_eq!(
+            operation.status(),
+            positron_governance::DurableOperationStatus::Failed
+        );
+        assert_eq!(
+            operation.irreversible_boundary(),
+            positron_governance::DurableOperationBoundary::ExportManifestPublished
         );
         Ok(())
     })
@@ -923,14 +974,18 @@ fn final_incomplete_batch_recovers_after_manifest_publication_failure_without_re
                 .len(),
             audit_before_recovery + 1
         );
+        let operation = positron_governance::DurableOperationAdministration::inspect(
+            fixture.kernel.catalog_for_test(),
+            operation_id,
+        )?
+        .ok_or("recovered operation missing")?;
         assert_eq!(
-            positron_governance::DurableOperationAdministration::inspect(
-                fixture.kernel.catalog_for_test(),
-                operation_id,
-            )?
-            .ok_or("recovered operation missing")?
-            .status(),
+            operation.status(),
             positron_governance::DurableOperationStatus::Failed
+        );
+        assert_eq!(
+            operation.irreversible_boundary(),
+            positron_governance::DurableOperationBoundary::ExportManifestPublished
         );
         Ok(())
     })

@@ -437,4 +437,38 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn query_export_manifest_failure_round_trips_only_with_its_crossed_boundary() {
+        let request = DurableOperationRequest::query_export(
+            PrincipalId::from_bytes([0x51; 16]).expect("principal"),
+            TenantId::from_bytes([0x52; 16]).expect("tenant"),
+            AdministrativeIdempotencyKey::new([0x53; 16]).expect("idempotency key"),
+            [0x54; 16],
+            1,
+            17,
+            [0x55; 32],
+        )
+        .expect("query export request");
+        let failed = DurableOperation::accepted(request)
+            .begin(18)
+            .expect("operation begins")
+            .failed_after_manifest_publication(19, DurableOperationTerminalError::HandlerRejected)
+            .expect("published manifest failure");
+        let encoded = encode_operation(failed);
+
+        assert_eq!(
+            decode_operation(&encoded)
+                .expect("decode")
+                .expect("operation"),
+            failed
+        );
+
+        let mut missing_boundary = encoded;
+        missing_boundary[BOUNDARY_OFFSET] = DurableOperationBoundary::NotCrossed.code();
+        assert!(
+            decode_operation(&missing_boundary).is_err(),
+            "a terminal incomplete export cannot deny its durable manifest boundary"
+        );
+    }
 }

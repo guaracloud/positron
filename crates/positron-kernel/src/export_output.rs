@@ -2132,4 +2132,5 @@ pub fn fuzz_export_output_record(data: &[u8]) {
     let _ = decode_payload(0, data);
     let _ = decode_manifest(data);
     let _ = decode_initial_preparation(data);
+    let _ = decode_terminal_evidence(data);
 }

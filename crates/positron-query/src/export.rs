@@ -670,6 +670,18 @@ fn durable_manifest_from_bytes(bytes: &[u8]) -> Result<ExportManifest, QueryFail
     })
 }
 
+/// Exercises the bounded durable terminal and manifest decoders with hostile
+/// persisted bytes.
+#[cfg(fuzzing)]
+pub(crate) fn fuzz_durable_export_records(data: &[u8]) {
+    const MAX_FUZZ_RECORD_BYTES: usize = 65_536;
+    if data.len() > MAX_FUZZ_RECORD_BYTES {
+        return;
+    }
+    let _ = terminal_from_evidence(data);
+    let _ = durable_manifest_from_bytes(data);
+}
+
 fn read_manifest_byte(bytes: &[u8], offset: &mut usize) -> Result<u8, QueryFailure> {
     let byte = *bytes
         .get(*offset)
@@ -986,7 +998,7 @@ impl<'kernel, 'catalog, 'ledger> crate::QueryService<'kernel, 'catalog, 'ledger>
                 )
             },
             ExportTerminal::Incomplete(_) => {
-                positron_governance::DurableOperationAdministration::fail_query_export(
+                positron_governance::DurableOperationAdministration::fail_published_query_export(
                     catalog,
                     context,
                     operation_id,
@@ -1063,7 +1075,7 @@ impl<'kernel, 'catalog, 'ledger> crate::QueryService<'kernel, 'catalog, 'ledger>
                         )
                     },
                     ExportTerminal::Incomplete(_) => {
-                        positron_governance::DurableOperationAdministration::fail_query_export(
+                        positron_governance::DurableOperationAdministration::fail_published_query_export(
                             catalog,
                             context,
                             operation_id,
@@ -1307,7 +1319,7 @@ impl<'kernel, 'catalog, 'ledger> crate::QueryService<'kernel, 'catalog, 'ledger>
                     positron_governance::DurableOperationStatus::Running,
                     ExportTerminal::Incomplete(_),
                 ) => {
-                    positron_governance::DurableOperationAdministration::fail_query_export(
+                    positron_governance::DurableOperationAdministration::fail_published_query_export(
                         catalog,
                         context,
                         operation_id,
@@ -1430,7 +1442,7 @@ impl<'kernel, 'catalog, 'ledger> crate::QueryService<'kernel, 'catalog, 'ledger>
                 )
             },
             ExportTerminal::Incomplete(_) => {
-                positron_governance::DurableOperationAdministration::fail_query_export(
+                positron_governance::DurableOperationAdministration::fail_published_query_export(
                     catalog,
                     context,
                     operation_id,
@@ -1737,8 +1749,8 @@ impl<'kernel, 'catalog, 'ledger> crate::QueryService<'kernel, 'catalog, 'ledger>
 #[cfg(test)]
 mod tests {
     use super::{
-        ExportDestination, ExportTerminal, manifest_payload, terminal_evidence_bytes,
-        terminal_from_evidence,
+        ExportDestination, ExportTerminal, durable_manifest_from_bytes, manifest_payload,
+        terminal_evidence_bytes, terminal_from_evidence,
     };
     use crate::stream::QueryCounters;
     use crate::{
@@ -1775,6 +1787,51 @@ mod tests {
         assert_eq!(
             terminal_from_evidence(&evidence).expect("authenticated format"),
             terminal
+        );
+    }
+
+    #[test]
+    fn durable_terminal_decoder_rejects_invalid_tags_and_trailing_bytes() {
+        let terminal = ExportTerminal::Complete(QueryStats::new(
+            QueryCounters {
+                records: 0,
+                scanned_bytes: 0,
+                decoded_records: 0,
+                output_bytes: 0,
+                memory_peak_bytes: 0,
+                cpu_work_units: 0,
+                wall_seconds: 0,
+            },
+            None,
+            [0x61; 32],
+            QueryBudget::new(10, 11, 12, 13, 14, 16).expect("fixture budget"),
+            0,
+            0,
+        ));
+        let evidence = terminal_evidence_bytes(&terminal).expect("bounded evidence");
+
+        let mut invalid_tag = evidence.clone();
+        invalid_tag[8] = 3;
+        assert_eq!(
+            terminal_from_evidence(&invalid_tag)
+                .expect_err("unknown terminal tag")
+                .code(),
+            QueryFailureCode::MalformedPersistentData
+        );
+
+        let mut trailing = evidence;
+        trailing.push(0);
+        assert_eq!(
+            terminal_from_evidence(&trailing)
+                .expect_err("trailing durable bytes")
+                .code(),
+            QueryFailureCode::MalformedPersistentData
+        );
+        assert_eq!(
+            durable_manifest_from_bytes(b"POSQEM01")
+                .expect_err("truncated manifest")
+                .code(),
+            QueryFailureCode::MalformedPersistentData
         );
     }
 

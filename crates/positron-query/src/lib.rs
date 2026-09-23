@@ -307,6 +307,12 @@ pub fn fuzz_query_cursor(data: &[u8]) {
 
 #[cfg(fuzzing)]
 #[doc(hidden)]
+pub fn fuzz_durable_export_records(data: &[u8]) {
+    export::fuzz_durable_export_records(data);
+}
+
+#[cfg(fuzzing)]
+#[doc(hidden)]
 pub fn fuzz_tail_cursor(data: &[u8]) {
     tail::fuzz_tail_cursor(data);
 }
