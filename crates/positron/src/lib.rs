@@ -20,6 +20,7 @@ use positron_runtime::{
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
+mod config_cli;
 mod keys;
 mod policy;
 mod tenant_alias_cli;
@@ -67,6 +68,13 @@ pub fn run_native(
     {
         arguments.next();
         return policy::run(arguments);
+    }
+    if arguments
+        .peek()
+        .is_some_and(|argument| argument == "config")
+    {
+        arguments.next();
+        return config_cli::run(arguments, environment);
     }
     match run(arguments, environment) {
         Ok(outcome) => exit_code(outcome),

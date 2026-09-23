@@ -53,6 +53,21 @@ pub fn generated_reference() -> String {
     include_str!("../../../configuration/reference.md").to_owned()
 }
 
+/// Returns the contract definition for a canonical setting path.
+#[must_use]
+pub fn setting_for_path(path: &str) -> Option<Setting> {
+    contract::SETTING_DEFINITIONS
+        .into_iter()
+        .find(|definition| definition.path() == path)
+        .map(SettingDefinition::setting)
+}
+
+/// Returns the complete canonical contract in deterministic declaration order.
+#[must_use]
+pub const fn setting_definitions() -> [SettingDefinition; 17] {
+    contract::SETTING_DEFINITIONS
+}
+
 mod source;
 use source::{apply_command_line, apply_environment, apply_toml};
 
@@ -387,6 +402,12 @@ fn validate_path(value: &str, setting: Setting) -> Result<(), ConfigurationFailu
             source,
         ));
     }
+    if value.bytes().any(|byte| byte.is_ascii_control()) {
+        return Err(ConfigurationFailure::new(
+            ConfigurationFailureCode::UnsafeCombination,
+            source,
+        ));
+    }
     if !value.starts_with('/') || value.split('/').any(|component| component == "..") {
         return Err(ConfigurationFailure::new(
             ConfigurationFailureCode::UnsafeCombination,
@@ -416,13 +437,6 @@ const fn setting_index(setting: Setting) -> usize {
         Setting::SecurityLocalKeyFile => 15,
         Setting::ExportDestinations => 16,
     }
-}
-
-fn setting_for_path(path: &str) -> Option<Setting> {
-    contract::SETTING_DEFINITIONS
-        .into_iter()
-        .find(|definition| definition.path() == path)
-        .map(SettingDefinition::setting)
 }
 
 const fn failure_source(setting: Setting) -> FailureSource {

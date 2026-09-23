@@ -106,15 +106,52 @@ pub enum ConfigurationFailureCode {
     ImmutableSettingChanged,
 }
 
+impl ConfigurationFailureCode {
+    /// Stable machine-readable classification for an operator finding.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Malformed => "malformed",
+            Self::MissingSchemaVersion => "missing_schema_version",
+            Self::UnknownSetting => "unknown_setting",
+            Self::UnsupportedValue => "unsupported_value",
+            Self::UnsafeCombination => "unsafe_combination",
+            Self::ConflictingSetting => "conflicting_setting",
+            Self::SecretOverrideNotAllowed => "secret_override_not_allowed",
+            Self::ResourceLimit => "resource_limit",
+            Self::ImmutableSettingChanged => "immutable_setting_changed",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RetryClass {
     Never,
     AfterInputCorrection,
 }
 
+impl RetryClass {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Never => "never",
+            Self::AfterInputCorrection => "after_input_correction",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CompletionState {
     Rejected,
+}
+
+impl CompletionState {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Rejected => "rejected",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -139,6 +176,34 @@ pub enum FailureSource {
     StorageSecretsDirectory,
     SecurityLocalKeyFile,
     ExportDestinations,
+}
+
+impl FailureSource {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ConfigurationDocument => "configuration_document",
+            Self::EnvironmentOverride => "environment_override",
+            Self::CommandLineOverride => "command_line_override",
+            Self::SchemaVersion => "schema_version",
+            Self::DiagnosticsLogLevel => "diagnostics.log_level",
+            Self::RuntimeShutdownGraceSeconds => "runtime.shutdown_grace_seconds",
+            Self::RuntimeMaxRegisteredTenants => "runtime.max_registered_tenants",
+            Self::ListenerControlPath => "listener.control_path",
+            Self::ListenerOperationsBindAddress => "listener.operations_bind_address",
+            Self::ListenerApiBindAddress => "listener.api_bind_address",
+            Self::ListenerApiTransport => "listener.api_transport",
+            Self::ListenerApiTlsCertificateFile => "listener.api_tls_certificate_file",
+            Self::ListenerApiTlsPrivateKeyFile => "listener.api_tls_private_key_file",
+            Self::ListenerOtlpGrpcBindAddress => "listener.otlp_grpc_bind_address",
+            Self::ListenerOtlpHttpBindAddress => "listener.otlp_http_bind_address",
+            Self::ListenerLokiPushBindAddress => "listener.loki_push_bind_address",
+            Self::StorageDataDirectory => "storage.data_directory",
+            Self::StorageSecretsDirectory => "storage.secrets_directory",
+            Self::SecurityLocalKeyFile => "security.local_key_file",
+            Self::ExportDestinations => "export.destination",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

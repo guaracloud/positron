@@ -317,5 +317,7 @@ fn generated_schema_and_reference_are_deterministic_and_secret_safe() {
         assert!(first_reference.contains(mutability));
     }
     assert!(first_reference.contains("secret-bearing (redacted)"));
+    assert!(first_reference.contains("positron config effective --redacted"));
+    assert!(first_reference.contains("positron config migrate --config PATH"));
     assert!(!first_reference.contains("/var/lib/positron-secrets/local-root-key"));
 }

@@ -13,6 +13,18 @@ pub enum SettingSource {
     CommandLine,
 }
 
+impl SettingSource {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CompiledDefault => "compiled_default",
+            Self::ConfigurationFile => "configuration_file",
+            Self::Environment => "environment",
+            Self::CommandLine => "command_line",
+        }
+    }
+}
+
 /// Whether a setting is visible in diagnostics and generated references.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SecrecyClass {
@@ -20,6 +32,16 @@ pub enum SecrecyClass {
     Public,
     /// The setting can only be rendered as a redaction marker.
     SecretBearing,
+}
+
+impl SecrecyClass {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::SecretBearing => "secret_bearing",
+        }
+    }
 }
 
 /// The only lifecycle treatment a setting may request after validation.
@@ -35,6 +57,18 @@ pub enum MutabilityClass {
     ImmutableAfterInitialization,
 }
 
+impl MutabilityClass {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LiveReloadable => "live_reloadable",
+            Self::DrainAndReload => "drain_and_reload",
+            Self::RestartRequired => "restart_required",
+            Self::ImmutableAfterInitialization => "immutable_after_initialization",
+        }
+    }
+}
+
 /// The TOML scalar shape owned by one setting definition.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SettingKind {
@@ -44,6 +78,17 @@ pub enum SettingKind {
     String,
     /// A bounded list of named durable-export destination scopes.
     ExportDestinations,
+}
+
+impl SettingKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Integer => "integer",
+            Self::String => "string",
+            Self::ExportDestinations => "export_destinations",
+        }
+    }
 }
 
 /// The closed value domain owned by one setting definition.
@@ -79,6 +124,15 @@ pub enum ProvenancePolicy {
 }
 
 impl ProvenancePolicy {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ConfigurationFileOnly => "configuration_file_only",
+            Self::NonSecretOverrides => "non_secret_overrides",
+            Self::ProtectedConfigurationFileOnly => "protected_configuration_file_only",
+        }
+    }
+
     pub(crate) const fn allows(self, source: SettingSource) -> bool {
         match self {
             Self::ConfigurationFileOnly | Self::ProtectedConfigurationFileOnly => {

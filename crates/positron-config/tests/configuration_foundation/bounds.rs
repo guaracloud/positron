@@ -187,6 +187,11 @@ fn rejects_invalid_shapes_and_values_from_each_closed_value_domain() {
             FailureSource::StorageSecretsDirectory,
         ),
         (
+            "schema_version = 1\n[storage]\ndata_directory = \"/safe\\nunsafe\"\n",
+            ConfigurationFailureCode::UnsafeCombination,
+            FailureSource::StorageDataDirectory,
+        ),
+        (
             "schema_version = 1\n[security]\nlocal_key_file = \"/keys/../root-key\"\n",
             ConfigurationFailureCode::UnsafeCombination,
             FailureSource::SecurityLocalKeyFile,
@@ -201,7 +206,7 @@ fn rejects_invalid_shapes_and_values_from_each_closed_value_domain() {
         assert!(matches!(
             result,
             Err(error) if error.code() == code && error.source() == source
-        ));
+        ), "document={document:?} result={result:?}");
     }
 
     let non_loopback = inputs(

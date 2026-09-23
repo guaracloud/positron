@@ -42,3 +42,28 @@ allowed_tenants = ["11111111-1111-1111-1111-111111111111"]
 Destination names and identities must be unique. The complete candidate is
 validated before publication; changing this immutable setting requires the
 explicit initialization or restore workflow rather than live reload.
+
+## Operator commands
+
+The native binary resolves this same contract without starting the database:
+
+```console
+positron config validate [--config PATH] [--set PATH=VALUE]
+positron config explain [--setting PATH]
+positron config effective --redacted [--config PATH] [--set PATH=VALUE]
+positron config diff --current PATH --candidate PATH
+positron config migrate --config PATH
+```
+
+`validate` resolves the complete candidate and reports only its schema version
+and warning count. `explain` reports each setting's canonical type, redacted
+default where required, value domain, secrecy, provenance policy, and
+mutability. `effective --redacted` renders the complete redacted effective
+state followed by the source of every setting. `diff` resolves both canonical
+documents without environment or command-line overrides, reports only redacted
+semantic values and provenance, and derives one no-mutation lifecycle plan.
+
+The current contract supports schema version 1 only. `migrate` therefore
+performs a strict version-compatibility preflight and reports `changed=false`
+for version 1; unsupported versions are rejected without coercion or an
+invented transformation.
