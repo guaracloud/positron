@@ -338,6 +338,130 @@ fn incomplete_durable_export_reports_its_published_manifest_boundary() -> Result
 }
 
 #[test]
+fn cancelled_pre_drain_export_retries_without_query_admission_or_audit_growth()
+-> Result<(), Box<dyn Error>> {
+    QueryFixture::scoped("durable-export-cancelled-pre-drain-retry", |fixture| {
+        fixture.kernel.append_log("accepted", 20, 1)?;
+        let service = fixture.service(1)?;
+        let signer = fixture.export_manifest_signer()?;
+        let destination = "configured";
+        let source = "logs | range query_time -100 100 | limit 1";
+        let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 16_384, 60)?;
+        let key = positron_governance::AdministrativeIdempotencyKey::new([0xaa; 16])?;
+        let tenant = fixture
+            .context
+            .tenant_attribution()
+            .ok_or("query context lacks tenant")?
+            .tenant_id();
+        let request = positron_governance::DurableOperationRequest::query_export(
+            fixture.context.principal_id(),
+            tenant,
+            key,
+            [0x7a; 16],
+            fixture.kernel.catalog_for_test().pin()?.number(),
+            100,
+            export_request_digest(fixture, destination, source, budget)?,
+        )?;
+        let accepted = positron_governance::DurableOperationAdministration::accept_query_export(
+            fixture.kernel.catalog_for_test(),
+            fixture.context,
+            request,
+        )?;
+        let cancelled = positron_governance::DurableOperationAdministration::cancel_query_export(
+            fixture.kernel.catalog_for_test(),
+            fixture.context,
+            accepted.operation_id(),
+            positron_governance::AdministrativeIdempotencyKey::new([0xab; 16])?,
+            101,
+        )?;
+        assert_eq!(
+            cancelled.status(),
+            positron_governance::DurableOperationStatus::Cancelled
+        );
+        let audit_before_retry = fixture
+            .kernel
+            .catalog_for_test()
+            .governance_audit_records()?
+            .len();
+        let direct_resume = service
+            .resume_durable_export(
+                fixture.kernel.catalog_for_test(),
+                &signer,
+                fixture.context,
+                accepted.operation_id(),
+                source,
+                budget,
+                destination,
+                &mut RecordingSink::default(),
+            )
+            .expect_err("a cancelled operation must resolve before lease recovery");
+        assert_eq!(direct_resume.code(), QueryFailureCode::Cancelled);
+        let held =
+            fixture
+                .kernel
+                .authority
+                .governor()
+                .reserve(positron_kernel::WorkClaim::tenant(
+                    tenant,
+                    positron_kernel::WorkKind::InteractiveQueryTail,
+                    positron_kernel::ResourceAmounts::only(
+                        positron_kernel::ResourceDimension::MemoryBytes,
+                        7_999_600,
+                    )?,
+                )?)?;
+        let resources_before_retry = fixture.kernel.authority.governor().inspect()?;
+        let mut denied_retry_sink = RecordingSink::default();
+        let denied_retry = service
+            .export_pipeline_as_operation(
+                fixture.kernel.catalog_for_test(),
+                &signer,
+                fixture.context,
+                key,
+                source,
+                budget,
+                destination,
+                &mut denied_retry_sink,
+            )
+            .expect_err("a cancelled operation must resolve before query resource admission");
+        assert_eq!(denied_retry.code(), QueryFailureCode::Cancelled);
+        assert!(!denied_retry_sink.started);
+        assert!(denied_retry_sink.batches.is_empty());
+        assert_eq!(
+            fixture.kernel.authority.governor().inspect()?,
+            resources_before_retry
+        );
+        drop(held);
+
+        let mut normal_retry_sink = RecordingSink::default();
+        let normal_retry = service
+            .export_pipeline_as_operation(
+                fixture.kernel.catalog_for_test(),
+                &signer,
+                fixture.context,
+                key,
+                source,
+                budget,
+                destination,
+                &mut normal_retry_sink,
+            )
+            .expect_err("a cancelled operation must remain its terminal result");
+        assert_eq!(normal_retry.code(), QueryFailureCode::Cancelled);
+        assert!(!normal_retry_sink.started);
+        assert!(normal_retry_sink.batches.is_empty());
+        assert_eq!(
+            fixture
+                .kernel
+                .catalog_for_test()
+                .governance_audit_records()?
+                .len(),
+            audit_before_retry,
+            "terminal cancellation replay must not publish another operation transition"
+        );
+        Ok(())
+    })
+}
+
+#[test]
 fn query_export_audit_decodes_and_is_visible_only_to_its_tenant() -> Result<(), Box<dyn Error>> {
     QueryFixture::scoped("durable-export-audit-tenant", |fixture| {
         fixture.kernel.append_log("accepted", 20, 1)?;

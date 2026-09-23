@@ -1036,31 +1036,36 @@ impl<'kernel, 'catalog, 'ledger> crate::QueryService<'kernel, 'catalog, 'ledger>
             request_digest,
         )
         .map_err(KernelExportSink::map_output_failure)?;
-        if accepted.status() == positron_governance::DurableOperationStatus::Failed
-            && let Some(failure) = accepted
-                .terminal_error()
-                .and_then(positron_governance::DurableOperationTerminalError::query_failure)
-        {
-            return Err(query_failure_from_durable(failure));
-        }
-        if matches!(
-            accepted.status(),
+        match accepted.status() {
+            positron_governance::DurableOperationStatus::Failed
+                if let Some(failure) = accepted.terminal_error().and_then(
+                    positron_governance::DurableOperationTerminalError::query_failure,
+                ) =>
+            {
+                return Err(query_failure_from_durable(failure));
+            },
             positron_governance::DurableOperationStatus::Succeeded
-                | positron_governance::DurableOperationStatus::Failed
-        ) {
-            // A terminal operation is resolved from its authenticated,
-            // descriptor-bound manifest. Its execution lease remains bounded,
-            // but terminal lookup follows the Durable Operation retention
-            // contract and must not re-enter unfinished snapshot recovery.
-            let output = positron_kernel::ExportOutput::reopen_for_request(catalog, output_request)
-                .map_err(KernelExportSink::map_output_failure)?;
-            return self.resolve_durable_export(
-                catalog,
-                context,
-                operation_id,
-                output.identity(),
-                destination_name,
-            );
+            | positron_governance::DurableOperationStatus::Failed => {
+                // A terminal operation is resolved from its authenticated,
+                // descriptor-bound manifest. Its execution lease remains bounded,
+                // but terminal lookup follows the Durable Operation retention
+                // contract and must not re-enter unfinished snapshot recovery.
+                let output =
+                    positron_kernel::ExportOutput::reopen_for_request(catalog, output_request)
+                        .map_err(KernelExportSink::map_output_failure)?;
+                return self.resolve_durable_export(
+                    catalog,
+                    context,
+                    operation_id,
+                    output.identity(),
+                    destination_name,
+                );
+            },
+            positron_governance::DurableOperationStatus::Cancelled => {
+                return Err(QueryFailure::new(QueryFailureCode::Cancelled));
+            },
+            positron_governance::DurableOperationStatus::Pending
+            | positron_governance::DurableOperationStatus::Running => {},
         }
         let recovered_output =
             positron_kernel::ExportOutput::recover_initial(catalog, output_request, self.now()?)
@@ -1414,6 +1419,9 @@ impl<'kernel, 'catalog, 'ledger> crate::QueryService<'kernel, 'catalog, 'ledger>
                 return Err(failure);
             },
         };
+        if operation.status() == positron_governance::DurableOperationStatus::Cancelled {
+            return Err(QueryFailure::new(QueryFailureCode::Cancelled));
+        }
         let mut output = match positron_kernel::ExportOutput::recover_initial(
             catalog,
             positron_kernel::ExportOutputRequest::new(
