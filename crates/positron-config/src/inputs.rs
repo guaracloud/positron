@@ -1,4 +1,9 @@
-use std::fmt::{Debug, Formatter};
+use std::{
+    fmt::{Debug, Formatter},
+    fs::File,
+    io::Read,
+    path::Path,
+};
 
 use super::{
     ConfigurationFailure, ConfigurationFailureCode, FailureSource, MAX_CONFIGURATION_BYTES,
@@ -77,7 +82,41 @@ impl Debug for ConfigurationInputs {
     }
 }
 
+/// Failure while assembling canonical configuration inputs from native sources.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConfigurationInputFailure {
+    DocumentUnavailable,
+    Configuration(ConfigurationFailure),
+}
+
 impl ConfigurationInputs {
+    /// Assembles all native sources with canonical precedence and bounded file IO.
+    pub fn try_from_sources<EnvironmentKey, EnvironmentValue, CommandLineKey, CommandLineValue>(
+        configuration_file: Option<&Path>,
+        environment: impl IntoIterator<Item = (EnvironmentKey, EnvironmentValue)>,
+        command_line: impl IntoIterator<Item = (CommandLineKey, CommandLineValue)>,
+    ) -> Result<Self, ConfigurationInputFailure>
+    where
+        EnvironmentKey: AsRef<str>,
+        EnvironmentValue: AsRef<str>,
+        CommandLineKey: AsRef<str>,
+        CommandLineValue: AsRef<str>,
+    {
+        let file = configuration_file
+            .map(read_configuration_file)
+            .transpose()?;
+        let environment = EnvironmentOverrides::try_from_pairs(
+            environment
+                .into_iter()
+                .filter(|(key, _)| key.as_ref().starts_with("POSITRON__")),
+        )
+        .map_err(Self::configuration_failure)?;
+        let command_line = CommandLineOverrides::try_from_pairs(command_line)
+            .map_err(Self::configuration_failure)?;
+        Self::try_new(file.as_deref(), environment, command_line)
+            .map_err(Self::configuration_failure)
+    }
+
     pub fn try_new(
         file: Option<&str>,
         environment: EnvironmentOverrides,
@@ -101,6 +140,34 @@ impl ConfigurationInputs {
             command_line,
         })
     }
+
+    const fn configuration_failure(failure: ConfigurationFailure) -> ConfigurationInputFailure {
+        ConfigurationInputFailure::Configuration(failure)
+    }
+}
+
+fn read_configuration_file(path: &Path) -> Result<String, ConfigurationInputFailure> {
+    let file = File::open(path).map_err(|_| ConfigurationInputFailure::DocumentUnavailable)?;
+    read_configuration_document(file)
+}
+
+fn read_configuration_document(reader: impl Read) -> Result<String, ConfigurationInputFailure> {
+    let maximum_bytes = u64::try_from(MAX_CONFIGURATION_BYTES)
+        .map_err(|_| ConfigurationInputFailure::DocumentUnavailable)?;
+    let mut bytes = Vec::with_capacity(MAX_CONFIGURATION_BYTES + 1);
+    reader
+        .take(maximum_bytes + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ConfigurationInputFailure::DocumentUnavailable)?;
+    if bytes.len() > MAX_CONFIGURATION_BYTES {
+        return Err(ConfigurationInputFailure::Configuration(
+            ConfigurationFailure::new(
+                ConfigurationFailureCode::ResourceLimit,
+                FailureSource::ConfigurationDocument,
+            ),
+        ));
+    }
+    String::from_utf8(bytes).map_err(|_| ConfigurationInputFailure::DocumentUnavailable)
 }
 
 fn collect_pairs<K, V>(
@@ -133,4 +200,50 @@ where
         collected.push((key.to_owned(), value.to_owned()));
     }
     Ok(collected)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        cell::Cell,
+        io::{self, Read},
+        rc::Rc,
+    };
+
+    use super::{
+        ConfigurationFailureCode, ConfigurationInputFailure, FailureSource,
+        MAX_CONFIGURATION_BYTES, read_configuration_document,
+    };
+
+    struct CountingReader {
+        remaining: usize,
+        consumed: Rc<Cell<usize>>,
+    }
+
+    impl Read for CountingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let bytes = buffer.len().min(self.remaining);
+            buffer[..bytes].fill(b'x');
+            self.remaining -= bytes;
+            self.consumed.set(self.consumed.get() + bytes);
+            Ok(bytes)
+        }
+    }
+
+    #[test]
+    fn configuration_document_reader_stops_after_the_canonical_limit_plus_one() {
+        let consumed = Rc::new(Cell::new(0));
+        let result = read_configuration_document(CountingReader {
+            remaining: MAX_CONFIGURATION_BYTES + 2,
+            consumed: Rc::clone(&consumed),
+        });
+
+        assert!(matches!(
+            result,
+            Err(ConfigurationInputFailure::Configuration(failure))
+                if failure.code() == ConfigurationFailureCode::ResourceLimit
+                    && failure.source() == FailureSource::ConfigurationDocument
+        ));
+        assert_eq!(consumed.get(), MAX_CONFIGURATION_BYTES + 1);
+    }
 }

@@ -7,9 +7,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use positron_config::{
-    ApiTransport, CommandLineOverrides, ConfigurationInputs, EnvironmentOverrides, resolve,
-};
+use positron_config::{ApiTransport, ConfigurationInputs, resolve};
 use positron_kernel::MountQualification;
 use positron_runtime::{
     ApiTransportProfile, ApplicationRuntime, BootstrapPaths, ConfiguredExportDestinationResolver,
@@ -90,22 +88,12 @@ fn run(
     environment: impl IntoIterator<Item = (String, String)>,
 ) -> Result<ExitOutcome, LaunchFailure> {
     let arguments = Arguments::parse(arguments)?;
-    let document = arguments
-        .config
-        .as_deref()
-        .map(std::fs::read_to_string)
-        .transpose()
-        .map_err(|_| LaunchFailure::Configuration)?;
-    let environment = EnvironmentOverrides::try_from_pairs(
-        environment
-            .into_iter()
-            .filter(|(key, _)| key.starts_with("POSITRON__")),
+    let inputs = ConfigurationInputs::try_from_sources(
+        arguments.config.as_deref().map(Path::new),
+        environment,
+        arguments.overrides,
     )
     .map_err(|_| LaunchFailure::Configuration)?;
-    let command_line = CommandLineOverrides::try_from_pairs(arguments.overrides)
-        .map_err(|_| LaunchFailure::Configuration)?;
-    let inputs = ConfigurationInputs::try_new(document.as_deref(), environment, command_line)
-        .map_err(|_| LaunchFailure::Configuration)?;
     let effective = resolve(inputs).map_err(|_| LaunchFailure::Configuration)?;
     for warning in effective.security_warnings() {
         eprintln!("positron: warning: {}", warning.message());

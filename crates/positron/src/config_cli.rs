@@ -1,8 +1,9 @@
-use std::process::ExitCode;
+use std::{path::Path, process::ExitCode};
 
 use positron_config::{
-    CommandLineOverrides, ConfigurationFailure, ConfigurationInputs, EnvironmentOverrides,
-    SecrecyClass, SettingDefinition, ValueDomain, resolve, setting_definitions, setting_for_path,
+    ConfigurationFailure, ConfigurationInputFailure, ConfigurationInputs, SecrecyClass,
+    SettingDefinition, ValueDomain, render_toml_basic_string, resolve, setting_definitions,
+    setting_for_path,
 };
 
 const EXIT_CONFIGURATION: u8 = 2;
@@ -43,8 +44,8 @@ fn execute(
             let candidate = resolve_document(&candidate)?;
             let diff = current.semantic_diff(&candidate);
             let mut output = format!(
-                "plan={} change_count={}\n",
-                diff.plan().as_str(),
+                "plan = {}\nchange_count = {}\n",
+                render_toml_basic_string(diff.plan().as_str()),
                 diff.changes().len()
             );
             for change in diff.changes() {
@@ -55,13 +56,13 @@ fn execute(
                     .after_source()
                     .map_or("unavailable", |source| source.as_str());
                 output.push_str(&format!(
-                    "setting={} before={} before_source={} after={} after_source={} mutability={}\n",
-                    change.setting().path(),
-                    change.before(),
-                    before_source,
-                    change.after(),
-                    after_source,
-                    change.setting().mutability().as_str(),
+                    "\n[[change]]\nsetting = {}\nbefore = {}\nbefore_source = {}\nafter = {}\nafter_source = {}\nmutability = {}\n",
+                    render_toml_basic_string(change.setting().path()),
+                    render_toml_basic_string(change.before()),
+                    render_toml_basic_string(before_source),
+                    render_toml_basic_string(change.after()),
+                    render_toml_basic_string(after_source),
+                    render_toml_basic_string(change.setting().mutability().as_str()),
                 ));
             }
             Ok(output)
@@ -81,36 +82,24 @@ fn resolve_inputs(
     inputs: InputOptions,
     environment: impl IntoIterator<Item = (String, String)>,
 ) -> Result<positron_config::EffectiveConfiguration, OperatorFailure> {
-    let file = inputs
-        .config
-        .as_deref()
-        .map(std::fs::read_to_string)
-        .transpose()
-        .map_err(|_| OperatorFailure::DocumentUnavailable)?;
-    let environment = EnvironmentOverrides::try_from_pairs(
-        environment
-            .into_iter()
-            .filter(|(key, _)| key.starts_with("POSITRON__")),
+    let inputs = ConfigurationInputs::try_from_sources(
+        inputs.config.as_deref().map(Path::new),
+        environment,
+        inputs.overrides,
     )
-    .map_err(OperatorFailure::Configuration)?;
-    let command_line = CommandLineOverrides::try_from_pairs(inputs.overrides)
-        .map_err(OperatorFailure::Configuration)?;
-    let inputs = ConfigurationInputs::try_new(file.as_deref(), environment, command_line)
-        .map_err(OperatorFailure::Configuration)?;
+    .map_err(OperatorFailure::Input)?;
     resolve(inputs).map_err(OperatorFailure::Configuration)
 }
 
 fn resolve_document(
     path: &str,
 ) -> Result<positron_config::EffectiveConfiguration, OperatorFailure> {
-    let document =
-        std::fs::read_to_string(path).map_err(|_| OperatorFailure::DocumentUnavailable)?;
-    let environment = EnvironmentOverrides::try_from_pairs([] as [(&str, &str); 0])
-        .map_err(OperatorFailure::Configuration)?;
-    let command_line = CommandLineOverrides::try_from_pairs([] as [(&str, &str); 0])
-        .map_err(OperatorFailure::Configuration)?;
-    let inputs = ConfigurationInputs::try_new(Some(&document), environment, command_line)
-        .map_err(OperatorFailure::Configuration)?;
+    let inputs = ConfigurationInputs::try_from_sources(
+        Some(Path::new(path)),
+        [] as [(&str, &str); 0],
+        [] as [(&str, &str); 0],
+    )
+    .map_err(OperatorFailure::Input)?;
     resolve(inputs).map_err(OperatorFailure::Configuration)
 }
 
@@ -269,7 +258,7 @@ enum OperatorFailure {
     Usage,
     RedactionRequired,
     UnknownExplainSetting,
-    DocumentUnavailable,
+    Input(ConfigurationInputFailure),
     Configuration(ConfigurationFailure),
 }
 
@@ -279,7 +268,14 @@ impl OperatorFailure {
             Self::Usage => "usage: positron config validate [--config PATH] [--set PATH=VALUE] | explain [--setting PATH] | effective --redacted [--config PATH] [--set PATH=VALUE] | diff --current PATH --candidate PATH | migrate --config PATH".to_owned(),
             Self::RedactionRequired => "effective configuration requires --redacted".to_owned(),
             Self::UnknownExplainSetting => "configuration_rejected code=unknown_setting retry=after_input_correction completion=rejected source=configuration_document".to_owned(),
-            Self::DocumentUnavailable => "configuration_rejected code=configuration_document_unavailable retry=after_input_correction completion=rejected source=configuration_document".to_owned(),
+            Self::Input(ConfigurationInputFailure::DocumentUnavailable) => "configuration_rejected code=configuration_document_unavailable retry=after_input_correction completion=rejected source=configuration_document".to_owned(),
+            Self::Input(ConfigurationInputFailure::Configuration(failure)) => format!(
+                "configuration_rejected code={} retry={} completion={} source={}",
+                failure.code().as_str(),
+                failure.retry_class().as_str(),
+                failure.completion_state().as_str(),
+                failure.source().as_str(),
+            ),
             Self::Configuration(failure) => format!(
                 "configuration_rejected code={} retry={} completion={} source={}",
                 failure.code().as_str(),

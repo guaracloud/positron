@@ -27,6 +27,8 @@ mod inputs;
 pub use inputs::*;
 mod effective;
 pub use effective::*;
+mod rendering;
+pub use rendering::*;
 
 /// Resolves every source into one checked, redacted typed candidate.
 pub fn resolve(

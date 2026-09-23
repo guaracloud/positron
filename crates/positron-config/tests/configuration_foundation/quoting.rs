@@ -243,6 +243,44 @@ fn array_table_syntax_precedes_ordinary_table_name_resource_classification() {
 }
 
 #[test]
+fn redacted_effective_uses_toml_escaped_public_values_and_redacts_secrets()
+-> Result<(), Box<dyn std::error::Error>> {
+    const PUBLIC_PATH: &str = "/srv/space \"quote\" \\branch before_source=forged";
+    const SECRET_PATH: &str = "/keys/secret \"quote\" \\branch after=forged";
+    let effective = inputs(
+        Some(
+            "schema_version = 1\n\
+             [storage]\n\
+             data_directory = \"/srv/space \\\"quote\\\" \\\\branch before_source=forged\"\n\
+             [security]\n\
+             local_key_file = \"/keys/secret \\\"quote\\\" \\\\branch after=forged\"\n",
+        ),
+        [],
+        [],
+    )
+    .and_then(resolve)?;
+
+    let rendered = effective.redacted_effective();
+    let parsed = rendered.parse::<toml::Table>()?;
+    let storage = parsed
+        .get("storage")
+        .and_then(toml::Value::as_table)
+        .ok_or("effective output has no storage table")?;
+    assert_eq!(
+        storage
+            .get("data_directory")
+            .and_then(toml::Value::as_str),
+        Some(PUBLIC_PATH)
+    );
+    assert!(rendered.contains(
+        "data_directory = \"/srv/space \\\"quote\\\" \\\\branch before_source=forged\""
+    ));
+    assert!(!rendered.contains(SECRET_PATH));
+    assert!(rendered.contains("local_key_file = \"<redacted>\""));
+    Ok(())
+}
+
+#[test]
 fn preflight_rejects_each_reachable_malformed_or_oversized_lexical_shape() {
     for document in [
         "schema_version 1\n",

@@ -248,15 +248,14 @@ impl EffectiveConfiguration {
         rendered.push_str("\n[provenance]\n");
         for definition in contract::SETTING_DEFINITIONS {
             let setting = definition.setting();
-            rendered.push('"');
-            rendered.push_str(definition.path());
-            rendered.push_str("\" = \"");
+            rendered.push_str(&super::render_toml_basic_string(definition.path()));
+            rendered.push_str(" = ");
             if let Some(source) = self.sources.get(setting_index(setting)) {
-                rendered.push_str(source.as_str());
+                rendered.push_str(&super::render_toml_basic_string(source.as_str()));
             } else {
-                rendered.push_str("unavailable");
+                rendered.push_str(&super::render_toml_basic_string("unavailable"));
             }
-            rendered.push_str("\"\n");
+            rendered.push('\n');
         }
         rendered
     }
@@ -287,54 +286,66 @@ impl EffectiveConfiguration {
         let mut rendered = String::with_capacity(512);
         rendered.push_str("schema_version = ");
         rendered.push_str(&self.schema_version.to_string());
-        rendered.push_str("\n\n[diagnostics]\nlog_level = \"");
-        rendered.push_str(self.log_level.as_str());
-        rendered.push_str("\"\n\n[runtime]\nshutdown_grace_seconds = ");
+        rendered.push_str("\n\n[diagnostics]\nlog_level = ");
+        rendered.push_str(&super::render_toml_basic_string(self.log_level.as_str()));
+        rendered.push_str("\n\n[runtime]\nshutdown_grace_seconds = ");
         rendered.push_str(&self.shutdown_grace_seconds.to_string());
         rendered.push_str("\nmax_registered_tenants = ");
         rendered.push_str(&self.max_registered_tenants.to_string());
-        rendered.push_str("\n\n[listener]\ncontrol_path = \"");
-        rendered.push_str(&self.control_path);
-        rendered.push_str("\"\noperations_bind_address = \"");
-        rendered.push_str(&self.operations_bind_address.to_string());
-        rendered.push_str("\"\napi_bind_address = \"");
-        rendered.push_str(&self.api_bind_address.to_string());
-        rendered.push_str("\"\napi_transport = \"");
-        rendered.push_str(self.api_transport.as_str());
-        rendered.push_str("\"\napi_tls_certificate_file = \"<redacted>\"\napi_tls_private_key_file = \"<redacted>");
-        rendered.push_str("\"\notlp_grpc_bind_address = \"");
-        rendered.push_str(&self.otlp_grpc_bind_address.to_string());
-        rendered.push_str("\"\notlp_http_bind_address = \"");
-        rendered.push_str(&self.otlp_http_bind_address.to_string());
-        rendered.push_str("\"\nloki_push_bind_address = \"");
-        rendered.push_str(&self.loki_push_bind_address.to_string());
-        rendered.push('"');
+        rendered.push_str("\n\n[listener]\ncontrol_path = ");
+        rendered.push_str(&super::render_toml_basic_string(&self.control_path));
+        rendered.push_str("\noperations_bind_address = ");
+        rendered.push_str(&super::render_toml_basic_string(
+            &self.operations_bind_address.to_string(),
+        ));
+        rendered.push_str("\napi_bind_address = ");
+        rendered.push_str(&super::render_toml_basic_string(
+            &self.api_bind_address.to_string(),
+        ));
+        rendered.push_str("\napi_transport = ");
+        rendered.push_str(&super::render_toml_basic_string(
+            self.api_transport.as_str(),
+        ));
+        rendered.push_str("\napi_tls_certificate_file = \"<redacted>\"\napi_tls_private_key_file = \"<redacted>\"");
+        rendered.push_str("\notlp_grpc_bind_address = ");
+        rendered.push_str(&super::render_toml_basic_string(
+            &self.otlp_grpc_bind_address.to_string(),
+        ));
+        rendered.push_str("\notlp_http_bind_address = ");
+        rendered.push_str(&super::render_toml_basic_string(
+            &self.otlp_http_bind_address.to_string(),
+        ));
+        rendered.push_str("\nloki_push_bind_address = ");
+        rendered.push_str(&super::render_toml_basic_string(
+            &self.loki_push_bind_address.to_string(),
+        ));
         for destination in &self.export_destinations {
-            rendered.push_str("\n\n[[export.destination]]\nname = \"");
-            rendered.push_str(&destination.name);
-            rendered.push_str("\"\nidentity = \"");
-            rendered.push_str(&hexadecimal_identity(destination.identity));
-            rendered.push_str("\"\nallowed_tenants = [");
+            rendered.push_str("\n\n[[export.destination]]\nname = ");
+            rendered.push_str(&super::render_toml_basic_string(&destination.name));
+            rendered.push_str("\nidentity = ");
+            rendered.push_str(&super::render_toml_basic_string(&hexadecimal_identity(
+                destination.identity,
+            )));
+            rendered.push_str("\nallowed_tenants = [");
             for (index, tenant) in destination.allowed_tenants.iter().enumerate() {
                 if index != 0 {
                     rendered.push_str(", ");
                 }
-                rendered.push('"');
-                rendered.push_str(&tenant.to_canonical_text());
-                rendered.push('"');
+                rendered.push_str(&super::render_toml_basic_string(
+                    &tenant.to_canonical_text(),
+                ));
             }
             rendered.push(']');
         }
         if let Some(warning) = self.security_warnings().first() {
-            rendered.push_str("\n\n[warnings]\nwarning = \"");
-            rendered.push_str(warning.message());
-            rendered.push('"');
+            rendered.push_str("\n\n[warnings]\nwarning = ");
+            rendered.push_str(&super::render_toml_basic_string(warning.message()));
         }
-        rendered.push_str("\n\n[storage]\ndata_directory = \"");
-        rendered.push_str(&self.data_directory);
-        rendered.push_str("\"\nsecrets_directory = \"");
-        rendered.push_str(&self.secrets_directory);
-        rendered.push_str("\"\n\n[security]\nlocal_key_file = \"<redacted>\"\n");
+        rendered.push_str("\n\n[storage]\ndata_directory = ");
+        rendered.push_str(&super::render_toml_basic_string(&self.data_directory));
+        rendered.push_str("\nsecrets_directory = ");
+        rendered.push_str(&super::render_toml_basic_string(&self.secrets_directory));
+        rendered.push_str("\n\n[security]\nlocal_key_file = \"<redacted>\"\n");
         rendered
     }
 

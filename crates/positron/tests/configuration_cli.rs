@@ -56,7 +56,7 @@ fn operator_commands_are_deterministic_and_never_start_the_runtime()
     assert!(diff.status.success(), "{diff:?}");
     assert_eq!(
         stdout(&diff)?,
-        "plan=restart_required change_count=2\nsetting=diagnostics.log_level before=info before_source=configuration_file after=debug after_source=configuration_file mutability=live_reloadable\nsetting=runtime.shutdown_grace_seconds before=30 before_source=compiled_default after=60 after_source=configuration_file mutability=restart_required\n"
+        "plan = \"restart_required\"\nchange_count = 2\n\n[[change]]\nsetting = \"diagnostics.log_level\"\nbefore = \"info\"\nbefore_source = \"configuration_file\"\nafter = \"debug\"\nafter_source = \"configuration_file\"\nmutability = \"live_reloadable\"\n\n[[change]]\nsetting = \"runtime.shutdown_grace_seconds\"\nbefore = \"30\"\nbefore_source = \"compiled_default\"\nafter = \"60\"\nafter_source = \"configuration_file\"\nmutability = \"restart_required\"\n"
     );
 
     let migrate = run(["config", "migrate", "--config", path(&candidate)?]);
@@ -105,8 +105,8 @@ fn effective_and_failure_outputs_redact_protected_reference_canaries()
     ]);
     assert!(diff.status.success(), "{diff:?}");
     assert_redacted(&diff, CANARY)?;
-    assert!(stdout(&diff)?.contains("before=<redacted>"));
-    assert!(stdout(&diff)?.contains("after=<redacted>"));
+    assert!(stdout(&diff)?.contains("before = \"<redacted>\""));
+    assert!(stdout(&diff)?.contains("after = \"<redacted>\""));
 
     let rejected = run([
         "config",
@@ -171,7 +171,66 @@ fn diff_reports_immutable_changes_as_a_non_mutating_migration_requirement()
     assert!(output.status.success(), "{output:?}");
     assert_eq!(
         stdout(&output)?,
-        "plan=requires_migration change_count=1\nsetting=storage.data_directory before=/var/lib/positron before_source=compiled_default after=/srv/positron after_source=configuration_file mutability=immutable_after_initialization\n"
+        "plan = \"requires_migration\"\nchange_count = 1\n\n[[change]]\nsetting = \"storage.data_directory\"\nbefore = \"/var/lib/positron\"\nbefore_source = \"compiled_default\"\nafter = \"/srv/positron\"\nafter_source = \"configuration_file\"\nmutability = \"immutable_after_initialization\"\n"
+    );
+    std::fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[test]
+fn public_operator_output_escapes_field_looking_path_values()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = temporary_root()?;
+    let current = root.join("current.toml");
+    let candidate = root.join("candidate.toml");
+    std::fs::write(&current, "schema_version = 1\n")?;
+    std::fs::write(
+        &candidate,
+        "schema_version = 1\n\
+         [storage]\n\
+         data_directory = \"/srv/space \\\"quote\\\" \\\\branch before_source=forged\"\n",
+    )?;
+
+    let output = run([
+        "config",
+        "diff",
+        "--current",
+        path(&current)?,
+        "--candidate",
+        path(&candidate)?,
+    ]);
+    assert!(output.status.success(), "{output:?}");
+    let report = stdout(&output)?;
+    assert_eq!(
+        report,
+        r##"plan = "requires_migration"
+change_count = 1
+
+[[change]]
+setting = "storage.data_directory"
+before = "/var/lib/positron"
+before_source = "compiled_default"
+after = "/srv/space \"quote\" \\branch before_source=forged"
+after_source = "configuration_file"
+mutability = "immutable_after_initialization"
+"##
+    );
+    std::fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[test]
+fn public_cli_rejects_a_configuration_file_just_over_the_canonical_input_limit()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = temporary_root()?;
+    let oversized = root.join("oversized.toml");
+    std::fs::write(&oversized, "x".repeat(16 * 1024 + 1))?;
+
+    let output = run(["config", "validate", "--config", path(&oversized)?]);
+    assert!(!output.status.success());
+    assert_eq!(
+        stderr(&output)?,
+        "positron: configuration_rejected code=resource_limit retry=after_input_correction completion=rejected source=configuration_document\n"
     );
     std::fs::remove_dir_all(root)?;
     Ok(())
