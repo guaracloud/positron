@@ -1009,12 +1009,11 @@ impl ExportOutput {
         let transaction =
             TransactionId::new(transaction_identity(self, snapshot.identity().to_bytes()))
                 .map_err(|_| fail(ExportOutputFailureCode::LimitExceeded))?;
-        let proposal = CatalogProposal::new(
-            transaction,
-            snapshot.format_epoch().unwrap_or(FormatEpoch::CATALOG_V2),
-            objects,
-        )
-        .map_err(map_catalog_failure)?;
+        let format_epoch = snapshot
+            .format_epoch()
+            .ok_or_else(|| fail(ExportOutputFailureCode::IntegrityCorruption))?;
+        let proposal = CatalogProposal::new(transaction, format_epoch, objects)
+            .map_err(map_catalog_failure)?;
         catalog
             .commit(snapshot.identity(), proposal, None)
             .map_err(map_catalog_failure)?;

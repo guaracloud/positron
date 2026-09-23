@@ -195,6 +195,67 @@ fn durable_export_records_a_catalog_backed_terminal_operation_after_the_signed_m
 }
 
 #[test]
+fn query_export_audit_decodes_and_is_visible_only_to_its_tenant() -> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("durable-export-audit-tenant")?;
+    fixture.kernel.append_log("accepted", 20, 1)?;
+    let service = fixture.service(1)?;
+    let key = positron_governance::AdministrativeIdempotencyKey::new([0x4a; 16])?;
+    let receipt = service.export_pipeline_as_operation(
+        fixture.kernel.catalog_for_test(),
+        &fixture.export_manifest_signer()?,
+        fixture.context,
+        key,
+        "logs | range query_time -100 100 | limit 1",
+        QueryBudget::new(1_048_576, 16, 16, 1_048_576, 16_384, 60)?,
+        "configured",
+        &mut RecordingSink::default(),
+    )?;
+    let tenant_administrator = fixture.tenant_administration_context()?;
+    let catalog = fixture.kernel.catalog_for_test();
+    let audit = catalog
+        .governance_audit_records()?
+        .iter()
+        .map(positron_governance::GovernanceAuditEntry::decode)
+        .collect::<Result<Vec<_>, _>>()?;
+    let tenant = fixture
+        .context
+        .tenant_attribution()
+        .ok_or("query context lacks tenant")?
+        .tenant_id();
+    let identity = positron_governance::Identity::open(&catalog.pin()?)?;
+    let visible = identity.inspect_audit(tenant_administrator, &audit)?;
+    let tenant_records = visible.audit_records().collect::<Vec<_>>();
+    let export_transitions = tenant_records
+        .iter()
+        .filter_map(|entry| match entry {
+            positron_governance::GovernanceAuditEntry::DurableOperation(entry)
+                if entry.operation_id() == receipt.operation_id() =>
+            {
+                Some(entry)
+            },
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(export_transitions.len(), 4);
+    assert!(export_transitions.iter().all(|entry| {
+        entry.applicable_tenant() == Some(tenant)
+            && entry.acting_principal() == Some(fixture.context.principal_id())
+            && entry.request_id() == Some(key)
+    }));
+    assert_eq!(
+        export_transitions.last().map(|entry| entry.outcome()),
+        Some(positron_governance::DurableOperationStatus::Succeeded)
+    );
+    assert!(
+        tenant_records
+            .iter()
+            .all(|entry| entry.tenant_id() == Some(tenant))
+    );
+    Ok(())
+}
+
+#[test]
 fn exact_caller_key_retry_resolves_its_completed_export_after_catalog_advances()
 -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("durable-export-idempotent-retry")?;
@@ -459,6 +520,39 @@ fn caller_key_retry_recovers_the_initial_cursor_after_descriptor_publication_fai
 }
 
 #[test]
+fn terminal_audit_publication_failure_is_reported_as_store_unavailable()
+-> Result<(), Box<dyn Error>> {
+    let fixture = QueryFixture::new("durable-export-terminal-audit-failure")?;
+    fixture.kernel.append_log("first", 20, 1)?;
+    let service = fixture.service(1)?;
+    let signer = fixture.export_manifest_signer()?;
+    let key = positron_governance::AdministrativeIdempotencyKey::new([0x49; 16])?;
+    let mut sink = RecordingSink::default();
+
+    let failure = positron_kernel::with_catalog_publication_fault_after(
+        positron_kernel::CatalogPublicationFault::SynchronizeCommit,
+        2,
+        || {
+            service.export_pipeline_as_operation(
+                fixture.kernel.catalog_for_test(),
+                &signer,
+                fixture.context,
+                key,
+                "unrecognized pipeline syntax",
+                QueryBudget::new(1_048_576, 16, 16, 1_048_576, 16_384, 60).expect("valid budget"),
+                "configured",
+                &mut sink,
+            )
+        },
+    )
+    .expect_err("a failed terminal audit publication leaves the caller outcome unknown");
+
+    assert_eq!(failure.code(), QueryFailureCode::StoreUnavailable);
+    assert!(sink.batches.is_empty());
+    Ok(())
+}
+
+#[test]
 fn kernel_owned_export_output_recovers_the_same_batch_receipts_after_restart()
 -> Result<(), Box<dyn Error>> {
     let fixture = QueryFixture::new("durable-export-output-restart")?;
@@ -569,6 +663,11 @@ fn durable_export_resumes_the_original_snapshot_and_cumulative_cursor_after_inte
         .digest_query_cursor(b"query-export-request-v1", &request_payload)?;
     let request = positron_governance::DurableOperationRequest::query_export(
         fixture.context.principal_id(),
+        fixture
+            .context
+            .tenant_attribution()
+            .ok_or("query context lacks tenant")?
+            .tenant_id(),
         positron_governance::AdministrativeIdempotencyKey::new([0x53; 16])?,
         [0x7a; 16],
         accepted_generation,
@@ -977,6 +1076,11 @@ fn export_operation_id(
     let digest = export_request_digest(fixture, destination, source, budget)?;
     Ok(positron_governance::DurableOperationRequest::query_export(
         fixture.context.principal_id(),
+        fixture
+            .context
+            .tenant_attribution()
+            .ok_or("query context lacks tenant")?
+            .tenant_id(),
         positron_governance::AdministrativeIdempotencyKey::new(key)?,
         [0x7a; 16],
         generation,

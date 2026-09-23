@@ -3,7 +3,7 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
-use positron_domain::identity::PrincipalId;
+use positron_domain::identity::{PrincipalId, TenantId};
 use sha2::{Digest, Sha256};
 
 use crate::AdministrativeIdempotencyKey;
@@ -90,6 +90,7 @@ pub struct DurableOperationRequest {
     pub(super) idempotency: AdministrativeIdempotencyKey,
     pub(super) kind: DurableOperationKind,
     pub(super) target_identity: Option<[u8; 16]>,
+    pub(super) applicable_tenant: Option<TenantId>,
     pub(super) accepted_generation: u64,
     pub(super) accepted_at_unix_seconds: u64,
     /// Full Query-owned request binding for a Query export. The generic
@@ -106,28 +107,48 @@ impl DurableOperationRequest {
         kind: DurableOperationKind,
         target_identity: Option<[u8; 16]>,
         accepted_generation: u64,
+        applicable_tenant: Option<TenantId>,
+        query_export_request_digest: Option<[u8; 32]>,
     ) -> Result<OperationId, DurableOperationFailure> {
         if accepted_generation == 0 {
             return Err(DurableOperationFailure::InvalidInput);
         }
+        let target_identity = target_identity.ok_or(DurableOperationFailure::InvalidInput)?;
         let mut hasher = Sha256::new();
         hasher.update(REQUEST_DOMAIN);
         hasher.update(principal.to_bytes());
         hasher.update(idempotency.to_bytes());
         hasher.update([kind.code()]);
-        if let Some(target_identity) = target_identity {
-            hasher.update(target_identity);
+        match kind {
+            DurableOperationKind::CatalogFormatMigration => {
+                if applicable_tenant.is_some() || query_export_request_digest.is_some() {
+                    return Err(DurableOperationFailure::InvalidInput);
+                }
+                hasher.update(target_identity);
+                hasher.update(accepted_generation.to_be_bytes());
+            },
+            DurableOperationKind::QueryExport => {
+                hasher.update(
+                    applicable_tenant
+                        .ok_or(DurableOperationFailure::InvalidInput)?
+                        .to_bytes(),
+                );
+                hasher.update(target_identity);
+                hasher.update(
+                    query_export_request_digest.ok_or(DurableOperationFailure::InvalidInput)?,
+                );
+            },
         }
-        hasher.update(accepted_generation.to_be_bytes());
         let digest: [u8; 32] = hasher.finalize().into();
         Ok(OperationId::from_request(&Self {
             principal,
             idempotency,
             kind,
-            target_identity,
+            target_identity: Some(target_identity),
+            applicable_tenant,
             accepted_generation,
             accepted_at_unix_seconds: 1,
-            query_export_request_digest: None,
+            query_export_request_digest,
             digest,
         }))
     }
@@ -152,6 +173,8 @@ impl DurableOperationRequest {
             kind,
             Some(target_identity),
             accepted_generation,
+            None,
+            None,
         )?;
         let mut hasher = Sha256::new();
         hasher.update(REQUEST_DOMAIN);
@@ -166,6 +189,7 @@ impl DurableOperationRequest {
             idempotency,
             kind,
             target_identity: Some(target_identity),
+            applicable_tenant: None,
             accepted_generation,
             accepted_at_unix_seconds,
             query_export_request_digest: None,
@@ -181,6 +205,7 @@ impl DurableOperationRequest {
     /// immutable protected output identity, never a path or credential.
     pub fn query_export(
         principal: PrincipalId,
+        tenant: TenantId,
         idempotency: AdministrativeIdempotencyKey,
         target_identity: [u8; 16],
         accepted_generation: u64,
@@ -200,6 +225,7 @@ impl DurableOperationRequest {
         hasher.update(principal.to_bytes());
         hasher.update(idempotency.to_bytes());
         hasher.update([kind.code()]);
+        hasher.update(tenant.to_bytes());
         hasher.update(target_identity);
         // Query catalog generation is a fresh-request precondition. It is not
         // part of the durable idempotency intent: an exact caller retry must
@@ -211,6 +237,7 @@ impl DurableOperationRequest {
             idempotency,
             kind,
             target_identity: Some(target_identity),
+            applicable_tenant: Some(tenant),
             accepted_generation,
             accepted_at_unix_seconds,
             query_export_request_digest: Some(query_export_request_digest),
@@ -264,11 +291,18 @@ impl DurableOperationRequest {
         self.query_export_request_digest
     }
 
+    /// Returns the tenant explicitly bound to a tenant-scoped operation.
+    #[must_use]
+    pub const fn applicable_tenant(self) -> Option<TenantId> {
+        self.applicable_tenant
+    }
+
     pub(super) fn has_same_semantics(self, other: Self) -> bool {
         self.principal == other.principal
             && self.idempotency == other.idempotency
             && self.kind == other.kind
             && self.target_identity == other.target_identity
+            && self.applicable_tenant == other.applicable_tenant
             && (self.kind == DurableOperationKind::QueryExport
                 || self.accepted_generation == other.accepted_generation)
             && self.query_export_request_digest == other.query_export_request_digest
@@ -295,6 +329,7 @@ impl DurableOperationRequest {
                 .and_then(|target_identity| {
                     Self::query_export(
                         self.principal,
+                        self.applicable_tenant?,
                         self.idempotency,
                         target_identity,
                         self.accepted_generation,

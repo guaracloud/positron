@@ -11,12 +11,17 @@ impl GovernanceAuditEntry {
         if intent.starts_with(&DURABLE_OPERATION_AUDIT_MAGIC)
             || intent.starts_with(&DURABLE_OPERATION_AUDIT_MAGIC_V3)
             || intent.starts_with(&DURABLE_OPERATION_AUDIT_MAGIC_V4)
+            || intent.starts_with(&DURABLE_OPERATION_AUDIT_MAGIC_V5)
         {
+            let is_v5 = intent.starts_with(&DURABLE_OPERATION_AUDIT_MAGIC_V5);
             let is_v4 = intent.starts_with(&DURABLE_OPERATION_AUDIT_MAGIC_V4);
-            let is_current = is_v4 || intent.starts_with(&DURABLE_OPERATION_AUDIT_MAGIC_V3);
+            let is_current =
+                is_v5 || is_v4 || intent.starts_with(&DURABLE_OPERATION_AUDIT_MAGIC_V3);
             let mut cursor = Cursor::new(intent);
             if cursor.take_array::<8>()?
-                != if is_v4 {
+                != if is_v5 {
+                    DURABLE_OPERATION_AUDIT_MAGIC_V5
+                } else if is_v4 {
                     DURABLE_OPERATION_AUDIT_MAGIC_V4
                 } else if is_current {
                     DURABLE_OPERATION_AUDIT_MAGIC_V3
@@ -30,7 +35,7 @@ impl GovernanceAuditEntry {
                 OperationId::from_bytes(cursor.take_array()?).map_err(|_| IdentityFailure)?;
             let actor =
                 PrincipalId::from_bytes(cursor.take_array()?).map_err(|_| IdentityFailure)?;
-            let target_identity = if is_v4 {
+            let target_identity = if is_v4 || is_v5 {
                 let target = cursor.take_array::<16>()?;
                 (!target.iter().all(|byte| *byte == 0)).then_some(target)
             } else {
@@ -47,6 +52,12 @@ impl GovernanceAuditEntry {
             let request_id = AdministrativeIdempotencyKey::new(cursor.take_array()?)
                 .map_err(|_| IdentityFailure)?;
             let accepted_generation = cursor.take_u64()?;
+            let query_export_request_digest = if is_v5 {
+                let digest = cursor.take_array::<32>()?;
+                (!digest.iter().all(|byte| *byte == 0)).then_some(digest)
+            } else {
+                None
+            };
             let progress_percent = cursor.take_u8()?;
             let revision = cursor.take_u64()?;
             let cancellation_request_id = if is_current {
@@ -72,6 +83,8 @@ impl GovernanceAuditEntry {
                 action,
                 target_identity,
                 accepted_generation,
+                applicable_tenant,
+                query_export_request_digest,
             )
             .map_err(|_| IdentityFailure)?;
             let canonical_transaction =

@@ -992,6 +992,44 @@ impl QueryFixture {
         Ok(context)
     }
 
+    pub(crate) fn tenant_administration_context(
+        &self,
+    ) -> Result<positron_governance::AuthorizedContext, Box<dyn Error>> {
+        let expected = self
+            .instance
+            .list_api_keys(self.administrator)?
+            .into_iter()
+            .find(|descriptor| descriptor.principal_id() == self.context.principal_id())
+            .ok_or("query credential descriptor missing")?
+            .generation();
+        let tenant = self
+            .context
+            .tenant_attribution()
+            .ok_or("query context lacks tenant")?
+            .tenant_id();
+        let created = self.instance.create_api_key_for_tenant(
+            self.administrator,
+            tenant,
+            Scope::TenantAdministration,
+            None,
+            expected,
+            positron_governance::AdministrativeIdempotencyKey::new([0x97; 16])?,
+        )?;
+        let context = self.instance.attribute(
+            PresentedCredential::parse(
+                created
+                    .secret()
+                    .ok_or("tenant administration secret missing")?,
+            )?,
+            RequestedIntent::TenantAdministration,
+            CompatibilityHints::none(),
+        )?;
+        self.instance
+            .governance_fixture_for_test()?
+            .replace_into(self.kernel.catalog_for_test())?;
+        Ok(context)
+    }
+
     pub(crate) fn suspend_query_tenant(&self) -> Result<(), Box<dyn Error>> {
         self.instance
             .governance_fixture_for_test()?

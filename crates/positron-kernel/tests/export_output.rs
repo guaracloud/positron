@@ -7,12 +7,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use positron_domain::identity::TenantId;
 use positron_kernel::{
-    Catalog, CatalogPublicationFault, CatalogSecret, DiskPressureThresholds, ExportOutput,
-    ExportOutputBinding, ExportOutputRequest, GovernorPolicy, InstanceId,
-    InventoryCardinalityLimits, MountQualification, ObservedResourceEnvironment, OperatorLimits,
-    OrdinaryPoolPolicy, PrimaryDataVolume, RecoveryPoolCapacities, RecoveryReserve,
+    Catalog, CatalogObject, CatalogProposal, CatalogPublicationFault, CatalogSecret,
+    DiskPressureThresholds, ExportOutput, ExportOutputBinding, ExportOutputRequest, GovernorPolicy,
+    InstanceId, InventoryCardinalityLimits, MountQualification, ObservedResourceEnvironment,
+    OperatorLimits, OrdinaryPoolPolicy, PrimaryDataVolume, RecoveryPoolCapacities, RecoveryReserve,
     RegisteredResourceBounds, ResourceAmounts, ResourceDimension, ResourceGovernorConfiguration,
-    ResourceInventory, SnapshotLeaseId, StorageKernelResourceAuthority, TenantQuota,
+    ResourceInventory, SnapshotLeaseId, StorageKernelResourceAuthority, TenantQuota, TransactionId,
     with_catalog_publication_fault_after,
 };
 
@@ -155,6 +155,56 @@ fn establish(
         .map_err(|error| format!("establish: {:?}", error.failure()).into())
 }
 
+fn open_export_catalog<'authority>(
+    authority: &'authority StorageKernelResourceAuthority,
+    instance: InstanceId,
+    secret: CatalogSecret,
+) -> Result<Catalog<'authority>, Box<dyn Error>> {
+    let catalog = Catalog::open(authority, instance, secret)?;
+    let snapshot = catalog.pin()?;
+    if snapshot.format_epoch().is_none() {
+        let transaction = TransactionId::new([0x01; 16])?;
+        let proposal = CatalogProposal::new(
+            transaction,
+            positron_kernel::FormatEpoch::CATALOG_V2,
+            vec![CatalogObject::new(b"export-output-test-catalog".to_vec())?],
+        )?;
+        catalog.commit(snapshot.identity(), proposal, None)?;
+    }
+    Ok(catalog)
+}
+
+#[test]
+fn export_output_rejects_an_uninitialized_catalog_format_epoch() -> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x80; 16])?,
+        CatalogSecret::from_owned(Box::new([0x81; 32]), Box::new([0x82; 32])),
+    )?;
+    let binding = ExportOutputBinding::new(
+        TenantId::from_bytes([0x41; 16])?,
+        [0x83; 16],
+        [0x84; 32],
+        [0x85; 32],
+        7,
+        9,
+        SnapshotLeaseId::new([0x86; 16])?,
+        100,
+        3_700,
+    )?;
+
+    let failure = ExportOutput::create(&catalog, binding)
+        .expect_err("exports require a catalog with an explicit format epoch");
+    assert_eq!(
+        failure.code(),
+        positron_kernel::ExportOutputFailureCode::IntegrityCorruption
+    );
+    Ok(())
+}
+
 #[test]
 fn exact_retry_publishes_a_payload_synced_before_its_descriptor_and_keeps_the_committed_checkpoint()
 -> Result<(), Box<dyn Error>> {
@@ -163,7 +213,7 @@ fn exact_retry_publishes_a_payload_synced_before_its_descriptor_and_keeps_the_co
     let authority = establish(volume)?;
     let instance = InstanceId::new([0x81; 16])?;
     let secret = CatalogSecret::from_owned(Box::new([0x82; 32]), Box::new([0x83; 32]));
-    let catalog = Catalog::open(&authority, instance, secret)?;
+    let catalog = open_export_catalog(&authority, instance, secret)?;
     let binding = ExportOutputBinding::new(
         TenantId::from_bytes([0x41; 16])?,
         [0x84; 16],
@@ -224,7 +274,7 @@ fn exact_retry_publishes_a_payload_synced_before_its_descriptor_and_keeps_the_co
     ));
 
     drop(catalog);
-    let catalog = Catalog::open(
+    let catalog = open_export_catalog(
         &authority,
         instance,
         CatalogSecret::from_owned(Box::new([0x82; 32]), Box::new([0x83; 32])),
@@ -243,7 +293,7 @@ fn initial_cursor_is_synced_before_descriptor_publication_and_recovered_by_exact
     let authority = establish(volume)?;
     let instance = InstanceId::new([0x8a; 16])?;
     let secret = CatalogSecret::from_owned(Box::new([0x8b; 32]), Box::new([0x8c; 32]));
-    let catalog = Catalog::open(&authority, instance, secret)?;
+    let catalog = open_export_catalog(&authority, instance, secret)?;
     let binding = ExportOutputBinding::new(
         TenantId::from_bytes([0x41; 16])?,
         [0x8d; 16],
@@ -275,7 +325,7 @@ fn initial_cursor_is_synced_before_descriptor_publication_and_recovered_by_exact
         Err(error) if error.code() == positron_kernel::ExportOutputFailureCode::IdempotencyConflict
     ));
     drop(catalog);
-    let catalog = Catalog::open(
+    let catalog = open_export_catalog(
         &authority,
         instance,
         CatalogSecret::from_owned(Box::new([0x8b; 32]), Box::new([0x8c; 32])),
@@ -296,7 +346,7 @@ fn operation_addressed_initial_preparation_survives_descriptor_failure_and_catal
     let authority = establish(volume)?;
     let instance = InstanceId::new([0xb1; 16])?;
     let secret = CatalogSecret::from_owned(Box::new([0xb2; 32]), Box::new([0xb3; 32]));
-    let catalog = Catalog::open(&authority, instance, secret)?;
+    let catalog = open_export_catalog(&authority, instance, secret)?;
     let tenant = TenantId::from_bytes([0x41; 16])?;
     let request = ExportOutputRequest::new([0xb4; 16], tenant, [0xb5; 16], [0xb6; 32])?;
     let binding = ExportOutputBinding::new_for_operation(
@@ -343,7 +393,7 @@ fn operation_addressed_initial_preparation_survives_descriptor_failure_and_catal
     )?;
     let _ = ExportOutput::create(&catalog, unrelated)?;
     drop(catalog);
-    let catalog = Catalog::open(
+    let catalog = open_export_catalog(
         &authority,
         instance,
         CatalogSecret::from_owned(Box::new([0xb2; 32]), Box::new([0xb3; 32])),
@@ -383,7 +433,7 @@ fn tampered_initial_preparation_fails_closed_without_replacement_output()
     let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
     let authority = establish(volume)?;
     let instance = InstanceId::new([0xbe; 16])?;
-    let catalog = Catalog::open(
+    let catalog = open_export_catalog(
         &authority,
         instance,
         CatalogSecret::from_owned(Box::new([0xbf; 32]), Box::new([0xc0; 32])),
@@ -448,7 +498,7 @@ fn later_orphan_keeps_the_predecessor_checkpoint_until_its_exact_retry_publishes
     let authority = establish(volume)?;
     let instance = InstanceId::new([0x91; 16])?;
     let secret = CatalogSecret::from_owned(Box::new([0x92; 32]), Box::new([0x93; 32]));
-    let catalog = Catalog::open(&authority, instance, secret)?;
+    let catalog = open_export_catalog(&authority, instance, secret)?;
     let binding = ExportOutputBinding::new(
         TenantId::from_bytes([0x41; 16])?,
         [0x94; 16],
@@ -523,7 +573,7 @@ fn output_admission_refuses_before_decrypting_a_corrupt_prior_payload() -> Resul
     let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
     let authority = establish(volume)?;
     let instance = InstanceId::new([0xa1; 16])?;
-    let catalog = Catalog::open(
+    let catalog = open_export_catalog(
         &authority,
         instance,
         CatalogSecret::from_owned(Box::new([0xa2; 32]), Box::new([0xa3; 32])),
@@ -573,7 +623,7 @@ fn durable_output_reopens_authenticated_incremental_payload_without_rewriting_pr
     let authority = establish(volume)?;
     let instance = InstanceId::new([0x11; 16])?;
     let secret = CatalogSecret::from_owned(Box::new([0x12; 32]), Box::new([0x13; 32]));
-    let catalog = Catalog::open(&authority, instance, secret)?;
+    let catalog = open_export_catalog(&authority, instance, secret)?;
     let binding = ExportOutputBinding::new(
         TenantId::from_bytes([0x41; 16])?,
         [0x21; 16],
@@ -609,7 +659,7 @@ fn durable_output_reopens_authenticated_incremental_payload_without_rewriting_pr
 
     let identity = output.identity();
     drop(catalog);
-    let catalog = Catalog::open(
+    let catalog = open_export_catalog(
         &authority,
         instance,
         CatalogSecret::from_owned(Box::new([0x12; 32]), Box::new([0x13; 32])),
@@ -636,7 +686,7 @@ fn corrupted_or_substituted_export_payload_fails_closed_after_reopen() -> Result
     let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
     let authority = establish(volume)?;
     let instance = InstanceId::new([0x41; 16])?;
-    let catalog = Catalog::open(
+    let catalog = open_export_catalog(
         &authority,
         instance,
         CatalogSecret::from_owned(Box::new([0x42; 32]), Box::new([0x43; 32])),

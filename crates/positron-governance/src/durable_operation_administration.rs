@@ -81,7 +81,7 @@ impl DurableOperationAdministration {
         actor: crate::AuthorizedContext,
         request: DurableOperationRequest,
     ) -> Result<DurableOperation, DurableOperationFailure> {
-        validate_query_actor(actor, request.principal)?;
+        validate_query_actor(actor, request.principal, request.applicable_tenant)?;
         if request.kind != DurableOperationKind::QueryExport {
             return Err(DurableOperationFailure::InvalidInput);
         }
@@ -167,7 +167,11 @@ impl DurableOperationAdministration {
         let snapshot = catalog.pin().map_err(map_catalog)?;
         let operation = find_by_id(&snapshot, operation_id)?
             .ok_or(DurableOperationFailure::UnknownOperation)?;
-        validate_query_actor(actor, operation.request.principal)?;
+        validate_query_actor(
+            actor,
+            operation.request.principal,
+            operation.request.applicable_tenant,
+        )?;
         if operation.request.kind != DurableOperationKind::QueryExport {
             return Err(DurableOperationFailure::InvalidState);
         }
@@ -186,7 +190,11 @@ impl DurableOperationAdministration {
         let snapshot = catalog.pin().map_err(map_catalog)?;
         let operation = find_by_id(&snapshot, operation_id)?
             .ok_or(DurableOperationFailure::UnknownOperation)?;
-        validate_query_actor(actor, operation.request.principal)?;
+        validate_query_actor(
+            actor,
+            operation.request.principal,
+            operation.request.applicable_tenant,
+        )?;
         if operation.request.kind != DurableOperationKind::QueryExport {
             return Err(DurableOperationFailure::InvalidState);
         }
@@ -249,7 +257,11 @@ impl DurableOperationAdministration {
         let snapshot = catalog.pin().map_err(map_catalog)?;
         let operation = find_by_id(&snapshot, operation_id)?
             .ok_or(DurableOperationFailure::UnknownOperation)?;
-        validate_query_actor(actor, operation.request.principal)?;
+        validate_query_actor(
+            actor,
+            operation.request.principal,
+            operation.request.applicable_tenant,
+        )?;
         if operation.request.kind != DurableOperationKind::QueryExport {
             return Err(DurableOperationFailure::InvalidState);
         }
@@ -284,7 +296,11 @@ impl DurableOperationAdministration {
         let snapshot = catalog.pin().map_err(map_catalog)?;
         let operation = find_by_id(&snapshot, operation_id)?
             .ok_or(DurableOperationFailure::UnknownOperation)?;
-        validate_query_actor(actor, operation.request.principal)?;
+        validate_query_actor(
+            actor,
+            operation.request.principal,
+            operation.request.applicable_tenant,
+        )?;
         if operation.request.kind != DurableOperationKind::QueryExport {
             return Err(DurableOperationFailure::InvalidState);
         }
@@ -325,7 +341,11 @@ impl DurableOperationAdministration {
         let snapshot = catalog.pin().map_err(map_catalog)?;
         let operation = find_by_id(&snapshot, operation_id)?
             .ok_or(DurableOperationFailure::UnknownOperation)?;
-        validate_query_actor(actor, operation.request.principal)?;
+        validate_query_actor(
+            actor,
+            operation.request.principal,
+            operation.request.applicable_tenant,
+        )?;
         if operation.request.kind != DurableOperationKind::QueryExport {
             return Err(DurableOperationFailure::InvalidState);
         }
@@ -378,10 +398,14 @@ fn validate_system_actor(
 fn validate_query_actor(
     actor: crate::AuthorizedContext,
     principal: PrincipalId,
+    tenant: Option<positron_domain::identity::TenantId>,
 ) -> Result<(), DurableOperationFailure> {
     if actor.principal_id() != principal
         || actor.scope() != Scope::Query
-        || actor.tenant_attribution().is_none()
+        || actor
+            .tenant_attribution()
+            .map(|attribution| attribution.tenant_id())
+            != tenant
     {
         return Err(DurableOperationFailure::Unauthorized);
     }
