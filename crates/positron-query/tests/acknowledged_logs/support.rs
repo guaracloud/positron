@@ -1873,11 +1873,9 @@ fn acknowledged_logs_fixture_uses_its_declared_inventory_instead_of_live_host_ca
 }
 
 #[test]
-fn kernel_fixtures_release_their_volume_descriptors_on_drop() -> Result<(), Box<dyn Error>>
-{
+fn kernel_fixtures_release_their_volume_descriptors_on_drop() -> Result<(), Box<dyn Error>> {
     const CHILD_ENVIRONMENT: &str = "POSITRON_ACKNOWLEDGED_LOGS_DESCRIPTOR_CHILD";
-    const TEST_NAME: &str =
-        "support::kernel_fixtures_release_their_volume_descriptors_on_drop";
+    const TEST_NAME: &str = "support::kernel_fixtures_release_their_volume_descriptors_on_drop";
 
     if std::env::var_os(CHILD_ENVIRONMENT).is_some() {
         let before = open_descriptor_count()?;

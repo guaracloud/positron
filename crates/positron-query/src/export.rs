@@ -11,6 +11,7 @@ const REQUEST_DOMAIN: &[u8] = b"query-export-request-v1";
 const MANIFEST_DOMAIN: &[u8] = b"query-export-manifest-v1";
 const MAX_MANIFEST_BATCHES: usize = 1_024;
 const MANIFEST_WIRE_MAGIC: &[u8; 8] = b"POSQEM01";
+const TERMINAL_EVIDENCE_MAGIC: &[u8; 8] = b"POSQET01";
 
 /// Immutable identity of the preconfigured protected output destination.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -46,6 +47,25 @@ pub trait ExportSink {
         batch: &QueryBatch,
         continuation: Option<&QueryCursor>,
     ) -> Result<(), QueryFailure>;
+
+    /// Commits the final batch with the Query-owned terminal truth that it
+    /// attests. Durable sinks override this so recovery never infers a result
+    /// from a missing continuation cursor; observation sinks retain the
+    /// ordinary batch callback.
+    fn write_terminal_batch(
+        &mut self,
+        destination: ExportDestination,
+        batch: &QueryBatch,
+        _terminal: &ExportTerminal,
+    ) -> Result<(), QueryFailure> {
+        self.write_batch(destination, batch, None)
+    }
+
+    /// Commits terminal truth for an empty export. Durable sinks bind it to
+    /// their protected descriptor; observation sinks have no durable state.
+    fn persist_terminal(&mut self, _terminal: &ExportTerminal) -> Result<(), QueryFailure> {
+        Ok(())
+    }
 
     /// Returns the identity of the kernel-owned protected output, if this
     /// sink materializes one. Observation-only sinks remain supported for the
@@ -227,6 +247,56 @@ impl ExportSink for KernelExportSink<'_, '_, '_> {
             return Err(QueryFailure::new(QueryFailureCode::MalformedPersistentData));
         }
         self.observer.write_batch(destination, batch, continuation)
+    }
+
+    fn write_terminal_batch(
+        &mut self,
+        destination: ExportDestination,
+        batch: &QueryBatch,
+        terminal: &ExportTerminal,
+    ) -> Result<(), QueryFailure> {
+        self.ensure_running()?;
+        if destination != self.destination {
+            return Err(QueryFailure::new(QueryFailureCode::Unauthorized));
+        }
+        self.cross_output_boundary_once()?;
+        let observed_at = self.now()?;
+        let terminal_evidence = terminal_evidence_bytes(terminal)?;
+        let output = self
+            .output
+            .as_mut()
+            .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
+        let reservation = output
+            .reserve_next_batch(self.catalog)
+            .map_err(Self::map_output_failure)?;
+        let canonical_bytes = batch.canonical_export_bytes()?;
+        let receipt = output
+            .append_terminal_batch_reserved(
+                self.catalog,
+                observed_at,
+                batch.sequence(),
+                batch.digest(),
+                &canonical_bytes,
+                &terminal_evidence,
+                reservation,
+            )
+            .map_err(Self::map_output_failure)?;
+        if receipt.sequence() != batch.sequence() || receipt.digest() != batch.digest() {
+            return Err(QueryFailure::new(QueryFailureCode::MalformedPersistentData));
+        }
+        self.observer.write_batch(destination, batch, None)
+    }
+
+    fn persist_terminal(&mut self, terminal: &ExportTerminal) -> Result<(), QueryFailure> {
+        self.ensure_running()?;
+        self.cross_output_boundary_once()?;
+        let observed_at = self.now()?;
+        let terminal_evidence = terminal_evidence_bytes(terminal)?;
+        self.output
+            .as_mut()
+            .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?
+            .write_terminal_evidence(self.catalog, observed_at, &terminal_evidence)
+            .map_err(Self::map_output_failure)
     }
 
     fn output_identity(&self) -> Option<[u8; 16]> {
@@ -475,6 +545,50 @@ fn durable_manifest_bytes(manifest: &ExportManifest) -> Result<Vec<u8>, QueryFai
     output.extend_from_slice(&signature.integrity_identity().fingerprint());
     output.extend_from_slice(&signature.bytes());
     Ok(output)
+}
+
+fn terminal_evidence_bytes(terminal: &ExportTerminal) -> Result<Vec<u8>, QueryFailure> {
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(8 + 2 + 179)
+        .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
+    bytes.extend_from_slice(TERMINAL_EVIDENCE_MAGIC);
+    match terminal {
+        ExportTerminal::Complete(stats) => {
+            bytes.push(1);
+            bytes.push(0);
+            stats.append_durable_export_encoding(&mut bytes)?;
+        },
+        ExportTerminal::Incomplete(incomplete) => {
+            bytes.push(2);
+            bytes.push(query_failure_code(incomplete.code()));
+            incomplete
+                .stats()
+                .append_durable_export_encoding(&mut bytes)?;
+        },
+    }
+    Ok(bytes)
+}
+
+fn terminal_from_evidence(bytes: &[u8]) -> Result<ExportTerminal, QueryFailure> {
+    let mut offset = 0;
+    if read_manifest_array::<8>(bytes, &mut offset)? != *TERMINAL_EVIDENCE_MAGIC {
+        return Err(QueryFailure::new(QueryFailureCode::MalformedPersistentData));
+    }
+    let terminal_tag = read_manifest_byte(bytes, &mut offset)?;
+    let failure_tag = read_manifest_byte(bytes, &mut offset)?;
+    let stats = QueryStats::from_durable_export_encoding(bytes, &mut offset)?;
+    if offset != bytes.len() {
+        return Err(QueryFailure::new(QueryFailureCode::MalformedPersistentData));
+    }
+    match terminal_tag {
+        1 if failure_tag == 0 => Ok(ExportTerminal::Complete(stats)),
+        2 => Ok(ExportTerminal::Incomplete(crate::QueryIncomplete::new(
+            QueryFailure::new(query_failure_code_from(failure_tag)?),
+            stats,
+        ))),
+        _ => Err(QueryFailure::new(QueryFailureCode::MalformedPersistentData)),
+    }
 }
 
 fn durable_manifest_from_bytes(bytes: &[u8]) -> Result<ExportManifest, QueryFailure> {
@@ -1145,6 +1259,81 @@ impl<'kernel, 'catalog, 'ledger> crate::QueryService<'kernel, 'catalog, 'ledger>
                 destination_name,
             );
         }
+        if let Some(evidence) = output
+            .read_terminal_evidence(catalog, self.now()?)
+            .map_err(KernelExportSink::map_output_failure)?
+        {
+            let terminal = terminal_from_evidence(&evidence)?;
+            let mut manifest = self.manifest_from_durable_terminal(
+                catalog,
+                &output,
+                self.now()?,
+                destination,
+                request_digest,
+                budget,
+                terminal,
+            )?;
+            let signature = signer
+                .sign(&manifest.payload()?)
+                .map_err(|_| QueryFailure::new(QueryFailureCode::MalformedPersistentData))?;
+            manifest.signature = Some(signature);
+            let mut kernel_sink = KernelExportSink {
+                catalog,
+                tenant,
+                destination,
+                request_digest,
+                clock: Arc::clone(&self.clock),
+                output: Some(output),
+                observer: sink,
+                operation_id,
+                context,
+                first_batch_started: true,
+            };
+            kernel_sink.persist_manifest(&durable_manifest_bytes(&manifest)?)?;
+            match (operation.status(), manifest.terminal()) {
+                (
+                    positron_governance::DurableOperationStatus::Running,
+                    ExportTerminal::Complete(_),
+                ) => {
+                    positron_governance::DurableOperationAdministration::succeed_query_export(
+                        catalog,
+                        context,
+                        operation_id,
+                        self.now()?,
+                    )
+                    .map_err(|_| QueryFailure::new(QueryFailureCode::StoreUnavailable))?;
+                },
+                (
+                    positron_governance::DurableOperationStatus::Running,
+                    ExportTerminal::Incomplete(_),
+                ) => {
+                    positron_governance::DurableOperationAdministration::fail_query_export(
+                        catalog,
+                        context,
+                        operation_id,
+                        self.now()?,
+                        positron_governance::DurableOperationTerminalError::HandlerRejected,
+                    )
+                    .map_err(|_| QueryFailure::new(QueryFailureCode::StoreUnavailable))?;
+                },
+                (
+                    positron_governance::DurableOperationStatus::Succeeded,
+                    ExportTerminal::Complete(_),
+                )
+                | (
+                    positron_governance::DurableOperationStatus::Failed,
+                    ExportTerminal::Incomplete(_),
+                ) => {},
+                (positron_governance::DurableOperationStatus::Cancelled, _) => {
+                    return Err(QueryFailure::new(QueryFailureCode::Cancelled));
+                },
+                _ => return Err(QueryFailure::new(QueryFailureCode::AuthorizationChanged)),
+            }
+            return Ok(DurableExportReceipt {
+                operation_id,
+                manifest,
+            });
+        }
         match operation.status() {
             positron_governance::DurableOperationStatus::Running => {},
             positron_governance::DurableOperationStatus::Cancelled => {
@@ -1357,6 +1546,67 @@ impl<'kernel, 'catalog, 'ledger> crate::QueryService<'kernel, 'catalog, 'ledger>
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn manifest_from_durable_terminal(
+        &self,
+        catalog: &positron_kernel::Catalog<'_>,
+        output: &positron_kernel::ExportOutput,
+        observed_at: u64,
+        destination: ExportDestination,
+        request_digest: [u8; 32],
+        budget: crate::QueryBudget,
+        terminal: ExportTerminal,
+    ) -> Result<ExportManifest, QueryFailure> {
+        let receipts = output
+            .batch_receipts(catalog, observed_at)
+            .map_err(KernelExportSink::map_output_failure)?;
+        let mut batches = Vec::new();
+        batches
+            .try_reserve_exact(receipts.len())
+            .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
+        for receipt in receipts {
+            batches.push(ExportBatch {
+                sequence: receipt.sequence(),
+                digest: receipt.digest(),
+            });
+        }
+        let terminal_matches_batches = match batches.last() {
+            Some(last) => terminal.stats().last_sequence() == Some(last.sequence()),
+            None => terminal.stats().last_sequence().is_none(),
+        };
+        if !terminal_matches_batches || terminal.stats().cumulative_budget() != budget {
+            return Err(QueryFailure::new(QueryFailureCode::MalformedPersistentData));
+        }
+        let snapshot = crate::ResultSnapshot::new(
+            output.binding().snapshot_identity(),
+            output.binding().snapshot_generation(),
+            output.binding().snapshot_frontier(),
+        );
+        let payload = manifest_payload(
+            destination,
+            Some(output.identity()),
+            request_digest,
+            snapshot,
+            &batches,
+            &terminal,
+        )?;
+        let authentication = self
+            .ledger
+            .control_tokens()
+            .authenticate_export_manifest(MANIFEST_DOMAIN, &payload)
+            .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
+        Ok(ExportManifest {
+            destination,
+            output_identity: Some(output.identity()),
+            request_digest,
+            snapshot,
+            batches,
+            terminal,
+            authentication,
+            signature: None,
+        })
+    }
+
     fn export_stream(
         &self,
         context: positron_governance::AuthorizedContext,
@@ -1376,6 +1626,7 @@ impl<'kernel, 'catalog, 'ledger> crate::QueryService<'kernel, 'catalog, 'ledger>
         }
         let mut pending_batch = None;
         let mut snapshot = None;
+        let mut terminal_evidence_persisted = false;
         let terminal = loop {
             let event = stream
                 .next()
@@ -1400,7 +1651,12 @@ impl<'kernel, 'catalog, 'ledger> crate::QueryService<'kernel, 'catalog, 'ledger>
                         if batch.sequence() != expected || batches.len() == MAX_MANIFEST_BATCHES {
                             return Err(QueryFailure::new(QueryFailureCode::Internal));
                         }
-                        sink.write_batch(destination, &batch, None)?;
+                        sink.write_terminal_batch(
+                            destination,
+                            &batch,
+                            &ExportTerminal::Complete(stats),
+                        )?;
+                        terminal_evidence_persisted = true;
                         batches.push(ExportBatch {
                             sequence: batch.sequence(),
                             digest: batch.digest(),
@@ -1415,7 +1671,12 @@ impl<'kernel, 'catalog, 'ledger> crate::QueryService<'kernel, 'catalog, 'ledger>
                         if batch.sequence() != expected || batches.len() == MAX_MANIFEST_BATCHES {
                             return Err(QueryFailure::new(QueryFailureCode::Internal));
                         }
-                        sink.write_batch(destination, &batch, None)?;
+                        sink.write_terminal_batch(
+                            destination,
+                            &batch,
+                            &ExportTerminal::Incomplete(incomplete.clone()),
+                        )?;
+                        terminal_evidence_persisted = true;
                         batches.push(ExportBatch {
                             sequence: batch.sequence(),
                             digest: batch.digest(),
@@ -1441,6 +1702,9 @@ impl<'kernel, 'catalog, 'ledger> crate::QueryService<'kernel, 'catalog, 'ledger>
                 },
             }
         };
+        if !terminal_evidence_persisted {
+            sink.persist_terminal(&terminal)?;
+        }
         sink.cross_output_boundary()?;
         let output_identity = sink.output_identity();
         let snapshot = snapshot.ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
@@ -1472,9 +1736,47 @@ impl<'kernel, 'catalog, 'ledger> crate::QueryService<'kernel, 'catalog, 'ledger>
 
 #[cfg(test)]
 mod tests {
-    use super::{ExportDestination, ExportTerminal, manifest_payload};
+    use super::{
+        ExportDestination, ExportTerminal, manifest_payload, terminal_evidence_bytes,
+        terminal_from_evidence,
+    };
     use crate::stream::QueryCounters;
-    use crate::{QueryBudget, QueryStats, ResultSnapshot};
+    use crate::{
+        QueryBudget, QueryFailure, QueryFailureCode, QueryIncomplete, QueryStats, ResultSnapshot,
+    };
+
+    #[test]
+    fn terminal_evidence_round_trips_an_incomplete_terminal() {
+        let budget = QueryBudget::new(10, 11, 12, 13, 14, 16)
+            .expect("fixture budget")
+            .with_cpu_work_units(15)
+            .expect("fixture cpu budget");
+        let terminal = ExportTerminal::Incomplete(QueryIncomplete::new(
+            QueryFailure::new(QueryFailureCode::BudgetExhausted),
+            QueryStats::new(
+                QueryCounters {
+                    records: 1,
+                    scanned_bytes: 2,
+                    decoded_records: 3,
+                    output_bytes: 4,
+                    memory_peak_bytes: 5,
+                    cpu_work_units: 6,
+                    wall_seconds: 7,
+                },
+                Some(0),
+                [0x71; 32],
+                budget,
+                0,
+                0,
+            ),
+        ));
+
+        let evidence = terminal_evidence_bytes(&terminal).expect("bounded evidence");
+        assert_eq!(
+            terminal_from_evidence(&evidence).expect("authenticated format"),
+            terminal
+        );
+    }
 
     #[test]
     fn signed_manifest_payload_binds_the_complete_query_snapshot_descriptor() {

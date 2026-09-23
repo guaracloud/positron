@@ -524,16 +524,24 @@ impl QueryStats {
             _ => return Err(QueryFailure::new(QueryFailureCode::MalformedPersistentData)),
         };
         let result_digest = read_export_array(bytes, offset)?;
+        let budget_scanned_bytes = read_export_u64(bytes, offset)?;
+        let budget_decoded_records = read_export_u64(bytes, offset)?;
+        let budget_output_rows = read_export_u64(bytes, offset)?;
+        let budget_output_bytes = read_export_u64(bytes, offset)?;
+        let budget_memory_bytes = read_export_u64(bytes, offset)?;
+        let budget_cpu_work_units = read_export_u64(bytes, offset)?;
+        let budget_wall_seconds = read_export_u64(bytes, offset)?;
+        let maximum_time_range_nanoseconds = read_export_u64(bytes, offset)?;
         let budget = crate::QueryBudget::new(
-            read_export_u64(bytes, offset)?,
-            read_export_u64(bytes, offset)?,
-            read_export_u64(bytes, offset)?,
-            read_export_u64(bytes, offset)?,
-            read_export_u64(bytes, offset)?,
-            read_export_u64(bytes, offset)?,
+            budget_scanned_bytes,
+            budget_decoded_records,
+            budget_output_rows,
+            budget_output_bytes,
+            budget_memory_bytes,
+            budget_wall_seconds,
         )?
-        .with_cpu_work_units(read_export_u64(bytes, offset)?)?
-        .with_maximum_time_range_nanoseconds(read_export_u64(bytes, offset)?)?;
+        .with_cpu_work_units(budget_cpu_work_units)?
+        .with_maximum_time_range_nanoseconds(maximum_time_range_nanoseconds)?;
         let resume_count = read_export_u64(bytes, offset)?;
         let repeated_batch_count = read_export_u64(bytes, offset)?;
         let limiting_budget = decode_budget_dimension(read_export_byte(bytes, offset)?)?;
@@ -656,4 +664,48 @@ pub enum QueryEvent {
     Header(QueryHeader),
     Batch(QueryBatch),
     Terminal(QueryTerminal),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::QueryStats;
+    use crate::QueryBudget;
+
+    #[test]
+    fn durable_export_stats_round_trip_distinct_cpu_and_wall_limits() {
+        let budget = QueryBudget::new(101, 102, 103, 104, 105, 107)
+            .expect("valid wall limit")
+            .with_cpu_work_units(106)
+            .expect("valid cpu limit")
+            .with_maximum_time_range_nanoseconds(108)
+            .expect("valid time range");
+        let stats = QueryStats {
+            records: 1,
+            scanned_bytes: 2,
+            decoded_records: 3,
+            output_bytes: 4,
+            memory_peak_bytes: 5,
+            cpu_work_units: 6,
+            wall_seconds: 7,
+            last_sequence: Some(8),
+            result_digest: [9; 32],
+            cumulative_budget: budget,
+            resume_count: 10,
+            repeated_batch_count: 11,
+            limiting_budget: None,
+            reduced_pruning: false,
+        };
+        let mut bytes = Vec::new();
+        stats
+            .append_durable_export_encoding(&mut bytes)
+            .expect("bounded encoding");
+        let mut offset = 0;
+        let recovered = QueryStats::from_durable_export_encoding(&bytes, &mut offset)
+            .expect("exact durable decoding");
+
+        assert_eq!(offset, bytes.len());
+        assert_eq!(recovered, stats);
+        assert_eq!(recovered.cumulative_budget().cpu_work_units(), 106);
+        assert_eq!(recovered.cumulative_budget().wall_seconds(), 107);
+    }
 }

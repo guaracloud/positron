@@ -57,6 +57,12 @@ fn manifest_path(root: &TemporaryRoot, identity: [u8; 16]) -> PathBuf {
         .join(hex(identity))
         .join("manifest")
 }
+fn terminal_path(root: &TemporaryRoot, identity: [u8; 16]) -> PathBuf {
+    root.path()
+        .join("exports")
+        .join(hex(identity))
+        .join("terminal")
+}
 fn initial_path(root: &TemporaryRoot, identity: [u8; 16]) -> PathBuf {
     root.path()
         .join("exports")
@@ -282,6 +288,82 @@ fn exact_retry_publishes_a_payload_synced_before_its_descriptor_and_keeps_the_co
     let recovered = ExportOutput::reopen(&catalog, output.identity())?;
     assert_eq!(recovered.batch_count(), 1);
     assert_eq!(recovered.latest_receipt(), Some(receipt));
+    Ok(())
+}
+
+#[test]
+fn terminal_evidence_is_descriptor_bound_bounded_and_authenticated() -> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish(volume)?;
+    let catalog = open_export_catalog(
+        &authority,
+        InstanceId::new([0xd1; 16])?,
+        CatalogSecret::from_owned(Box::new([0xd2; 32]), Box::new([0xd3; 32])),
+    )?;
+    let binding = ExportOutputBinding::new(
+        TenantId::from_bytes([0x41; 16])?,
+        [0xd4; 16],
+        [0xd5; 32],
+        [0xd6; 32],
+        7,
+        9,
+        SnapshotLeaseId::new([0xd7; 16])?,
+        100,
+        3_700,
+    )?;
+    let mut output = ExportOutput::create(&catalog, binding)?;
+    let terminal = b"query-terminal-evidence";
+    let reservation = output.reserve_next_batch(&catalog)?;
+    let receipt = output.append_terminal_batch_reserved(
+        &catalog,
+        101,
+        0,
+        [0xd8; 32],
+        b"canonical-final-batch",
+        terminal,
+        reservation,
+    )?;
+
+    assert_eq!(output.latest_receipt(), Some(receipt));
+    assert_eq!(
+        output
+            .latest_checkpoint(&catalog, 101)?
+            .ok_or("final checkpoint missing")?
+            .continuation_cursor(),
+        None
+    );
+    assert_eq!(
+        output.read_terminal_evidence(&catalog, 101)?.as_deref(),
+        Some(terminal as &[u8])
+    );
+    assert!(output.read_manifest(&catalog, 101)?.is_none());
+    assert!(matches!(
+        output.write_terminal_evidence(
+            &catalog,
+            101,
+            &[0_u8; positron_kernel::MAX_EXPORT_TERMINAL_EVIDENCE_BYTES + 1],
+        ),
+        Err(error) if error.code() == positron_kernel::ExportOutputFailureCode::LimitExceeded
+    ));
+
+    let path = terminal_path(&root, output.identity());
+    let mut tampered = fs::read(&path)?;
+    let byte = tampered
+        .last_mut()
+        .ok_or("terminal evidence must be protected")?;
+    *byte ^= 0x01;
+    fs::write(path, tampered)?;
+    let tampered_result = output.read_terminal_evidence(&catalog, 101);
+    assert!(matches!(
+        tampered_result,
+        Err(error) if matches!(
+            error.code(),
+            positron_kernel::ExportOutputFailureCode::AuthenticationFailed
+                | positron_kernel::ExportOutputFailureCode::IntegrityCorruption
+                | positron_kernel::ExportOutputFailureCode::StorageUnavailable
+        )
+    ));
     Ok(())
 }
 

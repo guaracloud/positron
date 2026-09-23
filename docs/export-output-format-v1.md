@@ -7,7 +7,7 @@ or mutable output-file capability.
 
 ## Binding and bounds
 
-One fixed-size `POSEXP03` Catalog Object binds an output identity to the
+One fixed-size `POSEXP04` Catalog Object binds an output identity to the
 accepted durable Operation ID, Tenant ID, configured destination identity,
 request digest, Query Snapshot identity/generation/frontier, Snapshot Lease
 identity, and lease start/expiry. The output identity is domain-derived from
@@ -15,8 +15,11 @@ that accepted Operation ID alone. A caller idempotency key therefore recovers
 the same operation and output, while a distinct accepted operation gets a
 distinct output even when its query and destination are identical.
 It also records only the next sequence, retained protected-byte total, last Query
-Result Batch digest, and an optional terminal-manifest digest. The descriptor
-contains no batch payload, continuation cursor, or terminal manifest bytes.
+Result Batch digest, an optional terminal-evidence digest, and an optional
+terminal-manifest digest. The descriptor contains no batch payload,
+continuation cursor, terminal evidence, or terminal manifest bytes. `POSEXP03`
+descriptors remain readable as pre-terminal-evidence records; they cannot infer
+a terminal outcome from an absent cursor.
 
 Before the descriptor becomes visible, the Kernel synchronizes one separately
 encrypted `initial` artifact containing the complete original binding and the
@@ -79,6 +82,18 @@ integrity corruption.
 The result-batch and continuation cursor bytes remain encrypted in the payload
 object. The Catalog remains bounded progress metadata and does not rewrite
 prior output batches when a successor is published.
+
+Before publishing a final Result Batch descriptor, Query supplies one bounded
+opaque terminal-evidence record containing its exact Complete or Incomplete
+truth, Result Digest, cumulative Query Budget, and resume statistics. Kernel
+encrypts and synchronizes it at the sibling
+`exports/<output-identity-hex>/terminal`, then publishes its digest with that
+final batch descriptor. An empty export uses the same artifact and descriptor
+publication without a batch. The artifact is Query-owned: Kernel only bounds,
+protects, and binds it. A restart reads evidence only when the descriptor names
+its digest, reconstructs the signed manifest without re-executing the Query
+Snapshot, and then performs the normal idempotent terminal operation
+transition. An orphaned terminal artifact is never terminal truth.
 
 ## Terminal manifest
 

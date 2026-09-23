@@ -117,6 +117,7 @@ pub use data_protection::{
 pub use export_output::{
     ExportBatchReceipt, ExportOutput, ExportOutputBatchReservation, ExportOutputBinding,
     ExportOutputCheckpoint, ExportOutputFailure, ExportOutputFailureCode, ExportOutputRequest,
+    MAX_EXPORT_TERMINAL_EVIDENCE_BYTES,
 };
 
 pub use instance_bootstrap_storage::{

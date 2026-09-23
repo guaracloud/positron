@@ -587,7 +587,7 @@ fn caller_key_retry_recovers_the_initial_cursor_after_descriptor_publication_fai
 
         let failure = positron_kernel::with_catalog_publication_fault_after(
             positron_kernel::CatalogPublicationFault::SynchronizeCommit,
-            4,
+            5,
             || {
                 service.export_pipeline_as_operation(
                     fixture.kernel.catalog_for_test(),
@@ -682,6 +682,132 @@ fn terminal_audit_publication_failure_is_reported_as_store_unavailable()
 
         assert_eq!(failure.code(), QueryFailureCode::StoreUnavailable);
         assert!(sink.batches.is_empty());
+        Ok(())
+    })
+}
+
+#[test]
+fn final_complete_batch_recovers_after_manifest_publication_failure_without_replay()
+-> Result<(), Box<dyn Error>> {
+    QueryFixture::scoped("durable-export-final-complete-recovery", |fixture| {
+        fixture.kernel.append_log("first", 20, 1)?;
+        let service = fixture.service(1)?;
+        let signer = fixture.export_manifest_signer()?;
+        let source = "logs | range query_time -100 100 | limit 1";
+        let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 16_384, 60)?;
+        let key = positron_governance::AdministrativeIdempotencyKey::new([0x4a; 16])?;
+        let generation = fixture.kernel.catalog_for_test().pin()?.number();
+        let operation_id = export_operation_id(
+            fixture,
+            "configured",
+            source,
+            budget,
+            generation,
+            key.to_bytes(),
+        )?;
+
+        let mut interrupted_sink = InterruptingSink { writes: 0 };
+        let initial_failure = service
+            .export_pipeline_as_operation(
+                fixture.kernel.catalog_for_test(),
+                &signer,
+                fixture.context,
+                key,
+                source,
+                budget,
+                "configured",
+                &mut interrupted_sink,
+            )
+            .expect_err("the observer can fail after the final descriptor is published");
+        assert_eq!(initial_failure.code(), QueryFailureCode::InvalidBudget);
+        assert_eq!(interrupted_sink.writes, 1);
+
+        let tenant = fixture
+            .context
+            .tenant_attribution()
+            .ok_or("query context lacks tenant")?
+            .tenant_id();
+        let output = positron_kernel::ExportOutput::find_for_request(
+            fixture.kernel.catalog_for_test(),
+            tenant,
+            [0x7a; 16],
+            export_request_digest(fixture, "configured", source, budget)?,
+        )?
+        .ok_or("published final export output missing")?;
+        assert_eq!(output.batch_count(), 1);
+        assert!(
+            output
+                .read_manifest(fixture.kernel.catalog_for_test(), 100)?
+                .is_none(),
+            "the terminal descriptor precedes manifest signing and publication"
+        );
+        assert!(
+            output
+                .latest_checkpoint(fixture.kernel.catalog_for_test(), 100)?
+                .ok_or("final batch checkpoint missing")?
+                .continuation_cursor()
+                .is_none(),
+            "the final batch has no resumable cursor"
+        );
+        let original_binding = output.binding();
+        let audit_before_recovery = fixture
+            .kernel
+            .catalog_for_test()
+            .governance_audit_records()?
+            .len();
+        fixture.kernel.append_log("later", 21, 2)?;
+
+        let mut retry_sink = RecordingSink::default();
+        let receipt = service.export_pipeline_as_operation(
+            fixture.kernel.catalog_for_test(),
+            &signer,
+            fixture.context,
+            key,
+            source,
+            budget,
+            "configured",
+            &mut retry_sink,
+        )?;
+
+        assert_eq!(receipt.operation_id(), operation_id);
+        assert!(retry_sink.batches.is_empty(), "recovery must not re-export");
+        assert_eq!(receipt.manifest().batch_count(), 1);
+        assert_eq!(
+            receipt.manifest().snapshot().identity(),
+            original_binding.snapshot_identity()
+        );
+        assert_eq!(
+            receipt.manifest().snapshot().generation(),
+            original_binding.snapshot_generation()
+        );
+        assert_eq!(
+            receipt.manifest().terminal().stats().cumulative_budget(),
+            budget
+        );
+        assert_eq!(receipt.manifest().terminal().stats().resume_count(), 0);
+        assert_eq!(
+            output.batch_count(),
+            1,
+            "recovery must not duplicate batches"
+        );
+        assert_eq!(
+            fixture
+                .kernel
+                .catalog_for_test()
+                .governance_audit_records()?
+                .len(),
+            audit_before_recovery + 1,
+            "recovery must add one terminal audit transition"
+        );
+        assert_eq!(
+            positron_governance::DurableOperationAdministration::inspect(
+                fixture.kernel.catalog_for_test(),
+                operation_id,
+            )?
+            .ok_or("recovered operation missing")?
+            .status(),
+            positron_governance::DurableOperationStatus::Succeeded
+        );
         Ok(())
     })
 }

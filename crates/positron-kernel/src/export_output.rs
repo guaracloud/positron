@@ -12,13 +12,15 @@ use crate::{
     SnapshotLeaseId, TransactionId,
 };
 
-const DESCRIPTOR_MAGIC: [u8; 8] = *b"POSEXP03";
+const DESCRIPTOR_MAGIC: [u8; 8] = *b"POSEXP04";
+const LEGACY_DESCRIPTOR_MAGIC: [u8; 8] = *b"POSEXP03";
 const PAYLOAD_MAGIC: [u8; 8] = *b"POEXBAT1";
 const MANIFEST_MAGIC: [u8; 8] = *b"POEXMAN1";
 const EXPORT_DIRECTORY: &str = "exports";
 const PAYLOAD_NAME: &str = "payload";
 const INITIAL_CURSOR_NAME: &str = "initial";
 const MANIFEST_NAME: &str = "manifest";
+const TERMINAL_EVIDENCE_NAME: &str = "terminal";
 const MAX_EXPORT_BATCHES: u64 = 1_024;
 const MAX_EXPORT_BATCH_BYTES: usize = 1_048_576;
 // Query cursors have their own authenticated 8 KiB wire ceiling. A durable
@@ -34,10 +36,17 @@ const PAYLOAD_FIXED_BYTES: usize = 54;
 const INITIAL_CURSOR_FIXED_BYTES: usize = 170;
 const MANIFEST_FIXED_BYTES: usize = 12;
 const MAX_PROTECTED_MANIFEST_BYTES: usize = MAX_EXPORT_MANIFEST_BYTES + 512;
+/// Query owns this opaque terminal truth encoding.  Kernel bounds, protects,
+/// and binds it to the committed final output record without interpreting it.
+pub const MAX_EXPORT_TERMINAL_EVIDENCE_BYTES: usize = 256;
+const TERMINAL_EVIDENCE_MAGIC: [u8; 8] = *b"POEXTER1";
+const TERMINAL_EVIDENCE_FIXED_BYTES: usize = 12;
+const MAX_PROTECTED_TERMINAL_EVIDENCE_BYTES: usize = MAX_EXPORT_TERMINAL_EVIDENCE_BYTES + 512;
 const MAX_PROTECTED_INITIAL_CURSOR_BYTES: usize = MAX_CONTINUATION_CURSOR_BYTES + 512;
 const INITIAL_CURSOR_MAGIC: [u8; 8] = *b"POEXINI2";
 const EXPORT_OUTPUT_BINDING_BYTES: usize = 160;
-const DESCRIPTOR_BYTES: usize = 264;
+const DESCRIPTOR_BYTES: usize = 296;
+const LEGACY_DESCRIPTOR_BYTES: usize = 264;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExportOutputFailureCode {
@@ -314,6 +323,7 @@ pub struct ExportOutput {
     next_sequence: u64,
     retained_bytes: u64,
     last_digest: [u8; 32],
+    terminal_evidence_digest: [u8; 32],
     manifest_digest: [u8; 32],
 }
 
@@ -357,6 +367,7 @@ impl ExportOutput {
                     next_sequence: 0,
                     retained_bytes: 0,
                     last_digest: [0; 32],
+                    terminal_evidence_digest: [0; 32],
                     manifest_digest: [0; 32],
                 };
                 output.require_live(observed_at)?;
@@ -427,6 +438,7 @@ impl ExportOutput {
                     next_sequence: 0,
                     retained_bytes: 0,
                     last_digest: [0; 32],
+                    terminal_evidence_digest: [0; 32],
                     manifest_digest: [0; 32],
                 };
                 ensure_payload_file(catalog, identity, true)?;
@@ -472,6 +484,7 @@ impl ExportOutput {
                     next_sequence: 0,
                     retained_bytes: 0,
                     last_digest: [0; 32],
+                    terminal_evidence_digest: [0; 32],
                     manifest_digest: [0; 32],
                 };
                 match read_initial_preparation(catalog, identity)? {
@@ -546,6 +559,47 @@ impl ExportOutput {
         )
     }
 
+    /// Commits Query-owned terminal truth with the final Result Batch. The
+    /// evidence is opaque to Kernel, but the descriptor only publishes it with
+    /// the final batch it attests so crash recovery never has to infer a
+    /// terminal outcome from an absent cursor.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_terminal_batch_reserved(
+        &mut self,
+        catalog: &Catalog<'_>,
+        observed_at: u64,
+        sequence: u64,
+        digest: [u8; 32],
+        bytes: &[u8],
+        terminal_evidence: &[u8],
+        reservation: ExportOutputBatchReservation<'_>,
+    ) -> Result<ExportBatchReceipt, ExportOutputFailure> {
+        self.require_live(observed_at)?;
+        self.validate_batch(digest, bytes, None)?;
+        validate_terminal_evidence(terminal_evidence)?;
+        let required_payload_bytes = bytes
+            .len()
+            .checked_add(MAX_EXPORT_BATCH_BYTES)
+            .and_then(|value| value.checked_add(MAX_PROTECTED_RECORD_BYTES))
+            .and_then(|value| value.checked_add(MAX_PROTECTED_RECORD_BYTES))
+            .ok_or_else(|| fail(ExportOutputFailureCode::LimitExceeded))?;
+        if reservation.output_identity != self.identity
+            || reservation.tenant != self.binding.tenant
+            || reservation.payload_bytes < required_payload_bytes
+        {
+            return Err(fail(ExportOutputFailureCode::ResourceAdmissionRefused));
+        }
+        self.append_batch_with_reservation(
+            catalog,
+            sequence,
+            digest,
+            bytes,
+            None,
+            Some(terminal_evidence),
+            reservation,
+        )
+    }
+
     /// Reserves the bounded worst-case batch working set before Query
     /// serializes a canonical Result Batch.
     pub fn reserve_next_batch<'authority>(
@@ -608,6 +662,7 @@ impl ExportOutput {
             digest,
             bytes,
             continuation_cursor,
+            None,
             reservation,
         )
     }
@@ -620,6 +675,7 @@ impl ExportOutput {
         digest: [u8; 32],
         bytes: &[u8],
         continuation_cursor: Option<&[u8]>,
+        terminal_evidence: Option<&[u8]>,
         _reservation: ExportOutputBatchReservation<'_>,
     ) -> Result<ExportBatchReceipt, ExportOutputFailure> {
         let _operation = catalog
@@ -639,6 +695,7 @@ impl ExportOutput {
             return if existing.digest == digest
                 && existing.bytes == bytes
                 && existing.continuation_cursor.as_deref() == continuation_cursor
+                && terminal_evidence.is_none()
             {
                 Ok(ExportBatchReceipt { sequence, digest })
             } else {
@@ -657,6 +714,7 @@ impl ExportOutput {
             return if existing.digest == digest
                 && existing.bytes == bytes
                 && existing.continuation_cursor.as_deref() == continuation_cursor
+                && terminal_evidence.is_none()
             {
                 if sequence == self.next_sequence {
                     let mut successor = self.clone();
@@ -675,6 +733,15 @@ impl ExportOutput {
         }
         if sequence != count || sequence >= MAX_EXPORT_BATCHES {
             return Err(fail(ExportOutputFailureCode::IdempotencyConflict));
+        }
+        if terminal_evidence.is_some()
+            && (continuation_cursor.is_some() || self.terminal_evidence_digest != [0; 32])
+        {
+            return Err(fail(ExportOutputFailureCode::InvalidBinding));
+        }
+        let terminal_digest = terminal_evidence.map(digest_bytes);
+        if let Some(evidence) = terminal_evidence {
+            create_terminal_evidence_file(catalog, self.binding.tenant, self.identity, evidence)?;
         }
         let plaintext = encode_payload(sequence, digest, bytes, continuation_cursor)?;
         let protected = catalog
@@ -716,9 +783,50 @@ impl ExportOutput {
             .ok_or_else(|| fail(ExportOutputFailureCode::LimitExceeded))?;
         successor.retained_bytes = next_bytes;
         successor.last_digest = digest;
+        if let Some(terminal_digest) = terminal_digest {
+            successor.terminal_evidence_digest = terminal_digest;
+        }
         successor.publish(catalog)?;
         *self = successor;
         Ok(ExportBatchReceipt { sequence, digest })
+    }
+
+    /// Commits Query-owned terminal truth for an export that produced no
+    /// Result Batches. Its descriptor publication is the same authoritative
+    /// crash-recovery boundary as a terminal batch publication.
+    pub fn write_terminal_evidence(
+        &mut self,
+        catalog: &Catalog<'_>,
+        observed_at: u64,
+        terminal_evidence: &[u8],
+    ) -> Result<(), ExportOutputFailure> {
+        self.require_live(observed_at)?;
+        validate_terminal_evidence(terminal_evidence)?;
+        let _operation = catalog
+            .export_output_operation
+            .lock()
+            .map_err(|_| fail(ExportOutputFailureCode::ConcurrentWriter))?;
+        let digest = digest_bytes(terminal_evidence);
+        if self.terminal_evidence_digest != [0; 32] {
+            return if self.terminal_evidence_digest == digest
+                && read_terminal_evidence_unlocked(catalog, self)? == terminal_evidence
+            {
+                Ok(())
+            } else {
+                Err(fail(ExportOutputFailureCode::IdempotencyConflict))
+            };
+        }
+        create_terminal_evidence_file(
+            catalog,
+            self.binding.tenant,
+            self.identity,
+            terminal_evidence,
+        )?;
+        let mut successor = self.clone();
+        successor.terminal_evidence_digest = digest;
+        successor.publish(catalog)?;
+        *self = successor;
+        Ok(())
     }
     /// Atomically makes one bounded Query-owned terminal manifest durable.
     ///
@@ -789,6 +897,24 @@ impl ExportOutput {
             return Ok(None);
         }
         Ok(Some(read_manifest_unlocked(catalog, self)?))
+    }
+
+    /// Returns terminal truth only after the descriptor that binds its digest
+    /// has been durably published. An orphaned evidence file is never a result.
+    pub fn read_terminal_evidence(
+        &self,
+        catalog: &Catalog<'_>,
+        observed_at: u64,
+    ) -> Result<Option<Vec<u8>>, ExportOutputFailure> {
+        self.require_live(observed_at)?;
+        let _operation = catalog
+            .export_output_operation
+            .lock()
+            .map_err(|_| fail(ExportOutputFailureCode::ConcurrentWriter))?;
+        if self.terminal_evidence_digest == [0; 32] {
+            return Ok(None);
+        }
+        Ok(Some(read_terminal_evidence_unlocked(catalog, self)?))
     }
 
     /// Reads the authenticated original Query cursor retained before this
@@ -1433,6 +1559,120 @@ fn read_manifest_unlocked(
     }
     Ok(manifest)
 }
+
+fn create_terminal_evidence_file(
+    catalog: &Catalog<'_>,
+    tenant: TenantId,
+    identity: [u8; 16],
+    evidence: &[u8],
+) -> Result<(), ExportOutputFailure> {
+    validate_terminal_evidence(evidence)?;
+    if let Some(existing) = read_unpublished_terminal_evidence(catalog, identity)? {
+        return if existing == evidence {
+            Ok(())
+        } else {
+            Err(fail(ExportOutputFailureCode::IdempotencyConflict))
+        };
+    }
+    let plaintext = encode_terminal_evidence(evidence)?;
+    let protected = catalog
+        .protect_export_output(
+            terminal_evidence_identity(identity),
+            FormatEpoch::CATALOG_V2,
+            &plaintext,
+        )
+        .map_err(map_catalog_failure)?;
+    if protected.len() > MAX_PROTECTED_TERMINAL_EVIDENCE_BYTES {
+        return Err(fail(ExportOutputFailureCode::LimitExceeded));
+    }
+    let _capacity = catalog
+        .reserve_export_output(tenant, evidence.len(), protected.len())
+        .map_err(map_catalog_failure)?;
+    create_named_protected_file(catalog, identity, TERMINAL_EVIDENCE_NAME, &protected)
+}
+
+fn read_unpublished_terminal_evidence(
+    catalog: &Catalog<'_>,
+    identity: [u8; 16],
+) -> Result<Option<Vec<u8>>, ExportOutputFailure> {
+    let Some(protected) = read_named_protected_file(
+        catalog,
+        identity,
+        TERMINAL_EVIDENCE_NAME,
+        MAX_PROTECTED_TERMINAL_EVIDENCE_BYTES,
+    )?
+    else {
+        return Ok(None);
+    };
+    let plaintext = catalog
+        .open_export_output(
+            terminal_evidence_identity(identity),
+            FormatEpoch::CATALOG_V2,
+            &protected,
+        )
+        .map_err(map_catalog_failure)?;
+    Ok(Some(decode_terminal_evidence(&plaintext)?))
+}
+
+fn read_terminal_evidence_unlocked(
+    catalog: &Catalog<'_>,
+    output: &ExportOutput,
+) -> Result<Vec<u8>, ExportOutputFailure> {
+    let evidence = read_unpublished_terminal_evidence(catalog, output.identity)?
+        .ok_or_else(|| fail(ExportOutputFailureCode::IntegrityCorruption))?;
+    if digest_bytes(&evidence) != output.terminal_evidence_digest {
+        return Err(fail(ExportOutputFailureCode::IntegrityCorruption));
+    }
+    Ok(evidence)
+}
+
+fn validate_terminal_evidence(bytes: &[u8]) -> Result<(), ExportOutputFailure> {
+    if bytes.is_empty() || bytes.len() > MAX_EXPORT_TERMINAL_EVIDENCE_BYTES {
+        return Err(fail(ExportOutputFailureCode::LimitExceeded));
+    }
+    Ok(())
+}
+
+fn encode_terminal_evidence(bytes: &[u8]) -> Result<Vec<u8>, ExportOutputFailure> {
+    validate_terminal_evidence(bytes)?;
+    let mut payload = Vec::new();
+    payload
+        .try_reserve_exact(
+            TERMINAL_EVIDENCE_FIXED_BYTES
+                .checked_add(bytes.len())
+                .ok_or_else(|| fail(ExportOutputFailureCode::LimitExceeded))?,
+        )
+        .map_err(|_| fail(ExportOutputFailureCode::LimitExceeded))?;
+    payload.extend_from_slice(&TERMINAL_EVIDENCE_MAGIC);
+    payload.extend_from_slice(
+        &u32::try_from(bytes.len())
+            .map_err(|_| fail(ExportOutputFailureCode::LimitExceeded))?
+            .to_be_bytes(),
+    );
+    payload.extend_from_slice(bytes);
+    Ok(payload)
+}
+
+fn decode_terminal_evidence(bytes: &[u8]) -> Result<Vec<u8>, ExportOutputFailure> {
+    if bytes.len() < TERMINAL_EVIDENCE_FIXED_BYTES
+        || bytes.get(..8) != Some(TERMINAL_EVIDENCE_MAGIC.as_slice())
+    {
+        return Err(fail(ExportOutputFailureCode::IntegrityCorruption));
+    }
+    let length = usize::try_from(u32::from_be_bytes(
+        bytes[8..12]
+            .try_into()
+            .map_err(|_| fail(ExportOutputFailureCode::IntegrityCorruption))?,
+    ))
+    .map_err(|_| fail(ExportOutputFailureCode::LimitExceeded))?;
+    if length == 0
+        || length > MAX_EXPORT_TERMINAL_EVIDENCE_BYTES
+        || bytes.len() != TERMINAL_EVIDENCE_FIXED_BYTES.saturating_add(length)
+    {
+        return Err(fail(ExportOutputFailureCode::IntegrityCorruption));
+    }
+    Ok(bytes[TERMINAL_EVIDENCE_FIXED_BYTES..].to_vec())
+}
 fn encode_manifest(bytes: &[u8]) -> Result<Vec<u8>, ExportOutputFailure> {
     if bytes.is_empty() || bytes.len() > MAX_EXPORT_MANIFEST_BYTES {
         return Err(fail(ExportOutputFailureCode::LimitExceeded));
@@ -1635,14 +1875,24 @@ fn encode_descriptor(output: &ExportOutput) -> Result<Vec<u8>, ExportOutputFailu
     bytes.extend_from_slice(&output.next_sequence.to_be_bytes());
     bytes.extend_from_slice(&output.retained_bytes.to_be_bytes());
     bytes.extend_from_slice(&output.last_digest);
+    bytes.extend_from_slice(&output.terminal_evidence_digest);
     bytes.extend_from_slice(&output.manifest_digest);
     Ok(bytes)
 }
 fn decode_descriptor(bytes: &[u8]) -> Result<Option<ExportOutput>, ExportOutputFailure> {
-    if bytes.get(..8) != Some(DESCRIPTOR_MAGIC.as_slice()) {
+    let magic = bytes
+        .get(..8)
+        .ok_or_else(|| fail(ExportOutputFailureCode::IntegrityCorruption))?;
+    let legacy = magic == LEGACY_DESCRIPTOR_MAGIC;
+    if !legacy && magic != DESCRIPTOR_MAGIC {
         return Ok(None);
     }
-    if bytes.len() != DESCRIPTOR_BYTES {
+    let expected_bytes = if legacy {
+        LEGACY_DESCRIPTOR_BYTES
+    } else {
+        DESCRIPTOR_BYTES
+    };
+    if bytes.len() != expected_bytes {
         return Err(fail(ExportOutputFailureCode::IntegrityCorruption));
     }
     let mut identity = [0; 16];
@@ -1660,8 +1910,14 @@ fn decode_descriptor(bytes: &[u8]) -> Result<Option<ExportOutput>, ExportOutputF
     );
     let mut last = [0; 32];
     last.copy_from_slice(&bytes[200..232]);
+    let mut terminal_evidence_digest = [0; 32];
     let mut manifest_digest = [0; 32];
-    manifest_digest.copy_from_slice(&bytes[232..264]);
+    if legacy {
+        manifest_digest.copy_from_slice(&bytes[232..264]);
+    } else {
+        terminal_evidence_digest.copy_from_slice(&bytes[232..264]);
+        manifest_digest.copy_from_slice(&bytes[264..296]);
+    }
     if identity != output_identity(binding)
         || next > MAX_EXPORT_BATCHES
         || retained > MAX_EXPORT_BYTES
@@ -1676,6 +1932,7 @@ fn decode_descriptor(bytes: &[u8]) -> Result<Option<ExportOutput>, ExportOutputF
         next_sequence: next,
         retained_bytes: retained,
         last_digest: last,
+        terminal_evidence_digest,
         manifest_digest,
     }))
 }
@@ -1777,6 +2034,12 @@ fn manifest_identity(output: [u8; 16]) -> [u8; 32] {
     hash.update(output);
     hash.finalize().into()
 }
+fn terminal_evidence_identity(output: [u8; 16]) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(b"positron.export-output.terminal-evidence.v1\0");
+    hash.update(output);
+    hash.finalize().into()
+}
 fn initial_cursor_identity(output: [u8; 16]) -> [u8; 32] {
     let mut hash = Sha256::new();
     hash.update(b"positron.export-output.initial-cursor.v1\0");
@@ -1799,6 +2062,7 @@ fn transaction_identity(output: &ExportOutput, predecessor: [u8; 32]) -> [u8; 16
     hash.update(output.identity);
     hash.update(output.next_sequence.to_be_bytes());
     hash.update(output.last_digest);
+    hash.update(output.terminal_evidence_digest);
     hash.update(output.manifest_digest);
     hash.update(predecessor);
     let digest: [u8; 32] = hash.finalize().into();
