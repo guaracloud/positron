@@ -1353,7 +1353,7 @@ impl<'kernel, 'catalog, 'ledger> crate::QueryService<'kernel, 'catalog, 'ledger>
         {
             return Err(query_failure_from_durable(failure));
         }
-        let output = match positron_kernel::ExportOutput::recover_initial(
+        let mut output = match positron_kernel::ExportOutput::recover_initial(
             catalog,
             positron_kernel::ExportOutputRequest::new(
                 operation_id.to_bytes(),
@@ -1423,10 +1423,16 @@ impl<'kernel, 'catalog, 'ledger> crate::QueryService<'kernel, 'catalog, 'ledger>
                 destination_name,
             );
         }
-        if let Some(evidence) = output
-            .read_terminal_evidence(catalog, self.now()?)
-            .map_err(KernelExportSink::map_output_failure)?
-        {
+        let terminal_evidence = output
+            .recover_terminal_orphan(catalog, self.now()?)
+            .map_err(KernelExportSink::map_output_failure)?;
+        let terminal_evidence = match terminal_evidence {
+            Some(evidence) => Some(evidence),
+            None => output
+                .read_terminal_evidence(catalog, self.now()?)
+                .map_err(KernelExportSink::map_output_failure)?,
+        };
+        if let Some(evidence) = terminal_evidence {
             if !output_boundary_crossed {
                 return Err(QueryFailure::new(QueryFailureCode::MalformedPersistentData));
             }

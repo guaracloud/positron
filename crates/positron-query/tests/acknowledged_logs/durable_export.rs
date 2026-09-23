@@ -1357,6 +1357,209 @@ fn final_incomplete_batch_recovers_after_manifest_publication_failure_without_re
     })
 }
 
+fn recover_terminal_orphan_after_descriptor_crash(
+    label: &str,
+    key_byte: u8,
+    incomplete: bool,
+) -> Result<(), Box<dyn Error>> {
+    QueryFixture::scoped(label, |fixture| {
+        fixture.kernel.append_log("first", 20, 1)?;
+        let clock = TestClock::shared(100);
+        let service = zero_work_clock_service(
+            fixture.kernel.authority.governor(),
+            fixture.kernel.ledger()?,
+            1,
+            clock.clone(),
+        )
+        .with_export_destination_resolver(Arc::new(TestExportDestinationResolver));
+        let signer = fixture.export_manifest_signer()?;
+        let source = "logs | range query_time -100 100 | limit 1";
+        let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 16_384, 60)?;
+        let key = positron_governance::AdministrativeIdempotencyKey::new([key_byte; 16])?;
+        let generation = fixture.kernel.catalog_for_test().pin()?.number();
+        let operation_id = export_operation_id(
+            fixture,
+            "configured",
+            source,
+            budget,
+            generation,
+            key.to_bytes(),
+        )?;
+
+        let terminal_descriptor_preceding_commits = if incomplete { 7 } else { 6 };
+        let initial = positron_kernel::with_catalog_publication_fault_after(
+            positron_kernel::CatalogPublicationFault::SynchronizeCommit,
+            terminal_descriptor_preceding_commits,
+            || {
+                let mut sink = RecordingSink::default();
+                if incomplete {
+                    positron_query::with_cancellation_after_next_batch(|| {
+                        service.export_pipeline_as_operation(
+                            fixture.kernel.catalog_for_test(),
+                            &signer,
+                            fixture.context,
+                            key,
+                            source,
+                            budget,
+                            "configured",
+                            &mut sink,
+                        )
+                    })
+                } else {
+                    service.export_pipeline_as_operation(
+                        fixture.kernel.catalog_for_test(),
+                        &signer,
+                        fixture.context,
+                        key,
+                        source,
+                        budget,
+                        "configured",
+                        &mut sink,
+                    )
+                }
+            },
+        )
+        .expect_err("the terminal payload must survive a descriptor-publication crash");
+        assert_eq!(initial.code(), QueryFailureCode::StoreUnavailable);
+
+        let tenant = fixture
+            .context
+            .tenant_attribution()
+            .ok_or("query context lacks tenant")?
+            .tenant_id();
+        let output = positron_kernel::ExportOutput::find_for_request(
+            fixture.kernel.catalog_for_test(),
+            tenant,
+            [0x7a; 16],
+            export_request_digest(fixture, "configured", source, budget)?,
+        )?
+        .ok_or("initial export descriptor missing")?;
+        assert_eq!(
+            output.batch_count(),
+            0,
+            "final payload is not descriptor-bound"
+        );
+        assert!(
+            output
+                .read_terminal_evidence(fixture.kernel.catalog_for_test(), 100)?
+                .is_none(),
+            "the old descriptor cannot expose an orphan terminal result"
+        );
+        assert_eq!(
+            positron_governance::DurableOperationAdministration::inspect(
+                fixture.kernel.catalog_for_test(),
+                operation_id,
+            )?
+            .ok_or("interrupted operation missing")?
+            .phase(),
+            positron_governance::DurableOperationPhase::Draining,
+            "the terminal payload fault must follow the output boundary"
+        );
+        let original_binding = output.binding();
+        let audit_before_retry = fixture
+            .kernel
+            .catalog_for_test()
+            .governance_audit_records()?
+            .len();
+        fixture.kernel.reopen_ledger()?;
+        clock.set(101);
+        fixture.kernel.append_log("later", 21, 2)?;
+        let restarted = zero_work_clock_service(
+            fixture.kernel.authority.governor(),
+            fixture.kernel.ledger()?,
+            1,
+            clock,
+        )
+        .with_export_destination_resolver(Arc::new(TestExportDestinationResolver));
+        let mut retry_sink = RecordingSink::default();
+        let retry = restarted.export_pipeline_as_operation(
+            fixture.kernel.catalog_for_test(),
+            &signer,
+            fixture.context,
+            key,
+            source,
+            budget,
+            "configured",
+            &mut retry_sink,
+        );
+
+        let receipt = retry?;
+        assert_eq!(receipt.operation_id(), operation_id);
+        assert!(
+            retry_sink.batches.is_empty(),
+            "recovery must not replay output"
+        );
+        assert_eq!(receipt.manifest().batch_count(), 1);
+        assert_eq!(
+            receipt.manifest().snapshot().identity(),
+            original_binding.snapshot_identity()
+        );
+        assert_eq!(
+            receipt.manifest().snapshot().generation(),
+            original_binding.snapshot_generation()
+        );
+        assert_eq!(
+            receipt.manifest().terminal().stats().cumulative_budget(),
+            budget
+        );
+        assert_eq!(receipt.manifest().terminal().stats().resume_count(), 0);
+        assert!(
+            matches!(
+                receipt.manifest().terminal(),
+                positron_query::ExportTerminal::Incomplete(incomplete_terminal)
+                    if incomplete && incomplete_terminal.code() == QueryFailureCode::Cancelled
+            ) || matches!(
+                receipt.manifest().terminal(),
+                positron_query::ExportTerminal::Complete(_) if !incomplete
+            )
+        );
+        assert_eq!(
+            positron_kernel::ExportOutput::reopen(
+                fixture.kernel.catalog_for_test(),
+                output.identity(),
+            )?
+            .batch_count(),
+            1,
+            "recovery must not duplicate batches"
+        );
+        assert_eq!(
+            fixture
+                .kernel
+                .catalog_for_test()
+                .governance_audit_records()?
+                .len(),
+            audit_before_retry + 1,
+            "recovery publishes only its original terminal operation outcome"
+        );
+        let operation = positron_governance::DurableOperationAdministration::inspect(
+            fixture.kernel.catalog_for_test(),
+            operation_id,
+        )?
+        .ok_or("recovered operation missing")?;
+        assert_eq!(
+            operation.status(),
+            if incomplete {
+                positron_governance::DurableOperationStatus::Failed
+            } else {
+                positron_governance::DurableOperationStatus::Succeeded
+            }
+        );
+        Ok(())
+    })
+}
+
+#[test]
+fn complete_terminal_orphan_recovers_after_reopen_without_reexecution() -> Result<(), Box<dyn Error>>
+{
+    recover_terminal_orphan_after_descriptor_crash("durable-export-orphan-complete", 0x7e, false)
+}
+
+#[test]
+fn incomplete_terminal_orphan_recovers_after_reopen_without_reexecution()
+-> Result<(), Box<dyn Error>> {
+    recover_terminal_orphan_after_descriptor_crash("durable-export-orphan-incomplete", 0x7f, true)
+}
+
 #[test]
 fn kernel_owned_export_output_recovers_the_same_batch_receipts_after_restart()
 -> Result<(), Box<dyn Error>> {

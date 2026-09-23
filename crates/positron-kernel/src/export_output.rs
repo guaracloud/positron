@@ -695,7 +695,7 @@ impl ExportOutput {
             return if existing.digest == digest
                 && existing.bytes == bytes
                 && existing.continuation_cursor.as_deref() == continuation_cursor
-                && terminal_evidence.is_none()
+                && self.matches_terminal_replay(catalog, terminal_evidence)?
             {
                 Ok(ExportBatchReceipt { sequence, digest })
             } else {
@@ -714,7 +714,7 @@ impl ExportOutput {
             return if existing.digest == digest
                 && existing.bytes == bytes
                 && existing.continuation_cursor.as_deref() == continuation_cursor
-                && terminal_evidence.is_none()
+                && self.matches_terminal_orphan(catalog, terminal_evidence)?
             {
                 if sequence == self.next_sequence {
                     let mut successor = self.clone();
@@ -723,6 +723,9 @@ impl ExportOutput {
                         .ok_or_else(|| fail(ExportOutputFailureCode::LimitExceeded))?;
                     successor.retained_bytes = tail.length;
                     successor.last_digest = digest;
+                    if let Some(evidence) = terminal_evidence {
+                        successor.terminal_evidence_digest = digest_bytes(evidence);
+                    }
                     successor.publish(catalog)?;
                     *self = successor;
                 }
@@ -791,6 +794,38 @@ impl ExportOutput {
         Ok(ExportBatchReceipt { sequence, digest })
     }
 
+    fn matches_terminal_replay(
+        &self,
+        catalog: &Catalog<'_>,
+        terminal_evidence: Option<&[u8]>,
+    ) -> Result<bool, ExportOutputFailure> {
+        match terminal_evidence {
+            None => Ok(self.terminal_evidence_digest == [0; 32]),
+            Some(evidence) => {
+                if self.terminal_evidence_digest != digest_bytes(evidence) {
+                    return Ok(false);
+                }
+                Ok(read_terminal_evidence_unlocked(catalog, self)? == evidence)
+            },
+        }
+    }
+
+    fn matches_terminal_orphan(
+        &self,
+        catalog: &Catalog<'_>,
+        terminal_evidence: Option<&[u8]>,
+    ) -> Result<bool, ExportOutputFailure> {
+        if self.terminal_evidence_digest != [0; 32] {
+            return Err(fail(ExportOutputFailureCode::IntegrityCorruption));
+        }
+        match terminal_evidence {
+            Some(evidence) => Ok(read_unpublished_terminal_evidence(catalog, self.identity)?
+                .as_deref()
+                == Some(evidence)),
+            None => Ok(read_unpublished_terminal_evidence(catalog, self.identity)?.is_none()),
+        }
+    }
+
     /// Commits Query-owned terminal truth for an export that produced no
     /// Result Batches. Its descriptor publication is the same authoritative
     /// crash-recovery boundary as a terminal batch publication.
@@ -828,6 +863,48 @@ impl ExportOutput {
         *self = successor;
         Ok(())
     }
+
+    /// Promotes an authenticated terminal payload that reached stable storage
+    /// before its descriptor publication was interrupted. The Kernel verifies
+    /// the protected terminal artifact and final payload together, then makes
+    /// the original terminal truth descriptor-visible without asking Query to
+    /// reconstruct or re-execute it.
+    pub fn recover_terminal_orphan(
+        &mut self,
+        catalog: &Catalog<'_>,
+        observed_at: u64,
+    ) -> Result<Option<Vec<u8>>, ExportOutputFailure> {
+        self.require_live(observed_at)?;
+        let _operation = catalog
+            .export_output_operation
+            .lock()
+            .map_err(|_| fail(ExportOutputFailureCode::ConcurrentWriter))?;
+        if self.terminal_evidence_digest != [0; 32] {
+            return Ok(Some(read_terminal_evidence_unlocked(catalog, self)?));
+        }
+        let tail = inspect_payload_tail(catalog, self)?;
+        let Some(orphan) = tail.orphan else {
+            return Ok(None);
+        };
+        if orphan.continuation_cursor.is_some() {
+            return Ok(None);
+        }
+        let Some(evidence) = read_unpublished_terminal_evidence(catalog, self.identity)? else {
+            return Ok(None);
+        };
+        let mut successor = self.clone();
+        successor.next_sequence = successor
+            .next_sequence
+            .checked_add(1)
+            .ok_or_else(|| fail(ExportOutputFailureCode::LimitExceeded))?;
+        successor.retained_bytes = tail.length;
+        successor.last_digest = orphan.digest;
+        successor.terminal_evidence_digest = digest_bytes(&evidence);
+        successor.publish(catalog)?;
+        *self = successor;
+        Ok(Some(evidence))
+    }
+
     /// Atomically makes one bounded Query-owned terminal manifest durable.
     ///
     /// The manifest bytes are encrypted under this output identity. An exact

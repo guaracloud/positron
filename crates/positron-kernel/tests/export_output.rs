@@ -368,6 +368,153 @@ fn terminal_evidence_is_descriptor_bound_bounded_and_authenticated() -> Result<(
 }
 
 #[test]
+fn kernel_recovers_a_synced_terminal_orphan_without_query_replay() -> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish(volume)?;
+    let catalog = open_export_catalog(
+        &authority,
+        InstanceId::new([0xd9; 16])?,
+        CatalogSecret::from_owned(Box::new([0xda; 32]), Box::new([0xdb; 32])),
+    )?;
+    let binding = ExportOutputBinding::new(
+        TenantId::from_bytes([0x41; 16])?,
+        [0xdc; 16],
+        [0xdd; 32],
+        [0xde; 32],
+        7,
+        9,
+        SnapshotLeaseId::new([0xdf; 16])?,
+        100,
+        3_700,
+    )?;
+    let mut output = ExportOutput::create(&catalog, binding)?;
+    let terminal = b"durable-query-terminal";
+    let interrupted =
+        with_catalog_publication_fault_after(CatalogPublicationFault::SynchronizeCommit, 0, || {
+            let reservation = output.reserve_next_batch(&catalog)?;
+            output.append_terminal_batch_reserved(
+                &catalog,
+                101,
+                0,
+                [0xe0; 32],
+                b"canonical-final-batch",
+                terminal,
+                reservation,
+            )
+        });
+    assert!(matches!(
+        interrupted,
+        Err(error) if error.code() == positron_kernel::ExportOutputFailureCode::StorageUnavailable
+    ));
+    assert_eq!(output.batch_count(), 0);
+    assert!(
+        fs::metadata(payload_path(&root, output.identity()))?.len() > 0,
+        "the final payload must be synchronized before descriptor publication"
+    );
+    assert!(
+        fs::metadata(terminal_path(&root, output.identity()))?.len() > 0,
+        "the terminal artifact must be synchronized before descriptor publication"
+    );
+    assert!(output.read_terminal_evidence(&catalog, 101)?.is_none());
+
+    let recovered = output
+        .recover_terminal_orphan(&catalog, 101)?
+        .ok_or("authenticated terminal orphan must recover")?;
+    assert_eq!(recovered, terminal);
+    let receipt = output
+        .latest_receipt()
+        .ok_or("recovery must publish the final receipt")?;
+    assert_eq!(output.latest_receipt(), Some(receipt));
+    assert_eq!(
+        output.read_terminal_evidence(&catalog, 101)?.as_deref(),
+        Some(terminal as &[u8])
+    );
+    Ok(())
+}
+
+#[test]
+fn terminal_orphan_recovery_rejects_changed_or_tampered_evidence() -> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish(volume)?;
+    let catalog = open_export_catalog(
+        &authority,
+        InstanceId::new([0xe1; 16])?,
+        CatalogSecret::from_owned(Box::new([0xe2; 32]), Box::new([0xe3; 32])),
+    )?;
+    let binding = ExportOutputBinding::new(
+        TenantId::from_bytes([0x41; 16])?,
+        [0xe4; 16],
+        [0xe5; 32],
+        [0xe6; 32],
+        7,
+        9,
+        SnapshotLeaseId::new([0xe7; 16])?,
+        100,
+        3_700,
+    )?;
+    let mut output = ExportOutput::create(&catalog, binding)?;
+    let terminal = b"original-terminal-evidence";
+    let interrupted =
+        with_catalog_publication_fault_after(CatalogPublicationFault::SynchronizeCommit, 0, || {
+            let reservation = output.reserve_next_batch(&catalog)?;
+            output.append_terminal_batch_reserved(
+                &catalog,
+                101,
+                0,
+                [0xe8; 32],
+                b"canonical-final-batch",
+                terminal,
+                reservation,
+            )
+        });
+    assert!(interrupted.is_err());
+
+    let changed_reservation = output.reserve_next_batch(&catalog)?;
+    assert!(matches!(
+        output.append_terminal_batch_reserved(
+            &catalog,
+            101,
+            0,
+            [0xe8; 32],
+            b"canonical-final-batch",
+            b"changed-terminal-evidence",
+            changed_reservation,
+        ),
+        Err(error) if error.code() == positron_kernel::ExportOutputFailureCode::IdempotencyConflict
+    ));
+
+    let path = terminal_path(&root, output.identity());
+    let mut tampered = fs::read(&path)?;
+    let byte = tampered
+        .last_mut()
+        .ok_or("terminal evidence must contain authenticated bytes")?;
+    *byte ^= 0x01;
+    fs::write(path, tampered)?;
+    let reservation = output.reserve_next_batch(&catalog)?;
+    assert!(matches!(
+        output.append_terminal_batch_reserved(
+            &catalog,
+            101,
+            0,
+            [0xe8; 32],
+            b"canonical-final-batch",
+            terminal,
+            reservation,
+        ),
+        Err(error) if matches!(
+            error.code(),
+            positron_kernel::ExportOutputFailureCode::AuthenticationFailed
+                | positron_kernel::ExportOutputFailureCode::IntegrityCorruption
+                | positron_kernel::ExportOutputFailureCode::StorageUnavailable
+        )
+    ));
+    assert_eq!(output.batch_count(), 0);
+    Ok(())
+}
+
+#[test]
 fn initial_cursor_is_synced_before_descriptor_publication_and_recovered_by_exact_create_retry()
 -> Result<(), Box<dyn Error>> {
     let root = TemporaryRoot::new()?;
