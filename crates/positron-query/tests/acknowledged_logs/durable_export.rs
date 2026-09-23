@@ -245,6 +245,61 @@ fn incomplete_durable_export_reports_its_published_manifest_boundary() -> Result
             operation.irreversible_boundary(),
             positron_governance::DurableOperationBoundary::ExportManifestPublished
         );
+        let output_identity = receipt
+            .manifest()
+            .output_identity()
+            .ok_or("incomplete export output missing")?;
+        let audit_before_retry = fixture
+            .kernel
+            .catalog_for_test()
+            .governance_audit_records()?
+            .len();
+        let mut retry_sink = RecordingSink::default();
+        let retry = service.export_pipeline_as_operation(
+            fixture.kernel.catalog_for_test(),
+            &signer,
+            fixture.context,
+            key,
+            "logs | range query_time -100 100 | limit 2",
+            QueryBudget::new(1_048_576, 16, 16, 1_048_576, 16_384, 60)?,
+            "configured",
+            &mut retry_sink,
+        )?;
+        assert_eq!(retry.operation_id(), receipt.operation_id());
+        assert_eq!(
+            retry.manifest().destination(),
+            receipt.manifest().destination()
+        );
+        assert_eq!(
+            retry.manifest().output_identity(),
+            receipt.manifest().output_identity()
+        );
+        assert_eq!(
+            retry.manifest().request_digest(),
+            receipt.manifest().request_digest()
+        );
+        assert_eq!(retry.manifest().snapshot(), receipt.manifest().snapshot());
+        assert_eq!(retry.manifest().batches(), receipt.manifest().batches());
+        assert_eq!(retry.manifest().terminal(), receipt.manifest().terminal());
+        assert_eq!(retry.manifest().signature(), receipt.manifest().signature());
+        assert!(retry_sink.batches.is_empty());
+        assert_eq!(
+            positron_kernel::ExportOutput::reopen(
+                fixture.kernel.catalog_for_test(),
+                output_identity,
+            )?
+            .batch_count(),
+            u64::try_from(receipt.manifest().batch_count())?
+        );
+        assert_eq!(
+            fixture
+                .kernel
+                .catalog_for_test()
+                .governance_audit_records()?
+                .len(),
+            audit_before_retry,
+            "an exact terminal retry must resolve without a second execution audit"
+        );
         Ok(())
     })
 }
@@ -887,6 +942,112 @@ fn terminal_audit_publication_failure_is_reported_as_store_unavailable()
 }
 
 #[test]
+fn exact_retry_replays_a_pre_output_terminal_query_failure_after_restart()
+-> Result<(), Box<dyn Error>> {
+    QueryFixture::scoped("durable-export-pre-output-terminal-retry", |fixture| {
+        let service = fixture.service(1)?;
+        let signer = fixture.export_manifest_signer()?;
+        let source = "unrecognized pipeline syntax";
+        let budget = QueryBudget::new(1_048_576, 16, 16, 1_048_576, 16_384, 60)?;
+        let key = positron_governance::AdministrativeIdempotencyKey::new([0x4c; 16])?;
+        let generation = fixture.kernel.catalog_for_test().pin()?.number();
+        let operation_id = export_operation_id(
+            fixture,
+            "configured",
+            source,
+            budget,
+            generation,
+            key.to_bytes(),
+        )?;
+        let mut initial_sink = RecordingSink::default();
+
+        let initial = service
+            .export_pipeline_as_operation(
+                fixture.kernel.catalog_for_test(),
+                &signer,
+                fixture.context,
+                key,
+                source,
+                budget,
+                "configured",
+                &mut initial_sink,
+            )
+            .expect_err("an invalid query fails before protected output publication");
+        assert_eq!(initial.code(), QueryFailureCode::UnsupportedQuery);
+        assert!(initial_sink.batches.is_empty());
+
+        let tenant = fixture
+            .context
+            .tenant_attribution()
+            .ok_or("query context lacks tenant")?
+            .tenant_id();
+        let request_digest = export_request_digest(fixture, "configured", source, budget)?;
+        assert!(
+            positron_kernel::ExportOutput::find_for_request(
+                fixture.kernel.catalog_for_test(),
+                tenant,
+                [0x7a; 16],
+                request_digest,
+            )?
+            .is_none(),
+            "a pre-output terminal failure must not create protected export output"
+        );
+        let operation = positron_governance::DurableOperationAdministration::inspect(
+            fixture.kernel.catalog_for_test(),
+            operation_id,
+        )?
+        .ok_or("terminal operation missing")?;
+        assert_eq!(
+            operation.status(),
+            positron_governance::DurableOperationStatus::Failed
+        );
+        let terminal_failure = operation
+            .terminal_error()
+            .and_then(positron_governance::DurableOperationTerminalError::query_failure)
+            .ok_or("typed terminal Query failure missing")?;
+        assert_eq!(
+            terminal_failure.code(),
+            positron_governance::DurableQueryExportFailureCode::UnsupportedQuery
+        );
+        assert_eq!(terminal_failure.limiting_budget(), None);
+        let audit_before_retry = fixture
+            .kernel
+            .catalog_for_test()
+            .governance_audit_records()?
+            .len();
+
+        fixture.kernel.seal_and_reopen()?;
+        let restarted_service = fixture.service(1)?;
+        let mut retry_sink = RecordingSink::default();
+        let retry = restarted_service
+            .export_pipeline_as_operation(
+                fixture.kernel.catalog_for_test(),
+                &signer,
+                fixture.context,
+                key,
+                source,
+                budget,
+                "configured",
+                &mut retry_sink,
+            )
+            .expect_err("an exact retry must resolve the original terminal failure");
+
+        assert_eq!(retry, initial);
+        assert!(retry_sink.batches.is_empty());
+        assert_eq!(
+            fixture
+                .kernel
+                .catalog_for_test()
+                .governance_audit_records()?
+                .len(),
+            audit_before_retry,
+            "resolving the original terminal result must not add an execution audit"
+        );
+        Ok(())
+    })
+}
+
+#[test]
 fn final_complete_batch_recovers_after_manifest_publication_failure_without_replay()
 -> Result<(), Box<dyn Error>> {
     QueryFixture::scoped("durable-export-final-complete-recovery", |fixture| {
@@ -1135,6 +1296,62 @@ fn final_incomplete_batch_recovers_after_manifest_publication_failure_without_re
         assert_eq!(
             operation.irreversible_boundary(),
             positron_governance::DurableOperationBoundary::ExportManifestPublished
+        );
+        let audit_before_exact_retry = fixture
+            .kernel
+            .catalog_for_test()
+            .governance_audit_records()?
+            .len();
+        let mut exact_retry_sink = RecordingSink::default();
+        let exact_retry = service.export_pipeline_as_operation(
+            fixture.kernel.catalog_for_test(),
+            &signer,
+            fixture.context,
+            key,
+            source,
+            budget,
+            "configured",
+            &mut exact_retry_sink,
+        )?;
+        assert_eq!(exact_retry.operation_id(), operation_id);
+        assert_eq!(
+            exact_retry.manifest().destination(),
+            receipt.manifest().destination()
+        );
+        assert_eq!(
+            exact_retry.manifest().output_identity(),
+            receipt.manifest().output_identity()
+        );
+        assert_eq!(
+            exact_retry.manifest().request_digest(),
+            receipt.manifest().request_digest()
+        );
+        assert_eq!(
+            exact_retry.manifest().snapshot(),
+            receipt.manifest().snapshot()
+        );
+        assert_eq!(
+            exact_retry.manifest().batches(),
+            receipt.manifest().batches()
+        );
+        assert_eq!(
+            exact_retry.manifest().terminal(),
+            receipt.manifest().terminal()
+        );
+        assert_eq!(
+            exact_retry.manifest().signature(),
+            receipt.manifest().signature()
+        );
+        assert!(exact_retry_sink.batches.is_empty());
+        assert_eq!(output.batch_count(), 1);
+        assert_eq!(
+            fixture
+                .kernel
+                .catalog_for_test()
+                .governance_audit_records()?
+                .len(),
+            audit_before_exact_retry,
+            "a recovered terminal export must remain an exact durable result"
         );
         Ok(())
     })

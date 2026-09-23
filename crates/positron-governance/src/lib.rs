@@ -45,7 +45,9 @@ pub use durable_operation_administration::{
     DurableOperation, DurableOperationAdministration, DurableOperationBoundary,
     DurableOperationCancellation, DurableOperationFailure, DurableOperationKind,
     DurableOperationLookupRetention, DurableOperationPhase, DurableOperationRequest,
-    DurableOperationRetry, DurableOperationStatus, DurableOperationTerminalError, OperationId,
+    DurableOperationRetry, DurableOperationStatus, DurableOperationTerminalError,
+    DurableQueryBudgetDimension, DurableQueryExportFailure, DurableQueryExportFailureCode,
+    OperationId,
 };
 pub use format_migration_administration::{
     CatalogFormatMigration, CatalogFormatMigrationAdministration, CatalogFormatMigrationFailure,

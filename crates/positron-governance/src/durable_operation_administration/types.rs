@@ -519,22 +519,223 @@ pub enum DurableOperationLookupRetention {
 pub enum DurableOperationTerminalError {
     HandlerRejected,
     LegacyUnknown,
+    QueryFailure(DurableQueryExportFailure),
 }
 
 impl DurableOperationTerminalError {
-    pub(super) const fn code(self) -> u8 {
+    pub(super) const fn encoded(self) -> (u8, u8) {
         match self {
-            Self::HandlerRejected => 1,
-            Self::LegacyUnknown => 2,
+            Self::HandlerRejected => (1, 0),
+            Self::LegacyUnknown => (2, 0),
+            Self::QueryFailure(failure) => {
+                (failure.code.code() + 2, failure.limiting_budget.code())
+            },
         }
     }
 
-    pub(super) fn from_code(code: u8) -> Result<Self, DurableOperationFailure> {
+    pub(super) fn from_encoded(code: u8, detail: u8) -> Result<Self, DurableOperationFailure> {
         match code {
-            1 => Ok(Self::HandlerRejected),
-            2 => Ok(Self::LegacyUnknown),
+            1 if detail == 0 => Ok(Self::HandlerRejected),
+            2 if detail == 0 => Ok(Self::LegacyUnknown),
+            3..=16 => Ok(Self::QueryFailure(DurableQueryExportFailure::from_encoded(
+                code - 2,
+                detail,
+            )?)),
             _ => Err(DurableOperationFailure::PersistenceUnavailable),
         }
+    }
+
+    #[must_use]
+    pub const fn query_failure(self) -> Option<DurableQueryExportFailure> {
+        match self {
+            Self::QueryFailure(failure) => Some(failure),
+            Self::HandlerRejected | Self::LegacyUnknown => None,
+        }
+    }
+
+    fn is_valid_for(self, kind: DurableOperationKind) -> bool {
+        match self {
+            Self::HandlerRejected | Self::LegacyUnknown => true,
+            Self::QueryFailure(failure) => {
+                kind == DurableOperationKind::QueryExport && failure.is_valid()
+            },
+        }
+    }
+}
+
+/// The durable, bounded public Query failure outcome retained for an exact
+/// Query-export retry that terminated before a signed manifest exists.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DurableQueryExportFailure {
+    code: DurableQueryExportFailureCode,
+    limiting_budget: DurableQueryBudgetDimension,
+}
+
+impl DurableQueryExportFailure {
+    #[must_use]
+    pub const fn new(
+        code: DurableQueryExportFailureCode,
+        limiting_budget: Option<DurableQueryBudgetDimension>,
+    ) -> Self {
+        Self {
+            code,
+            limiting_budget: DurableQueryBudgetDimension::from_option(limiting_budget),
+        }
+    }
+
+    fn from_encoded(code: u8, dimension: u8) -> Result<Self, DurableOperationFailure> {
+        let code = DurableQueryExportFailureCode::from_code(code)?;
+        let limiting_budget = DurableQueryBudgetDimension::from_code(dimension)?;
+        if !limiting_budget.is_allowed_for(code) {
+            return Err(DurableOperationFailure::PersistenceUnavailable);
+        }
+        Ok(Self {
+            code,
+            limiting_budget,
+        })
+    }
+
+    #[must_use]
+    pub const fn code(self) -> DurableQueryExportFailureCode {
+        self.code
+    }
+
+    #[must_use]
+    pub const fn limiting_budget(self) -> Option<DurableQueryBudgetDimension> {
+        self.limiting_budget.into_option()
+    }
+
+    const fn is_valid(self) -> bool {
+        self.limiting_budget.is_allowed_for(self.code)
+    }
+}
+
+/// Stable codes for terminal Query-export outcomes held by a Durable Operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DurableQueryExportFailureCode {
+    Unauthorized,
+    IdempotencyConflict,
+    InvalidBudget,
+    BudgetExhausted,
+    InvalidCursor,
+    SnapshotExpired,
+    AuthorizationChanged,
+    Cancelled,
+    ResourceAdmissionRefused,
+    ResourceExhausted,
+    UnsupportedQuery,
+    StoreUnavailable,
+    MalformedPersistentData,
+    Internal,
+}
+
+impl DurableQueryExportFailureCode {
+    const fn code(self) -> u8 {
+        match self {
+            Self::Unauthorized => 1,
+            Self::IdempotencyConflict => 2,
+            Self::InvalidBudget => 3,
+            Self::BudgetExhausted => 4,
+            Self::InvalidCursor => 5,
+            Self::SnapshotExpired => 6,
+            Self::AuthorizationChanged => 7,
+            Self::Cancelled => 8,
+            Self::ResourceAdmissionRefused => 9,
+            Self::ResourceExhausted => 10,
+            Self::UnsupportedQuery => 11,
+            Self::StoreUnavailable => 12,
+            Self::MalformedPersistentData => 13,
+            Self::Internal => 14,
+        }
+    }
+
+    fn from_code(code: u8) -> Result<Self, DurableOperationFailure> {
+        match code {
+            1 => Ok(Self::Unauthorized),
+            2 => Ok(Self::IdempotencyConflict),
+            3 => Ok(Self::InvalidBudget),
+            4 => Ok(Self::BudgetExhausted),
+            5 => Ok(Self::InvalidCursor),
+            6 => Ok(Self::SnapshotExpired),
+            7 => Ok(Self::AuthorizationChanged),
+            8 => Ok(Self::Cancelled),
+            9 => Ok(Self::ResourceAdmissionRefused),
+            10 => Ok(Self::ResourceExhausted),
+            11 => Ok(Self::UnsupportedQuery),
+            12 => Ok(Self::StoreUnavailable),
+            13 => Ok(Self::MalformedPersistentData),
+            14 => Ok(Self::Internal),
+            _ => Err(DurableOperationFailure::PersistenceUnavailable),
+        }
+    }
+}
+
+/// A bounded query budget dimension retained only when it qualified the
+/// original terminal Query failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DurableQueryBudgetDimension {
+    None,
+    ScannedBytes,
+    DecodedRecords,
+    OutputRows,
+    OutputBytes,
+    MemoryBytes,
+    CpuWorkUnits,
+    WallSeconds,
+    MaximumTimeRangeNanoseconds,
+}
+
+impl DurableQueryBudgetDimension {
+    const fn from_option(value: Option<Self>) -> Self {
+        match value {
+            Some(value) => value,
+            None => Self::None,
+        }
+    }
+
+    const fn into_option(self) -> Option<Self> {
+        match self {
+            Self::None => None,
+            value => Some(value),
+        }
+    }
+
+    const fn code(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::ScannedBytes => 1,
+            Self::DecodedRecords => 2,
+            Self::OutputRows => 3,
+            Self::OutputBytes => 4,
+            Self::MemoryBytes => 5,
+            Self::CpuWorkUnits => 6,
+            Self::WallSeconds => 7,
+            Self::MaximumTimeRangeNanoseconds => 8,
+        }
+    }
+
+    fn from_code(code: u8) -> Result<Self, DurableOperationFailure> {
+        match code {
+            0 => Ok(Self::None),
+            1 => Ok(Self::ScannedBytes),
+            2 => Ok(Self::DecodedRecords),
+            3 => Ok(Self::OutputRows),
+            4 => Ok(Self::OutputBytes),
+            5 => Ok(Self::MemoryBytes),
+            6 => Ok(Self::CpuWorkUnits),
+            7 => Ok(Self::WallSeconds),
+            8 => Ok(Self::MaximumTimeRangeNanoseconds),
+            _ => Err(DurableOperationFailure::PersistenceUnavailable),
+        }
+    }
+
+    const fn is_allowed_for(self, code: DurableQueryExportFailureCode) -> bool {
+        matches!(self, Self::None)
+            || matches!(
+                code,
+                DurableQueryExportFailureCode::InvalidBudget
+                    | DurableQueryExportFailureCode::BudgetExhausted
+            )
     }
 }
 
@@ -775,7 +976,10 @@ impl DurableOperation {
         now: u64,
         error: DurableOperationTerminalError,
     ) -> Result<Self, DurableOperationFailure> {
-        if self.status != DurableOperationStatus::Running || now < self.updated_at_unix_seconds {
+        if self.status != DurableOperationStatus::Running
+            || now < self.updated_at_unix_seconds
+            || !error.is_valid_for(self.request.kind)
+        {
             return Err(DurableOperationFailure::InvalidState);
         }
         self.status = DurableOperationStatus::Failed;
@@ -801,6 +1005,7 @@ impl DurableOperation {
         if self.status != DurableOperationStatus::Running
             || self.request.kind != DurableOperationKind::QueryExport
             || now < self.updated_at_unix_seconds
+            || !error.is_valid_for(self.request.kind)
         {
             return Err(DurableOperationFailure::InvalidState);
         }
@@ -824,6 +1029,12 @@ impl DurableOperation {
         if !self.request.is_valid_persisted_request()
             || self.updated_at_unix_seconds < self.request.accepted_at_unix_seconds
             || self.revision == 0
+        {
+            return false;
+        }
+        if self
+            .terminal_error
+            .is_some_and(|error| !error.is_valid_for(self.request.kind))
         {
             return false;
         }

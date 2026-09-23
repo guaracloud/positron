@@ -688,6 +688,10 @@ locates that output through the accepted operation, reauthenticates the current
 Query context, and resumes the original Query Snapshot and budget; it never
 starts a replacement query. The terminal manifest is signed with the
 Instance Integrity Key and published before the operation becomes terminal.
+If Query fails before protected output exists, Administration retains the
+bounded typed Query failure in that same authenticated Durable Operation so an
+exact, still-authorized retry returns the original failure without admission or
+execution; historical operation records retain their legacy terminal reason.
 
 ### 4.11 Storage Kernel
 

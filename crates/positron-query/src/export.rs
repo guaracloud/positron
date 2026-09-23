@@ -787,6 +787,126 @@ fn map_operation_failure(failure: positron_governance::DurableOperationFailure) 
     QueryFailure::new(code)
 }
 
+fn durable_query_failure(
+    failure: &QueryFailure,
+) -> positron_governance::DurableOperationTerminalError {
+    use positron_governance::{
+        DurableOperationTerminalError, DurableQueryBudgetDimension, DurableQueryExportFailure,
+        DurableQueryExportFailureCode,
+    };
+
+    let code = match failure.code() {
+        QueryFailureCode::Unauthorized => DurableQueryExportFailureCode::Unauthorized,
+        QueryFailureCode::IdempotencyConflict => DurableQueryExportFailureCode::IdempotencyConflict,
+        QueryFailureCode::InvalidBudget => DurableQueryExportFailureCode::InvalidBudget,
+        QueryFailureCode::BudgetExhausted => DurableQueryExportFailureCode::BudgetExhausted,
+        QueryFailureCode::InvalidCursor => DurableQueryExportFailureCode::InvalidCursor,
+        QueryFailureCode::SnapshotExpired => DurableQueryExportFailureCode::SnapshotExpired,
+        QueryFailureCode::AuthorizationChanged => {
+            DurableQueryExportFailureCode::AuthorizationChanged
+        },
+        QueryFailureCode::Cancelled => DurableQueryExportFailureCode::Cancelled,
+        QueryFailureCode::ResourceAdmissionRefused => {
+            DurableQueryExportFailureCode::ResourceAdmissionRefused
+        },
+        QueryFailureCode::ResourceExhausted => DurableQueryExportFailureCode::ResourceExhausted,
+        QueryFailureCode::UnsupportedQuery => DurableQueryExportFailureCode::UnsupportedQuery,
+        QueryFailureCode::StoreUnavailable => DurableQueryExportFailureCode::StoreUnavailable,
+        QueryFailureCode::MalformedPersistentData => {
+            DurableQueryExportFailureCode::MalformedPersistentData
+        },
+        QueryFailureCode::Internal => DurableQueryExportFailureCode::Internal,
+    };
+    let limiting_budget = match failure.limiting_budget() {
+        Some(crate::QueryBudgetDimension::ScannedBytes) => {
+            Some(DurableQueryBudgetDimension::ScannedBytes)
+        },
+        Some(crate::QueryBudgetDimension::DecodedRecords) => {
+            Some(DurableQueryBudgetDimension::DecodedRecords)
+        },
+        Some(crate::QueryBudgetDimension::OutputRows) => {
+            Some(DurableQueryBudgetDimension::OutputRows)
+        },
+        Some(crate::QueryBudgetDimension::OutputBytes) => {
+            Some(DurableQueryBudgetDimension::OutputBytes)
+        },
+        Some(crate::QueryBudgetDimension::MemoryBytes) => {
+            Some(DurableQueryBudgetDimension::MemoryBytes)
+        },
+        Some(crate::QueryBudgetDimension::CpuWorkUnits) => {
+            Some(DurableQueryBudgetDimension::CpuWorkUnits)
+        },
+        Some(crate::QueryBudgetDimension::WallSeconds) => {
+            Some(DurableQueryBudgetDimension::WallSeconds)
+        },
+        Some(crate::QueryBudgetDimension::MaximumTimeRangeNanoseconds) => {
+            Some(DurableQueryBudgetDimension::MaximumTimeRangeNanoseconds)
+        },
+        None => None,
+    };
+    DurableOperationTerminalError::QueryFailure(DurableQueryExportFailure::new(
+        code,
+        limiting_budget,
+    ))
+}
+
+fn query_failure_from_durable(
+    failure: positron_governance::DurableQueryExportFailure,
+) -> QueryFailure {
+    use positron_governance::{DurableQueryBudgetDimension, DurableQueryExportFailureCode};
+
+    let code = match failure.code() {
+        DurableQueryExportFailureCode::Unauthorized => QueryFailureCode::Unauthorized,
+        DurableQueryExportFailureCode::IdempotencyConflict => QueryFailureCode::IdempotencyConflict,
+        DurableQueryExportFailureCode::InvalidBudget => QueryFailureCode::InvalidBudget,
+        DurableQueryExportFailureCode::BudgetExhausted => QueryFailureCode::BudgetExhausted,
+        DurableQueryExportFailureCode::InvalidCursor => QueryFailureCode::InvalidCursor,
+        DurableQueryExportFailureCode::SnapshotExpired => QueryFailureCode::SnapshotExpired,
+        DurableQueryExportFailureCode::AuthorizationChanged => {
+            QueryFailureCode::AuthorizationChanged
+        },
+        DurableQueryExportFailureCode::Cancelled => QueryFailureCode::Cancelled,
+        DurableQueryExportFailureCode::ResourceAdmissionRefused => {
+            QueryFailureCode::ResourceAdmissionRefused
+        },
+        DurableQueryExportFailureCode::ResourceExhausted => QueryFailureCode::ResourceExhausted,
+        DurableQueryExportFailureCode::UnsupportedQuery => QueryFailureCode::UnsupportedQuery,
+        DurableQueryExportFailureCode::StoreUnavailable => QueryFailureCode::StoreUnavailable,
+        DurableQueryExportFailureCode::MalformedPersistentData => {
+            QueryFailureCode::MalformedPersistentData
+        },
+        DurableQueryExportFailureCode::Internal => QueryFailureCode::Internal,
+    };
+    match failure.limiting_budget() {
+        Some(DurableQueryBudgetDimension::ScannedBytes) => {
+            QueryFailure::for_budget(code, crate::QueryBudgetDimension::ScannedBytes)
+        },
+        Some(DurableQueryBudgetDimension::DecodedRecords) => {
+            QueryFailure::for_budget(code, crate::QueryBudgetDimension::DecodedRecords)
+        },
+        Some(DurableQueryBudgetDimension::OutputRows) => {
+            QueryFailure::for_budget(code, crate::QueryBudgetDimension::OutputRows)
+        },
+        Some(DurableQueryBudgetDimension::OutputBytes) => {
+            QueryFailure::for_budget(code, crate::QueryBudgetDimension::OutputBytes)
+        },
+        Some(DurableQueryBudgetDimension::MemoryBytes) => {
+            QueryFailure::for_budget(code, crate::QueryBudgetDimension::MemoryBytes)
+        },
+        Some(DurableQueryBudgetDimension::CpuWorkUnits) => {
+            QueryFailure::for_budget(code, crate::QueryBudgetDimension::CpuWorkUnits)
+        },
+        Some(DurableQueryBudgetDimension::WallSeconds) => {
+            QueryFailure::for_budget(code, crate::QueryBudgetDimension::WallSeconds)
+        },
+        Some(DurableQueryBudgetDimension::MaximumTimeRangeNanoseconds) => QueryFailure::for_budget(
+            code,
+            crate::QueryBudgetDimension::MaximumTimeRangeNanoseconds,
+        ),
+        Some(DurableQueryBudgetDimension::None) | None => QueryFailure::new(code),
+    }
+}
+
 impl<'kernel, 'catalog, 'ledger> crate::QueryService<'kernel, 'catalog, 'ledger> {
     /// Runs an export beneath the Catalog-backed Durable Operation lifecycle.
     ///
@@ -891,6 +1011,23 @@ impl<'kernel, 'catalog, 'ledger> crate::QueryService<'kernel, 'catalog, 'ledger>
         let recovered_output =
             positron_kernel::ExportOutput::recover_initial(catalog, output_request, self.now()?)
                 .map_err(KernelExportSink::map_output_failure)?;
+        if accepted.status() == positron_governance::DurableOperationStatus::Failed {
+            if let Some(failure) = accepted
+                .terminal_error()
+                .and_then(positron_governance::DurableOperationTerminalError::query_failure)
+            {
+                return Err(query_failure_from_durable(failure));
+            }
+            let output =
+                recovered_output.ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
+            return self.resolve_durable_export(
+                catalog,
+                context,
+                operation_id,
+                output.identity(),
+                destination_name,
+            );
+        }
         if accepted.status() == positron_governance::DurableOperationStatus::Succeeded {
             let output = recovered_output
                 .ok_or_else(|| QueryFailure::new(QueryFailureCode::StoreUnavailable))?;
@@ -946,7 +1083,7 @@ impl<'kernel, 'catalog, 'ledger> crate::QueryService<'kernel, 'catalog, 'ledger>
                     context,
                     operation_id,
                     self.now()?,
-                    positron_governance::DurableOperationTerminalError::HandlerRejected,
+                    durable_query_failure(&failure),
                 )
                 .map_err(map_operation_failure)?;
                 return Err(failure);
@@ -1184,20 +1321,21 @@ impl<'kernel, 'catalog, 'ledger> crate::QueryService<'kernel, 'catalog, 'ledger>
         let tenant = match self.validate_current_query_context(context) {
             Ok(tenant) => tenant,
             Err(failure) => {
+                let terminal_failure = match failure.code() {
+                    QueryFailureCode::StoreUnavailable => failure,
+                    _ => QueryFailure::new(QueryFailureCode::AuthorizationChanged),
+                };
                 if operation.status() == positron_governance::DurableOperationStatus::Running {
                     positron_governance::DurableOperationAdministration::fail_query_export(
                         catalog,
                         context,
                         operation_id,
                         self.now()?,
-                        positron_governance::DurableOperationTerminalError::HandlerRejected,
+                        durable_query_failure(&terminal_failure),
                     )
                     .map_err(|_| QueryFailure::new(QueryFailureCode::StoreUnavailable))?;
                 }
-                return Err(match failure.code() {
-                    QueryFailureCode::StoreUnavailable => failure,
-                    _ => QueryFailure::new(QueryFailureCode::AuthorizationChanged),
-                });
+                return Err(terminal_failure);
             },
         };
         let destination = self.resolve_export_destination_for_tenant(tenant, destination_name)?;
@@ -1207,6 +1345,13 @@ impl<'kernel, 'catalog, 'ledger> crate::QueryService<'kernel, 'catalog, 'ledger>
             || operation.request().query_export_request_digest() != Some(request_digest)
         {
             return Err(QueryFailure::new(QueryFailureCode::Unauthorized));
+        }
+        if operation.status() == positron_governance::DurableOperationStatus::Failed
+            && let Some(failure) = operation
+                .terminal_error()
+                .and_then(positron_governance::DurableOperationTerminalError::query_failure)
+        {
+            return Err(query_failure_from_durable(failure));
         }
         let output = match positron_kernel::ExportOutput::recover_initial(
             catalog,
@@ -1222,6 +1367,7 @@ impl<'kernel, 'catalog, 'ledger> crate::QueryService<'kernel, 'catalog, 'ledger>
             Ok(Some(output)) => output,
             Ok(None) => return Err(QueryFailure::new(QueryFailureCode::StoreUnavailable)),
             Err(error) => {
+                let failure = KernelExportSink::map_output_failure(error);
                 if error.code() == positron_kernel::ExportOutputFailureCode::Expired
                     && operation.status() == positron_governance::DurableOperationStatus::Running
                 {
@@ -1230,11 +1376,11 @@ impl<'kernel, 'catalog, 'ledger> crate::QueryService<'kernel, 'catalog, 'ledger>
                         context,
                         operation_id,
                         self.now()?,
-                        positron_governance::DurableOperationTerminalError::HandlerRejected,
+                        durable_query_failure(&failure),
                     )
                     .map_err(|_| QueryFailure::new(QueryFailureCode::StoreUnavailable))?;
                 }
-                return Err(KernelExportSink::map_output_failure(error));
+                return Err(failure);
             },
         };
         let binding = output.binding();
@@ -1252,6 +1398,7 @@ impl<'kernel, 'catalog, 'ledger> crate::QueryService<'kernel, 'catalog, 'ledger>
         let manifest = match output.read_manifest(catalog, self.now()?) {
             Ok(manifest) => manifest,
             Err(error) => {
+                let failure = KernelExportSink::map_output_failure(error);
                 if error.code() == positron_kernel::ExportOutputFailureCode::Expired
                     && operation.status() == positron_governance::DurableOperationStatus::Running
                 {
@@ -1260,11 +1407,11 @@ impl<'kernel, 'catalog, 'ledger> crate::QueryService<'kernel, 'catalog, 'ledger>
                         context,
                         operation_id,
                         self.now()?,
-                        positron_governance::DurableOperationTerminalError::HandlerRejected,
+                        durable_query_failure(&failure),
                     )
                     .map_err(|_| QueryFailure::new(QueryFailureCode::StoreUnavailable))?;
                 }
-                return Err(KernelExportSink::map_output_failure(error));
+                return Err(failure);
             },
         };
         if manifest.is_some() {
@@ -1408,7 +1555,7 @@ impl<'kernel, 'catalog, 'ledger> crate::QueryService<'kernel, 'catalog, 'ledger>
                         context,
                         operation_id,
                         self.now()?,
-                        positron_governance::DurableOperationTerminalError::HandlerRejected,
+                        durable_query_failure(&failure),
                     )
                     .map_err(map_operation_failure)?;
                 }

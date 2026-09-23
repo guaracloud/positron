@@ -11,7 +11,8 @@ use crate::AdministrativeIdempotencyKey;
 
 const OPERATION_MAGIC_V1: [u8; 8] = *b"POSOPR01";
 const OPERATION_MAGIC_V2: [u8; 8] = *b"POSOPR02";
-const OPERATION_MAGIC: [u8; 8] = *b"POSOPR03";
+const OPERATION_MAGIC_V3: [u8; 8] = *b"POSOPR03";
+const OPERATION_MAGIC: [u8; 8] = *b"POSOPR04";
 const EXPIRED_OPERATION_BINDING_MAGIC_V1: [u8; 8] = *b"POSOPX01";
 const EXPIRED_OPERATION_BINDING_MAGIC_V2: [u8; 8] = *b"POSOPX02";
 const EXPIRED_OPERATION_BINDING_MAGIC: [u8; 8] = *b"POSOPX03";
@@ -46,11 +47,11 @@ pub(super) fn encode_operation(operation: DurableOperation) -> Vec<u8> {
     encoded.push(operation.retry.code());
     encoded.push(operation.cancellation.code());
     encoded.push(operation.boundary.code());
-    encoded.push(
-        operation
-            .terminal_error
-            .map_or(0, DurableOperationTerminalError::code),
-    );
+    let (terminal_error, terminal_detail) = operation
+        .terminal_error
+        .map_or((0, 0), DurableOperationTerminalError::encoded);
+    encoded.push(terminal_error);
+    encoded.push(terminal_detail);
     encoded.extend_from_slice(&operation.updated_at_unix_seconds.to_be_bytes());
     encoded.extend_from_slice(
         &operation
@@ -164,13 +165,16 @@ pub(super) fn decode_expired_binding(
 pub(super) fn decode_operation(
     encoded: &[u8],
 ) -> Result<Option<DurableOperation>, DurableOperationFailure> {
-    let v3 = encoded.starts_with(&OPERATION_MAGIC);
+    let v4 = encoded.starts_with(&OPERATION_MAGIC);
+    let v3 = encoded.starts_with(&OPERATION_MAGIC_V3);
     let v2 = encoded.starts_with(&OPERATION_MAGIC_V2);
-    if !v3 && !v2 && !encoded.starts_with(&OPERATION_MAGIC_V1) {
+    if !v4 && !v3 && !v2 && !encoded.starts_with(&OPERATION_MAGIC_V1) {
         return Ok(None);
     }
     if encoded.len()
-        != if v3 {
+        != if v4 {
+            218
+        } else if v3 {
             217
         } else if v2 {
             201
@@ -189,7 +193,7 @@ pub(super) fn decode_operation(
     let kind = DurableOperationKind::from_code(take_byte(encoded, &mut offset)?)?;
     let target = take_array(encoded, &mut offset)?;
     let target_identity = (!target.iter().all(|byte| *byte == 0)).then_some(target);
-    let applicable_tenant = if v3 {
+    let applicable_tenant = if v3 || v4 {
         let tenant = take_array::<16>(encoded, &mut offset)?;
         (!tenant.iter().all(|byte| *byte == 0))
             .then(|| TenantId::from_bytes(tenant))
@@ -200,7 +204,7 @@ pub(super) fn decode_operation(
     };
     let accepted_generation = take_u64(encoded, &mut offset)?;
     let accepted_at_unix_seconds = take_u64(encoded, &mut offset)?;
-    let query_export_request_digest = if v2 || v3 {
+    let query_export_request_digest = if v2 || v3 || v4 {
         let digest = take_array(encoded, &mut offset)?;
         (!digest.iter().all(|byte| *byte == 0)).then_some(digest)
     } else {
@@ -233,9 +237,18 @@ pub(super) fn decode_operation(
     let retry = DurableOperationRetry::from_code(take_byte(encoded, &mut offset)?)?;
     let cancellation = DurableOperationCancellation::from_code(take_byte(encoded, &mut offset)?)?;
     let boundary = DurableOperationBoundary::from_code(take_byte(encoded, &mut offset)?)?;
-    let terminal_error = match take_byte(encoded, &mut offset)? {
+    let terminal_error_code = take_byte(encoded, &mut offset)?;
+    let terminal_error_detail = if v4 {
+        take_byte(encoded, &mut offset)?
+    } else {
+        0
+    };
+    let terminal_error = match terminal_error_code {
         0 => None,
-        code => Some(DurableOperationTerminalError::from_code(code)?),
+        code => Some(DurableOperationTerminalError::from_encoded(
+            code,
+            terminal_error_detail,
+        )?),
     };
     let updated_at_unix_seconds = take_u64(encoded, &mut offset)?;
     let completed = take_u64(encoded, &mut offset)?;
@@ -374,16 +387,21 @@ impl ExpiredOperationBinding {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        DurableQueryBudgetDimension, DurableQueryExportFailure, DurableQueryExportFailureCode,
+    };
 
     const TARGET_OFFSET: usize = 57;
-    const STATUS_OFFSET: usize = 121;
-    const PHASE_OFFSET: usize = 122;
-    const PROGRESS_OFFSET: usize = 123;
-    const RETRY_OFFSET: usize = 124;
-    const CANCELLATION_OFFSET: usize = 125;
-    const BOUNDARY_OFFSET: usize = 126;
-    const UPDATED_AT_OFFSET: usize = 128;
-    const COMPLETED_AT_OFFSET: usize = 136;
+    const STATUS_OFFSET: usize = 169;
+    const PHASE_OFFSET: usize = 170;
+    const PROGRESS_OFFSET: usize = 171;
+    const RETRY_OFFSET: usize = 172;
+    const CANCELLATION_OFFSET: usize = 173;
+    const BOUNDARY_OFFSET: usize = 174;
+    const TERMINAL_ERROR_OFFSET: usize = 175;
+    const TERMINAL_DETAIL_OFFSET: usize = 176;
+    const UPDATED_AT_OFFSET: usize = 177;
+    const COMPLETED_AT_OFFSET: usize = 185;
 
     fn accepted_record() -> Vec<u8> {
         pending_operation_fixture(
@@ -469,6 +487,82 @@ mod tests {
         assert!(
             decode_operation(&missing_boundary).is_err(),
             "a terminal incomplete export cannot deny its durable manifest boundary"
+        );
+    }
+
+    #[test]
+    fn query_export_pre_output_failure_round_trips_and_keeps_legacy_reader_support() {
+        let request = DurableOperationRequest::query_export(
+            PrincipalId::from_bytes([0x61; 16]).expect("principal"),
+            TenantId::from_bytes([0x62; 16]).expect("tenant"),
+            AdministrativeIdempotencyKey::new([0x63; 16]).expect("idempotency key"),
+            [0x64; 16],
+            1,
+            17,
+            [0x65; 32],
+        )
+        .expect("query export request");
+        let failed = DurableOperation::accepted(request)
+            .begin(18)
+            .expect("operation begins")
+            .failed(
+                19,
+                DurableOperationTerminalError::QueryFailure(DurableQueryExportFailure::new(
+                    DurableQueryExportFailureCode::BudgetExhausted,
+                    Some(DurableQueryBudgetDimension::MemoryBytes),
+                )),
+            )
+            .expect("pre-output failure");
+        let encoded = encode_operation(failed);
+        assert_eq!(
+            decode_operation(&encoded)
+                .expect("decode")
+                .expect("operation"),
+            failed
+        );
+
+        let mut malformed_budget = encoded.clone();
+        malformed_budget[TERMINAL_ERROR_OFFSET] = 13;
+        malformed_budget[TERMINAL_DETAIL_OFFSET] = 5;
+        assert!(
+            decode_operation(&malformed_budget).is_err(),
+            "only budget failures may retain a limiting dimension"
+        );
+
+        let migration = DurableOperation::accepted(
+            DurableOperationRequest::catalog_format_migration(
+                PrincipalId::from_bytes([0x71; 16]).expect("principal"),
+                AdministrativeIdempotencyKey::new([0x72; 16]).expect("idempotency key"),
+                [0x73; 16],
+                1,
+                17,
+            )
+            .expect("migration request"),
+        )
+        .begin(18)
+        .expect("operation begins")
+        .failed(19, DurableOperationTerminalError::HandlerRejected)
+        .expect("transition construction");
+        let mut wrong_kind = encode_operation(migration);
+        wrong_kind[TERMINAL_ERROR_OFFSET] = 13;
+        assert!(
+            decode_operation(&wrong_kind).is_err(),
+            "a Query-export terminal outcome cannot inhabit another handler's operation"
+        );
+
+        let legacy = DurableOperation::accepted(request)
+            .begin(18)
+            .expect("operation begins")
+            .failed(19, DurableOperationTerminalError::HandlerRejected)
+            .expect("legacy failure");
+        let mut v3 = encode_operation(legacy);
+        v3[..8].copy_from_slice(&OPERATION_MAGIC_V3);
+        v3.remove(TERMINAL_DETAIL_OFFSET);
+        assert_eq!(
+            decode_operation(&v3)
+                .expect("legacy decode")
+                .expect("legacy operation"),
+            legacy
         );
     }
 }

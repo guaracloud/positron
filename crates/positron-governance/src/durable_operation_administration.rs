@@ -21,7 +21,8 @@ pub use types::{
     DurableOperation, DurableOperationBoundary, DurableOperationCancellation,
     DurableOperationFailure, DurableOperationKind, DurableOperationLookupRetention,
     DurableOperationPhase, DurableOperationRequest, DurableOperationRetry, DurableOperationStatus,
-    DurableOperationTerminalError, OperationId,
+    DurableOperationTerminalError, DurableQueryBudgetDimension, DurableQueryExportFailure,
+    DurableQueryExportFailureCode, OperationId,
 };
 
 use crate::AdministrativeIdempotencyKey;
@@ -550,12 +551,10 @@ fn transition_request_digest(operation: DurableOperation) -> [u8; 32] {
     hasher.update([operation.retry.code()]);
     hasher.update([operation.cancellation.code()]);
     hasher.update([operation.boundary.code()]);
-    hasher.update(
-        operation
-            .terminal_error
-            .map_or(0, DurableOperationTerminalError::code)
-            .to_be_bytes(),
-    );
+    let (terminal_error, terminal_detail) = operation
+        .terminal_error
+        .map_or((0, 0), DurableOperationTerminalError::encoded);
+    hasher.update([terminal_error, terminal_detail]);
     match operation.cancellation_idempotency {
         Some(idempotency) => {
             hasher.update([1]);

@@ -2,4 +2,12 @@
 
 Every Release 1 administrative mutation accepts an Administrative Idempotency Key bound to Principal, operation type, and canonical request digest; identical retries resolve the original result, while changed content returns `IDEMPOTENCY_CONFLICT`. Mutable resources require expected Resource Generation preconditions. Backup, restore, purge, key lifecycle, verification, format migration, and upgrade create Durable Operations with stable IDs, persisted `Pending`, `Running`, `Succeeded`, `Failed`, or `Cancelled` state, bounded progress, safe retry guidance, and explicit Irreversible Boundaries. Timeouts make the caller's outcome unknown and are resolved by key or Operation ID rather than being treated as failure. Cancellation never claims to undo a published irreversible stage. Active operation records do not expire, completed lookup retention is disclosed, and every transition commits with governance evidence. CLI and generated SDKs share wait and cancellation behavior, while the operator derives deterministic keys from resource UID, generation, and operation type. This contract does not deduplicate at-least-once telemetry ingestion.
 
+For a Query-export terminal failure before protected output or a signed manifest,
+the same Durable Operation retains one bounded typed Query failure outcome. An
+exact retry reauthenticates its current caller and request binding before
+returning that original outcome, without starting another query or emitting a
+new transition. Persisted operation readers retain prior terminal-reason
+formats; the typed outcome is specific to Query export and does not create a
+general handler-result registry.
+
 For an API-key create or rotation that fails before its Catalog marker, the Catalog Writer retains one encrypted, authenticated transaction-owned prepared record before the immutable transaction digest. It binds the canonical administrative request digest to the exact generated credential verifier, audit entry, object set, commit record, and predecessor. Only the identical request may complete that exact predecessor; changed requests conflict. A missing, unauthenticated, incomplete, or no-longer-current predecessor resolves unavailable without mutation. Completion returns the original principal but never persists, derives, reconstructs, or redisplays the raw secret.
