@@ -883,13 +883,25 @@ impl ExportOutput {
             return Ok(Some(read_terminal_evidence_unlocked(catalog, self)?));
         }
         let tail = inspect_payload_tail(catalog, self)?;
+        let evidence = read_unpublished_terminal_evidence(catalog, self.identity)?;
+        if tail.orphan.is_none()
+            && tail.length == 0
+            && self.next_sequence == 0
+            && let Some(evidence) = evidence
+        {
+            let mut successor = self.clone();
+            successor.terminal_evidence_digest = digest_bytes(&evidence);
+            successor.publish(catalog)?;
+            *self = successor;
+            return Ok(Some(evidence));
+        }
         let Some(orphan) = tail.orphan else {
             return Ok(None);
         };
         if orphan.continuation_cursor.is_some() {
             return Ok(None);
         }
-        let Some(evidence) = read_unpublished_terminal_evidence(catalog, self.identity)? else {
+        let Some(evidence) = evidence else {
             return Ok(None);
         };
         let mut successor = self.clone();

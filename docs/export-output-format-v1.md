@@ -90,10 +90,19 @@ encrypts and synchronizes it at the sibling
 `exports/<output-identity-hex>/terminal`, then publishes its digest with that
 final batch descriptor. An empty export uses the same artifact and descriptor
 publication without a batch. The artifact is Query-owned: Kernel only bounds,
-protects, and binds it. A restart reads evidence only when the descriptor names
-its digest, reconstructs the signed manifest without re-executing the Query
-Snapshot, and then performs the normal idempotent terminal operation
-transition. An orphaned terminal artifact is never terminal truth.
+protects, and binds it. A restart normally reads evidence only when the
+descriptor names its digest. The sole recovery publication exception is an
+authenticated artifact synchronized before that descriptor update: Kernel may
+publish its digest only when it also authenticates the matching final payload
+record with no continuation cursor, or when the descriptor has zero batches,
+zero retained payload bytes, and `next_sequence` zero. The latter is the
+evidence-only empty-export case. In both cases Kernel preserves the original
+binding, Snapshot Lease, and payload receipt state without admitting a
+replacement payload or reservation; Query reconstructs the signed manifest
+without re-executing the Query Snapshot, then performs the normal idempotent
+terminal operation transition. Missing,
+truncated, malformed, substituted, mismatched, or out-of-shape artifacts are
+refused and cannot become terminal truth.
 
 ## Terminal manifest
 

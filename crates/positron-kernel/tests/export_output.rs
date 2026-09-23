@@ -434,6 +434,61 @@ fn kernel_recovers_a_synced_terminal_orphan_without_query_replay() -> Result<(),
 }
 
 #[test]
+fn kernel_recovers_synced_evidence_only_terminal_orphan_without_payload()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish(volume)?;
+    let catalog = open_export_catalog(
+        &authority,
+        InstanceId::new([0xf1; 16])?,
+        CatalogSecret::from_owned(Box::new([0xf2; 32]), Box::new([0xf3; 32])),
+    )?;
+    let binding = ExportOutputBinding::new(
+        TenantId::from_bytes([0x41; 16])?,
+        [0xf4; 16],
+        [0xf5; 32],
+        [0xf6; 32],
+        7,
+        9,
+        SnapshotLeaseId::new([0xf7; 16])?,
+        100,
+        3_700,
+    )?;
+    let mut output = ExportOutput::create(&catalog, binding)?;
+    let terminal = b"durable-empty-query-terminal";
+    let interrupted =
+        with_catalog_publication_fault_after(CatalogPublicationFault::SynchronizeCommit, 0, || {
+            output.write_terminal_evidence(&catalog, 101, terminal)
+        });
+    assert!(matches!(
+        interrupted,
+        Err(error) if error.code() == positron_kernel::ExportOutputFailureCode::StorageUnavailable
+    ));
+    assert_eq!(output.batch_count(), 0);
+    assert_eq!(
+        fs::metadata(payload_path(&root, output.identity()))?.len(),
+        0
+    );
+    assert!(
+        fs::metadata(terminal_path(&root, output.identity()))?.len() > 0,
+        "the terminal artifact must be synchronized before descriptor publication"
+    );
+    assert!(output.read_terminal_evidence(&catalog, 101)?.is_none());
+
+    let recovered = output
+        .recover_terminal_orphan(&catalog, 101)?
+        .ok_or("authenticated evidence-only terminal orphan must recover")?;
+    assert_eq!(recovered, terminal);
+    assert_eq!(output.batch_count(), 0);
+    assert_eq!(
+        output.read_terminal_evidence(&catalog, 101)?.as_deref(),
+        Some(terminal as &[u8])
+    );
+    Ok(())
+}
+
+#[test]
 fn terminal_orphan_recovery_rejects_changed_or_tampered_evidence() -> Result<(), Box<dyn Error>> {
     let root = TemporaryRoot::new()?;
     let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;

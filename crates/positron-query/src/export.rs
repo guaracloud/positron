@@ -1109,7 +1109,7 @@ impl<'kernel, 'catalog, 'ledger> crate::QueryService<'kernel, 'catalog, 'ledger>
                         context,
                         operation_id,
                         self.now()?,
-                        positron_governance::DurableOperationTerminalError::HandlerRejected,
+                        durable_query_failure(&failure),
                     )
                     .map_err(map_operation_failure)?;
                 }
@@ -1338,12 +1338,17 @@ impl<'kernel, 'catalog, 'ledger> crate::QueryService<'kernel, 'catalog, 'ledger>
                 return Err(terminal_failure);
             },
         };
-        let destination = self.resolve_export_destination_for_tenant(tenant, destination_name)?;
-        let request_digest = self.export_request_digest(source, budget, destination, language)?;
-        if operation.request().applicable_tenant() != Some(tenant)
-            || operation.target_identity() != Some(destination.identity())
-            || operation.request().query_export_request_digest() != Some(request_digest)
-        {
+        if operation.request().applicable_tenant() != Some(tenant) {
+            return Err(QueryFailure::new(QueryFailureCode::Unauthorized));
+        }
+        let accepted_destination = ExportDestination(
+            operation
+                .target_identity()
+                .ok_or_else(|| QueryFailure::new(QueryFailureCode::Unauthorized))?,
+        );
+        let request_digest =
+            self.export_request_digest(source, budget, accepted_destination, language)?;
+        if operation.request().query_export_request_digest() != Some(request_digest) {
             return Err(QueryFailure::new(QueryFailureCode::Unauthorized));
         }
         if operation.status() == positron_governance::DurableOperationStatus::Failed
@@ -1353,6 +1358,30 @@ impl<'kernel, 'catalog, 'ledger> crate::QueryService<'kernel, 'catalog, 'ledger>
         {
             return Err(query_failure_from_durable(failure));
         }
+        let configured_destination =
+            match self.resolve_export_destination_for_tenant(tenant, destination_name) {
+                Ok(destination) if destination == accepted_destination => Some(destination),
+                Ok(_) => None,
+                Err(failure) if failure.code() == QueryFailureCode::Unauthorized => None,
+                Err(failure) => return Err(failure),
+            };
+        let destination = match configured_destination {
+            Some(destination) => destination,
+            None => {
+                let failure = QueryFailure::new(QueryFailureCode::AuthorizationChanged);
+                if operation.status() == positron_governance::DurableOperationStatus::Running {
+                    positron_governance::DurableOperationAdministration::fail_query_export(
+                        catalog,
+                        context,
+                        operation_id,
+                        self.now()?,
+                        durable_query_failure(&failure),
+                    )
+                    .map_err(|_| QueryFailure::new(QueryFailureCode::StoreUnavailable))?;
+                }
+                return Err(failure);
+            },
+        };
         let mut output = match positron_kernel::ExportOutput::recover_initial(
             catalog,
             positron_kernel::ExportOutputRequest::new(
