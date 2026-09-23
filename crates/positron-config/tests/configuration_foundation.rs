@@ -6,8 +6,8 @@ use positron_config::{
     CommandLineOverrides, CompletionState, ConfigurationFailure, ConfigurationFailureCode,
     ConfigurationInputs, ConfigurationPlan, EnvironmentOverrides, FailureSource, LogLevel,
     MutabilityClass, ProvenancePolicy, RetryClass, SecrecyClass, Setting, SettingKind,
-    SettingSource, ValueDomain, generated_json_schema, generated_reference, resolve,
-    setting_definition, setting_definitions,
+    SettingSource, ValueDomain, generated_example, generated_json_schema, generated_reference,
+    resolve, setting_definition, setting_definitions,
 };
 
 #[derive(Debug)]

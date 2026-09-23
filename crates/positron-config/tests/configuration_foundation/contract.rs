@@ -22,6 +22,9 @@ fn generated_validation_fixtures_execute_through_the_public_resolver() -> Result
         generated_reference(),
         include_str!("../../../../configuration/reference.md")
     );
+    let example = generated_example();
+    assert_eq!(example, include_str!("../../../../configuration/example.toml"));
+    inputs(Some(&example), [], []).and_then(resolve)?;
 
     for fixture in fixtures {
         let result = inputs(Some(&fixture.document), [], []).and_then(resolve);

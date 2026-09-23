@@ -9,7 +9,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    fs::OpenOptions,
+    fs::{File, OpenOptions},
     io::Write,
     net::SocketAddr,
     os::unix::fs::OpenOptionsExt,
@@ -105,7 +105,7 @@ fn write_candidate_document(
             .and(Err(ConfigurationCandidateFailure::DestinationUnavailable));
     }
     match renameat_with(CWD, &temporary, CWD, destination, RenameFlags::NOREPLACE) {
-        Ok(()) => Ok(()),
+        Ok(()) => sync_candidate_parent(destination),
         Err(error) => {
             let failure = if error.kind() == std::io::ErrorKind::AlreadyExists {
                 ConfigurationCandidateFailure::DestinationExists
@@ -115,6 +115,13 @@ fn write_candidate_document(
             remove_temporary_candidate(&temporary).and(Err(failure))
         },
     }
+}
+
+fn sync_candidate_parent(destination: &Path) -> Result<(), ConfigurationCandidateFailure> {
+    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| ConfigurationCandidateFailure::DestinationUnavailable)
 }
 
 fn create_temporary_candidate(
@@ -155,6 +162,12 @@ pub fn generated_json_schema() -> String {
 #[must_use]
 pub fn generated_reference() -> String {
     render_reference()
+}
+
+/// Returns the generated public-only example configuration.
+#[must_use]
+pub fn generated_example() -> String {
+    render_example()
 }
 
 /// Returns the contract definition for a canonical setting path.

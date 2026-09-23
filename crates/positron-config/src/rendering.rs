@@ -22,11 +22,9 @@ pub fn render_toml_basic_string(value: &str) -> String {
     rendered
 }
 
-use std::fmt::Write;
-
 use crate::{
-    MutabilityClass, ProvenancePolicy, SecrecyClass, Setting, SettingDefinition, ValueDomain,
-    setting_definitions,
+    MutabilityClass, ProvenancePolicy, SecrecyClass, Setting, SettingDefinition, SettingKind,
+    ValueDomain, setting_definitions,
 };
 
 /// Renders the committed JSON Schema from the Rust-owned setting table.
@@ -151,9 +149,8 @@ pub fn render_reference() -> String {
         } else {
             format!("`{default}`")
         };
-        let _ = writeln!(
-            output,
-            "| `{}` | {} | {} | {} | {} | {} | {} |",
+        output.push_str(&format!(
+            "| `{}` | {} | {} | {} | {} | {} | {} |\n",
             definition.path(),
             reference_kind(definition),
             default,
@@ -161,12 +158,60 @@ pub fn render_reference() -> String {
             reference_secrecy(definition.secrecy()),
             reference_provenance(definition.provenance()),
             reference_mutability(definition.mutability()),
-        );
+        ));
     }
     output.push_str(
         "\n## Durable export destinations\n\nDurable export is disabled unless the selected TOML file includes one or more\n`[[export.destination]]` entries. Environment and command-line overrides are\nrejected. A destination may be selected only by an authenticated tenant named\nin its `allowed_tenants`; its opaque `identity` is passed internally to the\nprotected Kernel output directory and is not supplied by an API caller.\n\n```toml\n[[export.destination]]\nname = \"regulated-archive\"\nidentity = \"a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1\"\nallowed_tenants = [\"11111111-1111-1111-1111-111111111111\"]\n```\n\nDestination names and identities must be unique. The complete candidate is\nvalidated before publication; changing this immutable setting requires the\nexplicit initialization or restore workflow rather than live reload.\n\n## Operator commands\n\nThe native binary resolves this same contract without starting the database:\n\n```console\npositron config validate [--config PATH] [--set PATH=VALUE]\npositron config explain [--setting PATH]\npositron config effective --redacted [--config PATH] [--set PATH=VALUE]\npositron config diff --current PATH --candidate PATH\npositron config migrate --config PATH --output PATH\n```\n\n`validate` resolves the complete candidate and reports only its schema version\nand warning count. `explain` reports each setting's canonical type, redacted\ndefault where required, value domain, secrecy, provenance policy, and\nmutability. `effective --redacted` renders the complete redacted effective\nstate followed by the source of every setting. `diff` resolves both canonical\ndocuments without environment or command-line overrides, reports only redacted\nsemantic values and provenance, and derives one no-mutation lifecycle plan.\n\nThe current contract supports schema version 1 only. `migrate` validates its\nsource without environment or command-line overrides, then writes the validated\nsource bytes to the explicitly named output candidate. The output is created\nwith restrictive permissions and is never overwritten. This preserves protected\nfile references and avoids materializing defaults or overrides. The command\nreports the deterministic zero semantic diff for version 1; unsupported\nversions are rejected without coercion or an invented transformation.\n",
     );
     output
+}
+
+/// Renders a copyable configuration document from public canonical defaults.
+///
+/// Protected references remain absent so generated artifacts cannot disclose
+/// secret-bearing values; their safe compiled defaults remain in effect.
+#[must_use]
+pub fn render_example() -> String {
+    let mut output = String::from(
+        "# Generated from `crates/positron-config/src/contract.rs`.\n# Protected references are intentionally omitted.\n\n",
+    );
+    for definition in setting_definitions() {
+        if definition.setting() == Setting::SchemaVersion {
+            append_example_setting(&mut output, definition);
+        }
+    }
+    for section in ["diagnostics", "listener", "runtime", "storage"] {
+        let settings = setting_definitions()
+            .into_iter()
+            .filter(|definition| {
+                definition.secrecy() == SecrecyClass::Public
+                    && definition.kind() != SettingKind::ExportDestinations
+                    && definition.path().starts_with(&format!("{section}."))
+            })
+            .collect::<Vec<_>>();
+        if settings.is_empty() {
+            continue;
+        }
+        output.push_str(&format!("\n[{section}]\n"));
+        for definition in settings {
+            append_example_setting(&mut output, definition);
+        }
+    }
+    output
+}
+
+fn append_example_setting(output: &mut String, definition: SettingDefinition) {
+    let field = definition
+        .path()
+        .rsplit('.')
+        .next()
+        .unwrap_or(definition.path());
+    let value = match definition.kind() {
+        SettingKind::Integer => definition.default_value().to_owned(),
+        SettingKind::String => render_toml_basic_string(definition.default_value()),
+        SettingKind::ExportDestinations => return,
+    };
+    output.push_str(&format!("{field} = {value}\n"));
 }
 
 fn reference_kind(definition: SettingDefinition) -> &'static str {
