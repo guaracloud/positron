@@ -29,6 +29,109 @@ use crate::{
     setting_definitions,
 };
 
+/// Renders the committed JSON Schema from the Rust-owned setting table.
+///
+/// The schema deliberately retains custom annotations for validation rules that
+/// JSON Schema cannot express alone, such as loopback-only listener binding.
+#[must_use]
+pub fn render_json_schema() -> String {
+    let definitions = setting_definitions();
+    let mut output = String::from(
+        "{\n  \"$schema\": \"https://json-schema.org/draft/2020-12/schema\",\n  \"x-positron-generated-from\": \"crates/positron-config/src/contract.rs\",\n  \"title\": \"Positron Configuration Contract v1\",\n  \"type\": \"object\",\n  \"additionalProperties\": false,\n  \"properties\": {\n",
+    );
+    let schema_version = definitions
+        .iter()
+        .copied()
+        .find(|definition| definition.setting() == Setting::SchemaVersion);
+    if let Some(definition) = schema_version {
+        output.push_str(&format!(
+            "    \"schema_version\": {}",
+            render_schema_value(definition)
+        ));
+    }
+
+    for section in [
+        "diagnostics",
+        "listener",
+        "runtime",
+        "security",
+        "export",
+        "storage",
+    ] {
+        output.push_str(&format!(
+            ",\n    \"{section}\": {{\"type\": \"object\", \"additionalProperties\": false, \"properties\": {{"
+        ));
+        let mut first = true;
+        for definition in definitions.iter().copied().filter(|definition| {
+            definition
+                .path()
+                .split_once('.')
+                .is_some_and(|(path_section, _)| path_section == section)
+        }) {
+            let Some((_, field)) = definition.path().split_once('.') else {
+                continue;
+            };
+            if !first {
+                output.push_str(", ");
+            }
+            output.push_str(&format!("\"{field}\": {}", render_schema_value(definition)));
+            first = false;
+        }
+        output.push_str("}}");
+    }
+    output.push_str("\n  },\n  \"required\": [\"schema_version\"]\n}\n");
+    output
+}
+
+fn render_schema_value(definition: SettingDefinition) -> String {
+    match definition.domain() {
+        ValueDomain::ExactUnsignedInteger(value) => format!("{{\"const\": {value}}}"),
+        ValueDomain::StringEnumeration(values) => format!(
+            "{{\"type\": \"string\", \"enum\": [{}]}}",
+            values
+                .iter()
+                .map(|value| format!("\"{value}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        ValueDomain::UnsignedIntegerRange(minimum, maximum) => {
+            format!("{{\"type\": \"integer\", \"minimum\": {minimum}, \"maximum\": {maximum}}}")
+        },
+        ValueDomain::LoopbackSocketAddress(maximum) => format!(
+            "{{\"type\": \"string\", \"maxLength\": {maximum}, \"x-positron-address-scope\": \"loopback-only\"}}"
+        ),
+        ValueDomain::SocketAddress(maximum) => format!(
+            "{{\"type\": \"string\", \"maxLength\": {maximum}, \"x-positron-address-scope\": \"tls-or-explicit-plaintext-opt-out-off-loopback\"}}"
+        ),
+        ValueDomain::AbsolutePath(maximum) => render_path_schema(definition, maximum, false),
+        ValueDomain::ProtectedAbsolutePath(maximum) => {
+            render_path_schema(definition, maximum, true)
+        },
+        ValueDomain::ExportDestinations(maximum, maximum_name_bytes, maximum_tenants) => format!(
+            "{{\"type\": \"array\", \"maxItems\": {maximum}, \"items\": {{\"type\": \"object\", \"additionalProperties\": false, \"required\": [\"name\", \"identity\", \"allowed_tenants\"], \"properties\": {{\"name\": {{\"type\": \"string\", \"minLength\": 1, \"maxLength\": {maximum_name_bytes}, \"pattern\": \"^[a-z0-9]+(?:-[a-z0-9]+)*$\"}}, \"identity\": {{\"type\": \"string\", \"pattern\": \"^[0-9a-f]{{32}}$\", \"not\": {{\"const\": \"00000000000000000000000000000000\"}}}}, \"allowed_tenants\": {{\"type\": \"array\", \"minItems\": 1, \"maxItems\": {maximum_tenants}, \"uniqueItems\": true, \"items\": {{\"type\": \"string\", \"pattern\": \"^[0-9a-f]{{8}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{12}}$\"}}}}}}}}}}"
+        ),
+    }
+}
+
+fn render_path_schema(definition: SettingDefinition, maximum: usize, protected: bool) -> String {
+    let mut output = format!("{{\"type\": \"string\", \"maxLength\": {maximum}");
+    if definition.secrecy() == SecrecyClass::SecretBearing {
+        output.push_str(", \"writeOnly\": true");
+    }
+    match definition.setting() {
+        Setting::ListenerControlPath => output.push_str(", \"x-positron-path-kind\": \"absolute\""),
+        Setting::ListenerApiTlsCertificateFile | Setting::ListenerApiTlsPrivateKeyFile => {
+            output.push_str(", \"x-positron-path-kind\": \"protected-absolute\"");
+        },
+        Setting::SecurityLocalKeyFile if protected => output.push_str(
+            ", \"x-positron-runtime-invariant\": \"storage.secrets_directory/local-root-key.v1\"",
+        ),
+        _ => {},
+    }
+    output.push('}');
+    output
+}
+
 /// Renders the committed operator reference from the Rust-owned setting table.
 #[must_use]
 pub fn render_reference() -> String {

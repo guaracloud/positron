@@ -54,6 +54,98 @@ fn generated_validation_fixtures_execute_through_the_public_resolver() -> Result
     Ok(())
 }
 
+#[test]
+fn generated_schema_covers_every_canonical_setting_with_its_declared_constraints()
+-> Result<(), Box<dyn Error>> {
+    let schema: serde_json::Value = serde_json::from_str(&generated_json_schema())?;
+    let properties = schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| io::Error::other("generated schema is missing root properties"))?;
+
+    for definition in setting_definitions() {
+        let property = schema_property(properties, definition.path())?;
+        match definition.domain() {
+            ValueDomain::ExactUnsignedInteger(value) => {
+                assert_eq!(property.get("const").and_then(serde_json::Value::as_u64), Some(u64::from(value)));
+            },
+            ValueDomain::StringEnumeration(values) => {
+                let generated_values = property
+                    .get("enum")
+                    .and_then(serde_json::Value::as_array)
+                    .ok_or_else(|| io::Error::other("generated enum is missing"))?;
+                assert_eq!(generated_values.len(), values.len());
+                for expected in values {
+                    assert!(
+                        generated_values
+                            .iter()
+                            .any(|value| value.as_str() == Some(*expected))
+                    );
+                }
+            },
+            ValueDomain::UnsignedIntegerRange(minimum, maximum) => {
+                assert_eq!(property.get("type").and_then(serde_json::Value::as_str), Some("integer"));
+                assert_eq!(property.get("minimum").and_then(serde_json::Value::as_u64), Some(u64::from(minimum)));
+                assert_eq!(property.get("maximum").and_then(serde_json::Value::as_u64), Some(u64::from(maximum)));
+            },
+            ValueDomain::LoopbackSocketAddress(maximum) => {
+                assert_eq!(property.get("maxLength").and_then(serde_json::Value::as_u64), Some(maximum as u64));
+                assert_eq!(property.get("x-positron-address-scope").and_then(serde_json::Value::as_str), Some("loopback-only"));
+            },
+            ValueDomain::SocketAddress(maximum) => {
+                assert_eq!(property.get("maxLength").and_then(serde_json::Value::as_u64), Some(maximum as u64));
+                assert_eq!(property.get("x-positron-address-scope").and_then(serde_json::Value::as_str), Some("tls-or-explicit-plaintext-opt-out-off-loopback"));
+            },
+            ValueDomain::AbsolutePath(maximum) | ValueDomain::ProtectedAbsolutePath(maximum) => {
+                assert_eq!(property.get("maxLength").and_then(serde_json::Value::as_u64), Some(maximum as u64));
+            },
+            ValueDomain::ExportDestinations(maximum, maximum_name_bytes, maximum_tenants) => {
+                assert_eq!(property.get("maxItems").and_then(serde_json::Value::as_u64), Some(maximum as u64));
+                let item_properties = property
+                    .get("items")
+                    .and_then(|items| items.get("properties"))
+                    .and_then(serde_json::Value::as_object)
+                    .ok_or_else(|| io::Error::other("generated export destination item is missing properties"))?;
+                assert_eq!(item_properties.get("name").and_then(|name| name.get("maxLength")).and_then(serde_json::Value::as_u64), Some(maximum_name_bytes as u64));
+                assert_eq!(item_properties.get("allowed_tenants").and_then(|tenants| tenants.get("maxItems")).and_then(serde_json::Value::as_u64), Some(maximum_tenants as u64));
+                assert_eq!(
+                    item_properties
+                        .get("identity")
+                        .and_then(|identity| identity.get("not"))
+                        .and_then(|not| not.get("const"))
+                        .and_then(serde_json::Value::as_str),
+                    Some("00000000000000000000000000000000")
+                );
+            },
+        }
+        assert_eq!(
+            property.get("writeOnly").and_then(serde_json::Value::as_bool).unwrap_or(false),
+            definition.secrecy() == SecrecyClass::SecretBearing,
+            "{}",
+            definition.path()
+        );
+    }
+    Ok(())
+}
+
+fn schema_property<'a>(
+    root: &'a serde_json::Map<String, serde_json::Value>,
+    path: &str,
+) -> Result<&'a serde_json::Value, Box<dyn Error>> {
+    if !path.contains('.') {
+        return root
+            .get(path)
+            .ok_or_else(|| io::Error::other(format!("generated schema is missing `{path}`")).into());
+    }
+    let (section, field) = path
+        .split_once('.')
+        .ok_or_else(|| io::Error::other(format!("invalid setting path `{path}`")))?;
+    root.get(section)
+        .and_then(|section| section.get("properties"))
+        .and_then(|properties| properties.get(field))
+        .ok_or_else(|| io::Error::other(format!("generated schema is missing `{path}`")).into())
+}
+
 fn parse_generated_configuration_fixtures(
     document: &str,
 ) -> Result<Vec<GeneratedConfigurationFixture>, Box<dyn Error>> {

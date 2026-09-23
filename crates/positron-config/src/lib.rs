@@ -46,7 +46,7 @@ pub fn resolve(
 /// Returns the generated canonical JSON Schema.
 #[must_use]
 pub fn generated_json_schema() -> String {
-    include_str!("../../../configuration/schema.json").to_owned()
+    render_json_schema()
 }
 
 /// Returns the generated operator/reference documentation without secrets.
