@@ -160,7 +160,17 @@ fn durable_export_records_a_catalog_backed_terminal_operation_after_the_signed_m
         )?;
 
         assert_eq!(receipt.manifest().destination().identity(), [0x7a; 16]);
-        assert!(receipt.manifest().signature().is_some());
+        let signature = receipt
+            .manifest()
+            .signature()
+            .ok_or("durable exports must retain their custody-opened signature")?;
+        assert_eq!(signature.integrity_identity(), signer.identity());
+        assert!(
+            signature
+                .verify(signer.identity(), b"substituted durable export manifest")
+                .is_err(),
+            "the custody-opened signer must reject a substituted manifest payload"
+        );
         let output_identity = receipt
             .manifest()
             .output_identity()

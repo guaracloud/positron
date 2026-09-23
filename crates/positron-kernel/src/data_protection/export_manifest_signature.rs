@@ -18,7 +18,9 @@ pub struct ExportManifestSigner {
 
 impl ExportManifestSigner {
     /// Takes already-authorized Instance Integrity Key material into export-only custody.
-    pub fn from_seed(mut seed: Box<[u8; 32]>) -> Result<Self, ExportManifestSignatureFailure> {
+    pub(crate) fn from_seed(
+        mut seed: Box<[u8; 32]>,
+    ) -> Result<Self, ExportManifestSignatureFailure> {
         let pair = Ed25519KeyPair::from_seed_unchecked(seed.as_ref())
             .map_err(|_| ExportManifestSignatureFailure::AuthenticationFailed)?;
         let public_key: [u8; 32] = pair

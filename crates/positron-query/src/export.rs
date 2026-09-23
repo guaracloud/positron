@@ -2088,7 +2088,7 @@ mod tests {
     }
 
     #[test]
-    fn signed_manifest_payload_binds_the_complete_query_snapshot_descriptor() {
+    fn manifest_payload_binds_the_complete_query_snapshot_descriptor() {
         let destination = ExportDestination::configured([0x11; 16]).expect("fixture destination");
         let snapshot = ResultSnapshot::new([0x22; 32], 7, 9);
         let budget = QueryBudget::new(1, 1, 1, 1, 1, 1).expect("fixture budget");
@@ -2131,15 +2131,5 @@ mod tests {
         expected.push(1);
         expected.extend_from_slice(&[0x33; 32]);
         assert_eq!(payload, expected);
-
-        let signer = positron_kernel::ExportManifestSigner::from_seed(Box::new([0x66; 32]))
-            .expect("fixture signer");
-        let signature = signer.sign(&payload).expect("sign fixture payload");
-        signature
-            .verify(signer.identity(), &expected)
-            .expect("independent canonical payload verifies");
-        let mut substituted = expected;
-        substituted[65] ^= 1;
-        assert!(signature.verify(signer.identity(), &substituted).is_err());
     }
 }
