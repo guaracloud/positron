@@ -1839,14 +1839,7 @@ fn decode_initial_preparation(bytes: &[u8]) -> Result<InitialPreparation, Export
             .get(8..binding_end)
             .ok_or_else(|| fail(ExportOutputFailureCode::IntegrityCorruption))?,
     )?;
-    let length_end = binding_end
-        .checked_add(2)
-        .ok_or_else(|| fail(ExportOutputFailureCode::LimitExceeded))?;
-    let length = usize::from(u16::from_be_bytes(
-        bytes[binding_end..length_end]
-            .try_into()
-            .map_err(|_| fail(ExportOutputFailureCode::IntegrityCorruption))?,
-    ));
+    let length = usize::from(u16::from_be_bytes(bounded_array(bytes, binding_end)?));
     if length == 0
         || length > MAX_CONTINUATION_CURSOR_BYTES
         || bytes.len() != INITIAL_CURSOR_FIXED_BYTES.saturating_add(length)
@@ -1855,7 +1848,10 @@ fn decode_initial_preparation(bytes: &[u8]) -> Result<InitialPreparation, Export
     }
     Ok(InitialPreparation {
         binding,
-        cursor: bytes[INITIAL_CURSOR_FIXED_BYTES..].to_vec(),
+        cursor: bytes
+            .get(INITIAL_CURSOR_FIXED_BYTES..)
+            .ok_or_else(|| fail(ExportOutputFailureCode::IntegrityCorruption))?
+            .to_vec(),
     })
 }
 

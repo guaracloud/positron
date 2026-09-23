@@ -121,12 +121,16 @@ terminal result.
 The kernel-owned `ExportManifestSigner` opens the existing wrapped Instance
 Integrity Key into an export-only, domain-separated Ed25519 signing capability.
 It signs at most 42,496 canonical manifest bytes under
-`positron-query-export-manifest-signature-v1`. Verification always takes an
-externally pinned `BootstrapIntegrityIdentity` from the accepted governance
-key history. The identity carried in a receipt is checked against that expected
-key and fingerprint; it never self-authorizes a manifest. The signer reuses the
-existing IKI custody and rotation history and neither exposes its seed nor
-broadens `AuditCheckpointSigner` into a generic signing capability.
+`positron-query-export-manifest-signature-v1`. Release 1 verification resolves
+the current authenticated Catalog Governance identity. The identity carried in
+a receipt is checked against that expected key and fingerprint; it never
+self-authorizes a manifest. Rewrapping the same IKI supports ordinary restart
+verification, while an unknown predecessor identity is refused. Query-export
+verification can accept an authorized predecessor only when canonical
+Governance exposes integrity-key rotation history to this verifier; that remains
+a full-release integration requirement under ADR-0040. The signer reuses the
+existing IKI custody, neither exposes its seed, nor broadens
+`AuditCheckpointSigner` into a generic signing capability.
 
 `cargo fuzz run export_output_record` exercises the bounded descriptor, initial
 preparation, and plaintext-record decoders. `encrypted_frame_open` independently exercises the

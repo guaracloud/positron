@@ -121,4 +121,3 @@ fn export_inputs(file: Option<&str>) -> Result<ConfigurationInputs, Configuratio
         CommandLineOverrides::try_from_pairs([] as [(&str, &str); 0])?,
     )
 }
-
