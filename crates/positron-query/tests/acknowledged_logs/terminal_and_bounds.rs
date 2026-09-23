@@ -1,6 +1,7 @@
 use std::error::Error;
+use std::sync::Arc;
 
-use positron_domain::identity::Scope;
+use positron_domain::identity::{Scope, TenantId};
 use positron_governance::{CompatibilityHints, PresentedCredential, RequestedIntent};
 use positron_kernel::{ResourceAmounts, ResourceDimension, WorkClaim, WorkKind};
 use positron_query::{
@@ -12,6 +13,14 @@ use positron_runtime::{BootstrapPaths, InitializationPlan, InstanceBootstrap};
 use super::support::{
     KernelFixture, SequenceClock, TemporaryRoots, TestClock, zero_work_clock_service,
 };
+
+struct TestExportDestinationResolver;
+
+impl positron_query::ExportDestinationResolver for TestExportDestinationResolver {
+    fn resolve(&self, _tenant: TenantId, name: &str) -> Option<[u8; 16]> {
+        (name == "configured").then_some([0x7a; 16])
+    }
+}
 
 #[test]
 fn cancellation_replaces_unsent_events_with_one_non_complete_terminal() -> Result<(), Box<dyn Error>>
@@ -926,7 +935,8 @@ impl QueryFixture {
             self.kernel.authority.governor(),
             self.kernel.ledger()?,
             batch_limit,
-        ))
+        )
+        .with_export_destination_resolver(Arc::new(TestExportDestinationResolver)))
     }
 
     pub(crate) fn export_manifest_signer(

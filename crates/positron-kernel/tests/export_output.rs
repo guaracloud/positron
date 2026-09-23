@@ -8,11 +8,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use positron_domain::identity::TenantId;
 use positron_kernel::{
     Catalog, CatalogPublicationFault, CatalogSecret, DiskPressureThresholds, ExportOutput,
-    ExportOutputBinding, GovernorPolicy, InstanceId, InventoryCardinalityLimits,
-    MountQualification, ObservedResourceEnvironment, OperatorLimits, OrdinaryPoolPolicy,
-    PrimaryDataVolume, RecoveryPoolCapacities, RecoveryReserve, RegisteredResourceBounds,
-    ResourceAmounts, ResourceDimension, ResourceGovernorConfiguration, ResourceInventory,
-    SnapshotLeaseId, StorageKernelResourceAuthority, TenantQuota,
+    ExportOutputBinding, ExportOutputRequest, GovernorPolicy, InstanceId,
+    InventoryCardinalityLimits, MountQualification, ObservedResourceEnvironment, OperatorLimits,
+    OrdinaryPoolPolicy, PrimaryDataVolume, RecoveryPoolCapacities, RecoveryReserve,
+    RegisteredResourceBounds, ResourceAmounts, ResourceDimension, ResourceGovernorConfiguration,
+    ResourceInventory, SnapshotLeaseId, StorageKernelResourceAuthority, TenantQuota,
     with_catalog_publication_fault_after,
 };
 
@@ -56,6 +56,12 @@ fn manifest_path(root: &TemporaryRoot, identity: [u8; 16]) -> PathBuf {
         .join("exports")
         .join(hex(identity))
         .join("manifest")
+}
+fn initial_path(root: &TemporaryRoot, identity: [u8; 16]) -> PathBuf {
+    root.path()
+        .join("exports")
+        .join(hex(identity))
+        .join("initial")
 }
 
 fn amounts(value: u64) -> ResourceAmounts {
@@ -278,6 +284,158 @@ fn initial_cursor_is_synced_before_descriptor_publication_and_recovered_by_exact
     assert_eq!(
         recovered.initial_cursor(&catalog, 101)?.as_deref(),
         Some(b"original snapshot cursor" as &[u8])
+    );
+    Ok(())
+}
+
+#[test]
+fn operation_addressed_initial_preparation_survives_descriptor_failure_and_catalog_advance()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish(volume)?;
+    let instance = InstanceId::new([0xb1; 16])?;
+    let secret = CatalogSecret::from_owned(Box::new([0xb2; 32]), Box::new([0xb3; 32]));
+    let catalog = Catalog::open(&authority, instance, secret)?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let request = ExportOutputRequest::new([0xb4; 16], tenant, [0xb5; 16], [0xb6; 32])?;
+    let binding = ExportOutputBinding::new_for_operation(
+        request,
+        [0xb7; 32],
+        7,
+        9,
+        SnapshotLeaseId::new([0xb8; 16])?,
+        100,
+        3_700,
+    )?;
+
+    let interrupted =
+        with_catalog_publication_fault_after(CatalogPublicationFault::SynchronizeCommit, 0, || {
+            ExportOutput::create_with_initial_cursor(&catalog, binding, b"original cursor")
+        });
+    assert!(matches!(
+        interrupted,
+        Err(error) if error.code() == positron_kernel::ExportOutputFailureCode::StorageUnavailable
+    ));
+    assert!(
+        ExportOutput::find_for_request(
+            &catalog,
+            tenant,
+            request.destination(),
+            request.request_digest(),
+        )?
+        .is_none()
+    );
+
+    // Publish an unrelated successor and reopen the Catalog at a later clock
+    // value. Recovery must find the original operation preparation, never
+    // derive a replacement snapshot binding from the advanced state.
+    let unrelated = ExportOutputBinding::new(
+        tenant,
+        [0xb9; 16],
+        [0xba; 32],
+        [0xbb; 32],
+        8,
+        10,
+        SnapshotLeaseId::new([0xbc; 16])?,
+        120,
+        3_720,
+    )?;
+    let _ = ExportOutput::create(&catalog, unrelated)?;
+    drop(catalog);
+    let catalog = Catalog::open(
+        &authority,
+        instance,
+        CatalogSecret::from_owned(Box::new([0xb2; 32]), Box::new([0xb3; 32])),
+    )?;
+
+    assert!(matches!(
+        ExportOutput::recover_initial(
+            &catalog,
+            ExportOutputRequest::new([0xb4; 16], tenant, [0xbd; 16], [0xb6; 32])?,
+            300,
+        ),
+        Err(error) if error.code() == positron_kernel::ExportOutputFailureCode::AuthenticationFailed
+    ));
+    let recovered = ExportOutput::recover_initial(&catalog, request, 300)?
+        .ok_or("synced initial preparation must be discoverable by operation")?;
+    assert_eq!(recovered.binding(), binding);
+    assert_eq!(
+        recovered.initial_cursor(&catalog, 300)?.as_deref(),
+        Some(b"original cursor" as &[u8])
+    );
+    assert_eq!(
+        recovered.identity(),
+        ExportOutput::create_with_initial_cursor(&catalog, binding, b"original cursor",)?
+            .identity()
+    );
+    assert!(matches!(
+        ExportOutput::recover_initial(&catalog, request, 3_701),
+        Err(error) if error.code() == positron_kernel::ExportOutputFailureCode::Expired
+    ));
+    Ok(())
+}
+
+#[test]
+fn tampered_initial_preparation_fails_closed_without_replacement_output()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish(volume)?;
+    let instance = InstanceId::new([0xbe; 16])?;
+    let catalog = Catalog::open(
+        &authority,
+        instance,
+        CatalogSecret::from_owned(Box::new([0xbf; 32]), Box::new([0xc0; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x41; 16])?;
+    let request = ExportOutputRequest::new([0xc1; 16], tenant, [0xc2; 16], [0xc3; 32])?;
+    let binding = ExportOutputBinding::new_for_operation(
+        request,
+        [0xc4; 32],
+        7,
+        9,
+        SnapshotLeaseId::new([0xc5; 16])?,
+        100,
+        3_700,
+    )?;
+    let output = ExportOutput::create_with_initial_cursor(&catalog, binding, b"original cursor")?;
+    let path = initial_path(&root, output.identity());
+    let original = fs::read(&path)?;
+    let mut tampered = original.clone();
+    let byte = tampered
+        .last_mut()
+        .ok_or("initial preparation must contain authenticated bytes")?;
+    *byte ^= 0x01;
+    fs::write(&path, tampered)?;
+
+    assert!(matches!(
+        ExportOutput::recover_initial(&catalog, request, 300),
+        Err(error) if matches!(
+            error.code(),
+            positron_kernel::ExportOutputFailureCode::AuthenticationFailed
+                | positron_kernel::ExportOutputFailureCode::IntegrityCorruption
+                | positron_kernel::ExportOutputFailureCode::StorageUnavailable
+        )
+    ));
+    fs::write(&path, &original[..original.len() / 2])?;
+    let partial = ExportOutput::recover_initial(&catalog, request, 300)
+        .expect_err("partial authenticated preparation must not recover");
+    assert_ne!(
+        partial.code(),
+        positron_kernel::ExportOutputFailureCode::ConcurrentWriter
+    );
+    ExportOutput::create_with_initial_cursor(&catalog, binding, b"original cursor")
+        .expect_err("partial initial preparation must not be replaced");
+    assert_eq!(
+        ExportOutput::find_for_request(
+            &catalog,
+            tenant,
+            request.destination(),
+            request.request_digest(),
+        )?
+        .map(|existing| existing.identity()),
+        Some(output.identity())
     );
     Ok(())
 }

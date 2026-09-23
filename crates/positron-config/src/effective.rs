@@ -1,6 +1,8 @@
 use std::fmt::{Debug, Formatter};
 use std::net::SocketAddr;
 
+use positron_domain::identity::TenantId;
+
 use super::{
     ApiTransport, ConfigurationFailure, ConfigurationFailureCode, LogLevel, MutabilityClass,
     ProtectedFileReference, Setting, SettingSource, contract, failure_source, setting_for_path,
@@ -26,6 +28,53 @@ impl ConfigurationWarning {
 const NO_CONFIGURATION_WARNINGS: &[ConfigurationWarning] = &[];
 const PUBLIC_PLAINTEXT_API_WARNING: &[ConfigurationWarning] =
     &[ConfigurationWarning::PublicPlaintextApi];
+
+/// One resolved export destination authorized for a caller's tenant.
+///
+/// The identity has no public constructor: it is minted only after the
+/// Configuration Contract has validated an operator-owned definition.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfiguredExportDestination {
+    name: String,
+    identity: [u8; 16],
+    tenant_id: TenantId,
+}
+
+impl ConfiguredExportDestination {
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    #[must_use]
+    pub const fn identity(&self) -> [u8; 16] {
+        self.identity
+    }
+
+    #[must_use]
+    pub const fn tenant_id(&self) -> TenantId {
+        self.tenant_id
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ExportDestinationDefinition {
+    pub(crate) name: String,
+    pub(crate) identity: [u8; 16],
+    pub(crate) allowed_tenants: Vec<TenantId>,
+}
+
+impl ExportDestinationDefinition {
+    pub(crate) fn resolve(&self, tenant_id: TenantId) -> Option<ConfiguredExportDestination> {
+        self.allowed_tenants
+            .contains(&tenant_id)
+            .then(|| ConfiguredExportDestination {
+                name: self.name.clone(),
+                identity: self.identity,
+                tenant_id,
+            })
+    }
+}
 
 /// The resolved, configuration-file-only plaintext listener selection that
 /// startup must durably acknowledge before serving.
@@ -59,7 +108,8 @@ pub struct EffectiveConfiguration {
     pub(crate) data_directory: String,
     pub(crate) secrets_directory: String,
     pub(crate) local_key_file: ProtectedFileReference,
-    pub(crate) sources: [SettingSource; 16],
+    pub(crate) export_destinations: Vec<ExportDestinationDefinition>,
+    pub(crate) sources: [SettingSource; 17],
 }
 
 impl EffectiveConfiguration {
@@ -165,6 +215,26 @@ impl EffectiveConfiguration {
         &self.local_key_file
     }
 
+    /// Returns an operator-configured destination only when its scope includes
+    /// the authenticated tenant. No configured entries means durable export is
+    /// disabled.
+    #[must_use]
+    pub fn export_destination(
+        &self,
+        tenant_id: TenantId,
+        name: &str,
+    ) -> Option<ConfiguredExportDestination> {
+        self.export_destinations
+            .iter()
+            .find(|destination| destination.name == name)
+            .and_then(|destination| destination.resolve(tenant_id))
+    }
+
+    #[must_use]
+    pub const fn durable_exports_enabled(&self) -> bool {
+        !self.export_destinations.is_empty()
+    }
+
     #[must_use]
     pub fn source_for(&self, path: &str) -> Option<SettingSource> {
         setting_for_path(path).and_then(|setting| self.sources.get(setting_index(setting)).copied())
@@ -197,6 +267,22 @@ impl EffectiveConfiguration {
         rendered.push_str("\"\nloki_push_bind_address = \"");
         rendered.push_str(&self.loki_push_bind_address.to_string());
         rendered.push('"');
+        for destination in &self.export_destinations {
+            rendered.push_str("\n\n[[export.destination]]\nname = \"");
+            rendered.push_str(&destination.name);
+            rendered.push_str("\"\nidentity = \"");
+            rendered.push_str(&hexadecimal_identity(destination.identity));
+            rendered.push_str("\"\nallowed_tenants = [");
+            for (index, tenant) in destination.allowed_tenants.iter().enumerate() {
+                if index != 0 {
+                    rendered.push_str(", ");
+                }
+                rendered.push('"');
+                rendered.push_str(&tenant.to_canonical_text());
+                rendered.push('"');
+            }
+            rendered.push(']');
+        }
         if let Some(warning) = self.security_warnings().first() {
             rendered.push_str("\n\n[warnings]\nwarning = \"");
             rendered.push_str(warning.message());
@@ -261,8 +347,19 @@ impl EffectiveConfiguration {
             Setting::StorageDataDirectory => self.data_directory != other.data_directory,
             Setting::StorageSecretsDirectory => self.secrets_directory != other.secrets_directory,
             Setting::SecurityLocalKeyFile => self.local_key_file != other.local_key_file,
+            Setting::ExportDestinations => self.export_destinations != other.export_destinations,
         }
     }
+}
+
+fn hexadecimal_identity(identity: [u8; 16]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut rendered = String::with_capacity(32);
+    for byte in identity {
+        rendered.push(char::from(HEX[usize::from(byte >> 4)]));
+        rendered.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    rendered
 }
 
 impl Debug for EffectiveConfiguration {
@@ -284,6 +381,7 @@ impl Debug for EffectiveConfiguration {
             .field("data_directory", &self.data_directory)
             .field("secrets_directory", &self.secrets_directory)
             .field("local_key_file", &"<redacted>")
+            .field("export_destination_count", &self.export_destinations.len())
             .field("sources", &self.sources)
             .finish()
     }

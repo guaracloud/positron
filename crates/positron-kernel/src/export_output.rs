@@ -12,7 +12,7 @@ use crate::{
     SnapshotLeaseId, TransactionId,
 };
 
-const DESCRIPTOR_MAGIC: [u8; 8] = *b"POSEXP02";
+const DESCRIPTOR_MAGIC: [u8; 8] = *b"POSEXP03";
 const PAYLOAD_MAGIC: [u8; 8] = *b"POEXBAT1";
 const MANIFEST_MAGIC: [u8; 8] = *b"POEXMAN1";
 const EXPORT_DIRECTORY: &str = "exports";
@@ -31,12 +31,13 @@ const MAX_EXPORT_BYTES: u64 = 1_073_741_824;
 const MAX_PROTECTED_RECORD_BYTES: usize =
     MAX_EXPORT_BATCH_BYTES + MAX_CONTINUATION_CURSOR_BYTES + 512;
 const PAYLOAD_FIXED_BYTES: usize = 54;
-const INITIAL_CURSOR_FIXED_BYTES: usize = 10;
+const INITIAL_CURSOR_FIXED_BYTES: usize = 170;
 const MANIFEST_FIXED_BYTES: usize = 12;
 const MAX_PROTECTED_MANIFEST_BYTES: usize = MAX_EXPORT_MANIFEST_BYTES + 512;
 const MAX_PROTECTED_INITIAL_CURSOR_BYTES: usize = MAX_CONTINUATION_CURSOR_BYTES + 512;
-const INITIAL_CURSOR_MAGIC: [u8; 8] = *b"POEXINI1";
-const DESCRIPTOR_BYTES: usize = 248;
+const INITIAL_CURSOR_MAGIC: [u8; 8] = *b"POEXINI2";
+const EXPORT_OUTPUT_BINDING_BYTES: usize = 160;
+const DESCRIPTOR_BYTES: usize = 264;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExportOutputFailureCode {
@@ -71,9 +72,61 @@ impl std::fmt::Display for ExportOutputFailure {
 }
 impl std::error::Error for ExportOutputFailure {}
 
+/// Stable, authenticated caller intent for one durable export operation.
+///
+/// The operation identity is accepted by governance before Query admits a
+/// snapshot. It addresses the protected initial preparation independently of
+/// later Catalog generations or clock readings.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExportOutputRequest {
+    operation_id: [u8; 16],
+    tenant: TenantId,
+    destination: [u8; 16],
+    request_digest: [u8; 32],
+}
+
+impl ExportOutputRequest {
+    pub fn new(
+        operation_id: [u8; 16],
+        tenant: TenantId,
+        destination: [u8; 16],
+        request_digest: [u8; 32],
+    ) -> Result<Self, ExportOutputFailure> {
+        if operation_id.iter().all(|byte| *byte == 0)
+            || destination.iter().all(|byte| *byte == 0)
+            || request_digest.iter().all(|byte| *byte == 0)
+        {
+            return Err(fail(ExportOutputFailureCode::InvalidBinding));
+        }
+        Ok(Self {
+            operation_id,
+            tenant,
+            destination,
+            request_digest,
+        })
+    }
+    #[must_use]
+    pub const fn operation_id(self) -> [u8; 16] {
+        self.operation_id
+    }
+    #[must_use]
+    pub const fn tenant(self) -> TenantId {
+        self.tenant
+    }
+    #[must_use]
+    pub const fn destination(self) -> [u8; 16] {
+        self.destination
+    }
+    #[must_use]
+    pub const fn request_digest(self) -> [u8; 32] {
+        self.request_digest
+    }
+}
+
 /// Immutable identity binding for one bounded durable export payload.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExportOutputBinding {
+    operation_id: [u8; 16],
     tenant: TenantId,
     destination: [u8; 16],
     request_digest: [u8; 32],
@@ -97,9 +150,44 @@ impl ExportOutputBinding {
         lease_started_at: u64,
         lease_expiry_at: u64,
     ) -> Result<Self, ExportOutputFailure> {
-        if destination.iter().all(|byte| *byte == 0)
-            || request_digest.iter().all(|byte| *byte == 0)
-            || snapshot_identity.iter().all(|byte| *byte == 0)
+        let request = ExportOutputRequest::new(
+            legacy_operation_id(
+                tenant,
+                destination,
+                request_digest,
+                snapshot_identity,
+                snapshot_generation,
+                snapshot_frontier,
+                lease,
+                lease_started_at,
+                lease_expiry_at,
+            ),
+            tenant,
+            destination,
+            request_digest,
+        )?;
+        Self::new_for_operation(
+            request,
+            snapshot_identity,
+            snapshot_generation,
+            snapshot_frontier,
+            lease,
+            lease_started_at,
+            lease_expiry_at,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_for_operation(
+        request: ExportOutputRequest,
+        snapshot_identity: [u8; 32],
+        snapshot_generation: u64,
+        snapshot_frontier: u64,
+        lease: SnapshotLeaseId,
+        lease_started_at: u64,
+        lease_expiry_at: u64,
+    ) -> Result<Self, ExportOutputFailure> {
+        if snapshot_identity.iter().all(|byte| *byte == 0)
             || snapshot_generation == 0
             || lease_expiry_at <= lease_started_at
             || lease_expiry_at
@@ -111,9 +199,10 @@ impl ExportOutputBinding {
             ));
         }
         Ok(Self {
-            tenant,
-            destination,
-            request_digest,
+            operation_id: request.operation_id,
+            tenant: request.tenant,
+            destination: request.destination,
+            request_digest: request.request_digest,
             snapshot_identity,
             snapshot_generation,
             snapshot_frontier,
@@ -121,6 +210,19 @@ impl ExportOutputBinding {
             lease_started_at,
             lease_expiry_at,
         })
+    }
+    #[must_use]
+    pub const fn request(self) -> ExportOutputRequest {
+        ExportOutputRequest {
+            operation_id: self.operation_id,
+            tenant: self.tenant,
+            destination: self.destination,
+            request_digest: self.request_digest,
+        }
+    }
+    #[must_use]
+    pub const fn operation_id(self) -> [u8; 16] {
+        self.operation_id
     }
     #[must_use]
     pub const fn tenant(self) -> TenantId {
@@ -216,6 +318,56 @@ pub struct ExportOutput {
 }
 
 impl ExportOutput {
+    /// Recovers an initial preparation addressed by the accepted durable
+    /// operation. The record is authenticated before its original snapshot
+    /// binding can be returned, and an expired preparation remains terminal.
+    pub fn recover_initial(
+        catalog: &Catalog<'_>,
+        request: ExportOutputRequest,
+        observed_at: u64,
+    ) -> Result<Option<Self>, ExportOutputFailure> {
+        let _operation = catalog
+            .export_output_operation
+            .lock()
+            .map_err(|_| fail(ExportOutputFailureCode::ConcurrentWriter))?;
+        let identity = output_identity_for_operation(request.operation_id);
+        match Self::reopen_unlocked(catalog, identity) {
+            Ok(output) => {
+                if output.binding.request() != request {
+                    return Err(fail(ExportOutputFailureCode::AuthenticationFailed));
+                }
+                output.require_live(observed_at)?;
+                let prepared = read_initial_preparation(catalog, identity)?
+                    .ok_or_else(|| fail(ExportOutputFailureCode::IntegrityCorruption))?;
+                if prepared.binding != output.binding {
+                    return Err(fail(ExportOutputFailureCode::IntegrityCorruption));
+                }
+                Ok(Some(output))
+            },
+            Err(error) if error.code() == ExportOutputFailureCode::StorageUnavailable => {
+                let Some(prepared) = read_initial_preparation(catalog, identity)? else {
+                    return Ok(None);
+                };
+                if prepared.binding.request() != request {
+                    return Err(fail(ExportOutputFailureCode::AuthenticationFailed));
+                }
+                let output = Self {
+                    identity,
+                    binding: prepared.binding,
+                    next_sequence: 0,
+                    retained_bytes: 0,
+                    last_digest: [0; 32],
+                    manifest_digest: [0; 32],
+                };
+                output.require_live(observed_at)?;
+                ensure_payload_file(catalog, identity, true)?;
+                output.publish(catalog)?;
+                Ok(Some(output))
+            },
+            Err(error) => Err(error),
+        }
+    }
+
     /// Finds the sole protected output for an authenticated export request.
     /// This recovery lookup exposes no payload and rejects ambiguous Catalog
     /// state before a restarted Query operation can attach to it.
@@ -304,9 +456,9 @@ impl ExportOutput {
             .map_err(|_| fail(ExportOutputFailureCode::ConcurrentWriter))?;
         match Self::reopen_unlocked(catalog, identity) {
             Ok(existing) if existing.binding == binding => {
-                let stored = read_unpublished_initial_cursor(catalog, identity)?
+                let stored = read_initial_preparation(catalog, identity)?
                     .ok_or_else(|| fail(ExportOutputFailureCode::IntegrityCorruption))?;
-                if stored == initial_cursor {
+                if stored.binding == binding && stored.cursor == initial_cursor {
                     Ok(existing)
                 } else {
                     Err(fail(ExportOutputFailureCode::IdempotencyConflict))
@@ -322,12 +474,14 @@ impl ExportOutput {
                     last_digest: [0; 32],
                     manifest_digest: [0; 32],
                 };
-                match read_unpublished_initial_cursor(catalog, identity)? {
-                    Some(stored) if stored != initial_cursor => {
+                match read_initial_preparation(catalog, identity)? {
+                    Some(stored)
+                        if stored.binding != binding || stored.cursor != initial_cursor =>
+                    {
                         return Err(fail(ExportOutputFailureCode::IdempotencyConflict));
                     },
                     Some(_) => {},
-                    None => write_initial_cursor(catalog, &output, initial_cursor)?,
+                    None => write_initial_preparation(catalog, &output, initial_cursor)?,
                 }
                 ensure_payload_file(catalog, identity, true)?;
                 output.publish(catalog)?;
@@ -649,7 +803,12 @@ impl ExportOutput {
             .export_output_operation
             .lock()
             .map_err(|_| fail(ExportOutputFailureCode::ConcurrentWriter))?;
-        read_unpublished_initial_cursor(catalog, self.identity)
+        let prepared = read_initial_preparation(catalog, self.identity)?;
+        match prepared {
+            Some(prepared) if prepared.binding == self.binding => Ok(Some(prepared.cursor)),
+            Some(_) => Err(fail(ExportOutputFailureCode::IntegrityCorruption)),
+            None => Ok(None),
+        }
     }
     pub fn read_batch(
         &self,
@@ -847,8 +1006,9 @@ impl ExportOutput {
             objects.push(CatalogObject::new(bytes.to_vec()).map_err(map_catalog_failure)?);
         }
         objects.push(CatalogObject::new(encode_descriptor(self)?).map_err(map_catalog_failure)?);
-        let transaction = TransactionId::new(transaction_identity(self))
-            .map_err(|_| fail(ExportOutputFailureCode::LimitExceeded))?;
+        let transaction =
+            TransactionId::new(transaction_identity(self, snapshot.identity().to_bytes()))
+                .map_err(|_| fail(ExportOutputFailureCode::LimitExceeded))?;
         let proposal = CatalogProposal::new(
             transaction,
             snapshot.format_epoch().unwrap_or(FormatEpoch::CATALOG_V2),
@@ -1077,12 +1237,12 @@ fn create_manifest_file(
     Ok(())
 }
 
-fn write_initial_cursor(
+fn write_initial_preparation(
     catalog: &Catalog<'_>,
     output: &ExportOutput,
     cursor: &[u8],
 ) -> Result<(), ExportOutputFailure> {
-    let plaintext = encode_initial_cursor(cursor)?;
+    let plaintext = encode_initial_preparation(output.binding, cursor)?;
     let protected = catalog
         .protect_export_output(
             initial_cursor_identity(output.identity),
@@ -1124,10 +1284,16 @@ fn create_named_protected_file(
     Ok(())
 }
 
-fn read_unpublished_initial_cursor(
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct InitialPreparation {
+    binding: ExportOutputBinding,
+    cursor: Vec<u8>,
+}
+
+fn read_initial_preparation(
     catalog: &Catalog<'_>,
     identity: [u8; 16],
-) -> Result<Option<Vec<u8>>, ExportOutputFailure> {
+) -> Result<Option<InitialPreparation>, ExportOutputFailure> {
     let Some(protected) = read_named_protected_file(
         catalog,
         identity,
@@ -1144,7 +1310,7 @@ fn read_unpublished_initial_cursor(
             &protected,
         )
         .map_err(map_catalog_failure)?;
-    Ok(Some(decode_initial_cursor(&plaintext)?))
+    Ok(Some(decode_initial_preparation(&plaintext)?))
 }
 
 fn read_named_protected_file(
@@ -1304,7 +1470,10 @@ fn decode_manifest(bytes: &[u8]) -> Result<Vec<u8>, ExportOutputFailure> {
     Ok(bytes[MANIFEST_FIXED_BYTES..].to_vec())
 }
 
-fn encode_initial_cursor(cursor: &[u8]) -> Result<Vec<u8>, ExportOutputFailure> {
+fn encode_initial_preparation(
+    binding: ExportOutputBinding,
+    cursor: &[u8],
+) -> Result<Vec<u8>, ExportOutputFailure> {
     if cursor.is_empty() || cursor.len() > MAX_CONTINUATION_CURSOR_BYTES {
         return Err(fail(ExportOutputFailureCode::LimitExceeded));
     }
@@ -1317,6 +1486,7 @@ fn encode_initial_cursor(cursor: &[u8]) -> Result<Vec<u8>, ExportOutputFailure> 
         )
         .map_err(|_| fail(ExportOutputFailureCode::LimitExceeded))?;
     bytes.extend_from_slice(&INITIAL_CURSOR_MAGIC);
+    encode_binding(&mut bytes, binding);
     bytes.extend_from_slice(
         &u16::try_from(cursor.len())
             .map_err(|_| fail(ExportOutputFailureCode::LimitExceeded))?
@@ -1326,14 +1496,25 @@ fn encode_initial_cursor(cursor: &[u8]) -> Result<Vec<u8>, ExportOutputFailure> 
     Ok(bytes)
 }
 
-fn decode_initial_cursor(bytes: &[u8]) -> Result<Vec<u8>, ExportOutputFailure> {
+fn decode_initial_preparation(bytes: &[u8]) -> Result<InitialPreparation, ExportOutputFailure> {
     if bytes.len() < INITIAL_CURSOR_FIXED_BYTES
         || bytes.get(..8) != Some(INITIAL_CURSOR_MAGIC.as_slice())
     {
         return Err(fail(ExportOutputFailureCode::IntegrityCorruption));
     }
+    let binding_end = 8_usize
+        .checked_add(EXPORT_OUTPUT_BINDING_BYTES)
+        .ok_or_else(|| fail(ExportOutputFailureCode::LimitExceeded))?;
+    let binding = decode_binding(
+        bytes
+            .get(8..binding_end)
+            .ok_or_else(|| fail(ExportOutputFailureCode::IntegrityCorruption))?,
+    )?;
+    let length_end = binding_end
+        .checked_add(2)
+        .ok_or_else(|| fail(ExportOutputFailureCode::LimitExceeded))?;
     let length = usize::from(u16::from_be_bytes(
-        bytes[8..10]
+        bytes[binding_end..length_end]
             .try_into()
             .map_err(|_| fail(ExportOutputFailureCode::IntegrityCorruption))?,
     ));
@@ -1343,7 +1524,10 @@ fn decode_initial_cursor(bytes: &[u8]) -> Result<Vec<u8>, ExportOutputFailure> {
     {
         return Err(fail(ExportOutputFailureCode::IntegrityCorruption));
     }
-    Ok(bytes[INITIAL_CURSOR_FIXED_BYTES..].to_vec())
+    Ok(InitialPreparation {
+        binding,
+        cursor: bytes[INITIAL_CURSOR_FIXED_BYTES..].to_vec(),
+    })
 }
 
 fn open_directory(parent: &File, name: &str, create: bool) -> Result<File, ExportOutputFailure> {
@@ -1448,15 +1632,7 @@ fn encode_descriptor(output: &ExportOutput) -> Result<Vec<u8>, ExportOutputFailu
         .map_err(|_| fail(ExportOutputFailureCode::LimitExceeded))?;
     bytes.extend_from_slice(&DESCRIPTOR_MAGIC);
     bytes.extend_from_slice(&output.identity);
-    bytes.extend_from_slice(&output.binding.tenant.to_bytes());
-    bytes.extend_from_slice(&output.binding.destination);
-    bytes.extend_from_slice(&output.binding.request_digest);
-    bytes.extend_from_slice(&output.binding.snapshot_identity);
-    bytes.extend_from_slice(&output.binding.snapshot_generation.to_be_bytes());
-    bytes.extend_from_slice(&output.binding.snapshot_frontier.to_be_bytes());
-    bytes.extend_from_slice(&output.binding.lease.to_bytes());
-    bytes.extend_from_slice(&output.binding.lease_started_at.to_be_bytes());
-    bytes.extend_from_slice(&output.binding.lease_expiry_at.to_be_bytes());
+    encode_binding(&mut bytes, output.binding);
     bytes.extend_from_slice(&output.next_sequence.to_be_bytes());
     bytes.extend_from_slice(&output.retained_bytes.to_be_bytes());
     bytes.extend_from_slice(&output.last_digest);
@@ -1470,68 +1646,23 @@ fn decode_descriptor(bytes: &[u8]) -> Result<Option<ExportOutput>, ExportOutputF
     if bytes.len() != DESCRIPTOR_BYTES {
         return Err(fail(ExportOutputFailureCode::IntegrityCorruption));
     }
-    let sixteen = |start, end| {
-        bytes[start..end]
-            .try_into()
-            .map_err(|_| fail(ExportOutputFailureCode::IntegrityCorruption))
-    };
     let mut identity = [0; 16];
     identity.copy_from_slice(&bytes[8..24]);
-    let tenant = TenantId::from_bytes(sixteen(24, 40)?)
-        .map_err(|_| fail(ExportOutputFailureCode::IntegrityCorruption))?;
-    let mut destination = [0; 16];
-    destination.copy_from_slice(&bytes[40..56]);
-    let mut request = [0; 32];
-    request.copy_from_slice(&bytes[56..88]);
-    let mut snapshot = [0; 32];
-    snapshot.copy_from_slice(&bytes[88..120]);
-    let generation = u64::from_be_bytes(
-        bytes[120..128]
-            .try_into()
-            .map_err(|_| fail(ExportOutputFailureCode::IntegrityCorruption))?,
-    );
-    let frontier = u64::from_be_bytes(
-        bytes[128..136]
-            .try_into()
-            .map_err(|_| fail(ExportOutputFailureCode::IntegrityCorruption))?,
-    );
-    let lease = SnapshotLeaseId::new(sixteen(136, 152)?)
-        .map_err(|_| fail(ExportOutputFailureCode::IntegrityCorruption))?;
-    let started = u64::from_be_bytes(
-        bytes[152..160]
-            .try_into()
-            .map_err(|_| fail(ExportOutputFailureCode::IntegrityCorruption))?,
-    );
-    let expiry = u64::from_be_bytes(
-        bytes[160..168]
-            .try_into()
-            .map_err(|_| fail(ExportOutputFailureCode::IntegrityCorruption))?,
-    );
+    let binding = decode_binding(&bytes[24..184])?;
     let next = u64::from_be_bytes(
-        bytes[168..176]
+        bytes[184..192]
             .try_into()
             .map_err(|_| fail(ExportOutputFailureCode::IntegrityCorruption))?,
     );
     let retained = u64::from_be_bytes(
-        bytes[176..184]
+        bytes[192..200]
             .try_into()
             .map_err(|_| fail(ExportOutputFailureCode::IntegrityCorruption))?,
     );
     let mut last = [0; 32];
-    last.copy_from_slice(&bytes[184..216]);
+    last.copy_from_slice(&bytes[200..232]);
     let mut manifest_digest = [0; 32];
-    manifest_digest.copy_from_slice(&bytes[216..248]);
-    let binding = ExportOutputBinding::new(
-        tenant,
-        destination,
-        request,
-        snapshot,
-        generation,
-        frontier,
-        lease,
-        started,
-        expiry,
-    )?;
+    manifest_digest.copy_from_slice(&bytes[232..264]);
     if identity != output_identity(binding)
         || next > MAX_EXPORT_BATCHES
         || retained > MAX_EXPORT_BYTES
@@ -1550,21 +1681,96 @@ fn decode_descriptor(bytes: &[u8]) -> Result<Option<ExportOutput>, ExportOutputF
     }))
 }
 fn output_identity(binding: ExportOutputBinding) -> [u8; 16] {
+    output_identity_for_operation(binding.operation_id)
+}
+
+fn output_identity_for_operation(operation_id: [u8; 16]) -> [u8; 16] {
     let mut hash = Sha256::new();
-    hash.update(b"positron.export-output.binding.v2\0");
-    hash.update(binding.tenant.to_bytes());
-    hash.update(binding.destination);
-    hash.update(binding.request_digest);
-    hash.update(binding.snapshot_identity);
-    hash.update(binding.snapshot_generation.to_be_bytes());
-    hash.update(binding.snapshot_frontier.to_be_bytes());
-    hash.update(binding.lease.to_bytes());
-    hash.update(binding.lease_started_at.to_be_bytes());
-    hash.update(binding.lease_expiry_at.to_be_bytes());
+    hash.update(b"positron.export-output.operation.v1\0");
+    hash.update(operation_id);
     let digest: [u8; 32] = hash.finalize().into();
     let mut identity = [0; 16];
     identity.copy_from_slice(&digest[..16]);
     identity
+}
+
+#[allow(clippy::too_many_arguments)]
+fn legacy_operation_id(
+    tenant: TenantId,
+    destination: [u8; 16],
+    request_digest: [u8; 32],
+    snapshot_identity: [u8; 32],
+    snapshot_generation: u64,
+    snapshot_frontier: u64,
+    lease: SnapshotLeaseId,
+    lease_started_at: u64,
+    lease_expiry_at: u64,
+) -> [u8; 16] {
+    let mut hash = Sha256::new();
+    hash.update(b"positron.export-output.legacy-operation.v1\0");
+    hash.update(tenant.to_bytes());
+    hash.update(destination);
+    hash.update(request_digest);
+    hash.update(snapshot_identity);
+    hash.update(snapshot_generation.to_be_bytes());
+    hash.update(snapshot_frontier.to_be_bytes());
+    hash.update(lease.to_bytes());
+    hash.update(lease_started_at.to_be_bytes());
+    hash.update(lease_expiry_at.to_be_bytes());
+    let digest: [u8; 32] = hash.finalize().into();
+    let mut operation_id = [0; 16];
+    operation_id.copy_from_slice(&digest[..16]);
+    operation_id
+}
+
+fn encode_binding(bytes: &mut Vec<u8>, binding: ExportOutputBinding) {
+    bytes.extend_from_slice(&binding.operation_id);
+    bytes.extend_from_slice(&binding.tenant.to_bytes());
+    bytes.extend_from_slice(&binding.destination);
+    bytes.extend_from_slice(&binding.request_digest);
+    bytes.extend_from_slice(&binding.snapshot_identity);
+    bytes.extend_from_slice(&binding.snapshot_generation.to_be_bytes());
+    bytes.extend_from_slice(&binding.snapshot_frontier.to_be_bytes());
+    bytes.extend_from_slice(&binding.lease.to_bytes());
+    bytes.extend_from_slice(&binding.lease_started_at.to_be_bytes());
+    bytes.extend_from_slice(&binding.lease_expiry_at.to_be_bytes());
+}
+
+fn decode_binding(bytes: &[u8]) -> Result<ExportOutputBinding, ExportOutputFailure> {
+    if bytes.len() != EXPORT_OUTPUT_BINDING_BYTES {
+        return Err(fail(ExportOutputFailureCode::IntegrityCorruption));
+    }
+    let request = ExportOutputRequest::new(
+        bounded_array(bytes, 0)?,
+        TenantId::from_bytes(bounded_array(bytes, 16)?)
+            .map_err(|_| fail(ExportOutputFailureCode::IntegrityCorruption))?,
+        bounded_array(bytes, 32)?,
+        bounded_array(bytes, 48)?,
+    )?;
+    ExportOutputBinding::new_for_operation(
+        request,
+        bounded_array(bytes, 80)?,
+        u64::from_be_bytes(bounded_array(bytes, 112)?),
+        u64::from_be_bytes(bounded_array(bytes, 120)?),
+        SnapshotLeaseId::new(bounded_array(bytes, 128)?)
+            .map_err(|_| fail(ExportOutputFailureCode::IntegrityCorruption))?,
+        u64::from_be_bytes(bounded_array(bytes, 144)?),
+        u64::from_be_bytes(bounded_array(bytes, 152)?),
+    )
+}
+
+fn bounded_array<const N: usize>(
+    bytes: &[u8],
+    start: usize,
+) -> Result<[u8; N], ExportOutputFailure> {
+    let end = start
+        .checked_add(N)
+        .ok_or_else(|| fail(ExportOutputFailureCode::LimitExceeded))?;
+    bytes
+        .get(start..end)
+        .ok_or_else(|| fail(ExportOutputFailureCode::IntegrityCorruption))?
+        .try_into()
+        .map_err(|_| fail(ExportOutputFailureCode::IntegrityCorruption))
 }
 fn manifest_identity(output: [u8; 16]) -> [u8; 32] {
     let mut hash = Sha256::new();
@@ -1588,13 +1794,14 @@ fn payload_identity(output: [u8; 16], sequence: u64) -> [u8; 32] {
     hash.update(sequence.to_be_bytes());
     hash.finalize().into()
 }
-fn transaction_identity(output: &ExportOutput) -> [u8; 16] {
+fn transaction_identity(output: &ExportOutput, predecessor: [u8; 32]) -> [u8; 16] {
     let mut hash = Sha256::new();
     hash.update(b"positron.export-output.transition.v2\0");
     hash.update(output.identity);
     hash.update(output.next_sequence.to_be_bytes());
     hash.update(output.last_digest);
     hash.update(output.manifest_digest);
+    hash.update(predecessor);
     let digest: [u8; 32] = hash.finalize().into();
     let mut identity = [0; 16];
     identity.copy_from_slice(&digest[..16]);
@@ -1661,4 +1868,5 @@ pub fn fuzz_export_output_record(data: &[u8]) {
     let _ = decode_descriptor(data);
     let _ = decode_payload(0, data);
     let _ = decode_manifest(data);
+    let _ = decode_initial_preparation(data);
 }

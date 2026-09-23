@@ -7,18 +7,26 @@ or mutable output-file capability.
 
 ## Binding and bounds
 
-One fixed-size `POSEXP02` Catalog Object binds an output identity to the
-Tenant ID, configured destination identity, request digest, Query Snapshot
-identity/generation/frontier, Snapshot Lease identity, and lease start/expiry.
+One fixed-size `POSEXP03` Catalog Object binds an output identity to the
+accepted durable Operation ID, Tenant ID, configured destination identity,
+request digest, Query Snapshot identity/generation/frontier, Snapshot Lease
+identity, and lease start/expiry. The output identity is domain-derived from
+that accepted Operation ID alone. A caller idempotency key therefore recovers
+the same operation and output, while a distinct accepted operation gets a
+distinct output even when its query and destination are identical.
 It also records only the next sequence, retained protected-byte total, last Query
 Result Batch digest, and an optional terminal-manifest digest. The descriptor
 contains no batch payload, continuation cursor, or terminal manifest bytes.
 
 Before the descriptor becomes visible, the Kernel synchronizes one separately
-encrypted `initial` artifact containing the authenticated Query Cursor that
-starts the bound snapshot. It uses a distinct Export Output frame context and
-the same 8,192-byte cursor ceiling. An exact creation retry accepts only the
-same cursor, reuses that artifact, and publishes the descriptor. This keeps an
+encrypted `initial` artifact containing the complete original binding and the
+authenticated Query Cursor that starts its snapshot. It uses a distinct Export
+Output frame context and the same 8,192-byte cursor ceiling. Recovery addresses
+this artifact by the accepted Operation ID, authenticates its Tenant,
+destination, and request-digest binding, rejects expiry or tampering, and then
+publishes the original descriptor. It never derives a replacement snapshot,
+lease, cursor, or output identity from a later clock or Catalog generation.
+An exact creation retry accepts only the same binding and cursor. This keeps an
 interrupted first-batch export resumable against its original snapshot after
 the Catalog advances without placing cursor bytes in the fixed descriptor.
 
@@ -96,7 +104,7 @@ key and fingerprint; it never self-authorizes a manifest. The signer reuses the
 existing IKI custody and rotation history and neither exposes its seed nor
 broadens `AuditCheckpointSigner` into a generic signing capability.
 
-`cargo fuzz run export_output_record` exercises the bounded descriptor and
-plaintext-record decoders. `encrypted_frame_open` independently exercises the
+`cargo fuzz run export_output_record` exercises the bounded descriptor, initial
+preparation, and plaintext-record decoders. `encrypted_frame_open` independently exercises the
 shared protected-frame parser and authentication boundary used by every output
 record.

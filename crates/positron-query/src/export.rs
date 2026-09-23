@@ -17,8 +17,8 @@ const MANIFEST_WIRE_MAGIC: &[u8; 8] = b"POSQEM01";
 pub struct ExportDestination([u8; 16]);
 
 impl ExportDestination {
-    /// Validates one non-secret destination identity before execution starts.
-    pub fn new(identity: [u8; 16]) -> Result<Self, QueryFailure> {
+    /// Validates an identity returned only by the configured runtime authority.
+    fn configured(identity: [u8; 16]) -> Result<Self, QueryFailure> {
         (!identity.iter().all(|byte| *byte == 0))
             .then_some(Self(identity))
             .ok_or_else(|| QueryFailure::new(QueryFailureCode::UnsupportedQuery))
@@ -159,10 +159,15 @@ impl ExportSink for KernelExportSink<'_, '_, '_> {
             }
             return self.observer.start(header);
         }
-        let binding = positron_kernel::ExportOutputBinding::new(
+        let request = positron_kernel::ExportOutputRequest::new(
+            self.operation_id.to_bytes(),
             self.tenant,
             self.destination.identity(),
             self.request_digest,
+        )
+        .map_err(Self::map_output_failure)?;
+        let binding = positron_kernel::ExportOutputBinding::new_for_operation(
+            request,
             snapshot.identity(),
             snapshot.generation(),
             snapshot.frontier(),
@@ -477,7 +482,7 @@ fn durable_manifest_from_bytes(bytes: &[u8]) -> Result<ExportManifest, QueryFail
     if read_manifest_array::<8>(bytes, &mut offset)? != *MANIFEST_WIRE_MAGIC {
         return Err(QueryFailure::new(QueryFailureCode::MalformedPersistentData));
     }
-    let destination = ExportDestination::new(read_manifest_array(bytes, &mut offset)?)?;
+    let destination = ExportDestination::configured(read_manifest_array(bytes, &mut offset)?)?;
     let output_identity = read_manifest_array(bytes, &mut offset)?;
     if output_identity.iter().all(|byte| *byte == 0) {
         return Err(QueryFailure::new(QueryFailureCode::MalformedPersistentData));
@@ -581,6 +586,7 @@ fn read_manifest_array<const N: usize>(
 fn query_failure_code(code: QueryFailureCode) -> u8 {
     match code {
         QueryFailureCode::Unauthorized => 1,
+        QueryFailureCode::IdempotencyConflict => 14,
         QueryFailureCode::InvalidBudget => 2,
         QueryFailureCode::BudgetExhausted => 3,
         QueryFailureCode::InvalidCursor => 4,
@@ -599,6 +605,7 @@ fn query_failure_code(code: QueryFailureCode) -> u8 {
 fn query_failure_code_from(code: u8) -> Result<QueryFailureCode, QueryFailure> {
     match code {
         1 => Ok(QueryFailureCode::Unauthorized),
+        14 => Ok(QueryFailureCode::IdempotencyConflict),
         2 => Ok(QueryFailureCode::InvalidBudget),
         3 => Ok(QueryFailureCode::BudgetExhausted),
         4 => Ok(QueryFailureCode::InvalidCursor),
@@ -643,24 +650,18 @@ fn verify_durable_export_signature(
         .map_err(|_| QueryFailure::new(QueryFailureCode::MalformedPersistentData))
 }
 
-impl<'kernel, 'catalog, 'ledger> crate::QueryService<'kernel, 'catalog, 'ledger> {
-    /// Executes a total-order pipeline as a bounded incremental export.
-    ///
-    /// Each sink acknowledgement follows the immutable Result Batch boundary;
-    /// no transport disconnect can be treated as export completion.
-    pub fn export_pipeline(
-        &self,
-        context: positron_governance::AuthorizedContext,
-        source: &str,
-        budget: crate::QueryBudget,
-        destination: ExportDestination,
-        sink: &mut dyn ExportSink,
-    ) -> Result<ExportManifest, QueryFailure> {
-        let request_digest = self.export_request_digest(source, budget, destination)?;
-        let query = self.plan_pipeline(context, source, budget)?;
-        self.export_planned_query(context, query, destination, request_digest, sink)
-    }
+fn map_operation_failure(failure: positron_governance::DurableOperationFailure) -> QueryFailure {
+    use positron_governance::DurableOperationFailure as Failure;
+    let code = match failure {
+        Failure::IdempotencyConflict => QueryFailureCode::IdempotencyConflict,
+        Failure::PersistenceUnavailable => QueryFailureCode::StoreUnavailable,
+        Failure::Unauthorized => QueryFailureCode::Unauthorized,
+        _ => QueryFailureCode::Internal,
+    };
+    QueryFailure::new(code)
+}
 
+impl<'kernel, 'catalog, 'ledger> crate::QueryService<'kernel, 'catalog, 'ledger> {
     /// Runs an export beneath the Catalog-backed Durable Operation lifecycle.
     ///
     /// The operation is accepted before Query Snapshot admission, remains
@@ -672,30 +673,75 @@ impl<'kernel, 'catalog, 'ledger> crate::QueryService<'kernel, 'catalog, 'ledger>
         catalog: &'catalog positron_kernel::Catalog<'kernel>,
         signer: &positron_kernel::ExportManifestSigner,
         context: positron_governance::AuthorizedContext,
+        idempotency: positron_governance::AdministrativeIdempotencyKey,
         source: &str,
         budget: crate::QueryBudget,
-        destination: ExportDestination,
+        destination_name: &str,
+        sink: &mut dyn ExportSink,
+    ) -> Result<DurableExportReceipt, QueryFailure> {
+        self.export_as_operation(
+            catalog,
+            signer,
+            context,
+            idempotency,
+            source,
+            budget,
+            destination_name,
+            crate::query_service::QueryLanguage::Pipeline,
+            sink,
+        )
+    }
+
+    /// Runs a bounded read-only SQL export through the same durable executor
+    /// as a native pipeline export.
+    #[allow(clippy::too_many_arguments)]
+    pub fn export_sql_as_operation(
+        &self,
+        catalog: &'catalog positron_kernel::Catalog<'kernel>,
+        signer: &positron_kernel::ExportManifestSigner,
+        context: positron_governance::AuthorizedContext,
+        idempotency: positron_governance::AdministrativeIdempotencyKey,
+        source: &str,
+        budget: crate::QueryBudget,
+        destination_name: &str,
+        sink: &mut dyn ExportSink,
+    ) -> Result<DurableExportReceipt, QueryFailure> {
+        self.export_as_operation(
+            catalog,
+            signer,
+            context,
+            idempotency,
+            source,
+            budget,
+            destination_name,
+            crate::query_service::QueryLanguage::Sql,
+            sink,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn export_as_operation(
+        &self,
+        catalog: &'catalog positron_kernel::Catalog<'kernel>,
+        signer: &positron_kernel::ExportManifestSigner,
+        context: positron_governance::AuthorizedContext,
+        idempotency: positron_governance::AdministrativeIdempotencyKey,
+        source: &str,
+        budget: crate::QueryBudget,
+        destination_name: &str,
+        language: crate::query_service::QueryLanguage,
         sink: &mut dyn ExportSink,
     ) -> Result<DurableExportReceipt, QueryFailure> {
         if signer.identity() != catalog_integrity_identity(catalog)? {
             return Err(QueryFailure::new(QueryFailureCode::Unauthorized));
         }
-        let request_digest = self.export_request_digest(source, budget, destination)?;
+        let destination = self.resolve_export_destination(context, destination_name)?;
+        let request_digest = self.export_request_digest(source, budget, destination, language)?;
         let generation = self.current_query_catalog(context)?.2;
         let accepted_at = self.now()?;
-        let mut key = [0_u8; 16];
-        key.copy_from_slice(
-            request_digest
-                .get(..16)
-                .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?,
-        );
-        if key.iter().all(|byte| *byte == 0) {
-            key[0] = 1;
-        }
         let request = positron_governance::DurableOperationRequest::query_export(
             context.principal_id(),
-            positron_governance::AdministrativeIdempotencyKey::new(key)
-                .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?,
+            idempotency,
             destination.identity(),
             generation,
             accepted_at,
@@ -705,16 +751,54 @@ impl<'kernel, 'catalog, 'ledger> crate::QueryService<'kernel, 'catalog, 'ledger>
         let accepted = positron_governance::DurableOperationAdministration::accept_query_export(
             catalog, context, request,
         )
-        .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
+        .map_err(map_operation_failure)?;
         let operation_id = accepted.operation_id();
-        let _running = positron_governance::DurableOperationAdministration::begin_query_export(
-            catalog,
-            context,
-            operation_id,
-            self.now()?,
-        )
-        .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
         let tenant = self.validate_current_query_context(context)?;
+        let output_request = positron_kernel::ExportOutputRequest::new(
+            operation_id.to_bytes(),
+            tenant,
+            destination.identity(),
+            request_digest,
+        )
+        .map_err(KernelExportSink::map_output_failure)?;
+        let recovered_output =
+            positron_kernel::ExportOutput::recover_initial(catalog, output_request, self.now()?)
+                .map_err(KernelExportSink::map_output_failure)?;
+        if accepted.status() == positron_governance::DurableOperationStatus::Succeeded {
+            let output = recovered_output
+                .ok_or_else(|| QueryFailure::new(QueryFailureCode::StoreUnavailable))?;
+            return self.resolve_durable_export(
+                catalog,
+                context,
+                operation_id,
+                output.identity(),
+                destination_name,
+            );
+        }
+        if accepted.status() == positron_governance::DurableOperationStatus::Running
+            && recovered_output.is_some()
+        {
+            return self.resume_as_durable_export(
+                catalog,
+                signer,
+                context,
+                operation_id,
+                source,
+                budget,
+                destination_name,
+                language,
+                sink,
+            );
+        }
+        if accepted.status() == positron_governance::DurableOperationStatus::Pending {
+            let _running = positron_governance::DurableOperationAdministration::begin_query_export(
+                catalog,
+                context,
+                operation_id,
+                self.now()?,
+            )
+            .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
+        }
         let mut kernel_sink = KernelExportSink {
             catalog,
             tenant,
@@ -727,7 +811,7 @@ impl<'kernel, 'catalog, 'ledger> crate::QueryService<'kernel, 'catalog, 'ledger>
             context,
             first_batch_started: false,
         };
-        let query = match self.plan_pipeline(context, source, budget) {
+        let query = match self.plan(context, source, budget, language) {
             Ok(query) => query,
             Err(failure) => {
                 let _ = positron_governance::DurableOperationAdministration::fail_query_export(
@@ -809,8 +893,9 @@ impl<'kernel, 'catalog, 'ledger> crate::QueryService<'kernel, 'catalog, 'ledger>
         context: positron_governance::AuthorizedContext,
         operation_id: positron_governance::OperationId,
         output_identity: [u8; 16],
-        destination: ExportDestination,
+        destination_name: &str,
     ) -> Result<DurableExportReceipt, QueryFailure> {
+        let destination = self.resolve_export_destination(context, destination_name)?;
         let tenant = self.validate_current_query_context(context)?;
         let operation =
             positron_governance::DurableOperationAdministration::inspect(catalog, operation_id)
@@ -894,21 +979,71 @@ impl<'kernel, 'catalog, 'ledger> crate::QueryService<'kernel, 'catalog, 'ledger>
         operation_id: positron_governance::OperationId,
         source: &str,
         budget: crate::QueryBudget,
-        destination: ExportDestination,
+        destination_name: &str,
+        sink: &mut dyn ExportSink,
+    ) -> Result<DurableExportReceipt, QueryFailure> {
+        self.resume_as_durable_export(
+            catalog,
+            signer,
+            context,
+            operation_id,
+            source,
+            budget,
+            destination_name,
+            crate::query_service::QueryLanguage::Pipeline,
+            sink,
+        )
+    }
+
+    /// Resumes an interrupted bounded SQL export through its original cursor,
+    /// Snapshot Lease, and cumulative budget.
+    #[allow(clippy::too_many_arguments)]
+    pub fn resume_sql_durable_export(
+        &self,
+        catalog: &'catalog positron_kernel::Catalog<'kernel>,
+        signer: &positron_kernel::ExportManifestSigner,
+        context: positron_governance::AuthorizedContext,
+        operation_id: positron_governance::OperationId,
+        source: &str,
+        budget: crate::QueryBudget,
+        destination_name: &str,
+        sink: &mut dyn ExportSink,
+    ) -> Result<DurableExportReceipt, QueryFailure> {
+        self.resume_as_durable_export(
+            catalog,
+            signer,
+            context,
+            operation_id,
+            source,
+            budget,
+            destination_name,
+            crate::query_service::QueryLanguage::Sql,
+            sink,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resume_as_durable_export(
+        &self,
+        catalog: &'catalog positron_kernel::Catalog<'kernel>,
+        signer: &positron_kernel::ExportManifestSigner,
+        context: positron_governance::AuthorizedContext,
+        operation_id: positron_governance::OperationId,
+        source: &str,
+        budget: crate::QueryBudget,
+        destination_name: &str,
+        language: crate::query_service::QueryLanguage,
         sink: &mut dyn ExportSink,
     ) -> Result<DurableExportReceipt, QueryFailure> {
         if signer.identity() != catalog_integrity_identity(catalog)? {
             return Err(QueryFailure::new(QueryFailureCode::Unauthorized));
         }
-        let request_digest = self.export_request_digest(source, budget, destination)?;
         let operation =
             positron_governance::DurableOperationAdministration::inspect(catalog, operation_id)
                 .map_err(|_| QueryFailure::new(QueryFailureCode::StoreUnavailable))?
                 .ok_or_else(|| QueryFailure::new(QueryFailureCode::Unauthorized))?;
         if operation.kind() != positron_governance::DurableOperationKind::QueryExport
             || operation.request().principal() != context.principal_id()
-            || operation.target_identity() != Some(destination.identity())
-            || operation.request().query_export_request_digest() != Some(request_digest)
         {
             return Err(QueryFailure::new(QueryFailureCode::Unauthorized));
         }
@@ -931,14 +1066,42 @@ impl<'kernel, 'catalog, 'ledger> crate::QueryService<'kernel, 'catalog, 'ledger>
                 });
             },
         };
-        let output = positron_kernel::ExportOutput::find_for_request(
+        let destination = self.resolve_export_destination_for_tenant(tenant, destination_name)?;
+        let request_digest = self.export_request_digest(source, budget, destination, language)?;
+        if operation.target_identity() != Some(destination.identity())
+            || operation.request().query_export_request_digest() != Some(request_digest)
+        {
+            return Err(QueryFailure::new(QueryFailureCode::Unauthorized));
+        }
+        let output = match positron_kernel::ExportOutput::recover_initial(
             catalog,
-            tenant,
-            destination.identity(),
-            request_digest,
-        )
-        .map_err(KernelExportSink::map_output_failure)?
-        .ok_or_else(|| QueryFailure::new(QueryFailureCode::StoreUnavailable))?;
+            positron_kernel::ExportOutputRequest::new(
+                operation_id.to_bytes(),
+                tenant,
+                destination.identity(),
+                request_digest,
+            )
+            .map_err(KernelExportSink::map_output_failure)?,
+            self.now()?,
+        ) {
+            Ok(Some(output)) => output,
+            Ok(None) => return Err(QueryFailure::new(QueryFailureCode::StoreUnavailable)),
+            Err(error) => {
+                if error.code() == positron_kernel::ExportOutputFailureCode::Expired
+                    && operation.status() == positron_governance::DurableOperationStatus::Running
+                {
+                    positron_governance::DurableOperationAdministration::fail_query_export(
+                        catalog,
+                        context,
+                        operation_id,
+                        self.now()?,
+                        positron_governance::DurableOperationTerminalError::HandlerRejected,
+                    )
+                    .map_err(|_| QueryFailure::new(QueryFailureCode::StoreUnavailable))?;
+                }
+                return Err(KernelExportSink::map_output_failure(error));
+            },
+        };
         let binding = output.binding();
         if binding.tenant() != tenant
             || binding.destination() != destination.identity()
@@ -970,7 +1133,7 @@ impl<'kernel, 'catalog, 'ledger> crate::QueryService<'kernel, 'catalog, 'ledger>
                 context,
                 operation_id,
                 output.identity(),
-                destination,
+                destination_name,
             );
         }
         match operation.status() {
@@ -1107,17 +1270,46 @@ impl<'kernel, 'catalog, 'ledger> crate::QueryService<'kernel, 'catalog, 'ledger>
         self.verify_export_manifest(manifest)
     }
 
+    fn resolve_export_destination(
+        &self,
+        context: positron_governance::AuthorizedContext,
+        name: &str,
+    ) -> Result<ExportDestination, QueryFailure> {
+        let tenant = self.validate_current_query_context(context)?;
+        self.resolve_export_destination_for_tenant(tenant, name)
+    }
+
+    fn resolve_export_destination_for_tenant(
+        &self,
+        tenant: positron_domain::identity::TenantId,
+        name: &str,
+    ) -> Result<ExportDestination, QueryFailure> {
+        let resolver = self
+            .export_destination_resolver
+            .as_ref()
+            .ok_or_else(|| QueryFailure::new(QueryFailureCode::Unauthorized))?;
+        let identity = resolver
+            .resolve(tenant, name)
+            .ok_or_else(|| QueryFailure::new(QueryFailureCode::Unauthorized))?;
+        ExportDestination::configured(identity)
+    }
+
     fn export_request_digest(
         &self,
         source: &str,
         budget: crate::QueryBudget,
         destination: ExportDestination,
+        language: crate::query_service::QueryLanguage,
     ) -> Result<[u8; 32], QueryFailure> {
         let mut payload = Vec::new();
         payload
             .try_reserve_exact(source.len() + destination.identity().len() + 64)
             .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
         payload.extend_from_slice(&destination.identity());
+        payload.push(match language {
+            crate::query_service::QueryLanguage::Pipeline => 1,
+            crate::query_service::QueryLanguage::Sql => 2,
+        });
         for limit in [
             budget.scanned_bytes(),
             budget.decoded_records(),
@@ -1276,7 +1468,7 @@ mod tests {
 
     #[test]
     fn signed_manifest_payload_binds_the_complete_query_snapshot_descriptor() {
-        let destination = ExportDestination::new([0x11; 16]).expect("fixture destination");
+        let destination = ExportDestination::configured([0x11; 16]).expect("fixture destination");
         let snapshot = ResultSnapshot::new([0x22; 32], 7, 9);
         let budget = QueryBudget::new(1, 1, 1, 1, 1, 1).expect("fixture budget");
         let terminal = ExportTerminal::Complete(QueryStats::new(

@@ -201,7 +201,9 @@ impl DurableOperationRequest {
         hasher.update(idempotency.to_bytes());
         hasher.update([kind.code()]);
         hasher.update(target_identity);
-        hasher.update(accepted_generation.to_be_bytes());
+        // Query catalog generation is a fresh-request precondition. It is not
+        // part of the durable idempotency intent: an exact caller retry must
+        // retain the originally accepted snapshot after catalog advances.
         hasher.update(query_export_request_digest);
         let digest: [u8; 32] = hasher.finalize().into();
         let request = Self {
@@ -267,7 +269,8 @@ impl DurableOperationRequest {
             && self.idempotency == other.idempotency
             && self.kind == other.kind
             && self.target_identity == other.target_identity
-            && self.accepted_generation == other.accepted_generation
+            && (self.kind == DurableOperationKind::QueryExport
+                || self.accepted_generation == other.accepted_generation)
             && self.query_export_request_digest == other.query_export_request_digest
             && self.digest == other.digest
     }

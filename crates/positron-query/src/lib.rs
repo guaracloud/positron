@@ -45,7 +45,7 @@ pub use export::{
 };
 pub use failure::{QueryFailure, QueryFailureCode};
 pub use plan::{LogicalPlan, OrderDirection, PlannedQuery, TemporalAxis, TemporalRange};
-pub use query_service::QueryService;
+pub use query_service::{ExportDestinationResolver, QueryService};
 pub use runtime::{
     QueryClock, QueryClockFailure, QueryWorkFailure, QueryWorkMeter, QueryWorkStage,
 };

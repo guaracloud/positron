@@ -1353,6 +1353,8 @@ flowchart TD
     app --> config
     app --> kernel
 
+    config --> domain
+
     runtime --> api
     runtime --> domain
     runtime --> governance

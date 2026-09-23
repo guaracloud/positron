@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use positron_domain::identity::Scope;
+use positron_domain::identity::{Scope, TenantId};
 use positron_governance::{AuthorizedContext, Identity};
 use positron_kernel::{
     ActiveSegmentLedger, CatalogGenerationId, ResourceAmounts, ResourceDimension, ResourceGovernor,
@@ -12,6 +12,15 @@ use crate::{
 };
 
 const MAX_QUERY_SOURCE_BYTES: usize = 4_096;
+
+/// Runtime-owned resolution of configured protected export destinations.
+///
+/// The composition root builds this from the canonical Configuration Contract;
+/// Query receives only the resolved identity after it has authenticated the
+/// requesting tenant.
+pub trait ExportDestinationResolver: Send + Sync {
+    fn resolve(&self, tenant: TenantId, name: &str) -> Option<[u8; 16]>;
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum QueryLanguage {
@@ -26,6 +35,7 @@ pub struct QueryService<'kernel, 'catalog, 'ledger> {
     pub(crate) batch_limit: u16,
     pub(crate) clock: Arc<dyn crate::QueryClock>,
     pub(crate) work_meter: Arc<dyn crate::QueryWorkMeter>,
+    pub(crate) export_destination_resolver: Option<Arc<dyn ExportDestinationResolver>>,
 }
 
 impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
@@ -83,7 +93,18 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             batch_limit,
             clock,
             work_meter,
+            export_destination_resolver: None,
         }
+    }
+
+    /// Adds the runtime's immutable configured-destination authority.
+    #[must_use]
+    pub fn with_export_destination_resolver(
+        mut self,
+        resolver: Arc<dyn ExportDestinationResolver>,
+    ) -> Self {
+        self.export_destination_resolver = Some(resolver);
+        self
     }
 
     pub fn plan_pipeline(
@@ -104,7 +125,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         self.plan(context, source, budget, QueryLanguage::Sql)
     }
 
-    fn plan(
+    pub(crate) fn plan(
         &self,
         context: AuthorizedContext,
         source: &str,

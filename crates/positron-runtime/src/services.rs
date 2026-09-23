@@ -14,6 +14,7 @@ use positron_query::QueryBudget;
 use crate::InitializedInstance;
 
 mod api_keys;
+mod export_destinations;
 mod failure;
 mod ingest;
 mod otlp;
@@ -50,6 +51,7 @@ pub(super) fn context_tenant(
         .ok_or(ServiceFailure::Unauthorized)
 }
 
+pub use export_destinations::ConfiguredExportDestinationResolver;
 pub use failure::ServiceFailure;
 #[cfg(test)]
 use failure::map_query_failure_code;
@@ -65,6 +67,7 @@ mod tests;
 pub struct ServiceHandle {
     schema_sessions: TenantSchemaRegistry,
     shutdown_schema_capacity: Arc<Mutex<Option<TransferredResourceReservation>>>,
+    export_destination_resolver: Option<Arc<dyn positron_query::ExportDestinationResolver>>,
     #[cfg(test)]
     receiver_test_backend: Arc<Mutex<Option<Arc<dyn ReceiverTestBackend>>>>,
     #[cfg(test)]
@@ -123,6 +126,14 @@ impl ServiceHandle {
         instance: Arc<InitializedInstance>,
         cancellation: Option<&crate::TaskCancellation>,
     ) -> Result<Self, ServiceFailure> {
+        Self::new_with_export_destination_resolver(instance, cancellation, None)
+    }
+
+    pub(crate) fn new_with_export_destination_resolver(
+        instance: Arc<InitializedInstance>,
+        cancellation: Option<&crate::TaskCancellation>,
+        export_destination_resolver: Option<Arc<dyn positron_query::ExportDestinationResolver>>,
+    ) -> Result<Self, ServiceFailure> {
         let fallback = crate::TaskCancellation::new();
         let cancellation = cancellation.unwrap_or(&fallback);
         let recovered = schema_bootstrap::recover(&instance, cancellation)?;
@@ -138,6 +149,7 @@ impl ServiceHandle {
         Ok(Self {
             schema_sessions: recovered.registry,
             shutdown_schema_capacity: Arc::new(Mutex::new(None)),
+            export_destination_resolver,
             #[cfg(test)]
             receiver_test_backend: Arc::new(Mutex::new(None)),
             #[cfg(test)]
