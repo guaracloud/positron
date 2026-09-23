@@ -52,7 +52,7 @@ pub fn generated_json_schema() -> String {
 /// Returns the generated operator/reference documentation without secrets.
 #[must_use]
 pub fn generated_reference() -> String {
-    include_str!("../../../configuration/reference.md").to_owned()
+    render_reference()
 }
 
 /// Returns the contract definition for a canonical setting path.
