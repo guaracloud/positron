@@ -1,6 +1,9 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
+const MAX_ROOT_COLLISION_RETRIES: u64 = 64;
 
 #[test]
 fn operator_commands_are_deterministic_and_never_start_the_runtime()
@@ -65,7 +68,6 @@ fn operator_commands_are_deterministic_and_never_start_the_runtime()
         stdout(&migrate)?,
         "status=compatible from_schema_version=1 to_schema_version=1 changed=false\n"
     );
-    std::fs::remove_dir_all(root)?;
     Ok(())
 }
 
@@ -127,7 +129,6 @@ fn effective_and_failure_outputs_redact_protected_reference_canaries()
         stderr(&missing_redacted)?,
         "positron: effective configuration requires --redacted\n"
     );
-    std::fs::remove_dir_all(root)?;
     Ok(())
 }
 
@@ -144,7 +145,6 @@ fn migration_rejects_an_unsupported_schema_without_coercion()
         stderr(&output)?,
         "positron: configuration_rejected code=unsupported_value retry=after_input_correction completion=rejected source=schema_version\n"
     );
-    std::fs::remove_dir_all(root)?;
     Ok(())
 }
 
@@ -173,7 +173,6 @@ fn diff_reports_immutable_changes_as_a_non_mutating_migration_requirement()
         stdout(&output)?,
         "plan = \"requires_migration\"\nchange_count = 1\n\n[[change]]\nsetting = \"storage.data_directory\"\nbefore = \"/var/lib/positron\"\nbefore_source = \"compiled_default\"\nafter = \"/srv/positron\"\nafter_source = \"configuration_file\"\nmutability = \"immutable_after_initialization\"\n"
     );
-    std::fs::remove_dir_all(root)?;
     Ok(())
 }
 
@@ -215,7 +214,6 @@ after_source = "configuration_file"
 mutability = "immutable_after_initialization"
 "##
     );
-    std::fs::remove_dir_all(root)?;
     Ok(())
 }
 
@@ -232,7 +230,6 @@ fn public_cli_rejects_a_configuration_file_just_over_the_canonical_input_limit()
         stderr(&output)?,
         "positron: configuration_rejected code=resource_limit retry=after_input_correction completion=rejected source=configuration_document\n"
     );
-    std::fs::remove_dir_all(root)?;
     Ok(())
 }
 
@@ -326,7 +323,6 @@ fn export_destination_diff_is_complete_and_uses_canonical_membership_semantics()
         "{reverse_reordered_diff:?}"
     );
     assert_eq!(stdout(&reverse_reordered_diff)?, stdout(&reordered_diff)?);
-    std::fs::remove_dir_all(root)?;
     Ok(())
 }
 
@@ -351,7 +347,6 @@ fn invalid_utf8_is_malformed_while_missing_configuration_is_unavailable()
         stderr(&unavailable)?,
         "positron: configuration_rejected code=configuration_document_unavailable retry=after_input_correction completion=rejected source=configuration_document\n"
     );
-    std::fs::remove_dir_all(root)?;
     Ok(())
 }
 
@@ -391,14 +386,67 @@ fn stderr(output: &Output) -> Result<String, std::string::FromUtf8Error> {
     String::from_utf8(output.stderr.clone())
 }
 
-fn temporary_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-    let root = std::env::temp_dir().join(format!(
-        "positron-configuration-cli-{}-{nonce}",
-        std::process::id()
-    ));
-    std::fs::create_dir(&root)?;
-    Ok(root)
+struct TemporaryRoot(PathBuf);
+
+impl TemporaryRoot {
+    fn new() -> Result<Self, std::io::Error> {
+        Self::new_from_sequence(NEXT_ROOT.fetch_add(1, Ordering::Relaxed))
+    }
+
+    fn new_from_sequence(sequence: u64) -> Result<Self, std::io::Error> {
+        for offset in 0..MAX_ROOT_COLLISION_RETRIES {
+            let path = Self::path_for(sequence.saturating_add(offset));
+            match std::fs::create_dir(&path) {
+                Ok(()) => return Ok(Self(path)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {},
+                Err(error) => return Err(error),
+            }
+        }
+        Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists))
+    }
+
+    fn path_for(sequence: u64) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "positron-configuration-cli-{}-{sequence}",
+            std::process::id()
+        ))
+    }
+
+    fn join(&self, path: impl AsRef<Path>) -> PathBuf {
+        self.0.join(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TemporaryRoot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn temporary_root() -> Result<TemporaryRoot, std::io::Error> {
+    TemporaryRoot::new()
+}
+
+#[test]
+fn temporary_root_skips_a_stale_process_sequence() -> Result<(), std::io::Error> {
+    let sequence = (0..MAX_ROOT_COLLISION_RETRIES)
+        .map(|offset| u64::MAX - MAX_ROOT_COLLISION_RETRIES + offset)
+        .find(|candidate| !TemporaryRoot::path_for(*candidate).exists())
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::AlreadyExists))?;
+    let stale = TemporaryRoot::path_for(sequence);
+    std::fs::create_dir(&stale)?;
+
+    let result = (|| {
+        let root = TemporaryRoot::new_from_sequence(sequence)?;
+        assert_ne!(root.path(), stale);
+        Ok(())
+    })();
+    std::fs::remove_dir(&stale)?;
+    result
 }
 
 fn path(path: &Path) -> Result<&str, Box<dyn std::error::Error>> {
