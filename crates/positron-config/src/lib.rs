@@ -8,7 +8,16 @@
 
 #![forbid(unsafe_code)]
 
-use std::net::SocketAddr;
+use std::{
+    fs::{File, OpenOptions},
+    io::Write,
+    net::SocketAddr,
+    os::unix::fs::OpenOptionsExt,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+};
+
+use rustix::fs::{CWD, RenameFlags, renameat_with};
 
 pub use positron_domain::identity::TenantId;
 
@@ -17,6 +26,8 @@ const MAX_OVERRIDE_PAIRS: usize = 16;
 const MAX_TOML_ENTRIES: usize = 64;
 const MAX_KEY_BYTES: usize = 64;
 const MAX_VALUE_BYTES: usize = 256;
+const MAX_CANDIDATE_TEMPORARY_ATTEMPTS: u64 = 32;
+static NEXT_CANDIDATE_TEMPORARY: AtomicU64 = AtomicU64::new(0);
 
 mod contract;
 mod settings;
@@ -27,6 +38,8 @@ mod inputs;
 pub use inputs::*;
 mod effective;
 pub use effective::*;
+mod rendering;
+pub use rendering::*;
 
 /// Resolves every source into one checked, redacted typed candidate.
 pub fn resolve(
@@ -41,16 +54,135 @@ pub fn resolve(
     candidate.validate()
 }
 
+/// Failure while writing a separately named, current-schema configuration candidate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConfigurationCandidateFailure {
+    Input(ConfigurationInputFailure),
+    Configuration(ConfigurationFailure),
+    DestinationExists,
+    DestinationUnavailable,
+    CleanupFailed,
+}
+
+/// Validates one source document and writes its current-schema candidate without
+/// allowing source precedence inputs to alter the persisted document.
+///
+/// The current Release 1 schema is version 1. Preserving its validated bytes
+/// avoids inventing a transform, materializing defaults, or replacing protected
+/// references with redaction markers. The destination is published only after
+/// the candidate has been fully written and synced, and it is never replaced.
+pub fn write_current_schema_candidate(
+    source: &Path,
+    destination: &Path,
+) -> Result<EffectiveConfiguration, ConfigurationCandidateFailure> {
+    let inputs = ConfigurationInputs::try_from_sources(
+        Some(source),
+        [] as [(&str, &str); 0],
+        [] as [(&str, &str); 0],
+    )
+    .map_err(ConfigurationCandidateFailure::Input)?;
+    let effective =
+        resolve(inputs.clone()).map_err(ConfigurationCandidateFailure::Configuration)?;
+    let document = inputs
+        .file
+        .as_deref()
+        .ok_or(ConfigurationCandidateFailure::DestinationUnavailable)?;
+    write_candidate_document(destination, document)?;
+    Ok(effective)
+}
+
+fn write_candidate_document(
+    destination: &Path,
+    document: &str,
+) -> Result<(), ConfigurationCandidateFailure> {
+    let (temporary, mut file) = create_temporary_candidate(destination)?;
+    let write_result = file
+        .write_all(document.as_bytes())
+        .and_then(|()| file.sync_all());
+    drop(file);
+    if write_result.is_err() {
+        return remove_temporary_candidate(&temporary)
+            .and(Err(ConfigurationCandidateFailure::DestinationUnavailable));
+    }
+    match renameat_with(CWD, &temporary, CWD, destination, RenameFlags::NOREPLACE) {
+        Ok(()) => sync_candidate_parent(destination),
+        Err(error) => {
+            let failure = if error.kind() == std::io::ErrorKind::AlreadyExists {
+                ConfigurationCandidateFailure::DestinationExists
+            } else {
+                ConfigurationCandidateFailure::DestinationUnavailable
+            };
+            remove_temporary_candidate(&temporary).and(Err(failure))
+        },
+    }
+}
+
+fn sync_candidate_parent(destination: &Path) -> Result<(), ConfigurationCandidateFailure> {
+    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| ConfigurationCandidateFailure::DestinationUnavailable)
+}
+
+fn create_temporary_candidate(
+    destination: &Path,
+) -> Result<(PathBuf, std::fs::File), ConfigurationCandidateFailure> {
+    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+    for _ in 0..MAX_CANDIDATE_TEMPORARY_ATTEMPTS {
+        let sequence = NEXT_CANDIDATE_TEMPORARY.fetch_add(1, Ordering::Relaxed);
+        let temporary = parent.join(format!(
+            ".positron-config-candidate-{}-{sequence}",
+            std::process::id()
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)
+        {
+            Ok(file) => return Ok((temporary, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {},
+            Err(_) => return Err(ConfigurationCandidateFailure::DestinationUnavailable),
+        }
+    }
+    Err(ConfigurationCandidateFailure::DestinationUnavailable)
+}
+
+fn remove_temporary_candidate(path: &Path) -> Result<(), ConfigurationCandidateFailure> {
+    std::fs::remove_file(path).map_err(|_| ConfigurationCandidateFailure::CleanupFailed)
+}
+
 /// Returns the generated canonical JSON Schema.
 #[must_use]
 pub fn generated_json_schema() -> String {
-    include_str!("../../../configuration/schema.json").to_owned()
+    render_json_schema()
 }
 
 /// Returns the generated operator/reference documentation without secrets.
 #[must_use]
 pub fn generated_reference() -> String {
-    include_str!("../../../configuration/reference.md").to_owned()
+    render_reference()
+}
+
+/// Returns the generated public-only example configuration.
+#[must_use]
+pub fn generated_example() -> String {
+    render_example()
+}
+
+/// Returns the contract definition for a canonical setting path.
+#[must_use]
+pub fn setting_for_path(path: &str) -> Option<Setting> {
+    contract::SETTING_DEFINITIONS
+        .into_iter()
+        .find(|definition| definition.path() == path)
+        .map(SettingDefinition::setting)
+}
+
+/// Returns the complete canonical contract in deterministic declaration order.
+#[must_use]
+pub const fn setting_definitions() -> [SettingDefinition; 17] {
+    contract::SETTING_DEFINITIONS
 }
 
 mod source;
@@ -111,8 +243,14 @@ impl Candidate {
             )?,
             api_bind_address: parse_socket_address(api, Setting::ListenerApiBindAddress)?,
             api_transport: ApiTransport::parse(api_transport)?,
-            api_tls_certificate_file: ProtectedFileReference::parse(api_certificate)?,
-            api_tls_private_key_file: ProtectedFileReference::parse(api_private_key)?,
+            api_tls_certificate_file: ProtectedFileReference::parse(
+                api_certificate,
+                Setting::ListenerApiTlsCertificateFile,
+            )?,
+            api_tls_private_key_file: ProtectedFileReference::parse(
+                api_private_key,
+                Setting::ListenerApiTlsPrivateKeyFile,
+            )?,
             otlp_grpc_bind_address: parse_loopback_address(
                 otlp_grpc,
                 Setting::ListenerOtlpGrpcBindAddress,
@@ -127,7 +265,10 @@ impl Candidate {
             )?,
             data_directory: checked_path(data, Setting::StorageDataDirectory)?,
             secrets_directory: checked_path(secrets, Setting::StorageSecretsDirectory)?,
-            local_key_file: ProtectedFileReference::parse(local_key)?,
+            local_key_file: ProtectedFileReference::parse(
+                local_key,
+                Setting::SecurityLocalKeyFile,
+            )?,
             export_destinations: Vec::new(),
             sources: [SettingSource::CompiledDefault; 17],
         })
@@ -172,10 +313,10 @@ impl Candidate {
                 self.api_transport = ApiTransport::parse(value)?;
             },
             Setting::ListenerApiTlsCertificateFile => {
-                self.api_tls_certificate_file = ProtectedFileReference::parse(value)?;
+                self.api_tls_certificate_file = ProtectedFileReference::parse(value, setting)?;
             },
             Setting::ListenerApiTlsPrivateKeyFile => {
-                self.api_tls_private_key_file = ProtectedFileReference::parse(value)?;
+                self.api_tls_private_key_file = ProtectedFileReference::parse(value, setting)?;
             },
             Setting::ListenerOtlpGrpcBindAddress => {
                 self.otlp_grpc_bind_address = parse_loopback_address(value, setting)?;
@@ -193,7 +334,7 @@ impl Candidate {
                 self.secrets_directory = checked_path(value, setting)?;
             },
             Setting::SecurityLocalKeyFile => {
-                self.local_key_file = ProtectedFileReference::parse(value)?
+                self.local_key_file = ProtectedFileReference::parse(value, setting)?
             },
             Setting::ExportDestinations => {
                 return Err(ConfigurationFailure::new(
@@ -387,6 +528,12 @@ fn validate_path(value: &str, setting: Setting) -> Result<(), ConfigurationFailu
             source,
         ));
     }
+    if value.bytes().any(|byte| byte.is_ascii_control()) {
+        return Err(ConfigurationFailure::new(
+            ConfigurationFailureCode::UnsafeCombination,
+            source,
+        ));
+    }
     if !value.starts_with('/') || value.split('/').any(|component| component == "..") {
         return Err(ConfigurationFailure::new(
             ConfigurationFailureCode::UnsafeCombination,
@@ -416,13 +563,6 @@ const fn setting_index(setting: Setting) -> usize {
         Setting::SecurityLocalKeyFile => 15,
         Setting::ExportDestinations => 16,
     }
-}
-
-fn setting_for_path(path: &str) -> Option<Setting> {
-    contract::SETTING_DEFINITIONS
-        .into_iter()
-        .find(|definition| definition.path() == path)
-        .map(SettingDefinition::setting)
 }
 
 const fn failure_source(setting: Setting) -> FailureSource {

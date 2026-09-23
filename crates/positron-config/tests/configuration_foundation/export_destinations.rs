@@ -114,6 +114,38 @@ fn keeps_export_destinations_file_only_and_immutable() -> Result<(), Configurati
     Ok(())
 }
 
+#[test]
+fn canonical_export_destination_membership_order_is_not_a_change()
+-> Result<(), ConfigurationFailure> {
+    let current = resolve(export_inputs(Some(
+        "schema_version = 1\n\
+         [[export.destination]]\n\
+         name = \"archive\"\n\
+         identity = \"a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1\"\n\
+         allowed_tenants = [\"11111111-1111-1111-1111-111111111111\", \"22222222-2222-2222-2222-222222222222\"]\n\
+         [[export.destination]]\n\
+         name = \"warehouse\"\n\
+         identity = \"b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2\"\n\
+         allowed_tenants = [\"33333333-3333-3333-3333-333333333333\"]\n",
+    ))?)?;
+    let reordered = resolve(export_inputs(Some(
+        "schema_version = 1\n\
+         [[export.destination]]\n\
+         name = \"warehouse\"\n\
+         identity = \"b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2\"\n\
+         allowed_tenants = [\"33333333-3333-3333-3333-333333333333\"]\n\
+         [[export.destination]]\n\
+         name = \"archive\"\n\
+         identity = \"a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1\"\n\
+         allowed_tenants = [\"22222222-2222-2222-2222-222222222222\", \"11111111-1111-1111-1111-111111111111\"]\n",
+    ))?)?;
+
+    assert!(current.semantic_diff(&reordered).changes().is_empty());
+    assert_eq!(current.plan_update(&reordered)?, ConfigurationPlan::NoChange);
+    assert_eq!(current.redacted_reference(), reordered.redacted_reference());
+    Ok(())
+}
+
 fn export_inputs(file: Option<&str>) -> Result<ConfigurationInputs, ConfigurationFailure> {
     ConfigurationInputs::try_new(
         file,

@@ -351,6 +351,7 @@ fn apply_export_destinations(
         }
         destinations.push(destination);
     }
+    destinations.sort_unstable_by(|left, right| left.name.cmp(&right.name));
     candidate.apply_export_destinations(destinations)
 }
 
@@ -409,6 +410,7 @@ fn parse_export_destination(
         }
         allowed_tenants.push(tenant);
     }
+    allowed_tenants.sort_unstable();
     Ok(ExportDestinationDefinition {
         name: name.to_owned(),
         identity,

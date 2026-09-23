@@ -43,6 +43,17 @@ cargo +nightly fuzz run otlp_traces_decode --sanitizer none -- fuzz/corpus/otlp_
 The repository's production toolchain remains pinned; `cargo-fuzz` uses an
 installed nightly toolchain only for sanitizer instrumentation.
 
+Current Configuration Contract parser target:
+
+```console
+cargo +nightly fuzz run configuration_document --sanitizer none -- -runs=1000
+```
+
+The target feeds arbitrary bytes through the bounded canonical TOML preflight,
+typed resolver, version check, and semantic validation with no environment or
+command-line overrides. It must not retain protected-reference bytes in output
+or diagnostics.
+
 Current storage target:
 
 ```console

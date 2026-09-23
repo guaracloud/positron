@@ -240,59 +240,112 @@ impl EffectiveConfiguration {
         setting_for_path(path).and_then(|setting| self.sources.get(setting_index(setting)).copied())
     }
 
+    /// Renders the complete effective state with every secret-bearing setting
+    /// replaced by a redaction marker and each setting's source recorded.
+    #[must_use]
+    pub fn redacted_effective(&self) -> String {
+        let mut rendered = self.redacted_reference();
+        rendered.push_str("\n[provenance]\n");
+        for definition in contract::SETTING_DEFINITIONS {
+            let setting = definition.setting();
+            rendered.push_str(&super::render_toml_basic_string(definition.path()));
+            rendered.push_str(" = ");
+            if let Some(source) = self.sources.get(setting_index(setting)) {
+                rendered.push_str(&super::render_toml_basic_string(source.as_str()));
+            } else {
+                rendered.push_str(&super::render_toml_basic_string("unavailable"));
+            }
+            rendered.push('\n');
+        }
+        rendered
+    }
+
+    /// Computes the deterministic semantic difference without mutating a
+    /// runtime or publishing a configuration generation.
+    #[must_use]
+    pub fn semantic_diff(&self, candidate: &Self) -> ConfigurationDiff {
+        let mut changes = Vec::with_capacity(12);
+        for definition in contract::SETTING_DEFINITIONS {
+            let setting = definition.setting();
+            if self.setting_differs(candidate, setting) {
+                changes.push(ConfigurationChange {
+                    setting,
+                    before: self.redacted_value(setting),
+                    after: candidate.redacted_value(setting),
+                    before_source: self.source_for(setting.path()),
+                    after_source: candidate.source_for(setting.path()),
+                });
+            }
+        }
+        let plan = ConfigurationDiffPlan::from_changes(&changes);
+        ConfigurationDiff { changes, plan }
+    }
+
     #[must_use]
     pub fn redacted_reference(&self) -> String {
         let mut rendered = String::with_capacity(512);
         rendered.push_str("schema_version = ");
         rendered.push_str(&self.schema_version.to_string());
-        rendered.push_str("\n\n[diagnostics]\nlog_level = \"");
-        rendered.push_str(self.log_level.as_str());
-        rendered.push_str("\"\n\n[runtime]\nshutdown_grace_seconds = ");
+        rendered.push_str("\n\n[diagnostics]\nlog_level = ");
+        rendered.push_str(&super::render_toml_basic_string(self.log_level.as_str()));
+        rendered.push_str("\n\n[runtime]\nshutdown_grace_seconds = ");
         rendered.push_str(&self.shutdown_grace_seconds.to_string());
         rendered.push_str("\nmax_registered_tenants = ");
         rendered.push_str(&self.max_registered_tenants.to_string());
-        rendered.push_str("\n\n[listener]\ncontrol_path = \"");
-        rendered.push_str(&self.control_path);
-        rendered.push_str("\"\noperations_bind_address = \"");
-        rendered.push_str(&self.operations_bind_address.to_string());
-        rendered.push_str("\"\napi_bind_address = \"");
-        rendered.push_str(&self.api_bind_address.to_string());
-        rendered.push_str("\"\napi_transport = \"");
-        rendered.push_str(self.api_transport.as_str());
-        rendered.push_str("\"\napi_tls_certificate_file = \"<redacted>\"\napi_tls_private_key_file = \"<redacted>");
-        rendered.push_str("\"\notlp_grpc_bind_address = \"");
-        rendered.push_str(&self.otlp_grpc_bind_address.to_string());
-        rendered.push_str("\"\notlp_http_bind_address = \"");
-        rendered.push_str(&self.otlp_http_bind_address.to_string());
-        rendered.push_str("\"\nloki_push_bind_address = \"");
-        rendered.push_str(&self.loki_push_bind_address.to_string());
-        rendered.push('"');
+        rendered.push_str("\n\n[listener]\ncontrol_path = ");
+        rendered.push_str(&super::render_toml_basic_string(&self.control_path));
+        rendered.push_str("\noperations_bind_address = ");
+        rendered.push_str(&super::render_toml_basic_string(
+            &self.operations_bind_address.to_string(),
+        ));
+        rendered.push_str("\napi_bind_address = ");
+        rendered.push_str(&super::render_toml_basic_string(
+            &self.api_bind_address.to_string(),
+        ));
+        rendered.push_str("\napi_transport = ");
+        rendered.push_str(&super::render_toml_basic_string(
+            self.api_transport.as_str(),
+        ));
+        rendered.push_str("\napi_tls_certificate_file = \"<redacted>\"\napi_tls_private_key_file = \"<redacted>\"");
+        rendered.push_str("\notlp_grpc_bind_address = ");
+        rendered.push_str(&super::render_toml_basic_string(
+            &self.otlp_grpc_bind_address.to_string(),
+        ));
+        rendered.push_str("\notlp_http_bind_address = ");
+        rendered.push_str(&super::render_toml_basic_string(
+            &self.otlp_http_bind_address.to_string(),
+        ));
+        rendered.push_str("\nloki_push_bind_address = ");
+        rendered.push_str(&super::render_toml_basic_string(
+            &self.loki_push_bind_address.to_string(),
+        ));
         for destination in &self.export_destinations {
-            rendered.push_str("\n\n[[export.destination]]\nname = \"");
-            rendered.push_str(&destination.name);
-            rendered.push_str("\"\nidentity = \"");
-            rendered.push_str(&hexadecimal_identity(destination.identity));
-            rendered.push_str("\"\nallowed_tenants = [");
+            rendered.push_str("\n\n[[export.destination]]\nname = ");
+            rendered.push_str(&super::render_toml_basic_string(&destination.name));
+            rendered.push_str("\nidentity = ");
+            rendered.push_str(&super::render_toml_basic_string(&hexadecimal_identity(
+                destination.identity,
+            )));
+            rendered.push_str("\nallowed_tenants = [");
             for (index, tenant) in destination.allowed_tenants.iter().enumerate() {
                 if index != 0 {
                     rendered.push_str(", ");
                 }
-                rendered.push('"');
-                rendered.push_str(&tenant.to_canonical_text());
-                rendered.push('"');
+                rendered.push_str(&super::render_toml_basic_string(
+                    &tenant.to_canonical_text(),
+                ));
             }
             rendered.push(']');
         }
         if let Some(warning) = self.security_warnings().first() {
-            rendered.push_str("\n\n[warnings]\nwarning = \"");
-            rendered.push_str(warning.message());
-            rendered.push('"');
+            rendered.push_str("\n\n[warnings]\nwarning = ");
+            rendered.push_str(&super::render_toml_basic_string(warning.message()));
         }
-        rendered.push_str("\n\n[storage]\ndata_directory = \"");
-        rendered.push_str(&self.data_directory);
-        rendered.push_str("\"\nsecrets_directory = \"");
-        rendered.push_str(&self.secrets_directory);
-        rendered.push_str("\"\n\n[security]\nlocal_key_file = \"<redacted>\"\n");
+        rendered.push_str("\n\n[storage]\ndata_directory = ");
+        rendered.push_str(&super::render_toml_basic_string(&self.data_directory));
+        rendered.push_str("\nsecrets_directory = ");
+        rendered.push_str(&super::render_toml_basic_string(&self.secrets_directory));
+        rendered.push_str("\n\n[security]\nlocal_key_file = \"<redacted>\"\n");
         rendered
     }
 
@@ -350,14 +403,59 @@ impl EffectiveConfiguration {
             Setting::ExportDestinations => self.export_destinations != other.export_destinations,
         }
     }
+
+    fn redacted_value(&self, setting: Setting) -> String {
+        if setting.secrecy() == super::SecrecyClass::SecretBearing {
+            return "<redacted>".to_owned();
+        }
+        match setting {
+            Setting::SchemaVersion => self.schema_version.to_string(),
+            Setting::DiagnosticsLogLevel => self.log_level.as_str().to_owned(),
+            Setting::RuntimeShutdownGraceSeconds => self.shutdown_grace_seconds.to_string(),
+            Setting::RuntimeMaxRegisteredTenants => self.max_registered_tenants.to_string(),
+            Setting::ListenerControlPath => self.control_path.clone(),
+            Setting::ListenerOperationsBindAddress => self.operations_bind_address.to_string(),
+            Setting::ListenerApiBindAddress => self.api_bind_address.to_string(),
+            Setting::ListenerApiTransport => self.api_transport.as_str().to_owned(),
+            Setting::ListenerApiTlsCertificateFile
+            | Setting::ListenerApiTlsPrivateKeyFile
+            | Setting::SecurityLocalKeyFile => "<redacted>".to_owned(),
+            Setting::ListenerOtlpGrpcBindAddress => self.otlp_grpc_bind_address.to_string(),
+            Setting::ListenerOtlpHttpBindAddress => self.otlp_http_bind_address.to_string(),
+            Setting::ListenerLokiPushBindAddress => self.loki_push_bind_address.to_string(),
+            Setting::StorageDataDirectory => self.data_directory.clone(),
+            Setting::StorageSecretsDirectory => self.secrets_directory.clone(),
+            Setting::ExportDestinations => self.redacted_export_destinations(),
+        }
+    }
+
+    fn redacted_export_destinations(&self) -> String {
+        let mut rendered = String::new();
+        for (index, destination) in self.export_destinations.iter().enumerate() {
+            if index != 0 {
+                rendered.push(';');
+            }
+            rendered.push_str("name=");
+            rendered.push_str(&destination.name);
+            rendered.push_str(",identity=");
+            rendered.push_str(&hexadecimal_identity(destination.identity));
+            rendered.push_str(",allowed_tenants=[");
+            for (tenant_index, tenant) in destination.allowed_tenants.iter().enumerate() {
+                if tenant_index != 0 {
+                    rendered.push(',');
+                }
+                rendered.push_str(&tenant.to_canonical_text());
+            }
+            rendered.push(']');
+        }
+        rendered
+    }
 }
 
 fn hexadecimal_identity(identity: [u8; 16]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut rendered = String::with_capacity(32);
     for byte in identity {
-        rendered.push(char::from(HEX[usize::from(byte >> 4)]));
-        rendered.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        rendered.push_str(&format!("{byte:02x}"));
     }
     rendered
 }
@@ -393,6 +491,109 @@ pub enum ConfigurationPlan {
     PublishLive { changed: Vec<Setting> },
     DrainThenPublish { changed: Vec<Setting> },
     RestartRequired { changed: Vec<Setting> },
+}
+
+/// One redacted, provenance-bearing semantic setting difference.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfigurationChange {
+    setting: Setting,
+    before: String,
+    after: String,
+    before_source: Option<SettingSource>,
+    after_source: Option<SettingSource>,
+}
+
+impl ConfigurationChange {
+    #[must_use]
+    pub const fn setting(&self) -> Setting {
+        self.setting
+    }
+
+    #[must_use]
+    pub fn before(&self) -> &str {
+        &self.before
+    }
+
+    #[must_use]
+    pub fn after(&self) -> &str {
+        &self.after
+    }
+
+    #[must_use]
+    pub const fn before_source(&self) -> Option<SettingSource> {
+        self.before_source
+    }
+
+    #[must_use]
+    pub const fn after_source(&self) -> Option<SettingSource> {
+        self.after_source
+    }
+}
+
+/// The lifecycle treatment derived from a complete semantic difference.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConfigurationDiffPlan {
+    NoChange,
+    PublishLive,
+    DrainThenPublish,
+    RestartRequired,
+    RequiresMigration,
+}
+
+impl ConfigurationDiffPlan {
+    fn from_changes(changes: &[ConfigurationChange]) -> Self {
+        if changes.is_empty() {
+            return Self::NoChange;
+        }
+        if changes.iter().any(|change| {
+            change.setting().mutability() == MutabilityClass::ImmutableAfterInitialization
+        }) {
+            return Self::RequiresMigration;
+        }
+        if changes
+            .iter()
+            .any(|change| change.setting().mutability() == MutabilityClass::RestartRequired)
+        {
+            return Self::RestartRequired;
+        }
+        if changes
+            .iter()
+            .any(|change| change.setting().mutability() == MutabilityClass::DrainAndReload)
+        {
+            return Self::DrainThenPublish;
+        }
+        Self::PublishLive
+    }
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NoChange => "no_change",
+            Self::PublishLive => "publish_live",
+            Self::DrainThenPublish => "drain_then_publish",
+            Self::RestartRequired => "restart_required",
+            Self::RequiresMigration => "requires_migration",
+        }
+    }
+}
+
+/// The complete deterministic semantic difference and its lifecycle plan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfigurationDiff {
+    changes: Vec<ConfigurationChange>,
+    plan: ConfigurationDiffPlan,
+}
+
+impl ConfigurationDiff {
+    #[must_use]
+    pub fn changes(&self) -> &[ConfigurationChange] {
+        &self.changes
+    }
+
+    #[must_use]
+    pub const fn plan(&self) -> ConfigurationDiffPlan {
+        self.plan
+    }
 }
 
 impl ConfigurationPlan {

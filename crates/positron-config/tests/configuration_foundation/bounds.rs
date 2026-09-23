@@ -187,9 +187,24 @@ fn rejects_invalid_shapes_and_values_from_each_closed_value_domain() {
             FailureSource::StorageSecretsDirectory,
         ),
         (
+            "schema_version = 1\n[storage]\ndata_directory = \"/safe\\nunsafe\"\n",
+            ConfigurationFailureCode::UnsafeCombination,
+            FailureSource::StorageDataDirectory,
+        ),
+        (
             "schema_version = 1\n[security]\nlocal_key_file = \"/keys/../root-key\"\n",
             ConfigurationFailureCode::UnsafeCombination,
             FailureSource::SecurityLocalKeyFile,
+        ),
+        (
+            "schema_version = 1\n[listener]\napi_tls_certificate_file = \"relative-certificate.pem\"\n",
+            ConfigurationFailureCode::UnsafeCombination,
+            FailureSource::ListenerApiTlsCertificateFile,
+        ),
+        (
+            "schema_version = 1\n[listener]\napi_tls_private_key_file = \"/keys/../private-key.pem\"\n",
+            ConfigurationFailureCode::UnsafeCombination,
+            FailureSource::ListenerApiTlsPrivateKeyFile,
         ),
         (
             "schema_version = 1\n[storage]\ndata_directory = 1\n",
@@ -201,7 +216,7 @@ fn rejects_invalid_shapes_and_values_from_each_closed_value_domain() {
         assert!(matches!(
             result,
             Err(error) if error.code() == code && error.source() == source
-        ));
+        ), "document={document:?} result={result:?}");
     }
 
     let non_loopback = inputs(
@@ -229,6 +244,27 @@ fn rejects_invalid_shapes_and_values_from_each_closed_value_domain() {
             Err(error)
                 if error.code() == ConfigurationFailureCode::Malformed
                     && error.source() == FailureSource::RuntimeShutdownGraceSeconds
+        ));
+    }
+
+    for (environment, command_line, source) in [
+        (
+            vec![("POSITRON__LISTENER__API_TLS_CERTIFICATE_FILE", "/keys/certificate.pem")],
+            Vec::new(),
+            FailureSource::ListenerApiTlsCertificateFile,
+        ),
+        (
+            Vec::new(),
+            vec![("listener.api_tls_private_key_file", "/keys/private-key.pem")],
+            FailureSource::ListenerApiTlsPrivateKeyFile,
+        ),
+    ] {
+        let result = inputs(None, environment, command_line).and_then(resolve);
+        assert!(matches!(
+            result,
+            Err(error)
+                if error.code() == ConfigurationFailureCode::SecretOverrideNotAllowed
+                    && error.source() == source
         ));
     }
 }

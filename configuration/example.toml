@@ -1,0 +1,24 @@
+# Generated from `crates/positron-config/src/contract.rs`.
+# Protected references are intentionally omitted.
+
+schema_version = 1
+
+[diagnostics]
+log_level = "info"
+
+[listener]
+control_path = "/var/run/positron/control.sock"
+operations_bind_address = "127.0.0.1:13133"
+api_bind_address = "127.0.0.1:8080"
+api_transport = "tls"
+otlp_grpc_bind_address = "127.0.0.1:4317"
+otlp_http_bind_address = "127.0.0.1:4318"
+loki_push_bind_address = "127.0.0.1:3100"
+
+[runtime]
+shutdown_grace_seconds = 30
+max_registered_tenants = 2
+
+[storage]
+data_directory = "/var/lib/positron"
+secrets_directory = "/var/lib/positron-secrets"

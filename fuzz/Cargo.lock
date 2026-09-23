@@ -1137,6 +1137,7 @@ name = "positron-config"
 version = "0.0.0"
 dependencies = [
  "positron-domain",
+ "rustix",
  "toml",
 ]
 
@@ -1159,6 +1160,7 @@ dependencies = [
  "libfuzzer-sys",
  "opentelemetry-proto",
  "positron-api",
+ "positron-config",
  "positron-domain",
  "positron-governance",
  "positron-ingest",
