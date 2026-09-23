@@ -267,7 +267,7 @@ impl OperatorFailure {
         match self {
             Self::Usage => "usage: positron config validate [--config PATH] [--set PATH=VALUE] | explain [--setting PATH] | effective --redacted [--config PATH] [--set PATH=VALUE] | diff --current PATH --candidate PATH | migrate --config PATH".to_owned(),
             Self::RedactionRequired => "effective configuration requires --redacted".to_owned(),
-            Self::UnknownExplainSetting => "configuration_rejected code=unknown_setting retry=after_input_correction completion=rejected source=configuration_document".to_owned(),
+            Self::UnknownExplainSetting => "configuration_rejected code=unknown_setting retry=after_input_correction completion=rejected source=command_line_override".to_owned(),
             Self::Input(ConfigurationInputFailure::DocumentUnavailable) => "configuration_rejected code=configuration_document_unavailable retry=after_input_correction completion=rejected source=configuration_document".to_owned(),
             Self::Input(ConfigurationInputFailure::Configuration(failure)) => format!(
                 "configuration_rejected code={} retry={} completion={} source={}",

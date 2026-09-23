@@ -35,6 +35,13 @@ fn operator_commands_are_deterministic_and_never_start_the_runtime()
         "setting=diagnostics.log_level type=string default=info domain=enum:error,warn,info,debug secrecy=public provenance=non_secret_overrides mutability=live_reloadable\n"
     );
 
+    let unknown_explain = run(["config", "explain", "--setting", "missing.setting"]);
+    assert!(!unknown_explain.status.success());
+    assert_eq!(
+        stderr(&unknown_explain)?,
+        "positron: configuration_rejected code=unknown_setting retry=after_input_correction completion=rejected source=command_line_override\n"
+    );
+
     let effective = run([
         "config",
         "effective",
@@ -345,6 +352,19 @@ fn invalid_utf8_is_malformed_while_missing_configuration_is_unavailable()
     assert!(!unavailable.status.success());
     assert_eq!(
         stderr(&unavailable)?,
+        "positron: configuration_rejected code=configuration_document_unavailable retry=after_input_correction completion=rejected source=configuration_document\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn non_regular_configuration_path_is_rejected_without_reading_it()
+-> Result<(), Box<dyn std::error::Error>> {
+    let rejected = run(["config", "validate", "--config", "/"]);
+
+    assert!(!rejected.status.success());
+    assert_eq!(
+        stderr(&rejected)?,
         "positron: configuration_rejected code=configuration_document_unavailable retry=after_input_correction completion=rejected source=configuration_document\n"
     );
     Ok(())

@@ -5,6 +5,8 @@ use std::{
     path::Path,
 };
 
+use rustix::fs::{self as unix_fs, Mode, OFlags};
+
 use super::{
     ConfigurationFailure, ConfigurationFailureCode, FailureSource, MAX_CONFIGURATION_BYTES,
     MAX_KEY_BYTES, MAX_OVERRIDE_PAIRS, MAX_VALUE_BYTES,
@@ -147,7 +149,24 @@ impl ConfigurationInputs {
 }
 
 fn read_configuration_file(path: &Path) -> Result<String, ConfigurationInputFailure> {
-    let file = File::open(path).map_err(|_| ConfigurationInputFailure::DocumentUnavailable)?;
+    // A path can be replaced after caller-side checks. Opening non-blocking
+    // prevents a FIFO or device from turning configuration input into an
+    // unbounded wait, and the held descriptor is verified before it is read.
+    let file = unix_fs::open(
+        path,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|_| ConfigurationInputFailure::DocumentUnavailable)?;
+    if !file
+        .metadata()
+        .map_err(|_| ConfigurationInputFailure::DocumentUnavailable)?
+        .file_type()
+        .is_file()
+    {
+        return Err(ConfigurationInputFailure::DocumentUnavailable);
+    }
     read_configuration_document(file)
 }
 
@@ -159,6 +178,12 @@ fn read_configuration_document(reader: impl Read) -> Result<String, Configuratio
         .take(maximum_bytes + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| ConfigurationInputFailure::DocumentUnavailable)?;
+    decode_configuration_document(&bytes)
+}
+
+/// Decodes a raw configuration document without lossy UTF-8 replacement.
+/// Native-file callers use the same decoder after capped descriptor IO.
+pub fn decode_configuration_document(bytes: &[u8]) -> Result<String, ConfigurationInputFailure> {
     if bytes.len() > MAX_CONFIGURATION_BYTES {
         return Err(ConfigurationInputFailure::Configuration(
             ConfigurationFailure::new(
@@ -167,7 +192,7 @@ fn read_configuration_document(reader: impl Read) -> Result<String, Configuratio
             ),
         ));
     }
-    String::from_utf8(bytes).map_err(|_| {
+    String::from_utf8(bytes.to_vec()).map_err(|_| {
         ConfigurationInputFailure::Configuration(ConfigurationFailure::new(
             ConfigurationFailureCode::Malformed,
             FailureSource::ConfigurationDocument,
@@ -212,12 +237,13 @@ mod tests {
     use std::{
         cell::Cell,
         io::{self, Read},
+        path::Path,
         rc::Rc,
     };
 
     use super::{
-        ConfigurationFailureCode, ConfigurationInputFailure, FailureSource,
-        MAX_CONFIGURATION_BYTES, read_configuration_document,
+        ConfigurationFailureCode, ConfigurationInputFailure, ConfigurationInputs, FailureSource,
+        MAX_CONFIGURATION_BYTES, decode_configuration_document, read_configuration_document,
     };
 
     struct CountingReader {
@@ -262,5 +288,35 @@ mod tests {
                 if failure.code() == ConfigurationFailureCode::Malformed
                     && failure.source() == FailureSource::ConfigurationDocument
         ));
+    }
+
+    #[test]
+    fn raw_configuration_document_decoder_preserves_byte_failure_classes() {
+        let oversized = vec![b'x'; MAX_CONFIGURATION_BYTES + 1];
+        let malformed = b"schema_version = 1\n\xff";
+
+        assert!(matches!(
+            decode_configuration_document(&oversized),
+            Err(ConfigurationInputFailure::Configuration(failure))
+                if failure.code() == ConfigurationFailureCode::ResourceLimit
+                    && failure.source() == FailureSource::ConfigurationDocument
+        ));
+        assert!(matches!(
+            decode_configuration_document(malformed),
+            Err(ConfigurationInputFailure::Configuration(failure))
+                if failure.code() == ConfigurationFailureCode::Malformed
+                    && failure.source() == FailureSource::ConfigurationDocument
+        ));
+    }
+
+    #[test]
+    fn native_sources_reject_a_non_regular_configuration_path_before_reading() {
+        let result = ConfigurationInputs::try_from_sources(
+            Some(Path::new("/")),
+            [] as [(&str, &str); 0],
+            [] as [(&str, &str); 0],
+        );
+
+        assert_eq!(result, Err(ConfigurationInputFailure::DocumentUnavailable));
     }
 }
