@@ -166,7 +166,13 @@ pub type ActiveListenerGeneration = (
 /// has succeeded. The gate is generation-owned so a discarded candidate never
 /// shares workers with the serving generation.
 pub trait ListenerGenerationActivation: Send {
-    fn activate_and_wait_ready(&self) -> Result<(), ListenerFailure>;
+    /// Starts parked workers and proves they are ready while their admissions
+    /// remain closed. This must complete before durable publication.
+    fn prepare_and_wait_ready(&self) -> Result<(), ListenerFailure>;
+
+    /// Opens already prepared admissions. Implementations must not perform a
+    /// fallible operation here because publication has already succeeded.
+    fn open_admission(&self);
 }
 
 impl std::fmt::Debug for ListenerGeneration {
@@ -302,13 +308,21 @@ impl ListenerGeneration {
         self
     }
 
-    /// Opens the staged workers and waits until all role loops acknowledge
-    /// service readiness. This is deliberately after catalog publication and
-    /// before the old generation loses admission.
-    pub fn activate_tasks(&self) -> Result<(), ListenerFailure> {
+    /// Starts the staged workers and waits for readiness while their listener
+    /// admissions remain closed. Callers can discard a failed preparation
+    /// before any durable configuration or audit publication.
+    pub fn prepare_tasks(&self) -> Result<(), ListenerFailure> {
         self.activation
             .as_ref()
-            .map_or(Ok(()), |activation| activation.activate_and_wait_ready())
+            .map_or(Ok(()), |activation| activation.prepare_and_wait_ready())
+    }
+
+    /// Opens admissions after publication and after the retiring generation
+    /// has stopped accepting new work.
+    pub fn open_admission(&self) {
+        if let Some(activation) = self.activation.as_ref() {
+            activation.open_admission();
+        }
     }
 
     /// Cancels and joins a discarded candidate before its descriptors are

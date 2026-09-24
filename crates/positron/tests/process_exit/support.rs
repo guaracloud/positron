@@ -243,11 +243,17 @@ pub(super) fn process_configuration(
     let certificate = runtime_directory.join("api-test-cert.pem");
     let private_key = runtime_directory.join("api-test-key.pem");
     format!(
-        "schema_version = 1\n[runtime]\nshutdown_grace_seconds = 2\n[listener]\ncontrol_path = \"{}\"\noperations_bind_address = \"127.0.0.1:{operations_port}\"\noperations_transport = \"plaintext\"\napi_bind_address = \"127.0.0.1:{api_port}\"\napi_transport = \"tls\"\napi_tls_certificate_file = \"{}\"\napi_tls_private_key_file = \"{}\"\notlp_grpc_bind_address = \"127.0.0.1:{otlp_grpc_port}\"\notlp_http_bind_address = \"127.0.0.1:{otlp_http_port}\"\nloki_push_bind_address = \"127.0.0.1:{loki_push_port}\"\n[storage]\ndata_directory = \"{}\"\nsecrets_directory = \"{}\"\n[security]\nlocal_key_file = \"{}\"\n",
+        "schema_version = 1\n[runtime]\nshutdown_grace_seconds = 2\n[listener]\ncontrol_path = \"{}\"\noperations_bind_address = \"127.0.0.1:{operations_port}\"\noperations_transport = \"plaintext\"\napi_bind_address = \"127.0.0.1:{api_port}\"\napi_transport = \"tls\"\napi_tls_certificate_file = \"{}\"\napi_tls_private_key_file = \"{}\"\notlp_grpc_bind_address = \"127.0.0.1:{otlp_grpc_port}\"\notlp_grpc_tls_certificate_file = \"{}\"\notlp_grpc_tls_private_key_file = \"{}\"\notlp_http_bind_address = \"127.0.0.1:{otlp_http_port}\"\notlp_http_tls_certificate_file = \"{}\"\notlp_http_tls_private_key_file = \"{}\"\nloki_push_bind_address = \"127.0.0.1:{loki_push_port}\"\nloki_push_tls_certificate_file = \"{}\"\nloki_push_tls_private_key_file = \"{}\"\n[storage]\ndata_directory = \"{}\"\nsecrets_directory = \"{}\"\n[security]\nlocal_key_file = \"{}\"\n",
         std::path::Path::new("/tmp")
             .join(root.file_name().unwrap_or_default())
             .with_extension("sock")
             .display(),
+        certificate.display(),
+        private_key.display(),
+        certificate.display(),
+        private_key.display(),
+        certificate.display(),
+        private_key.display(),
         certificate.display(),
         private_key.display(),
         data.display(),

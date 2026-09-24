@@ -495,6 +495,58 @@ fn same_endpoint_reload_drains_accepted_old_work_before_the_successor_serves()
 }
 
 #[test]
+fn control_path_reload_binds_the_candidate_socket_and_releases_the_predecessor()
+-> Result<(), Box<dyn std::error::Error>> {
+    let roots = TestRoots::new("configuration-control-path-reload")?;
+    let operations_port = available_loopback_port()?;
+    let old_control = std::env::temp_dir().join(format!(
+        "p77-control-path-old-{}-{operations_port}.sock",
+        std::process::id()
+    ));
+    let new_control = std::env::temp_dir().join(format!(
+        "p77-control-path-new-{}-{operations_port}.sock",
+        std::process::id()
+    ));
+    let initial = configuration(Some(&listener_configuration(
+        old_control.clone(),
+        operations_port,
+    )))?;
+    let host = NativeHost::new(NativeBindings::from_effective(&initial)?);
+    let process = ApplicationRuntime::start(
+        ServeConfiguration::new(
+            roots.bootstrap_paths()?,
+            InitializationMode::InitializeIfEmpty,
+        )
+        .with_effective_configuration(Arc::clone(&initial)),
+        HostInputs::new(&host, &host),
+    )?;
+    assert!(old_control.exists());
+
+    let candidate = configuration(Some(&listener_configuration(
+        new_control.clone(),
+        operations_port,
+    )))?;
+    assert!(matches!(
+        process.reload_configuration(candidate)?,
+        ConfigurationReloadOutcome::PublishedLive { .. }
+    ));
+    assert!(
+        new_control.exists(),
+        "candidate control socket was not bound"
+    );
+    assert!(
+        !old_control.exists(),
+        "predecessor control socket remained reachable after replacement"
+    );
+    assert!(matches!(
+        process.shutdown(ShutdownTrigger::FirstSignal),
+        positron_runtime::ExitOutcome::Graceful
+    ));
+    assert!(!new_control.exists());
+    Ok(())
+}
+
+#[test]
 fn failed_listener_staging_preserves_the_serving_generation_and_endpoints()
 -> Result<(), Box<dyn std::error::Error>> {
     let roots = TestRoots::new("configuration-listener-staging-failure")?;

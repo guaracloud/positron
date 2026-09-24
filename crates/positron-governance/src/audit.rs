@@ -926,6 +926,10 @@ impl ListenerTransportRole {
 }
 
 /// The disposition of one TLS material reload attempt.
+///
+/// `Applied` means a complete staged material snapshot passed readiness and
+/// was durably authorized for the listener handoff. It does not replace the
+/// process lifecycle record if a later runtime failure fences the process.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TlsMaterialReloadOutcome {
     Applied,

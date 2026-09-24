@@ -591,7 +591,13 @@ impl ListenerFactory for NativeHost {
                     return false;
                 }
                 match requested_address {
-                    None => role == ListenerRole::Control,
+                    None => {
+                        role == ListenerRole::Control
+                            && admission
+                                .control_path
+                                .as_ref()
+                                .is_some_and(|path| path.path == self.bindings.control)
+                    },
                     Some(address) => matches!(
                         &admission.listener,
                         NativeListener::Tcp(listener)
@@ -915,8 +921,12 @@ fn serve_exact_listener_role(
     if cancellation.is_cancelled() {
         return Ok(());
     }
+    gate.mark_ready()?;
+    gate.wait_for_admission(&cancellation);
+    if cancellation.is_cancelled() {
+        return Ok(());
+    }
     admission.accepting.store(true, Ordering::Release);
-    gate.mark_serving()?;
     if role == ListenerRole::OtlpGrpc {
         otlp_grpc::serve(admission, cancellation, force, services)
             .map_err(|_| TaskFailure::JoinUnavailable)

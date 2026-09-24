@@ -479,6 +479,16 @@ fn same_path_tls_rotation_replaces_valid_identity_and_retains_the_previous_ident
         material_reload[1].attempt_id(),
         material_reload[2].attempt_id()
     );
+    assert_ne!(
+        material_reload[1].material_identity(),
+        material_reload[1].listener_set_identity(),
+        "a rejected material attempt must not mislabel the unchanged configuration digest as material"
+    );
+    assert_eq!(
+        material_reload[1].material_identity(),
+        material_reload[2].material_identity(),
+        "the same rejected candidate keeps one opaque attempt-class identity"
+    );
     Ok(())
 }
 

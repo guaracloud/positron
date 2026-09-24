@@ -6,6 +6,7 @@ use positron_config::{
     EffectiveConfiguration, NetworkListenerRole, NetworkTransport,
 };
 use positron_kernel::OwnedPrimaryDataVolume;
+use sha2::{Digest, Sha256};
 
 use crate::health::ProcessState;
 use crate::{
@@ -470,18 +471,37 @@ impl RunningProcess {
                     publication
                         .record_rejected_listener_staging(observed.effective(), &candidate)?;
                 } else {
-                    let identity = crate::configuration_catalog::configuration_digest(&candidate);
+                    let listener_set_identity =
+                        crate::configuration_catalog::configuration_digest(&candidate);
                     publication.record_tls_material_reload(
                         positron_governance::TlsMaterialReloadListenerSet::new(0b0011_1110)
                             .map_err(|_| ConfigurationRuntimeFailure::PublicationUnavailable)?,
                         positron_governance::TlsMaterialReloadOutcome::Rejected,
-                        identity,
-                        identity,
+                        listener_set_identity,
+                        Self::rejected_tls_attempt_identity(listener_set_identity),
                     )?;
                 }
                 return Err(ConfigurationRuntimeFailure::ListenerUnavailable);
             },
         };
+        if staged.prepare_tasks().is_err() {
+            let material_identity = staged.material_identity();
+            staged
+                .discard()
+                .map_err(|_| ConfigurationRuntimeFailure::ListenerUnavailable)?;
+            if plan != ConfigurationDiffPlan::NoChange {
+                publication.record_rejected_listener_staging(observed.effective(), &candidate)?;
+            } else if let Some(material_identity) = material_identity {
+                publication.record_tls_material_reload(
+                    positron_governance::TlsMaterialReloadListenerSet::new(0b0011_1110)
+                        .map_err(|_| ConfigurationRuntimeFailure::PublicationUnavailable)?,
+                    positron_governance::TlsMaterialReloadOutcome::Rejected,
+                    crate::configuration_catalog::configuration_digest(&candidate),
+                    material_identity,
+                )?;
+            }
+            return Err(ConfigurationRuntimeFailure::ListenerUnavailable);
+        }
         if plan == ConfigurationDiffPlan::NoChange {
             let material_identity = staged
                 .material_identity()
@@ -511,34 +531,20 @@ impl RunningProcess {
                 return Err(error);
             },
         };
-        if staged.activate_tasks().is_err() {
-            staged
-                .discard()
-                .map_err(|_| ConfigurationRuntimeFailure::ListenerUnavailable)?;
-            self.state.transition(ProcessPhase::Fenced);
-            return Err(ConfigurationRuntimeFailure::ListenerUnavailable);
-        }
-        let (mut successor, mut successor_tasks, successor_cancellation) = staged.into_active();
         let mut retired = {
             let mut active = self.listeners();
-            std::mem::swap(&mut *active, &mut successor);
-            successor
+            std::mem::take(&mut *active)
         };
         let mut retired_tasks = {
             let mut active = self.tasks();
-            std::mem::swap(&mut *active, &mut successor_tasks);
-            successor_tasks
+            std::mem::take(&mut *active)
         };
         let retired_cancellations = {
             let mut active = match self.listener_task_cancellations.lock() {
                 Ok(cancellations) => cancellations,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            let retired = std::mem::take(&mut *active);
-            if let Some(cancellation) = successor_cancellation {
-                active.push(cancellation);
-            }
-            retired
+            std::mem::take(&mut *active)
         };
         let retirement_deadline = std::time::Instant::now() + self.drain_deadline;
         if close_listeners(&mut retired).is_err() {
@@ -548,6 +554,23 @@ impl RunningProcess {
                 return Err(ConfigurationRuntimeFailure::ListenerUnavailable);
             }
             return Err(ConfigurationRuntimeFailure::ListenerUnavailable);
+        }
+        staged.open_admission();
+        let (successor, successor_tasks, successor_cancellation) = staged.into_active();
+        {
+            let mut active = self.listeners();
+            *active = successor;
+        }
+        {
+            let mut active = self.tasks();
+            *active = successor_tasks;
+        }
+        if let Some(cancellation) = successor_cancellation {
+            let mut active = match self.listener_task_cancellations.lock() {
+                Ok(cancellations) => cancellations,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            active.push(cancellation);
         }
         for cancellation in retired_cancellations {
             cancellation.cancel();
@@ -563,6 +586,13 @@ impl RunningProcess {
             return Err(ConfigurationRuntimeFailure::ListenerUnavailable);
         }
         Ok(outcome)
+    }
+
+    fn rejected_tls_attempt_identity(listener_set_identity: [u8; 32]) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(b"positron/tls-material-reload/rejected-attempt/v1");
+        hasher.update(listener_set_identity);
+        hasher.finalize().into()
     }
 
     /// Records a rejected source document while retaining the current complete
