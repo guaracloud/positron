@@ -558,6 +558,11 @@ fn tenant_retention_audit_is_typed_redacted_and_strict() {
 fn configuration_audit_binds_the_fenced_drift_to_one_catalog_generation() {
     let request = ConfigurationAuditRequest::new(
         ConfigurationAuditOutcome::FencedDrift,
+        1_725_000_000,
+        PrincipalId::from_bytes([0x31; 16]).expect("principal"),
+        None,
+        [0x32; 16],
+        [0x33; 16],
         42,
         1,
         [0x41; 32],
@@ -576,6 +581,11 @@ fn configuration_audit_binds_the_fenced_drift_to_one_catalog_generation() {
         ConfigurationAuditOutcome::FencedDrift
     );
     assert_eq!(configuration.catalog_generation(), 42);
+    assert_eq!(configuration.ingest_time_unix_seconds(), 1_725_000_000);
+    assert_eq!(configuration.principal().to_bytes(), [0x31; 16]);
+    assert_eq!(configuration.applicable_tenant(), None);
+    assert_eq!(configuration.target(), [0x32; 16]);
+    assert_eq!(configuration.request_id(), [0x33; 16]);
     assert_eq!(configuration.active_digest(), [0x41; 32]);
     assert_eq!(configuration.candidate_digest(), [0x42; 32]);
 

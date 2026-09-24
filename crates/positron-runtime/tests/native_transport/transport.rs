@@ -1,5 +1,98 @@
 use super::*;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::Arc;
+
+use positron_config::{CommandLineOverrides, ConfigurationInputs, EnvironmentOverrides, resolve};
+
+fn effective_configuration(
+    document: Option<&str>,
+) -> Result<Arc<positron_config::EffectiveConfiguration>, Box<dyn std::error::Error>> {
+    let inputs = ConfigurationInputs::try_new(
+        document,
+        EnvironmentOverrides::try_from_pairs([] as [(&str, &str); 0])?,
+        CommandLineOverrides::try_from_pairs([] as [(&str, &str); 0])?,
+    )?;
+    Ok(Arc::new(resolve(inputs)?))
+}
+
+fn quoted_status_value(response: &str, field: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let prefix = format!("\"{field}\":\"");
+    let start = response
+        .find(&prefix)
+        .ok_or_else(|| format!("status field {field} missing"))?
+        .saturating_add(prefix.len());
+    let end = response[start..]
+        .find('"')
+        .map(|offset| start.saturating_add(offset))
+        .ok_or_else(|| format!("status field {field} was not terminated"))?;
+    Ok(response[start..end].to_owned())
+}
+
+#[test]
+fn operations_status_exposes_a_fenced_configuration_drift() -> Result<(), Box<dyn std::error::Error>>
+{
+    let _guard = live_test_guard();
+    let roots = TestRoots::new("cfg-status")?;
+    let active = effective_configuration(None)?;
+    let host = NativeHost::new(bindings(&roots, "cfg-status")?);
+    let process = ApplicationRuntime::start(
+        ServeConfiguration::new(roots.paths()?, InitializationMode::InitializeIfEmpty)
+            .with_effective_configuration(Arc::clone(&active)),
+        HostInputs::new(&host, &host),
+    )?;
+    let operations = address(
+        &process.bound_endpoints(),
+        positron_runtime::ListenerRole::Operations,
+    )?;
+    let reloaded = effective_configuration(Some(
+        "schema_version = 1\n[diagnostics]\nlog_level = \"debug\"\n",
+    ))?;
+    let outcome = process.reload_configuration(Arc::clone(&reloaded))?;
+    assert!(matches!(
+        outcome,
+        positron_runtime::ConfigurationReloadOutcome::PublishedLive { .. }
+    ));
+    let reloaded_status = http(operations, "GET", "/status", &[], &[])?;
+    assert_status(reloaded_status.clone(), 200);
+    assert!(reloaded_status.contains("\"phase\":\"serving\""));
+    assert!(reloaded_status.contains("\"drift_disposition\":\"none\""));
+    assert!(reloaded_status.contains("\"pending_restart\":false"));
+    assert_eq!(
+        quoted_status_value(&reloaded_status, "effective_digest")?,
+        quoted_status_value(&reloaded_status, "desired_digest")?
+    );
+
+    let desired = effective_configuration(Some(
+        "schema_version = 1\n[diagnostics]\nlog_level = \"debug\"\n[storage]\ndata_directory = \"/different-data\"\n",
+    ))?;
+
+    let drift = process.reconcile_configuration_drift(Arc::clone(&desired))?;
+
+    assert_eq!(
+        drift.disposition(),
+        positron_config::ConfigurationDriftDisposition::Fence
+    );
+    let observed_generation = process
+        .configuration()
+        .ok_or("configuration runtime missing")?
+        .observed()?
+        .generation();
+    let status = http(operations, "GET", "/status", &[], &[])?;
+    assert_status(status.clone(), 200);
+    assert!(status.contains("\"phase\":\"fenced\""));
+    assert!(status.contains(&format!("\"observed_generation\":{observed_generation}")));
+    assert!(status.contains("\"drift_disposition\":\"fence\""));
+    assert!(status.contains("\"pending_restart\":false"));
+    assert_ne!(
+        quoted_status_value(&status, "effective_digest")?,
+        quoted_status_value(&status, "desired_digest")?
+    );
+    assert_eq!(
+        process.shutdown(ShutdownTrigger::FirstSignal),
+        positron_runtime::ExitOutcome::Graceful
+    );
+    Ok(())
+}
 
 #[test]
 fn operations_health_exposes_plaintext_transport_warning_without_degrading_readiness()

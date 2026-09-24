@@ -1,5 +1,7 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Arc, RwLock};
+
+use crate::{ConfigurationRuntimeFailure, ConfigurationRuntimeStatus};
 
 /// The one runtime phase that controls admission and shutdown behavior.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -40,6 +42,7 @@ pub enum HealthWarning {
 pub struct HealthState {
     phase: Arc<AtomicU8>,
     public_plaintext_api: Arc<AtomicBool>,
+    configuration_status: Arc<RwLock<Option<ConfigurationRuntimeStatus>>>,
 }
 
 impl HealthState {
@@ -73,6 +76,17 @@ impl HealthState {
             .load(Ordering::Acquire)
             .then_some(HealthWarning::PublicPlaintextApi)
     }
+
+    /// Returns the closed redacted configuration observation available to the
+    /// Operations listener.
+    pub fn configuration_status(
+        &self,
+    ) -> Result<Option<ConfigurationRuntimeStatus>, ConfigurationRuntimeFailure> {
+        self.configuration_status
+            .read()
+            .map(|status| status.clone())
+            .map_err(|_| ConfigurationRuntimeFailure::Unavailable)
+    }
 }
 
 pub(crate) struct ProcessState {
@@ -85,6 +99,7 @@ impl ProcessState {
             health: HealthState {
                 phase: Arc::new(AtomicU8::new(ProcessPhase::Starting as u8)),
                 public_plaintext_api: Arc::new(AtomicBool::new(false)),
+                configuration_status: Arc::new(RwLock::new(None)),
             },
         }
     }
@@ -101,6 +116,17 @@ impl ProcessState {
         self.health
             .public_plaintext_api
             .store(enabled, Ordering::Release);
+    }
+
+    pub(crate) fn set_configuration_status(
+        &self,
+        status: Option<ConfigurationRuntimeStatus>,
+    ) -> Result<(), ConfigurationRuntimeFailure> {
+        self.health
+            .configuration_status
+            .write()
+            .map(|mut observed| *observed = status)
+            .map_err(|_| ConfigurationRuntimeFailure::Unavailable)
     }
 }
 

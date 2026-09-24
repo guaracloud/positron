@@ -153,6 +153,14 @@ impl ApplicationRuntime {
                     let publication = CatalogConfigurationPublication::new(Arc::clone(&instance));
                     let generation = match publication.establish(effective) {
                         Ok(generation) => generation,
+                        Err(ConfigurationRuntimeFailure::ImmutableConfiguration) => {
+                            return Err(cleanup_startup(
+                                ExitOutcome::InvalidConfiguration,
+                                &cancellation,
+                                &mut listeners,
+                                &mut tasks,
+                            ));
+                        },
                         Err(_) => {
                             return Err(cleanup_startup(
                                 ExitOutcome::StartupUnavailable(
@@ -174,6 +182,24 @@ impl ApplicationRuntime {
                 },
                 None => (None, None),
             };
+        if let Some(runtime) = runtime_configuration.as_ref() {
+            let status = ConfigurationRuntimeStatus::initial(runtime).map_err(|_| {
+                cleanup_startup(
+                    ExitOutcome::StartupUnavailable(BootstrapFailureCode::CatalogUnavailable),
+                    &cancellation,
+                    &mut listeners,
+                    &mut tasks,
+                )
+            })?;
+            state.set_configuration_status(Some(status)).map_err(|_| {
+                cleanup_startup(
+                    ExitOutcome::StartupUnavailable(BootstrapFailureCode::CatalogUnavailable),
+                    &cancellation,
+                    &mut listeners,
+                    &mut tasks,
+                )
+            })?;
+        }
         let export_destination_resolver = configuration.export_destination_resolver.or_else(|| {
             runtime_configuration.as_ref().map(|runtime| {
                 Arc::new(crate::ConfiguredExportDestinationResolver::from_runtime(

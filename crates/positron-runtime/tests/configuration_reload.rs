@@ -103,6 +103,34 @@ fn mixed_live_and_restart_required_reload_publishes_only_live_settings_and_keeps
 }
 
 #[test]
+fn restart_only_reload_advances_to_the_catalog_generation_which_records_the_pending_candidate()
+-> Result<(), Box<dyn std::error::Error>> {
+    let runtime = RuntimeConfiguration::new(configuration(None)?);
+    let candidate = configuration(Some(
+        "schema_version = 1\n[runtime]\nshutdown_grace_seconds = 60\n",
+    ))?;
+
+    let outcome = runtime.reload_with(Arc::clone(&candidate), &ReceiptPublication(7))?;
+
+    assert!(matches!(
+        outcome,
+        ConfigurationReloadOutcome::PendingRestart { generation: 7, .. }
+    ));
+    let observed = runtime.observed()?;
+    assert_eq!(observed.generation(), 7);
+    assert_eq!(observed.effective().shutdown_grace_seconds(), 30);
+    assert_eq!(
+        observed
+            .pending_restart()
+            .ok_or("restart candidate missing")?
+            .candidate()
+            .shutdown_grace_seconds(),
+        60
+    );
+    Ok(())
+}
+
+#[test]
 fn drain_and_reload_candidate_is_visible_as_unapplied_until_the_listener_owner_can_drain()
 -> Result<(), Box<dyn std::error::Error>> {
     let runtime = RuntimeConfiguration::new(configuration(None)?);
@@ -238,6 +266,55 @@ fn catalog_and_governance_audit_publication_survives_restart_without_replacing_t
     assert_eq!(observed.effective().log_level(), LogLevel::Debug);
     assert!(matches!(
         restarted.shutdown(ShutdownTrigger::FirstSignal),
+        positron_runtime::ExitOutcome::Graceful
+    ));
+    Ok(())
+}
+
+#[test]
+fn startup_refuses_an_immutable_configuration_change_after_initialization()
+-> Result<(), Box<dyn std::error::Error>> {
+    let roots = TestRoots::new("configuration-startup-immutable")?;
+    let initial = configuration(None)?;
+    let listeners = ObservingListeners::default();
+    let tasks = ObservingTasks::default();
+    let initialized = ApplicationRuntime::start(
+        ServeConfiguration::new(
+            roots.bootstrap_paths()?,
+            InitializationMode::InitializeIfEmpty,
+        )
+        .with_effective_configuration(Arc::clone(&initial)),
+        HostInputs::new(&listeners, &tasks),
+    )?;
+    assert!(matches!(
+        initialized.shutdown(ShutdownTrigger::FirstSignal),
+        positron_runtime::ExitOutcome::Graceful
+    ));
+
+    let changed_storage_identity = configuration(Some(
+        "schema_version = 1\n[storage]\ndata_directory = \"/different-data\"\n",
+    ))?;
+    let rejected = ApplicationRuntime::start(
+        ServeConfiguration::new(roots.bootstrap_paths()?, InitializationMode::ExistingOnly)
+            .with_effective_configuration(changed_storage_identity),
+        HostInputs::new(&listeners, &tasks),
+    );
+    let failure = match rejected {
+        Ok(process) => {
+            let _ = process.shutdown(ShutdownTrigger::FirstSignal);
+            return Err("immutable startup change was accepted".into());
+        },
+        Err(failure) => failure,
+    };
+    assert_eq!(failure, positron_runtime::ExitOutcome::InvalidConfiguration);
+
+    let recovered = ApplicationRuntime::start(
+        ServeConfiguration::new(roots.bootstrap_paths()?, InitializationMode::ExistingOnly)
+            .with_effective_configuration(initial),
+        HostInputs::new(&listeners, &tasks),
+    )?;
+    assert!(matches!(
+        recovered.shutdown(ShutdownTrigger::FirstSignal),
         positron_runtime::ExitOutcome::Graceful
     ));
     Ok(())

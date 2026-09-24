@@ -169,6 +169,11 @@ impl ConfigurationAuditOutcome {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ConfigurationAuditRequest {
     outcome: ConfigurationAuditOutcome,
+    ingest_time_unix_seconds: u64,
+    principal: PrincipalId,
+    applicable_tenant: Option<TenantId>,
+    target: [u8; 16],
+    request_id: [u8; 16],
     catalog_generation: u64,
     changed_setting_count: u8,
     active_digest: [u8; 32],
@@ -178,12 +183,20 @@ pub struct ConfigurationAuditRequest {
 impl ConfigurationAuditRequest {
     pub fn new(
         outcome: ConfigurationAuditOutcome,
+        ingest_time_unix_seconds: u64,
+        principal: PrincipalId,
+        applicable_tenant: Option<TenantId>,
+        target: [u8; 16],
+        request_id: [u8; 16],
         catalog_generation: u64,
         changed_setting_count: u8,
         active_digest: [u8; 32],
         candidate_digest: [u8; 32],
     ) -> Result<Self, GovernanceIntentFailure> {
-        if catalog_generation == 0
+        if ingest_time_unix_seconds == 0
+            || target.iter().all(|byte| *byte == 0)
+            || request_id.iter().all(|byte| *byte == 0)
+            || catalog_generation == 0
             || changed_setting_count == 0
             || active_digest.iter().all(|byte| *byte == 0)
             || candidate_digest.iter().all(|byte| *byte == 0)
@@ -192,6 +205,11 @@ impl ConfigurationAuditRequest {
         }
         Ok(Self {
             outcome,
+            ingest_time_unix_seconds,
+            principal,
+            applicable_tenant,
+            target,
+            request_id,
             catalog_generation,
             changed_setting_count,
             active_digest,
@@ -202,6 +220,31 @@ impl ConfigurationAuditRequest {
     #[must_use]
     pub const fn outcome(self) -> ConfigurationAuditOutcome {
         self.outcome
+    }
+
+    #[must_use]
+    pub const fn ingest_time_unix_seconds(self) -> u64 {
+        self.ingest_time_unix_seconds
+    }
+
+    #[must_use]
+    pub const fn principal(self) -> PrincipalId {
+        self.principal
+    }
+
+    #[must_use]
+    pub const fn applicable_tenant(self) -> Option<TenantId> {
+        self.applicable_tenant
+    }
+
+    #[must_use]
+    pub const fn target(self) -> [u8; 16] {
+        self.target
+    }
+
+    #[must_use]
+    pub const fn request_id(self) -> [u8; 16] {
+        self.request_id
     }
 
     #[must_use]
@@ -229,6 +272,15 @@ impl ConfigurationAuditRequest {
         let mut hasher = Sha256::new();
         hasher.update(CONFIGURATION_AUDIT_DOMAIN);
         hasher.update([self.outcome.code()]);
+        hasher.update(self.ingest_time_unix_seconds.to_be_bytes());
+        hasher.update(self.principal.to_bytes());
+        hasher.update([u8::from(self.applicable_tenant.is_some())]);
+        hasher.update(
+            self.applicable_tenant
+                .map_or([0; 16], |tenant| tenant.to_bytes()),
+        );
+        hasher.update(self.target);
+        hasher.update(self.request_id);
         hasher.update(self.catalog_generation.to_be_bytes());
         hasher.update([self.changed_setting_count]);
         hasher.update(self.active_digest);
@@ -241,9 +293,19 @@ impl ConfigurationAuditRequest {
 
     #[must_use]
     pub fn encode(self) -> Vec<u8> {
-        let mut encoded = Vec::with_capacity(82);
+        let mut encoded = Vec::with_capacity(155);
         encoded.extend_from_slice(&CONFIGURATION_AUDIT_MAGIC);
         encoded.push(self.outcome.code());
+        encoded.extend_from_slice(&self.ingest_time_unix_seconds.to_be_bytes());
+        encoded.extend_from_slice(&self.principal.to_bytes());
+        encoded.push(u8::from(self.applicable_tenant.is_some()));
+        encoded.extend_from_slice(
+            &self
+                .applicable_tenant
+                .map_or([0; 16], |tenant| tenant.to_bytes()),
+        );
+        encoded.extend_from_slice(&self.target);
+        encoded.extend_from_slice(&self.request_id);
         encoded.extend_from_slice(&self.catalog_generation.to_be_bytes());
         encoded.push(self.changed_setting_count);
         encoded.extend_from_slice(&self.active_digest);
@@ -261,12 +323,32 @@ impl ConfigurationAuditRequest {
             return Err(IdentityFailure);
         }
         let outcome = ConfigurationAuditOutcome::from_code(cursor.take_u8()?)?;
+        let ingest_time_unix_seconds = cursor.take_u64()?;
+        let principal =
+            PrincipalId::from_bytes(cursor.take_array()?).map_err(|_| IdentityFailure)?;
+        let applicable_tenant = match cursor.take_u8()? {
+            0 => {
+                if cursor.take_array::<16>()? != [0; 16] {
+                    return Err(IdentityFailure);
+                }
+                None
+            },
+            1 => Some(TenantId::from_bytes(cursor.take_array()?).map_err(|_| IdentityFailure)?),
+            _ => return Err(IdentityFailure),
+        };
+        let target = cursor.take_array()?;
+        let request_id = cursor.take_array()?;
         let catalog_generation = cursor.take_u64()?;
         let changed_setting_count = cursor.take_u8()?;
         let active_digest = cursor.take_array()?;
         let candidate_digest = cursor.take_array()?;
         let request = Self::new(
             outcome,
+            ingest_time_unix_seconds,
+            principal,
+            applicable_tenant,
+            target,
+            request_id,
             catalog_generation,
             changed_setting_count,
             active_digest,
@@ -279,6 +361,11 @@ impl ConfigurationAuditRequest {
         Ok(ConfigurationAuditEntry {
             position,
             outcome,
+            ingest_time_unix_seconds,
+            principal,
+            applicable_tenant,
+            target,
+            request_id,
             catalog_generation,
             changed_setting_count,
             active_digest,
@@ -292,6 +379,11 @@ impl ConfigurationAuditRequest {
 pub struct ConfigurationAuditEntry {
     position: u64,
     outcome: ConfigurationAuditOutcome,
+    ingest_time_unix_seconds: u64,
+    principal: PrincipalId,
+    applicable_tenant: Option<TenantId>,
+    target: [u8; 16],
+    request_id: [u8; 16],
     catalog_generation: u64,
     changed_setting_count: u8,
     active_digest: [u8; 32],
@@ -307,6 +399,31 @@ impl ConfigurationAuditEntry {
     #[must_use]
     pub const fn outcome(&self) -> ConfigurationAuditOutcome {
         self.outcome
+    }
+
+    #[must_use]
+    pub const fn ingest_time_unix_seconds(&self) -> u64 {
+        self.ingest_time_unix_seconds
+    }
+
+    #[must_use]
+    pub const fn principal(&self) -> PrincipalId {
+        self.principal
+    }
+
+    #[must_use]
+    pub const fn applicable_tenant(&self) -> Option<TenantId> {
+        self.applicable_tenant
+    }
+
+    #[must_use]
+    pub const fn target(&self) -> [u8; 16] {
+        self.target
+    }
+
+    #[must_use]
+    pub const fn request_id(&self) -> [u8; 16] {
+        self.request_id
     }
 
     #[must_use]
@@ -1042,7 +1159,7 @@ impl GovernanceAuditEntry {
             Self::TenantRetentionUpdate(entry) => Some(entry.tenant),
             Self::SystemAuditRetentionUpdate(_) => None,
             Self::DurableOperation(entry) => entry.applicable_tenant(),
-            Self::Configuration(_) => None,
+            Self::Configuration(entry) => entry.applicable_tenant(),
         }
     }
 

@@ -28,6 +28,77 @@ pub struct PublicPlaintextApiStartupIntent {
     api_bind_address: SocketAddr,
 }
 
+/// A closed, redacted configuration observation exposed through Operations.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfigurationRuntimeStatus {
+    observed_generation: u64,
+    effective_digest: [u8; 32],
+    desired_digest: [u8; 32],
+    drift_disposition: ConfigurationDriftDisposition,
+    pending_restart: bool,
+}
+
+impl ConfigurationRuntimeStatus {
+    pub(crate) fn initial(
+        runtime: &RuntimeConfiguration,
+    ) -> Result<Self, ConfigurationRuntimeFailure> {
+        let observed = runtime.observed()?;
+        Ok(Self {
+            observed_generation: observed.generation(),
+            effective_digest: crate::configuration_catalog::configuration_digest(
+                observed.effective(),
+            ),
+            desired_digest: crate::configuration_catalog::configuration_digest(
+                observed.effective(),
+            ),
+            drift_disposition: ConfigurationDriftDisposition::None,
+            pending_restart: observed.pending_restart().is_some(),
+        })
+    }
+
+    fn for_desired(
+        runtime: &RuntimeConfiguration,
+        desired: &EffectiveConfiguration,
+        drift_disposition: ConfigurationDriftDisposition,
+    ) -> Result<Self, ConfigurationRuntimeFailure> {
+        let observed = runtime.observed()?;
+        Ok(Self {
+            observed_generation: observed.generation(),
+            effective_digest: crate::configuration_catalog::configuration_digest(
+                observed.effective(),
+            ),
+            desired_digest: crate::configuration_catalog::configuration_digest(desired),
+            drift_disposition,
+            pending_restart: observed.pending_restart().is_some(),
+        })
+    }
+
+    #[must_use]
+    pub const fn observed_generation(&self) -> u64 {
+        self.observed_generation
+    }
+
+    #[must_use]
+    pub const fn effective_digest(&self) -> [u8; 32] {
+        self.effective_digest
+    }
+
+    #[must_use]
+    pub const fn desired_digest(&self) -> [u8; 32] {
+        self.desired_digest
+    }
+
+    #[must_use]
+    pub const fn drift_disposition(&self) -> ConfigurationDriftDisposition {
+        self.drift_disposition
+    }
+
+    #[must_use]
+    pub const fn pending_restart(&self) -> bool {
+        self.pending_restart
+    }
+}
+
 impl PublicPlaintextApiStartupIntent {
     #[must_use]
     pub const fn configuration_file(api_bind_address: SocketAddr) -> Self {
@@ -332,15 +403,31 @@ impl RunningProcess {
         &self,
         candidate: Arc<EffectiveConfiguration>,
     ) -> Result<ConfigurationReloadOutcome, ConfigurationRuntimeFailure> {
-        self.configuration
+        let runtime = self
+            .configuration
             .as_ref()
-            .ok_or(ConfigurationRuntimeFailure::Unavailable)?
-            .reload_with(
-                candidate,
-                self.configuration_publication
-                    .as_ref()
-                    .ok_or(ConfigurationRuntimeFailure::Unavailable)?,
-            )
+            .ok_or(ConfigurationRuntimeFailure::Unavailable)?;
+        let outcome = runtime.reload_with(
+            Arc::clone(&candidate),
+            self.configuration_publication
+                .as_ref()
+                .ok_or(ConfigurationRuntimeFailure::Unavailable)?,
+        )?;
+        if matches!(
+            outcome,
+            ConfigurationReloadOutcome::NoChange { .. }
+                | ConfigurationReloadOutcome::PublishedLive { .. }
+                | ConfigurationReloadOutcome::PendingRestart { .. }
+        ) {
+            let drift = runtime.drift_against(Arc::clone(&candidate))?;
+            self.state
+                .set_configuration_status(Some(ConfigurationRuntimeStatus::for_desired(
+                    runtime,
+                    &candidate,
+                    drift.disposition(),
+                )?))?;
+        }
+        Ok(outcome)
     }
 
     /// Records a rejected source document while retaining the current complete
@@ -370,19 +457,35 @@ impl RunningProcess {
             .ok_or(ConfigurationRuntimeFailure::Unavailable)?;
         let drift = runtime.drift_against(Arc::clone(&desired))?;
         match drift.disposition() {
-            ConfigurationDriftDisposition::None => Ok(drift),
+            ConfigurationDriftDisposition::None => {
+                self.state.set_configuration_status(Some(
+                    ConfigurationRuntimeStatus::for_desired(
+                        runtime,
+                        &desired,
+                        ConfigurationDriftDisposition::None,
+                    )?,
+                ))?;
+                Ok(drift)
+            },
             ConfigurationDriftDisposition::Reconcile => {
                 self.reload_configuration(desired)?;
                 Ok(drift)
             },
             ConfigurationDriftDisposition::Fence => {
                 let drift = runtime.record_fenced_drift_with(
-                    desired,
+                    Arc::clone(&desired),
                     self.configuration_publication
                         .as_ref()
                         .ok_or(ConfigurationRuntimeFailure::Unavailable)?,
                 )?;
                 self.state.transition(ProcessPhase::Fenced);
+                self.state.set_configuration_status(Some(
+                    ConfigurationRuntimeStatus::for_desired(
+                        runtime,
+                        &desired,
+                        ConfigurationDriftDisposition::Fence,
+                    )?,
+                ))?;
                 Ok(drift)
             },
         }

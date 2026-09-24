@@ -256,7 +256,9 @@ fn wait_for_shutdown(
                 }
             },
             Err(()) => {
-                let _ = process.record_invalid_configuration_reload();
+                if process.record_invalid_configuration_reload().is_err() {
+                    eprintln!("positron: configuration reload audit unavailable");
+                }
                 eprintln!("positron: configuration reload rejected");
             },
         }

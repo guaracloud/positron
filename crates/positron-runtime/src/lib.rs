@@ -37,9 +37,10 @@ pub use native_host::{
     ApiTransportProfile, NativeBindings, NativeHost, NativeHostFailure, TrustedProxy,
 };
 pub use process::{
-    ApplicationRuntime, CleanupFailure, CleanupPrimary, CleanupRole, DrainingProcess, ExitOutcome,
-    HostInputs, InitializationMode, PublicPlaintextApiStartupIntent, RecoveryAttempt,
-    RecoveryAttemptHost, RecoveryDecision, RunningProcess, ServeConfiguration, ShutdownTrigger,
+    ApplicationRuntime, CleanupFailure, CleanupPrimary, CleanupRole, ConfigurationRuntimeStatus,
+    DrainingProcess, ExitOutcome, HostInputs, InitializationMode, PublicPlaintextApiStartupIntent,
+    RecoveryAttempt, RecoveryAttemptHost, RecoveryDecision, RunningProcess, ServeConfiguration,
+    ShutdownTrigger,
 };
 pub use services::{ConfiguredExportDestinationResolver, ServiceFailure, ServiceHandle};
 pub use task::{

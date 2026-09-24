@@ -208,16 +208,15 @@ impl RuntimeConfiguration {
             },
             ConfigurationDiffPlan::RestartRequired => {
                 let active = Arc::new(state.effective.with_live_changes_from(&candidate));
-                let active_changed = active.as_ref() != state.effective.as_ref();
                 let generation = publication.publish(
                     &active,
                     &candidate,
                     &diff,
                     ConfigurationPublicationDisposition::PendingRestart,
                 )?;
-                if active_changed {
-                    validate_successor_generation(state.generation, generation)?;
-                    state.generation = generation;
+                validate_successor_generation(state.generation, generation)?;
+                state.generation = generation;
+                if active.as_ref() != state.effective.as_ref() {
                     state.effective = active;
                 }
                 state.pending_restart = Some(PendingRestart {
@@ -288,6 +287,7 @@ fn validate_successor_generation(
 pub enum ConfigurationRuntimeFailure {
     Unavailable,
     PublicationUnavailable,
+    ImmutableConfiguration,
 }
 
 impl Display for ConfigurationRuntimeFailure {
@@ -295,6 +295,9 @@ impl Display for ConfigurationRuntimeFailure {
         formatter.write_str(match self {
             Self::Unavailable => "configuration runtime is unavailable",
             Self::PublicationUnavailable => "configuration publication is unavailable",
+            Self::ImmutableConfiguration => {
+                "configuration changes an immutable initialized setting"
+            },
         })
     }
 }

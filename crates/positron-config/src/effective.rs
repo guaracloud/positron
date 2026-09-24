@@ -2,6 +2,7 @@ use std::fmt::{Debug, Formatter};
 use std::net::SocketAddr;
 
 use positron_domain::identity::TenantId;
+use sha2::{Digest, Sha256};
 
 use super::{
     ApiTransport, ConfigurationFailure, ConfigurationFailureCode, LogLevel, MutabilityClass,
@@ -213,6 +214,29 @@ impl EffectiveConfiguration {
     #[must_use]
     pub fn local_key_file(&self) -> &ProtectedFileReference {
         &self.local_key_file
+    }
+
+    /// Returns the durable, non-reversible binding for settings that may only
+    /// change through an explicit initialization, migration, or restore
+    /// workflow. The Catalog stores this digest instead of protected paths.
+    #[must_use]
+    pub fn immutable_configuration_digest(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(b"positron.configuration.immutable.v1\0");
+        for definition in contract::SETTING_DEFINITIONS {
+            if definition.mutability() != MutabilityClass::ImmutableAfterInitialization {
+                continue;
+            }
+            update_digest_string(&mut hasher, definition.path());
+            update_digest_string(
+                &mut hasher,
+                &self.canonical_identity_value(definition.setting()),
+            );
+        }
+        let digest = hasher.finalize();
+        let mut result = [0; 32];
+        result.copy_from_slice(&digest);
+        result
     }
 
     /// Returns an operator-configured destination only when its scope includes
@@ -449,6 +473,28 @@ impl EffectiveConfiguration {
         }
     }
 
+    fn canonical_identity_value(&self, setting: Setting) -> String {
+        match setting {
+            Setting::SchemaVersion => self.schema_version.to_string(),
+            Setting::DiagnosticsLogLevel => self.log_level.as_str().to_owned(),
+            Setting::RuntimeShutdownGraceSeconds => self.shutdown_grace_seconds.to_string(),
+            Setting::RuntimeMaxRegisteredTenants => self.max_registered_tenants.to_string(),
+            Setting::ListenerControlPath => self.control_path.clone(),
+            Setting::ListenerOperationsBindAddress => self.operations_bind_address.to_string(),
+            Setting::ListenerApiBindAddress => self.api_bind_address.to_string(),
+            Setting::ListenerApiTransport => self.api_transport.as_str().to_owned(),
+            Setting::ListenerApiTlsCertificateFile => self.api_tls_certificate_file.path.clone(),
+            Setting::ListenerApiTlsPrivateKeyFile => self.api_tls_private_key_file.path.clone(),
+            Setting::ListenerOtlpGrpcBindAddress => self.otlp_grpc_bind_address.to_string(),
+            Setting::ListenerOtlpHttpBindAddress => self.otlp_http_bind_address.to_string(),
+            Setting::ListenerLokiPushBindAddress => self.loki_push_bind_address.to_string(),
+            Setting::StorageDataDirectory => self.data_directory.clone(),
+            Setting::StorageSecretsDirectory => self.secrets_directory.clone(),
+            Setting::SecurityLocalKeyFile => self.local_key_file.path.clone(),
+            Setting::ExportDestinations => self.redacted_export_destinations(),
+        }
+    }
+
     fn redacted_value(&self, setting: Setting) -> String {
         if setting.secrecy() == super::SecrecyClass::SecretBearing {
             return "<redacted>".to_owned();
@@ -495,6 +541,11 @@ impl EffectiveConfiguration {
         }
         rendered
     }
+}
+
+fn update_digest_string(hasher: &mut Sha256, value: &str) {
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value.as_bytes());
 }
 
 fn hexadecimal_identity(identity: [u8; 16]) -> String {

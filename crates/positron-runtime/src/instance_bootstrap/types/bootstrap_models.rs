@@ -326,3 +326,12 @@ impl std::fmt::Debug for InitializedInstance {
             .finish_non_exhaustive()
     }
 }
+
+impl InitializedInstance {
+    /// Returns the bootstrap-pinned system administrator that acts for
+    /// instance-owned maintenance transitions.
+    #[must_use]
+    pub(crate) const fn administrator(&self) -> PrincipalId {
+        self.administrator
+    }
+}
