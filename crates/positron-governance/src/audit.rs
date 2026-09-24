@@ -161,6 +161,44 @@ impl ConfigurationAuditOutcome {
     }
 }
 
+/// Administration-owned actor, target, request, and time binding for one
+/// configuration reload audit intent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConfigurationAuditContext {
+    outcome: ConfigurationAuditOutcome,
+    ingest_time_unix_seconds: u64,
+    principal: PrincipalId,
+    applicable_tenant: Option<TenantId>,
+    target: [u8; 16],
+    request_id: [u8; 16],
+}
+
+impl ConfigurationAuditContext {
+    pub fn new(
+        outcome: ConfigurationAuditOutcome,
+        ingest_time_unix_seconds: u64,
+        principal: PrincipalId,
+        applicable_tenant: Option<TenantId>,
+        target: [u8; 16],
+        request_id: [u8; 16],
+    ) -> Result<Self, GovernanceIntentFailure> {
+        if ingest_time_unix_seconds == 0
+            || target.iter().all(|byte| *byte == 0)
+            || request_id.iter().all(|byte| *byte == 0)
+        {
+            return Err(GovernanceIntentFailure);
+        }
+        Ok(Self {
+            outcome,
+            ingest_time_unix_seconds,
+            principal,
+            applicable_tenant,
+            target,
+            request_id,
+        })
+    }
+}
+
 /// Administration-owned, redacted audit intent for one configuration reload.
 ///
 /// The configuration module supplies only digests of complete redacted
@@ -182,21 +220,13 @@ pub struct ConfigurationAuditRequest {
 
 impl ConfigurationAuditRequest {
     pub fn new(
-        outcome: ConfigurationAuditOutcome,
-        ingest_time_unix_seconds: u64,
-        principal: PrincipalId,
-        applicable_tenant: Option<TenantId>,
-        target: [u8; 16],
-        request_id: [u8; 16],
+        context: ConfigurationAuditContext,
         catalog_generation: u64,
         changed_setting_count: u8,
         active_digest: [u8; 32],
         candidate_digest: [u8; 32],
     ) -> Result<Self, GovernanceIntentFailure> {
-        if ingest_time_unix_seconds == 0
-            || target.iter().all(|byte| *byte == 0)
-            || request_id.iter().all(|byte| *byte == 0)
-            || catalog_generation == 0
+        if catalog_generation == 0
             || changed_setting_count == 0
             || active_digest.iter().all(|byte| *byte == 0)
             || candidate_digest.iter().all(|byte| *byte == 0)
@@ -204,12 +234,12 @@ impl ConfigurationAuditRequest {
             return Err(GovernanceIntentFailure);
         }
         Ok(Self {
-            outcome,
-            ingest_time_unix_seconds,
-            principal,
-            applicable_tenant,
-            target,
-            request_id,
+            outcome: context.outcome,
+            ingest_time_unix_seconds: context.ingest_time_unix_seconds,
+            principal: context.principal,
+            applicable_tenant: context.applicable_tenant,
+            target: context.target,
+            request_id: context.request_id,
             catalog_generation,
             changed_setting_count,
             active_digest,
@@ -342,13 +372,17 @@ impl ConfigurationAuditRequest {
         let changed_setting_count = cursor.take_u8()?;
         let active_digest = cursor.take_array()?;
         let candidate_digest = cursor.take_array()?;
-        let request = Self::new(
+        let context = ConfigurationAuditContext::new(
             outcome,
             ingest_time_unix_seconds,
             principal,
             applicable_tenant,
             target,
             request_id,
+        )
+        .map_err(|_| IdentityFailure)?;
+        let request = Self::new(
+            context,
             catalog_generation,
             changed_setting_count,
             active_digest,

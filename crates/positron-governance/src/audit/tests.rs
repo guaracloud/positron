@@ -556,19 +556,17 @@ fn tenant_retention_audit_is_typed_redacted_and_strict() {
 
 #[test]
 fn configuration_audit_binds_the_fenced_drift_to_one_catalog_generation() {
-    let request = ConfigurationAuditRequest::new(
+    let context = crate::ConfigurationAuditContext::new(
         ConfigurationAuditOutcome::FencedDrift,
         1_725_000_000,
         PrincipalId::from_bytes([0x31; 16]).expect("principal"),
         None,
         [0x32; 16],
         [0x33; 16],
-        42,
-        1,
-        [0x41; 32],
-        [0x42; 32],
     )
-    .expect("valid configuration audit request");
+    .expect("valid configuration audit context");
+    let request = ConfigurationAuditRequest::new(context, 42, 1, [0x41; 32], [0x42; 32])
+        .expect("valid configuration audit request");
     let encoded = request.encode();
     let entry = GovernanceAuditEntry::decode_fields(9, request.transaction_id(), &encoded)
         .expect("typed configuration audit");

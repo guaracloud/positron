@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use positron_config::{ConfigurationDiff, EffectiveConfiguration};
 use positron_domain::routing::SignalKind;
-use positron_governance::{ConfigurationAuditOutcome, ConfigurationAuditRequest};
+use positron_governance::{
+    ConfigurationAuditContext, ConfigurationAuditOutcome, ConfigurationAuditRequest,
+};
 use positron_kernel::{
     AuditIntent, Catalog, CatalogObject, CatalogProposal, FormatEpoch, TransactionId,
 };
@@ -280,13 +282,17 @@ impl InitializedInstance {
             active_digest,
             candidate_digest,
         );
-        ConfigurationAuditRequest::new(
+        let context = ConfigurationAuditContext::new(
             outcome,
             ingest_time_unix_seconds,
             self.administrator(),
             None,
             self.instance.to_bytes(),
             request_id,
+        )
+        .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        ConfigurationAuditRequest::new(
+            context,
             catalog_generation,
             changed_setting_count,
             active_digest,
