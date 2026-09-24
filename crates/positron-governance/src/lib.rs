@@ -33,6 +33,7 @@ pub use api_key_administration::{
 };
 pub use audit::{
     ApiKeyLifecycleAction, CatalogRootRotationAuditEntry, CatalogRootRotationStage,
+    ConfigurationAuditEntry, ConfigurationAuditOutcome, ConfigurationAuditRequest,
     DurableOperationAuditEntry, GovernanceAuditEntry, IngestPolicyActivationAuditEntry,
     InitialAuditMetadata, InitializationAuditEntry, ListenerTransportAuditEntry,
     ListenerTransportAuditRequest, ListenerTransportConfigurationProvenance,

@@ -281,6 +281,14 @@ impl EffectiveConfiguration {
         ConfigurationDiff { changes, plan }
     }
 
+    /// Compares one operator-rendered desired configuration to this observed
+    /// active configuration without exposing secret-bearing values.
+    #[must_use]
+    pub fn drift_against(&self, desired: &Self) -> ConfigurationDrift {
+        let diff = self.semantic_diff(desired);
+        ConfigurationDrift::from_diff(diff)
+    }
+
     #[must_use]
     pub fn redacted_reference(&self) -> String {
         let mut rendered = String::with_capacity(512);
@@ -364,6 +372,43 @@ impl EffectiveConfiguration {
             }
         }
         Ok(ConfigurationPlan::from_changes(changes))
+    }
+
+    /// Produces the active successor after applying only settings the
+    /// Configuration Contract classifies as live-reloadable. Callers retain
+    /// the complete candidate separately when restart-required settings are
+    /// pending, so no consumer can observe a partly applied candidate.
+    #[must_use]
+    pub fn with_live_changes_from(&self, candidate: &Self) -> Self {
+        let mut active = self.clone();
+        for definition in contract::SETTING_DEFINITIONS {
+            let setting = definition.setting();
+            if setting.mutability() != MutabilityClass::LiveReloadable
+                || !self.setting_differs(candidate, setting)
+            {
+                continue;
+            }
+            match setting {
+                Setting::DiagnosticsLogLevel => active.log_level = candidate.log_level,
+                Setting::SchemaVersion
+                | Setting::RuntimeShutdownGraceSeconds
+                | Setting::RuntimeMaxRegisteredTenants
+                | Setting::ListenerControlPath
+                | Setting::ListenerOperationsBindAddress
+                | Setting::ListenerApiBindAddress
+                | Setting::ListenerApiTransport
+                | Setting::ListenerApiTlsCertificateFile
+                | Setting::ListenerApiTlsPrivateKeyFile
+                | Setting::ListenerOtlpGrpcBindAddress
+                | Setting::ListenerOtlpHttpBindAddress
+                | Setting::ListenerLokiPushBindAddress
+                | Setting::StorageDataDirectory
+                | Setting::StorageSecretsDirectory
+                | Setting::SecurityLocalKeyFile
+                | Setting::ExportDestinations => {},
+            }
+        }
+        active
     }
 
     fn setting_differs(&self, other: &Self, setting: Setting) -> bool {
@@ -582,6 +627,48 @@ impl ConfigurationDiffPlan {
 pub struct ConfigurationDiff {
     changes: Vec<ConfigurationChange>,
     plan: ConfigurationDiffPlan,
+}
+
+/// The operator-visible disposition of desired versus observed configuration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfigurationDrift {
+    diff: ConfigurationDiff,
+    disposition: ConfigurationDriftDisposition,
+}
+
+impl ConfigurationDrift {
+    fn from_diff(diff: ConfigurationDiff) -> Self {
+        let disposition = if diff.changes.is_empty() {
+            ConfigurationDriftDisposition::None
+        } else if diff
+            .changes
+            .iter()
+            .any(|change| change.setting().requires_drift_fence())
+        {
+            ConfigurationDriftDisposition::Fence
+        } else {
+            ConfigurationDriftDisposition::Reconcile
+        };
+        Self { diff, disposition }
+    }
+
+    #[must_use]
+    pub const fn diff(&self) -> &ConfigurationDiff {
+        &self.diff
+    }
+
+    #[must_use]
+    pub const fn disposition(&self) -> ConfigurationDriftDisposition {
+        self.disposition
+    }
+}
+
+/// The only safe automatic handling for detected configuration drift.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConfigurationDriftDisposition {
+    None,
+    Reconcile,
+    Fence,
 }
 
 impl ConfigurationDiff {

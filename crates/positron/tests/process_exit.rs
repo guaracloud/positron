@@ -5,6 +5,8 @@ use std::process::Command;
 #[cfg(unix)]
 use std::fs;
 #[cfg(unix)]
+use std::process::Stdio;
+#[cfg(unix)]
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[cfg(unix)]
 use std::{io::Read, io::Write, net::TcpStream};
@@ -103,6 +105,94 @@ fn first_os_signal_drains_and_exits_successfully() -> Result<(), Box<dyn std::er
     assert!(signal.success());
     let status = child.wait()?;
     assert_eq!(status.code(), Some(0));
+    fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn sighup_reloads_a_valid_candidate_and_keeps_serving_after_a_rejected_candidate()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _serial = PROCESS_TEST
+        .lock()
+        .map_err(|_| "process test lock poisoned")?;
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let root = std::env::temp_dir().join(format!("positron-reload-{}-{nonce}", std::process::id()));
+    let data = root.join("data");
+    let secrets = root.join("secrets");
+    fs::create_dir_all(&data)?;
+    fs::create_dir_all(&secrets)?;
+    fs::set_permissions(&secrets, fs::Permissions::from_mode(0o700))?;
+    let [
+        operations_port,
+        api_port,
+        otlp_grpc_port,
+        otlp_http_port,
+        loki_push_port,
+    ] = available_ports()?;
+    let config_path = root.join("positron.toml");
+    let base_configuration = process_configuration(
+        &root,
+        &data,
+        &secrets,
+        [
+            operations_port,
+            api_port,
+            otlp_grpc_port,
+            otlp_http_port,
+            loki_push_port,
+        ],
+    );
+    fs::write(&config_path, &base_configuration)?;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_positron"))
+        .args(["serve", "--init-if-empty", "--config"])
+        .arg(&config_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    wait_for_ready(operations_port)?;
+
+    fs::write(
+        &config_path,
+        format!("{base_configuration}\n[diagnostics]\nlog_level = \"debug\"\n"),
+    )?;
+    assert!(
+        Command::new("/bin/kill")
+            .args(["-HUP", &child.id().to_string()])
+            .status()?
+            .success()
+    );
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(child.try_wait()?.is_none());
+    wait_for_ready(operations_port)?;
+
+    fs::write(
+        &config_path,
+        "schema_version = 1\n[diagnostics]\nlog_level = \"invalid\"\n",
+    )?;
+    assert!(
+        Command::new("/bin/kill")
+            .args(["-HUP", &child.id().to_string()])
+            .status()?
+            .success()
+    );
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(child.try_wait()?.is_none());
+    wait_for_ready(operations_port)?;
+    assert!(
+        Command::new("/bin/kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status()?
+            .success()
+    );
+    let output = child.wait_with_output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8(output.stderr)?,
+        "positron: configuration reload rejected\n"
+    );
     fs::remove_dir_all(root)?;
     Ok(())
 }
