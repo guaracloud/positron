@@ -31,7 +31,7 @@ macro_rules! define_settings {
     };
 }
 
-pub(crate) const SETTING_DEFINITIONS: [SettingDefinition; 32] = define_settings! {
+pub(crate) const SETTING_DEFINITIONS: [SettingDefinition; 44] = define_settings! {
     SchemaVersion | "schema_version" | Integer | "1" | ExactUnsignedInteger(1) | Public | ConfigurationFileOnly | ImmutableAfterInitialization;
     DiagnosticsLogLevel | "diagnostics.log_level" | String | "info" | StringEnumeration(&["error", "warn", "info", "debug"]) | Public | NonSecretOverrides | LiveReloadable;
     RuntimeShutdownGraceSeconds | "runtime.shutdown_grace_seconds" | Integer | "30" | UnsignedIntegerRange(1, 3600) | Public | NonSecretOverrides | RestartRequired;
@@ -39,25 +39,37 @@ pub(crate) const SETTING_DEFINITIONS: [SettingDefinition; 32] = define_settings!
     ListenerControlPath | "listener.control_path" | String | "/var/run/positron/control.sock" | AbsolutePath(256) | Public | NonSecretOverrides | DrainAndReload;
     ListenerOperationsBindAddress | "listener.operations_bind_address" | String | "127.0.0.1:13133" | SocketAddress(256) | Public | NonSecretOverrides | DrainAndReload;
     ListenerOperationsTransport | "listener.operations_transport" | String | "tls" | StringEnumeration(&["tls", "mtls", "plaintext"]) | Public | ConfigurationFileOnly | DrainAndReload;
+    ListenerOperationsTlsCertificateFile | "listener.operations_tls_certificate_file" | String | "/var/lib/positron-secrets/operations-certificate.pem" | ProtectedAbsolutePath(256) | SecretBearing | ProtectedConfigurationFileOnly | DrainAndReload;
+    ListenerOperationsTlsPrivateKeyFile | "listener.operations_tls_private_key_file" | String | "/var/lib/positron-secrets/operations-private-key.pem" | ProtectedAbsolutePath(256) | SecretBearing | ProtectedConfigurationFileOnly | DrainAndReload;
+    ListenerOperationsTlsClientCaFile | "listener.operations_tls_client_ca_file" | String | "/var/lib/positron-secrets/operations-client-ca.pem" | ProtectedAbsolutePath(256) | SecretBearing | ProtectedConfigurationFileOnly | DrainAndReload;
     ListenerOperationsTrustedProxyCidrs | "listener.operations.trusted_proxy_cidrs" | TrustedProxyCidrs | "disabled" | TrustedProxyCidrs(16, 64) | Public | ConfigurationFileOnly | DrainAndReload;
     ListenerOperationsForwardedHops | "listener.operations.forwarded_hops" | Integer | "0" | UnsignedIntegerRange(0, 255) | Public | ConfigurationFileOnly | DrainAndReload;
     ListenerApiBindAddress | "listener.api_bind_address" | String | "127.0.0.1:8080" | SocketAddress(256) | Public | NonSecretOverrides | DrainAndReload;
-    ListenerApiTransport | "listener.api_transport" | String | "tls" | StringEnumeration(&["tls", "plaintext"]) | Public | ConfigurationFileOnly | DrainAndReload;
+    ListenerApiTransport | "listener.api_transport" | String | "tls" | StringEnumeration(&["tls", "mtls", "plaintext"]) | Public | ConfigurationFileOnly | DrainAndReload;
     ListenerApiTrustedProxyCidrs | "listener.api.trusted_proxy_cidrs" | TrustedProxyCidrs | "disabled" | TrustedProxyCidrs(16, 64) | Public | ConfigurationFileOnly | DrainAndReload;
     ListenerApiForwardedHops | "listener.api.forwarded_hops" | Integer | "0" | UnsignedIntegerRange(0, 255) | Public | ConfigurationFileOnly | DrainAndReload;
     ListenerApiTlsCertificateFile | "listener.api_tls_certificate_file" | String | "/var/lib/positron-secrets/api-certificate.pem" | ProtectedAbsolutePath(256) | SecretBearing | ProtectedConfigurationFileOnly | DrainAndReload;
     ListenerApiTlsPrivateKeyFile | "listener.api_tls_private_key_file" | String | "/var/lib/positron-secrets/api-private-key.pem" | ProtectedAbsolutePath(256) | SecretBearing | ProtectedConfigurationFileOnly | DrainAndReload;
-    ListenerTlsClientCaFile | "listener.tls_client_ca_file" | String | "/var/lib/positron-secrets/client-ca.pem" | ProtectedAbsolutePath(256) | SecretBearing | ProtectedConfigurationFileOnly | DrainAndReload;
+    ListenerApiTlsClientCaFile | "listener.api_tls_client_ca_file" | String | "/var/lib/positron-secrets/api-client-ca.pem" | ProtectedAbsolutePath(256) | SecretBearing | ProtectedConfigurationFileOnly | DrainAndReload;
     ListenerOtlpGrpcBindAddress | "listener.otlp_grpc_bind_address" | String | "127.0.0.1:4317" | SocketAddress(256) | Public | NonSecretOverrides | DrainAndReload;
     ListenerOtlpGrpcTransport | "listener.otlp_grpc_transport" | String | "tls" | StringEnumeration(&["tls", "mtls", "plaintext"]) | Public | ConfigurationFileOnly | DrainAndReload;
+    ListenerOtlpGrpcTlsCertificateFile | "listener.otlp_grpc_tls_certificate_file" | String | "/var/lib/positron-secrets/otlp-grpc-certificate.pem" | ProtectedAbsolutePath(256) | SecretBearing | ProtectedConfigurationFileOnly | DrainAndReload;
+    ListenerOtlpGrpcTlsPrivateKeyFile | "listener.otlp_grpc_tls_private_key_file" | String | "/var/lib/positron-secrets/otlp-grpc-private-key.pem" | ProtectedAbsolutePath(256) | SecretBearing | ProtectedConfigurationFileOnly | DrainAndReload;
+    ListenerOtlpGrpcTlsClientCaFile | "listener.otlp_grpc_tls_client_ca_file" | String | "/var/lib/positron-secrets/otlp-grpc-client-ca.pem" | ProtectedAbsolutePath(256) | SecretBearing | ProtectedConfigurationFileOnly | DrainAndReload;
     ListenerOtlpGrpcTrustedProxyCidrs | "listener.otlp_grpc.trusted_proxy_cidrs" | TrustedProxyCidrs | "disabled" | TrustedProxyCidrs(16, 64) | Public | ConfigurationFileOnly | DrainAndReload;
     ListenerOtlpGrpcForwardedHops | "listener.otlp_grpc.forwarded_hops" | Integer | "0" | UnsignedIntegerRange(0, 255) | Public | ConfigurationFileOnly | DrainAndReload;
     ListenerOtlpHttpBindAddress | "listener.otlp_http_bind_address" | String | "127.0.0.1:4318" | SocketAddress(256) | Public | NonSecretOverrides | DrainAndReload;
     ListenerOtlpHttpTransport | "listener.otlp_http_transport" | String | "tls" | StringEnumeration(&["tls", "mtls", "plaintext"]) | Public | ConfigurationFileOnly | DrainAndReload;
+    ListenerOtlpHttpTlsCertificateFile | "listener.otlp_http_tls_certificate_file" | String | "/var/lib/positron-secrets/otlp-http-certificate.pem" | ProtectedAbsolutePath(256) | SecretBearing | ProtectedConfigurationFileOnly | DrainAndReload;
+    ListenerOtlpHttpTlsPrivateKeyFile | "listener.otlp_http_tls_private_key_file" | String | "/var/lib/positron-secrets/otlp-http-private-key.pem" | ProtectedAbsolutePath(256) | SecretBearing | ProtectedConfigurationFileOnly | DrainAndReload;
+    ListenerOtlpHttpTlsClientCaFile | "listener.otlp_http_tls_client_ca_file" | String | "/var/lib/positron-secrets/otlp-http-client-ca.pem" | ProtectedAbsolutePath(256) | SecretBearing | ProtectedConfigurationFileOnly | DrainAndReload;
     ListenerOtlpHttpTrustedProxyCidrs | "listener.otlp_http.trusted_proxy_cidrs" | TrustedProxyCidrs | "disabled" | TrustedProxyCidrs(16, 64) | Public | ConfigurationFileOnly | DrainAndReload;
     ListenerOtlpHttpForwardedHops | "listener.otlp_http.forwarded_hops" | Integer | "0" | UnsignedIntegerRange(0, 255) | Public | ConfigurationFileOnly | DrainAndReload;
     ListenerLokiPushBindAddress | "listener.loki_push_bind_address" | String | "127.0.0.1:3100" | SocketAddress(256) | Public | NonSecretOverrides | DrainAndReload;
     ListenerLokiPushTransport | "listener.loki_push_transport" | String | "tls" | StringEnumeration(&["tls", "mtls", "plaintext"]) | Public | ConfigurationFileOnly | DrainAndReload;
+    ListenerLokiPushTlsCertificateFile | "listener.loki_push_tls_certificate_file" | String | "/var/lib/positron-secrets/loki-push-certificate.pem" | ProtectedAbsolutePath(256) | SecretBearing | ProtectedConfigurationFileOnly | DrainAndReload;
+    ListenerLokiPushTlsPrivateKeyFile | "listener.loki_push_tls_private_key_file" | String | "/var/lib/positron-secrets/loki-push-private-key.pem" | ProtectedAbsolutePath(256) | SecretBearing | ProtectedConfigurationFileOnly | DrainAndReload;
+    ListenerLokiPushTlsClientCaFile | "listener.loki_push_tls_client_ca_file" | String | "/var/lib/positron-secrets/loki-push-client-ca.pem" | ProtectedAbsolutePath(256) | SecretBearing | ProtectedConfigurationFileOnly | DrainAndReload;
     ListenerLokiPushTrustedProxyCidrs | "listener.loki_push.trusted_proxy_cidrs" | TrustedProxyCidrs | "disabled" | TrustedProxyCidrs(16, 64) | Public | ConfigurationFileOnly | DrainAndReload;
     ListenerLokiPushForwardedHops | "listener.loki_push.forwarded_hops" | Integer | "0" | UnsignedIntegerRange(0, 255) | Public | ConfigurationFileOnly | DrainAndReload;
     StorageDataDirectory | "storage.data_directory" | String | "/var/lib/positron" | AbsolutePath(256) | Public | ConfigurationFileOnly | ImmutableAfterInitialization;

@@ -30,7 +30,11 @@ const KEY_LIFECYCLE_V2_MAGIC: [u8; 8] = *b"POSKEY02";
 const KEY_LIFECYCLE_V3_MAGIC: [u8; 8] = *b"POSKEY03";
 const LISTENER_TRANSPORT_MAGIC: [u8; 8] = *b"POSTPT01";
 const LISTENER_TRANSPORT_V2_MAGIC: [u8; 8] = *b"POSTPT02";
-const LISTENER_TRANSPORT_REQUEST_DOMAIN: &[u8] = b"positron.listener-transport.request.v1\0";
+const LISTENER_TRANSPORT_V3_MAGIC: [u8; 8] = *b"POSTPT03";
+const LISTENER_TRANSPORT_V2_REQUEST_DOMAIN: &[u8] = b"positron.listener-transport.request.v1\0";
+const LISTENER_TRANSPORT_V3_REQUEST_DOMAIN: &[u8] = b"positron.listener-transport.request.v2\0";
+const TLS_MATERIAL_RELOAD_MAGIC: [u8; 8] = *b"POSTMR01";
+const TLS_MATERIAL_RELOAD_DOMAIN: &[u8] = b"positron.tls-material-reload.audit.v1\0";
 const TENANT_LIFECYCLE_MAGIC: [u8; 8] = *b"POSTEN01";
 const TENANT_LIFECYCLE_V2_MAGIC: [u8; 8] = *b"POSTEN02";
 const TENANT_CREATION_MAGIC: [u8; 8] = *b"POSTNA01";
@@ -123,6 +127,7 @@ pub enum GovernanceAuditEntry {
     SystemAuditRetentionUpdate(SystemAuditRetentionUpdateAuditEntry),
     DurableOperation(DurableOperationAuditEntry),
     Configuration(ConfigurationAuditEntry),
+    TlsMaterialReload(TlsMaterialReloadAuditEntry),
 }
 
 /// The durable disposition of one resolved configuration candidate.
@@ -681,13 +686,14 @@ pub struct TenantLifecycleAuditEntry {
     request_digest: Option<[u8; 32]>,
 }
 
-/// Redacted evidence that the active API listener uses the explicit plaintext
+/// Redacted evidence that an active listener uses the explicit plaintext
 /// transport opt-out.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ListenerTransportAuditEntry {
     position: u64,
     instance: [u8; 16],
     listener_target: Option<SocketAddr>,
+    listener_role: Option<ListenerTransportRole>,
     configuration_provenance: Option<ListenerTransportConfigurationProvenance>,
     request_id: Option<[u8; 16]>,
     request_digest: Option<[u8; 32]>,
@@ -700,6 +706,7 @@ impl ListenerTransportAuditEntry {
             position,
             instance,
             listener_target: None,
+            listener_role: None,
             configuration_provenance: None,
             request_id: None,
             request_digest: None,
@@ -711,6 +718,7 @@ impl ListenerTransportAuditEntry {
         position: u64,
         instance: [u8; 16],
         listener_target: SocketAddr,
+        listener_role: Option<ListenerTransportRole>,
         configuration_provenance: ListenerTransportConfigurationProvenance,
         request_id: [u8; 16],
         request_digest: [u8; 32],
@@ -719,6 +727,7 @@ impl ListenerTransportAuditEntry {
             position,
             instance,
             listener_target: Some(listener_target),
+            listener_role,
             configuration_provenance: Some(configuration_provenance),
             request_id: Some(request_id),
             request_digest: Some(request_digest),
@@ -740,6 +749,13 @@ impl ListenerTransportAuditEntry {
     #[must_use]
     pub const fn listener_target(&self) -> Option<SocketAddr> {
         self.listener_target
+    }
+
+    /// Returns the exact listener role for current role-bound records.
+    /// Earlier API-only records retain no fabricated role field.
+    #[must_use]
+    pub const fn listener_role(&self) -> Option<ListenerTransportRole> {
+        self.listener_role
     }
 
     /// Returns the resolved Configuration Contract source for current bound
@@ -773,12 +789,47 @@ impl ListenerTransportAuditEntry {
 
     #[must_use]
     pub const fn action(&self) -> &'static str {
-        "listener.api-transport.plaintext-opt-out"
+        match self.listener_role {
+            Some(ListenerTransportRole::Control) => "listener.control-transport.plaintext-opt-out",
+            Some(ListenerTransportRole::Operations) => {
+                "listener.operations-transport.plaintext-opt-out"
+            },
+            Some(ListenerTransportRole::Api) | None => "listener.api-transport.plaintext-opt-out",
+            Some(ListenerTransportRole::OtlpGrpc) => {
+                "listener.otlp-grpc-transport.plaintext-opt-out"
+            },
+            Some(ListenerTransportRole::OtlpHttp) => {
+                "listener.otlp-http-transport.plaintext-opt-out"
+            },
+            Some(ListenerTransportRole::LokiPush) => {
+                "listener.loki-push-transport.plaintext-opt-out"
+            },
+        }
     }
 
     #[must_use]
     pub const fn outcome(&self) -> &'static str {
         "active"
+    }
+
+    pub(crate) fn matches_request(
+        &self,
+        instance: [u8; 16],
+        request: ListenerTransportAuditRequest,
+    ) -> bool {
+        if self.instance != instance {
+            return false;
+        }
+        match self.listener_role {
+            Some(listener_role) => {
+                listener_role == request.listener_role()
+                    && self.request_digest == Some(request.digest_for(instance))
+            },
+            None => {
+                request.listener_role() == ListenerTransportRole::Api
+                    && self.request_digest == Some(request.legacy_digest_for(instance))
+            },
+        }
     }
 }
 
@@ -787,6 +838,307 @@ impl ListenerTransportAuditEntry {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ListenerTransportConfigurationProvenance {
     ConfigurationFile,
+}
+
+/// The listener surface covered by one plaintext transport opt-out.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ListenerTransportRole {
+    Control,
+    Operations,
+    Api,
+    OtlpGrpc,
+    OtlpHttp,
+    LokiPush,
+}
+
+impl ListenerTransportRole {
+    const fn code(self) -> u8 {
+        match self {
+            Self::Control => 1,
+            Self::Operations => 2,
+            Self::Api => 3,
+            Self::OtlpGrpc => 4,
+            Self::OtlpHttp => 5,
+            Self::LokiPush => 6,
+        }
+    }
+
+    const fn from_code(code: u8) -> Result<Self, IdentityFailure> {
+        match code {
+            1 => Ok(Self::Control),
+            2 => Ok(Self::Operations),
+            3 => Ok(Self::Api),
+            4 => Ok(Self::OtlpGrpc),
+            5 => Ok(Self::OtlpHttp),
+            6 => Ok(Self::LokiPush),
+            _ => Err(IdentityFailure),
+        }
+    }
+}
+
+/// The network listener roles whose TLS material was examined as one atomic
+/// reload attempt. Control is a local Unix-domain socket and cannot occur in
+/// this set.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TlsMaterialReloadListenerSet(u8);
+
+impl TlsMaterialReloadListenerSet {
+    const NETWORK_ROLE_BITS: u8 = 0b0011_1110;
+
+    /// Forms a closed non-empty set of network listener roles from its stable
+    /// bit representation. The representation is intentionally not a socket
+    /// address or a configuration path.
+    pub fn new(bits: u8) -> Result<Self, GovernanceIntentFailure> {
+        if bits == 0 || bits & !Self::NETWORK_ROLE_BITS != 0 {
+            return Err(GovernanceIntentFailure);
+        }
+        Ok(Self(bits))
+    }
+
+    /// Returns a one-role set for a listener that can own TLS material.
+    pub fn for_role(role: ListenerTransportRole) -> Result<Self, GovernanceIntentFailure> {
+        Self::new(role.tls_material_bit())
+    }
+
+    #[must_use]
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    #[must_use]
+    pub const fn contains(self, role: ListenerTransportRole) -> bool {
+        let bit = role.tls_material_bit();
+        bit != 0 && self.0 & bit != 0
+    }
+}
+
+impl ListenerTransportRole {
+    const fn tls_material_bit(self) -> u8 {
+        match self {
+            Self::Control => 0,
+            Self::Operations => 1 << 1,
+            Self::Api => 1 << 2,
+            Self::OtlpGrpc => 1 << 3,
+            Self::OtlpHttp => 1 << 4,
+            Self::LokiPush => 1 << 5,
+        }
+    }
+}
+
+/// The disposition of one TLS material reload attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TlsMaterialReloadOutcome {
+    Applied,
+    Rejected,
+}
+
+impl TlsMaterialReloadOutcome {
+    const fn code(self) -> u8 {
+        match self {
+            Self::Applied => 1,
+            Self::Rejected => 2,
+        }
+    }
+
+    const fn from_code(code: u8) -> Result<Self, IdentityFailure> {
+        match code {
+            1 => Ok(Self::Applied),
+            2 => Ok(Self::Rejected),
+            _ => Err(IdentityFailure),
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Applied => "applied",
+            Self::Rejected => "rejected",
+        }
+    }
+}
+
+/// Typed, secret-safe evidence for one TLS material reload attempt.
+///
+/// The identities are caller-provided opaque digests. They must never contain
+/// certificate, key, CA, path, or other secret source bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TlsMaterialReloadAuditRequest {
+    listener_set: TlsMaterialReloadListenerSet,
+    outcome: TlsMaterialReloadOutcome,
+    listener_set_identity: [u8; 32],
+    material_identity: [u8; 32],
+    attempt_id: [u8; 16],
+}
+
+impl TlsMaterialReloadAuditRequest {
+    pub fn new(
+        listener_set: TlsMaterialReloadListenerSet,
+        outcome: TlsMaterialReloadOutcome,
+        listener_set_identity: [u8; 32],
+        material_identity: [u8; 32],
+        attempt_id: [u8; 16],
+    ) -> Result<Self, GovernanceIntentFailure> {
+        if listener_set_identity.iter().all(|byte| *byte == 0)
+            || material_identity.iter().all(|byte| *byte == 0)
+            || attempt_id.iter().all(|byte| *byte == 0)
+        {
+            return Err(GovernanceIntentFailure);
+        }
+        Ok(Self {
+            listener_set,
+            outcome,
+            listener_set_identity,
+            material_identity,
+            attempt_id,
+        })
+    }
+
+    #[must_use]
+    pub const fn listener_set(self) -> TlsMaterialReloadListenerSet {
+        self.listener_set
+    }
+
+    #[must_use]
+    pub const fn outcome(self) -> TlsMaterialReloadOutcome {
+        self.outcome
+    }
+
+    #[must_use]
+    pub const fn listener_set_identity(self) -> [u8; 32] {
+        self.listener_set_identity
+    }
+
+    #[must_use]
+    pub const fn material_identity(self) -> [u8; 32] {
+        self.material_identity
+    }
+
+    #[must_use]
+    pub const fn attempt_id(self) -> [u8; 16] {
+        self.attempt_id
+    }
+
+    #[must_use]
+    pub fn transaction_id(self, instance: [u8; 16]) -> [u8; 16] {
+        let mut hasher = Sha256::new();
+        hasher.update(TLS_MATERIAL_RELOAD_DOMAIN);
+        hasher.update(instance);
+        hasher.update([self.listener_set.bits()]);
+        hasher.update([self.outcome.code()]);
+        hasher.update(self.listener_set_identity);
+        hasher.update(self.material_identity);
+        hasher.update(self.attempt_id);
+        transaction_id_for_digest(hasher.finalize().into())
+    }
+
+    #[must_use]
+    pub fn encode(self, instance: [u8; 16]) -> Vec<u8> {
+        let mut encoded = Vec::with_capacity(107);
+        encoded.extend_from_slice(&TLS_MATERIAL_RELOAD_MAGIC);
+        encoded.extend_from_slice(&instance);
+        encoded.push(self.listener_set.bits());
+        encoded.push(self.outcome.code());
+        encoded.extend_from_slice(&self.listener_set_identity);
+        encoded.extend_from_slice(&self.material_identity);
+        encoded.extend_from_slice(&self.attempt_id);
+        encoded
+    }
+
+    pub(crate) fn decode(
+        position: u64,
+        transaction_id: [u8; 16],
+        intent: &[u8],
+    ) -> Result<TlsMaterialReloadAuditEntry, IdentityFailure> {
+        let mut cursor = Cursor::new(intent);
+        if cursor.take_array::<8>()? != TLS_MATERIAL_RELOAD_MAGIC {
+            return Err(IdentityFailure);
+        }
+        let instance = cursor.take_array()?;
+        let listener_set =
+            TlsMaterialReloadListenerSet::new(cursor.take_u8()?).map_err(|_| IdentityFailure)?;
+        let outcome = TlsMaterialReloadOutcome::from_code(cursor.take_u8()?)?;
+        let listener_set_identity = cursor.take_array()?;
+        let material_identity = cursor.take_array()?;
+        let attempt_id = cursor.take_array()?;
+        let request = Self::new(
+            listener_set,
+            outcome,
+            listener_set_identity,
+            material_identity,
+            attempt_id,
+        )
+        .map_err(|_| IdentityFailure)?;
+        if !cursor.is_empty() || transaction_id != request.transaction_id(instance) {
+            return Err(IdentityFailure);
+        }
+        Ok(TlsMaterialReloadAuditEntry {
+            position,
+            instance,
+            listener_set,
+            outcome,
+            listener_set_identity,
+            material_identity,
+            attempt_id,
+        })
+    }
+}
+
+/// Decoded redacted receipt of a TLS material reload attempt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TlsMaterialReloadAuditEntry {
+    position: u64,
+    instance: [u8; 16],
+    listener_set: TlsMaterialReloadListenerSet,
+    outcome: TlsMaterialReloadOutcome,
+    listener_set_identity: [u8; 32],
+    material_identity: [u8; 32],
+    attempt_id: [u8; 16],
+}
+
+impl TlsMaterialReloadAuditEntry {
+    #[must_use]
+    pub const fn position(&self) -> u64 {
+        self.position
+    }
+
+    #[must_use]
+    pub const fn instance_id(&self) -> [u8; 16] {
+        self.instance
+    }
+
+    #[must_use]
+    pub const fn listener_set(&self) -> TlsMaterialReloadListenerSet {
+        self.listener_set
+    }
+
+    #[must_use]
+    pub const fn outcome(&self) -> TlsMaterialReloadOutcome {
+        self.outcome
+    }
+
+    #[must_use]
+    pub const fn listener_set_identity(&self) -> [u8; 32] {
+        self.listener_set_identity
+    }
+
+    #[must_use]
+    pub const fn material_identity(&self) -> [u8; 32] {
+        self.material_identity
+    }
+
+    #[must_use]
+    pub const fn attempt_id(&self) -> [u8; 16] {
+        self.attempt_id
+    }
+
+    #[must_use]
+    pub const fn action(&self) -> &'static str {
+        "listener.tls-material.reload"
+    }
+
+    #[must_use]
+    pub const fn outcome_label(&self) -> &'static str {
+        self.outcome.label()
+    }
 }
 
 impl ListenerTransportConfigurationProvenance {
@@ -808,6 +1160,7 @@ impl ListenerTransportConfigurationProvenance {
 /// public administration request and accepts no caller-controlled identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ListenerTransportAuditRequest {
+    listener_role: ListenerTransportRole,
     listener_target: SocketAddr,
     configuration_provenance: ListenerTransportConfigurationProvenance,
 }
@@ -815,7 +1168,16 @@ pub struct ListenerTransportAuditRequest {
 impl ListenerTransportAuditRequest {
     #[must_use]
     pub const fn configuration_file(listener_target: SocketAddr) -> Self {
+        Self::configuration_file_listener(ListenerTransportRole::Api, listener_target)
+    }
+
+    #[must_use]
+    pub const fn configuration_file_listener(
+        listener_role: ListenerTransportRole,
+        listener_target: SocketAddr,
+    ) -> Self {
         Self {
+            listener_role,
             listener_target,
             configuration_provenance: ListenerTransportConfigurationProvenance::ConfigurationFile,
         }
@@ -827,6 +1189,11 @@ impl ListenerTransportAuditRequest {
     }
 
     #[must_use]
+    pub const fn listener_role(self) -> ListenerTransportRole {
+        self.listener_role
+    }
+
+    #[must_use]
     pub const fn configuration_provenance(self) -> ListenerTransportConfigurationProvenance {
         self.configuration_provenance
     }
@@ -834,7 +1201,17 @@ impl ListenerTransportAuditRequest {
     #[must_use]
     pub fn digest_for(self, instance: [u8; 16]) -> [u8; 32] {
         let mut hasher = Sha256::new();
-        hasher.update(LISTENER_TRANSPORT_REQUEST_DOMAIN);
+        hasher.update(LISTENER_TRANSPORT_V3_REQUEST_DOMAIN);
+        hasher.update(instance);
+        hasher.update([self.listener_role.code()]);
+        hasher.update([self.configuration_provenance.code()]);
+        hasher.update(listener_target_bytes(self.listener_target));
+        hasher.finalize().into()
+    }
+
+    pub(crate) fn legacy_digest_for(self, instance: [u8; 16]) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(LISTENER_TRANSPORT_V2_REQUEST_DOMAIN);
         hasher.update(instance);
         hasher.update([self.configuration_provenance.code()]);
         hasher.update(listener_target_bytes(self.listener_target));
@@ -843,26 +1220,51 @@ impl ListenerTransportAuditRequest {
 
     #[must_use]
     pub fn transaction_id_for(self, instance: [u8; 16]) -> [u8; 16] {
-        let digest = self.digest_for(instance);
-        let mut request_id = [0_u8; 16];
-        request_id.copy_from_slice(&digest[..16]);
-        if request_id.iter().all(|byte| *byte == 0) {
-            request_id[0] = 1;
-        }
-        request_id
+        transaction_id_for_digest(self.digest_for(instance))
+    }
+
+    pub(crate) fn legacy_transaction_id_for(self, instance: [u8; 16]) -> [u8; 16] {
+        transaction_id_for_digest(self.legacy_digest_for(instance))
     }
 }
 
+fn transaction_id_for_digest(digest: [u8; 32]) -> [u8; 16] {
+    let mut request_id = [0_u8; 16];
+    request_id.copy_from_slice(&digest[..16]);
+    if request_id.iter().all(|byte| *byte == 0) {
+        request_id[0] = 1;
+    }
+    request_id
+}
+
+#[cfg(test)]
 pub(crate) fn plaintext_api_transport_audit_intent_v2(
+    instance: [u8; 16],
+    request: ListenerTransportAuditRequest,
+) -> Vec<u8> {
+    let digest = request.legacy_digest_for(instance);
+    let request_id = request.legacy_transaction_id_for(instance);
+    let mut intent = Vec::with_capacity(76);
+    intent.extend_from_slice(&LISTENER_TRANSPORT_V2_MAGIC);
+    intent.extend_from_slice(&instance);
+    intent.extend_from_slice(&listener_target_bytes(request.listener_target()));
+    intent.push(request.configuration_provenance().code());
+    intent.extend_from_slice(&request_id);
+    intent.extend_from_slice(&digest);
+    intent
+}
+
+pub(crate) fn plaintext_listener_transport_audit_intent_v3(
     instance: [u8; 16],
     request: ListenerTransportAuditRequest,
 ) -> Vec<u8> {
     let digest = request.digest_for(instance);
     let request_id = request.transaction_id_for(instance);
-    let mut intent = Vec::with_capacity(76);
-    intent.extend_from_slice(&LISTENER_TRANSPORT_V2_MAGIC);
+    let mut intent = Vec::with_capacity(77);
+    intent.extend_from_slice(&LISTENER_TRANSPORT_V3_MAGIC);
     intent.extend_from_slice(&instance);
     intent.extend_from_slice(&listener_target_bytes(request.listener_target()));
+    intent.push(request.listener_role().code());
     intent.push(request.configuration_provenance().code());
     intent.extend_from_slice(&request_id);
     intent.extend_from_slice(&digest);
@@ -1174,6 +1576,7 @@ impl GovernanceAuditEntry {
             Self::SystemAuditRetentionUpdate(entry) => entry.position,
             Self::DurableOperation(entry) => entry.position,
             Self::Configuration(entry) => entry.position(),
+            Self::TlsMaterialReload(entry) => entry.position(),
         }
     }
 
@@ -1199,6 +1602,7 @@ impl GovernanceAuditEntry {
             Self::SystemAuditRetentionUpdate(_) => None,
             Self::DurableOperation(entry) => entry.applicable_tenant(),
             Self::Configuration(entry) => entry.applicable_tenant(),
+            Self::TlsMaterialReload(_) => None,
         }
     }
 
@@ -1225,6 +1629,7 @@ impl GovernanceAuditEntry {
             Self::SystemAuditRetentionUpdate(_) => "system.audit-retention.update",
             Self::DurableOperation(_) => "durable-operation.transition",
             Self::Configuration(_) => "configuration.reload",
+            Self::TlsMaterialReload(entry) => entry.action(),
         }
     }
 
@@ -1259,6 +1664,7 @@ impl GovernanceAuditEntry {
                 ConfigurationAuditOutcome::PublishedLive
                 | ConfigurationAuditOutcome::PendingRestart => "succeeded",
             },
+            Self::TlsMaterialReload(entry) => entry.outcome_label(),
         }
     }
 
@@ -1280,7 +1686,7 @@ impl GovernanceAuditEntry {
             | Self::TenantRetentionUpdate(_)
             | Self::SystemAuditRetentionUpdate(_)
             | Self::DurableOperation(_) => None,
-            Self::Configuration(_) => None,
+            Self::Configuration(_) | Self::TlsMaterialReload(_) => None,
         }
     }
 
@@ -1302,7 +1708,7 @@ impl GovernanceAuditEntry {
             | Self::TenantRetentionUpdate(_)
             | Self::SystemAuditRetentionUpdate(_)
             | Self::DurableOperation(_) => None,
-            Self::Configuration(_) => None,
+            Self::Configuration(_) | Self::TlsMaterialReload(_) => None,
         }
     }
 
@@ -1324,7 +1730,7 @@ impl GovernanceAuditEntry {
             | Self::TenantRetentionUpdate(_)
             | Self::SystemAuditRetentionUpdate(_)
             | Self::DurableOperation(_) => None,
-            Self::Configuration(_) => None,
+            Self::Configuration(_) | Self::TlsMaterialReload(_) => None,
         }
     }
 
@@ -1346,7 +1752,7 @@ impl GovernanceAuditEntry {
             | Self::TenantRetentionUpdate(_)
             | Self::SystemAuditRetentionUpdate(_)
             | Self::DurableOperation(_) => None,
-            Self::Configuration(_) => None,
+            Self::Configuration(_) | Self::TlsMaterialReload(_) => None,
         }
     }
 
@@ -1368,7 +1774,7 @@ impl GovernanceAuditEntry {
             | Self::TenantRetentionUpdate(_)
             | Self::SystemAuditRetentionUpdate(_)
             | Self::DurableOperation(_) => None,
-            Self::Configuration(_) => None,
+            Self::Configuration(_) | Self::TlsMaterialReload(_) => None,
         }
     }
 
@@ -1390,7 +1796,7 @@ impl GovernanceAuditEntry {
             | Self::TenantRetentionUpdate(_)
             | Self::SystemAuditRetentionUpdate(_)
             | Self::DurableOperation(_) => None,
-            Self::Configuration(_) => None,
+            Self::Configuration(_) | Self::TlsMaterialReload(_) => None,
         }
     }
 
@@ -1412,7 +1818,7 @@ impl GovernanceAuditEntry {
             | Self::TenantRetentionUpdate(_)
             | Self::SystemAuditRetentionUpdate(_)
             | Self::DurableOperation(_) => None,
-            Self::Configuration(_) => None,
+            Self::Configuration(_) | Self::TlsMaterialReload(_) => None,
         }
     }
 
@@ -1436,7 +1842,7 @@ impl GovernanceAuditEntry {
             | Self::TenantRetentionUpdate(_)
             | Self::SystemAuditRetentionUpdate(_)
             | Self::DurableOperation(_) => None,
-            Self::Configuration(_) => None,
+            Self::Configuration(_) | Self::TlsMaterialReload(_) => None,
         }
     }
 
@@ -1458,7 +1864,8 @@ impl GovernanceAuditEntry {
             | Self::TenantAliasBinding(_) => None,
             Self::SystemAuditRetentionUpdate(_)
             | Self::DurableOperation(_)
-            | Self::Configuration(_) => None,
+            | Self::Configuration(_)
+            | Self::TlsMaterialReload(_) => None,
         }
     }
 
@@ -1476,6 +1883,14 @@ impl GovernanceAuditEntry {
     pub const fn as_configuration(&self) -> Option<&ConfigurationAuditEntry> {
         match self {
             Self::Configuration(entry) => Some(entry),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_tls_material_reload(&self) -> Option<&TlsMaterialReloadAuditEntry> {
+        match self {
+            Self::TlsMaterialReload(entry) => Some(entry),
             _ => None,
         }
     }

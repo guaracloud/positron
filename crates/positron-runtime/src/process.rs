@@ -453,9 +453,11 @@ impl RunningProcess {
             .as_ref()
             .ok_or(ConfigurationRuntimeFailure::Unavailable)?;
         let observed = runtime.observed()?;
-        if observed.effective().semantic_diff(&candidate).plan()
-            != ConfigurationDiffPlan::DrainThenPublish
-        {
+        let plan = observed.effective().semantic_diff(&candidate).plan();
+        if !matches!(
+            plan,
+            ConfigurationDiffPlan::DrainThenPublish | ConfigurationDiffPlan::NoChange
+        ) {
             return runtime.reload_with(candidate, publication);
         }
         let Some(factory) = self.listener_generation_factory.as_ref() else {
@@ -464,13 +466,39 @@ impl RunningProcess {
         let staged = match factory.stage(&candidate, self.health(), self.services()) {
             Ok(staged) => staged,
             Err(_) => {
-                publication.record_rejected_listener_staging(observed.effective(), &candidate)?;
+                if plan != ConfigurationDiffPlan::NoChange {
+                    publication
+                        .record_rejected_listener_staging(observed.effective(), &candidate)?;
+                } else {
+                    let identity = crate::configuration_catalog::configuration_digest(&candidate);
+                    publication.record_tls_material_reload(
+                        positron_governance::TlsMaterialReloadListenerSet::new(0b0011_1110)
+                            .map_err(|_| ConfigurationRuntimeFailure::PublicationUnavailable)?,
+                        positron_governance::TlsMaterialReloadOutcome::Rejected,
+                        identity,
+                        identity,
+                    )?;
+                }
                 return Err(ConfigurationRuntimeFailure::ListenerUnavailable);
             },
         };
-        let outcome = match runtime
-            .publish_staged_listener_reload(Arc::clone(&candidate), publication)
-        {
+        if plan == ConfigurationDiffPlan::NoChange {
+            let material_identity = staged
+                .material_identity()
+                .ok_or(ConfigurationRuntimeFailure::ListenerUnavailable)?;
+            publication.record_tls_material_reload(
+                positron_governance::TlsMaterialReloadListenerSet::new(0b0011_1110)
+                    .map_err(|_| ConfigurationRuntimeFailure::PublicationUnavailable)?,
+                positron_governance::TlsMaterialReloadOutcome::Applied,
+                crate::configuration_catalog::configuration_digest(&candidate),
+                material_identity,
+            )?;
+        }
+        let outcome = match if plan == ConfigurationDiffPlan::NoChange {
+            runtime.reload_with(Arc::clone(&candidate), publication)
+        } else {
+            runtime.publish_staged_listener_reload(Arc::clone(&candidate), publication)
+        } {
             Ok(outcome) => {
                 self.state
                     .set_plaintext_listener_warnings(&plaintext_listener_intents_for(&candidate));

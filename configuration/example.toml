@@ -9,11 +9,35 @@ log_level = "info"
 [listener]
 control_path = "/var/run/positron/control.sock"
 operations_bind_address = "127.0.0.1:13133"
+operations_transport = "tls"
 api_bind_address = "127.0.0.1:8080"
 api_transport = "tls"
 otlp_grpc_bind_address = "127.0.0.1:4317"
+otlp_grpc_transport = "tls"
 otlp_http_bind_address = "127.0.0.1:4318"
+otlp_http_transport = "tls"
 loki_push_bind_address = "127.0.0.1:3100"
+loki_push_transport = "tls"
+
+[listener.operations]
+trusted_proxy_cidrs = []
+forwarded_hops = 0
+
+[listener.api]
+trusted_proxy_cidrs = []
+forwarded_hops = 0
+
+[listener.otlp_grpc]
+trusted_proxy_cidrs = []
+forwarded_hops = 0
+
+[listener.otlp_http]
+trusted_proxy_cidrs = []
+forwarded_hops = 0
+
+[listener.loki_push]
+trusted_proxy_cidrs = []
+forwarded_hops = 0
 
 [runtime]
 shutdown_grace_seconds = 30

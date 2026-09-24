@@ -11,7 +11,10 @@ use std::time::{Duration, Instant};
 use positron_config::{
     EffectiveConfiguration, NetworkListenerProfile, NetworkListenerRole, NetworkTransport,
 };
+use sha2::{Digest, Sha256};
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::net::UnixListener;
 
@@ -119,6 +122,25 @@ impl NativeBindings {
         Ok(bindings)
     }
 
+    fn staged_material_identity(&self) -> Result<[u8; 32], NativeHostFailure> {
+        let mut hasher = Sha256::new();
+        for (role, transport) in [
+            (ListenerRole::Operations, &self.operations_transport),
+            (ListenerRole::Api, &self.api_transport),
+            (ListenerRole::OtlpGrpc, &self.otlp_grpc_transport),
+            (ListenerRole::OtlpHttp, &self.otlp_http_transport),
+            (ListenerRole::LokiPush, &self.loki_push_transport),
+        ] {
+            hasher.update([role as u8]);
+            hasher.update(
+                transport
+                    .material_identity()
+                    .map_err(|_| NativeHostFailure::InvalidTlsProfile)?,
+            );
+        }
+        Ok(hasher.finalize().into())
+    }
+
     pub fn new(
         control: PathBuf,
         operations: SocketAddr,
@@ -193,6 +215,17 @@ impl NativeBindings {
             (ListenerRole::LokiPush, loki_push),
         ] {
             BoundEndpoint::tcp(role, address).map_err(|_| NativeHostFailure::InvalidBinding)?;
+        }
+        for transport in [
+            &operations_transport,
+            &api_transport,
+            &otlp_grpc_transport,
+            &otlp_http_transport,
+            &loki_push_transport,
+        ] {
+            transport
+                .material_identity()
+                .map_err(|_| NativeHostFailure::InvalidTlsProfile)?;
         }
         Ok(Self {
             control,
@@ -595,6 +628,11 @@ impl ListenerFactory for NativeHost {
                 }
                 let listener = UnixListener::bind(&self.bindings.control)
                     .map_err(|_| ListenerFailure::BindUnavailable)?;
+                std::fs::set_permissions(
+                    &self.bindings.control,
+                    std::fs::Permissions::from_mode(0o600),
+                )
+                .map_err(|_| ListenerFailure::BindUnavailable)?;
                 listener
                     .set_nonblocking(true)
                     .map_err(|_| ListenerFailure::BindUnavailable)?;
@@ -675,6 +713,9 @@ impl ListenerGenerationFactory for NativeHost {
     ) -> Result<ListenerGeneration, ListenerFailure> {
         let bindings = NativeBindings::from_effective(configuration)
             .map_err(|_| ListenerFailure::BindUnavailable)?;
+        let material_identity = bindings
+            .staged_material_identity()
+            .map_err(|_| ListenerFailure::BindUnavailable)?;
         let staged_admissions = Arc::new(Mutex::new(Vec::with_capacity(6)));
         let configured = Self {
             bindings,
@@ -695,7 +736,8 @@ impl ListenerGenerationFactory for NativeHost {
             otlp_http?,
             loki_push?,
         ])?;
-        let generation = ListenerGeneration::activate(candidate, &configured, health.clone())?;
+        let generation = ListenerGeneration::activate(candidate, &configured, health.clone())
+            .map(|generation| generation.with_material_identity(material_identity))?;
         let admissions = staged_admissions
             .lock()
             .map_err(|_| ListenerFailure::BindUnavailable)?

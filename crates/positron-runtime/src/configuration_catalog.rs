@@ -79,6 +79,23 @@ impl CatalogConfigurationPublication {
             .record_rejected_listener_staging(active, candidate)
             .map_err(|_| ConfigurationRuntimeFailure::PublicationUnavailable)
     }
+
+    pub fn record_tls_material_reload(
+        &self,
+        listener_set: positron_governance::TlsMaterialReloadListenerSet,
+        outcome: positron_governance::TlsMaterialReloadOutcome,
+        listener_set_identity: [u8; 32],
+        material_identity: [u8; 32],
+    ) -> Result<(), ConfigurationRuntimeFailure> {
+        self.instance
+            .record_tls_material_reload(
+                listener_set,
+                outcome,
+                listener_set_identity,
+                material_identity,
+            )
+            .map_err(|_| ConfigurationRuntimeFailure::PublicationUnavailable)
+    }
 }
 
 impl ConfigurationPublication for CatalogConfigurationPublication {
@@ -371,7 +388,7 @@ impl InitializedInstance {
     }
 }
 
-fn successor_objects(
+pub(crate) fn successor_objects(
     basis: &positron_kernel::CatalogSnapshot,
     transaction: TransactionId,
     replacement: Option<(u64, &EffectiveConfiguration, [u8; 32])>,

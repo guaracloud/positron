@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use rustls::server::WebPkiClientVerifier;
 use rustls::{RootCertStore, ServerConfig, ServerConnection};
+use sha2::{Digest, Sha256};
 use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 use zeroize::Zeroizing;
 
@@ -130,6 +131,27 @@ impl TlsProfile {
             None => Ok(configuration),
         }
     }
+
+    pub(super) fn material_identity(&self) -> Result<[u8; 32], TlsFailure> {
+        let mut loaded = self
+            .loaded
+            .lock()
+            .map_err(|_| TlsFailure::LoadUnavailable)?;
+        if loaded.is_none() {
+            *loaded = Some(Arc::new(load_tls(
+                &self.identity,
+                self.client_trust.as_ref(),
+            )?));
+        }
+        let material = loaded.as_ref().ok_or(TlsFailure::LoadUnavailable)?;
+        let mut hasher = Sha256::new();
+        hasher.update(&material.certificate_pem);
+        match material.trust_pem.as_ref() {
+            Some(trust) => hasher.update(trust),
+            None => hasher.update([0]),
+        }
+        Ok(hasher.finalize().into())
+    }
 }
 
 /// A classified TLS-profile construction failure that never exposes material.
@@ -210,6 +232,13 @@ impl TransportProfile {
             },
             Self::Tls(_) => crate::ListenerTransport::Tls,
             Self::PlaintextOptOut => crate::ListenerTransport::PlaintextOptOut,
+        }
+    }
+
+    pub(super) fn material_identity(&self) -> Result<[u8; 32], TlsFailure> {
+        match self {
+            Self::Tls(profile) => profile.material_identity(),
+            Self::PlaintextOptOut => Ok([0; 32]),
         }
     }
 

@@ -9,7 +9,9 @@ use crate::{
     ApiKeyLifecycleAction, ConfigurationAuditOutcome, ConfigurationAuditRequest,
     DurableOperationKind, DurableOperationPhase, DurableOperationStatus, InitialAuditContext,
     InitialGovernanceIntent, InitialTenantIntent, ListenerTransportAuditEntry,
-    ListenerTransportAuditRequest, ListenerTransportConfigurationProvenance, ResourceGeneration,
+    ListenerTransportAuditRequest, ListenerTransportConfigurationProvenance, ListenerTransportRole,
+    ResourceGeneration, TlsMaterialReloadAuditRequest, TlsMaterialReloadListenerSet,
+    TlsMaterialReloadOutcome,
 };
 
 #[test]
@@ -208,7 +210,7 @@ fn version_two_plaintext_transport_audit_binds_target_provenance_and_request_ide
         IpAddr::V4(Ipv4Addr::new(198, 51, 100, 23)),
         8_080,
     ));
-    let transaction = request.transaction_id_for(instance);
+    let transaction = request.legacy_transaction_id_for(instance);
     let intent = crate::audit::plaintext_api_transport_audit_intent_v2(instance, request);
 
     let entry = GovernanceAuditEntry::decode_fields(8, transaction, &intent)
@@ -218,6 +220,7 @@ fn version_two_plaintext_transport_audit_binds_target_provenance_and_request_ide
         .expect("typed transport audit");
     assert_eq!(transport.instance_id(), instance);
     assert_eq!(transport.listener_target(), Some(request.listener_target()));
+    assert_eq!(transport.listener_role(), None);
     assert_eq!(
         transport.configuration_provenance(),
         Some(ListenerTransportConfigurationProvenance::ConfigurationFile)
@@ -225,7 +228,7 @@ fn version_two_plaintext_transport_audit_binds_target_provenance_and_request_ide
     assert_eq!(transport.request_id(), Some(transaction));
     assert_eq!(
         transport.request_digest(),
-        Some(request.digest_for(instance))
+        Some(request.legacy_digest_for(instance))
     );
     assert!(transport.is_configuration_file_intent());
 
@@ -242,6 +245,104 @@ fn version_two_plaintext_transport_audit_binds_target_provenance_and_request_ide
     let mut changed_encoded_target = intent;
     changed_encoded_target[30] = 24;
     assert!(GovernanceAuditEntry::decode_fields(8, transaction, &changed_encoded_target).is_err());
+}
+
+#[test]
+fn version_three_plaintext_listener_transport_audit_binds_the_listener_role() {
+    let instance = [20; 16];
+    let listener_target = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4_318);
+    let api = ListenerTransportAuditRequest::configuration_file(listener_target);
+    let otlp_http = ListenerTransportAuditRequest::configuration_file_listener(
+        ListenerTransportRole::OtlpHttp,
+        listener_target,
+    );
+    let transaction = otlp_http.transaction_id_for(instance);
+    let intent = crate::audit::plaintext_listener_transport_audit_intent_v3(instance, otlp_http);
+
+    let entry = GovernanceAuditEntry::decode_fields(9, transaction, &intent)
+        .expect("role-bound plaintext listener transport audit");
+    let transport = entry
+        .as_listener_transport()
+        .expect("typed listener transport audit");
+    assert_eq!(
+        transport.listener_role(),
+        Some(ListenerTransportRole::OtlpHttp)
+    );
+    assert_eq!(transport.listener_target(), Some(listener_target));
+    assert_eq!(
+        transport.action(),
+        "listener.otlp-http-transport.plaintext-opt-out"
+    );
+    assert_ne!(
+        otlp_http.transaction_id_for(instance),
+        api.transaction_id_for(instance),
+        "different listener roles sharing an address must retain independent receipts"
+    );
+    assert_ne!(otlp_http.digest_for(instance), api.digest_for(instance));
+}
+
+#[test]
+fn tls_material_reload_audit_binds_staged_set_outcome_and_fresh_opaque_attempt() {
+    let instance = [0x61; 16];
+    let listener_set = TlsMaterialReloadListenerSet::new(0b0011_1110)
+        .expect("all network listener roles form one closed set");
+    let applied = TlsMaterialReloadAuditRequest::new(
+        listener_set,
+        TlsMaterialReloadOutcome::Applied,
+        [0x62; 32],
+        [0x63; 32],
+        [0x64; 16],
+    )
+    .expect("opaque staged identities");
+    let rejected = TlsMaterialReloadAuditRequest::new(
+        listener_set,
+        TlsMaterialReloadOutcome::Rejected,
+        [0x62; 32],
+        [0x63; 32],
+        [0x65; 16],
+    )
+    .expect("a repeated material observation has a fresh attempt identity");
+    assert_ne!(
+        applied.transaction_id(instance),
+        rejected.transaction_id(instance),
+        "every reload attempt must retain a distinct committed identity"
+    );
+
+    let transaction = applied.transaction_id(instance);
+    let intent = applied.encode(instance);
+    let entry = GovernanceAuditEntry::decode_fields(10, transaction, &intent)
+        .expect("typed TLS material reload audit");
+    let reload = entry
+        .as_tls_material_reload()
+        .expect("typed TLS material reload receipt");
+    assert_eq!(entry.action(), "listener.tls-material.reload");
+    assert_eq!(entry.outcome(), "applied");
+    assert_eq!(reload.outcome(), TlsMaterialReloadOutcome::Applied);
+    assert!(
+        reload
+            .listener_set()
+            .contains(ListenerTransportRole::Operations)
+    );
+    assert!(reload.listener_set().contains(ListenerTransportRole::Api));
+    assert!(
+        reload
+            .listener_set()
+            .contains(ListenerTransportRole::LokiPush)
+    );
+    assert!(
+        !reload
+            .listener_set()
+            .contains(ListenerTransportRole::Control)
+    );
+    assert_eq!(reload.listener_set_identity(), [0x62; 32]);
+    assert_eq!(reload.material_identity(), [0x63; 32]);
+    assert_eq!(reload.attempt_id(), [0x64; 16]);
+    assert!(!format!("{entry:?}").contains("-----BEGIN"));
+
+    let mut malformed = intent;
+    malformed[26] = 0;
+    assert!(GovernanceAuditEntry::decode_fields(10, transaction, &malformed).is_err());
+    assert!(TlsMaterialReloadListenerSet::for_role(ListenerTransportRole::Control).is_err());
 }
 
 #[test]

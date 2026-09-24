@@ -421,7 +421,7 @@ fn exposes_the_complete_canonical_setting_contract_and_compiled_defaults()
             "listener.operations_bind_address",
             SettingKind::String,
             "127.0.0.1:13133",
-            ValueDomain::LoopbackSocketAddress(256),
+            ValueDomain::SocketAddress(256),
             SecrecyClass::Public,
             ProvenancePolicy::NonSecretOverrides,
             MutabilityClass::DrainAndReload,
@@ -441,7 +441,7 @@ fn exposes_the_complete_canonical_setting_contract_and_compiled_defaults()
             "listener.api_transport",
             SettingKind::String,
             "tls",
-            ValueDomain::StringEnumeration(&["tls", "plaintext"]),
+            ValueDomain::StringEnumeration(&["tls", "mtls", "plaintext"]),
             SecrecyClass::Public,
             ProvenancePolicy::ConfigurationFileOnly,
             MutabilityClass::DrainAndReload,
@@ -471,7 +471,7 @@ fn exposes_the_complete_canonical_setting_contract_and_compiled_defaults()
             "listener.otlp_grpc_bind_address",
             SettingKind::String,
             "127.0.0.1:4317",
-            ValueDomain::LoopbackSocketAddress(256),
+            ValueDomain::SocketAddress(256),
             SecrecyClass::Public,
             ProvenancePolicy::NonSecretOverrides,
             MutabilityClass::DrainAndReload,
@@ -481,7 +481,7 @@ fn exposes_the_complete_canonical_setting_contract_and_compiled_defaults()
             "listener.otlp_http_bind_address",
             SettingKind::String,
             "127.0.0.1:4318",
-            ValueDomain::LoopbackSocketAddress(256),
+            ValueDomain::SocketAddress(256),
             SecrecyClass::Public,
             ProvenancePolicy::NonSecretOverrides,
             MutabilityClass::DrainAndReload,
@@ -491,7 +491,7 @@ fn exposes_the_complete_canonical_setting_contract_and_compiled_defaults()
             "listener.loki_push_bind_address",
             SettingKind::String,
             "127.0.0.1:3100",
-            ValueDomain::LoopbackSocketAddress(256),
+            ValueDomain::SocketAddress(256),
             SecrecyClass::Public,
             ProvenancePolicy::NonSecretOverrides,
             MutabilityClass::DrainAndReload,
@@ -590,13 +590,35 @@ fn exposes_the_complete_canonical_setting_contract_and_compiled_defaults()
          [runtime]\nshutdown_grace_seconds = 30\nmax_registered_tenants = 2\n\n\
          [listener]\ncontrol_path = \"/var/run/positron/control.sock\"\n\
          operations_bind_address = \"127.0.0.1:13133\"\n\
+         operations_transport = \"tls\"\n\
+         operations_tls_certificate_file = \"<redacted>\"\n\
+         operations_tls_private_key_file = \"<redacted>\"\n\
+         operations_tls_client_ca_file = \"<redacted>\"\n\
          api_bind_address = \"127.0.0.1:8080\"\n\
          api_transport = \"tls\"\n\
          api_tls_certificate_file = \"<redacted>\"\n\
          api_tls_private_key_file = \"<redacted>\"\n\
+         api_tls_client_ca_file = \"<redacted>\"\n\
          otlp_grpc_bind_address = \"127.0.0.1:4317\"\n\
+         otlp_grpc_transport = \"tls\"\n\
+         otlp_grpc_tls_certificate_file = \"<redacted>\"\n\
+         otlp_grpc_tls_private_key_file = \"<redacted>\"\n\
+         otlp_grpc_tls_client_ca_file = \"<redacted>\"\n\
          otlp_http_bind_address = \"127.0.0.1:4318\"\n\
-         loki_push_bind_address = \"127.0.0.1:3100\"\n\n\
+         otlp_http_transport = \"tls\"\n\
+         otlp_http_tls_certificate_file = \"<redacted>\"\n\
+         otlp_http_tls_private_key_file = \"<redacted>\"\n\
+         otlp_http_tls_client_ca_file = \"<redacted>\"\n\
+         loki_push_bind_address = \"127.0.0.1:3100\"\n\
+         loki_push_transport = \"tls\"\n\
+         loki_push_tls_certificate_file = \"<redacted>\"\n\
+         loki_push_tls_private_key_file = \"<redacted>\"\n\
+         loki_push_tls_client_ca_file = \"<redacted>\"\n\n\
+         [listener.operations]\ntrusted_proxy_cidrs = []\nforwarded_hops = 0\n\n\
+         [listener.api]\ntrusted_proxy_cidrs = []\nforwarded_hops = 0\n\n\
+         [listener.otlp_grpc]\ntrusted_proxy_cidrs = []\nforwarded_hops = 0\n\n\
+         [listener.otlp_http]\ntrusted_proxy_cidrs = []\nforwarded_hops = 0\n\n\
+         [listener.loki_push]\ntrusted_proxy_cidrs = []\nforwarded_hops = 0\n\n\
          [storage]\ndata_directory = \"/var/lib/positron\"\n\
          secrets_directory = \"/var/lib/positron-secrets\"\n\n\
          [security]\nlocal_key_file = \"<redacted>\"\n"

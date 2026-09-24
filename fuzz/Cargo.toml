@@ -260,5 +260,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "trusted_proxy"
+path = "fuzz_targets/trusted_proxy.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 members = ["."]

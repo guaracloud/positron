@@ -61,6 +61,41 @@ fn tls_http_with_client_identity(
     Ok(response)
 }
 
+fn tls_peer_certificate(
+    address: SocketAddr,
+    trust_file: &Path,
+    certificate_file: &Path,
+    private_key_file: &Path,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut roots = RootCertStore::empty();
+    for certificate in CertificateDer::pem_file_iter(trust_file)? {
+        roots.add(certificate?)?;
+    }
+    let certificates =
+        CertificateDer::pem_file_iter(certificate_file)?.collect::<Result<Vec<_>, _>>()?;
+    let private_key = PrivateKeyDer::from_pem_file(private_key_file)?;
+    let configuration = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_client_auth_cert(certificates, private_key)?;
+    let connection = ClientConnection::new(
+        Arc::new(configuration),
+        ServerName::try_from("localhost".to_owned())?,
+    )?;
+    let stream = TcpStream::connect_timeout(&address, Duration::from_secs(2))?;
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+    let mut stream = StreamOwned::new(connection, stream);
+    stream.write_all(
+        b"GET /v1/capabilities:negotiate HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+    )?;
+    let certificate = stream
+        .conn
+        .peer_certificates()
+        .and_then(|certificates| certificates.first())
+        .ok_or("TLS peer did not present a certificate")?;
+    Ok(certificate.as_ref().to_vec())
+}
+
 struct OtlpLogCodec;
 
 struct OtlpLogDecoder;
@@ -199,29 +234,34 @@ fn mtls_profile_accepts_only_a_client_trusted_by_its_configured_authority()
         positron_runtime::InitializationPlan::non_interactive(),
     )?);
     let authority = fixture("mtls-ca-cert.pem");
-    let transport = TransportProfile::Tls(TlsProfile::new(
-        TlsIdentity::new(
-            fixture("mtls-server-cert.pem"),
-            fixture("mtls-server-key.pem"),
-        ),
-        Some(TlsTrust::new(authority.clone())),
-    ));
-    let loopback = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
-    let host = NativeHost::new(NativeBindings::new_with_listener_transports(
-        roots.parent.join("mtls-trusted-client.sock"),
-        loopback,
-        loopback,
-        loopback,
-        loopback,
-        loopback,
-        TransportProfile::plaintext_opt_out(),
-        transport,
-        TransportProfile::plaintext_opt_out(),
-        TransportProfile::plaintext_opt_out(),
-        TransportProfile::plaintext_opt_out(),
-    )?);
+    let api_certificate = fixture("mtls-server-cert.pem");
+    let api_private_key = fixture("mtls-server-key.pem");
+    let tls_certificate = fixture("api-test-cert.pem");
+    let tls_private_key = fixture("api-test-key.pem");
+    let control = roots.parent.join("control.sock");
+    let configuration = Arc::new(resolve(ConfigurationInputs::try_new(
+        Some(&format!(
+            "schema_version = 1\n[listener]\ncontrol_path = \"{}\"\noperations_bind_address = \"127.0.0.1:0\"\noperations_transport = \"tls\"\noperations_tls_certificate_file = \"{}\"\noperations_tls_private_key_file = \"{}\"\napi_bind_address = \"127.0.0.1:0\"\napi_transport = \"mtls\"\napi_tls_certificate_file = \"{}\"\napi_tls_private_key_file = \"{}\"\napi_tls_client_ca_file = \"{}\"\notlp_grpc_bind_address = \"127.0.0.1:0\"\notlp_grpc_transport = \"tls\"\notlp_grpc_tls_certificate_file = \"{}\"\notlp_grpc_tls_private_key_file = \"{}\"\notlp_http_bind_address = \"127.0.0.1:0\"\notlp_http_transport = \"tls\"\notlp_http_tls_certificate_file = \"{}\"\notlp_http_tls_private_key_file = \"{}\"\nloki_push_bind_address = \"127.0.0.1:0\"\nloki_push_transport = \"tls\"\nloki_push_tls_certificate_file = \"{}\"\nloki_push_tls_private_key_file = \"{}\"\n",
+            control.display(),
+            tls_certificate.display(),
+            tls_private_key.display(),
+            api_certificate.display(),
+            api_private_key.display(),
+            authority.display(),
+            tls_certificate.display(),
+            tls_private_key.display(),
+            tls_certificate.display(),
+            tls_private_key.display(),
+            tls_certificate.display(),
+            tls_private_key.display(),
+        )),
+        EnvironmentOverrides::try_from_pairs([] as [(&str, &str); 0])?,
+        CommandLineOverrides::try_from_pairs([] as [(&str, &str); 0])?,
+    )?)?);
+    let host = NativeHost::new(NativeBindings::from_effective(&configuration)?);
     let process = ApplicationRuntime::start(
-        ServeConfiguration::new(paths, InitializationMode::ExistingOnly),
+        ServeConfiguration::new(paths.clone(), InitializationMode::ExistingOnly)
+            .with_effective_configuration(configuration),
         HostInputs::new(&host, &host),
     )?;
     let api = address(
@@ -257,6 +297,304 @@ fn mtls_profile_accepts_only_a_client_trusted_by_its_configured_authority()
         positron_runtime::ExitOutcome::Graceful
     );
     Ok(())
+}
+
+#[test]
+fn same_path_tls_rotation_replaces_valid_identity_and_retains_the_previous_identity_on_failure()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _guard = live_test_guard();
+    let roots = TestRoots::new("same-path-tls-rotation")?;
+    let paths = roots.paths()?;
+    drop(InstanceBootstrap::initialize(
+        &paths,
+        positron_runtime::InitializationPlan::non_interactive(),
+    )?);
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let tls_material = roots.parent.join("tls-material");
+    std::fs::create_dir(&tls_material)?;
+    let certificate = tls_material.join("listener-certificate.pem");
+    let private_key = tls_material.join("listener-private-key.pem");
+    std::fs::copy(fixture("api-test-cert.pem"), &certificate)?;
+    std::fs::copy(fixture("api-test-key.pem"), &private_key)?;
+    let control = roots.parent.join("control.sock");
+    let document = listener_tls_document(&control, &certificate, &private_key);
+    let initial = Arc::new(resolve(ConfigurationInputs::try_new(
+        Some(&document),
+        EnvironmentOverrides::try_from_pairs([] as [(&str, &str); 0])?,
+        CommandLineOverrides::try_from_pairs([] as [(&str, &str); 0])?,
+    )?)?);
+    let loopback = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+    let host = NativeHost::new(NativeBindings::new_with_listener_transports(
+        control.clone(),
+        loopback,
+        loopback,
+        loopback,
+        loopback,
+        loopback,
+        TransportProfile::tls(certificate.clone(), private_key.clone())?,
+        TransportProfile::Tls(TlsProfile::new(
+            TlsIdentity::new(certificate.clone(), private_key.clone()),
+            Some(TlsTrust::new(fixture("mtls-ca-cert.pem"))),
+        )),
+        TransportProfile::tls(certificate.clone(), private_key.clone())?,
+        TransportProfile::tls(certificate.clone(), private_key.clone())?,
+        TransportProfile::tls(certificate.clone(), private_key.clone())?,
+    )?);
+    let process = ApplicationRuntime::start(
+        ServeConfiguration::new(paths.clone(), InitializationMode::ExistingOnly)
+            .with_effective_configuration(Arc::clone(&initial)),
+        HostInputs::new(&host, &host),
+    )?;
+    assert_eq!(
+        process.health().phase(),
+        positron_runtime::ProcessPhase::Serving
+    );
+    let configuration_generation = process
+        .configuration()
+        .ok_or("configuration runtime missing")?
+        .observed()?
+        .generation();
+    let api = address(
+        &process.bound_endpoints(),
+        positron_runtime::ListenerRole::Api,
+    )?;
+    assert_status(
+        tls_http_with_client_identity(
+            api,
+            &certificate,
+            &fixture("mtls-client-cert.pem"),
+            &fixture("mtls-client-key.pem"),
+            "GET",
+            "/v1/capabilities:negotiate",
+        )?,
+        405,
+    );
+
+    std::fs::copy(fixture("mtls-server-cert.pem"), &certificate)?;
+    std::fs::copy(fixture("mtls-server-key.pem"), &private_key)?;
+    let valid_rotation = Arc::new(resolve(ConfigurationInputs::try_new(
+        Some(&document),
+        EnvironmentOverrides::try_from_pairs([] as [(&str, &str); 0])?,
+        CommandLineOverrides::try_from_pairs([] as [(&str, &str); 0])?,
+    )?)?);
+    assert!(matches!(
+        process.reload_configuration(valid_rotation)?,
+        positron_runtime::ConfigurationReloadOutcome::NoChange { .. }
+    ));
+    assert_eq!(
+        process
+            .configuration()
+            .ok_or("configuration runtime missing")?
+            .observed()?
+            .generation(),
+        configuration_generation
+    );
+    assert_status(
+        tls_http_with_client_identity(
+            api,
+            &fixture("mtls-ca-cert.pem"),
+            &fixture("mtls-client-cert.pem"),
+            &fixture("mtls-client-key.pem"),
+            "GET",
+            "/v1/capabilities:negotiate",
+        )?,
+        405,
+    );
+
+    std::fs::write(&certificate, b"not a certificate")?;
+    let invalid_rotation = Arc::new(resolve(ConfigurationInputs::try_new(
+        Some(&document),
+        EnvironmentOverrides::try_from_pairs([] as [(&str, &str); 0])?,
+        CommandLineOverrides::try_from_pairs([] as [(&str, &str); 0])?,
+    )?)?);
+    let invalid_reload = process.reload_configuration(Arc::clone(&invalid_rotation));
+    assert!(
+        matches!(
+            invalid_reload,
+            Err(positron_runtime::ConfigurationRuntimeFailure::ListenerUnavailable)
+        ),
+        "invalid TLS replacement outcome: {invalid_reload:?}"
+    );
+    let repeated_invalid_reload = process.reload_configuration(Arc::clone(&invalid_rotation));
+    assert!(
+        matches!(
+            repeated_invalid_reload,
+            Err(positron_runtime::ConfigurationRuntimeFailure::ListenerUnavailable)
+        ),
+        "repeated invalid TLS replacement outcome: {repeated_invalid_reload:?}"
+    );
+    assert_eq!(
+        process
+            .configuration()
+            .ok_or("configuration runtime missing")?
+            .observed()?
+            .generation(),
+        configuration_generation
+    );
+    assert_status(
+        tls_http_with_client_identity(
+            api,
+            &fixture("mtls-ca-cert.pem"),
+            &fixture("mtls-client-cert.pem"),
+            &fixture("mtls-client-key.pem"),
+            "GET",
+            "/v1/capabilities:negotiate",
+        )?,
+        405,
+    );
+    assert_eq!(
+        process.shutdown(ShutdownTrigger::FirstSignal),
+        positron_runtime::ExitOutcome::Graceful
+    );
+    let reopened = InstanceBootstrap::reopen(&paths)?;
+    let administrator = reopened.attribute(
+        positron_governance::PresentedCredential::parse(claim.secret())?,
+        positron_governance::RequestedIntent::SystemAdministration,
+        positron_governance::CompatibilityHints::none(),
+    )?;
+    let history = reopened.inspect_governance_audit_history(administrator)?;
+    let material_reload = history
+        .records()
+        .iter()
+        .filter_map(positron_governance::GovernanceAuditEntry::as_tls_material_reload)
+        .collect::<Vec<_>>();
+    assert_eq!(material_reload.len(), 3);
+    assert_eq!(
+        material_reload[0].outcome(),
+        positron_governance::TlsMaterialReloadOutcome::Applied
+    );
+    assert_eq!(
+        material_reload[1].outcome(),
+        positron_governance::TlsMaterialReloadOutcome::Rejected
+    );
+    assert_eq!(
+        material_reload[2].outcome(),
+        positron_governance::TlsMaterialReloadOutcome::Rejected
+    );
+    assert_ne!(
+        material_reload[0].attempt_id(),
+        material_reload[1].attempt_id()
+    );
+    assert_ne!(
+        material_reload[1].attempt_id(),
+        material_reload[2].attempt_id()
+    );
+    Ok(())
+}
+
+#[test]
+fn same_path_tls_rotation_keeps_the_live_identity_when_audit_publication_fails()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _guard = live_test_guard();
+    let roots = TestRoots::new("same-path-tls-rotation-audit-failure")?;
+    let paths = roots.paths()?;
+    drop(InstanceBootstrap::initialize(
+        &paths,
+        positron_runtime::InitializationPlan::non_interactive(),
+    )?);
+    let tls_material = roots.parent.join("tls-material");
+    std::fs::create_dir(&tls_material)?;
+    let certificate = tls_material.join("listener-certificate.pem");
+    let private_key = tls_material.join("listener-private-key.pem");
+    std::fs::copy(fixture("mtls-server-cert.pem"), &certificate)?;
+    std::fs::copy(fixture("mtls-server-key.pem"), &private_key)?;
+    let control = roots.parent.join("control.sock");
+    let document = listener_tls_document(&control, &certificate, &private_key);
+    let initial = Arc::new(resolve(ConfigurationInputs::try_new(
+        Some(&document),
+        EnvironmentOverrides::try_from_pairs([] as [(&str, &str); 0])?,
+        CommandLineOverrides::try_from_pairs([] as [(&str, &str); 0])?,
+    )?)?);
+    let loopback = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+    let host = NativeHost::new(NativeBindings::new_with_listener_transports(
+        control,
+        loopback,
+        loopback,
+        loopback,
+        loopback,
+        loopback,
+        TransportProfile::tls(certificate.clone(), private_key.clone())?,
+        TransportProfile::Tls(TlsProfile::new(
+            TlsIdentity::new(certificate.clone(), private_key.clone()),
+            Some(TlsTrust::new(fixture("mtls-ca-cert.pem"))),
+        )),
+        TransportProfile::tls(certificate.clone(), private_key.clone())?,
+        TransportProfile::tls(certificate.clone(), private_key.clone())?,
+        TransportProfile::tls(certificate.clone(), private_key.clone())?,
+    )?);
+    let process = ApplicationRuntime::start(
+        ServeConfiguration::new(paths, InitializationMode::ExistingOnly)
+            .with_effective_configuration(Arc::clone(&initial)),
+        HostInputs::new(&host, &host),
+    )?;
+    let configuration_generation = process
+        .configuration()
+        .ok_or("configuration runtime missing")?
+        .observed()?
+        .generation();
+    let api = address(
+        &process.bound_endpoints(),
+        positron_runtime::ListenerRole::Api,
+    )?;
+
+    std::fs::copy(fixture("api-test-cert.pem"), &certificate)?;
+    std::fs::copy(fixture("api-test-key.pem"), &private_key)?;
+    let candidate = Arc::new(resolve(ConfigurationInputs::try_new(
+        Some(&document),
+        EnvironmentOverrides::try_from_pairs([] as [(&str, &str); 0])?,
+        CommandLineOverrides::try_from_pairs([] as [(&str, &str); 0])?,
+    )?)?);
+    let failure = positron_kernel::with_catalog_publication_fault_after(
+        positron_kernel::CatalogPublicationFault::SynchronizeCommit,
+        0,
+        || process.reload_configuration(candidate),
+    )
+    .expect_err("a TLS rotation must not activate before its audit receipt commits");
+    assert_eq!(
+        failure,
+        positron_runtime::ConfigurationRuntimeFailure::PublicationUnavailable
+    );
+    assert_eq!(
+        process
+            .configuration()
+            .ok_or("configuration runtime missing")?
+            .observed()?
+            .generation(),
+        configuration_generation
+    );
+    let served = tls_peer_certificate(
+        api,
+        &fixture("mtls-ca-cert.pem"),
+        &fixture("mtls-client-cert.pem"),
+        &fixture("mtls-client-key.pem"),
+    )?;
+    let prior = CertificateDer::pem_file_iter(fixture("mtls-server-cert.pem"))?
+        .next()
+        .ok_or("rotation fixture missing server certificate")??;
+    assert_eq!(served, prior.as_ref());
+    assert_eq!(
+        process.shutdown(ShutdownTrigger::FirstSignal),
+        positron_runtime::ExitOutcome::Graceful
+    );
+    Ok(())
+}
+
+fn listener_tls_document(control: &Path, certificate: &Path, private_key: &Path) -> String {
+    format!(
+        "schema_version = 1\n[listener]\ncontrol_path = \"{}\"\noperations_bind_address = \"127.0.0.1:0\"\noperations_transport = \"tls\"\noperations_tls_certificate_file = \"{}\"\noperations_tls_private_key_file = \"{}\"\napi_bind_address = \"127.0.0.1:0\"\napi_transport = \"mtls\"\napi_tls_certificate_file = \"{}\"\napi_tls_private_key_file = \"{}\"\napi_tls_client_ca_file = \"{}\"\notlp_grpc_bind_address = \"127.0.0.1:0\"\notlp_grpc_transport = \"tls\"\notlp_grpc_tls_certificate_file = \"{}\"\notlp_grpc_tls_private_key_file = \"{}\"\notlp_http_bind_address = \"127.0.0.1:0\"\notlp_http_transport = \"tls\"\notlp_http_tls_certificate_file = \"{}\"\notlp_http_tls_private_key_file = \"{}\"\nloki_push_bind_address = \"127.0.0.1:0\"\nloki_push_transport = \"tls\"\nloki_push_tls_certificate_file = \"{}\"\nloki_push_tls_private_key_file = \"{}\"\n",
+        control.display(),
+        certificate.display(),
+        private_key.display(),
+        certificate.display(),
+        private_key.display(),
+        fixture("mtls-ca-cert.pem").display(),
+        certificate.display(),
+        private_key.display(),
+        certificate.display(),
+        private_key.display(),
+        certificate.display(),
+        private_key.display(),
+    )
 }
 
 #[test]

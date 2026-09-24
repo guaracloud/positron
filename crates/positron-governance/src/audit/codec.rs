@@ -8,6 +8,10 @@ impl GovernanceAuditEntry {
         transaction_id: [u8; 16],
         intent: &[u8],
     ) -> Result<Self, IdentityFailure> {
+        if intent.starts_with(&TLS_MATERIAL_RELOAD_MAGIC) {
+            return TlsMaterialReloadAuditRequest::decode(position, transaction_id, intent)
+                .map(Self::TlsMaterialReload);
+        }
         if intent.starts_with(&CONFIGURATION_AUDIT_MAGIC) {
             return ConfigurationAuditRequest::decode(position, transaction_id, intent)
                 .map(Self::Configuration);
@@ -285,6 +289,40 @@ impl GovernanceAuditEntry {
             return SchemaCheckpointAuditEntry::decode_intent(position, transaction_id, intent)
                 .map(Self::SchemaCheckpoint);
         }
+        if intent.starts_with(&LISTENER_TRANSPORT_V3_MAGIC) {
+            let mut cursor = Cursor::new(intent);
+            if cursor.take_array::<8>()? != LISTENER_TRANSPORT_V3_MAGIC {
+                return Err(IdentityFailure);
+            }
+            let instance = cursor.take_array()?;
+            let listener_target = decode_listener_target(&mut cursor)?;
+            let listener_role = ListenerTransportRole::from_code(cursor.take_u8()?)?;
+            let configuration_provenance =
+                ListenerTransportConfigurationProvenance::from_code(cursor.take_u8()?)?;
+            let request_id = cursor.take_array()?;
+            let request_digest = cursor.take_array()?;
+            let request = ListenerTransportAuditRequest::configuration_file_listener(
+                listener_role,
+                listener_target,
+            );
+            if request.configuration_provenance() != configuration_provenance
+                || request_id != transaction_id
+                || request_id != request.transaction_id_for(instance)
+                || request_digest != request.digest_for(instance)
+                || !cursor.is_empty()
+            {
+                return Err(IdentityFailure);
+            }
+            return Ok(Self::ListenerTransport(ListenerTransportAuditEntry::bound(
+                position,
+                instance,
+                listener_target,
+                Some(listener_role),
+                configuration_provenance,
+                request_id,
+                request_digest,
+            )));
+        }
         if intent.starts_with(&LISTENER_TRANSPORT_V2_MAGIC) {
             let mut cursor = Cursor::new(intent);
             if cursor.take_array::<8>()? != LISTENER_TRANSPORT_V2_MAGIC {
@@ -301,8 +339,8 @@ impl GovernanceAuditEntry {
                 return Err(IdentityFailure);
             }
             if request_id != transaction_id
-                || request_id != request.transaction_id_for(instance)
-                || request_digest != request.digest_for(instance)
+                || request_id != request.legacy_transaction_id_for(instance)
+                || request_digest != request.legacy_digest_for(instance)
                 || !cursor.is_empty()
             {
                 return Err(IdentityFailure);
@@ -311,6 +349,7 @@ impl GovernanceAuditEntry {
                 position,
                 instance,
                 listener_target,
+                None,
                 configuration_provenance,
                 request_id,
                 request_digest,

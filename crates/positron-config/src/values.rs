@@ -7,6 +7,7 @@ use super::{Setting, ValueDomain, setting_definition, validate_path};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ApiTransport {
     Tls,
+    MutualTls,
     PlaintextOptOut,
 }
 
@@ -68,6 +69,7 @@ impl ApiTransport {
     pub(crate) fn parse(value: &str) -> Result<Self, ConfigurationFailure> {
         match value {
             "tls" => Ok(Self::Tls),
+            "mtls" => Ok(Self::MutualTls),
             "plaintext" => Ok(Self::PlaintextOptOut),
             _ => Err(ConfigurationFailure::unsupported_value(
                 FailureSource::ListenerApiTransport,
@@ -79,6 +81,7 @@ impl ApiTransport {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Tls => "tls",
+            Self::MutualTls => "mtls",
             Self::PlaintextOptOut => "plaintext",
         }
     }
@@ -220,6 +223,9 @@ pub enum FailureSource {
     ListenerControlPath,
     ListenerOperationsBindAddress,
     ListenerOperationsTransport,
+    ListenerOperationsTlsCertificateFile,
+    ListenerOperationsTlsPrivateKeyFile,
+    ListenerOperationsTlsClientCaFile,
     ListenerOperationsTrustedProxyCidrs,
     ListenerOperationsForwardedHops,
     ListenerApiBindAddress,
@@ -228,17 +234,26 @@ pub enum FailureSource {
     ListenerApiForwardedHops,
     ListenerApiTlsCertificateFile,
     ListenerApiTlsPrivateKeyFile,
-    ListenerTlsClientCaFile,
+    ListenerApiTlsClientCaFile,
     ListenerOtlpGrpcBindAddress,
     ListenerOtlpGrpcTransport,
+    ListenerOtlpGrpcTlsCertificateFile,
+    ListenerOtlpGrpcTlsPrivateKeyFile,
+    ListenerOtlpGrpcTlsClientCaFile,
     ListenerOtlpGrpcTrustedProxyCidrs,
     ListenerOtlpGrpcForwardedHops,
     ListenerOtlpHttpBindAddress,
     ListenerOtlpHttpTransport,
+    ListenerOtlpHttpTlsCertificateFile,
+    ListenerOtlpHttpTlsPrivateKeyFile,
+    ListenerOtlpHttpTlsClientCaFile,
     ListenerOtlpHttpTrustedProxyCidrs,
     ListenerOtlpHttpForwardedHops,
     ListenerLokiPushBindAddress,
     ListenerLokiPushTransport,
+    ListenerLokiPushTlsCertificateFile,
+    ListenerLokiPushTlsPrivateKeyFile,
+    ListenerLokiPushTlsClientCaFile,
     ListenerLokiPushTrustedProxyCidrs,
     ListenerLokiPushForwardedHops,
     StorageDataDirectory,
@@ -261,6 +276,11 @@ impl FailureSource {
             Self::ListenerControlPath => "listener.control_path",
             Self::ListenerOperationsBindAddress => "listener.operations_bind_address",
             Self::ListenerOperationsTransport => "listener.operations_transport",
+            Self::ListenerOperationsTlsCertificateFile => {
+                "listener.operations_tls_certificate_file"
+            },
+            Self::ListenerOperationsTlsPrivateKeyFile => "listener.operations_tls_private_key_file",
+            Self::ListenerOperationsTlsClientCaFile => "listener.operations_tls_client_ca_file",
             Self::ListenerOperationsTrustedProxyCidrs => "listener.operations.trusted_proxy_cidrs",
             Self::ListenerOperationsForwardedHops => "listener.operations.forwarded_hops",
             Self::ListenerApiBindAddress => "listener.api_bind_address",
@@ -269,17 +289,26 @@ impl FailureSource {
             Self::ListenerApiForwardedHops => "listener.api.forwarded_hops",
             Self::ListenerApiTlsCertificateFile => "listener.api_tls_certificate_file",
             Self::ListenerApiTlsPrivateKeyFile => "listener.api_tls_private_key_file",
-            Self::ListenerTlsClientCaFile => "listener.tls_client_ca_file",
+            Self::ListenerApiTlsClientCaFile => "listener.api_tls_client_ca_file",
             Self::ListenerOtlpGrpcBindAddress => "listener.otlp_grpc_bind_address",
             Self::ListenerOtlpGrpcTransport => "listener.otlp_grpc_transport",
+            Self::ListenerOtlpGrpcTlsCertificateFile => "listener.otlp_grpc_tls_certificate_file",
+            Self::ListenerOtlpGrpcTlsPrivateKeyFile => "listener.otlp_grpc_tls_private_key_file",
+            Self::ListenerOtlpGrpcTlsClientCaFile => "listener.otlp_grpc_tls_client_ca_file",
             Self::ListenerOtlpGrpcTrustedProxyCidrs => "listener.otlp_grpc.trusted_proxy_cidrs",
             Self::ListenerOtlpGrpcForwardedHops => "listener.otlp_grpc.forwarded_hops",
             Self::ListenerOtlpHttpBindAddress => "listener.otlp_http_bind_address",
             Self::ListenerOtlpHttpTransport => "listener.otlp_http_transport",
+            Self::ListenerOtlpHttpTlsCertificateFile => "listener.otlp_http_tls_certificate_file",
+            Self::ListenerOtlpHttpTlsPrivateKeyFile => "listener.otlp_http_tls_private_key_file",
+            Self::ListenerOtlpHttpTlsClientCaFile => "listener.otlp_http_tls_client_ca_file",
             Self::ListenerOtlpHttpTrustedProxyCidrs => "listener.otlp_http.trusted_proxy_cidrs",
             Self::ListenerOtlpHttpForwardedHops => "listener.otlp_http.forwarded_hops",
             Self::ListenerLokiPushBindAddress => "listener.loki_push_bind_address",
             Self::ListenerLokiPushTransport => "listener.loki_push_transport",
+            Self::ListenerLokiPushTlsCertificateFile => "listener.loki_push_tls_certificate_file",
+            Self::ListenerLokiPushTlsPrivateKeyFile => "listener.loki_push_tls_private_key_file",
+            Self::ListenerLokiPushTlsClientCaFile => "listener.loki_push_tls_client_ca_file",
             Self::ListenerLokiPushTrustedProxyCidrs => "listener.loki_push.trusted_proxy_cidrs",
             Self::ListenerLokiPushForwardedHops => "listener.loki_push.forwarded_hops",
             Self::StorageDataDirectory => "storage.data_directory",

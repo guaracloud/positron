@@ -152,6 +152,7 @@ pub struct ListenerGeneration {
     tasks: ListenerTasks,
     cancellation: Option<TaskCancellation>,
     activation: Option<Box<dyn ListenerGenerationActivation>>,
+    material_identity: Option<[u8; 32]>,
 }
 
 pub type ListenerTasks = Vec<(TaskRole, Box<dyn RunningTask>)>;
@@ -175,6 +176,7 @@ impl std::fmt::Debug for ListenerGeneration {
             .field("profile_count", &self.candidate.len())
             .field("bound_count", &self.listeners.len())
             .field("task_count", &self.tasks.len())
+            .field("has_material_identity", &self.material_identity.is_some())
             .finish()
     }
 }
@@ -223,7 +225,18 @@ impl ListenerGeneration {
             tasks: Vec::new(),
             cancellation: None,
             activation: None,
+            material_identity: None,
         })
+    }
+
+    pub(crate) fn with_material_identity(mut self, identity: [u8; 32]) -> Self {
+        self.material_identity = Some(identity);
+        self
+    }
+
+    #[must_use]
+    pub(crate) const fn material_identity(&self) -> Option<[u8; 32]> {
+        self.material_identity
     }
 
     /// Stages a complete replacement without disturbing this active

@@ -33,7 +33,7 @@ fn rust_owned_definitions_keep_runtime_and_generated_constraints_in_parity()
     }
 
     let listener = setting_definition(Setting::ListenerOperationsBindAddress);
-    assert_eq!(listener.domain(), ValueDomain::LoopbackSocketAddress(256));
+    assert_eq!(listener.domain(), ValueDomain::SocketAddress(256));
     let non_loopback = inputs(
         Some(
             "schema_version = 1\n\
@@ -44,17 +44,13 @@ fn rust_owned_definitions_keep_runtime_and_generated_constraints_in_parity()
         [],
     )
     .and_then(resolve);
-    assert!(matches!(
-        non_loopback,
-        Err(error)
-            if error.code() == ConfigurationFailureCode::UnsafeCombination
-                && error.source()
-                    == positron_config::FailureSource::ListenerOperationsBindAddress
-    ));
+    assert!(non_loopback.is_ok());
 
     let schema = generated_json_schema();
     assert!(schema.contains("\"minimum\": 1, \"maximum\": 3600"));
-    assert!(schema.contains("\"x-positron-address-scope\": \"loopback-only\""));
+    assert!(schema.contains(
+        "\"x-positron-address-scope\": \"tls-or-explicit-plaintext-opt-out-off-loopback\""
+    ));
     Ok(())
 }
 
@@ -225,12 +221,7 @@ fn rejects_invalid_shapes_and_values_from_each_closed_value_domain() {
         [],
     )
     .and_then(resolve);
-    assert!(matches!(
-        non_loopback,
-        Err(error)
-            if error.code() == ConfigurationFailureCode::UnsafeCombination
-                && error.source() == FailureSource::ListenerOperationsBindAddress
-    ));
+    assert!(non_loopback.is_ok());
 
     for value in ["", "01", "not-a-number"] {
         let result = inputs(

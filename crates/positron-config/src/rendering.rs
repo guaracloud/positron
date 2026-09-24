@@ -156,7 +156,21 @@ fn render_path_schema(definition: SettingDefinition, maximum: usize, protected: 
     }
     match definition.setting() {
         Setting::ListenerControlPath => output.push_str(", \"x-positron-path-kind\": \"absolute\""),
-        Setting::ListenerApiTlsCertificateFile | Setting::ListenerApiTlsPrivateKeyFile => {
+        Setting::ListenerOperationsTlsCertificateFile
+        | Setting::ListenerOperationsTlsPrivateKeyFile
+        | Setting::ListenerOperationsTlsClientCaFile
+        | Setting::ListenerApiTlsCertificateFile
+        | Setting::ListenerApiTlsPrivateKeyFile
+        | Setting::ListenerApiTlsClientCaFile
+        | Setting::ListenerOtlpGrpcTlsCertificateFile
+        | Setting::ListenerOtlpGrpcTlsPrivateKeyFile
+        | Setting::ListenerOtlpGrpcTlsClientCaFile
+        | Setting::ListenerOtlpHttpTlsCertificateFile
+        | Setting::ListenerOtlpHttpTlsPrivateKeyFile
+        | Setting::ListenerOtlpHttpTlsClientCaFile
+        | Setting::ListenerLokiPushTlsCertificateFile
+        | Setting::ListenerLokiPushTlsPrivateKeyFile
+        | Setting::ListenerLokiPushTlsClientCaFile => {
             output.push_str(", \"x-positron-path-kind\": \"protected-absolute\"");
         },
         Setting::SecurityLocalKeyFile if protected => output.push_str(
@@ -296,7 +310,7 @@ fn reference_domain(definition: SettingDefinition) -> String {
     match definition.setting() {
         Setting::RuntimeMaxRegisteredTenants => "`1..=1024`; maximum tenant quotas simultaneously registered in the live Resource Governor, including the default tenant and a pending non-admittable tenant-creation reservation".to_owned(),
         Setting::ListenerApiBindAddress => "socket address; at most 256 bytes; non-loopback requires TLS or the explicit plaintext opt-out".to_owned(),
-        Setting::ListenerApiTransport => "`tls`, `plaintext`; plaintext emits a configuration warning, persistent ready health warning, and one redacted governance audit record".to_owned(),
+        Setting::ListenerApiTransport => "`tls`, `mtls`, `plaintext`; plaintext emits a configuration warning, persistent ready health warning, and one redacted governance audit record".to_owned(),
         Setting::SecurityLocalKeyFile => "protected absolute path under `storage.secrets_directory`, named `local-root-key.v1`; at most 256 bytes".to_owned(),
         _ => match definition.domain() {
             ValueDomain::ExactUnsignedInteger(value) => format!("exactly `{value}`"),

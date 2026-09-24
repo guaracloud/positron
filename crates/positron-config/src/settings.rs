@@ -216,6 +216,9 @@ pub enum Setting {
     ListenerControlPath,
     ListenerOperationsBindAddress,
     ListenerOperationsTransport,
+    ListenerOperationsTlsCertificateFile,
+    ListenerOperationsTlsPrivateKeyFile,
+    ListenerOperationsTlsClientCaFile,
     ListenerOperationsTrustedProxyCidrs,
     ListenerOperationsForwardedHops,
     ListenerApiBindAddress,
@@ -224,17 +227,26 @@ pub enum Setting {
     ListenerApiForwardedHops,
     ListenerApiTlsCertificateFile,
     ListenerApiTlsPrivateKeyFile,
-    ListenerTlsClientCaFile,
+    ListenerApiTlsClientCaFile,
     ListenerOtlpGrpcBindAddress,
     ListenerOtlpGrpcTransport,
+    ListenerOtlpGrpcTlsCertificateFile,
+    ListenerOtlpGrpcTlsPrivateKeyFile,
+    ListenerOtlpGrpcTlsClientCaFile,
     ListenerOtlpGrpcTrustedProxyCidrs,
     ListenerOtlpGrpcForwardedHops,
     ListenerOtlpHttpBindAddress,
     ListenerOtlpHttpTransport,
+    ListenerOtlpHttpTlsCertificateFile,
+    ListenerOtlpHttpTlsPrivateKeyFile,
+    ListenerOtlpHttpTlsClientCaFile,
     ListenerOtlpHttpTrustedProxyCidrs,
     ListenerOtlpHttpForwardedHops,
     ListenerLokiPushBindAddress,
     ListenerLokiPushTransport,
+    ListenerLokiPushTlsCertificateFile,
+    ListenerLokiPushTlsPrivateKeyFile,
+    ListenerLokiPushTlsClientCaFile,
     ListenerLokiPushTrustedProxyCidrs,
     ListenerLokiPushForwardedHops,
     StorageDataDirectory,
@@ -269,8 +281,21 @@ impl Setting {
             Self::SchemaVersion
                 | Self::ListenerControlPath
                 | Self::ListenerApiTransport
+                | Self::ListenerOperationsTlsCertificateFile
+                | Self::ListenerOperationsTlsPrivateKeyFile
+                | Self::ListenerOperationsTlsClientCaFile
                 | Self::ListenerApiTlsCertificateFile
                 | Self::ListenerApiTlsPrivateKeyFile
+                | Self::ListenerApiTlsClientCaFile
+                | Self::ListenerOtlpGrpcTlsCertificateFile
+                | Self::ListenerOtlpGrpcTlsPrivateKeyFile
+                | Self::ListenerOtlpGrpcTlsClientCaFile
+                | Self::ListenerOtlpHttpTlsCertificateFile
+                | Self::ListenerOtlpHttpTlsPrivateKeyFile
+                | Self::ListenerOtlpHttpTlsClientCaFile
+                | Self::ListenerLokiPushTlsCertificateFile
+                | Self::ListenerLokiPushTlsPrivateKeyFile
+                | Self::ListenerLokiPushTlsClientCaFile
                 | Self::StorageDataDirectory
                 | Self::StorageSecretsDirectory
                 | Self::SecurityLocalKeyFile
@@ -282,72 +307,5 @@ impl Setting {
 /// Returns the Rust-owned canonical definition for one setting.
 #[must_use]
 pub const fn setting_definition(setting: Setting) -> SettingDefinition {
-    let [
-        schema_version,
-        diagnostics_log_level,
-        runtime_shutdown_grace_seconds,
-        runtime_max_registered_tenants,
-        listener_control_path,
-        listener_operations_bind_address,
-        listener_operations_transport,
-        listener_operations_trusted_proxy_cidrs,
-        listener_operations_forwarded_hops,
-        listener_api_bind_address,
-        listener_api_transport,
-        listener_api_trusted_proxy_cidrs,
-        listener_api_forwarded_hops,
-        listener_api_tls_certificate_file,
-        listener_api_tls_private_key_file,
-        listener_tls_client_ca_file,
-        listener_otlp_grpc_bind_address,
-        listener_otlp_grpc_transport,
-        listener_otlp_grpc_trusted_proxy_cidrs,
-        listener_otlp_grpc_forwarded_hops,
-        listener_otlp_http_bind_address,
-        listener_otlp_http_transport,
-        listener_otlp_http_trusted_proxy_cidrs,
-        listener_otlp_http_forwarded_hops,
-        listener_loki_push_bind_address,
-        listener_loki_push_transport,
-        listener_loki_push_trusted_proxy_cidrs,
-        listener_loki_push_forwarded_hops,
-        storage_data_directory,
-        storage_secrets_directory,
-        security_local_key_file,
-        export_destinations,
-    ] = contract::SETTING_DEFINITIONS;
-    match setting {
-        Setting::SchemaVersion => schema_version,
-        Setting::DiagnosticsLogLevel => diagnostics_log_level,
-        Setting::RuntimeShutdownGraceSeconds => runtime_shutdown_grace_seconds,
-        Setting::RuntimeMaxRegisteredTenants => runtime_max_registered_tenants,
-        Setting::ListenerControlPath => listener_control_path,
-        Setting::ListenerOperationsBindAddress => listener_operations_bind_address,
-        Setting::ListenerOperationsTransport => listener_operations_transport,
-        Setting::ListenerOperationsTrustedProxyCidrs => listener_operations_trusted_proxy_cidrs,
-        Setting::ListenerOperationsForwardedHops => listener_operations_forwarded_hops,
-        Setting::ListenerApiBindAddress => listener_api_bind_address,
-        Setting::ListenerApiTransport => listener_api_transport,
-        Setting::ListenerApiTrustedProxyCidrs => listener_api_trusted_proxy_cidrs,
-        Setting::ListenerApiForwardedHops => listener_api_forwarded_hops,
-        Setting::ListenerApiTlsCertificateFile => listener_api_tls_certificate_file,
-        Setting::ListenerApiTlsPrivateKeyFile => listener_api_tls_private_key_file,
-        Setting::ListenerTlsClientCaFile => listener_tls_client_ca_file,
-        Setting::ListenerOtlpGrpcBindAddress => listener_otlp_grpc_bind_address,
-        Setting::ListenerOtlpGrpcTransport => listener_otlp_grpc_transport,
-        Setting::ListenerOtlpGrpcTrustedProxyCidrs => listener_otlp_grpc_trusted_proxy_cidrs,
-        Setting::ListenerOtlpGrpcForwardedHops => listener_otlp_grpc_forwarded_hops,
-        Setting::ListenerOtlpHttpBindAddress => listener_otlp_http_bind_address,
-        Setting::ListenerOtlpHttpTransport => listener_otlp_http_transport,
-        Setting::ListenerOtlpHttpTrustedProxyCidrs => listener_otlp_http_trusted_proxy_cidrs,
-        Setting::ListenerOtlpHttpForwardedHops => listener_otlp_http_forwarded_hops,
-        Setting::ListenerLokiPushBindAddress => listener_loki_push_bind_address,
-        Setting::ListenerLokiPushTransport => listener_loki_push_transport,
-        Setting::ListenerLokiPushTrustedProxyCidrs => listener_loki_push_trusted_proxy_cidrs,
-        Setting::ListenerLokiPushForwardedHops => listener_loki_push_forwarded_hops,
-        Setting::StorageDataDirectory => storage_data_directory,
-        Setting::StorageSecretsDirectory => storage_secrets_directory,
-        Setting::SecurityLocalKeyFile => security_local_key_file,
-        Setting::ExportDestinations => export_destinations,
-    }
+    contract::SETTING_DEFINITIONS[super::setting_index(setting)]
 }

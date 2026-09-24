@@ -182,7 +182,7 @@ pub fn setting_for_path(path: &str) -> Option<Setting> {
 
 /// Returns the complete canonical contract in deterministic declaration order.
 #[must_use]
-pub const fn setting_definitions() -> [SettingDefinition; 32] {
+pub const fn setting_definitions() -> [SettingDefinition; 44] {
     contract::SETTING_DEFINITIONS
 }
 
@@ -198,6 +198,9 @@ struct Candidate {
     control_path: String,
     operations_bind_address: SocketAddr,
     operations_transport: NetworkTransport,
+    operations_tls_certificate_file: ProtectedFileReference,
+    operations_tls_private_key_file: ProtectedFileReference,
+    operations_tls_client_ca_file: ProtectedFileReference,
     operations_trusted_proxy_cidrs: Vec<String>,
     operations_forwarded_hops: Option<NonZeroU8>,
     api_bind_address: SocketAddr,
@@ -206,24 +209,33 @@ struct Candidate {
     api_forwarded_hops: Option<NonZeroU8>,
     api_tls_certificate_file: ProtectedFileReference,
     api_tls_private_key_file: ProtectedFileReference,
-    tls_client_ca_file: ProtectedFileReference,
+    api_tls_client_ca_file: ProtectedFileReference,
     otlp_grpc_bind_address: SocketAddr,
     otlp_grpc_transport: NetworkTransport,
+    otlp_grpc_tls_certificate_file: ProtectedFileReference,
+    otlp_grpc_tls_private_key_file: ProtectedFileReference,
+    otlp_grpc_tls_client_ca_file: ProtectedFileReference,
     otlp_grpc_trusted_proxy_cidrs: Vec<String>,
     otlp_grpc_forwarded_hops: Option<NonZeroU8>,
     otlp_http_bind_address: SocketAddr,
     otlp_http_transport: NetworkTransport,
+    otlp_http_tls_certificate_file: ProtectedFileReference,
+    otlp_http_tls_private_key_file: ProtectedFileReference,
+    otlp_http_tls_client_ca_file: ProtectedFileReference,
     otlp_http_trusted_proxy_cidrs: Vec<String>,
     otlp_http_forwarded_hops: Option<NonZeroU8>,
     loki_push_bind_address: SocketAddr,
     loki_push_transport: NetworkTransport,
+    loki_push_tls_certificate_file: ProtectedFileReference,
+    loki_push_tls_private_key_file: ProtectedFileReference,
+    loki_push_tls_client_ca_file: ProtectedFileReference,
     loki_push_trusted_proxy_cidrs: Vec<String>,
     loki_push_forwarded_hops: Option<NonZeroU8>,
     data_directory: String,
     secrets_directory: String,
     local_key_file: ProtectedFileReference,
     export_destinations: Vec<ExportDestinationDefinition>,
-    sources: [SettingSource; 32],
+    sources: [SettingSource; 44],
 }
 
 impl Candidate {
@@ -243,7 +255,6 @@ impl Candidate {
             setting_definition(Setting::ListenerApiTlsCertificateFile).default_value();
         let api_private_key =
             setting_definition(Setting::ListenerApiTlsPrivateKeyFile).default_value();
-        let tls_client_ca = setting_definition(Setting::ListenerTlsClientCaFile).default_value();
         let otlp_grpc = setting_definition(Setting::ListenerOtlpGrpcBindAddress).default_value();
         let otlp_grpc_transport =
             setting_definition(Setting::ListenerOtlpGrpcTransport).default_value();
@@ -270,6 +281,15 @@ impl Candidate {
                 operations_transport,
                 FailureSource::ListenerOperationsTransport,
             )?,
+            operations_tls_certificate_file: default_protected_reference(
+                Setting::ListenerOperationsTlsCertificateFile,
+            )?,
+            operations_tls_private_key_file: default_protected_reference(
+                Setting::ListenerOperationsTlsPrivateKeyFile,
+            )?,
+            operations_tls_client_ca_file: default_protected_reference(
+                Setting::ListenerOperationsTlsClientCaFile,
+            )?,
             operations_trusted_proxy_cidrs: Vec::new(),
             operations_forwarded_hops: None,
             api_bind_address: parse_socket_address(api, Setting::ListenerApiBindAddress)?,
@@ -284,9 +304,8 @@ impl Candidate {
                 api_private_key,
                 Setting::ListenerApiTlsPrivateKeyFile,
             )?,
-            tls_client_ca_file: ProtectedFileReference::parse(
-                tls_client_ca,
-                Setting::ListenerTlsClientCaFile,
+            api_tls_client_ca_file: default_protected_reference(
+                Setting::ListenerApiTlsClientCaFile,
             )?,
             otlp_grpc_bind_address: parse_socket_address(
                 otlp_grpc,
@@ -295,6 +314,15 @@ impl Candidate {
             otlp_grpc_transport: NetworkTransport::parse(
                 otlp_grpc_transport,
                 FailureSource::ListenerOtlpGrpcTransport,
+            )?,
+            otlp_grpc_tls_certificate_file: default_protected_reference(
+                Setting::ListenerOtlpGrpcTlsCertificateFile,
+            )?,
+            otlp_grpc_tls_private_key_file: default_protected_reference(
+                Setting::ListenerOtlpGrpcTlsPrivateKeyFile,
+            )?,
+            otlp_grpc_tls_client_ca_file: default_protected_reference(
+                Setting::ListenerOtlpGrpcTlsClientCaFile,
             )?,
             otlp_grpc_trusted_proxy_cidrs: Vec::new(),
             otlp_grpc_forwarded_hops: None,
@@ -306,6 +334,15 @@ impl Candidate {
                 otlp_http_transport,
                 FailureSource::ListenerOtlpHttpTransport,
             )?,
+            otlp_http_tls_certificate_file: default_protected_reference(
+                Setting::ListenerOtlpHttpTlsCertificateFile,
+            )?,
+            otlp_http_tls_private_key_file: default_protected_reference(
+                Setting::ListenerOtlpHttpTlsPrivateKeyFile,
+            )?,
+            otlp_http_tls_client_ca_file: default_protected_reference(
+                Setting::ListenerOtlpHttpTlsClientCaFile,
+            )?,
             otlp_http_trusted_proxy_cidrs: Vec::new(),
             otlp_http_forwarded_hops: None,
             loki_push_bind_address: parse_socket_address(
@@ -316,6 +353,15 @@ impl Candidate {
                 loki_push_transport,
                 FailureSource::ListenerLokiPushTransport,
             )?,
+            loki_push_tls_certificate_file: default_protected_reference(
+                Setting::ListenerLokiPushTlsCertificateFile,
+            )?,
+            loki_push_tls_private_key_file: default_protected_reference(
+                Setting::ListenerLokiPushTlsPrivateKeyFile,
+            )?,
+            loki_push_tls_client_ca_file: default_protected_reference(
+                Setting::ListenerLokiPushTlsClientCaFile,
+            )?,
             loki_push_trusted_proxy_cidrs: Vec::new(),
             loki_push_forwarded_hops: None,
             data_directory: checked_path(data, Setting::StorageDataDirectory)?,
@@ -325,7 +371,7 @@ impl Candidate {
                 Setting::SecurityLocalKeyFile,
             )?,
             export_destinations: Vec::new(),
-            sources: [SettingSource::CompiledDefault; 32],
+            sources: [SettingSource::CompiledDefault; 44],
         })
     }
 
@@ -365,6 +411,17 @@ impl Candidate {
                 self.operations_transport =
                     NetworkTransport::parse(value, FailureSource::ListenerOperationsTransport)?;
             },
+            Setting::ListenerOperationsTlsCertificateFile => {
+                self.operations_tls_certificate_file =
+                    ProtectedFileReference::parse(value, setting)?;
+            },
+            Setting::ListenerOperationsTlsPrivateKeyFile => {
+                self.operations_tls_private_key_file =
+                    ProtectedFileReference::parse(value, setting)?;
+            },
+            Setting::ListenerOperationsTlsClientCaFile => {
+                self.operations_tls_client_ca_file = ProtectedFileReference::parse(value, setting)?;
+            },
             Setting::ListenerOperationsForwardedHops => {
                 self.operations_forwarded_hops = parse_forwarded_hops(value, setting)?;
             },
@@ -383,8 +440,8 @@ impl Candidate {
             Setting::ListenerApiTlsPrivateKeyFile => {
                 self.api_tls_private_key_file = ProtectedFileReference::parse(value, setting)?;
             },
-            Setting::ListenerTlsClientCaFile => {
-                self.tls_client_ca_file = ProtectedFileReference::parse(value, setting)?;
+            Setting::ListenerApiTlsClientCaFile => {
+                self.api_tls_client_ca_file = ProtectedFileReference::parse(value, setting)?;
             },
             Setting::ListenerOtlpGrpcBindAddress => {
                 self.otlp_grpc_bind_address = parse_socket_address(value, setting)?;
@@ -392,6 +449,17 @@ impl Candidate {
             Setting::ListenerOtlpGrpcTransport => {
                 self.otlp_grpc_transport =
                     NetworkTransport::parse(value, FailureSource::ListenerOtlpGrpcTransport)?;
+            },
+            Setting::ListenerOtlpGrpcTlsCertificateFile => {
+                self.otlp_grpc_tls_certificate_file =
+                    ProtectedFileReference::parse(value, setting)?;
+            },
+            Setting::ListenerOtlpGrpcTlsPrivateKeyFile => {
+                self.otlp_grpc_tls_private_key_file =
+                    ProtectedFileReference::parse(value, setting)?;
+            },
+            Setting::ListenerOtlpGrpcTlsClientCaFile => {
+                self.otlp_grpc_tls_client_ca_file = ProtectedFileReference::parse(value, setting)?;
             },
             Setting::ListenerOtlpGrpcForwardedHops => {
                 self.otlp_grpc_forwarded_hops = parse_forwarded_hops(value, setting)?;
@@ -403,6 +471,17 @@ impl Candidate {
                 self.otlp_http_transport =
                     NetworkTransport::parse(value, FailureSource::ListenerOtlpHttpTransport)?;
             },
+            Setting::ListenerOtlpHttpTlsCertificateFile => {
+                self.otlp_http_tls_certificate_file =
+                    ProtectedFileReference::parse(value, setting)?;
+            },
+            Setting::ListenerOtlpHttpTlsPrivateKeyFile => {
+                self.otlp_http_tls_private_key_file =
+                    ProtectedFileReference::parse(value, setting)?;
+            },
+            Setting::ListenerOtlpHttpTlsClientCaFile => {
+                self.otlp_http_tls_client_ca_file = ProtectedFileReference::parse(value, setting)?;
+            },
             Setting::ListenerOtlpHttpForwardedHops => {
                 self.otlp_http_forwarded_hops = parse_forwarded_hops(value, setting)?;
             },
@@ -412,6 +491,17 @@ impl Candidate {
             Setting::ListenerLokiPushTransport => {
                 self.loki_push_transport =
                     NetworkTransport::parse(value, FailureSource::ListenerLokiPushTransport)?;
+            },
+            Setting::ListenerLokiPushTlsCertificateFile => {
+                self.loki_push_tls_certificate_file =
+                    ProtectedFileReference::parse(value, setting)?;
+            },
+            Setting::ListenerLokiPushTlsPrivateKeyFile => {
+                self.loki_push_tls_private_key_file =
+                    ProtectedFileReference::parse(value, setting)?;
+            },
+            Setting::ListenerLokiPushTlsClientCaFile => {
+                self.loki_push_tls_client_ca_file = ProtectedFileReference::parse(value, setting)?;
             },
             Setting::ListenerLokiPushForwardedHops => {
                 self.loki_push_forwarded_hops = parse_forwarded_hops(value, setting)?;
@@ -541,6 +631,9 @@ impl Candidate {
             control_path: self.control_path,
             operations_bind_address: self.operations_bind_address,
             operations_transport: self.operations_transport,
+            operations_tls_certificate_file: self.operations_tls_certificate_file,
+            operations_tls_private_key_file: self.operations_tls_private_key_file,
+            operations_tls_client_ca_file: self.operations_tls_client_ca_file,
             operations_trusted_proxy_cidrs: self.operations_trusted_proxy_cidrs,
             operations_forwarded_hops: self.operations_forwarded_hops,
             api_bind_address: self.api_bind_address,
@@ -549,17 +642,26 @@ impl Candidate {
             api_forwarded_hops: self.api_forwarded_hops,
             api_tls_certificate_file: self.api_tls_certificate_file,
             api_tls_private_key_file: self.api_tls_private_key_file,
-            tls_client_ca_file: self.tls_client_ca_file,
+            api_tls_client_ca_file: self.api_tls_client_ca_file,
             otlp_grpc_bind_address: self.otlp_grpc_bind_address,
             otlp_grpc_transport: self.otlp_grpc_transport,
+            otlp_grpc_tls_certificate_file: self.otlp_grpc_tls_certificate_file,
+            otlp_grpc_tls_private_key_file: self.otlp_grpc_tls_private_key_file,
+            otlp_grpc_tls_client_ca_file: self.otlp_grpc_tls_client_ca_file,
             otlp_grpc_trusted_proxy_cidrs: self.otlp_grpc_trusted_proxy_cidrs,
             otlp_grpc_forwarded_hops: self.otlp_grpc_forwarded_hops,
             otlp_http_bind_address: self.otlp_http_bind_address,
             otlp_http_transport: self.otlp_http_transport,
+            otlp_http_tls_certificate_file: self.otlp_http_tls_certificate_file,
+            otlp_http_tls_private_key_file: self.otlp_http_tls_private_key_file,
+            otlp_http_tls_client_ca_file: self.otlp_http_tls_client_ca_file,
             otlp_http_trusted_proxy_cidrs: self.otlp_http_trusted_proxy_cidrs,
             otlp_http_forwarded_hops: self.otlp_http_forwarded_hops,
             loki_push_bind_address: self.loki_push_bind_address,
             loki_push_transport: self.loki_push_transport,
+            loki_push_tls_certificate_file: self.loki_push_tls_certificate_file,
+            loki_push_tls_private_key_file: self.loki_push_tls_private_key_file,
+            loki_push_tls_client_ca_file: self.loki_push_tls_client_ca_file,
             loki_push_trusted_proxy_cidrs: self.loki_push_trusted_proxy_cidrs,
             loki_push_forwarded_hops: self.loki_push_forwarded_hops,
             data_directory: self.data_directory,
@@ -569,6 +671,12 @@ impl Candidate {
             sources: self.sources,
         })
     }
+}
+
+fn default_protected_reference(
+    setting: Setting,
+) -> Result<ProtectedFileReference, ConfigurationFailure> {
+    ProtectedFileReference::parse(setting_definition(setting).default_value(), setting)
 }
 
 fn parse_schema_version(value: &str) -> Result<u16, ConfigurationFailure> {
@@ -816,31 +924,43 @@ const fn setting_index(setting: Setting) -> usize {
         Setting::ListenerControlPath => 4,
         Setting::ListenerOperationsBindAddress => 5,
         Setting::ListenerOperationsTransport => 6,
-        Setting::ListenerOperationsTrustedProxyCidrs => 7,
-        Setting::ListenerOperationsForwardedHops => 8,
-        Setting::ListenerApiBindAddress => 9,
-        Setting::ListenerApiTransport => 10,
-        Setting::ListenerApiTrustedProxyCidrs => 11,
-        Setting::ListenerApiForwardedHops => 12,
-        Setting::ListenerApiTlsCertificateFile => 13,
-        Setting::ListenerApiTlsPrivateKeyFile => 14,
-        Setting::ListenerTlsClientCaFile => 15,
-        Setting::ListenerOtlpGrpcBindAddress => 16,
-        Setting::ListenerOtlpGrpcTransport => 17,
-        Setting::ListenerOtlpGrpcTrustedProxyCidrs => 18,
-        Setting::ListenerOtlpGrpcForwardedHops => 19,
-        Setting::ListenerOtlpHttpBindAddress => 20,
-        Setting::ListenerOtlpHttpTransport => 21,
-        Setting::ListenerOtlpHttpTrustedProxyCidrs => 22,
-        Setting::ListenerOtlpHttpForwardedHops => 23,
-        Setting::ListenerLokiPushBindAddress => 24,
-        Setting::ListenerLokiPushTransport => 25,
-        Setting::ListenerLokiPushTrustedProxyCidrs => 26,
-        Setting::ListenerLokiPushForwardedHops => 27,
-        Setting::StorageDataDirectory => 28,
-        Setting::StorageSecretsDirectory => 29,
-        Setting::SecurityLocalKeyFile => 30,
-        Setting::ExportDestinations => 31,
+        Setting::ListenerOperationsTlsCertificateFile => 7,
+        Setting::ListenerOperationsTlsPrivateKeyFile => 8,
+        Setting::ListenerOperationsTlsClientCaFile => 9,
+        Setting::ListenerOperationsTrustedProxyCidrs => 10,
+        Setting::ListenerOperationsForwardedHops => 11,
+        Setting::ListenerApiBindAddress => 12,
+        Setting::ListenerApiTransport => 13,
+        Setting::ListenerApiTrustedProxyCidrs => 14,
+        Setting::ListenerApiForwardedHops => 15,
+        Setting::ListenerApiTlsCertificateFile => 16,
+        Setting::ListenerApiTlsPrivateKeyFile => 17,
+        Setting::ListenerApiTlsClientCaFile => 18,
+        Setting::ListenerOtlpGrpcBindAddress => 19,
+        Setting::ListenerOtlpGrpcTransport => 20,
+        Setting::ListenerOtlpGrpcTlsCertificateFile => 21,
+        Setting::ListenerOtlpGrpcTlsPrivateKeyFile => 22,
+        Setting::ListenerOtlpGrpcTlsClientCaFile => 23,
+        Setting::ListenerOtlpGrpcTrustedProxyCidrs => 24,
+        Setting::ListenerOtlpGrpcForwardedHops => 25,
+        Setting::ListenerOtlpHttpBindAddress => 26,
+        Setting::ListenerOtlpHttpTransport => 27,
+        Setting::ListenerOtlpHttpTlsCertificateFile => 28,
+        Setting::ListenerOtlpHttpTlsPrivateKeyFile => 29,
+        Setting::ListenerOtlpHttpTlsClientCaFile => 30,
+        Setting::ListenerOtlpHttpTrustedProxyCidrs => 31,
+        Setting::ListenerOtlpHttpForwardedHops => 32,
+        Setting::ListenerLokiPushBindAddress => 33,
+        Setting::ListenerLokiPushTransport => 34,
+        Setting::ListenerLokiPushTlsCertificateFile => 35,
+        Setting::ListenerLokiPushTlsPrivateKeyFile => 36,
+        Setting::ListenerLokiPushTlsClientCaFile => 37,
+        Setting::ListenerLokiPushTrustedProxyCidrs => 38,
+        Setting::ListenerLokiPushForwardedHops => 39,
+        Setting::StorageDataDirectory => 40,
+        Setting::StorageSecretsDirectory => 41,
+        Setting::SecurityLocalKeyFile => 42,
+        Setting::ExportDestinations => 43,
     }
 }
 
@@ -853,6 +973,15 @@ const fn failure_source(setting: Setting) -> FailureSource {
         Setting::ListenerControlPath => FailureSource::ListenerControlPath,
         Setting::ListenerOperationsBindAddress => FailureSource::ListenerOperationsBindAddress,
         Setting::ListenerOperationsTransport => FailureSource::ListenerOperationsTransport,
+        Setting::ListenerOperationsTlsCertificateFile => {
+            FailureSource::ListenerOperationsTlsCertificateFile
+        },
+        Setting::ListenerOperationsTlsPrivateKeyFile => {
+            FailureSource::ListenerOperationsTlsPrivateKeyFile
+        },
+        Setting::ListenerOperationsTlsClientCaFile => {
+            FailureSource::ListenerOperationsTlsClientCaFile
+        },
         Setting::ListenerOperationsTrustedProxyCidrs => {
             FailureSource::ListenerOperationsTrustedProxyCidrs
         },
@@ -863,21 +992,42 @@ const fn failure_source(setting: Setting) -> FailureSource {
         Setting::ListenerApiForwardedHops => FailureSource::ListenerApiForwardedHops,
         Setting::ListenerApiTlsCertificateFile => FailureSource::ListenerApiTlsCertificateFile,
         Setting::ListenerApiTlsPrivateKeyFile => FailureSource::ListenerApiTlsPrivateKeyFile,
-        Setting::ListenerTlsClientCaFile => FailureSource::ListenerTlsClientCaFile,
+        Setting::ListenerApiTlsClientCaFile => FailureSource::ListenerApiTlsClientCaFile,
         Setting::ListenerOtlpGrpcBindAddress => FailureSource::ListenerOtlpGrpcBindAddress,
         Setting::ListenerOtlpGrpcTransport => FailureSource::ListenerOtlpGrpcTransport,
+        Setting::ListenerOtlpGrpcTlsCertificateFile => {
+            FailureSource::ListenerOtlpGrpcTlsCertificateFile
+        },
+        Setting::ListenerOtlpGrpcTlsPrivateKeyFile => {
+            FailureSource::ListenerOtlpGrpcTlsPrivateKeyFile
+        },
+        Setting::ListenerOtlpGrpcTlsClientCaFile => FailureSource::ListenerOtlpGrpcTlsClientCaFile,
         Setting::ListenerOtlpGrpcTrustedProxyCidrs => {
             FailureSource::ListenerOtlpGrpcTrustedProxyCidrs
         },
         Setting::ListenerOtlpGrpcForwardedHops => FailureSource::ListenerOtlpGrpcForwardedHops,
         Setting::ListenerOtlpHttpBindAddress => FailureSource::ListenerOtlpHttpBindAddress,
         Setting::ListenerOtlpHttpTransport => FailureSource::ListenerOtlpHttpTransport,
+        Setting::ListenerOtlpHttpTlsCertificateFile => {
+            FailureSource::ListenerOtlpHttpTlsCertificateFile
+        },
+        Setting::ListenerOtlpHttpTlsPrivateKeyFile => {
+            FailureSource::ListenerOtlpHttpTlsPrivateKeyFile
+        },
+        Setting::ListenerOtlpHttpTlsClientCaFile => FailureSource::ListenerOtlpHttpTlsClientCaFile,
         Setting::ListenerOtlpHttpTrustedProxyCidrs => {
             FailureSource::ListenerOtlpHttpTrustedProxyCidrs
         },
         Setting::ListenerOtlpHttpForwardedHops => FailureSource::ListenerOtlpHttpForwardedHops,
         Setting::ListenerLokiPushBindAddress => FailureSource::ListenerLokiPushBindAddress,
         Setting::ListenerLokiPushTransport => FailureSource::ListenerLokiPushTransport,
+        Setting::ListenerLokiPushTlsCertificateFile => {
+            FailureSource::ListenerLokiPushTlsCertificateFile
+        },
+        Setting::ListenerLokiPushTlsPrivateKeyFile => {
+            FailureSource::ListenerLokiPushTlsPrivateKeyFile
+        },
+        Setting::ListenerLokiPushTlsClientCaFile => FailureSource::ListenerLokiPushTlsClientCaFile,
         Setting::ListenerLokiPushTrustedProxyCidrs => {
             FailureSource::ListenerLokiPushTrustedProxyCidrs
         },
