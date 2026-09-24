@@ -164,6 +164,12 @@ fn reload(
                 .unwrap_or_else(|_| panic!("failed publication must keep runtime observable"));
             assert_same_observation(&before, &after);
         },
+        Err(ConfigurationRuntimeFailure::ImmutableConfiguration) => {
+            let after = runtime
+                .observed()
+                .unwrap_or_else(|_| panic!("immutable reload must keep runtime observable"));
+            assert_same_observation(&before, &after);
+        },
         Err(ConfigurationRuntimeFailure::Unavailable) => {
             panic!("single-threaded reload must not lose its configuration lock");
         },
