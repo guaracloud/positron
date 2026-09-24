@@ -5,7 +5,7 @@ use positron_governance::CompatibilityHints;
 use zeroize::{Zeroize, Zeroizing};
 
 use super::super::TrustedProxy;
-use crate::{ConfigurationRuntimeStatus, HealthWarning, ProcessPhase};
+use crate::{ConfigurationObservation, HealthWarning, ProcessPhase};
 
 const MAX_HEADER_BYTES: usize = 8 * 1024;
 
@@ -175,18 +175,22 @@ pub(in crate::native_host) fn health_response(
 
 pub(in crate::native_host) fn configuration_status_response(
     phase: ProcessPhase,
-    status: &ConfigurationRuntimeStatus,
+    status: &ConfigurationObservation,
 ) -> Response {
     Response::json(
         200,
         format!(
             "{{\"phase\":\"{}\",\"observed_generation\":{},\"effective_digest\":\"{}\",\"desired_digest\":\"{}\",\"drift_disposition\":\"{}\",\"pending_restart\":{}}}",
             process_phase_name(phase),
-            status.observed_generation(),
-            hexadecimal_digest(status.effective_digest()),
-            hexadecimal_digest(status.desired_digest()),
+            status.generation(),
+            hexadecimal_digest(crate::configuration_catalog::configuration_digest(
+                status.effective()
+            )),
+            hexadecimal_digest(crate::configuration_catalog::configuration_digest(
+                status.desired()
+            )),
             drift_disposition_name(status.drift_disposition()),
-            status.pending_restart(),
+            status.pending_restart().is_some(),
         ),
     )
 }

@@ -33,10 +33,16 @@ fn operations_status_exposes_a_fenced_configuration_drift() -> Result<(), Box<dy
 {
     let _guard = live_test_guard();
     let roots = TestRoots::new("cfg-status")?;
+    let paths = roots.paths()?;
+    drop(InstanceBootstrap::initialize(
+        &paths,
+        positron_runtime::InitializationPlan::non_interactive(),
+    )?);
+    let claim = InstanceBootstrap::claim(&paths)?;
     let active = effective_configuration(None)?;
     let host = NativeHost::new(bindings(&roots, "cfg-status")?);
     let process = ApplicationRuntime::start(
-        ServeConfiguration::new(roots.paths()?, InitializationMode::InitializeIfEmpty)
+        ServeConfiguration::new(paths, InitializationMode::ExistingOnly)
             .with_effective_configuration(Arc::clone(&active)),
         HostInputs::new(&host, &host),
     )?;
@@ -44,6 +50,23 @@ fn operations_status_exposes_a_fenced_configuration_drift() -> Result<(), Box<dy
         &process.bound_endpoints(),
         positron_runtime::ListenerRole::Operations,
     )?;
+    assert_status(http(operations, "GET", "/health/live", &[], &[])?, 200);
+    assert_status(http(operations, "GET", "/health/ready", &[], &[])?, 200);
+    let unauthenticated = http(operations, "GET", "/status", &[], &[])?;
+    assert_status(unauthenticated, 401);
+    let unauthorized = format!(
+        "Bearer {}",
+        claim.ingest_secret().ok_or("ingest secret missing")?
+    );
+    let unauthorized_status = http(
+        operations,
+        "GET",
+        "/status",
+        &[("Authorization", &unauthorized)],
+        &[],
+    )?;
+    assert_status(unauthorized_status, 401);
+    let authorization = format!("Bearer {}", claim.secret());
     let reloaded = effective_configuration(Some(
         "schema_version = 1\n[diagnostics]\nlog_level = \"debug\"\n",
     ))?;
@@ -52,7 +75,13 @@ fn operations_status_exposes_a_fenced_configuration_drift() -> Result<(), Box<dy
         outcome,
         positron_runtime::ConfigurationReloadOutcome::PublishedLive { .. }
     ));
-    let reloaded_status = http(operations, "GET", "/status", &[], &[])?;
+    let reloaded_status = http(
+        operations,
+        "GET",
+        "/status",
+        &[("Authorization", &authorization)],
+        &[],
+    )?;
     assert_status(reloaded_status.clone(), 200);
     assert!(reloaded_status.contains("\"phase\":\"serving\""));
     assert!(reloaded_status.contains("\"drift_disposition\":\"none\""));
@@ -77,7 +106,13 @@ fn operations_status_exposes_a_fenced_configuration_drift() -> Result<(), Box<dy
         .ok_or("configuration runtime missing")?
         .observed()?
         .generation();
-    let status = http(operations, "GET", "/status", &[], &[])?;
+    let status = http(
+        operations,
+        "GET",
+        "/status",
+        &[("Authorization", &authorization)],
+        &[],
+    )?;
     assert_status(status.clone(), 200);
     assert!(status.contains("\"phase\":\"fenced\""));
     assert!(status.contains(&format!("\"observed_generation\":{observed_generation}")));

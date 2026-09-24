@@ -147,6 +147,16 @@ impl ApplicationRuntime {
             ));
         }
         let instance = Arc::new(instance);
+        state
+            .set_inspection_authority(Arc::clone(&instance))
+            .map_err(|_| {
+                cleanup_startup(
+                    ExitOutcome::StartupUnavailable(BootstrapFailureCode::CatalogUnavailable),
+                    &cancellation,
+                    &mut listeners,
+                    &mut tasks,
+                )
+            })?;
         let (runtime_configuration, configuration_publication) =
             match configuration.effective_configuration.as_ref() {
                 Some(effective) => {
@@ -183,22 +193,16 @@ impl ApplicationRuntime {
                 None => (None, None),
             };
         if let Some(runtime) = runtime_configuration.as_ref() {
-            let status = ConfigurationRuntimeStatus::initial(runtime).map_err(|_| {
-                cleanup_startup(
-                    ExitOutcome::StartupUnavailable(BootstrapFailureCode::CatalogUnavailable),
-                    &cancellation,
-                    &mut listeners,
-                    &mut tasks,
-                )
-            })?;
-            state.set_configuration_status(Some(status)).map_err(|_| {
-                cleanup_startup(
-                    ExitOutcome::StartupUnavailable(BootstrapFailureCode::CatalogUnavailable),
-                    &cancellation,
-                    &mut listeners,
-                    &mut tasks,
-                )
-            })?;
+            state
+                .set_configuration_runtime(Arc::clone(runtime))
+                .map_err(|_| {
+                    cleanup_startup(
+                        ExitOutcome::StartupUnavailable(BootstrapFailureCode::CatalogUnavailable),
+                        &cancellation,
+                        &mut listeners,
+                        &mut tasks,
+                    )
+                })?;
         }
         let export_destination_resolver = configuration.export_destination_resolver.or_else(|| {
             runtime_configuration.as_ref().map(|runtime| {

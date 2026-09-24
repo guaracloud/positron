@@ -19,8 +19,8 @@ use super::support::{
 struct TestExportDestinationResolver;
 
 impl positron_query::ExportDestinationResolver for TestExportDestinationResolver {
-    fn resolve(&self, _tenant: TenantId, name: &str) -> Option<[u8; 16]> {
-        (name == "configured").then_some([0x7a; 16])
+    fn resolve(&self, _tenant: TenantId, name: &str) -> Result<Option<[u8; 16]>, QueryFailureCode> {
+        Ok((name == "configured").then_some([0x7a; 16]))
     }
 }
 

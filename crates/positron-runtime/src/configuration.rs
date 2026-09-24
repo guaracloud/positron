@@ -12,6 +12,8 @@ use positron_config::{
 pub struct ConfigurationObservation {
     generation: u64,
     effective: Arc<EffectiveConfiguration>,
+    desired: Arc<EffectiveConfiguration>,
+    drift_disposition: ConfigurationDriftDisposition,
     pending_restart: Option<PendingRestart>,
 }
 
@@ -27,6 +29,16 @@ impl ConfigurationObservation {
     }
 
     #[must_use]
+    pub fn desired(&self) -> &Arc<EffectiveConfiguration> {
+        &self.desired
+    }
+
+    #[must_use]
+    pub const fn drift_disposition(&self) -> ConfigurationDriftDisposition {
+        self.drift_disposition
+    }
+
+    #[must_use]
     pub fn pending_restart(&self) -> Option<&PendingRestart> {
         self.pending_restart.as_ref()
     }
@@ -37,6 +49,7 @@ impl std::fmt::Debug for ConfigurationObservation {
         formatter
             .debug_struct("ConfigurationObservation")
             .field("generation", &self.generation)
+            .field("drift_disposition", &self.drift_disposition)
             .field("pending_restart", &self.pending_restart.is_some())
             .finish_non_exhaustive()
     }
@@ -150,7 +163,9 @@ impl RuntimeConfiguration {
         Self {
             state: RwLock::new(ConfigurationObservation {
                 generation,
-                effective: initial,
+                effective: Arc::clone(&initial),
+                desired: initial,
+                drift_disposition: ConfigurationDriftDisposition::None,
                 pending_restart: None,
             }),
         }
@@ -202,7 +217,9 @@ impl RuntimeConfiguration {
                 )?;
                 validate_successor_generation(state.generation, generation)?;
                 state.generation = generation;
-                state.effective = candidate;
+                state.effective = Arc::clone(&candidate);
+                state.desired = candidate;
+                state.drift_disposition = ConfigurationDriftDisposition::None;
                 state.pending_restart = None;
                 Ok(ConfigurationReloadOutcome::PublishedLive { generation, diff })
             },
@@ -219,6 +236,8 @@ impl RuntimeConfiguration {
                 if active.as_ref() != state.effective.as_ref() {
                     state.effective = active;
                 }
+                state.desired = Arc::clone(&candidate);
+                state.drift_disposition = ConfigurationDriftDisposition::Reconcile;
                 state.pending_restart = Some(PendingRestart {
                     candidate,
                     diff: diff.clone(),
@@ -257,7 +276,7 @@ impl RuntimeConfiguration {
         desired: Arc<EffectiveConfiguration>,
         publication: &dyn ConfigurationPublication,
     ) -> Result<ConfigurationDrift, ConfigurationRuntimeFailure> {
-        let state = self
+        let mut state = self
             .state
             .write()
             .map_err(|_| ConfigurationRuntimeFailure::Unavailable)?;
@@ -269,6 +288,8 @@ impl RuntimeConfiguration {
                 drift.diff(),
                 ConfigurationPublicationDisposition::FencedDrift,
             )?;
+            state.desired = desired;
+            state.drift_disposition = ConfigurationDriftDisposition::Fence;
         }
         Ok(drift)
     }

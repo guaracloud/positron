@@ -239,6 +239,28 @@ impl EffectiveConfiguration {
         result
     }
 
+    /// Returns the complete, non-reversible configuration intent bound to
+    /// private Catalog binding and an opaque Governance Audit request
+    /// identifier. Unlike the public redacted rendering, this includes
+    /// protected file references so two candidates with different protected
+    /// inputs cannot share audit intent.
+    #[must_use]
+    pub fn audit_binding_digest(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(b"positron.configuration.audit-binding.v1\0");
+        for definition in contract::SETTING_DEFINITIONS {
+            update_digest_string(&mut hasher, definition.path());
+            update_digest_string(
+                &mut hasher,
+                &self.canonical_identity_value(definition.setting()),
+            );
+        }
+        let digest = hasher.finalize();
+        let mut result = [0; 32];
+        result.copy_from_slice(&digest);
+        result
+    }
+
     /// Returns an operator-configured destination only when its scope includes
     /// the authenticated tenant. No configured entries means durable export is
     /// disabled.

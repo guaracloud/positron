@@ -19,7 +19,7 @@ const MAX_QUERY_SOURCE_BYTES: usize = 4_096;
 /// Query receives only the resolved identity after it has authenticated the
 /// requesting tenant.
 pub trait ExportDestinationResolver: Send + Sync {
-    fn resolve(&self, tenant: TenantId, name: &str) -> Option<[u8; 16]>;
+    fn resolve(&self, tenant: TenantId, name: &str) -> Result<Option<[u8; 16]>, QueryFailureCode>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

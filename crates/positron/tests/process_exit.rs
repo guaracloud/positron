@@ -199,6 +199,80 @@ fn sighup_reloads_a_valid_candidate_and_keeps_serving_after_a_rejected_candidate
 
 #[cfg(unix)]
 #[test]
+fn sighup_during_recovery_does_not_interrupt_native_startup()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _serial = PROCESS_TEST
+        .lock()
+        .map_err(|_| "process test lock poisoned")?;
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "positron-recovery-sighup-{}-{nonce}",
+        std::process::id()
+    ));
+    let data = root.join("data");
+    let secrets = root.join("secrets");
+    fs::create_dir_all(&data)?;
+    fs::create_dir_all(&secrets)?;
+    fs::set_permissions(&secrets, fs::Permissions::from_mode(0o700))?;
+    let [
+        operations_port,
+        api_port,
+        otlp_grpc_port,
+        otlp_http_port,
+        loki_push_port,
+    ] = available_ports()?;
+    let config_path = root.join("positron.toml");
+    fs::write(
+        &config_path,
+        process_configuration(
+            &root,
+            &data,
+            &secrets,
+            [
+                operations_port,
+                api_port,
+                otlp_grpc_port,
+                otlp_http_port,
+                loki_push_port,
+            ],
+        ),
+    )?;
+    let ownership = positron_kernel::PrimaryDataVolume::acquire(
+        &data,
+        positron_kernel::MountQualification::LocalHost,
+    )?;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_positron"))
+        .args(["serve", "--init-if-empty", "--config"])
+        .arg(&config_path)
+        .spawn()?;
+
+    wait_for_readiness(operations_port, "HTTP/1.1 503 ")?;
+    assert!(
+        Command::new("/bin/kill")
+            .args(["-HUP", &child.id().to_string()])
+            .status()?
+            .success()
+    );
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(child.try_wait()?.is_none());
+
+    drop(ownership);
+    wait_for_ready(operations_port)?;
+    assert!(
+        Command::new("/bin/kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status()?
+            .success()
+    );
+    assert_eq!(child.wait()?.code(), Some(0));
+    fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
 fn fenced_native_process_stays_alive_until_signal_and_retains_ownership()
 -> Result<(), Box<dyn std::error::Error>> {
     let _serial = PROCESS_TEST

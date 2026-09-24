@@ -176,6 +176,41 @@ fn immutable_configuration_digest_follows_the_canonical_mutability_contract()
 }
 
 #[test]
+fn audit_binding_distinguishes_protected_reference_changes_without_rendering_them()
+-> Result<(), ConfigurationFailure> {
+    let active = inputs(
+        Some(
+            "schema_version = 1\n\
+             [listener]\n\
+             api_transport = \"tls\"\n\
+             api_tls_certificate_file = \"/protected/certificate-a.pem\"\n\
+             api_tls_private_key_file = \"/protected/key.pem\"\n",
+        ),
+        [],
+        [],
+    )
+    .and_then(resolve)?;
+    let candidate = inputs(
+        Some(
+            "schema_version = 1\n\
+             [listener]\n\
+             api_transport = \"tls\"\n\
+             api_tls_certificate_file = \"/protected/certificate-b.pem\"\n\
+             api_tls_private_key_file = \"/protected/key.pem\"\n",
+        ),
+        [],
+        [],
+    )
+    .and_then(resolve)?;
+
+    assert_eq!(active.redacted_effective(), candidate.redacted_effective());
+    assert_ne!(active.audit_binding_digest(), candidate.audit_binding_digest());
+    assert!(!active.redacted_effective().contains("certificate-a.pem"));
+    assert!(!candidate.redacted_effective().contains("certificate-b.pem"));
+    Ok(())
+}
+
+#[test]
 fn plans_no_change_and_mixed_mutability_with_closed_priority() -> Result<(), ConfigurationFailure> {
     let current = inputs(None, [], []).and_then(resolve)?;
     assert_eq!(current.plan_update(&current)?, ConfigurationPlan::NoChange);

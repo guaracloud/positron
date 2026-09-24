@@ -192,12 +192,20 @@ impl NativeRecovery {
     }
 
     fn pending_trigger(signals: &mut Signals) -> Option<ShutdownTrigger> {
-        let count = signals.pending().take(2).count();
-        match count {
-            0 => None,
-            1 => Some(ShutdownTrigger::FirstSignal),
-            _ => Some(ShutdownTrigger::SecondSignal),
-        }
+        pending_termination_trigger(signals)
+    }
+}
+
+fn pending_termination_trigger(signals: &mut Signals) -> Option<ShutdownTrigger> {
+    let count = signals
+        .pending()
+        .filter(|signal| matches!(*signal, SIGINT | SIGTERM))
+        .take(2)
+        .count();
+    match count {
+        0 => None,
+        1 => Some(ShutdownTrigger::FirstSignal),
+        _ => Some(ShutdownTrigger::SecondSignal),
     }
 }
 
@@ -266,7 +274,7 @@ fn wait_for_shutdown(
     let mut draining = process.begin_shutdown();
     let deadline_at = Instant::now() + deadline;
     loop {
-        if signals.pending().next().is_some() {
+        if pending_termination_trigger(&mut signals).is_some() {
             return Ok(draining.finish(ShutdownTrigger::SecondSignal));
         }
         if Instant::now() >= deadline_at {
@@ -369,7 +377,7 @@ fn exit_code(outcome: ExitOutcome) -> ExitCode {
 mod tests {
     use super::{
         ExitOutcome, LaunchFailure, NativeRecovery, RecoveryAttemptHost, RecoveryDecision,
-        ShutdownTrigger, exit_code,
+        ShutdownTrigger, exit_code, pending_termination_trigger,
     };
     use positron_runtime::{BootstrapFailureCode, ListenerRole, RecoveryAttempt, TaskRole};
     use signal_hook::iterator::Signals;
@@ -430,15 +438,38 @@ mod tests {
     }
 
     #[test]
-    fn pending_native_signal_interrupts_recovery_backoff() -> Result<(), Box<dyn std::error::Error>>
-    {
-        let recovery = NativeRecovery::new(Signals::new([signal_hook::consts::signal::SIGUSR1])?);
-        signal_hook::low_level::raise(signal_hook::consts::signal::SIGUSR1)?;
+    fn pending_native_termination_signal_interrupts_recovery_backoff()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let recovery = NativeRecovery::new(Signals::new([signal_hook::consts::signal::SIGTERM])?);
+        signal_hook::low_level::raise(signal_hook::consts::signal::SIGTERM)?;
 
         assert_eq!(
             recovery.after_failure(RecoveryAttempt::for_test(1)),
             RecoveryDecision::Terminate(ShutdownTrigger::FirstSignal)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn native_recovery_keeps_sighup_out_of_termination_handling()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let recovery = NativeRecovery::new(Signals::new([signal_hook::consts::signal::SIGHUP])?);
+        signal_hook::low_level::raise(signal_hook::consts::signal::SIGHUP)?;
+
+        assert_eq!(
+            recovery.after_failure(RecoveryAttempt::for_test(1)),
+            RecoveryDecision::Retry
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn native_drain_keeps_sighup_out_of_forced_exit_handling()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut signals = Signals::new([signal_hook::consts::signal::SIGHUP])?;
+        signal_hook::low_level::raise(signal_hook::consts::signal::SIGHUP)?;
+
+        assert_eq!(pending_termination_trigger(&mut signals), None);
         Ok(())
     }
 }

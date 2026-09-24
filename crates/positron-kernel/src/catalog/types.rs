@@ -184,6 +184,27 @@ impl CatalogSecret {
         self.predecessor = Some(predecessor);
         Ok(self)
     }
+
+    /// Returns a domain-separated opaque digest without exposing Catalog key
+    /// material. Callers must supply a non-empty domain for their persisted
+    /// private binding.
+    pub fn opaque_digest(&self, domain: &[u8], payload: &[u8]) -> Result<[u8; 32], CatalogFailure> {
+        if domain.is_empty() || payload.is_empty() {
+            return Err(CatalogFailure::new(CatalogFailureCode::InvalidInput));
+        }
+        let capacity = domain
+            .len()
+            .checked_add(payload.len())
+            .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?;
+        let mut authenticated = Vec::new();
+        authenticated
+            .try_reserve_exact(capacity)
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?;
+        authenticated.extend_from_slice(domain);
+        authenticated.extend_from_slice(payload);
+        DataProtection::authenticate(&self.marker_key, &authenticated)
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::AuthenticationFailed))
+    }
 }
 
 impl std::fmt::Debug for CatalogSecret {

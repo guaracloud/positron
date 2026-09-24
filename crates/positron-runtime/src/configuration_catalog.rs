@@ -6,7 +6,7 @@ use positron_governance::{
     ConfigurationAuditContext, ConfigurationAuditOutcome, ConfigurationAuditRequest,
 };
 use positron_kernel::{
-    AuditIntent, Catalog, CatalogObject, CatalogProposal, FormatEpoch, TransactionId,
+    AuditIntent, Catalog, CatalogObject, CatalogProposal, CatalogSecret, FormatEpoch, TransactionId,
 };
 use sha2::{Digest, Sha256};
 
@@ -16,7 +16,9 @@ use crate::{
 };
 
 const CONFIGURATION_OBJECT_MAGIC: [u8; 8] = *b"POSCFGV1";
-const CONFIGURATION_OBJECT_HEADER_BYTES: usize = CONFIGURATION_OBJECT_MAGIC.len() + 16 + 8 + 32;
+const CONFIGURATION_OBJECT_HEADER_BYTES: usize =
+    CONFIGURATION_OBJECT_MAGIC.len() + 16 + 8 + 32 + 32;
+const CONFIGURATION_BINDING_DOMAIN: &[u8] = b"positron.configuration.binding.v1\0";
 
 #[derive(Debug)]
 pub(crate) enum ConfigurationEstablishFailure {
@@ -98,16 +100,20 @@ impl InitializedInstance {
             .key
             .catalog_secret(self.instance)
             .map_err(|_| ConfigurationEstablishFailure::Unavailable)?;
+        let expected_audit_binding = ConfigurationAuditBinding::from_configuration(&secret, active)
+            .map_err(|_| ConfigurationEstablishFailure::Unavailable)?;
         let catalog = Catalog::open(&self._authority, self.instance, secret)
             .map_err(|_| ConfigurationEstablishFailure::Unavailable)?;
         let basis = catalog
             .pin()
             .map_err(|_| ConfigurationEstablishFailure::Unavailable)?;
-        let expected_digest = configuration_digest(active);
+        let expected_digest = expected_audit_binding.redacted_digest;
         if let Some(existing) = configuration_catalog_state(&basis)
             .map_err(|_| ConfigurationEstablishFailure::Unavailable)?
         {
-            if existing.effective_digest == expected_digest {
+            if existing.effective_digest == expected_digest
+                && existing.audit_binding_digest == expected_audit_binding.private_digest
+            {
                 return Ok(existing.generation);
             }
             if existing.immutable_digest != active.immutable_configuration_digest() {
@@ -120,8 +126,11 @@ impl InitializedInstance {
                         ConfigurationAuditOutcome::RejectedImmutable,
                         catalog_generation,
                         1,
-                        existing.effective_digest,
-                        expected_digest,
+                        ConfigurationAuditBinding::stored(
+                            existing.effective_digest,
+                            existing.audit_binding_digest,
+                        ),
+                        expected_audit_binding,
                     )
                     .map_err(|_| ConfigurationEstablishFailure::Unavailable)?;
                 let transaction = TransactionId::new(request.transaction_id())
@@ -145,20 +154,27 @@ impl InitializedInstance {
             .number()
             .checked_add(1)
             .ok_or(ConfigurationEstablishFailure::Unavailable)?;
-        let digest = expected_digest;
         let request = self
             .configuration_audit_request(
                 ConfigurationAuditOutcome::PublishedLive,
                 catalog_generation,
                 1,
-                digest,
-                digest,
+                expected_audit_binding,
+                expected_audit_binding,
             )
             .map_err(|_| ConfigurationEstablishFailure::Unavailable)?;
         let transaction = TransactionId::new(request.transaction_id())
             .map_err(|_| ConfigurationEstablishFailure::Unavailable)?;
-        let objects = successor_objects(&basis, transaction, Some((catalog_generation, active)))
-            .map_err(|_| ConfigurationEstablishFailure::Unavailable)?;
+        let objects = successor_objects(
+            &basis,
+            transaction,
+            Some((
+                catalog_generation,
+                active,
+                expected_audit_binding.private_digest,
+            )),
+        )
+        .map_err(|_| ConfigurationEstablishFailure::Unavailable)?;
         let proposal = CatalogProposal::new(transaction, FormatEpoch::CATALOG_V1, objects)
             .map_err(|_| ConfigurationEstablishFailure::Unavailable)?;
         let audit = AuditIntent::new(request.encode())
@@ -182,6 +198,11 @@ impl InitializedInstance {
             .key
             .catalog_secret(self.instance)
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
+        let active_binding = ConfigurationAuditBinding::from_configuration(&secret, active)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        let candidate_binding =
+            ConfigurationAuditBinding::from_configuration(&secret, candidate)
+                .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
         let catalog = Catalog::open(&self._authority, self.instance, secret)
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
         let basis = catalog
@@ -197,8 +218,8 @@ impl InitializedInstance {
                 catalog_generation,
                 u8::try_from(diff.changes().len())
                     .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?,
-                configuration_digest(active),
-                configuration_digest(candidate),
+                active_binding,
+                candidate_binding,
             )
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
         let transaction = TransactionId::new(request.transaction_id())
@@ -208,14 +229,17 @@ impl InitializedInstance {
             ConfigurationPublicationDisposition::PublishedLive
                 | ConfigurationPublicationDisposition::PendingRestart
         );
-        let persisted_active = if disposition == ConfigurationPublicationDisposition::PublishedLive
-        {
-            candidate
-        } else {
-            active
-        };
-        let replacement =
-            replaces_active_configuration.then_some((catalog_generation, persisted_active));
+        let (persisted_active, persisted_binding) =
+            if disposition == ConfigurationPublicationDisposition::PublishedLive {
+                (candidate, candidate_binding.private_digest)
+            } else {
+                (active, active_binding.private_digest)
+            };
+        let replacement = replaces_active_configuration.then_some((
+            catalog_generation,
+            persisted_active,
+            persisted_binding,
+        ));
         let objects = successor_objects(&basis, transaction, replacement)?;
         let proposal = CatalogProposal::new(transaction, FormatEpoch::CATALOG_V1, objects)
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
@@ -237,6 +261,8 @@ impl InitializedInstance {
             .key
             .catalog_secret(self.instance)
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
+        let binding = ConfigurationAuditBinding::from_configuration(&secret, active)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
         let catalog = Catalog::open(&self._authority, self.instance, secret)
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
         let basis = catalog
@@ -246,9 +272,8 @@ impl InitializedInstance {
             .number()
             .checked_add(1)
             .ok_or_else(|| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
-        let digest = configuration_digest(active);
         let request =
-            self.configuration_audit_request(outcome, catalog_generation, 1, digest, digest)?;
+            self.configuration_audit_request(outcome, catalog_generation, 1, binding, binding)?;
         let transaction = TransactionId::new(request.transaction_id())
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
         let objects = successor_objects(&basis, transaction, None)?;
@@ -267,8 +292,8 @@ impl InitializedInstance {
         outcome: ConfigurationAuditOutcome,
         catalog_generation: u64,
         changed_setting_count: u8,
-        active_digest: [u8; 32],
-        candidate_digest: [u8; 32],
+        active: ConfigurationAuditBinding,
+        candidate: ConfigurationAuditBinding,
     ) -> Result<ConfigurationAuditRequest, BootstrapFailure> {
         let audit_scope =
             positron_kernel::SegmentScope::new(self.tenant, SignalKind::Logs, self.logs_shard);
@@ -279,8 +304,8 @@ impl InitializedInstance {
         let request_id = configuration_request_id(
             self.instance.to_bytes(),
             outcome,
-            active_digest,
-            candidate_digest,
+            active.private_digest,
+            candidate.private_digest,
         );
         let context = ConfigurationAuditContext::new(
             outcome,
@@ -295,8 +320,8 @@ impl InitializedInstance {
             context,
             catalog_generation,
             changed_setting_count,
-            active_digest,
-            candidate_digest,
+            active.redacted_digest,
+            candidate.redacted_digest,
         )
         .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))
     }
@@ -305,7 +330,7 @@ impl InitializedInstance {
 fn successor_objects(
     basis: &positron_kernel::CatalogSnapshot,
     transaction: TransactionId,
-    replacement: Option<(u64, &EffectiveConfiguration)>,
+    replacement: Option<(u64, &EffectiveConfiguration, [u8; 32])>,
 ) -> Result<Vec<CatalogObject>, BootstrapFailure> {
     let replace_configuration = replacement.is_some();
     let capacity = basis
@@ -340,10 +365,15 @@ fn successor_objects(
             BootstrapFailureCode::CatalogUnavailable,
         ));
     }
-    if let Some((generation, active)) = replacement {
+    if let Some((generation, active, audit_binding_digest)) = replacement {
         objects.push(
-            CatalogObject::new(configuration_object(transaction, generation, active))
-                .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?,
+            CatalogObject::new(configuration_object(
+                transaction,
+                generation,
+                active,
+                audit_binding_digest,
+            ))
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?,
         );
     }
     Ok(objects)
@@ -353,6 +383,42 @@ struct ConfigurationCatalogState {
     generation: u64,
     immutable_digest: [u8; 32],
     effective_digest: [u8; 32],
+    audit_binding_digest: [u8; 32],
+}
+
+/// Couples the redacted audit summary with the complete configuration intent.
+///
+/// Governance Audit persists the redacted digest defined by its public
+/// contract. The Catalog-held opaque digest binds the complete intent and
+/// only influences the opaque audit request ID.
+/// That gives the Catalog proposal and its audit intent one exact binding
+/// without placing protected references in an audit record.
+#[derive(Clone, Copy)]
+struct ConfigurationAuditBinding {
+    redacted_digest: [u8; 32],
+    private_digest: [u8; 32],
+}
+
+impl ConfigurationAuditBinding {
+    fn from_configuration(
+        secret: &CatalogSecret,
+        configuration: &EffectiveConfiguration,
+    ) -> Result<Self, positron_kernel::CatalogFailure> {
+        Ok(Self {
+            redacted_digest: configuration_digest(configuration),
+            private_digest: secret.opaque_digest(
+                CONFIGURATION_BINDING_DOMAIN,
+                &configuration.audit_binding_digest(),
+            )?,
+        })
+    }
+
+    const fn stored(redacted_digest: [u8; 32], private_digest: [u8; 32]) -> Self {
+        Self {
+            redacted_digest,
+            private_digest,
+        }
+    }
 }
 
 fn configuration_catalog_state(
@@ -390,8 +456,13 @@ fn configuration_catalog_state(
     if generation == 0 {
         return Err(BootstrapFailure::new(BootstrapFailureCode::CorruptState));
     }
+    let immutable_digest_end = generation_end.saturating_add(32);
     let immutable_digest = bytes
-        .get(generation_end..CONFIGURATION_OBJECT_HEADER_BYTES)
+        .get(generation_end..immutable_digest_end)
+        .and_then(|value| value.try_into().ok())
+        .ok_or_else(|| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
+    let audit_binding_digest = bytes
+        .get(immutable_digest_end..CONFIGURATION_OBJECT_HEADER_BYTES)
         .and_then(|value| value.try_into().ok())
         .ok_or_else(|| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
     let rendered = bytes
@@ -407,6 +478,7 @@ fn configuration_catalog_state(
         generation,
         immutable_digest,
         effective_digest,
+        audit_binding_digest,
     }))
 }
 
@@ -414,6 +486,7 @@ fn configuration_object(
     transaction: TransactionId,
     generation: u64,
     active: &EffectiveConfiguration,
+    audit_binding_digest: [u8; 32],
 ) -> Vec<u8> {
     let rendered = active.redacted_effective();
     let mut object = Vec::with_capacity(
@@ -422,12 +495,14 @@ fn configuration_object(
             .saturating_add(16)
             .saturating_add(8)
             .saturating_add(32)
+            .saturating_add(32)
             .saturating_add(rendered.len()),
     );
     object.extend_from_slice(&CONFIGURATION_OBJECT_MAGIC);
     object.extend_from_slice(&transaction.to_bytes());
     object.extend_from_slice(&generation.to_be_bytes());
     object.extend_from_slice(&active.immutable_configuration_digest());
+    object.extend_from_slice(&audit_binding_digest);
     object.extend_from_slice(rendered.as_bytes());
     object
 }
@@ -454,15 +529,15 @@ pub(crate) fn configuration_digest(configuration: &EffectiveConfiguration) -> [u
 fn configuration_request_id(
     instance: [u8; 16],
     outcome: ConfigurationAuditOutcome,
-    active_digest: [u8; 32],
-    candidate_digest: [u8; 32],
+    active_binding_digest: [u8; 32],
+    candidate_binding_digest: [u8; 32],
 ) -> [u8; 16] {
     let mut hasher = Sha256::new();
     hasher.update(b"positron.configuration.request.v1\0");
     hasher.update(instance);
     hasher.update([configuration_outcome_code(outcome)]);
-    hasher.update(active_digest);
-    hasher.update(candidate_digest);
+    hasher.update(active_binding_digest);
+    hasher.update(candidate_binding_digest);
     let digest = hasher.finalize();
     let mut request_id = [0; 16];
     request_id.copy_from_slice(&digest[..16]);

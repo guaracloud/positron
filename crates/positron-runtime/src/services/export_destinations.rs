@@ -19,15 +19,19 @@ impl ConfiguredExportDestinationResolver {
 }
 
 impl ExportDestinationResolver for ConfiguredExportDestinationResolver {
-    fn resolve(&self, tenant: TenantId, name: &str) -> Option<[u8; 16]> {
+    fn resolve(
+        &self,
+        tenant: TenantId,
+        name: &str,
+    ) -> Result<Option<[u8; 16]>, positron_query::QueryFailureCode> {
         let configuration = self
             .configuration
             .observed()
             .map(|observation| Arc::clone(observation.effective()))
-            .ok()?;
-        configuration
+            .map_err(|_| positron_query::QueryFailureCode::StoreUnavailable)?;
+        Ok(configuration
             .export_destination(tenant, name)
-            .map(|destination| destination.identity())
+            .map(|destination| destination.identity()))
     }
 }
 
@@ -55,10 +59,10 @@ mod tests {
 
         assert_eq!(
             resolver.resolve(allowed, "regulated-archive"),
-            Some([0xa1; 16])
+            Ok(Some([0xa1; 16]))
         );
-        assert_eq!(resolver.resolve(denied, "regulated-archive"), None);
-        assert_eq!(resolver.resolve(allowed, "unknown"), None);
+        assert_eq!(resolver.resolve(denied, "regulated-archive"), Ok(None));
+        assert_eq!(resolver.resolve(allowed, "unknown"), Ok(None));
         Ok(())
     }
 }

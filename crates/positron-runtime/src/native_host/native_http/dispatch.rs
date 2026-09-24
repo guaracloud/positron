@@ -486,13 +486,23 @@ pub(super) fn route(
             "ready",
             health.security_warning(),
         )),
-        (ListenerRole::Operations, "GET", "/status") => health
-            .configuration_status()
-            .map_err(|_| Response::empty(503))?
-            .map_or_else(
-                || Ok(Response::empty(503)),
-                |status| Ok(configuration_status_response(health.phase(), &status)),
-            ),
+        (ListenerRole::Operations, "GET", "/status") => {
+            let bearer = Zeroizing::new(head.bearer.take().ok_or_else(|| {
+                Response::json(401, "{\"code\":\"authentication_rejected\"}".to_owned())
+            })?);
+            health
+                .authorize_configuration_status(&bearer)
+                .map_err(|_| {
+                    Response::json(401, "{\"code\":\"authentication_rejected\"}".to_owned())
+                })?;
+            health
+                .configuration_status()
+                .map_err(|_| Response::empty(503))?
+                .map_or_else(
+                    || Ok(Response::empty(503)),
+                    |status| Ok(configuration_status_response(health.phase(), &status)),
+                )
+        },
         (ListenerRole::Api, "POST", "/v1/capabilities:negotiate") => {
             let services = services.ok_or_else(|| Response::empty(503))?;
             let body = read_body(stream, head.content_length, MAX_API_BODY_BYTES)?;
