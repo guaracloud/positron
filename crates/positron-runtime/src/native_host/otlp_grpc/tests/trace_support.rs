@@ -302,6 +302,7 @@ impl ReceiverHarness {
             control_path: None,
             transport: Some(TransportProfile::plaintext_opt_out()),
             trusted_proxy: None,
+            connection_admission: None,
         });
         let cancellation = TaskCancellation::new();
         let serve_cancellation = cancellation.clone();

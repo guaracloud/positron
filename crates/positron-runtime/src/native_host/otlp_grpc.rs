@@ -1,4 +1,7 @@
+use std::io;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsService;
@@ -11,16 +14,18 @@ use opentelemetry_proto::tonic::collector::trace::v1::{
 };
 use positron_governance::{AuthorizedContext, CompatibilityHints};
 use positron_ingest::{IngestRequestOutcome, OtlpGrpcTransportEvidence};
-use tokio_stream::wrappers::TcpListenerStream;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio_stream::Stream;
 use tonic::codec::CompressionEncoding;
 use tonic::service::LayerExt;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Server;
+use tonic::transport::server::{Connected, TcpConnectInfo};
 use tonic::{Request, Response, Status};
 use tower::util::MapResponseLayer;
 
 use super::otlp_outcome::{OtlpFailure, OtlpSignal};
-use super::{Admission, TrustedProxy};
+use super::{Admission, ConnectionLease, TrustedProxy};
 use crate::{ServiceFailure, ServiceHandle, TaskCancellation};
 
 const MAX_MESSAGE_BYTES: usize = 1_048_576;
@@ -95,7 +100,10 @@ impl PreparedGrpc {
         let listener = self.listener;
         let mut server = self.server;
         let (result, forced) = self.runtime.block_on(async move {
-            let incoming = TcpListenerStream::new(listener);
+            let incoming = AdmittedIncoming {
+                listener,
+                admission: Arc::clone(&admission),
+            };
             let authentication = services.clone();
             let trace_authentication = services.clone();
             let trusted_proxy = admission.trusted_proxy.clone();
@@ -141,6 +149,74 @@ impl PreparedGrpc {
             self.blocking.shutdown()?;
         }
         result
+    }
+}
+
+struct AdmittedIncoming {
+    listener: tokio::net::TcpListener,
+    admission: Arc<Admission>,
+}
+
+struct AdmittedTcpStream {
+    stream: Pin<Box<tokio::net::TcpStream>>,
+    _lease: ConnectionLease,
+}
+
+impl Stream for AdmittedIncoming {
+    type Item = Result<AdmittedTcpStream, io::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        match this.listener.poll_accept(context) {
+            Poll::Ready(Ok((stream, peer))) => match this.admission.accept_connection(peer.ip()) {
+                Some(lease) => Poll::Ready(Some(Ok(AdmittedTcpStream {
+                    stream: Box::pin(stream),
+                    _lease: lease,
+                }))),
+                None => {
+                    context.waker().wake_by_ref();
+                    Poll::Pending
+                },
+            },
+            Poll::Ready(Err(error)) => Poll::Ready(Some(Err(error))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl AsyncRead for AdmittedTcpStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        self.stream.as_mut().poll_read(context, buffer)
+    }
+}
+
+impl AsyncWrite for AdmittedTcpStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.stream.as_mut().poll_write(context, buffer)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.stream.as_mut().poll_flush(context)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.stream.as_mut().poll_shutdown(context)
+    }
+}
+
+impl Connected for AdmittedTcpStream {
+    type ConnectInfo = TcpConnectInfo;
+
+    fn connect_info(&self) -> Self::ConnectInfo {
+        self.stream.as_ref().get_ref().connect_info()
     }
 }
 

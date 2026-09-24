@@ -2,6 +2,7 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::net::{IpAddr, SocketAddr, TcpListener};
 use std::num::NonZeroU8;
+use std::num::NonZeroU16;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -25,6 +26,7 @@ use crate::{
     TaskRegistrar, TaskRole, ValidatedListenerSet,
 };
 
+mod connection_admission;
 mod generation;
 mod loki_http;
 mod native_http;
@@ -84,6 +86,11 @@ pub struct NativeBindings {
     otlp_http_transport: TransportProfile,
     loki_push: SocketAddr,
     loki_push_transport: TransportProfile,
+    operations_admission: (NonZeroU16, NonZeroU16),
+    api_admission: (NonZeroU16, NonZeroU16),
+    otlp_grpc_admission: (NonZeroU16, NonZeroU16),
+    otlp_http_admission: (NonZeroU16, NonZeroU16),
+    loki_push_admission: (NonZeroU16, NonZeroU16),
     operations_trusted_proxy: Option<TrustedProxy>,
     api_trusted_proxy: Option<TrustedProxy>,
     otlp_grpc_trusted_proxy: Option<TrustedProxy>,
@@ -119,6 +126,11 @@ impl NativeBindings {
         bindings.otlp_grpc_trusted_proxy = otlp_grpc.2;
         bindings.otlp_http_trusted_proxy = otlp_http.2;
         bindings.loki_push_trusted_proxy = loki_push.2;
+        bindings.operations_admission = operations.3;
+        bindings.api_admission = api.3;
+        bindings.otlp_grpc_admission = otlp_grpc.3;
+        bindings.otlp_http_admission = otlp_http.3;
+        bindings.loki_push_admission = loki_push.3;
         Ok(bindings)
     }
 
@@ -239,6 +251,11 @@ impl NativeBindings {
             otlp_http_transport,
             loki_push,
             loki_push_transport,
+            operations_admission: default_admission_limits(),
+            api_admission: default_admission_limits(),
+            otlp_grpc_admission: default_admission_limits(),
+            otlp_http_admission: default_admission_limits(),
+            loki_push_admission: default_admission_limits(),
             operations_trusted_proxy: None,
             api_trusted_proxy: None,
             otlp_grpc_trusted_proxy: None,
@@ -297,12 +314,37 @@ impl NativeBindings {
             ListenerRole::Control => None,
         }
     }
+
+    fn admission(&self, role: ListenerRole) -> Option<(NonZeroU16, NonZeroU16)> {
+        match role {
+            ListenerRole::Operations => Some(self.operations_admission),
+            ListenerRole::Api => Some(self.api_admission),
+            ListenerRole::OtlpGrpc => Some(self.otlp_grpc_admission),
+            ListenerRole::OtlpHttp => Some(self.otlp_http_admission),
+            ListenerRole::LokiPush => Some(self.loki_push_admission),
+            ListenerRole::Control => None,
+        }
+    }
 }
+
+const fn default_admission_limits() -> (NonZeroU16, NonZeroU16) {
+    (
+        NonZeroU16::new(128).expect("nonzero accepted socket default"),
+        NonZeroU16::new(16).expect("nonzero peer socket default"),
+    )
+}
+
+type EffectiveNativeProfile = (
+    SocketAddr,
+    TransportProfile,
+    Option<TrustedProxy>,
+    (NonZeroU16, NonZeroU16),
+);
 
 fn effective_profile(
     effective: &EffectiveConfiguration,
     role: NetworkListenerRole,
-) -> Result<(SocketAddr, TransportProfile, Option<TrustedProxy>), NativeHostFailure> {
+) -> Result<EffectiveNativeProfile, NativeHostFailure> {
     let profile = effective
         .network_listener_profile(role)
         .ok_or(NativeHostFailure::InvalidBinding)?;
@@ -326,6 +368,14 @@ fn effective_profile(
         profile.bind_address(),
         transport,
         trusted_proxy_from_profile(&profile)?,
+        (
+            profile
+                .connection_admission()
+                .global_accepted_socket_limit(),
+            profile
+                .connection_admission()
+                .per_address_accepted_socket_limit(),
+        ),
     ))
 }
 
@@ -415,10 +465,12 @@ impl NativeHost {
                         NativeListener::Unix(_) => None,
                     })?
                 })?;
-        ListenerProfile::network(
+        ListenerProfile::network_with_admission(
             role,
             active_address,
             configured.bindings.transport(role)?.listener_transport(),
+            configured.bindings.admission(role)?.0,
+            configured.bindings.admission(role)?.1,
         )
         .ok()
     }
@@ -463,6 +515,7 @@ struct Admission {
     control_path: Option<Arc<ControlPathLease>>,
     transport: Option<TransportProfile>,
     trusted_proxy: Option<TrustedProxy>,
+    connection_admission: Option<Arc<connection_admission::ConnectionAdmission>>,
 }
 
 type AdmissionRegistry = Arc<Mutex<Vec<(ListenerRole, Arc<Admission>)>>>;
@@ -495,11 +548,16 @@ impl Admission {
         self.accepting.load(Ordering::Acquire)
     }
 
-    fn accept_connection(self: &Arc<Self>) -> ConnectionLease {
+    pub(super) fn accept_connection(self: &Arc<Self>, peer: IpAddr) -> Option<ConnectionLease> {
+        let reservation = match &self.connection_admission {
+            Some(admission) => Some(admission.reserve(peer)?),
+            None => None,
+        };
         self.accepted_connections.fetch_add(1, Ordering::AcqRel);
-        ConnectionLease {
+        Some(ConnectionLease {
             admission: Arc::clone(self),
-        }
+            _reservation: reservation,
+        })
     }
 
     fn drain_within(&self, deadline: Instant) -> bool {
@@ -533,8 +591,9 @@ impl Admission {
     }
 }
 
-struct ConnectionLease {
+pub(super) struct ConnectionLease {
     admission: Arc<Admission>,
+    _reservation: Option<connection_admission::ConnectionReservation>,
 }
 
 impl Drop for ConnectionLease {
@@ -599,13 +658,21 @@ impl ListenerFactory for NativeHost {
                     role: requested_role,
                     address,
                     transport,
+                    global_accepted_socket_limit,
+                    per_address_accepted_socket_limit,
                 },
                 ListenerProfile::Network {
                     role: expected_role,
                     transport: expected_transport,
+                    global_accepted_socket_limit: expected_global_limit,
+                    per_address_accepted_socket_limit: expected_per_address_limit,
                     ..
                 },
-            ) if requested_role == expected_role && transport == expected_transport => {
+            ) if requested_role == expected_role
+                && transport == expected_transport
+                && global_accepted_socket_limit == expected_global_limit
+                && per_address_accepted_socket_limit == expected_per_address_limit =>
+            {
                 Some(*address)
             },
             _ => return Err(ListenerFailure::InvalidTransport),
@@ -707,6 +774,12 @@ impl ListenerFactory for NativeHost {
             control_path,
             transport: self.bindings.transport(role),
             trusted_proxy: self.bindings.trusted_proxy(role),
+            connection_admission: self.bindings.admission(role).map(|(global, per_address)| {
+                Arc::new(connection_admission::ConnectionAdmission::new(
+                    global,
+                    per_address,
+                ))
+            }),
         });
         self.admissions
             .lock()
@@ -731,7 +804,8 @@ impl ListenerFactory for NativeHost {
         }
         let address = self.bindings.address(role)?;
         let transport = self.bindings.transport(role)?.listener_transport();
-        ListenerProfile::network(role, address, transport).ok()
+        let (global, per_address) = self.bindings.admission(role)?;
+        ListenerProfile::network_with_admission(role, address, transport, global, per_address).ok()
     }
 
     fn generation_factory(&self) -> Option<Arc<dyn ListenerGenerationFactory>> {
@@ -1258,6 +1332,7 @@ mod listener_generation_tests {
             control_path: None,
             transport: Some(TransportProfile::plaintext_opt_out()),
             trusted_proxy: None,
+            connection_admission: None,
         });
         let gate = Arc::new(ActivationGate::new());
         let cancellation = crate::TaskCancellation::new();
@@ -1290,6 +1365,7 @@ mod listener_generation_tests {
             control_path: None,
             transport: Some(TransportProfile::plaintext_opt_out()),
             trusted_proxy: None,
+            connection_admission: None,
         };
         let cancellation = crate::TaskCancellation::new();
         admission.stop();
@@ -1417,7 +1493,9 @@ fn serve_http(
                 if !can_serve_accepted_connection(&admission, &cancellation) {
                     continue;
                 }
-                let _lease = admission.accept_connection();
+                let Some(_lease) = admission.accept_connection(peer.ip()) else {
+                    continue;
+                };
                 if stream.set_nonblocking(false).is_err()
                     || stream
                         .set_read_timeout(Some(Duration::from_secs(2)))

@@ -1,6 +1,7 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::net::SocketAddr;
+use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -85,6 +86,8 @@ pub enum ListenerProfile {
         role: ListenerRole,
         address: SocketAddr,
         transport: ListenerTransport,
+        global_accepted_socket_limit: NonZeroU16,
+        per_address_accepted_socket_limit: NonZeroU16,
     },
 }
 
@@ -99,6 +102,22 @@ impl ListenerProfile {
         address: SocketAddr,
         transport: ListenerTransport,
     ) -> Result<Self, ListenerFailure> {
+        Self::network_with_admission(
+            role,
+            address,
+            transport,
+            NonZeroU16::new(128).ok_or(ListenerFailure::InvalidEndpoint)?,
+            NonZeroU16::new(16).ok_or(ListenerFailure::InvalidEndpoint)?,
+        )
+    }
+
+    pub fn network_with_admission(
+        role: ListenerRole,
+        address: SocketAddr,
+        transport: ListenerTransport,
+        global_accepted_socket_limit: NonZeroU16,
+        per_address_accepted_socket_limit: NonZeroU16,
+    ) -> Result<Self, ListenerFailure> {
         if !role.is_network() {
             return Err(ListenerFailure::InvalidEndpoint);
         }
@@ -109,6 +128,8 @@ impl ListenerProfile {
             role,
             address,
             transport,
+            global_accepted_socket_limit,
+            per_address_accepted_socket_limit,
         })
     }
 
@@ -125,6 +146,21 @@ impl ListenerProfile {
         match self {
             Self::Control { .. } => None,
             Self::Network { transport, .. } => Some(*transport),
+        }
+    }
+
+    #[must_use]
+    pub const fn connection_admission(&self) -> Option<(NonZeroU16, NonZeroU16)> {
+        match self {
+            Self::Control { .. } => None,
+            Self::Network {
+                global_accepted_socket_limit,
+                per_address_accepted_socket_limit,
+                ..
+            } => Some((
+                *global_accepted_socket_limit,
+                *per_address_accepted_socket_limit,
+            )),
         }
     }
 
