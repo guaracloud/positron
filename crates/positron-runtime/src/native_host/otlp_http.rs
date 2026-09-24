@@ -1,3 +1,5 @@
+use std::io::{Read, Write};
+#[cfg(test)]
 use std::net::TcpStream;
 
 use positron_ingest::{OtlpRequestEncoding, OtlpTracesRequestEncoding};
@@ -42,8 +44,8 @@ pub(super) fn receive(
     )
 }
 
-pub(super) fn receive_from(
-    stream: &mut TcpStream,
+pub(super) fn receive_from<S: Read + Write>(
+    stream: &mut S,
     head: RequestHead,
     peer: std::net::SocketAddr,
     trusted_proxy: Option<TrustedProxy>,
@@ -134,8 +136,8 @@ pub(super) fn receive_traces(
     )
 }
 
-pub(super) fn receive_traces_from(
-    stream: &mut TcpStream,
+pub(super) fn receive_traces_from<S: Read + Write>(
+    stream: &mut S,
     head: RequestHead,
     peer: std::net::SocketAddr,
     trusted_proxy: Option<TrustedProxy>,

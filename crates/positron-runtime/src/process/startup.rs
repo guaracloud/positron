@@ -6,7 +6,19 @@ impl ApplicationRuntime {
         host: HostInputs<'_>,
     ) -> Result<RunningProcess, ExitOutcome> {
         let state = ProcessState::starting();
-        state.set_public_plaintext_api_warning(configuration.public_plaintext_api_intent.is_some());
+        let drain_deadline = configuration.drain_deadline();
+        let listener_generation_factory = host.listeners.generation_factory();
+        let plaintext_listener_intents =
+            configuration.effective_configuration.as_ref().map_or_else(
+                || configuration.plaintext_listener_intents().to_vec(),
+                |effective| super::plaintext_listener_intents_for(effective),
+            );
+        state.set_plaintext_listener_warnings(&plaintext_listener_intents);
+        // A native host has already resolved every profile before it reaches
+        // this boundary. Validate that it is a complete generation now, but
+        // do not open data sockets until bootstrap has established ownership,
+        // integrity, identity, and the catalog below.
+        let _candidate = complete_candidate(host.listeners);
         let mut listeners = Vec::with_capacity(6);
         bind(
             ListenerRole::Control,
@@ -81,8 +93,11 @@ impl ApplicationRuntime {
                     state.transition(ProcessPhase::Fenced);
                     return Ok(RunningProcess {
                         state,
-                        listeners,
-                        tasks,
+                        listeners: std::sync::Mutex::new(listeners),
+                        listener_generation_factory,
+                        reload_lock: std::sync::Mutex::new(()),
+                        tasks: std::sync::Mutex::new(tasks),
+                        listener_task_cancellations: std::sync::Mutex::new(Vec::new()),
                         cancellation,
                         instance: None,
                         fenced_volume: Some(fenced_volume),
@@ -90,6 +105,7 @@ impl ApplicationRuntime {
                         configuration: None,
                         configuration_publication: None,
                         cleanup: CleanupAccumulator::empty(),
+                        drain_deadline,
                         terminal_cleanup_complete: false,
                     });
                 }
@@ -133,18 +149,18 @@ impl ApplicationRuntime {
                 },
             }
         };
-        if let Some(planner) = configuration.admission_group_planner {
-            instance.admission_group_planner = planner;
+        if let Some(planner) = configuration.admission_group_planner.as_ref() {
+            instance.admission_group_planner = Arc::clone(planner);
         }
-        if let Some(intent) = configuration.public_plaintext_api_intent
-            && let Err(failure) = instance.activate_public_plaintext_api_transport(intent)
-        {
-            return Err(cleanup_startup(
-                ExitOutcome::StartupUnavailable(failure.code()),
-                &cancellation,
-                &mut listeners,
-                &mut tasks,
-            ));
+        for intent in &plaintext_listener_intents {
+            if let Err(failure) = instance.activate_public_plaintext_api_transport(*intent) {
+                return Err(cleanup_startup(
+                    ExitOutcome::StartupUnavailable(failure.code()),
+                    &cancellation,
+                    &mut listeners,
+                    &mut tasks,
+                ));
+            }
         }
         let instance = Arc::new(instance);
         state
@@ -261,8 +277,11 @@ impl ApplicationRuntime {
         state.transition(ProcessPhase::Serving);
         Ok(RunningProcess {
             state,
-            listeners,
-            tasks,
+            listeners: std::sync::Mutex::new(listeners),
+            listener_generation_factory,
+            reload_lock: std::sync::Mutex::new(()),
+            tasks: std::sync::Mutex::new(tasks),
+            listener_task_cancellations: std::sync::Mutex::new(Vec::new()),
             cancellation,
             instance: Some(instance),
             fenced_volume: None,
@@ -270,9 +289,24 @@ impl ApplicationRuntime {
             configuration: runtime_configuration,
             configuration_publication,
             cleanup: CleanupAccumulator::empty(),
+            drain_deadline,
             terminal_cleanup_complete: false,
         })
     }
+}
+
+fn complete_candidate(factory: &dyn ListenerFactory) -> Option<crate::ValidatedListenerSet> {
+    let [control, operations, api, otlp_grpc, otlp_http, loki_push] =
+        ListenerRole::all().map(|role| factory.profile_for(role));
+    crate::ValidatedListenerSet::new([
+        control?,
+        operations?,
+        api?,
+        otlp_grpc?,
+        otlp_http?,
+        loki_push?,
+    ])
+    .ok()
 }
 
 type RegisteredTasks = Vec<(TaskRole, Box<dyn RegisteredTask>)>;
@@ -381,8 +415,12 @@ fn bind(
     factory: &dyn ListenerFactory,
     listeners: &mut Vec<Box<dyn BoundListener>>,
 ) -> Result<(), ExitOutcome> {
+    let request = factory
+        .profile_for(role)
+        .map(|profile| ListenerRequest::for_profile(profile, state.health()))
+        .unwrap_or_else(|| ListenerRequest::new(role, state.health()));
     let listener = factory
-        .bind(ListenerRequest::new(role, state.health()))
+        .bind(request)
         .map_err(|_| ExitOutcome::ListenerUnavailable(role))?;
     if listener.endpoint().role() != role {
         return Err(ExitOutcome::ListenerUnavailable(role));

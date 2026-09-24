@@ -1,4 +1,4 @@
-use std::net::TcpStream;
+use std::io::{Read, Write};
 
 use positron_ingest::{IngestFailureCode, IngestOutcome, LokiPushRequestEncoding};
 
@@ -10,8 +10,8 @@ use crate::{ServiceFailure, ServiceHandle};
 #[path = "loki_http/tests/mod.rs"]
 mod tests;
 
-pub(super) fn receive_push(
-    stream: &mut TcpStream,
+pub(super) fn receive_push<S: Read + Write>(
+    stream: &mut S,
     head: RequestHead,
     peer: std::net::SocketAddr,
     trusted_proxy: Option<TrustedProxy>,

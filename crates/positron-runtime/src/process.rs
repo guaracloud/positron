@@ -1,16 +1,19 @@
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
-use positron_config::{ConfigurationDrift, ConfigurationDriftDisposition, EffectiveConfiguration};
+use positron_config::{
+    ConfigurationDiffPlan, ConfigurationDrift, ConfigurationDriftDisposition,
+    EffectiveConfiguration, NetworkListenerRole, NetworkTransport,
+};
 use positron_kernel::OwnedPrimaryDataVolume;
 
 use crate::health::ProcessState;
 use crate::{
     BootstrapFailure, BootstrapFailureCode, BootstrapPaths, BoundEndpoint, BoundListener,
     CatalogConfigurationPublication, ConfigurationReloadOutcome, ConfigurationRuntimeFailure,
-    HealthState, InitializationPlan, InstanceBootstrap, ListenerFactory, ListenerRequest,
-    ListenerRole, ProcessPhase, RegisteredTask, RunningTask, RuntimeConfiguration, ServiceHandle,
-    TaskCancellation, TaskFailure, TaskJoinOutcome, TaskRegistrar, TaskRole,
+    HealthState, InitializationPlan, InstanceBootstrap, ListenerFactory, ListenerGenerationFactory,
+    ListenerRequest, ListenerRole, ProcessPhase, RegisteredTask, RunningTask, RuntimeConfiguration,
+    ServiceHandle, TaskCancellation, TaskFailure, TaskJoinOutcome, TaskRegistrar, TaskRole,
 };
 
 /// Whether serving may initialize a provably empty instance.
@@ -25,18 +28,40 @@ pub enum InitializationMode {
 /// administration and has no actor or credential.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PublicPlaintextApiStartupIntent {
-    api_bind_address: SocketAddr,
+    role: ListenerRole,
+    listener_target: SocketAddr,
 }
 
 impl PublicPlaintextApiStartupIntent {
     #[must_use]
     pub const fn configuration_file(api_bind_address: SocketAddr) -> Self {
-        Self { api_bind_address }
+        Self::configuration_file_listener(ListenerRole::Api, api_bind_address)
+    }
+
+    #[must_use]
+    pub const fn configuration_file_listener(
+        role: ListenerRole,
+        listener_target: SocketAddr,
+    ) -> Self {
+        Self {
+            role,
+            listener_target,
+        }
+    }
+
+    #[must_use]
+    pub const fn role(self) -> ListenerRole {
+        self.role
+    }
+
+    #[must_use]
+    pub const fn listener_target(self) -> SocketAddr {
+        self.listener_target
     }
 
     #[must_use]
     pub const fn api_bind_address(self) -> SocketAddr {
-        self.api_bind_address
+        self.listener_target
     }
 }
 
@@ -45,7 +70,7 @@ pub struct ServeConfiguration {
     paths: BootstrapPaths,
     initialization: InitializationMode,
     max_registered_tenants: u16,
-    public_plaintext_api_intent: Option<PublicPlaintextApiStartupIntent>,
+    plaintext_listener_intents: Vec<PublicPlaintextApiStartupIntent>,
     export_destination_resolver: Option<Arc<dyn positron_query::ExportDestinationResolver>>,
     effective_configuration: Option<Arc<EffectiveConfiguration>>,
     admission_group_planner: Option<Arc<dyn positron_ingest::AdmissionGroupPlanner>>,
@@ -58,7 +83,7 @@ impl ServeConfiguration {
             paths,
             initialization,
             max_registered_tenants: 2,
-            public_plaintext_api_intent: None,
+            plaintext_listener_intents: Vec::new(),
             export_destination_resolver: None,
             effective_configuration: None,
             admission_group_planner: None,
@@ -84,12 +109,24 @@ impl ServeConfiguration {
     /// Keeps the process ready while making an explicit public plaintext API
     /// selection continuously visible through its health state.
     #[must_use]
-    pub const fn with_public_plaintext_api_intent(
+    pub fn with_public_plaintext_api_intent(self, intent: PublicPlaintextApiStartupIntent) -> Self {
+        self.with_plaintext_listener_intent(intent)
+    }
+
+    /// Carries one configuration-file plaintext opt-out into the joint
+    /// startup publication path for its exact listener role.
+    #[must_use]
+    pub fn with_plaintext_listener_intent(
         mut self,
         intent: PublicPlaintextApiStartupIntent,
     ) -> Self {
-        self.public_plaintext_api_intent = Some(intent);
+        self.plaintext_listener_intents.push(intent);
         self
+    }
+
+    #[must_use]
+    pub(crate) fn plaintext_listener_intents(&self) -> &[PublicPlaintextApiStartupIntent] {
+        &self.plaintext_listener_intents
     }
 
     #[must_use]
@@ -110,6 +147,40 @@ impl ServeConfiguration {
         self.effective_configuration = Some(configuration);
         self
     }
+
+    pub(crate) fn drain_deadline(&self) -> std::time::Duration {
+        self.effective_configuration.as_ref().map_or_else(
+            || std::time::Duration::from_secs(30),
+            |configuration| {
+                std::time::Duration::from_secs(u64::from(configuration.shutdown_grace_seconds()))
+            },
+        )
+    }
+}
+
+fn plaintext_listener_intents_for(
+    configuration: &EffectiveConfiguration,
+) -> Vec<PublicPlaintextApiStartupIntent> {
+    [
+        (NetworkListenerRole::Operations, ListenerRole::Operations),
+        (NetworkListenerRole::Api, ListenerRole::Api),
+        (NetworkListenerRole::OtlpGrpc, ListenerRole::OtlpGrpc),
+        (NetworkListenerRole::OtlpHttp, ListenerRole::OtlpHttp),
+        (NetworkListenerRole::LokiPush, ListenerRole::LokiPush),
+    ]
+    .into_iter()
+    .filter_map(|(configuration_role, runtime_role)| {
+        configuration
+            .network_listener_profile(configuration_role)
+            .filter(|profile| profile.transport() == NetworkTransport::PlaintextOptOut)
+            .map(|profile| {
+                PublicPlaintextApiStartupIntent::configuration_file_listener(
+                    runtime_role,
+                    profile.bind_address(),
+                )
+            })
+    })
+    .collect()
 }
 
 impl std::fmt::Debug for ServeConfiguration {
@@ -120,8 +191,8 @@ impl std::fmt::Debug for ServeConfiguration {
             .field("initialization", &self.initialization)
             .field("max_registered_tenants", &self.max_registered_tenants)
             .field(
-                "public_plaintext_api_intent",
-                &self.public_plaintext_api_intent,
+                "plaintext_listener_intent_count",
+                &self.plaintext_listener_intents.len(),
             )
             .field(
                 "admission_group_planner",
@@ -268,8 +339,11 @@ pub enum ShutdownTrigger {
 /// Owns all listeners, kernel authority, key custody, and process phase.
 pub struct RunningProcess {
     state: ProcessState,
-    listeners: Vec<Box<dyn BoundListener>>,
-    tasks: RunningTasks,
+    listeners: Mutex<Vec<Box<dyn BoundListener>>>,
+    listener_generation_factory: Option<Arc<dyn ListenerGenerationFactory>>,
+    reload_lock: Mutex<()>,
+    tasks: Mutex<RunningTasks>,
+    listener_task_cancellations: Mutex<Vec<TaskCancellation>>,
     cancellation: TaskCancellation,
     instance: Option<Arc<crate::InitializedInstance>>,
     fenced_volume: Option<OwnedPrimaryDataVolume>,
@@ -277,6 +351,7 @@ pub struct RunningProcess {
     configuration: Option<Arc<RuntimeConfiguration>>,
     configuration_publication: Option<CatalogConfigurationPublication>,
     cleanup: CleanupAccumulator,
+    drain_deadline: std::time::Duration,
     terminal_cleanup_complete: bool,
 }
 
@@ -294,13 +369,49 @@ impl std::fmt::Debug for RunningProcess {
         formatter
             .debug_struct("RunningProcess")
             .field("phase", &self.state.health().phase())
-            .field("listener_count", &self.listeners.len())
-            .field("task_count", &self.tasks.len())
+            .field("listener_count", &self.listeners().len())
+            .field("task_count", &self.tasks().len())
             .finish_non_exhaustive()
     }
 }
 
 impl RunningProcess {
+    fn listeners(&self) -> MutexGuard<'_, Vec<Box<dyn BoundListener>>> {
+        match self.listeners.lock() {
+            Ok(listeners) => listeners,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    fn reload_lock(&self) -> MutexGuard<'_, ()> {
+        match self.reload_lock.lock() {
+            Ok(lock) => lock,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    fn tasks(&self) -> MutexGuard<'_, RunningTasks> {
+        match self.tasks.lock() {
+            Ok(tasks) => tasks,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    fn cancel_listener_tasks(&self) {
+        let cancellations = match self.listener_task_cancellations.lock() {
+            Ok(cancellations) => cancellations,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        for cancellation in &*cancellations {
+            cancellation.cancel();
+        }
+    }
+
+    fn take_listeners(&self) -> Vec<Box<dyn BoundListener>> {
+        let mut listeners = self.listeners();
+        std::mem::take(&mut *listeners)
+    }
+
     #[must_use]
     pub fn health(&self) -> HealthState {
         self.state.health()
@@ -308,7 +419,7 @@ impl RunningProcess {
 
     #[must_use]
     pub fn bound_endpoints(&self) -> Vec<BoundEndpoint> {
-        self.listeners
+        self.listeners()
             .iter()
             .map(|listener| listener.endpoint().clone())
             .collect()
@@ -332,16 +443,97 @@ impl RunningProcess {
         &self,
         candidate: Arc<EffectiveConfiguration>,
     ) -> Result<ConfigurationReloadOutcome, ConfigurationRuntimeFailure> {
+        let _reload = self.reload_lock();
         let runtime = self
             .configuration
             .as_ref()
             .ok_or(ConfigurationRuntimeFailure::Unavailable)?;
-        let outcome = runtime.reload_with(
-            Arc::clone(&candidate),
-            self.configuration_publication
-                .as_ref()
-                .ok_or(ConfigurationRuntimeFailure::Unavailable)?,
-        )?;
+        let publication = self
+            .configuration_publication
+            .as_ref()
+            .ok_or(ConfigurationRuntimeFailure::Unavailable)?;
+        let observed = runtime.observed()?;
+        if observed.effective().semantic_diff(&candidate).plan()
+            != ConfigurationDiffPlan::DrainThenPublish
+        {
+            return runtime.reload_with(candidate, publication);
+        }
+        let Some(factory) = self.listener_generation_factory.as_ref() else {
+            return runtime.reload_with(candidate, publication);
+        };
+        let staged = match factory.stage(&candidate, self.health(), self.services()) {
+            Ok(staged) => staged,
+            Err(_) => {
+                publication.record_rejected_listener_staging(observed.effective(), &candidate)?;
+                return Err(ConfigurationRuntimeFailure::ListenerUnavailable);
+            },
+        };
+        let outcome = match runtime
+            .publish_staged_listener_reload(Arc::clone(&candidate), publication)
+        {
+            Ok(outcome) => {
+                self.state
+                    .set_plaintext_listener_warnings(&plaintext_listener_intents_for(&candidate));
+                outcome
+            },
+            Err(error) => {
+                staged
+                    .discard()
+                    .map_err(|_| ConfigurationRuntimeFailure::ListenerUnavailable)?;
+                return Err(error);
+            },
+        };
+        if staged.activate_tasks().is_err() {
+            staged
+                .discard()
+                .map_err(|_| ConfigurationRuntimeFailure::ListenerUnavailable)?;
+            self.state.transition(ProcessPhase::Fenced);
+            return Err(ConfigurationRuntimeFailure::ListenerUnavailable);
+        }
+        let (mut successor, mut successor_tasks, successor_cancellation) = staged.into_active();
+        let mut retired = {
+            let mut active = self.listeners();
+            std::mem::swap(&mut *active, &mut successor);
+            successor
+        };
+        let mut retired_tasks = {
+            let mut active = self.tasks();
+            std::mem::swap(&mut *active, &mut successor_tasks);
+            successor_tasks
+        };
+        let retired_cancellations = {
+            let mut active = match self.listener_task_cancellations.lock() {
+                Ok(cancellations) => cancellations,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let retired = std::mem::take(&mut *active);
+            if let Some(cancellation) = successor_cancellation {
+                active.push(cancellation);
+            }
+            retired
+        };
+        let retirement_deadline = std::time::Instant::now() + self.drain_deadline;
+        if close_listeners(&mut retired).is_err() {
+            let abort_failed = abort_retired_tasks(&mut retired_tasks).is_err();
+            self.state.transition(ProcessPhase::Fenced);
+            if abort_failed {
+                return Err(ConfigurationRuntimeFailure::ListenerUnavailable);
+            }
+            return Err(ConfigurationRuntimeFailure::ListenerUnavailable);
+        }
+        for cancellation in retired_cancellations {
+            cancellation.cancel();
+        }
+        if drain_listeners_until(&mut retired, retirement_deadline).is_err()
+            || join_retired_tasks_until(&mut retired_tasks, retirement_deadline).is_err()
+        {
+            let abort_failed = abort_retired_tasks(&mut retired_tasks).is_err();
+            self.state.transition(ProcessPhase::Fenced);
+            if abort_failed {
+                return Err(ConfigurationRuntimeFailure::ListenerUnavailable);
+            }
+            return Err(ConfigurationRuntimeFailure::ListenerUnavailable);
+        }
         Ok(outcome)
     }
 
@@ -404,19 +596,25 @@ impl RunningProcess {
     #[must_use]
     pub fn begin_shutdown(mut self) -> DrainingProcess {
         self.state.transition(ProcessPhase::Draining);
-        let mut listener_close_failed = false;
-        self.listeners.retain_mut(|listener| {
-            if listener.endpoint().role().is_data() {
-                if listener.close().is_err() && listener.close().is_err() {
-                    listener_close_failed = true;
-                    self.cleanup.record_listener(listener.endpoint().role());
+        let failed_roles = {
+            let mut listeners = self.listeners();
+            let mut failed_roles = Vec::new();
+            listeners.retain_mut(|listener| {
+                if listener.endpoint().role().is_data() {
+                    if listener.close().is_err() {
+                        failed_roles.push(listener.endpoint().role());
+                    }
+                    false
+                } else {
+                    true
                 }
-                false
-            } else {
-                true
-            }
-        });
-        if listener_close_failed {
+            });
+            failed_roles
+        };
+        for role in failed_roles {
+            self.cleanup.record_listener(role);
+        }
+        if self.cleanup.has_failures() {
             self.state.transition(ProcessPhase::Stopping);
         }
         if self
@@ -427,8 +625,54 @@ impl RunningProcess {
             self.cleanup.record_schema_checkpoint();
         }
         self.cancellation.cancel();
+        self.cancel_listener_tasks();
         DrainingProcess(self)
     }
+}
+
+fn close_listeners(listeners: &mut [Box<dyn BoundListener>]) -> Result<(), ()> {
+    for listener in &mut *listeners {
+        listener.close().map_err(|_| ())?;
+    }
+    Ok(())
+}
+
+fn drain_listeners_until(
+    listeners: &mut [Box<dyn BoundListener>],
+    deadline: std::time::Instant,
+) -> Result<(), ()> {
+    for listener in listeners {
+        let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+            return Err(());
+        };
+        if !listener.drain_within(remaining).map_err(|_| ())? {
+            return Err(());
+        }
+    }
+    Ok(())
+}
+
+fn join_retired_tasks_until(
+    tasks: &mut RunningTasks,
+    deadline: std::time::Instant,
+) -> Result<(), ()> {
+    for (_, task) in tasks {
+        let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+            return Err(());
+        };
+        match task.join_within(remaining).map_err(|_| ())? {
+            TaskJoinOutcome::Joined => {},
+            TaskJoinOutcome::DeadlineExpired | TaskJoinOutcome::SecondSignal => return Err(()),
+        }
+    }
+    Ok(())
+}
+
+fn abort_retired_tasks(tasks: &mut RunningTasks) -> Result<(), ()> {
+    for (_, task) in tasks {
+        task.abort().map_err(|_| ())?;
+    }
+    Ok(())
 }
 
 impl DrainingProcess {
@@ -438,7 +682,12 @@ impl DrainingProcess {
     }
 
     pub fn poll(&mut self) -> Result<bool, TaskFailure> {
-        for (_, task) in &mut self.0.tasks {
+        let tasks = self
+            .0
+            .tasks
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (_, task) in &mut *tasks {
             match task.poll_join()? {
                 Some(TaskJoinOutcome::Joined) => {},
                 Some(TaskJoinOutcome::DeadlineExpired | TaskJoinOutcome::SecondSignal) => {
@@ -458,16 +707,31 @@ impl DrainingProcess {
             return self.0.abort_shutdown();
         }
         if trigger == ShutdownTrigger::FirstSignal {
-            for (_, task) in &mut self.0.tasks {
-                match task.join() {
+            let deadline = std::time::Instant::now() + self.0.drain_deadline;
+            let tasks = self
+                .0
+                .tasks
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for (_, task) in &mut *tasks {
+                let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now())
+                else {
+                    return self.0.abort_shutdown();
+                };
+                match task.join_within(remaining) {
                     Ok(TaskJoinOutcome::Joined) => {},
                     Ok(TaskJoinOutcome::DeadlineExpired | TaskJoinOutcome::SecondSignal)
                     | Err(_) => return self.0.abort_shutdown(),
                 }
             }
         }
-        self.0.tasks.clear();
-        self.0.cleanup.cleanup_listeners(&mut self.0.listeners);
+        self.0
+            .tasks
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        let mut listeners = self.0.take_listeners();
+        self.0.cleanup.cleanup_listeners(&mut listeners);
         if self.0.services.as_ref().is_some_and(|services| {
             services
                 .publish_prepared_shutdown_schema_checkpoint()
@@ -498,9 +762,15 @@ impl RunningProcess {
     fn abort_shutdown(&mut self) -> ExitOutcome {
         self.state.transition(ProcessPhase::Stopping);
         self.cleanup.set_primary(ExitOutcome::Forced);
-        self.cleanup
-            .cleanup_tasks(&self.cancellation, &mut self.tasks);
-        self.cleanup.cleanup_listeners(&mut self.listeners);
+        self.cancel_listener_tasks();
+        self.cleanup.cleanup_tasks(
+            &self.cancellation,
+            self.tasks
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        let mut listeners = self.take_listeners();
+        self.cleanup.cleanup_listeners(&mut listeners);
         self.instance.take();
         self.fenced_volume.take();
         self.services.take();
@@ -516,9 +786,18 @@ impl Drop for RunningProcess {
             return;
         }
         self.state.transition(ProcessPhase::Stopping);
-        self.cleanup
-            .cleanup_tasks(&self.cancellation, &mut self.tasks);
-        self.cleanup.cleanup_listeners(&mut self.listeners);
+        self.cancel_listener_tasks();
+        self.cleanup.cleanup_tasks(
+            &self.cancellation,
+            self.tasks
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        let listeners = match self.listeners.get_mut() {
+            Ok(listeners) => listeners,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        self.cleanup.cleanup_listeners(listeners);
         self.instance.take();
         self.fenced_volume.take();
         self.services.take();

@@ -163,6 +163,9 @@ fn domain_description(domain: ValueDomain) -> String {
         ValueDomain::ProtectedAbsolutePath(maximum) => {
             format!("protected_absolute_path:max_bytes={maximum}")
         },
+        ValueDomain::TrustedProxyCidrs(maximum, maximum_bytes) => {
+            format!("trusted_proxy_cidrs:max_items={maximum},max_bytes={maximum_bytes}")
+        },
         ValueDomain::ExportDestinations(maximum, maximum_name_bytes, maximum_tenants) => format!(
             "export_destinations:max_items={maximum},max_name_bytes={maximum_name_bytes},max_tenants={maximum_tenants}"
         ),

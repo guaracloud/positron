@@ -11,7 +11,8 @@
 use std::{
     fs::{File, OpenOptions},
     io::Write,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
+    num::NonZeroU8,
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
@@ -181,7 +182,7 @@ pub fn setting_for_path(path: &str) -> Option<Setting> {
 
 /// Returns the complete canonical contract in deterministic declaration order.
 #[must_use]
-pub const fn setting_definitions() -> [SettingDefinition; 17] {
+pub const fn setting_definitions() -> [SettingDefinition; 32] {
     contract::SETTING_DEFINITIONS
 }
 
@@ -196,18 +197,33 @@ struct Candidate {
     max_registered_tenants: u16,
     control_path: String,
     operations_bind_address: SocketAddr,
+    operations_transport: NetworkTransport,
+    operations_trusted_proxy_cidrs: Vec<String>,
+    operations_forwarded_hops: Option<NonZeroU8>,
     api_bind_address: SocketAddr,
     api_transport: ApiTransport,
+    api_trusted_proxy_cidrs: Vec<String>,
+    api_forwarded_hops: Option<NonZeroU8>,
     api_tls_certificate_file: ProtectedFileReference,
     api_tls_private_key_file: ProtectedFileReference,
+    tls_client_ca_file: ProtectedFileReference,
     otlp_grpc_bind_address: SocketAddr,
+    otlp_grpc_transport: NetworkTransport,
+    otlp_grpc_trusted_proxy_cidrs: Vec<String>,
+    otlp_grpc_forwarded_hops: Option<NonZeroU8>,
     otlp_http_bind_address: SocketAddr,
+    otlp_http_transport: NetworkTransport,
+    otlp_http_trusted_proxy_cidrs: Vec<String>,
+    otlp_http_forwarded_hops: Option<NonZeroU8>,
     loki_push_bind_address: SocketAddr,
+    loki_push_transport: NetworkTransport,
+    loki_push_trusted_proxy_cidrs: Vec<String>,
+    loki_push_forwarded_hops: Option<NonZeroU8>,
     data_directory: String,
     secrets_directory: String,
     local_key_file: ProtectedFileReference,
     export_destinations: Vec<ExportDestinationDefinition>,
-    sources: [SettingSource; 17],
+    sources: [SettingSource; 32],
 }
 
 impl Candidate {
@@ -219,15 +235,24 @@ impl Candidate {
             setting_definition(Setting::RuntimeMaxRegisteredTenants).default_value();
         let control = setting_definition(Setting::ListenerControlPath).default_value();
         let operations = setting_definition(Setting::ListenerOperationsBindAddress).default_value();
+        let operations_transport =
+            setting_definition(Setting::ListenerOperationsTransport).default_value();
         let api = setting_definition(Setting::ListenerApiBindAddress).default_value();
         let api_transport = setting_definition(Setting::ListenerApiTransport).default_value();
         let api_certificate =
             setting_definition(Setting::ListenerApiTlsCertificateFile).default_value();
         let api_private_key =
             setting_definition(Setting::ListenerApiTlsPrivateKeyFile).default_value();
+        let tls_client_ca = setting_definition(Setting::ListenerTlsClientCaFile).default_value();
         let otlp_grpc = setting_definition(Setting::ListenerOtlpGrpcBindAddress).default_value();
+        let otlp_grpc_transport =
+            setting_definition(Setting::ListenerOtlpGrpcTransport).default_value();
         let otlp_http = setting_definition(Setting::ListenerOtlpHttpBindAddress).default_value();
+        let otlp_http_transport =
+            setting_definition(Setting::ListenerOtlpHttpTransport).default_value();
         let loki_push = setting_definition(Setting::ListenerLokiPushBindAddress).default_value();
+        let loki_push_transport =
+            setting_definition(Setting::ListenerLokiPushTransport).default_value();
         let data = setting_definition(Setting::StorageDataDirectory).default_value();
         let secrets = setting_definition(Setting::StorageSecretsDirectory).default_value();
         let local_key = setting_definition(Setting::SecurityLocalKeyFile).default_value();
@@ -237,12 +262,20 @@ impl Candidate {
             shutdown_grace_seconds: parse_shutdown_grace_seconds(shutdown)?,
             max_registered_tenants: parse_max_registered_tenants(max_registered_tenants)?,
             control_path: checked_path(control, Setting::ListenerControlPath)?,
-            operations_bind_address: parse_loopback_address(
+            operations_bind_address: parse_socket_address(
                 operations,
                 Setting::ListenerOperationsBindAddress,
             )?,
+            operations_transport: NetworkTransport::parse(
+                operations_transport,
+                FailureSource::ListenerOperationsTransport,
+            )?,
+            operations_trusted_proxy_cidrs: Vec::new(),
+            operations_forwarded_hops: None,
             api_bind_address: parse_socket_address(api, Setting::ListenerApiBindAddress)?,
             api_transport: ApiTransport::parse(api_transport)?,
+            api_trusted_proxy_cidrs: Vec::new(),
+            api_forwarded_hops: None,
             api_tls_certificate_file: ProtectedFileReference::parse(
                 api_certificate,
                 Setting::ListenerApiTlsCertificateFile,
@@ -251,18 +284,40 @@ impl Candidate {
                 api_private_key,
                 Setting::ListenerApiTlsPrivateKeyFile,
             )?,
-            otlp_grpc_bind_address: parse_loopback_address(
+            tls_client_ca_file: ProtectedFileReference::parse(
+                tls_client_ca,
+                Setting::ListenerTlsClientCaFile,
+            )?,
+            otlp_grpc_bind_address: parse_socket_address(
                 otlp_grpc,
                 Setting::ListenerOtlpGrpcBindAddress,
             )?,
-            otlp_http_bind_address: parse_loopback_address(
+            otlp_grpc_transport: NetworkTransport::parse(
+                otlp_grpc_transport,
+                FailureSource::ListenerOtlpGrpcTransport,
+            )?,
+            otlp_grpc_trusted_proxy_cidrs: Vec::new(),
+            otlp_grpc_forwarded_hops: None,
+            otlp_http_bind_address: parse_socket_address(
                 otlp_http,
                 Setting::ListenerOtlpHttpBindAddress,
             )?,
-            loki_push_bind_address: parse_loopback_address(
+            otlp_http_transport: NetworkTransport::parse(
+                otlp_http_transport,
+                FailureSource::ListenerOtlpHttpTransport,
+            )?,
+            otlp_http_trusted_proxy_cidrs: Vec::new(),
+            otlp_http_forwarded_hops: None,
+            loki_push_bind_address: parse_socket_address(
                 loki_push,
                 Setting::ListenerLokiPushBindAddress,
             )?,
+            loki_push_transport: NetworkTransport::parse(
+                loki_push_transport,
+                FailureSource::ListenerLokiPushTransport,
+            )?,
+            loki_push_trusted_proxy_cidrs: Vec::new(),
+            loki_push_forwarded_hops: None,
             data_directory: checked_path(data, Setting::StorageDataDirectory)?,
             secrets_directory: checked_path(secrets, Setting::StorageSecretsDirectory)?,
             local_key_file: ProtectedFileReference::parse(
@@ -270,7 +325,7 @@ impl Candidate {
                 Setting::SecurityLocalKeyFile,
             )?,
             export_destinations: Vec::new(),
-            sources: [SettingSource::CompiledDefault; 17],
+            sources: [SettingSource::CompiledDefault; 32],
         })
     }
 
@@ -304,7 +359,14 @@ impl Candidate {
                 self.control_path = checked_path(value, setting)?;
             },
             Setting::ListenerOperationsBindAddress => {
-                self.operations_bind_address = parse_loopback_address(value, setting)?;
+                self.operations_bind_address = parse_socket_address(value, setting)?;
+            },
+            Setting::ListenerOperationsTransport => {
+                self.operations_transport =
+                    NetworkTransport::parse(value, FailureSource::ListenerOperationsTransport)?;
+            },
+            Setting::ListenerOperationsForwardedHops => {
+                self.operations_forwarded_hops = parse_forwarded_hops(value, setting)?;
             },
             Setting::ListenerApiBindAddress => {
                 self.api_bind_address = parse_socket_address(value, setting)?;
@@ -312,20 +374,47 @@ impl Candidate {
             Setting::ListenerApiTransport => {
                 self.api_transport = ApiTransport::parse(value)?;
             },
+            Setting::ListenerApiForwardedHops => {
+                self.api_forwarded_hops = parse_forwarded_hops(value, setting)?;
+            },
             Setting::ListenerApiTlsCertificateFile => {
                 self.api_tls_certificate_file = ProtectedFileReference::parse(value, setting)?;
             },
             Setting::ListenerApiTlsPrivateKeyFile => {
                 self.api_tls_private_key_file = ProtectedFileReference::parse(value, setting)?;
             },
+            Setting::ListenerTlsClientCaFile => {
+                self.tls_client_ca_file = ProtectedFileReference::parse(value, setting)?;
+            },
             Setting::ListenerOtlpGrpcBindAddress => {
-                self.otlp_grpc_bind_address = parse_loopback_address(value, setting)?;
+                self.otlp_grpc_bind_address = parse_socket_address(value, setting)?;
+            },
+            Setting::ListenerOtlpGrpcTransport => {
+                self.otlp_grpc_transport =
+                    NetworkTransport::parse(value, FailureSource::ListenerOtlpGrpcTransport)?;
+            },
+            Setting::ListenerOtlpGrpcForwardedHops => {
+                self.otlp_grpc_forwarded_hops = parse_forwarded_hops(value, setting)?;
             },
             Setting::ListenerOtlpHttpBindAddress => {
-                self.otlp_http_bind_address = parse_loopback_address(value, setting)?;
+                self.otlp_http_bind_address = parse_socket_address(value, setting)?;
+            },
+            Setting::ListenerOtlpHttpTransport => {
+                self.otlp_http_transport =
+                    NetworkTransport::parse(value, FailureSource::ListenerOtlpHttpTransport)?;
+            },
+            Setting::ListenerOtlpHttpForwardedHops => {
+                self.otlp_http_forwarded_hops = parse_forwarded_hops(value, setting)?;
             },
             Setting::ListenerLokiPushBindAddress => {
-                self.loki_push_bind_address = parse_loopback_address(value, setting)?;
+                self.loki_push_bind_address = parse_socket_address(value, setting)?;
+            },
+            Setting::ListenerLokiPushTransport => {
+                self.loki_push_transport =
+                    NetworkTransport::parse(value, FailureSource::ListenerLokiPushTransport)?;
+            },
+            Setting::ListenerLokiPushForwardedHops => {
+                self.loki_push_forwarded_hops = parse_forwarded_hops(value, setting)?;
             },
             Setting::StorageDataDirectory => {
                 self.data_directory = checked_path(value, setting)?;
@@ -336,7 +425,12 @@ impl Candidate {
             Setting::SecurityLocalKeyFile => {
                 self.local_key_file = ProtectedFileReference::parse(value, setting)?
             },
-            Setting::ExportDestinations => {
+            Setting::ListenerOperationsTrustedProxyCidrs
+            | Setting::ListenerApiTrustedProxyCidrs
+            | Setting::ListenerOtlpGrpcTrustedProxyCidrs
+            | Setting::ListenerOtlpHttpTrustedProxyCidrs
+            | Setting::ListenerLokiPushTrustedProxyCidrs
+            | Setting::ExportDestinations => {
                 return Err(ConfigurationFailure::new(
                     ConfigurationFailureCode::Malformed,
                     FailureSource::ExportDestinations,
@@ -350,6 +444,37 @@ impl Candidate {
             ));
         };
         *entry = source;
+        Ok(())
+    }
+
+    fn apply_trusted_proxy_cidrs(
+        &mut self,
+        setting: Setting,
+        cidrs: Vec<String>,
+    ) -> Result<(), ConfigurationFailure> {
+        let destination = match setting {
+            Setting::ListenerOperationsTrustedProxyCidrs => {
+                &mut self.operations_trusted_proxy_cidrs
+            },
+            Setting::ListenerApiTrustedProxyCidrs => &mut self.api_trusted_proxy_cidrs,
+            Setting::ListenerOtlpGrpcTrustedProxyCidrs => &mut self.otlp_grpc_trusted_proxy_cidrs,
+            Setting::ListenerOtlpHttpTrustedProxyCidrs => &mut self.otlp_http_trusted_proxy_cidrs,
+            Setting::ListenerLokiPushTrustedProxyCidrs => &mut self.loki_push_trusted_proxy_cidrs,
+            _ => {
+                return Err(ConfigurationFailure::new(
+                    ConfigurationFailureCode::Malformed,
+                    failure_source(setting),
+                ));
+            },
+        };
+        *destination = cidrs;
+        let Some(entry) = self.sources.get_mut(setting_index(setting)) else {
+            return Err(ConfigurationFailure::new(
+                ConfigurationFailureCode::Malformed,
+                FailureSource::ConfigurationDocument,
+            ));
+        };
+        *entry = SettingSource::ConfigurationFile;
         Ok(())
     }
 
@@ -378,6 +503,36 @@ impl Candidate {
                 FailureSource::StorageDataDirectory,
             ));
         }
+        validate_proxy_trust_pair(
+            &self.operations_trusted_proxy_cidrs,
+            self.operations_forwarded_hops,
+            Setting::ListenerOperationsTrustedProxyCidrs,
+            Setting::ListenerOperationsForwardedHops,
+        )?;
+        validate_proxy_trust_pair(
+            &self.api_trusted_proxy_cidrs,
+            self.api_forwarded_hops,
+            Setting::ListenerApiTrustedProxyCidrs,
+            Setting::ListenerApiForwardedHops,
+        )?;
+        validate_proxy_trust_pair(
+            &self.otlp_grpc_trusted_proxy_cidrs,
+            self.otlp_grpc_forwarded_hops,
+            Setting::ListenerOtlpGrpcTrustedProxyCidrs,
+            Setting::ListenerOtlpGrpcForwardedHops,
+        )?;
+        validate_proxy_trust_pair(
+            &self.otlp_http_trusted_proxy_cidrs,
+            self.otlp_http_forwarded_hops,
+            Setting::ListenerOtlpHttpTrustedProxyCidrs,
+            Setting::ListenerOtlpHttpForwardedHops,
+        )?;
+        validate_proxy_trust_pair(
+            &self.loki_push_trusted_proxy_cidrs,
+            self.loki_push_forwarded_hops,
+            Setting::ListenerLokiPushTrustedProxyCidrs,
+            Setting::ListenerLokiPushForwardedHops,
+        )?;
         Ok(EffectiveConfiguration {
             schema_version: self.schema_version,
             log_level: self.log_level,
@@ -385,13 +540,28 @@ impl Candidate {
             max_registered_tenants: self.max_registered_tenants,
             control_path: self.control_path,
             operations_bind_address: self.operations_bind_address,
+            operations_transport: self.operations_transport,
+            operations_trusted_proxy_cidrs: self.operations_trusted_proxy_cidrs,
+            operations_forwarded_hops: self.operations_forwarded_hops,
             api_bind_address: self.api_bind_address,
             api_transport: self.api_transport,
+            api_trusted_proxy_cidrs: self.api_trusted_proxy_cidrs,
+            api_forwarded_hops: self.api_forwarded_hops,
             api_tls_certificate_file: self.api_tls_certificate_file,
             api_tls_private_key_file: self.api_tls_private_key_file,
+            tls_client_ca_file: self.tls_client_ca_file,
             otlp_grpc_bind_address: self.otlp_grpc_bind_address,
+            otlp_grpc_transport: self.otlp_grpc_transport,
+            otlp_grpc_trusted_proxy_cidrs: self.otlp_grpc_trusted_proxy_cidrs,
+            otlp_grpc_forwarded_hops: self.otlp_grpc_forwarded_hops,
             otlp_http_bind_address: self.otlp_http_bind_address,
+            otlp_http_transport: self.otlp_http_transport,
+            otlp_http_trusted_proxy_cidrs: self.otlp_http_trusted_proxy_cidrs,
+            otlp_http_forwarded_hops: self.otlp_http_forwarded_hops,
             loki_push_bind_address: self.loki_push_bind_address,
+            loki_push_transport: self.loki_push_transport,
+            loki_push_trusted_proxy_cidrs: self.loki_push_trusted_proxy_cidrs,
+            loki_push_forwarded_hops: self.loki_push_forwarded_hops,
             data_directory: self.data_directory,
             secrets_directory: self.secrets_directory,
             local_key_file: self.local_key_file,
@@ -455,6 +625,123 @@ fn parse_max_registered_tenants(value: &str) -> Result<u16, ConfigurationFailure
     Ok(tenants)
 }
 
+fn parse_forwarded_hops(
+    value: &str,
+    setting: Setting,
+) -> Result<Option<NonZeroU8>, ConfigurationFailure> {
+    let hops = parse_canonical_u16(value, failure_source(setting))?;
+    let ValueDomain::UnsignedIntegerRange(minimum, maximum) = setting_definition(setting).domain()
+    else {
+        return Err(ConfigurationFailure::new(
+            ConfigurationFailureCode::Malformed,
+            failure_source(setting),
+        ));
+    };
+    if !(minimum..=maximum).contains(&hops) {
+        return Err(ConfigurationFailure::unsupported_value(failure_source(
+            setting,
+        )));
+    }
+    let hops = u8::try_from(hops)
+        .map_err(|_| ConfigurationFailure::unsupported_value(failure_source(setting)))?;
+    Ok(NonZeroU8::new(hops))
+}
+
+fn parse_trusted_proxy_cidrs(
+    values: &[toml::Value],
+    setting: Setting,
+) -> Result<Vec<String>, ConfigurationFailure> {
+    let ValueDomain::TrustedProxyCidrs(maximum_entries, maximum_entry_bytes) =
+        setting_definition(setting).domain()
+    else {
+        return Err(ConfigurationFailure::new(
+            ConfigurationFailureCode::Malformed,
+            failure_source(setting),
+        ));
+    };
+    if values.len() > maximum_entries {
+        return Err(ConfigurationFailure::unsupported_value(failure_source(
+            setting,
+        )));
+    }
+    let mut cidrs = Vec::with_capacity(values.len());
+    for value in values {
+        let toml::Value::String(value) = value else {
+            return Err(ConfigurationFailure::unsupported_value(failure_source(
+                setting,
+            )));
+        };
+        validate_trusted_proxy_cidr(value, maximum_entry_bytes, setting)?;
+        cidrs.push(value.clone());
+    }
+    Ok(cidrs)
+}
+
+fn validate_trusted_proxy_cidr(
+    value: &str,
+    maximum_bytes: usize,
+    setting: Setting,
+) -> Result<(), ConfigurationFailure> {
+    if value.is_empty()
+        || value.len() > maximum_bytes
+        || value.bytes().any(|byte| byte.is_ascii_whitespace())
+    {
+        return Err(ConfigurationFailure::unsupported_value(failure_source(
+            setting,
+        )));
+    }
+    let Some((address, prefix_text)) = value.split_once('/') else {
+        return Err(ConfigurationFailure::unsupported_value(failure_source(
+            setting,
+        )));
+    };
+    if prefix_text.is_empty()
+        || prefix_text.len() > 3
+        || !prefix_text.bytes().all(|byte| byte.is_ascii_digit())
+        || (prefix_text.len() > 1 && prefix_text.starts_with('0'))
+    {
+        return Err(ConfigurationFailure::unsupported_value(failure_source(
+            setting,
+        )));
+    }
+    let address = address
+        .parse::<IpAddr>()
+        .map_err(|_| ConfigurationFailure::unsupported_value(failure_source(setting)))?;
+    let prefix = prefix_text
+        .parse::<u16>()
+        .map_err(|_| ConfigurationFailure::unsupported_value(failure_source(setting)))?;
+    let maximum_prefix = match address {
+        IpAddr::V4(_) => 32,
+        IpAddr::V6(_) => 128,
+    };
+    if prefix > maximum_prefix {
+        return Err(ConfigurationFailure::unsupported_value(failure_source(
+            setting,
+        )));
+    }
+    Ok(())
+}
+
+fn validate_proxy_trust_pair(
+    cidrs: &[String],
+    forwarded_hops: Option<NonZeroU8>,
+    cidr_setting: Setting,
+    hop_setting: Setting,
+) -> Result<(), ConfigurationFailure> {
+    if cidrs.is_empty() == forwarded_hops.is_none() {
+        return Ok(());
+    }
+    let setting = if cidrs.is_empty() {
+        hop_setting
+    } else {
+        cidr_setting
+    };
+    Err(ConfigurationFailure::new(
+        ConfigurationFailureCode::UnsafeCombination,
+        failure_source(setting),
+    ))
+}
+
 fn parse_canonical_u16(value: &str, source: FailureSource) -> Result<u16, ConfigurationFailure> {
     if value.is_empty()
         || value.len() > 5
@@ -469,29 +756,6 @@ fn parse_canonical_u16(value: &str, source: FailureSource) -> Result<u16, Config
     value
         .parse::<u16>()
         .map_err(|_| ConfigurationFailure::new(ConfigurationFailureCode::UnsupportedValue, source))
-}
-
-fn parse_loopback_address(
-    value: &str,
-    setting: Setting,
-) -> Result<SocketAddr, ConfigurationFailure> {
-    let source = failure_source(setting);
-    let ValueDomain::LoopbackSocketAddress(_) = setting_definition(setting).domain() else {
-        return Err(ConfigurationFailure::new(
-            ConfigurationFailureCode::Malformed,
-            source,
-        ));
-    };
-    let address = value
-        .parse::<SocketAddr>()
-        .map_err(|_| ConfigurationFailure::new(ConfigurationFailureCode::Malformed, source))?;
-    if !address.ip().is_loopback() {
-        return Err(ConfigurationFailure::new(
-            ConfigurationFailureCode::UnsafeCombination,
-            source,
-        ));
-    }
-    Ok(address)
 }
 
 fn parse_socket_address(value: &str, setting: Setting) -> Result<SocketAddr, ConfigurationFailure> {
@@ -551,17 +815,32 @@ const fn setting_index(setting: Setting) -> usize {
         Setting::RuntimeMaxRegisteredTenants => 3,
         Setting::ListenerControlPath => 4,
         Setting::ListenerOperationsBindAddress => 5,
-        Setting::ListenerApiBindAddress => 6,
-        Setting::ListenerApiTransport => 7,
-        Setting::ListenerApiTlsCertificateFile => 8,
-        Setting::ListenerApiTlsPrivateKeyFile => 9,
-        Setting::ListenerOtlpGrpcBindAddress => 10,
-        Setting::ListenerOtlpHttpBindAddress => 11,
-        Setting::ListenerLokiPushBindAddress => 12,
-        Setting::StorageDataDirectory => 13,
-        Setting::StorageSecretsDirectory => 14,
-        Setting::SecurityLocalKeyFile => 15,
-        Setting::ExportDestinations => 16,
+        Setting::ListenerOperationsTransport => 6,
+        Setting::ListenerOperationsTrustedProxyCidrs => 7,
+        Setting::ListenerOperationsForwardedHops => 8,
+        Setting::ListenerApiBindAddress => 9,
+        Setting::ListenerApiTransport => 10,
+        Setting::ListenerApiTrustedProxyCidrs => 11,
+        Setting::ListenerApiForwardedHops => 12,
+        Setting::ListenerApiTlsCertificateFile => 13,
+        Setting::ListenerApiTlsPrivateKeyFile => 14,
+        Setting::ListenerTlsClientCaFile => 15,
+        Setting::ListenerOtlpGrpcBindAddress => 16,
+        Setting::ListenerOtlpGrpcTransport => 17,
+        Setting::ListenerOtlpGrpcTrustedProxyCidrs => 18,
+        Setting::ListenerOtlpGrpcForwardedHops => 19,
+        Setting::ListenerOtlpHttpBindAddress => 20,
+        Setting::ListenerOtlpHttpTransport => 21,
+        Setting::ListenerOtlpHttpTrustedProxyCidrs => 22,
+        Setting::ListenerOtlpHttpForwardedHops => 23,
+        Setting::ListenerLokiPushBindAddress => 24,
+        Setting::ListenerLokiPushTransport => 25,
+        Setting::ListenerLokiPushTrustedProxyCidrs => 26,
+        Setting::ListenerLokiPushForwardedHops => 27,
+        Setting::StorageDataDirectory => 28,
+        Setting::StorageSecretsDirectory => 29,
+        Setting::SecurityLocalKeyFile => 30,
+        Setting::ExportDestinations => 31,
     }
 }
 
@@ -573,13 +852,36 @@ const fn failure_source(setting: Setting) -> FailureSource {
         Setting::RuntimeMaxRegisteredTenants => FailureSource::RuntimeMaxRegisteredTenants,
         Setting::ListenerControlPath => FailureSource::ListenerControlPath,
         Setting::ListenerOperationsBindAddress => FailureSource::ListenerOperationsBindAddress,
+        Setting::ListenerOperationsTransport => FailureSource::ListenerOperationsTransport,
+        Setting::ListenerOperationsTrustedProxyCidrs => {
+            FailureSource::ListenerOperationsTrustedProxyCidrs
+        },
+        Setting::ListenerOperationsForwardedHops => FailureSource::ListenerOperationsForwardedHops,
         Setting::ListenerApiBindAddress => FailureSource::ListenerApiBindAddress,
         Setting::ListenerApiTransport => FailureSource::ListenerApiTransport,
+        Setting::ListenerApiTrustedProxyCidrs => FailureSource::ListenerApiTrustedProxyCidrs,
+        Setting::ListenerApiForwardedHops => FailureSource::ListenerApiForwardedHops,
         Setting::ListenerApiTlsCertificateFile => FailureSource::ListenerApiTlsCertificateFile,
         Setting::ListenerApiTlsPrivateKeyFile => FailureSource::ListenerApiTlsPrivateKeyFile,
+        Setting::ListenerTlsClientCaFile => FailureSource::ListenerTlsClientCaFile,
         Setting::ListenerOtlpGrpcBindAddress => FailureSource::ListenerOtlpGrpcBindAddress,
+        Setting::ListenerOtlpGrpcTransport => FailureSource::ListenerOtlpGrpcTransport,
+        Setting::ListenerOtlpGrpcTrustedProxyCidrs => {
+            FailureSource::ListenerOtlpGrpcTrustedProxyCidrs
+        },
+        Setting::ListenerOtlpGrpcForwardedHops => FailureSource::ListenerOtlpGrpcForwardedHops,
         Setting::ListenerOtlpHttpBindAddress => FailureSource::ListenerOtlpHttpBindAddress,
+        Setting::ListenerOtlpHttpTransport => FailureSource::ListenerOtlpHttpTransport,
+        Setting::ListenerOtlpHttpTrustedProxyCidrs => {
+            FailureSource::ListenerOtlpHttpTrustedProxyCidrs
+        },
+        Setting::ListenerOtlpHttpForwardedHops => FailureSource::ListenerOtlpHttpForwardedHops,
         Setting::ListenerLokiPushBindAddress => FailureSource::ListenerLokiPushBindAddress,
+        Setting::ListenerLokiPushTransport => FailureSource::ListenerLokiPushTransport,
+        Setting::ListenerLokiPushTrustedProxyCidrs => {
+            FailureSource::ListenerLokiPushTrustedProxyCidrs
+        },
+        Setting::ListenerLokiPushForwardedHops => FailureSource::ListenerLokiPushForwardedHops,
         Setting::StorageDataDirectory => FailureSource::StorageDataDirectory,
         Setting::StorageSecretsDirectory => FailureSource::StorageSecretsDirectory,
         Setting::SecurityLocalKeyFile => FailureSource::SecurityLocalKeyFile,

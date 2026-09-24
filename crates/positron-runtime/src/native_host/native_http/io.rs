@@ -154,12 +154,22 @@ pub(in crate::native_host) fn read_body<S: Read>(
 pub(in crate::native_host) fn health_response(
     healthy: bool,
     label: &'static str,
-    warning: Option<HealthWarning>,
+    warnings: &[HealthWarning],
 ) -> Response {
-    let warnings = match warning {
-        Some(HealthWarning::PublicPlaintextApi) => "[\"public_plaintext_api\"]",
-        None => "[]",
-    };
+    let warnings =
+        warnings
+            .iter()
+            .enumerate()
+            .fold(String::from("["), |mut rendered, (index, warning)| {
+                if index > 0 {
+                    rendered.push(',');
+                }
+                rendered.push('\"');
+                rendered.push_str(warning.label());
+                rendered.push('\"');
+                rendered
+            })
+            + "]";
     if healthy {
         Response::json(
             200,
@@ -367,7 +377,7 @@ pub(in crate::native_host) fn write_response<S: Write>(
 mod tests {
     use std::io::{Cursor, Read, Write};
 
-    use super::super::serve_tls_api_connection;
+    use super::super::serve_tls_connection;
 
     struct MemoryStream {
         input: Cursor<Vec<u8>>,
@@ -412,7 +422,17 @@ mod tests {
             positron_api::policy::HTTP_ACTIVATE_PATH,
         ] {
             let mut stream = MemoryStream::request(path);
-            assert!(serve_tls_api_connection(&mut stream, &health, None).is_ok());
+            assert!(
+                serve_tls_connection(
+                    &mut stream,
+                    crate::ListenerRole::Api,
+                    "127.0.0.1:1".parse().expect("loopback peer"),
+                    None,
+                    &health,
+                    None,
+                )
+                .is_ok()
+            );
             let response = std::str::from_utf8(&stream.output).expect("HTTP response");
             assert!(
                 response.starts_with("HTTP/1.1 503 Service Unavailable"),

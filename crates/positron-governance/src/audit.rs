@@ -134,6 +134,7 @@ pub enum ConfigurationAuditOutcome {
     RequiresDrain,
     RejectedInvalid,
     FencedDrift,
+    RejectedListenerStaging,
 }
 
 impl ConfigurationAuditOutcome {
@@ -145,6 +146,7 @@ impl ConfigurationAuditOutcome {
             Self::RequiresDrain => 4,
             Self::RejectedInvalid => 5,
             Self::FencedDrift => 6,
+            Self::RejectedListenerStaging => 7,
         }
     }
 
@@ -156,6 +158,7 @@ impl ConfigurationAuditOutcome {
             4 => Ok(Self::RequiresDrain),
             5 => Ok(Self::RejectedInvalid),
             6 => Ok(Self::FencedDrift),
+            7 => Ok(Self::RejectedListenerStaging),
             _ => Err(IdentityFailure),
         }
     }
@@ -1250,7 +1253,8 @@ impl GovernanceAuditEntry {
             Self::Configuration(entry) => match entry.outcome() {
                 ConfigurationAuditOutcome::RejectedImmutable
                 | ConfigurationAuditOutcome::RejectedInvalid
-                | ConfigurationAuditOutcome::FencedDrift => "rejected",
+                | ConfigurationAuditOutcome::FencedDrift
+                | ConfigurationAuditOutcome::RejectedListenerStaging => "rejected",
                 ConfigurationAuditOutcome::RequiresDrain => "deferred",
                 ConfigurationAuditOutcome::PublishedLive
                 | ConfigurationAuditOutcome::PendingRestart => "succeeded",

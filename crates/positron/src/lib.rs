@@ -2,17 +2,17 @@
 
 #![forbid(unsafe_code)]
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::ExitCode;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
+use std::{path::PathBuf, sync::Arc};
 
-use positron_config::{ApiTransport, ConfigurationInputs, resolve};
+use positron_config::{ConfigurationInputs, NetworkListenerRole, NetworkTransport, resolve};
 use positron_kernel::MountQualification;
 use positron_runtime::{
-    ApiTransportProfile, ApplicationRuntime, BootstrapPaths, ExitOutcome, HostInputs,
-    InitializationMode, NativeBindings, NativeHost, PublicPlaintextApiStartupIntent,
-    RecoveryAttempt, RecoveryAttemptHost, RecoveryDecision, ServeConfiguration, ShutdownTrigger,
+    ApplicationRuntime, BootstrapPaths, ExitOutcome, HostInputs, InitializationMode,
+    NativeBindings, NativeHost, PublicPlaintextApiStartupIntent, RecoveryAttempt,
+    RecoveryAttemptHost, RecoveryDecision, ServeConfiguration, ShutdownTrigger,
 };
 use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
@@ -105,24 +105,8 @@ fn run(
         MountQualification::LocalHost,
     )
     .map_err(|_| LaunchFailure::Configuration)?;
-    let api_transport = match effective.api_transport() {
-        ApiTransport::Tls => ApiTransportProfile::tls(
-            effective.api_tls_certificate_file().as_path().to_path_buf(),
-            effective.api_tls_private_key_file().as_path().to_path_buf(),
-        ),
-        ApiTransport::PlaintextOptOut => Ok(ApiTransportProfile::plaintext_opt_out()),
-    }
-    .map_err(|_| LaunchFailure::Configuration)?;
-    let bindings = NativeBindings::new_with_api_transport(
-        PathBuf::from(effective.control_path()),
-        effective.operations_bind_address(),
-        effective.api_bind_address(),
-        effective.otlp_grpc_bind_address(),
-        effective.otlp_http_bind_address(),
-        effective.loki_push_bind_address(),
-        api_transport,
-    )
-    .map_err(|_| LaunchFailure::Configuration)?;
+    let bindings =
+        NativeBindings::from_effective(&effective).map_err(|_| LaunchFailure::Configuration)?;
     let host = NativeHost::new(bindings);
     let recovery = NativeRecovery::new(
         Signals::new([SIGHUP, SIGINT, SIGTERM]).map_err(|_| LaunchFailure::Signal)?,
@@ -130,10 +114,39 @@ fn run(
     let mut configuration = ServeConfiguration::new(paths, arguments.initialization)
         .with_max_registered_tenants(effective.max_registered_tenants())
         .with_effective_configuration(Arc::new(effective.clone()));
-    if let Some(plaintext) = effective.public_plaintext_api_configuration() {
-        configuration = configuration.with_public_plaintext_api_intent(
-            PublicPlaintextApiStartupIntent::configuration_file(plaintext.api_bind_address()),
-        );
+    for (configuration_role, runtime_role) in [
+        (
+            NetworkListenerRole::Operations,
+            positron_runtime::ListenerRole::Operations,
+        ),
+        (
+            NetworkListenerRole::Api,
+            positron_runtime::ListenerRole::Api,
+        ),
+        (
+            NetworkListenerRole::OtlpGrpc,
+            positron_runtime::ListenerRole::OtlpGrpc,
+        ),
+        (
+            NetworkListenerRole::OtlpHttp,
+            positron_runtime::ListenerRole::OtlpHttp,
+        ),
+        (
+            NetworkListenerRole::LokiPush,
+            positron_runtime::ListenerRole::LokiPush,
+        ),
+    ] {
+        let Some(profile) = effective.network_listener_profile(configuration_role) else {
+            continue;
+        };
+        if profile.transport() == NetworkTransport::PlaintextOptOut {
+            configuration = configuration.with_plaintext_listener_intent(
+                PublicPlaintextApiStartupIntent::configuration_file_listener(
+                    runtime_role,
+                    profile.bind_address(),
+                ),
+            );
+        }
     }
     let process = match ApplicationRuntime::start(
         configuration,

@@ -13,8 +13,8 @@ use positron_governance::{
 use positron_runtime::{
     ApplicationRuntime, ConfigurationPublication, ConfigurationPublicationDisposition,
     ConfigurationReloadOutcome, ConfigurationRuntimeFailure, HostInputs, InitializationMode,
-    InstanceBootstrap, ProcessPhase, Readiness, RuntimeConfiguration, ServeConfiguration,
-    ShutdownTrigger,
+    InstanceBootstrap, ListenerRole, NativeBindings, NativeHost, ProcessPhase, Readiness,
+    RuntimeConfiguration, ServeConfiguration, ShutdownTrigger,
 };
 
 #[allow(dead_code)]
@@ -375,6 +375,319 @@ fn catalog_and_governance_audit_publication_survives_restart_without_replacing_t
         positron_runtime::ExitOutcome::Graceful
     ));
     Ok(())
+}
+
+#[test]
+fn listener_reload_publishes_the_staged_configuration_generation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let roots = TestRoots::new("configuration-listener-generation")?;
+    let first_operations = available_loopback_port()?;
+    let successor_operations = available_loopback_port()?;
+    let control_path = std::env::temp_dir().join(format!(
+        "p77-listener-generation-{}-{first_operations}.sock",
+        std::process::id()
+    ));
+    let initial = configuration(Some(&listener_configuration(
+        control_path.clone(),
+        first_operations,
+    )))?;
+    let host = NativeHost::new(NativeBindings::from_effective(&initial)?);
+    let process = ApplicationRuntime::start(
+        ServeConfiguration::new(
+            roots.bootstrap_paths()?,
+            InitializationMode::InitializeIfEmpty,
+        )
+        .with_effective_configuration(Arc::clone(&initial)),
+        HostInputs::new(&host, &host),
+    )?;
+    let runtime = process
+        .configuration()
+        .ok_or("configuration runtime missing")?;
+    let before = runtime.observed()?;
+    let candidate = configuration(Some(&listener_configuration(
+        control_path,
+        successor_operations,
+    )))?;
+
+    let outcome = process.reload_configuration(candidate)?;
+
+    assert!(matches!(
+        outcome,
+        ConfigurationReloadOutcome::PublishedLive { .. }
+    ));
+    let after = runtime.observed()?;
+    assert!(after.generation() > before.generation());
+    assert_eq!(
+        after.effective().operations_bind_address().port(),
+        successor_operations
+    );
+    let operations = process
+        .bound_endpoints()
+        .into_iter()
+        .find(|endpoint| endpoint.role() == ListenerRole::Operations)
+        .and_then(|endpoint| endpoint.socket_address())
+        .ok_or("replacement operations endpoint missing")?;
+    assert_eq!(operations.port(), successor_operations);
+    assert!(matches!(
+        process.shutdown(ShutdownTrigger::FirstSignal),
+        positron_runtime::ExitOutcome::Graceful
+    ));
+    Ok(())
+}
+
+#[test]
+fn same_endpoint_reload_drains_accepted_old_work_before_the_successor_serves()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::io::{Read, Write};
+
+    let roots = TestRoots::new("configuration-listener-drain")?;
+    let operations_port = available_loopback_port()?;
+    let control_path = std::env::temp_dir().join(format!(
+        "p77-listener-drain-{}-{operations_port}.sock",
+        std::process::id()
+    ));
+    let initial = configuration(Some(&listener_configuration(
+        control_path.clone(),
+        operations_port,
+    )))?;
+    let host = NativeHost::new(NativeBindings::from_effective(&initial)?);
+    let process = ApplicationRuntime::start(
+        ServeConfiguration::new(
+            roots.bootstrap_paths()?,
+            InitializationMode::InitializeIfEmpty,
+        )
+        .with_effective_configuration(Arc::clone(&initial)),
+        HostInputs::new(&host, &host),
+    )?;
+    let mut old = std::net::TcpStream::connect(("127.0.0.1", operations_port))?;
+    old.set_read_timeout(Some(Duration::from_secs(3)))?;
+    old.write_all(b"GET /health/ready HTTP/1.1\r\nHost: localhost\r\n")?;
+    std::thread::sleep(Duration::from_millis(25));
+    let candidate = configuration(Some(&format!(
+        "{}\n[listener.operations]\ntrusted_proxy_cidrs = [\"127.0.0.1/32\"]\nforwarded_hops = 1\n",
+        listener_configuration(control_path, operations_port)
+    )))?;
+
+    let outcome = process.reload_configuration(candidate)?;
+
+    assert!(matches!(
+        outcome,
+        ConfigurationReloadOutcome::PublishedLive { .. }
+    ));
+    let mut old_terminal = String::new();
+    old.read_to_string(&mut old_terminal)?;
+    assert!(
+        old_terminal.starts_with("HTTP/1.1 400 "),
+        "accepted old connection did not receive its bounded terminal response: {old_terminal:?}"
+    );
+    let mut fresh = std::net::TcpStream::connect(("127.0.0.1", operations_port))?;
+    fresh.set_read_timeout(Some(Duration::from_secs(1)))?;
+    fresh
+        .write_all(b"GET /health/ready HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n")?;
+    let mut successor = String::new();
+    fresh.read_to_string(&mut successor)?;
+    assert!(successor.starts_with("HTTP/1.1 200 "));
+    assert!(matches!(
+        process.shutdown(ShutdownTrigger::FirstSignal),
+        positron_runtime::ExitOutcome::Graceful
+    ));
+    Ok(())
+}
+
+#[test]
+fn failed_listener_staging_preserves_the_serving_generation_and_endpoints()
+-> Result<(), Box<dyn std::error::Error>> {
+    let roots = TestRoots::new("configuration-listener-staging-failure")?;
+    let paths = roots.bootstrap_paths()?;
+    let operations_port = available_loopback_port()?;
+    let control_path = std::env::temp_dir().join(format!(
+        "p77-listener-staging-failure-{}-{operations_port}.sock",
+        std::process::id()
+    ));
+    let initial = configuration(Some(&listener_configuration(
+        control_path.clone(),
+        operations_port,
+    )))?;
+    let host = NativeHost::new(NativeBindings::from_effective(&initial)?);
+    let process = ApplicationRuntime::start(
+        ServeConfiguration::new(paths.clone(), InitializationMode::InitializeIfEmpty)
+            .with_effective_configuration(Arc::clone(&initial)),
+        HostInputs::new(&host, &host),
+    )?;
+    let runtime = process
+        .configuration()
+        .ok_or("configuration runtime missing")?;
+    let before = runtime.observed()?;
+    let endpoints = process.bound_endpoints();
+    let occupied_api_port = endpoints
+        .iter()
+        .find(|endpoint| endpoint.role() == ListenerRole::Api)
+        .and_then(|endpoint| endpoint.socket_address())
+        .ok_or("API endpoint missing")?
+        .port();
+    let candidate = configuration(Some(&listener_configuration(
+        control_path,
+        occupied_api_port,
+    )))?;
+
+    let failure = process
+        .reload_configuration(Arc::clone(&candidate))
+        .expect_err("a staged role cannot bind another active role's endpoint");
+
+    assert_eq!(failure, ConfigurationRuntimeFailure::ListenerUnavailable);
+    assert_eq!(process.health().phase(), ProcessPhase::Serving);
+    assert_eq!(process.health().readiness(), Readiness::Ready);
+    assert_eq!(process.bound_endpoints(), endpoints);
+    let after = runtime.observed()?;
+    assert_eq!(after.generation(), before.generation());
+    assert_eq!(
+        after.effective().operations_bind_address(),
+        before.effective().operations_bind_address()
+    );
+    assert!(matches!(
+        process.shutdown(ShutdownTrigger::FirstSignal),
+        positron_runtime::ExitOutcome::Graceful
+    ));
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let reopened = InstanceBootstrap::reopen(&paths)?;
+    let administrator = reopened.attribute(
+        PresentedCredential::parse(claim.secret())?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let history = reopened.inspect_governance_audit_history(administrator)?;
+    let rejected = history
+        .records()
+        .iter()
+        .filter_map(positron_governance::GovernanceAuditEntry::as_configuration)
+        .find(|entry| entry.outcome() == ConfigurationAuditOutcome::RejectedListenerStaging)
+        .ok_or("listener staging rejection audit missing")?;
+    assert_ne!(rejected.active_digest(), rejected.candidate_digest());
+    Ok(())
+}
+
+#[test]
+fn failed_listener_staging_reports_audit_publication_failure_without_advancing_configuration()
+-> Result<(), Box<dyn std::error::Error>> {
+    let roots = TestRoots::new("configuration-listener-staging-audit-failure")?;
+    let paths = roots.bootstrap_paths()?;
+    let operations_port = available_loopback_port()?;
+    let control_path = std::env::temp_dir().join(format!(
+        "p77-listener-staging-audit-failure-{}-{operations_port}.sock",
+        std::process::id()
+    ));
+    let initial = configuration(Some(&listener_configuration(
+        control_path.clone(),
+        operations_port,
+    )))?;
+    let host = NativeHost::new(NativeBindings::from_effective(&initial)?);
+    let process = ApplicationRuntime::start(
+        ServeConfiguration::new(paths.clone(), InitializationMode::InitializeIfEmpty)
+            .with_effective_configuration(Arc::clone(&initial)),
+        HostInputs::new(&host, &host),
+    )?;
+    let runtime = process
+        .configuration()
+        .ok_or("configuration runtime missing")?;
+    let before = runtime.observed()?;
+    let occupied_api_port = process
+        .bound_endpoints()
+        .into_iter()
+        .find(|endpoint| endpoint.role() == ListenerRole::Api)
+        .and_then(|endpoint| endpoint.socket_address())
+        .ok_or("API endpoint missing")?
+        .port();
+    let candidate = configuration(Some(&listener_configuration(
+        control_path,
+        occupied_api_port,
+    )))?;
+
+    let failure = positron_kernel::with_catalog_publication_fault_after(
+        positron_kernel::CatalogPublicationFault::SynchronizeCommit,
+        0,
+        || process.reload_configuration(candidate),
+    )
+    .expect_err("a rejected staging audit must fail explicitly when it cannot commit");
+
+    assert_eq!(failure, ConfigurationRuntimeFailure::PublicationUnavailable);
+    assert_eq!(runtime.observed()?.generation(), before.generation());
+    assert_eq!(process.health().phase(), ProcessPhase::Serving);
+    assert!(matches!(
+        process.shutdown(ShutdownTrigger::FirstSignal),
+        positron_runtime::ExitOutcome::Graceful
+    ));
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let reopened = InstanceBootstrap::reopen(&paths)?;
+    let administrator = reopened.attribute(
+        PresentedCredential::parse(claim.secret())?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let history = reopened.inspect_governance_audit_history(administrator)?;
+    assert!(
+        history
+            .records()
+            .iter()
+            .filter_map(positron_governance::GovernanceAuditEntry::as_configuration)
+            .all(|entry| entry.outcome() != ConfigurationAuditOutcome::RejectedListenerStaging)
+    );
+    Ok(())
+}
+
+#[test]
+fn same_endpoint_proxy_policy_reload_keeps_the_serving_endpoints_stable()
+-> Result<(), Box<dyn std::error::Error>> {
+    let roots = TestRoots::new("configuration-listener-policy-generation")?;
+    let operations_port = available_loopback_port()?;
+    let control_path = std::env::temp_dir().join(format!(
+        "p77-listener-policy-generation-{}-{operations_port}.sock",
+        std::process::id()
+    ));
+    let initial = configuration(Some(&listener_configuration(
+        control_path.clone(),
+        operations_port,
+    )))?;
+    let host = NativeHost::new(NativeBindings::from_effective(&initial)?);
+    let process = ApplicationRuntime::start(
+        ServeConfiguration::new(
+            roots.bootstrap_paths()?,
+            InitializationMode::InitializeIfEmpty,
+        )
+        .with_effective_configuration(Arc::clone(&initial)),
+        HostInputs::new(&host, &host),
+    )?;
+    let endpoints = process.bound_endpoints();
+    let candidate = configuration(Some(&format!(
+        "{}\n[listener.operations]\ntrusted_proxy_cidrs = [\"127.0.0.1/32\"]\nforwarded_hops = 1\n",
+        listener_configuration(control_path, operations_port)
+    )))?;
+
+    let outcome = process.reload_configuration(candidate)?;
+
+    assert!(matches!(
+        outcome,
+        ConfigurationReloadOutcome::PublishedLive { .. }
+    ));
+    assert_eq!(process.bound_endpoints(), endpoints);
+    assert_eq!(process.health().phase(), ProcessPhase::Serving);
+    assert_eq!(process.health().readiness(), Readiness::Ready);
+    assert!(matches!(
+        process.shutdown(ShutdownTrigger::FirstSignal),
+        positron_runtime::ExitOutcome::Graceful
+    ));
+    Ok(())
+}
+
+fn available_loopback_port() -> Result<u16, std::io::Error> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    listener.local_addr().map(|address| address.port())
+}
+
+fn listener_configuration(control_path: std::path::PathBuf, operations_port: u16) -> String {
+    format!(
+        "schema_version = 1\n[listener]\ncontrol_path = \"{}\"\noperations_bind_address = \"127.0.0.1:{operations_port}\"\noperations_transport = \"plaintext\"\napi_bind_address = \"127.0.0.1:0\"\napi_transport = \"plaintext\"\notlp_grpc_bind_address = \"127.0.0.1:0\"\notlp_grpc_transport = \"plaintext\"\notlp_http_bind_address = \"127.0.0.1:0\"\notlp_http_transport = \"plaintext\"\nloki_push_bind_address = \"127.0.0.1:0\"\nloki_push_transport = \"plaintext\"\n",
+        control_path.display(),
+    )
 }
 
 #[test]

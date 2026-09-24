@@ -30,6 +30,8 @@ use support::*;
 
 #[path = "native_transport/policy_routes.rs"]
 mod policy_routes;
+#[path = "native_transport/proxy_trust.rs"]
+mod proxy_trust;
 #[path = "native_transport/tenant_administration.rs"]
 mod tenant_administration;
 #[path = "native_transport/tls_profiles.rs"]

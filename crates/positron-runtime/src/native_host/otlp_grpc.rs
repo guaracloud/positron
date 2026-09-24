@@ -43,6 +43,7 @@ pub(super) fn serve(
 ) -> Result<(), GrpcFailure> {
     let services = services.ok_or(GrpcFailure)?;
     let listener = admission.tcp_listener().map_err(|_| GrpcFailure)?;
+    let tls = admission.grpc_tls_config().map_err(|_| GrpcFailure)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -57,7 +58,8 @@ pub(super) fn serve(
         let incoming = TcpListenerStream::new(listener);
         let authentication = services.clone();
         let trace_authentication = services.clone();
-        let trusted_proxy = admission.trusted_proxy;
+        let trusted_proxy = admission.trusted_proxy.clone();
+        let trace_trusted_proxy = trusted_proxy.clone();
         let receiver = OtlpLogsServer::new(OtlpLogsGrpc {
             services: services.clone(),
             blocking: blocking_handle.clone(),
@@ -66,7 +68,7 @@ pub(super) fn serve(
         .max_decoding_message_size(MAX_MESSAGE_BYTES);
         let receiver = MapResponseLayer::new(map_decode_failure).named_layer(receiver);
         let receiver = InterceptedService::new(receiver, move |request| {
-            authenticate(request, &authentication, trusted_proxy)
+            authenticate(request, &authentication, trusted_proxy.clone())
         });
         let trace_receiver = OtlpTracesServer::new(OtlpTracesGrpc {
             services,
@@ -76,10 +78,17 @@ pub(super) fn serve(
         let trace_receiver =
             MapResponseLayer::new(map_trace_decode_failure).named_layer(trace_receiver);
         let trace_receiver = InterceptedService::new(trace_receiver, move |request| {
-            authenticate_traces(request, &trace_authentication, trusted_proxy)
+            authenticate_traces(request, &trace_authentication, trace_trusted_proxy.clone())
         });
         let graceful_admission = Arc::clone(&admission);
-        let serving = Server::builder()
+        let mut server = match tls {
+            Some(configuration) => match Server::builder().tls_config(configuration) {
+                Ok(server) => server,
+                Err(_) => return (Err(GrpcFailure), false),
+            },
+            None => Server::builder(),
+        };
+        let serving = server
             .add_service(receiver)
             .add_service(trace_receiver)
             .serve_with_incoming_shutdown(incoming, async move {

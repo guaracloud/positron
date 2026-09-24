@@ -1,5 +1,4 @@
 use std::io::{Read, Write};
-use std::net::TcpStream;
 
 use zeroize::Zeroizing;
 
@@ -20,6 +19,7 @@ use crate::{HealthState, ListenerRole, Liveness, Readiness, ServiceHandle};
 
 const MAX_API_BODY_BYTES: usize = positron_api::generated::MAX_PUBLIC_REQUEST_BYTES;
 
+#[allow(dead_code)]
 pub(super) fn route_tls_api<S: Read + Write>(
     stream: &mut S,
     mut head: RequestHead,
@@ -257,8 +257,8 @@ pub(super) fn route_tls_api<S: Read + Write>(
     }
 }
 
-pub(super) fn route(
-    stream: &mut TcpStream,
+pub(super) fn route<S: Read + Write>(
+    stream: &mut S,
     role: ListenerRole,
     peer: std::net::SocketAddr,
     trusted_proxy: Option<TrustedProxy>,
@@ -479,12 +479,12 @@ pub(super) fn route(
         (ListenerRole::Operations, "GET", "/health/live") => Ok(health_response(
             health.liveness() == Liveness::Live,
             "live",
-            health.security_warning(),
+            &health.security_warnings(),
         )),
         (ListenerRole::Operations, "GET", "/health/ready") => Ok(health_response(
             health.readiness() == Readiness::Ready,
             "ready",
-            health.security_warning(),
+            &health.security_warnings(),
         )),
         (ListenerRole::Operations, "GET", "/status") => {
             let bearer = Zeroizing::new(head.bearer.take().ok_or_else(|| {

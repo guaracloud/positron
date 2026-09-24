@@ -67,6 +67,18 @@ impl CatalogConfigurationPublication {
             .record_invalid_configuration_change(active)
             .map_err(|_| ConfigurationRuntimeFailure::PublicationUnavailable)
     }
+
+    /// Records a staged listener candidate that was rejected before it could
+    /// replace the active configuration generation.
+    pub fn record_rejected_listener_staging(
+        &self,
+        active: &EffectiveConfiguration,
+        candidate: &EffectiveConfiguration,
+    ) -> Result<(), ConfigurationRuntimeFailure> {
+        self.instance
+            .record_rejected_listener_staging(active, candidate)
+            .map_err(|_| ConfigurationRuntimeFailure::PublicationUnavailable)
+    }
 }
 
 impl ConfigurationPublication for CatalogConfigurationPublication {
@@ -88,8 +100,30 @@ impl InitializedInstance {
         &self,
         active: &EffectiveConfiguration,
     ) -> Result<(), BootstrapFailure> {
-        self.commit_configuration_audit_only(active, ConfigurationAuditOutcome::RejectedInvalid)
-            .map(|_| ())
+        self.commit_configuration_audit_only(
+            active,
+            active,
+            ConfigurationAuditOutcome::RejectedInvalid,
+            1,
+        )
+        .map(|_| ())
+    }
+
+    fn record_rejected_listener_staging(
+        &self,
+        active: &EffectiveConfiguration,
+        candidate: &EffectiveConfiguration,
+    ) -> Result<(), BootstrapFailure> {
+        let changed_setting_count =
+            u8::try_from(active.semantic_diff(candidate).changes().len())
+                .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        self.commit_configuration_audit_only(
+            active,
+            candidate,
+            ConfigurationAuditOutcome::RejectedListenerStaging,
+            changed_setting_count,
+        )
+        .map(|_| ())
     }
 
     pub(crate) fn establish_configuration_generation(
@@ -255,14 +289,19 @@ impl InitializedInstance {
     fn commit_configuration_audit_only(
         &self,
         active: &EffectiveConfiguration,
+        candidate: &EffectiveConfiguration,
         outcome: ConfigurationAuditOutcome,
+        changed_setting_count: u8,
     ) -> Result<u64, BootstrapFailure> {
         let secret = self
             .key
             .catalog_secret(self.instance)
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
-        let binding = ConfigurationAuditBinding::from_configuration(&secret, active)
+        let active_binding = ConfigurationAuditBinding::from_configuration(&secret, active)
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        let candidate_binding =
+            ConfigurationAuditBinding::from_configuration(&secret, candidate)
+                .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
         let catalog = Catalog::open(&self._authority, self.instance, secret)
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
         let basis = catalog
@@ -272,8 +311,13 @@ impl InitializedInstance {
             .number()
             .checked_add(1)
             .ok_or_else(|| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
-        let request =
-            self.configuration_audit_request(outcome, catalog_generation, 1, binding, binding)?;
+        let request = self.configuration_audit_request(
+            outcome,
+            catalog_generation,
+            changed_setting_count,
+            active_binding,
+            candidate_binding,
+        )?;
         let transaction = TransactionId::new(request.transaction_id())
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
         let objects = successor_objects(&basis, transaction, None)?;
@@ -557,6 +601,7 @@ const fn configuration_outcome_code(outcome: ConfigurationAuditOutcome) -> u8 {
         ConfigurationAuditOutcome::RequiresDrain => 4,
         ConfigurationAuditOutcome::RejectedInvalid => 5,
         ConfigurationAuditOutcome::FencedDrift => 6,
+        ConfigurationAuditOutcome::RejectedListenerStaging => 7,
     }
 }
 

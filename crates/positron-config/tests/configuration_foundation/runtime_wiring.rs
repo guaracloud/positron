@@ -126,6 +126,35 @@ fn api_transport_profile_allows_explicit_public_tls_and_plaintext() {
     );
 }
 
+#[test]
+fn complete_listener_profiles_keep_public_plaintext_an_explicit_visible_role_choice() {
+    let effective = inputs(
+        Some(
+            "schema_version = 1\n[listener]\n\
+             otlp_grpc_bind_address = \"192.0.2.9:4317\"\n\
+             otlp_grpc_transport = \"plaintext\"\n",
+        ),
+        [],
+        [],
+    )
+    .and_then(resolve)
+    .expect("an explicit per-role plaintext opt-out resolves");
+
+    let profile = effective
+        .network_listener_profile(positron_config::NetworkListenerRole::OtlpGrpc)
+        .expect("OTLP gRPC profile");
+    assert_eq!(profile.bind_address().to_string(), "192.0.2.9:4317");
+    assert_eq!(profile.transport(), positron_config::NetworkTransport::PlaintextOptOut);
+    assert!(effective.security_warnings().contains(
+        &positron_config::ConfigurationWarning::PublicPlaintextListener(
+            positron_config::NetworkListenerRole::OtlpGrpc
+        )
+    ));
+    assert!(effective
+        .redacted_reference()
+        .contains("OTLP gRPC transport is plaintext"));
+}
+
 fn assert_document_rejection<T>(
     result: Result<T, ConfigurationFailure>,
     code: ConfigurationFailureCode,

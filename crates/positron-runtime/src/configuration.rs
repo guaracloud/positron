@@ -286,6 +286,38 @@ impl RuntimeConfiguration {
         }
     }
 
+    /// Commits a candidate whose drain-and-reload Listener Set has already
+    /// been staged by the process owner. Staging happens before this durable
+    /// Catalog and Governance Audit publication; only a successful
+    /// publication may make the successor configuration observable.
+    pub(crate) fn publish_staged_listener_reload(
+        &self,
+        candidate: Arc<EffectiveConfiguration>,
+        publication: &dyn ConfigurationPublication,
+    ) -> Result<ConfigurationReloadOutcome, ConfigurationRuntimeFailure> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| ConfigurationRuntimeFailure::Unavailable)?;
+        let diff = state.effective.semantic_diff(&candidate);
+        if diff.plan() != ConfigurationDiffPlan::DrainThenPublish {
+            return Err(ConfigurationRuntimeFailure::Unavailable);
+        }
+        let generation = publication.publish(
+            &state.effective,
+            &candidate,
+            &diff,
+            ConfigurationPublicationDisposition::PublishedLive,
+        )?;
+        validate_successor_generation(state.generation, generation)?;
+        state.generation = generation;
+        state.effective = Arc::clone(&candidate);
+        state.desired = candidate;
+        state.drift_disposition = ConfigurationDriftDisposition::None;
+        state.pending_restart = None;
+        Ok(ConfigurationReloadOutcome::PublishedLive { generation, diff })
+    }
+
     /// Records a security- or identity-sensitive desired-state drift while
     /// retaining the active configuration. Callers fence data admission only
     /// after this durable evidence has been accepted.
@@ -340,6 +372,7 @@ fn validate_successor_generation(
 pub enum ConfigurationRuntimeFailure {
     Unavailable,
     PublicationUnavailable,
+    ListenerUnavailable,
     ImmutableConfiguration,
 }
 
@@ -348,6 +381,7 @@ impl Display for ConfigurationRuntimeFailure {
         formatter.write_str(match self {
             Self::Unavailable => "configuration runtime is unavailable",
             Self::PublicationUnavailable => "configuration publication is unavailable",
+            Self::ListenerUnavailable => "listener replacement is unavailable",
             Self::ImmutableConfiguration => {
                 "configuration changes an immutable initialized setting"
             },

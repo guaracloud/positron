@@ -65,6 +65,7 @@ pub fn render_json_schema() -> String {
                 .path()
                 .split_once('.')
                 .is_some_and(|(path_section, _)| path_section == section)
+                && definition.path().split('.').count() == 2
         }) {
             let Some((_, field)) = definition.path().split_once('.') else {
                 continue;
@@ -75,10 +76,44 @@ pub fn render_json_schema() -> String {
             output.push_str(&format!("\"{field}\": {}", render_schema_value(definition)));
             first = false;
         }
+        if section == "listener" {
+            append_listener_role_schema(&mut output, &mut first, &definitions);
+        }
         output.push_str("}}");
     }
     output.push_str("\n  },\n  \"required\": [\"schema_version\"]\n}\n");
     output
+}
+
+fn append_listener_role_schema(
+    output: &mut String,
+    first: &mut bool,
+    definitions: &[SettingDefinition],
+) {
+    for role in ["operations", "api", "otlp_grpc", "otlp_http", "loki_push"] {
+        let cidr_path = format!("listener.{role}.trusted_proxy_cidrs");
+        let hop_path = format!("listener.{role}.forwarded_hops");
+        let cidrs = definitions
+            .iter()
+            .copied()
+            .find(|definition| definition.path() == cidr_path);
+        let hops = definitions
+            .iter()
+            .copied()
+            .find(|definition| definition.path() == hop_path);
+        let (Some(cidrs), Some(hops)) = (cidrs, hops) else {
+            continue;
+        };
+        if !*first {
+            output.push_str(", ");
+        }
+        output.push_str(&format!(
+            "\"{role}\": {{\"type\": \"object\", \"additionalProperties\": false, \"properties\": {{\"trusted_proxy_cidrs\": {}, \"forwarded_hops\": {}}}}}",
+            render_schema_value(cidrs),
+            render_schema_value(hops),
+        ));
+        *first = false;
+    }
 }
 
 fn render_schema_value(definition: SettingDefinition) -> String {
@@ -107,6 +142,9 @@ fn render_schema_value(definition: SettingDefinition) -> String {
         },
         ValueDomain::ExportDestinations(maximum, maximum_name_bytes, maximum_tenants) => format!(
             "{{\"type\": \"array\", \"maxItems\": {maximum}, \"items\": {{\"type\": \"object\", \"additionalProperties\": false, \"required\": [\"name\", \"identity\", \"allowed_tenants\"], \"properties\": {{\"name\": {{\"type\": \"string\", \"minLength\": 1, \"maxLength\": {maximum_name_bytes}, \"pattern\": \"^[a-z0-9]+(?:-[a-z0-9]+)*$\"}}, \"identity\": {{\"type\": \"string\", \"pattern\": \"^[0-9a-f]{{32}}$\", \"not\": {{\"const\": \"00000000000000000000000000000000\"}}}}, \"allowed_tenants\": {{\"type\": \"array\", \"minItems\": 1, \"maxItems\": {maximum_tenants}, \"uniqueItems\": true, \"items\": {{\"type\": \"string\", \"pattern\": \"^[0-9a-f]{{8}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{12}}$\"}}}}}}}}}}"
+        ),
+        ValueDomain::TrustedProxyCidrs(maximum_entries, maximum_entry_bytes) => format!(
+            "{{\"type\": \"array\", \"maxItems\": {maximum_entries}, \"items\": {{\"type\": \"string\", \"maxLength\": {maximum_entry_bytes}, \"x-positron-address-kind\": \"literal-ip-cidr\"}}}}"
         ),
     }
 }
@@ -139,12 +177,28 @@ pub fn render_reference() -> String {
     for definition in setting_definitions() {
         let default = if definition.secrecy() == SecrecyClass::SecretBearing {
             "<redacted protected-file reference>"
-        } else if definition.setting() == Setting::ExportDestinations {
+        } else if matches!(
+            definition.setting(),
+            Setting::ExportDestinations
+                | Setting::ListenerOperationsTrustedProxyCidrs
+                | Setting::ListenerApiTrustedProxyCidrs
+                | Setting::ListenerOtlpGrpcTrustedProxyCidrs
+                | Setting::ListenerOtlpHttpTrustedProxyCidrs
+                | Setting::ListenerLokiPushTrustedProxyCidrs
+        ) {
             "disabled"
         } else {
             definition.default_value()
         };
-        let default = if definition.setting() == Setting::ExportDestinations {
+        let default = if matches!(
+            definition.setting(),
+            Setting::ExportDestinations
+                | Setting::ListenerOperationsTrustedProxyCidrs
+                | Setting::ListenerApiTrustedProxyCidrs
+                | Setting::ListenerOtlpGrpcTrustedProxyCidrs
+                | Setting::ListenerOtlpHttpTrustedProxyCidrs
+                | Setting::ListenerLokiPushTrustedProxyCidrs
+        ) {
             default.to_owned()
         } else {
             format!("`{default}`")
@@ -186,6 +240,7 @@ pub fn render_example() -> String {
             .filter(|definition| {
                 definition.secrecy() == SecrecyClass::Public
                     && definition.kind() != SettingKind::ExportDestinations
+                    && definition.path().split('.').count() == 2
                     && definition.path().starts_with(&format!("{section}."))
             })
             .collect::<Vec<_>>();
@@ -195,6 +250,9 @@ pub fn render_example() -> String {
         output.push_str(&format!("\n[{section}]\n"));
         for definition in settings {
             append_example_setting(&mut output, definition);
+        }
+        if section == "listener" {
+            append_proxy_trust_example(&mut output);
         }
     }
     output
@@ -209,14 +267,27 @@ fn append_example_setting(output: &mut String, definition: SettingDefinition) {
     let value = match definition.kind() {
         SettingKind::Integer => definition.default_value().to_owned(),
         SettingKind::String => render_toml_basic_string(definition.default_value()),
-        SettingKind::ExportDestinations => return,
+        SettingKind::ExportDestinations | SettingKind::TrustedProxyCidrs => return,
     };
     output.push_str(&format!("{field} = {value}\n"));
+}
+
+fn append_proxy_trust_example(output: &mut String) {
+    for role in ["operations", "api", "otlp_grpc", "otlp_http", "loki_push"] {
+        output.push_str("\n[listener.");
+        output.push_str(role);
+        output.push_str("]\ntrusted_proxy_cidrs = []\nforwarded_hops = 0\n");
+    }
 }
 
 fn reference_kind(definition: SettingDefinition) -> &'static str {
     match definition.setting() {
         Setting::ExportDestinations => "array of tables",
+        Setting::ListenerOperationsTrustedProxyCidrs
+        | Setting::ListenerApiTrustedProxyCidrs
+        | Setting::ListenerOtlpGrpcTrustedProxyCidrs
+        | Setting::ListenerOtlpHttpTrustedProxyCidrs
+        | Setting::ListenerLokiPushTrustedProxyCidrs => "array",
         _ => definition.kind().as_str(),
     }
 }
@@ -236,6 +307,7 @@ fn reference_domain(definition: SettingDefinition) -> String {
             ValueDomain::AbsolutePath(maximum) => format!("absolute path; at most {maximum} bytes"),
             ValueDomain::ProtectedAbsolutePath(maximum) => format!("protected absolute path; at most {maximum} bytes"),
             ValueDomain::ExportDestinations(maximum, name, tenants) => format!("at most {maximum} named destinations; each has a lowercase `name` of at most {name} bytes, a nonzero 16-byte lowercase hexadecimal `identity`, and one to {tenants} unique canonical `allowed_tenants`"),
+            ValueDomain::TrustedProxyCidrs(maximum, maximum_bytes) => format!("at most {maximum} literal IPv4 or IPv6 CIDRs, each at most {maximum_bytes} bytes; forwarded headers remain ignored unless this list and the matching nonzero fixed hop count are both configured"),
         },
     }
 }

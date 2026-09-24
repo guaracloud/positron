@@ -1,10 +1,10 @@
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
 use positron_governance::{CompatibilityHints, PresentedCredential, RequestedIntent};
 
 use crate::{
-    ConfigurationObservation, ConfigurationRuntimeFailure, InitializedInstance,
+    ConfigurationObservation, ConfigurationRuntimeFailure, InitializedInstance, ListenerRole,
     RuntimeConfiguration,
 };
 
@@ -38,15 +38,33 @@ pub enum Liveness {
 /// A bounded operator-visible security condition that does not affect readiness.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HealthWarning {
-    /// The API listener is using the explicit plaintext transport opt-out.
+    /// One listener role is using the explicit plaintext transport opt-out.
+    PlaintextListener(ListenerRole),
+    /// Compatibility view for the public API plaintext opt-out.
     PublicPlaintextApi,
+}
+
+impl HealthWarning {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::PlaintextListener(ListenerRole::Operations) => "operations_plaintext",
+            Self::PlaintextListener(ListenerRole::Api) | Self::PublicPlaintextApi => {
+                "public_plaintext_api"
+            },
+            Self::PlaintextListener(ListenerRole::OtlpGrpc) => "otlp_grpc_plaintext",
+            Self::PlaintextListener(ListenerRole::OtlpHttp) => "otlp_http_plaintext",
+            Self::PlaintextListener(ListenerRole::LokiPush) => "loki_push_plaintext",
+            Self::PlaintextListener(ListenerRole::Control) => "control_plaintext",
+        }
+    }
 }
 
 /// A read-only view of the runtime's single phase authority.
 #[derive(Clone)]
 pub struct HealthState {
     phase: Arc<AtomicU8>,
-    public_plaintext_api: Arc<AtomicBool>,
+    plaintext_listener_roles: Arc<AtomicU8>,
     configuration: Arc<OnceLock<Arc<RuntimeConfiguration>>>,
     inspection_authority: Arc<OnceLock<Weak<InitializedInstance>>>,
 }
@@ -91,9 +109,24 @@ impl HealthState {
     /// Returns the active transport warning without changing admission readiness.
     #[must_use]
     pub fn security_warning(&self) -> Option<HealthWarning> {
-        self.public_plaintext_api
-            .load(Ordering::Acquire)
-            .then_some(HealthWarning::PublicPlaintextApi)
+        self.security_warnings().into_iter().next()
+    }
+
+    /// Returns every active, bounded plaintext transport warning.
+    #[must_use]
+    pub fn security_warnings(&self) -> Vec<HealthWarning> {
+        let roles = self.plaintext_listener_roles.load(Ordering::Acquire);
+        ListenerRole::all()
+            .into_iter()
+            .filter(|role| plaintext_role_bit(*role).is_some_and(|bit| roles & bit != 0))
+            .map(|role| {
+                if role == ListenerRole::Api {
+                    HealthWarning::PublicPlaintextApi
+                } else {
+                    HealthWarning::PlaintextListener(role)
+                }
+            })
+            .collect()
     }
 
     /// Returns the one canonical configuration observation available to
@@ -133,7 +166,7 @@ impl ProcessState {
         Self {
             health: HealthState {
                 phase: Arc::new(AtomicU8::new(ProcessPhase::Starting as u8)),
-                public_plaintext_api: Arc::new(AtomicBool::new(false)),
+                plaintext_listener_roles: Arc::new(AtomicU8::new(0)),
                 configuration: Arc::new(OnceLock::new()),
                 inspection_authority: Arc::new(OnceLock::new()),
             },
@@ -148,10 +181,16 @@ impl ProcessState {
         self.health.phase.store(phase as u8, Ordering::Release);
     }
 
-    pub(crate) fn set_public_plaintext_api_warning(&self, enabled: bool) {
+    pub(crate) fn set_plaintext_listener_warnings(
+        &self,
+        intents: &[crate::PublicPlaintextApiStartupIntent],
+    ) {
+        let roles = intents.iter().fold(0_u8, |roles, intent| {
+            plaintext_role_bit(intent.role()).map_or(roles, |bit| roles | bit)
+        });
         self.health
-            .public_plaintext_api
-            .store(enabled, Ordering::Release);
+            .plaintext_listener_roles
+            .store(roles, Ordering::Release);
     }
 
     pub(crate) fn set_configuration_runtime(
@@ -172,6 +211,17 @@ impl ProcessState {
             .inspection_authority
             .set(Arc::downgrade(&authority))
             .map_err(|_| ConfigurationRuntimeFailure::Unavailable)
+    }
+}
+
+fn plaintext_role_bit(role: ListenerRole) -> Option<u8> {
+    match role {
+        ListenerRole::Control => None,
+        ListenerRole::Operations => Some(1),
+        ListenerRole::Api => Some(1 << 1),
+        ListenerRole::OtlpGrpc => Some(1 << 2),
+        ListenerRole::OtlpHttp => Some(1 << 3),
+        ListenerRole::LokiPush => Some(1 << 4),
     }
 }
 

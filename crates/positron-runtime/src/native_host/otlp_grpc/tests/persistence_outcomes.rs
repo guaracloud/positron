@@ -281,8 +281,9 @@ impl ReceiverHarness {
             role: ListenerRole::OtlpGrpc,
             listener: NativeListener::Tcp(listener),
             accepting: AtomicBool::new(true),
+            accepted_connections: AtomicUsize::new(0),
             control_path: None,
-            api_transport: None,
+            transport: None,
             trusted_proxy: None,
         });
         let cancellation = TaskCancellation::new();

@@ -16,12 +16,19 @@ impl positron_runtime::RecoveryAttemptHost for ExhaustOnFailure {
 fn explicit_plaintext_api_transport_stays_ready_with_a_persistent_health_warning()
 -> Result<(), Box<dyn std::error::Error>> {
     let plaintext_roots = TestRoots::new("plaintext-transport-warning")?;
+    let plaintext_paths = plaintext_roots.bootstrap_paths()?;
     let plaintext_listeners = ObservingListeners::default();
     let plaintext_tasks = ObservingTasks::default();
     let plaintext = ApplicationRuntime::start(
         ServeConfiguration::new(
-            plaintext_roots.bootstrap_paths()?,
+            plaintext_paths.clone(),
             InitializationMode::InitializeIfEmpty,
+        )
+        .with_plaintext_listener_intent(
+            PublicPlaintextApiStartupIntent::configuration_file_listener(
+                ListenerRole::Operations,
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 13_133)),
+            ),
         )
         .with_public_plaintext_api_intent(
             PublicPlaintextApiStartupIntent::configuration_file(SocketAddr::from((
@@ -33,13 +40,36 @@ fn explicit_plaintext_api_transport_stays_ready_with_a_persistent_health_warning
     )?;
     assert_eq!(plaintext.health().readiness(), Readiness::Ready);
     assert_eq!(
-        plaintext.health().security_warning(),
-        Some(positron_runtime::HealthWarning::PublicPlaintextApi)
+        plaintext.health().security_warnings(),
+        [
+            positron_runtime::HealthWarning::PlaintextListener(ListenerRole::Operations),
+            positron_runtime::HealthWarning::PublicPlaintextApi,
+        ]
     );
     assert_eq!(
         plaintext.shutdown(ShutdownTrigger::FirstSignal),
         positron_runtime::ExitOutcome::Graceful
     );
+    let claim = positron_runtime::InstanceBootstrap::claim(&plaintext_paths)?;
+    let reopened = positron_runtime::InstanceBootstrap::reopen(&plaintext_paths)?;
+    let administrator = reopened.attribute(
+        positron_governance::PresentedCredential::parse(claim.secret())?,
+        positron_governance::RequestedIntent::SystemAdministration,
+        positron_governance::CompatibilityHints::none(),
+    )?;
+    let history = reopened.inspect_governance_audit_history(administrator)?;
+    let plaintext_audits = history
+        .records()
+        .iter()
+        .filter_map(positron_governance::GovernanceAuditEntry::as_listener_transport)
+        .collect::<Vec<_>>();
+    assert_eq!(plaintext_audits.len(), 2);
+    assert!(plaintext_audits.iter().any(|entry| {
+        entry.listener_target() == Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 13_133)))
+    }));
+    assert!(plaintext_audits.iter().any(|entry| {
+        entry.listener_target() == Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 8_080)))
+    }));
 
     let tls_roots = TestRoots::new("tls-transport-warning")?;
     let tls_listeners = ObservingListeners::default();

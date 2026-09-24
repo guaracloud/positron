@@ -28,3 +28,4 @@ include!("configuration_foundation/quoting.rs");
 include!("configuration_foundation/overrides.rs");
 include!("configuration_foundation/runtime_wiring.rs");
 include!("configuration_foundation/loki_listener.rs");
+include!("configuration_foundation/proxy_trust.rs");

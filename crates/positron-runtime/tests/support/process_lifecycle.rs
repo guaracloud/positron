@@ -169,10 +169,13 @@ struct ObservedRunningTask {
 
 impl RunningTask for ObservedRunningTask {
     fn poll_join(&mut self) -> Result<Option<TaskJoinOutcome>, TaskFailure> {
-        self.join().map(Some)
+        self.join_within(std::time::Duration::ZERO).map(Some)
     }
 
-    fn join(&mut self) -> Result<TaskJoinOutcome, TaskFailure> {
+    fn join_within(
+        &mut self,
+        _remaining: std::time::Duration,
+    ) -> Result<TaskJoinOutcome, TaskFailure> {
         self.events.borrow_mut().push(TaskEvent::Joined(
             self.role,
             self.health.phase(),

@@ -254,7 +254,7 @@ fn sighup_reloads_a_valid_candidate_and_keeps_serving_after_a_rejected_candidate
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(
         String::from_utf8(output.stderr)?,
-        "positron: configuration reload rejected\n"
+        "positron: warning: operations transport is plaintext\npositron: configuration reload rejected\n"
     );
     fs::remove_dir_all(root)?;
     Ok(())

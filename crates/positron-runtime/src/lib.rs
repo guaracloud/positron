@@ -31,10 +31,14 @@ pub use instance_bootstrap::{
     InitializationPlan, InitializedInstance, InstanceBootstrap, TenantRetentionImpactPreview,
 };
 pub use listener::{
-    BoundEndpoint, BoundListener, ListenerFactory, ListenerFailure, ListenerRequest, ListenerRole,
+    BoundEndpoint, BoundListener, ListenerFactory, ListenerFailure, ListenerGeneration,
+    ListenerGenerationActivation, ListenerGenerationFactory, ListenerProfile, ListenerRequest,
+    ListenerRole, ListenerTransport, ValidatedListenerSet,
 };
 pub use native_host::{
-    ApiTransportProfile, NativeBindings, NativeHost, NativeHostFailure, TrustedProxy,
+    ApiTransportProfile, NativeBindings, NativeHost, NativeHostFailure, ProxyTrustFailure,
+    TlsFailure, TlsIdentity, TlsProfile, TlsTrust, TransportProfile, TrustedCidr, TrustedProxy,
+    TrustedProxyPolicy,
 };
 pub use process::{
     ApplicationRuntime, CleanupFailure, CleanupPrimary, CleanupRole, DrainingProcess, ExitOutcome,
@@ -71,10 +75,7 @@ pub fn fuzz_process_inputs(data: &[u8]) {
             u16::from(byte),
         ));
         let endpoint = BoundEndpoint::tcp(role, address);
-        assert_eq!(
-            endpoint.is_ok(),
-            role != ListenerRole::Control && address.ip().is_loopback()
-        );
+        assert_eq!(endpoint.is_ok(), role != ListenerRole::Control);
         let control = BoundEndpoint::control(PathBuf::from(format!("/tmp/{byte}.sock")));
         assert!(control.is_ok());
     }
