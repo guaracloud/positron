@@ -6,8 +6,9 @@ use super::{
     schema_checkpoint_audit_intent,
 };
 use crate::{
-    ApiKeyLifecycleAction, DurableOperationKind, DurableOperationPhase, DurableOperationStatus,
-    InitialAuditContext, InitialGovernanceIntent, InitialTenantIntent, ListenerTransportAuditEntry,
+    ApiKeyLifecycleAction, ConfigurationAuditOutcome, ConfigurationAuditRequest,
+    DurableOperationKind, DurableOperationPhase, DurableOperationStatus, InitialAuditContext,
+    InitialGovernanceIntent, InitialTenantIntent, ListenerTransportAuditEntry,
     ListenerTransportAuditRequest, ListenerTransportConfigurationProvenance, ResourceGeneration,
 };
 
@@ -551,4 +552,45 @@ fn tenant_retention_audit_is_typed_redacted_and_strict() {
     let mut trailing = intent;
     trailing.push(0);
     assert!(GovernanceAuditEntry::decode_fields(10, transaction, &trailing).is_err());
+}
+
+#[test]
+fn configuration_audit_binds_the_fenced_drift_to_one_catalog_generation() {
+    let context = crate::ConfigurationAuditContext::new(
+        ConfigurationAuditOutcome::FencedDrift,
+        1_725_000_000,
+        PrincipalId::from_bytes([0x31; 16]).expect("principal"),
+        None,
+        [0x32; 16],
+        [0x33; 16],
+    )
+    .expect("valid configuration audit context");
+    let request = ConfigurationAuditRequest::new(context, 42, 1, [0x41; 32], [0x42; 32])
+        .expect("valid configuration audit request");
+    let encoded = request.encode();
+    let entry = GovernanceAuditEntry::decode_fields(9, request.transaction_id(), &encoded)
+        .expect("typed configuration audit");
+    let configuration = entry.as_configuration().expect("configuration entry");
+    assert_eq!(entry.action(), "configuration.reload");
+    assert_eq!(entry.outcome(), "rejected");
+    assert_eq!(configuration.position(), 9);
+    assert_eq!(
+        configuration.outcome(),
+        ConfigurationAuditOutcome::FencedDrift
+    );
+    assert_eq!(configuration.catalog_generation(), 42);
+    assert_eq!(configuration.ingest_time_unix_seconds(), 1_725_000_000);
+    assert_eq!(configuration.principal().to_bytes(), [0x31; 16]);
+    assert_eq!(configuration.applicable_tenant(), None);
+    assert_eq!(configuration.target(), [0x32; 16]);
+    assert_eq!(configuration.request_id(), [0x33; 16]);
+    assert_eq!(configuration.active_digest(), [0x41; 32]);
+    assert_eq!(configuration.candidate_digest(), [0x42; 32]);
+
+    let mut wrong_digest = encoded;
+    let digest_start = wrong_digest.len() - 32;
+    wrong_digest[digest_start] ^= 1;
+    assert!(
+        GovernanceAuditEntry::decode_fields(9, request.transaction_id(), &wrong_digest).is_err()
+    );
 }

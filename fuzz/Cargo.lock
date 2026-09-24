@@ -1138,6 +1138,7 @@ version = "0.0.0"
 dependencies = [
  "positron-domain",
  "rustix",
+ "sha2",
  "toml",
 ]
 

@@ -1,14 +1,16 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use positron_config::{ConfigurationDrift, ConfigurationDriftDisposition, EffectiveConfiguration};
 use positron_kernel::OwnedPrimaryDataVolume;
 
 use crate::health::ProcessState;
 use crate::{
     BootstrapFailure, BootstrapFailureCode, BootstrapPaths, BoundEndpoint, BoundListener,
+    CatalogConfigurationPublication, ConfigurationReloadOutcome, ConfigurationRuntimeFailure,
     HealthState, InitializationPlan, InstanceBootstrap, ListenerFactory, ListenerRequest,
-    ListenerRole, ProcessPhase, RegisteredTask, RunningTask, ServiceHandle, TaskCancellation,
-    TaskFailure, TaskJoinOutcome, TaskRegistrar, TaskRole,
+    ListenerRole, ProcessPhase, RegisteredTask, RunningTask, RuntimeConfiguration, ServiceHandle,
+    TaskCancellation, TaskFailure, TaskJoinOutcome, TaskRegistrar, TaskRole,
 };
 
 /// Whether serving may initialize a provably empty instance.
@@ -45,6 +47,7 @@ pub struct ServeConfiguration {
     max_registered_tenants: u16,
     public_plaintext_api_intent: Option<PublicPlaintextApiStartupIntent>,
     export_destination_resolver: Option<Arc<dyn positron_query::ExportDestinationResolver>>,
+    effective_configuration: Option<Arc<EffectiveConfiguration>>,
     admission_group_planner: Option<Arc<dyn positron_ingest::AdmissionGroupPlanner>>,
 }
 
@@ -57,6 +60,7 @@ impl ServeConfiguration {
             max_registered_tenants: 2,
             public_plaintext_api_intent: None,
             export_destination_resolver: None,
+            effective_configuration: None,
             admission_group_planner: None,
         }
     }
@@ -96,6 +100,16 @@ impl ServeConfiguration {
         self.export_destination_resolver = Some(resolver);
         self
     }
+
+    /// Passes the canonical resolved Configuration Contract to the runtime.
+    #[must_use]
+    pub fn with_effective_configuration(
+        mut self,
+        configuration: Arc<EffectiveConfiguration>,
+    ) -> Self {
+        self.effective_configuration = Some(configuration);
+        self
+    }
 }
 
 impl std::fmt::Debug for ServeConfiguration {
@@ -116,6 +130,10 @@ impl std::fmt::Debug for ServeConfiguration {
             .field(
                 "export_destination_resolver",
                 &self.export_destination_resolver.is_some(),
+            )
+            .field(
+                "effective_configuration",
+                &self.effective_configuration.is_some(),
             )
             .finish()
     }
@@ -256,6 +274,8 @@ pub struct RunningProcess {
     instance: Option<Arc<crate::InitializedInstance>>,
     fenced_volume: Option<OwnedPrimaryDataVolume>,
     services: Option<ServiceHandle>,
+    configuration: Option<Arc<RuntimeConfiguration>>,
+    configuration_publication: Option<CatalogConfigurationPublication>,
     cleanup: CleanupAccumulator,
     terminal_cleanup_complete: bool,
 }
@@ -297,6 +317,80 @@ impl RunningProcess {
     #[must_use]
     pub fn services(&self) -> Option<ServiceHandle> {
         self.services.clone()
+    }
+
+    /// Returns the only complete Configuration generation visible to runtime
+    /// consumers and authenticated inspection.
+    #[must_use]
+    pub fn configuration(&self) -> Option<Arc<RuntimeConfiguration>> {
+        self.configuration.clone()
+    }
+
+    /// Publishes an already resolved candidate only through the joint Catalog
+    /// and Governance Audit commit point.
+    pub fn reload_configuration(
+        &self,
+        candidate: Arc<EffectiveConfiguration>,
+    ) -> Result<ConfigurationReloadOutcome, ConfigurationRuntimeFailure> {
+        let runtime = self
+            .configuration
+            .as_ref()
+            .ok_or(ConfigurationRuntimeFailure::Unavailable)?;
+        let outcome = runtime.reload_with(
+            Arc::clone(&candidate),
+            self.configuration_publication
+                .as_ref()
+                .ok_or(ConfigurationRuntimeFailure::Unavailable)?,
+        )?;
+        Ok(outcome)
+    }
+
+    /// Records a rejected source document while retaining the current complete
+    /// runtime configuration.
+    pub fn record_invalid_configuration_reload(&self) -> Result<(), ConfigurationRuntimeFailure> {
+        let runtime = self
+            .configuration
+            .as_ref()
+            .ok_or(ConfigurationRuntimeFailure::Unavailable)?;
+        let active = runtime.observed()?;
+        self.configuration_publication
+            .as_ref()
+            .ok_or(ConfigurationRuntimeFailure::Unavailable)?
+            .record_invalid(active.effective())
+    }
+
+    /// Reconciles ordinary desired-state drift through the durable reload
+    /// path. Security, storage, and identity drift are instead durably
+    /// reported and immediately stop data admission.
+    pub fn reconcile_configuration_drift(
+        &self,
+        desired: Arc<EffectiveConfiguration>,
+    ) -> Result<ConfigurationDrift, ConfigurationRuntimeFailure> {
+        let runtime = self
+            .configuration
+            .as_ref()
+            .ok_or(ConfigurationRuntimeFailure::Unavailable)?;
+        if let Some(drift) = runtime.clear_matching_desired_configuration(&desired)? {
+            return Ok(drift);
+        }
+        let drift = runtime.drift_against(Arc::clone(&desired))?;
+        match drift.disposition() {
+            ConfigurationDriftDisposition::None => Ok(drift),
+            ConfigurationDriftDisposition::Reconcile => {
+                self.reload_configuration(desired)?;
+                Ok(drift)
+            },
+            ConfigurationDriftDisposition::Fence => {
+                let drift = runtime.record_fenced_drift_with(
+                    Arc::clone(&desired),
+                    self.configuration_publication
+                        .as_ref()
+                        .ok_or(ConfigurationRuntimeFailure::Unavailable)?,
+                )?;
+                self.state.transition(ProcessPhase::Fenced);
+                Ok(drift)
+            },
+        }
     }
 
     #[must_use]

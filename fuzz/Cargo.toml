@@ -30,6 +30,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "configuration_reload"
+path = "fuzz_targets/configuration_reload.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "primary_data_volume_stateful"
 path = "fuzz_targets/primary_data_volume_stateful.rs"
 test = false

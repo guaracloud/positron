@@ -2,6 +2,7 @@ use std::fmt::{Debug, Formatter};
 use std::net::SocketAddr;
 
 use positron_domain::identity::TenantId;
+use sha2::{Digest, Sha256};
 
 use super::{
     ApiTransport, ConfigurationFailure, ConfigurationFailureCode, LogLevel, MutabilityClass,
@@ -215,6 +216,51 @@ impl EffectiveConfiguration {
         &self.local_key_file
     }
 
+    /// Returns the durable, non-reversible binding for settings that may only
+    /// change through an explicit initialization, migration, or restore
+    /// workflow. The Catalog stores this digest instead of protected paths.
+    #[must_use]
+    pub fn immutable_configuration_digest(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(b"positron.configuration.immutable.v1\0");
+        for definition in contract::SETTING_DEFINITIONS {
+            if definition.mutability() != MutabilityClass::ImmutableAfterInitialization {
+                continue;
+            }
+            update_digest_string(&mut hasher, definition.path());
+            update_digest_string(
+                &mut hasher,
+                &self.canonical_identity_value(definition.setting()),
+            );
+        }
+        let digest = hasher.finalize();
+        let mut result = [0; 32];
+        result.copy_from_slice(&digest);
+        result
+    }
+
+    /// Returns the complete, non-reversible configuration intent bound to
+    /// private Catalog binding and an opaque Governance Audit request
+    /// identifier. Unlike the public redacted rendering, this includes
+    /// protected file references so two candidates with different protected
+    /// inputs cannot share audit intent.
+    #[must_use]
+    pub fn audit_binding_digest(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(b"positron.configuration.audit-binding.v1\0");
+        for definition in contract::SETTING_DEFINITIONS {
+            update_digest_string(&mut hasher, definition.path());
+            update_digest_string(
+                &mut hasher,
+                &self.canonical_identity_value(definition.setting()),
+            );
+        }
+        let digest = hasher.finalize();
+        let mut result = [0; 32];
+        result.copy_from_slice(&digest);
+        result
+    }
+
     /// Returns an operator-configured destination only when its scope includes
     /// the authenticated tenant. No configured entries means durable export is
     /// disabled.
@@ -279,6 +325,14 @@ impl EffectiveConfiguration {
         }
         let plan = ConfigurationDiffPlan::from_changes(&changes);
         ConfigurationDiff { changes, plan }
+    }
+
+    /// Compares one operator-rendered desired configuration to this observed
+    /// active configuration without exposing secret-bearing values.
+    #[must_use]
+    pub fn drift_against(&self, desired: &Self) -> ConfigurationDrift {
+        let diff = self.semantic_diff(desired);
+        ConfigurationDrift::from_diff(diff)
     }
 
     #[must_use]
@@ -366,6 +420,43 @@ impl EffectiveConfiguration {
         Ok(ConfigurationPlan::from_changes(changes))
     }
 
+    /// Produces the active successor after applying only settings the
+    /// Configuration Contract classifies as live-reloadable. Callers retain
+    /// the complete candidate separately when restart-required settings are
+    /// pending, so no consumer can observe a partly applied candidate.
+    #[must_use]
+    pub fn with_live_changes_from(&self, candidate: &Self) -> Self {
+        let mut active = self.clone();
+        for definition in contract::SETTING_DEFINITIONS {
+            let setting = definition.setting();
+            if setting.mutability() != MutabilityClass::LiveReloadable
+                || !self.setting_differs(candidate, setting)
+            {
+                continue;
+            }
+            match setting {
+                Setting::DiagnosticsLogLevel => active.log_level = candidate.log_level,
+                Setting::SchemaVersion
+                | Setting::RuntimeShutdownGraceSeconds
+                | Setting::RuntimeMaxRegisteredTenants
+                | Setting::ListenerControlPath
+                | Setting::ListenerOperationsBindAddress
+                | Setting::ListenerApiBindAddress
+                | Setting::ListenerApiTransport
+                | Setting::ListenerApiTlsCertificateFile
+                | Setting::ListenerApiTlsPrivateKeyFile
+                | Setting::ListenerOtlpGrpcBindAddress
+                | Setting::ListenerOtlpHttpBindAddress
+                | Setting::ListenerLokiPushBindAddress
+                | Setting::StorageDataDirectory
+                | Setting::StorageSecretsDirectory
+                | Setting::SecurityLocalKeyFile
+                | Setting::ExportDestinations => {},
+            }
+        }
+        active
+    }
+
     fn setting_differs(&self, other: &Self, setting: Setting) -> bool {
         match setting {
             Setting::SchemaVersion => self.schema_version != other.schema_version,
@@ -401,6 +492,28 @@ impl EffectiveConfiguration {
             Setting::StorageSecretsDirectory => self.secrets_directory != other.secrets_directory,
             Setting::SecurityLocalKeyFile => self.local_key_file != other.local_key_file,
             Setting::ExportDestinations => self.export_destinations != other.export_destinations,
+        }
+    }
+
+    fn canonical_identity_value(&self, setting: Setting) -> String {
+        match setting {
+            Setting::SchemaVersion => self.schema_version.to_string(),
+            Setting::DiagnosticsLogLevel => self.log_level.as_str().to_owned(),
+            Setting::RuntimeShutdownGraceSeconds => self.shutdown_grace_seconds.to_string(),
+            Setting::RuntimeMaxRegisteredTenants => self.max_registered_tenants.to_string(),
+            Setting::ListenerControlPath => self.control_path.clone(),
+            Setting::ListenerOperationsBindAddress => self.operations_bind_address.to_string(),
+            Setting::ListenerApiBindAddress => self.api_bind_address.to_string(),
+            Setting::ListenerApiTransport => self.api_transport.as_str().to_owned(),
+            Setting::ListenerApiTlsCertificateFile => self.api_tls_certificate_file.path.clone(),
+            Setting::ListenerApiTlsPrivateKeyFile => self.api_tls_private_key_file.path.clone(),
+            Setting::ListenerOtlpGrpcBindAddress => self.otlp_grpc_bind_address.to_string(),
+            Setting::ListenerOtlpHttpBindAddress => self.otlp_http_bind_address.to_string(),
+            Setting::ListenerLokiPushBindAddress => self.loki_push_bind_address.to_string(),
+            Setting::StorageDataDirectory => self.data_directory.clone(),
+            Setting::StorageSecretsDirectory => self.secrets_directory.clone(),
+            Setting::SecurityLocalKeyFile => self.local_key_file.path.clone(),
+            Setting::ExportDestinations => self.redacted_export_destinations(),
         }
     }
 
@@ -450,6 +563,11 @@ impl EffectiveConfiguration {
         }
         rendered
     }
+}
+
+fn update_digest_string(hasher: &mut Sha256, value: &str) {
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value.as_bytes());
 }
 
 fn hexadecimal_identity(identity: [u8; 16]) -> String {
@@ -582,6 +700,48 @@ impl ConfigurationDiffPlan {
 pub struct ConfigurationDiff {
     changes: Vec<ConfigurationChange>,
     plan: ConfigurationDiffPlan,
+}
+
+/// The operator-visible disposition of desired versus observed configuration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfigurationDrift {
+    diff: ConfigurationDiff,
+    disposition: ConfigurationDriftDisposition,
+}
+
+impl ConfigurationDrift {
+    fn from_diff(diff: ConfigurationDiff) -> Self {
+        let disposition = if diff.changes.is_empty() {
+            ConfigurationDriftDisposition::None
+        } else if diff
+            .changes
+            .iter()
+            .any(|change| change.setting().requires_drift_fence())
+        {
+            ConfigurationDriftDisposition::Fence
+        } else {
+            ConfigurationDriftDisposition::Reconcile
+        };
+        Self { diff, disposition }
+    }
+
+    #[must_use]
+    pub const fn diff(&self) -> &ConfigurationDiff {
+        &self.diff
+    }
+
+    #[must_use]
+    pub const fn disposition(&self) -> ConfigurationDriftDisposition {
+        self.disposition
+    }
+}
+
+/// The only safe automatic handling for detected configuration drift.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConfigurationDriftDisposition {
+    None,
+    Reconcile,
+    Fence,
 }
 
 impl ConfigurationDiff {

@@ -24,6 +24,8 @@ struct InterruptingSink {
 
 struct TestExportDestinationResolver;
 
+struct UnavailableExportDestinationResolver;
+
 struct WithdrawableExportDestinationResolver {
     available: AtomicBool,
 }
@@ -41,14 +43,24 @@ impl WithdrawableExportDestinationResolver {
 }
 
 impl positron_query::ExportDestinationResolver for TestExportDestinationResolver {
-    fn resolve(&self, _tenant: TenantId, name: &str) -> Option<[u8; 16]> {
-        (name == "configured").then_some([0x7a; 16])
+    fn resolve(&self, _tenant: TenantId, name: &str) -> Result<Option<[u8; 16]>, QueryFailureCode> {
+        Ok((name == "configured").then_some([0x7a; 16]))
+    }
+}
+
+impl positron_query::ExportDestinationResolver for UnavailableExportDestinationResolver {
+    fn resolve(
+        &self,
+        _tenant: TenantId,
+        _name: &str,
+    ) -> Result<Option<[u8; 16]>, QueryFailureCode> {
+        Err(QueryFailureCode::StoreUnavailable)
     }
 }
 
 impl positron_query::ExportDestinationResolver for WithdrawableExportDestinationResolver {
-    fn resolve(&self, _tenant: TenantId, name: &str) -> Option<[u8; 16]> {
-        (name == "configured" && self.available.load(Ordering::SeqCst)).then_some([0x7a; 16])
+    fn resolve(&self, _tenant: TenantId, name: &str) -> Result<Option<[u8; 16]>, QueryFailureCode> {
+        Ok((name == "configured" && self.available.load(Ordering::SeqCst)).then_some([0x7a; 16]))
     }
 }
 
@@ -134,6 +146,31 @@ fn durable_export_writes_each_deterministic_batch_to_its_configured_destination(
         assert_eq!(manifest.batch_count(), 2);
         assert_ne!(manifest.result_digest(), [0; 32]);
         service.verify_export_manifest(&manifest)?;
+        Ok(())
+    })
+}
+
+#[test]
+fn durable_export_propagates_unavailable_configured_destination_resolution()
+-> Result<(), Box<dyn Error>> {
+    QueryFixture::scoped("durable-export-destination-unavailable", |fixture| {
+        fixture.kernel.append_log("first", 20, 1)?;
+        let service = fixture
+            .service(1)?
+            .with_export_destination_resolver(Arc::new(UnavailableExportDestinationResolver));
+        let failure = service
+            .export_pipeline_as_operation(
+                fixture.kernel.catalog_for_test(),
+                &fixture.export_manifest_signer()?,
+                fixture.context,
+                positron_governance::AdministrativeIdempotencyKey::new([0x3f; 16])?,
+                "logs | range query_time -100 100 | limit 1",
+                QueryBudget::new(1_048_576, 16, 16, 1_048_576, 16_384, 60)?,
+                "configured",
+                &mut RecordingSink::default(),
+            )
+            .expect_err("configuration resolution failure must not look absent");
+        assert_eq!(failure.code(), QueryFailureCode::StoreUnavailable);
         Ok(())
     })
 }

@@ -10,12 +10,11 @@ use std::time::{Duration, Instant};
 use positron_config::{ApiTransport, ConfigurationInputs, resolve};
 use positron_kernel::MountQualification;
 use positron_runtime::{
-    ApiTransportProfile, ApplicationRuntime, BootstrapPaths, ConfiguredExportDestinationResolver,
-    ExitOutcome, HostInputs, InitializationMode, NativeBindings, NativeHost,
-    PublicPlaintextApiStartupIntent, RecoveryAttempt, RecoveryAttemptHost, RecoveryDecision,
-    ServeConfiguration, ShutdownTrigger,
+    ApiTransportProfile, ApplicationRuntime, BootstrapPaths, ExitOutcome, HostInputs,
+    InitializationMode, NativeBindings, NativeHost, PublicPlaintextApiStartupIntent,
+    RecoveryAttempt, RecoveryAttemptHost, RecoveryDecision, ServeConfiguration, ShutdownTrigger,
 };
-use signal_hook::consts::signal::{SIGINT, SIGTERM};
+use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
 mod config_cli;
@@ -88,10 +87,11 @@ fn run(
     environment: impl IntoIterator<Item = (String, String)>,
 ) -> Result<ExitOutcome, LaunchFailure> {
     let arguments = Arguments::parse(arguments)?;
+    let environment = environment.into_iter().collect::<Vec<_>>();
     let inputs = ConfigurationInputs::try_from_sources(
         arguments.config.as_deref().map(Path::new),
-        environment,
-        arguments.overrides,
+        environment.clone(),
+        arguments.overrides.clone(),
     )
     .map_err(|_| LaunchFailure::Configuration)?;
     let effective = resolve(inputs).map_err(|_| LaunchFailure::Configuration)?;
@@ -124,14 +124,12 @@ fn run(
     )
     .map_err(|_| LaunchFailure::Configuration)?;
     let host = NativeHost::new(bindings);
-    let recovery =
-        NativeRecovery::new(Signals::new([SIGINT, SIGTERM]).map_err(|_| LaunchFailure::Signal)?);
-    let resolver = Arc::new(ConfiguredExportDestinationResolver::new(Arc::new(
-        effective.clone(),
-    )));
+    let recovery = NativeRecovery::new(
+        Signals::new([SIGHUP, SIGINT, SIGTERM]).map_err(|_| LaunchFailure::Signal)?,
+    );
     let mut configuration = ServeConfiguration::new(paths, arguments.initialization)
         .with_max_registered_tenants(effective.max_registered_tenants())
-        .with_export_destination_resolver(resolver);
+        .with_effective_configuration(Arc::new(effective.clone()));
     if let Some(plaintext) = effective.public_plaintext_api_configuration() {
         configuration = configuration.with_public_plaintext_api_intent(
             PublicPlaintextApiStartupIntent::configuration_file(plaintext.api_bind_address()),
@@ -147,7 +145,30 @@ fn run(
     };
     let signals = recovery.into_signals()?;
     let deadline = Duration::from_secs(u64::from(effective.shutdown_grace_seconds()));
-    wait_for_shutdown(process, signals, deadline)
+    let reload = ReloadInputs {
+        config: arguments.config,
+        environment,
+        overrides: arguments.overrides,
+    };
+    wait_for_shutdown(process, signals, deadline, &reload)
+}
+
+struct ReloadInputs {
+    config: Option<PathBuf>,
+    environment: Vec<(String, String)>,
+    overrides: Vec<(String, String)>,
+}
+
+impl ReloadInputs {
+    fn resolve(&self) -> Result<Arc<positron_config::EffectiveConfiguration>, ()> {
+        let inputs = ConfigurationInputs::try_from_sources(
+            self.config.as_deref().map(Path::new),
+            self.environment.clone(),
+            self.overrides.clone(),
+        )
+        .map_err(|_| ())?;
+        resolve(inputs).map(Arc::new).map_err(|_| ())
+    }
 }
 
 struct NativeRecovery {
@@ -171,12 +192,20 @@ impl NativeRecovery {
     }
 
     fn pending_trigger(signals: &mut Signals) -> Option<ShutdownTrigger> {
-        let count = signals.pending().take(2).count();
-        match count {
-            0 => None,
-            1 => Some(ShutdownTrigger::FirstSignal),
-            _ => Some(ShutdownTrigger::SecondSignal),
-        }
+        pending_termination_trigger(signals)
+    }
+}
+
+fn pending_termination_trigger(signals: &mut Signals) -> Option<ShutdownTrigger> {
+    let count = signals
+        .pending()
+        .filter(|signal| matches!(*signal, SIGINT | SIGTERM))
+        .take(2)
+        .count();
+    match count {
+        0 => None,
+        1 => Some(ShutdownTrigger::FirstSignal),
+        _ => Some(ShutdownTrigger::SecondSignal),
     }
 }
 
@@ -211,14 +240,41 @@ fn wait_for_shutdown(
     process: positron_runtime::RunningProcess,
     mut signals: Signals,
     deadline: Duration,
+    reload: &ReloadInputs,
 ) -> Result<ExitOutcome, LaunchFailure> {
-    let Some(_) = signals.forever().next() else {
-        return Err(LaunchFailure::Signal);
-    };
+    loop {
+        let Some(signal) = signals.forever().next() else {
+            return Err(LaunchFailure::Signal);
+        };
+        if signal != SIGHUP {
+            break;
+        }
+        match reload.resolve() {
+            Ok(candidate) => {
+                let outcome = process.reload_configuration(candidate);
+                if !matches!(
+                    outcome,
+                    Ok(
+                        positron_runtime::ConfigurationReloadOutcome::NoChange { .. }
+                            | positron_runtime::ConfigurationReloadOutcome::PublishedLive { .. }
+                            | positron_runtime::ConfigurationReloadOutcome::PendingRestart { .. }
+                    )
+                ) {
+                    eprintln!("positron: configuration reload rejected");
+                }
+            },
+            Err(()) => {
+                if process.record_invalid_configuration_reload().is_err() {
+                    eprintln!("positron: configuration reload audit unavailable");
+                }
+                eprintln!("positron: configuration reload rejected");
+            },
+        }
+    }
     let mut draining = process.begin_shutdown();
     let deadline_at = Instant::now() + deadline;
     loop {
-        if signals.pending().next().is_some() {
+        if pending_termination_trigger(&mut signals).is_some() {
             return Ok(draining.finish(ShutdownTrigger::SecondSignal));
         }
         if Instant::now() >= deadline_at {
@@ -321,7 +377,7 @@ fn exit_code(outcome: ExitOutcome) -> ExitCode {
 mod tests {
     use super::{
         ExitOutcome, LaunchFailure, NativeRecovery, RecoveryAttemptHost, RecoveryDecision,
-        ShutdownTrigger, exit_code,
+        ShutdownTrigger, exit_code, pending_termination_trigger,
     };
     use positron_runtime::{BootstrapFailureCode, ListenerRole, RecoveryAttempt, TaskRole};
     use signal_hook::iterator::Signals;
@@ -382,15 +438,38 @@ mod tests {
     }
 
     #[test]
-    fn pending_native_signal_interrupts_recovery_backoff() -> Result<(), Box<dyn std::error::Error>>
-    {
-        let recovery = NativeRecovery::new(Signals::new([signal_hook::consts::signal::SIGUSR1])?);
-        signal_hook::low_level::raise(signal_hook::consts::signal::SIGUSR1)?;
+    fn pending_native_termination_signal_interrupts_recovery_backoff()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let recovery = NativeRecovery::new(Signals::new([signal_hook::consts::signal::SIGTERM])?);
+        signal_hook::low_level::raise(signal_hook::consts::signal::SIGTERM)?;
 
         assert_eq!(
             recovery.after_failure(RecoveryAttempt::for_test(1)),
             RecoveryDecision::Terminate(ShutdownTrigger::FirstSignal)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn native_recovery_keeps_sighup_out_of_termination_handling()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let recovery = NativeRecovery::new(Signals::new([signal_hook::consts::signal::SIGHUP])?);
+        signal_hook::low_level::raise(signal_hook::consts::signal::SIGHUP)?;
+
+        assert_eq!(
+            recovery.after_failure(RecoveryAttempt::for_test(1)),
+            RecoveryDecision::Retry
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn native_drain_keeps_sighup_out_of_forced_exit_handling()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut signals = Signals::new([signal_hook::consts::signal::SIGHUP])?;
+        signal_hook::low_level::raise(signal_hook::consts::signal::SIGHUP)?;
+
+        assert_eq!(pending_termination_trigger(&mut signals), None);
         Ok(())
     }
 }

@@ -4,6 +4,8 @@
 
 #![forbid(unsafe_code)]
 
+mod configuration;
+mod configuration_catalog;
 mod health;
 mod instance_bootstrap;
 mod listener;
@@ -16,6 +18,11 @@ mod tail_fuzz;
 mod tail_fuzz_support;
 mod task;
 
+pub use configuration::{
+    ConfigurationObservation, ConfigurationPublication, ConfigurationPublicationDisposition,
+    ConfigurationReloadOutcome, ConfigurationRuntimeFailure, PendingRestart, RuntimeConfiguration,
+};
+pub use configuration_catalog::CatalogConfigurationPublication;
 pub use health::{HealthState, HealthWarning, Liveness, ProcessPhase, Readiness};
 #[cfg(any(test, feature = "test-support"))]
 pub use instance_bootstrap::GovernanceTestFixture;

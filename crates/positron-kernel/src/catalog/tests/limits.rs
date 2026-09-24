@@ -69,3 +69,33 @@ fn root_key_routing_requires_nonzero_provider_and_epoch() {
         Some(CatalogGenerationId::ORIGIN)
     );
 }
+
+#[test]
+fn opaque_digest_is_domain_separated_and_refuses_an_ambiguous_input() {
+    let secret = CatalogSecret::from_owned(Box::new([0x71; 32]), Box::new([0x72; 32]));
+    let first = secret
+        .opaque_digest(b"positron.test.binding.v1\0", b"first")
+        .expect("bounded binding input is accepted");
+    let same = secret
+        .opaque_digest(b"positron.test.binding.v1\0", b"first")
+        .expect("same binding input is stable");
+    let different_domain = secret
+        .opaque_digest(b"positron.test.other.v1\0", b"first")
+        .expect("different domain is accepted");
+    let first_split = secret
+        .opaque_digest(b"a", b"bc")
+        .expect("first split binding is accepted");
+    let second_split = secret
+        .opaque_digest(b"ab", b"c")
+        .expect("second split binding is accepted");
+    assert_eq!(first, same);
+    assert_ne!(first, different_domain);
+    assert_ne!(first_split, second_split);
+    assert_eq!(
+        secret
+            .opaque_digest(b"", b"first")
+            .expect_err("an unscoped private binding is ambiguous")
+            .code(),
+        CatalogFailureCode::InvalidInput
+    );
+}

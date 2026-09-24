@@ -1,5 +1,12 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Arc, OnceLock, Weak};
+
+use positron_governance::{CompatibilityHints, PresentedCredential, RequestedIntent};
+
+use crate::{
+    ConfigurationObservation, ConfigurationRuntimeFailure, InitializedInstance,
+    RuntimeConfiguration,
+};
 
 /// The one runtime phase that controls admission and shutdown behavior.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -36,10 +43,25 @@ pub enum HealthWarning {
 }
 
 /// A read-only view of the runtime's single phase authority.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct HealthState {
     phase: Arc<AtomicU8>,
     public_plaintext_api: Arc<AtomicBool>,
+    configuration: Arc<OnceLock<Arc<RuntimeConfiguration>>>,
+    inspection_authority: Arc<OnceLock<Weak<InitializedInstance>>>,
+}
+
+impl std::fmt::Debug for HealthState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HealthState")
+            .field("phase", &self.phase())
+            .field(
+                "configuration_available",
+                &self.configuration.get().is_some(),
+            )
+            .finish()
+    }
 }
 
 impl HealthState {
@@ -73,6 +95,33 @@ impl HealthState {
             .load(Ordering::Acquire)
             .then_some(HealthWarning::PublicPlaintextApi)
     }
+
+    /// Returns the one canonical configuration observation available to
+    /// authenticated Operations inspection.
+    pub fn configuration_status(
+        &self,
+    ) -> Result<Option<ConfigurationObservation>, ConfigurationRuntimeFailure> {
+        self.configuration
+            .get()
+            .map(|runtime| runtime.observed())
+            .transpose()
+    }
+
+    /// Authorizes inspection through the immutable governance authority shared
+    /// with runtime services.
+    pub(crate) fn authorize_configuration_status(&self, bearer: &str) -> Result<(), ()> {
+        self.inspection_authority
+            .get()
+            .and_then(Weak::upgrade)
+            .ok_or(())?
+            .attribute(
+                PresentedCredential::parse(bearer).map_err(|_| ())?,
+                RequestedIntent::SystemAdministration,
+                CompatibilityHints::none(),
+            )
+            .map(|_| ())
+            .map_err(|_| ())
+    }
 }
 
 pub(crate) struct ProcessState {
@@ -85,6 +134,8 @@ impl ProcessState {
             health: HealthState {
                 phase: Arc::new(AtomicU8::new(ProcessPhase::Starting as u8)),
                 public_plaintext_api: Arc::new(AtomicBool::new(false)),
+                configuration: Arc::new(OnceLock::new()),
+                inspection_authority: Arc::new(OnceLock::new()),
             },
         }
     }
@@ -101,6 +152,26 @@ impl ProcessState {
         self.health
             .public_plaintext_api
             .store(enabled, Ordering::Release);
+    }
+
+    pub(crate) fn set_configuration_runtime(
+        &self,
+        runtime: Arc<RuntimeConfiguration>,
+    ) -> Result<(), ConfigurationRuntimeFailure> {
+        self.health
+            .configuration
+            .set(runtime)
+            .map_err(|_| ConfigurationRuntimeFailure::Unavailable)
+    }
+
+    pub(crate) fn set_inspection_authority(
+        &self,
+        authority: Arc<InitializedInstance>,
+    ) -> Result<(), ConfigurationRuntimeFailure> {
+        self.health
+            .inspection_authority
+            .set(Arc::downgrade(&authority))
+            .map_err(|_| ConfigurationRuntimeFailure::Unavailable)
     }
 }
 

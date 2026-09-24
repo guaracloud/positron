@@ -141,6 +141,8 @@ pub struct CatalogSecret {
     pub(super) predecessor: Option<CatalogWrappingKey>,
 }
 
+const OPAQUE_DIGEST_DOMAIN: &[u8] = b"positron.catalog.opaque-digest.v1\0";
+
 impl CatalogSecret {
     #[must_use]
     pub fn from_owned(marker_authentication: Box<[u8; 32]>, wrapping_key: Box<[u8; 32]>) -> Self {
@@ -183,6 +185,37 @@ impl CatalogSecret {
         }
         self.predecessor = Some(predecessor);
         Ok(self)
+    }
+
+    /// Returns a domain-separated opaque digest without exposing Catalog key
+    /// material. Callers must supply a non-empty domain for their persisted
+    /// private binding.
+    pub fn opaque_digest(&self, domain: &[u8], payload: &[u8]) -> Result<[u8; 32], CatalogFailure> {
+        if domain.is_empty() || payload.is_empty() {
+            return Err(CatalogFailure::new(CatalogFailureCode::InvalidInput));
+        }
+        let domain_length = u64::try_from(domain.len())
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?;
+        let payload_length = u64::try_from(payload.len())
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?;
+        let capacity = OPAQUE_DIGEST_DOMAIN
+            .len()
+            .checked_add(8)
+            .and_then(|value| value.checked_add(domain.len()))
+            .and_then(|value| value.checked_add(8))
+            .and_then(|value| value.checked_add(payload.len()))
+            .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?;
+        let mut authenticated = Vec::new();
+        authenticated
+            .try_reserve_exact(capacity)
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?;
+        authenticated.extend_from_slice(OPAQUE_DIGEST_DOMAIN);
+        authenticated.extend_from_slice(&domain_length.to_be_bytes());
+        authenticated.extend_from_slice(domain);
+        authenticated.extend_from_slice(&payload_length.to_be_bytes());
+        authenticated.extend_from_slice(payload);
+        DataProtection::authenticate(&self.marker_key, &authenticated)
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::AuthenticationFailed))
     }
 }
 

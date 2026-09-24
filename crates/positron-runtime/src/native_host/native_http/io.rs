@@ -5,7 +5,7 @@ use positron_governance::CompatibilityHints;
 use zeroize::{Zeroize, Zeroizing};
 
 use super::super::TrustedProxy;
-use crate::HealthWarning;
+use crate::{ConfigurationObservation, HealthWarning, ProcessPhase};
 
 const MAX_HEADER_BYTES: usize = 8 * 1024;
 
@@ -171,6 +171,60 @@ pub(in crate::native_host) fn health_response(
             format!("{{\"status\":\"not_{label}\",\"warnings\":{warnings}}}"),
         )
     }
+}
+
+pub(in crate::native_host) fn configuration_status_response(
+    phase: ProcessPhase,
+    status: &ConfigurationObservation,
+) -> Response {
+    Response::json(
+        200,
+        format!(
+            "{{\"phase\":\"{}\",\"observed_generation\":{},\"effective_digest\":\"{}\",\"desired_digest\":\"{}\",\"drift_disposition\":\"{}\",\"pending_restart\":{}}}",
+            process_phase_name(phase),
+            status.generation(),
+            hexadecimal_digest(crate::configuration_catalog::configuration_digest(
+                status.effective()
+            )),
+            hexadecimal_digest(crate::configuration_catalog::configuration_digest(
+                status.desired()
+            )),
+            drift_disposition_name(status.drift_disposition()),
+            status.pending_restart().is_some(),
+        ),
+    )
+}
+
+fn process_phase_name(phase: ProcessPhase) -> &'static str {
+    match phase {
+        ProcessPhase::Starting => "starting",
+        ProcessPhase::Recovering => "recovering",
+        ProcessPhase::Serving => "serving",
+        ProcessPhase::Draining => "draining",
+        ProcessPhase::Fenced => "fenced",
+        ProcessPhase::Stopping => "stopping",
+        ProcessPhase::Stopped => "stopped",
+    }
+}
+
+fn drift_disposition_name(
+    disposition: positron_config::ConfigurationDriftDisposition,
+) -> &'static str {
+    match disposition {
+        positron_config::ConfigurationDriftDisposition::None => "none",
+        positron_config::ConfigurationDriftDisposition::Reconcile => "reconcile",
+        positron_config::ConfigurationDriftDisposition::Fence => "fence",
+    }
+}
+
+fn hexadecimal_digest(digest: [u8; 32]) -> String {
+    let mut rendered = String::with_capacity(64);
+    for byte in digest {
+        const HEXADECIMAL: &[u8; 16] = b"0123456789abcdef";
+        rendered.push(char::from(HEXADECIMAL[usize::from(byte >> 4)]));
+        rendered.push(char::from(HEXADECIMAL[usize::from(byte & 0x0f)]));
+    }
+    rendered
 }
 
 pub(in crate::native_host) fn capability_response(

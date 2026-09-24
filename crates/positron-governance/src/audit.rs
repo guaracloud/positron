@@ -14,7 +14,8 @@ use crate::identity::IdentityFailure;
 use crate::tenant_profile_administration::TENANT_DISPLAY_MAGIC;
 use crate::{
     AdministrativeIdempotencyKey, DurableOperationKind, DurableOperationPhase,
-    DurableOperationRequest, DurableOperationStatus, OperationId, ResourceGeneration,
+    DurableOperationRequest, DurableOperationStatus, GovernanceIntentFailure, OperationId,
+    ResourceGeneration,
 };
 
 pub use rotation::{CatalogRootRotationAuditEntry, CatalogRootRotationStage};
@@ -42,6 +43,8 @@ const DURABLE_OPERATION_AUDIT_MAGIC_V3: [u8; 8] = *b"POSOPA03";
 const DURABLE_OPERATION_AUDIT_MAGIC_V4: [u8; 8] = *b"POSOPA04";
 const DURABLE_OPERATION_AUDIT_MAGIC_V5: [u8; 8] = *b"POSOPA05";
 const DURABLE_OPERATION_AUDIT_MAGIC_V1: [u8; 8] = *b"POSOPA01";
+const CONFIGURATION_AUDIT_MAGIC: [u8; 8] = *b"POSCFG01";
+const CONFIGURATION_AUDIT_DOMAIN: &[u8] = b"positron.configuration.audit.v1\0";
 
 /// Extracts a terminal receipt's idempotency key only after its owning codec
 /// has recognized the supported receipt version and key location. Callers use
@@ -119,6 +122,365 @@ pub enum GovernanceAuditEntry {
     TenantRetentionUpdate(TenantRetentionUpdateAuditEntry),
     SystemAuditRetentionUpdate(SystemAuditRetentionUpdateAuditEntry),
     DurableOperation(DurableOperationAuditEntry),
+    Configuration(ConfigurationAuditEntry),
+}
+
+/// The durable disposition of one resolved configuration candidate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConfigurationAuditOutcome {
+    PublishedLive,
+    PendingRestart,
+    RejectedImmutable,
+    RequiresDrain,
+    RejectedInvalid,
+    FencedDrift,
+}
+
+impl ConfigurationAuditOutcome {
+    pub(crate) const fn code(self) -> u8 {
+        match self {
+            Self::PublishedLive => 1,
+            Self::PendingRestart => 2,
+            Self::RejectedImmutable => 3,
+            Self::RequiresDrain => 4,
+            Self::RejectedInvalid => 5,
+            Self::FencedDrift => 6,
+        }
+    }
+
+    pub(crate) const fn from_code(code: u8) -> Result<Self, IdentityFailure> {
+        match code {
+            1 => Ok(Self::PublishedLive),
+            2 => Ok(Self::PendingRestart),
+            3 => Ok(Self::RejectedImmutable),
+            4 => Ok(Self::RequiresDrain),
+            5 => Ok(Self::RejectedInvalid),
+            6 => Ok(Self::FencedDrift),
+            _ => Err(IdentityFailure),
+        }
+    }
+}
+
+/// Administration-owned actor, target, request, and time binding for one
+/// configuration reload audit intent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConfigurationAuditContext {
+    outcome: ConfigurationAuditOutcome,
+    ingest_time_unix_seconds: u64,
+    principal: PrincipalId,
+    applicable_tenant: Option<TenantId>,
+    target: [u8; 16],
+    request_id: [u8; 16],
+}
+
+impl ConfigurationAuditContext {
+    pub fn new(
+        outcome: ConfigurationAuditOutcome,
+        ingest_time_unix_seconds: u64,
+        principal: PrincipalId,
+        applicable_tenant: Option<TenantId>,
+        target: [u8; 16],
+        request_id: [u8; 16],
+    ) -> Result<Self, GovernanceIntentFailure> {
+        if ingest_time_unix_seconds == 0
+            || target.iter().all(|byte| *byte == 0)
+            || request_id.iter().all(|byte| *byte == 0)
+        {
+            return Err(GovernanceIntentFailure);
+        }
+        Ok(Self {
+            outcome,
+            ingest_time_unix_seconds,
+            principal,
+            applicable_tenant,
+            target,
+            request_id,
+        })
+    }
+}
+
+/// Administration-owned, redacted audit intent for one configuration reload.
+///
+/// The configuration module supplies only digests of complete redacted
+/// snapshots. The Catalog Writer owns atomic publication of this intent and
+/// any corresponding configuration generation object.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConfigurationAuditRequest {
+    outcome: ConfigurationAuditOutcome,
+    ingest_time_unix_seconds: u64,
+    principal: PrincipalId,
+    applicable_tenant: Option<TenantId>,
+    target: [u8; 16],
+    request_id: [u8; 16],
+    catalog_generation: u64,
+    changed_setting_count: u8,
+    active_digest: [u8; 32],
+    candidate_digest: [u8; 32],
+}
+
+impl ConfigurationAuditRequest {
+    pub fn new(
+        context: ConfigurationAuditContext,
+        catalog_generation: u64,
+        changed_setting_count: u8,
+        active_digest: [u8; 32],
+        candidate_digest: [u8; 32],
+    ) -> Result<Self, GovernanceIntentFailure> {
+        if catalog_generation == 0
+            || changed_setting_count == 0
+            || active_digest.iter().all(|byte| *byte == 0)
+            || candidate_digest.iter().all(|byte| *byte == 0)
+        {
+            return Err(GovernanceIntentFailure);
+        }
+        Ok(Self {
+            outcome: context.outcome,
+            ingest_time_unix_seconds: context.ingest_time_unix_seconds,
+            principal: context.principal,
+            applicable_tenant: context.applicable_tenant,
+            target: context.target,
+            request_id: context.request_id,
+            catalog_generation,
+            changed_setting_count,
+            active_digest,
+            candidate_digest,
+        })
+    }
+
+    #[must_use]
+    pub const fn outcome(self) -> ConfigurationAuditOutcome {
+        self.outcome
+    }
+
+    #[must_use]
+    pub const fn ingest_time_unix_seconds(self) -> u64 {
+        self.ingest_time_unix_seconds
+    }
+
+    #[must_use]
+    pub const fn principal(self) -> PrincipalId {
+        self.principal
+    }
+
+    #[must_use]
+    pub const fn applicable_tenant(self) -> Option<TenantId> {
+        self.applicable_tenant
+    }
+
+    #[must_use]
+    pub const fn target(self) -> [u8; 16] {
+        self.target
+    }
+
+    #[must_use]
+    pub const fn request_id(self) -> [u8; 16] {
+        self.request_id
+    }
+
+    #[must_use]
+    pub const fn catalog_generation(self) -> u64 {
+        self.catalog_generation
+    }
+
+    #[must_use]
+    pub const fn changed_setting_count(self) -> u8 {
+        self.changed_setting_count
+    }
+
+    #[must_use]
+    pub const fn active_digest(self) -> [u8; 32] {
+        self.active_digest
+    }
+
+    #[must_use]
+    pub const fn candidate_digest(self) -> [u8; 32] {
+        self.candidate_digest
+    }
+
+    #[must_use]
+    pub fn transaction_id(self) -> [u8; 16] {
+        let mut hasher = Sha256::new();
+        hasher.update(CONFIGURATION_AUDIT_DOMAIN);
+        hasher.update([self.outcome.code()]);
+        hasher.update(self.ingest_time_unix_seconds.to_be_bytes());
+        hasher.update(self.principal.to_bytes());
+        hasher.update([u8::from(self.applicable_tenant.is_some())]);
+        hasher.update(
+            self.applicable_tenant
+                .map_or([0; 16], |tenant| tenant.to_bytes()),
+        );
+        hasher.update(self.target);
+        hasher.update(self.request_id);
+        hasher.update(self.catalog_generation.to_be_bytes());
+        hasher.update([self.changed_setting_count]);
+        hasher.update(self.active_digest);
+        hasher.update(self.candidate_digest);
+        let digest = hasher.finalize();
+        let mut transaction = [0; 16];
+        for (destination, source) in transaction.iter_mut().zip(digest.iter()) {
+            *destination = *source;
+        }
+        transaction
+    }
+
+    #[must_use]
+    pub fn encode(self) -> Vec<u8> {
+        let mut encoded = Vec::with_capacity(155);
+        encoded.extend_from_slice(&CONFIGURATION_AUDIT_MAGIC);
+        encoded.push(self.outcome.code());
+        encoded.extend_from_slice(&self.ingest_time_unix_seconds.to_be_bytes());
+        encoded.extend_from_slice(&self.principal.to_bytes());
+        encoded.push(u8::from(self.applicable_tenant.is_some()));
+        encoded.extend_from_slice(
+            &self
+                .applicable_tenant
+                .map_or([0; 16], |tenant| tenant.to_bytes()),
+        );
+        encoded.extend_from_slice(&self.target);
+        encoded.extend_from_slice(&self.request_id);
+        encoded.extend_from_slice(&self.catalog_generation.to_be_bytes());
+        encoded.push(self.changed_setting_count);
+        encoded.extend_from_slice(&self.active_digest);
+        encoded.extend_from_slice(&self.candidate_digest);
+        encoded
+    }
+
+    pub(crate) fn decode(
+        position: u64,
+        transaction_id: [u8; 16],
+        intent: &[u8],
+    ) -> Result<ConfigurationAuditEntry, IdentityFailure> {
+        let mut cursor = Cursor::new(intent);
+        if cursor.take_array::<8>()? != CONFIGURATION_AUDIT_MAGIC {
+            return Err(IdentityFailure);
+        }
+        let outcome = ConfigurationAuditOutcome::from_code(cursor.take_u8()?)?;
+        let ingest_time_unix_seconds = cursor.take_u64()?;
+        let principal =
+            PrincipalId::from_bytes(cursor.take_array()?).map_err(|_| IdentityFailure)?;
+        let applicable_tenant = match cursor.take_u8()? {
+            0 => {
+                if cursor.take_array::<16>()? != [0; 16] {
+                    return Err(IdentityFailure);
+                }
+                None
+            },
+            1 => Some(TenantId::from_bytes(cursor.take_array()?).map_err(|_| IdentityFailure)?),
+            _ => return Err(IdentityFailure),
+        };
+        let target = cursor.take_array()?;
+        let request_id = cursor.take_array()?;
+        let catalog_generation = cursor.take_u64()?;
+        let changed_setting_count = cursor.take_u8()?;
+        let active_digest = cursor.take_array()?;
+        let candidate_digest = cursor.take_array()?;
+        let context = ConfigurationAuditContext::new(
+            outcome,
+            ingest_time_unix_seconds,
+            principal,
+            applicable_tenant,
+            target,
+            request_id,
+        )
+        .map_err(|_| IdentityFailure)?;
+        let request = Self::new(
+            context,
+            catalog_generation,
+            changed_setting_count,
+            active_digest,
+            candidate_digest,
+        )
+        .map_err(|_| IdentityFailure)?;
+        if !cursor.is_empty() || transaction_id != request.transaction_id() {
+            return Err(IdentityFailure);
+        }
+        Ok(ConfigurationAuditEntry {
+            position,
+            outcome,
+            ingest_time_unix_seconds,
+            principal,
+            applicable_tenant,
+            target,
+            request_id,
+            catalog_generation,
+            changed_setting_count,
+            active_digest,
+            candidate_digest,
+        })
+    }
+}
+
+/// A decoded, secret-safe committed Configuration Audit Record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfigurationAuditEntry {
+    position: u64,
+    outcome: ConfigurationAuditOutcome,
+    ingest_time_unix_seconds: u64,
+    principal: PrincipalId,
+    applicable_tenant: Option<TenantId>,
+    target: [u8; 16],
+    request_id: [u8; 16],
+    catalog_generation: u64,
+    changed_setting_count: u8,
+    active_digest: [u8; 32],
+    candidate_digest: [u8; 32],
+}
+
+impl ConfigurationAuditEntry {
+    #[must_use]
+    pub const fn position(&self) -> u64 {
+        self.position
+    }
+
+    #[must_use]
+    pub const fn outcome(&self) -> ConfigurationAuditOutcome {
+        self.outcome
+    }
+
+    #[must_use]
+    pub const fn ingest_time_unix_seconds(&self) -> u64 {
+        self.ingest_time_unix_seconds
+    }
+
+    #[must_use]
+    pub const fn principal(&self) -> PrincipalId {
+        self.principal
+    }
+
+    #[must_use]
+    pub const fn applicable_tenant(&self) -> Option<TenantId> {
+        self.applicable_tenant
+    }
+
+    #[must_use]
+    pub const fn target(&self) -> [u8; 16] {
+        self.target
+    }
+
+    #[must_use]
+    pub const fn request_id(&self) -> [u8; 16] {
+        self.request_id
+    }
+
+    #[must_use]
+    pub const fn catalog_generation(&self) -> u64 {
+        self.catalog_generation
+    }
+
+    #[must_use]
+    pub const fn changed_setting_count(&self) -> u8 {
+        self.changed_setting_count
+    }
+
+    #[must_use]
+    pub const fn active_digest(&self) -> [u8; 32] {
+        self.active_digest
+    }
+
+    #[must_use]
+    pub const fn candidate_digest(&self) -> [u8; 32] {
+        self.candidate_digest
+    }
 }
 
 /// Redacted jointly committed evidence for one durable-operation state transition.
@@ -808,6 +1170,7 @@ impl GovernanceAuditEntry {
             Self::TenantRetentionUpdate(entry) => entry.position,
             Self::SystemAuditRetentionUpdate(entry) => entry.position,
             Self::DurableOperation(entry) => entry.position,
+            Self::Configuration(entry) => entry.position(),
         }
     }
 
@@ -832,6 +1195,7 @@ impl GovernanceAuditEntry {
             Self::TenantRetentionUpdate(entry) => Some(entry.tenant),
             Self::SystemAuditRetentionUpdate(_) => None,
             Self::DurableOperation(entry) => entry.applicable_tenant(),
+            Self::Configuration(entry) => entry.applicable_tenant(),
         }
     }
 
@@ -857,6 +1221,7 @@ impl GovernanceAuditEntry {
             Self::TenantRetentionUpdate(_) => "tenant.retention.update",
             Self::SystemAuditRetentionUpdate(_) => "system.audit-retention.update",
             Self::DurableOperation(_) => "durable-operation.transition",
+            Self::Configuration(_) => "configuration.reload",
         }
     }
 
@@ -882,6 +1247,14 @@ impl GovernanceAuditEntry {
                 DurableOperationStatus::Cancelled => "cancelled",
                 _ => "succeeded",
             },
+            Self::Configuration(entry) => match entry.outcome() {
+                ConfigurationAuditOutcome::RejectedImmutable
+                | ConfigurationAuditOutcome::RejectedInvalid
+                | ConfigurationAuditOutcome::FencedDrift => "rejected",
+                ConfigurationAuditOutcome::RequiresDrain => "deferred",
+                ConfigurationAuditOutcome::PublishedLive
+                | ConfigurationAuditOutcome::PendingRestart => "succeeded",
+            },
         }
     }
 
@@ -903,6 +1276,7 @@ impl GovernanceAuditEntry {
             | Self::TenantRetentionUpdate(_)
             | Self::SystemAuditRetentionUpdate(_)
             | Self::DurableOperation(_) => None,
+            Self::Configuration(_) => None,
         }
     }
 
@@ -924,6 +1298,7 @@ impl GovernanceAuditEntry {
             | Self::TenantRetentionUpdate(_)
             | Self::SystemAuditRetentionUpdate(_)
             | Self::DurableOperation(_) => None,
+            Self::Configuration(_) => None,
         }
     }
 
@@ -945,6 +1320,7 @@ impl GovernanceAuditEntry {
             | Self::TenantRetentionUpdate(_)
             | Self::SystemAuditRetentionUpdate(_)
             | Self::DurableOperation(_) => None,
+            Self::Configuration(_) => None,
         }
     }
 
@@ -966,6 +1342,7 @@ impl GovernanceAuditEntry {
             | Self::TenantRetentionUpdate(_)
             | Self::SystemAuditRetentionUpdate(_)
             | Self::DurableOperation(_) => None,
+            Self::Configuration(_) => None,
         }
     }
 
@@ -987,6 +1364,7 @@ impl GovernanceAuditEntry {
             | Self::TenantRetentionUpdate(_)
             | Self::SystemAuditRetentionUpdate(_)
             | Self::DurableOperation(_) => None,
+            Self::Configuration(_) => None,
         }
     }
 
@@ -1008,6 +1386,7 @@ impl GovernanceAuditEntry {
             | Self::TenantRetentionUpdate(_)
             | Self::SystemAuditRetentionUpdate(_)
             | Self::DurableOperation(_) => None,
+            Self::Configuration(_) => None,
         }
     }
 
@@ -1029,6 +1408,7 @@ impl GovernanceAuditEntry {
             | Self::TenantRetentionUpdate(_)
             | Self::SystemAuditRetentionUpdate(_)
             | Self::DurableOperation(_) => None,
+            Self::Configuration(_) => None,
         }
     }
 
@@ -1052,6 +1432,7 @@ impl GovernanceAuditEntry {
             | Self::TenantRetentionUpdate(_)
             | Self::SystemAuditRetentionUpdate(_)
             | Self::DurableOperation(_) => None,
+            Self::Configuration(_) => None,
         }
     }
 
@@ -1071,7 +1452,9 @@ impl GovernanceAuditEntry {
             | Self::TenantCreation(_)
             | Self::CatalogFormatMigration(_)
             | Self::TenantAliasBinding(_) => None,
-            Self::SystemAuditRetentionUpdate(_) | Self::DurableOperation(_) => None,
+            Self::SystemAuditRetentionUpdate(_)
+            | Self::DurableOperation(_)
+            | Self::Configuration(_) => None,
         }
     }
 
@@ -1081,6 +1464,14 @@ impl GovernanceAuditEntry {
     ) -> Option<&SystemAuditRetentionUpdateAuditEntry> {
         match self {
             Self::SystemAuditRetentionUpdate(entry) => Some(entry),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_configuration(&self) -> Option<&ConfigurationAuditEntry> {
+        match self {
+            Self::Configuration(entry) => Some(entry),
             _ => None,
         }
     }

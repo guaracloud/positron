@@ -1731,6 +1731,7 @@ impl<'kernel, 'catalog, 'ledger> crate::QueryService<'kernel, 'catalog, 'ledger>
             .ok_or_else(|| QueryFailure::new(QueryFailureCode::Unauthorized))?;
         let identity = resolver
             .resolve(tenant, name)
+            .map_err(QueryFailure::new)?
             .ok_or_else(|| QueryFailure::new(QueryFailureCode::Unauthorized))?;
         ExportDestination::configured(identity)
     }

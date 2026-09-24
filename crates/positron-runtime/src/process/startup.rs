@@ -87,6 +87,8 @@ impl ApplicationRuntime {
                         instance: None,
                         fenced_volume: Some(fenced_volume),
                         services: None,
+                        configuration: None,
+                        configuration_publication: None,
                         cleanup: CleanupAccumulator::empty(),
                         terminal_cleanup_complete: false,
                     });
@@ -145,10 +147,74 @@ impl ApplicationRuntime {
             ));
         }
         let instance = Arc::new(instance);
+        state
+            .set_inspection_authority(Arc::clone(&instance))
+            .map_err(|_| {
+                cleanup_startup(
+                    ExitOutcome::StartupUnavailable(BootstrapFailureCode::CatalogUnavailable),
+                    &cancellation,
+                    &mut listeners,
+                    &mut tasks,
+                )
+            })?;
+        let (runtime_configuration, configuration_publication) =
+            match configuration.effective_configuration.as_ref() {
+                Some(effective) => {
+                    let publication = CatalogConfigurationPublication::new(Arc::clone(&instance));
+                    let generation = match publication.establish(effective) {
+                        Ok(generation) => generation,
+                        Err(ConfigurationRuntimeFailure::ImmutableConfiguration) => {
+                            return Err(cleanup_startup(
+                                ExitOutcome::InvalidConfiguration,
+                                &cancellation,
+                                &mut listeners,
+                                &mut tasks,
+                            ));
+                        },
+                        Err(_) => {
+                            return Err(cleanup_startup(
+                                ExitOutcome::StartupUnavailable(
+                                    BootstrapFailureCode::CatalogUnavailable,
+                                ),
+                                &cancellation,
+                                &mut listeners,
+                                &mut tasks,
+                            ));
+                        },
+                    };
+                    (
+                        Some(Arc::new(RuntimeConfiguration::new_at_generation(
+                            Arc::clone(effective),
+                            generation,
+                        ))),
+                        Some(publication),
+                    )
+                },
+                None => (None, None),
+            };
+        if let Some(runtime) = runtime_configuration.as_ref() {
+            state
+                .set_configuration_runtime(Arc::clone(runtime))
+                .map_err(|_| {
+                    cleanup_startup(
+                        ExitOutcome::StartupUnavailable(BootstrapFailureCode::CatalogUnavailable),
+                        &cancellation,
+                        &mut listeners,
+                        &mut tasks,
+                    )
+                })?;
+        }
+        let export_destination_resolver = configuration.export_destination_resolver.or_else(|| {
+            runtime_configuration.as_ref().map(|runtime| {
+                Arc::new(crate::ConfiguredExportDestinationResolver::from_runtime(
+                    Arc::clone(runtime),
+                )) as Arc<dyn positron_query::ExportDestinationResolver>
+            })
+        });
         let services = match ServiceHandle::new_with_export_destination_resolver(
             Arc::clone(&instance),
             Some(&cancellation),
-            configuration.export_destination_resolver,
+            export_destination_resolver,
         ) {
             Ok(services) => services,
             Err(failure) => {
@@ -201,6 +267,8 @@ impl ApplicationRuntime {
             instance: Some(instance),
             fenced_volume: None,
             services: Some(services),
+            configuration: runtime_configuration,
+            configuration_publication,
             cleanup: CleanupAccumulator::empty(),
             terminal_cleanup_complete: false,
         })

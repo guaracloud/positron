@@ -238,6 +238,25 @@ impl Setting {
     pub const fn mutability(self) -> MutabilityClass {
         setting_definition(self).mutability()
     }
+
+    /// Drift in these settings can change instance identity, encryption,
+    /// storage ownership, or the owner-only control plane and must fence the
+    /// instance rather than be reconciled automatically.
+    #[must_use]
+    pub const fn requires_drift_fence(self) -> bool {
+        matches!(
+            self,
+            Self::SchemaVersion
+                | Self::ListenerControlPath
+                | Self::ListenerApiTransport
+                | Self::ListenerApiTlsCertificateFile
+                | Self::ListenerApiTlsPrivateKeyFile
+                | Self::StorageDataDirectory
+                | Self::StorageSecretsDirectory
+                | Self::SecurityLocalKeyFile
+                | Self::ExportDestinations
+        )
+    }
 }
 
 /// Returns the Rust-owned canonical definition for one setting.

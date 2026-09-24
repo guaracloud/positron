@@ -12,7 +12,10 @@ use super::adapters::tenant::{
     tenant_alias_response, tenant_lifecycle_response, tenant_quota_response,
     tenant_retention_preview_response, tenant_retention_update_response, tenant_service_response,
 };
-use super::io::{RequestHead, Response, capability_response, health_response, read_body};
+use super::io::{
+    RequestHead, Response, capability_response, configuration_status_response, health_response,
+    read_body,
+};
 use crate::{HealthState, ListenerRole, Liveness, Readiness, ServiceHandle};
 
 const MAX_API_BODY_BYTES: usize = positron_api::generated::MAX_PUBLIC_REQUEST_BYTES;
@@ -483,6 +486,23 @@ pub(super) fn route(
             "ready",
             health.security_warning(),
         )),
+        (ListenerRole::Operations, "GET", "/status") => {
+            let bearer = Zeroizing::new(head.bearer.take().ok_or_else(|| {
+                Response::json(401, "{\"code\":\"authentication_rejected\"}".to_owned())
+            })?);
+            health
+                .authorize_configuration_status(&bearer)
+                .map_err(|_| {
+                    Response::json(401, "{\"code\":\"authentication_rejected\"}".to_owned())
+                })?;
+            health
+                .configuration_status()
+                .map_err(|_| Response::empty(503))?
+                .map_or_else(
+                    || Ok(Response::empty(503)),
+                    |status| Ok(configuration_status_response(health.phase(), &status)),
+                )
+        },
         (ListenerRole::Api, "POST", "/v1/capabilities:negotiate") => {
             let services = services.ok_or_else(|| Response::empty(503))?;
             let body = read_body(stream, head.content_length, MAX_API_BODY_BYTES)?;
@@ -510,7 +530,7 @@ pub(super) fn route(
             let services = services.ok_or_else(|| Response::empty(503))?;
             super::super::otlp_http::receive_from(stream, head, peer, trusted_proxy, services)
         },
-        (ListenerRole::Operations, _, "/health/live" | "/health/ready")
+        (ListenerRole::Operations, _, "/health/live" | "/health/ready" | "/status")
         | (ListenerRole::Api, _, "/v1/capabilities:negotiate")
         | (ListenerRole::Api, _, positron_api::api_keys::HTTP_PATH)
         | (ListenerRole::Api, _, positron_api::tenant_quotas::HTTP_PATH)

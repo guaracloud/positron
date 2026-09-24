@@ -33,11 +33,13 @@ pub use api_key_administration::{
 };
 pub use audit::{
     ApiKeyLifecycleAction, CatalogRootRotationAuditEntry, CatalogRootRotationStage,
-    DurableOperationAuditEntry, GovernanceAuditEntry, IngestPolicyActivationAuditEntry,
-    InitialAuditMetadata, InitializationAuditEntry, ListenerTransportAuditEntry,
-    ListenerTransportAuditRequest, ListenerTransportConfigurationProvenance,
-    SchemaCheckpointAuditEntry, SystemAuditRetentionUpdateAuditEntry,
-    TenantDisplayNameUpdateAuditEntry, TenantQuotaUpdateAuditEntry, schema_checkpoint_audit_intent,
+    ConfigurationAuditContext, ConfigurationAuditEntry, ConfigurationAuditOutcome,
+    ConfigurationAuditRequest, DurableOperationAuditEntry, GovernanceAuditEntry,
+    IngestPolicyActivationAuditEntry, InitialAuditMetadata, InitializationAuditEntry,
+    ListenerTransportAuditEntry, ListenerTransportAuditRequest,
+    ListenerTransportConfigurationProvenance, SchemaCheckpointAuditEntry,
+    SystemAuditRetentionUpdateAuditEntry, TenantDisplayNameUpdateAuditEntry,
+    TenantQuotaUpdateAuditEntry, schema_checkpoint_audit_intent,
 };
 #[cfg(fuzzing)]
 pub use durable_operation_administration::fuzz_durable_operation_record;
