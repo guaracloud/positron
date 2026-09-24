@@ -108,6 +108,42 @@ pub(super) fn wait_for_ready(port: u16) -> Result<(), Box<dyn std::error::Error>
 }
 
 #[cfg(unix)]
+pub(super) fn wait_for_configuration_status(
+    port: u16,
+    authorization: &str,
+    expected_fragments: &[&str],
+) -> Result<String, Box<dyn std::error::Error>> {
+    for _ in 0..100 {
+        if let Ok(response) = configuration_status(port, authorization) {
+            if response.starts_with("HTTP/1.1 200 ")
+                && expected_fragments
+                    .iter()
+                    .all(|fragment| response.contains(fragment))
+            {
+                return Ok(response);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    Err("Positron configuration status did not reach expected state".into())
+}
+
+#[cfg(unix)]
+fn configuration_status(
+    port: u16,
+    authorization: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port))?;
+    let request = format!(
+        "GET /status HTTP/1.1\r\nHost: localhost\r\nAuthorization: {authorization}\r\nContent-Length: 0\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes())?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    Ok(response)
+}
+
+#[cfg(unix)]
 pub(super) fn wait_for_readiness(
     port: u16,
     expected_status: &str,

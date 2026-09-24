@@ -202,14 +202,7 @@ impl RuntimeConfiguration {
             .state
             .write()
             .map_err(|_| ConfigurationRuntimeFailure::Unavailable)?;
-        let drift = state.effective.drift_against(desired);
-        if drift.disposition() != ConfigurationDriftDisposition::None {
-            return Ok(None);
-        }
-        state.desired = Arc::clone(&state.effective);
-        state.drift_disposition = ConfigurationDriftDisposition::None;
-        state.pending_restart = None;
-        Ok(Some(drift))
+        Ok(clear_matching_desired_state(&mut state, desired))
     }
 
     /// Reloads through the durable Catalog and Governance Audit boundary.
@@ -227,9 +220,12 @@ impl RuntimeConfiguration {
             .map_err(|_| ConfigurationRuntimeFailure::Unavailable)?;
         let diff = state.effective.semantic_diff(&candidate);
         match diff.plan() {
-            ConfigurationDiffPlan::NoChange => Ok(ConfigurationReloadOutcome::NoChange {
-                generation: state.generation,
-            }),
+            ConfigurationDiffPlan::NoChange => {
+                clear_matching_desired_state(&mut state, &candidate);
+                Ok(ConfigurationReloadOutcome::NoChange {
+                    generation: state.generation,
+                })
+            },
             ConfigurationDiffPlan::PublishLive => {
                 let generation = publication.publish(
                     &state.effective,
@@ -315,6 +311,20 @@ impl RuntimeConfiguration {
         }
         Ok(drift)
     }
+}
+
+fn clear_matching_desired_state(
+    state: &mut ConfigurationObservation,
+    desired: &EffectiveConfiguration,
+) -> Option<ConfigurationDrift> {
+    let drift = state.effective.drift_against(desired);
+    if drift.disposition() != ConfigurationDriftDisposition::None {
+        return None;
+    }
+    state.desired = Arc::clone(&state.effective);
+    state.drift_disposition = ConfigurationDriftDisposition::None;
+    state.pending_restart = None;
+    Some(drift)
 }
 
 fn validate_successor_generation(

@@ -3,6 +3,10 @@
 use std::process::Command;
 
 #[cfg(unix)]
+use positron_kernel::MountQualification;
+#[cfg(unix)]
+use positron_runtime::{BootstrapPaths, InitializationPlan, InstanceBootstrap};
+#[cfg(unix)]
 use std::fs;
 #[cfg(unix)]
 use std::process::Stdio;
@@ -146,8 +150,17 @@ fn sighup_reloads_a_valid_candidate_and_keeps_serving_after_a_rejected_candidate
         ],
     );
     fs::write(&config_path, &base_configuration)?;
+    let bootstrap_paths = BootstrapPaths::new(&data, &secrets, MountQualification::LocalHost)?;
+    drop(InstanceBootstrap::initialize(
+        &bootstrap_paths,
+        InitializationPlan::non_interactive(),
+    )?);
+    let authorization = format!(
+        "Bearer {}",
+        InstanceBootstrap::claim(&bootstrap_paths)?.secret()
+    );
     let mut child = Command::new(env!("CARGO_BIN_EXE_positron"))
-        .args(["serve", "--init-if-empty", "--config"])
+        .args(["serve", "--config"])
         .arg(&config_path)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -167,6 +180,56 @@ fn sighup_reloads_a_valid_candidate_and_keeps_serving_after_a_rejected_candidate
     std::thread::sleep(Duration::from_millis(100));
     assert!(child.try_wait()?.is_none());
     wait_for_ready(operations_port)?;
+
+    let restart_required_configuration = base_configuration.replacen(
+        "shutdown_grace_seconds = 2",
+        "shutdown_grace_seconds = 60",
+        1,
+    );
+    fs::write(&config_path, restart_required_configuration)?;
+    assert!(
+        Command::new("/bin/kill")
+            .args(["-HUP", &child.id().to_string()])
+            .status()?
+            .success()
+    );
+    let pending_status = wait_for_configuration_status(
+        operations_port,
+        &authorization,
+        &[
+            "\"pending_restart\":true",
+            "\"drift_disposition\":\"reconcile\"",
+        ],
+    )?;
+    let pending_generation = status_value(&pending_status, "observed_generation")?;
+    assert_ne!(
+        status_value(&pending_status, "effective_digest")?,
+        status_value(&pending_status, "desired_digest")?
+    );
+
+    fs::write(&config_path, &base_configuration)?;
+    assert!(
+        Command::new("/bin/kill")
+            .args(["-HUP", &child.id().to_string()])
+            .status()?
+            .success()
+    );
+    let restored_status = wait_for_configuration_status(
+        operations_port,
+        &authorization,
+        &[
+            "\"pending_restart\":false",
+            "\"drift_disposition\":\"none\"",
+        ],
+    )?;
+    assert_eq!(
+        status_value(&restored_status, "observed_generation")?,
+        pending_generation
+    );
+    assert_eq!(
+        status_value(&restored_status, "effective_digest")?,
+        status_value(&restored_status, "desired_digest")?
+    );
 
     fs::write(
         &config_path,
@@ -195,6 +258,23 @@ fn sighup_reloads_a_valid_candidate_and_keeps_serving_after_a_rejected_candidate
     );
     fs::remove_dir_all(root)?;
     Ok(())
+}
+
+#[cfg(unix)]
+fn status_value<'response>(
+    response: &'response str,
+    field: &str,
+) -> Result<&'response str, Box<dyn std::error::Error>> {
+    let prefix = format!("\"{field}\":");
+    let value = response
+        .split_once(&prefix)
+        .map(|(_, value)| value)
+        .ok_or_else(|| format!("status field {field} missing"))?;
+    value
+        .split([',', '}'])
+        .next()
+        .map(|value| value.trim_matches('"'))
+        .ok_or_else(|| format!("status field {field} missing value").into())
 }
 
 #[cfg(unix)]
