@@ -190,6 +190,28 @@ impl RuntimeConfiguration {
             .map_err(|_| ConfigurationRuntimeFailure::Unavailable)
     }
 
+    /// Clears a superseded desired candidate only when the supplied desired
+    /// configuration is still equal to the active configuration under the
+    /// canonical state lock. This is an observation update, so it does not
+    /// publish a new Catalog generation or Governance Audit record.
+    pub(crate) fn clear_matching_desired_configuration(
+        &self,
+        desired: &EffectiveConfiguration,
+    ) -> Result<Option<ConfigurationDrift>, ConfigurationRuntimeFailure> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| ConfigurationRuntimeFailure::Unavailable)?;
+        let drift = state.effective.drift_against(desired);
+        if drift.disposition() != ConfigurationDriftDisposition::None {
+            return Ok(None);
+        }
+        state.desired = Arc::clone(&state.effective);
+        state.drift_disposition = ConfigurationDriftDisposition::None;
+        state.pending_restart = None;
+        Ok(Some(drift))
+    }
+
     /// Reloads through the durable Catalog and Governance Audit boundary.
     /// The write lock remains held until the publication succeeds, preventing
     /// readers from observing an in-memory successor without its audit-bound

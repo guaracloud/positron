@@ -91,6 +91,47 @@ fn operations_status_exposes_a_fenced_configuration_drift() -> Result<(), Box<dy
         quoted_status_value(&reloaded_status, "desired_digest")?
     );
 
+    let restart_required = effective_configuration(Some(
+        "schema_version = 1\n[diagnostics]\nlog_level = \"debug\"\n[runtime]\nshutdown_grace_seconds = 60\n",
+    ))?;
+    assert!(matches!(
+        process.reload_configuration(restart_required)?,
+        positron_runtime::ConfigurationReloadOutcome::PendingRestart { .. }
+    ));
+    let pending_generation = process
+        .configuration()
+        .ok_or("configuration runtime missing")?
+        .observed()?
+        .generation();
+    assert_eq!(
+        process
+            .reconcile_configuration_drift(Arc::clone(&reloaded))?
+            .disposition(),
+        positron_config::ConfigurationDriftDisposition::None
+    );
+    assert_eq!(
+        process
+            .configuration()
+            .ok_or("configuration runtime missing")?
+            .observed()?
+            .generation(),
+        pending_generation
+    );
+    let reconciled_status = http(
+        operations,
+        "GET",
+        "/status",
+        &[("Authorization", &authorization)],
+        &[],
+    )?;
+    assert_status(reconciled_status.clone(), 200);
+    assert!(reconciled_status.contains("\"drift_disposition\":\"none\""));
+    assert!(reconciled_status.contains("\"pending_restart\":false"));
+    assert_eq!(
+        quoted_status_value(&reconciled_status, "effective_digest")?,
+        quoted_status_value(&reconciled_status, "desired_digest")?
+    );
+
     let desired = effective_configuration(Some(
         "schema_version = 1\n[diagnostics]\nlog_level = \"debug\"\n[storage]\ndata_directory = \"/different-data\"\n",
     ))?;

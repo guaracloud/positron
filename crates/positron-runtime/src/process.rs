@@ -370,6 +370,9 @@ impl RunningProcess {
             .configuration
             .as_ref()
             .ok_or(ConfigurationRuntimeFailure::Unavailable)?;
+        if let Some(drift) = runtime.clear_matching_desired_configuration(&desired)? {
+            return Ok(drift);
+        }
         let drift = runtime.drift_against(Arc::clone(&desired))?;
         match drift.disposition() {
             ConfigurationDriftDisposition::None => Ok(drift),

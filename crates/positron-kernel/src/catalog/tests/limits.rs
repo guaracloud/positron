@@ -82,8 +82,15 @@ fn opaque_digest_is_domain_separated_and_refuses_an_ambiguous_input() {
     let different_domain = secret
         .opaque_digest(b"positron.test.other.v1\0", b"first")
         .expect("different domain is accepted");
+    let first_split = secret
+        .opaque_digest(b"a", b"bc")
+        .expect("first split binding is accepted");
+    let second_split = secret
+        .opaque_digest(b"ab", b"c")
+        .expect("second split binding is accepted");
     assert_eq!(first, same);
     assert_ne!(first, different_domain);
+    assert_ne!(first_split, second_split);
     assert_eq!(
         secret
             .opaque_digest(b"", b"first")
