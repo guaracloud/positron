@@ -129,6 +129,21 @@ pub trait ConfigurationPublication: Send + Sync {
         diff: &ConfigurationDiff,
         disposition: ConfigurationPublicationDisposition,
     ) -> Result<u64, ConfigurationRuntimeFailure>;
+
+    fn publish_with_plaintext_listener_opt_outs(
+        &self,
+        active: &EffectiveConfiguration,
+        candidate: &EffectiveConfiguration,
+        diff: &ConfigurationDiff,
+        disposition: ConfigurationPublicationDisposition,
+        plaintext_listener_opt_outs: &[positron_governance::ListenerTransportAuditRequest],
+    ) -> Result<u64, ConfigurationRuntimeFailure> {
+        if plaintext_listener_opt_outs.is_empty() {
+            self.publish(active, candidate, diff, disposition)
+        } else {
+            Err(ConfigurationRuntimeFailure::PublicationUnavailable)
+        }
+    }
 }
 
 impl ConfigurationReloadOutcome {
@@ -294,6 +309,7 @@ impl RuntimeConfiguration {
         &self,
         candidate: Arc<EffectiveConfiguration>,
         publication: &dyn ConfigurationPublication,
+        plaintext_listener_opt_outs: &[positron_governance::ListenerTransportAuditRequest],
     ) -> Result<ConfigurationReloadOutcome, ConfigurationRuntimeFailure> {
         let mut state = self
             .state
@@ -303,11 +319,12 @@ impl RuntimeConfiguration {
         if diff.plan() != ConfigurationDiffPlan::DrainThenPublish {
             return Err(ConfigurationRuntimeFailure::Unavailable);
         }
-        let generation = publication.publish(
+        let generation = publication.publish_with_plaintext_listener_opt_outs(
             &state.effective,
             &candidate,
             &diff,
             ConfigurationPublicationDisposition::PublishedLive,
+            plaintext_listener_opt_outs,
         )?;
         validate_successor_generation(state.generation, generation)?;
         state.generation = generation;

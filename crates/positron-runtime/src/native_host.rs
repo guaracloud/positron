@@ -393,6 +393,36 @@ impl Clone for NativeHost {
 }
 
 impl NativeHost {
+    fn staged_profile(&self, configured: &Self, role: ListenerRole) -> Option<ListenerProfile> {
+        if role == ListenerRole::Control {
+            return configured.profile_for(role);
+        }
+        let configured_address = configured.bindings.address(role)?;
+        if configured_address.port() != 0 || self.bindings.address(role) != Some(configured_address)
+        {
+            return configured.profile_for(role);
+        }
+        let active_address =
+            self.admissions
+                .lock()
+                .ok()?
+                .iter()
+                .rev()
+                .find_map(|(active_role, admission)| {
+                    (*active_role == role).then(|| match &admission.listener {
+                        NativeListener::Tcp(listener) => listener.local_addr().ok(),
+                        #[cfg(unix)]
+                        NativeListener::Unix(_) => None,
+                    })?
+                })?;
+        ListenerProfile::network(
+            role,
+            active_address,
+            configured.bindings.transport(role)?.listener_transport(),
+        )
+        .ok()
+    }
+
     #[must_use]
     pub fn new(bindings: NativeBindings) -> Self {
         Self {
@@ -601,8 +631,7 @@ impl ListenerFactory for NativeHost {
                     Some(address) => matches!(
                         &admission.listener,
                         NativeListener::Tcp(listener)
-                            if address.port() == 0
-                                || listener.local_addr().is_ok_and(|local| local == address)
+                            if listener.local_addr().is_ok_and(|local| local == address)
                     ),
                 }
             })
@@ -729,8 +758,7 @@ impl ListenerGenerationFactory for NativeHost {
             staged_admissions: Some(Arc::clone(&staged_admissions)),
         };
         let profiles = ListenerRole::all().map(|role| {
-            configured
-                .profile_for(role)
+            self.staged_profile(&configured, role)
                 .ok_or(ListenerFailure::InvalidEndpoint)
         });
         let [control, operations, api, otlp_grpc, otlp_http, loki_push] = profiles;
@@ -917,18 +945,37 @@ fn serve_exact_listener_role(
     health: HealthState,
     services: Option<ServiceHandle>,
 ) -> Result<(), TaskFailure> {
+    let prepared_grpc = if role == ListenerRole::OtlpGrpc {
+        Some(
+            otlp_grpc::prepare(Arc::clone(&admission), services.clone())
+                .map_err(|_| TaskFailure::SpawnUnavailable)?,
+        )
+    } else {
+        None
+    };
     gate.park_then_wait(&cancellation)?;
     if cancellation.is_cancelled() {
+        if let Some(prepared) = prepared_grpc {
+            prepared
+                .discard()
+                .map_err(|_| TaskFailure::JoinUnavailable)?;
+        }
         return Ok(());
     }
     gate.mark_ready()?;
     gate.wait_for_admission(&cancellation);
     if cancellation.is_cancelled() {
+        if let Some(prepared) = prepared_grpc {
+            prepared
+                .discard()
+                .map_err(|_| TaskFailure::JoinUnavailable)?;
+        }
         return Ok(());
     }
     admission.accepting.store(true, Ordering::Release);
-    if role == ListenerRole::OtlpGrpc {
-        otlp_grpc::serve(admission, cancellation, force, services)
+    if let Some(prepared) = prepared_grpc {
+        prepared
+            .serve(cancellation, force)
             .map_err(|_| TaskFailure::JoinUnavailable)
     } else {
         serve_http(admission, cancellation, health, services);
@@ -1058,8 +1105,13 @@ fn join_thread(
 mod listener_generation_tests {
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
     use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
 
-    use super::{NativeBindings, NativeHost};
+    use super::{
+        ActivationGate, Admission, NativeBindings, NativeHost, NativeListener, TransportProfile,
+        serve_exact_listener_role,
+    };
     use crate::{
         ListenerFactory, ListenerFailure, ListenerGeneration, ListenerProfile, ListenerRole,
         ValidatedListenerSet, health::ProcessState,
@@ -1194,6 +1246,60 @@ mod listener_generation_tests {
         Ok(())
     }
 
+    #[test]
+    fn grpc_preparation_failure_never_reaches_the_publication_readiness_gate()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let admission = Arc::new(Admission {
+            role: ListenerRole::OtlpGrpc,
+            listener: NativeListener::Tcp(listener),
+            accepting: AtomicBool::new(false),
+            accepted_connections: std::sync::atomic::AtomicUsize::new(0),
+            control_path: None,
+            transport: Some(TransportProfile::plaintext_opt_out()),
+            trusted_proxy: None,
+        });
+        let gate = Arc::new(ActivationGate::new());
+        let cancellation = crate::TaskCancellation::new();
+        let result = serve_exact_listener_role(
+            ListenerRole::OtlpGrpc,
+            admission,
+            Arc::clone(&gate),
+            cancellation.clone(),
+            crate::TaskCancellation::new(),
+            ProcessState::starting().health(),
+            None,
+        );
+        assert!(matches!(result, Err(crate::TaskFailure::SpawnUnavailable)));
+        assert!(
+            gate.wait_parked(1).is_err(),
+            "an OTLP gRPC preparation failure must not make a candidate ready for publication"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn accepted_socket_is_not_served_after_its_generation_stops_admission()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let admission = Admission {
+            role: ListenerRole::Api,
+            listener: NativeListener::Tcp(listener),
+            accepting: AtomicBool::new(true),
+            accepted_connections: std::sync::atomic::AtomicUsize::new(0),
+            control_path: None,
+            transport: Some(TransportProfile::plaintext_opt_out()),
+            trusted_proxy: None,
+        };
+        let cancellation = crate::TaskCancellation::new();
+        admission.stop();
+        assert!(
+            !super::can_serve_accepted_connection(&admission, &cancellation),
+            "the post-accept admission check must discard a socket accepted by a retired generation"
+        );
+        Ok(())
+    }
+
     fn native_candidate(
         host: &NativeHost,
     ) -> Result<ValidatedListenerSet, Box<dyn std::error::Error>> {
@@ -1308,6 +1414,9 @@ fn serve_http(
         };
         match accepted {
             Ok((mut stream, peer)) => {
+                if !can_serve_accepted_connection(&admission, &cancellation) {
+                    continue;
+                }
                 let _lease = admission.accept_connection();
                 if stream.set_nonblocking(false).is_err()
                     || stream
@@ -1359,6 +1468,10 @@ fn serve_http(
             Err(_) => break,
         }
     }
+}
+
+fn can_serve_accepted_connection(admission: &Admission, cancellation: &TaskCancellation) -> bool {
+    admission.is_accepting() && !cancellation.is_cancelled()
 }
 
 #[cfg(test)]

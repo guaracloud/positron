@@ -49,6 +49,11 @@ const DURABLE_OPERATION_AUDIT_MAGIC_V5: [u8; 8] = *b"POSOPA05";
 const DURABLE_OPERATION_AUDIT_MAGIC_V1: [u8; 8] = *b"POSOPA01";
 const CONFIGURATION_AUDIT_MAGIC: [u8; 8] = *b"POSCFG01";
 const CONFIGURATION_AUDIT_DOMAIN: &[u8] = b"positron.configuration.audit.v1\0";
+const CONFIGURATION_WITH_PLAINTEXT_AUDIT_MAGIC: [u8; 8] = *b"POSCFG02";
+const CONFIGURATION_WITH_PLAINTEXT_AUDIT_DOMAIN: &[u8] =
+    b"positron.configuration-with-plaintext.audit.v1\0";
+const CONFIGURATION_AUDIT_BYTES: usize = 155;
+const MAX_PLAINTEXT_LISTENER_RECEIPTS: usize = 5;
 
 /// Extracts a terminal receipt's idempotency key only after its owning codec
 /// has recognized the supported receipt version and key location. Callers use
@@ -358,6 +363,14 @@ impl ConfigurationAuditRequest {
         transaction_id: [u8; 16],
         intent: &[u8],
     ) -> Result<ConfigurationAuditEntry, IdentityFailure> {
+        let request = Self::decode_request(intent)?;
+        if transaction_id != request.transaction_id() {
+            return Err(IdentityFailure);
+        }
+        Ok(request.entry(position, Vec::new()))
+    }
+
+    fn decode_request(intent: &[u8]) -> Result<Self, IdentityFailure> {
         let mut cursor = Cursor::new(intent);
         if cursor.take_array::<8>()? != CONFIGURATION_AUDIT_MAGIC {
             return Err(IdentityFailure);
@@ -399,22 +412,170 @@ impl ConfigurationAuditRequest {
             candidate_digest,
         )
         .map_err(|_| IdentityFailure)?;
-        if !cursor.is_empty() || transaction_id != request.transaction_id() {
+        if !cursor.is_empty() {
             return Err(IdentityFailure);
         }
-        Ok(ConfigurationAuditEntry {
+        Ok(request)
+    }
+
+    fn entry(
+        self,
+        position: u64,
+        plaintext_listener_opt_outs: Vec<ListenerTransportAuditEntry>,
+    ) -> ConfigurationAuditEntry {
+        ConfigurationAuditEntry {
             position,
-            outcome,
-            ingest_time_unix_seconds,
-            principal,
-            applicable_tenant,
-            target,
-            request_id,
-            catalog_generation,
-            changed_setting_count,
-            active_digest,
-            candidate_digest,
+            outcome: self.outcome,
+            ingest_time_unix_seconds: self.ingest_time_unix_seconds,
+            principal: self.principal,
+            applicable_tenant: self.applicable_tenant,
+            target: self.target,
+            request_id: self.request_id,
+            catalog_generation: self.catalog_generation,
+            changed_setting_count: self.changed_setting_count,
+            active_digest: self.active_digest,
+            candidate_digest: self.candidate_digest,
+            plaintext_listener_opt_outs,
+        }
+    }
+}
+
+/// One joint configuration publication and its exact configuration-file
+/// plaintext opt-outs. Catalog advances its audit frontier once, so this
+/// bounded composite deliberately has one transaction and one audit record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfigurationWithPlaintextAuditRequest {
+    configuration: ConfigurationAuditRequest,
+    instance: [u8; 16],
+    plaintext_listener_opt_outs: Vec<ListenerTransportAuditRequest>,
+}
+
+impl ConfigurationWithPlaintextAuditRequest {
+    pub fn new(
+        configuration: ConfigurationAuditRequest,
+        instance: [u8; 16],
+        plaintext_listener_opt_outs: Vec<ListenerTransportAuditRequest>,
+    ) -> Result<Self, GovernanceIntentFailure> {
+        if plaintext_listener_opt_outs.is_empty()
+            || plaintext_listener_opt_outs.len() > MAX_PLAINTEXT_LISTENER_RECEIPTS
+            || instance.iter().all(|byte| *byte == 0)
+        {
+            return Err(GovernanceIntentFailure);
+        }
+        let mut roles = 0_u8;
+        for request in &plaintext_listener_opt_outs {
+            let role = request.listener_role();
+            if role == ListenerTransportRole::Control
+                || request.configuration_provenance()
+                    != ListenerTransportConfigurationProvenance::ConfigurationFile
+            {
+                return Err(GovernanceIntentFailure);
+            }
+            let bit = 1_u8
+                .checked_shl(u32::from(role.code()))
+                .ok_or(GovernanceIntentFailure)?;
+            if roles & bit != 0 {
+                return Err(GovernanceIntentFailure);
+            }
+            roles |= bit;
+        }
+        Ok(Self {
+            configuration,
+            instance,
+            plaintext_listener_opt_outs,
         })
+    }
+
+    #[must_use]
+    pub fn transaction_id(&self) -> [u8; 16] {
+        let mut hasher = Sha256::new();
+        hasher.update(CONFIGURATION_WITH_PLAINTEXT_AUDIT_DOMAIN);
+        hasher.update(self.encode());
+        let digest = hasher.finalize();
+        let mut transaction = [0; 16];
+        transaction.copy_from_slice(&digest[..16]);
+        if transaction.iter().all(|byte| *byte == 0) {
+            transaction[0] = 1;
+        }
+        transaction
+    }
+
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut encoded = Vec::with_capacity(
+            CONFIGURATION_AUDIT_BYTES + 16 + 1 + self.plaintext_listener_opt_outs.len() * 21,
+        );
+        encoded.extend_from_slice(&CONFIGURATION_WITH_PLAINTEXT_AUDIT_MAGIC);
+        encoded.extend_from_slice(&self.configuration.encode()[8..]);
+        encoded.extend_from_slice(&self.instance);
+        encoded.push(u8::try_from(self.plaintext_listener_opt_outs.len()).unwrap_or(0));
+        for request in &self.plaintext_listener_opt_outs {
+            encoded.push(request.listener_role().code());
+            encoded.push(request.configuration_provenance().code());
+            encoded.extend_from_slice(&listener_target_bytes(request.listener_target()));
+        }
+        encoded
+    }
+
+    pub(crate) fn decode(
+        position: u64,
+        transaction_id: [u8; 16],
+        intent: &[u8],
+    ) -> Result<ConfigurationAuditEntry, IdentityFailure> {
+        let mut cursor = Cursor::new(intent);
+        if cursor.take_array::<8>()? != CONFIGURATION_WITH_PLAINTEXT_AUDIT_MAGIC {
+            return Err(IdentityFailure);
+        }
+        let configuration_fields = cursor.take_exact(CONFIGURATION_AUDIT_BYTES - 8)?;
+        let mut configuration = Vec::with_capacity(CONFIGURATION_AUDIT_BYTES);
+        configuration.extend_from_slice(&CONFIGURATION_AUDIT_MAGIC);
+        configuration.extend_from_slice(configuration_fields);
+        let configuration = ConfigurationAuditRequest::decode_request(&configuration)?;
+        let instance = cursor.take_array::<16>()?;
+        let count = usize::from(cursor.take_u8()?);
+        if count == 0 || count > MAX_PLAINTEXT_LISTENER_RECEIPTS {
+            return Err(IdentityFailure);
+        }
+        let mut requests = Vec::with_capacity(count);
+        let mut entries = Vec::with_capacity(count);
+        let mut roles = 0_u8;
+        for _ in 0..count {
+            let role = ListenerTransportRole::from_code(cursor.take_u8()?)?;
+            let provenance =
+                ListenerTransportConfigurationProvenance::from_code(cursor.take_u8()?)?;
+            let target = decode_listener_target(&mut cursor)?;
+            let request = ListenerTransportAuditRequest::configuration_file_listener(role, target);
+            if role == ListenerTransportRole::Control
+                || provenance != request.configuration_provenance()
+            {
+                return Err(IdentityFailure);
+            }
+            let bit = 1_u8
+                .checked_shl(u32::from(role.code()))
+                .ok_or(IdentityFailure)?;
+            if roles & bit != 0 {
+                return Err(IdentityFailure);
+            }
+            roles |= bit;
+            entries.push(ListenerTransportAuditEntry::bound(
+                position,
+                instance,
+                target,
+                Some(role),
+                provenance,
+                request.transaction_id_for(instance),
+                request.digest_for(instance),
+            ));
+            requests.push(request);
+        }
+        if !cursor.is_empty() {
+            return Err(IdentityFailure);
+        }
+        let request = Self::new(configuration, instance, requests).map_err(|_| IdentityFailure)?;
+        if request.transaction_id() != transaction_id {
+            return Err(IdentityFailure);
+        }
+        Ok(request.configuration.entry(position, entries))
     }
 }
 
@@ -432,9 +593,16 @@ pub struct ConfigurationAuditEntry {
     changed_setting_count: u8,
     active_digest: [u8; 32],
     candidate_digest: [u8; 32],
+    plaintext_listener_opt_outs: Vec<ListenerTransportAuditEntry>,
 }
 
 impl ConfigurationAuditEntry {
+    /// Role-specific plaintext selections committed in this configuration
+    /// transaction. An empty slice preserves historical configuration records.
+    #[must_use]
+    pub fn plaintext_listener_opt_outs(&self) -> &[ListenerTransportAuditEntry] {
+        &self.plaintext_listener_opt_outs
+    }
     #[must_use]
     pub const fn position(&self) -> u64 {
         self.position
@@ -2258,6 +2426,14 @@ impl<'a> Cursor<'a> {
         let (value, rest) = self.remaining.split_at_checked(N).ok_or(IdentityFailure)?;
         self.remaining = rest;
         value.try_into().map_err(|_| IdentityFailure)
+    }
+    fn take_exact(&mut self, length: usize) -> Result<&'a [u8], IdentityFailure> {
+        let (value, rest) = self
+            .remaining
+            .split_at_checked(length)
+            .ok_or(IdentityFailure)?;
+        self.remaining = rest;
+        Ok(value)
     }
     fn take_u8(&mut self) -> Result<u8, IdentityFailure> {
         Ok(self.take_array::<1>()?[0])

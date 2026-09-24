@@ -59,6 +59,17 @@ impl ListenerTransportAdministration {
         for record in catalog.governance_audit_records().map_err(map_catalog)? {
             let entry = GovernanceAuditEntry::decode(&record)
                 .map_err(|_| ListenerTransportAdministrationFailure::CorruptState)?;
+            if let Some(configuration) = entry.as_configuration()
+                && configuration
+                    .plaintext_listener_opt_outs()
+                    .iter()
+                    .any(|receipt| receipt.matches_request(instance.to_bytes(), request))
+            {
+                if existing.replace(configuration.position()).is_some() {
+                    return Err(ListenerTransportAdministrationFailure::CorruptState);
+                }
+                continue;
+            }
             let Some(transport) = entry.as_listener_transport() else {
                 continue;
             };
@@ -226,6 +237,27 @@ fn encode_receipt(
     bytes.extend_from_slice(&request_digest);
     bytes.extend_from_slice(&audit_position.to_be_bytes());
     bytes
+}
+
+/// Builds one receipt object for a role record carried by another joint audit
+/// transaction. The caller owns the enclosing Catalog proposal and supplies
+/// its one shared audit position.
+pub fn plaintext_listener_transport_receipt_object(
+    instance: InstanceId,
+    transaction: TransactionId,
+    request: ListenerTransportAuditRequest,
+    audit_position: u64,
+) -> Result<CatalogObject, ListenerTransportAdministrationFailure> {
+    if audit_position == 0 {
+        return Err(ListenerTransportAdministrationFailure::PersistenceUnavailable);
+    }
+    CatalogObject::new(encode_receipt(
+        instance,
+        transaction,
+        request.digest_for(instance.to_bytes()),
+        audit_position,
+    ))
+    .map_err(map_catalog)
 }
 
 pub(crate) fn legacy_receipt_object(

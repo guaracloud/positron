@@ -35,12 +35,20 @@ use trace_codec::OtlpTracesServer;
 #[cfg(test)]
 mod tests;
 
-pub(super) fn serve(
+pub(super) struct PreparedGrpc {
     admission: Arc<Admission>,
-    cancellation: TaskCancellation,
-    force: TaskCancellation,
+    runtime: tokio::runtime::Runtime,
+    listener: tokio::net::TcpListener,
+    server: Server,
+    services: ServiceHandle,
+    blocking: BlockingIngestExecutor,
+    blocking_handle: BlockingIngestHandle,
+}
+
+pub(super) fn prepare(
+    admission: Arc<Admission>,
     services: Option<ServiceHandle>,
-) -> Result<(), GrpcFailure> {
+) -> Result<PreparedGrpc, GrpcFailure> {
     let services = services.ok_or(GrpcFailure)?;
     let listener = admission.tcp_listener().map_err(|_| GrpcFailure)?;
     let tls = admission.grpc_tls_config().map_err(|_| GrpcFailure)?;
@@ -48,66 +56,101 @@ pub(super) fn serve(
         .enable_all()
         .build()
         .map_err(|_| GrpcFailure)?;
-    let mut blocking = BlockingIngestExecutor::start()?;
+    let listener = {
+        let _entered = runtime.enter();
+        tokio::net::TcpListener::from_std(listener).map_err(|_| GrpcFailure)?
+    };
+    let server = match tls {
+        Some(configuration) => Server::builder()
+            .tls_config(configuration)
+            .map_err(|_| GrpcFailure)?,
+        None => Server::builder(),
+    };
+    let blocking = BlockingIngestExecutor::start()?;
     let blocking_handle = blocking.handle()?;
-    let (result, forced) = runtime.block_on(async move {
-        let listener = match tokio::net::TcpListener::from_std(listener) {
-            Ok(listener) => listener,
-            Err(_) => return (Err(GrpcFailure), false),
-        };
-        let incoming = TcpListenerStream::new(listener);
-        let authentication = services.clone();
-        let trace_authentication = services.clone();
-        let trusted_proxy = admission.trusted_proxy.clone();
-        let trace_trusted_proxy = trusted_proxy.clone();
-        let receiver = OtlpLogsServer::new(OtlpLogsGrpc {
-            services: services.clone(),
-            blocking: blocking_handle.clone(),
-        })
-        .accept_compressed(CompressionEncoding::Gzip)
-        .max_decoding_message_size(MAX_MESSAGE_BYTES);
-        let receiver = MapResponseLayer::new(map_decode_failure).named_layer(receiver);
-        let receiver = InterceptedService::new(receiver, move |request| {
-            authenticate(request, &authentication, trusted_proxy.clone())
-        });
-        let trace_receiver = OtlpTracesServer::new(OtlpTracesGrpc {
-            services,
-            blocking: blocking_handle,
-        })
-        .accept_compressed(CompressionEncoding::Gzip);
-        let trace_receiver =
-            MapResponseLayer::new(map_trace_decode_failure).named_layer(trace_receiver);
-        let trace_receiver = InterceptedService::new(trace_receiver, move |request| {
-            authenticate_traces(request, &trace_authentication, trace_trusted_proxy.clone())
-        });
-        let graceful_admission = Arc::clone(&admission);
-        let mut server = match tls {
-            Some(configuration) => match Server::builder().tls_config(configuration) {
-                Ok(server) => server,
-                Err(_) => return (Err(GrpcFailure), false),
-            },
-            None => Server::builder(),
-        };
-        let serving = server
-            .add_service(receiver)
-            .add_service(trace_receiver)
-            .serve_with_incoming_shutdown(incoming, async move {
-                while graceful_admission.is_accepting() && !cancellation.is_cancelled() {
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-            });
-        tokio::pin!(serving);
-        tokio::select! {
-            result = &mut serving => (result.map_err(|_| GrpcFailure), false),
-            () = wait_for(force) => (Ok(()), true),
-        }
-    });
-    if forced {
-        let _worker_joined = blocking.shutdown_within(Duration::from_millis(100))?;
-    } else {
-        blocking.shutdown()?;
+    Ok(PreparedGrpc {
+        admission,
+        runtime,
+        listener,
+        server,
+        services,
+        blocking,
+        blocking_handle,
+    })
+}
+
+impl PreparedGrpc {
+    pub(super) fn discard(mut self) -> Result<(), GrpcFailure> {
+        self.blocking.shutdown()
     }
-    result
+
+    pub(super) fn serve(
+        mut self,
+        cancellation: TaskCancellation,
+        force: TaskCancellation,
+    ) -> Result<(), GrpcFailure> {
+        let admission = Arc::clone(&self.admission);
+        let services = self.services.clone();
+        let blocking_handle = self.blocking_handle.clone();
+        let listener = self.listener;
+        let mut server = self.server;
+        let (result, forced) = self.runtime.block_on(async move {
+            let incoming = TcpListenerStream::new(listener);
+            let authentication = services.clone();
+            let trace_authentication = services.clone();
+            let trusted_proxy = admission.trusted_proxy.clone();
+            let trace_trusted_proxy = trusted_proxy.clone();
+            let receiver = OtlpLogsServer::new(OtlpLogsGrpc {
+                services: services.clone(),
+                blocking: blocking_handle.clone(),
+            })
+            .accept_compressed(CompressionEncoding::Gzip)
+            .max_decoding_message_size(MAX_MESSAGE_BYTES);
+            let receiver = MapResponseLayer::new(map_decode_failure).named_layer(receiver);
+            let receiver = InterceptedService::new(receiver, move |request| {
+                authenticate(request, &authentication, trusted_proxy.clone())
+            });
+            let trace_receiver = OtlpTracesServer::new(OtlpTracesGrpc {
+                services,
+                blocking: blocking_handle,
+            })
+            .accept_compressed(CompressionEncoding::Gzip);
+            let trace_receiver =
+                MapResponseLayer::new(map_trace_decode_failure).named_layer(trace_receiver);
+            let trace_receiver = InterceptedService::new(trace_receiver, move |request| {
+                authenticate_traces(request, &trace_authentication, trace_trusted_proxy.clone())
+            });
+            let graceful_admission = Arc::clone(&admission);
+            let serving = server
+                .add_service(receiver)
+                .add_service(trace_receiver)
+                .serve_with_incoming_shutdown(incoming, async move {
+                    while graceful_admission.is_accepting() && !cancellation.is_cancelled() {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                });
+            tokio::pin!(serving);
+            tokio::select! {
+                result = &mut serving => (result.map_err(|_| GrpcFailure), false),
+                () = wait_for(force) => (Ok(()), true),
+            }
+        });
+        if forced {
+            let _worker_joined = self.blocking.shutdown_within(Duration::from_millis(100))?;
+        } else {
+            self.blocking.shutdown()?;
+        }
+        result
+    }
+}
+
+pub(super) fn serve(
+    admission: Arc<Admission>,
+    cancellation: TaskCancellation,
+    force: TaskCancellation,
+    services: Option<ServiceHandle>,
+) -> Result<(), GrpcFailure> {
+    prepare(admission, services)?.serve(cancellation, force)
 }
 
 fn map_decode_failure<B>(response: http::Response<B>) -> http::Response<B> {

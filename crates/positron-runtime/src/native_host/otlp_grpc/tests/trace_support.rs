@@ -25,7 +25,7 @@ use positron_kernel::MountQualification;
 use prost::Message;
 
 use super::super::serve;
-use crate::native_host::{Admission, NativeListener};
+use crate::native_host::{Admission, NativeListener, TransportProfile};
 use crate::services::ReceiverTestBackend;
 use crate::{
     BootstrapPaths, InitializationPlan, InitializedInstance, InstanceBootstrap, ListenerRole,
@@ -300,7 +300,7 @@ impl ReceiverHarness {
             accepting: AtomicBool::new(true),
             accepted_connections: AtomicUsize::new(0),
             control_path: None,
-            transport: None,
+            transport: Some(TransportProfile::plaintext_opt_out()),
             trusted_proxy: None,
         });
         let cancellation = TaskCancellation::new();

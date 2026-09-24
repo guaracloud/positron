@@ -6,12 +6,12 @@ use super::{
     schema_checkpoint_audit_intent,
 };
 use crate::{
-    ApiKeyLifecycleAction, ConfigurationAuditOutcome, ConfigurationAuditRequest,
-    DurableOperationKind, DurableOperationPhase, DurableOperationStatus, InitialAuditContext,
-    InitialGovernanceIntent, InitialTenantIntent, ListenerTransportAuditEntry,
-    ListenerTransportAuditRequest, ListenerTransportConfigurationProvenance, ListenerTransportRole,
-    ResourceGeneration, TlsMaterialReloadAuditRequest, TlsMaterialReloadListenerSet,
-    TlsMaterialReloadOutcome,
+    ApiKeyLifecycleAction, ConfigurationAuditContext, ConfigurationAuditOutcome,
+    ConfigurationAuditRequest, ConfigurationWithPlaintextAuditRequest, DurableOperationKind,
+    DurableOperationPhase, DurableOperationStatus, InitialAuditContext, InitialGovernanceIntent,
+    InitialTenantIntent, ListenerTransportAuditEntry, ListenerTransportAuditRequest,
+    ListenerTransportConfigurationProvenance, ListenerTransportRole, ResourceGeneration,
+    TlsMaterialReloadAuditRequest, TlsMaterialReloadListenerSet, TlsMaterialReloadOutcome,
 };
 
 #[test]
@@ -693,5 +693,94 @@ fn configuration_audit_binds_the_fenced_drift_to_one_catalog_generation() {
     wrong_digest[digest_start] ^= 1;
     assert!(
         GovernanceAuditEntry::decode_fields(9, request.transaction_id(), &wrong_digest).is_err()
+    );
+}
+
+#[test]
+fn composite_configuration_audit_binds_role_distinct_plaintext_opt_outs() {
+    let context = ConfigurationAuditContext::new(
+        ConfigurationAuditOutcome::PublishedLive,
+        1_725_000_000,
+        PrincipalId::from_bytes([0x31; 16]).expect("principal"),
+        None,
+        [0x32; 16],
+        [0x33; 16],
+    )
+    .expect("context");
+    let configuration =
+        ConfigurationAuditRequest::new(context, 42, 2, [0x41; 32], [0x42; 32]).expect("request");
+    let request = ConfigurationWithPlaintextAuditRequest::new(
+        configuration,
+        [0x51; 16],
+        vec![
+            ListenerTransportAuditRequest::configuration_file_listener(
+                ListenerTransportRole::Api,
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 443)),
+            ),
+            ListenerTransportAuditRequest::configuration_file_listener(
+                ListenerTransportRole::OtlpGrpc,
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 4317)),
+            ),
+        ],
+    )
+    .expect("bounded distinct roles");
+    let encoded = request.encode();
+    let transaction = request.transaction_id();
+    let entry = GovernanceAuditEntry::decode_fields(9, transaction, &encoded)
+        .expect("typed composite configuration audit");
+    let configuration = entry.as_configuration().expect("configuration entry");
+    assert_eq!(configuration.position(), 9);
+    assert_eq!(configuration.plaintext_listener_opt_outs().len(), 2);
+    assert_eq!(
+        configuration.plaintext_listener_opt_outs()[0].listener_role(),
+        Some(ListenerTransportRole::Api)
+    );
+    assert_eq!(
+        configuration.plaintext_listener_opt_outs()[1].listener_role(),
+        Some(ListenerTransportRole::OtlpGrpc)
+    );
+    assert_ne!(transaction, configuration.request_id());
+    assert!(GovernanceAuditEntry::decode_fields(9, [0x99; 16], &encoded).is_err());
+
+    let mut trailing = encoded;
+    trailing.push(0);
+    assert!(GovernanceAuditEntry::decode_fields(9, transaction, &trailing).is_err());
+}
+
+#[test]
+fn composite_configuration_audit_refuses_control_duplicate_and_unbounded_roles() {
+    let context = ConfigurationAuditContext::new(
+        ConfigurationAuditOutcome::PublishedLive,
+        1_725_000_000,
+        PrincipalId::from_bytes([0x31; 16]).expect("principal"),
+        None,
+        [0x32; 16],
+        [0x33; 16],
+    )
+    .expect("context");
+    let configuration =
+        ConfigurationAuditRequest::new(context, 42, 1, [0x41; 32], [0x42; 32]).expect("request");
+    let api = ListenerTransportAuditRequest::configuration_file_listener(
+        ListenerTransportRole::Api,
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 443)),
+    );
+    assert!(
+        ConfigurationWithPlaintextAuditRequest::new(configuration, [0x51; 16], vec![api, api],)
+            .is_err()
+    );
+    assert!(
+        ConfigurationWithPlaintextAuditRequest::new(
+            configuration,
+            [0x51; 16],
+            vec![ListenerTransportAuditRequest::configuration_file_listener(
+                ListenerTransportRole::Control,
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 443)),
+            )],
+        )
+        .is_err()
+    );
+    assert!(
+        ConfigurationWithPlaintextAuditRequest::new(configuration, [0x51; 16], vec![api; 6],)
+            .is_err()
     );
 }

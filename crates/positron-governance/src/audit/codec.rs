@@ -16,6 +16,14 @@ impl GovernanceAuditEntry {
             return ConfigurationAuditRequest::decode(position, transaction_id, intent)
                 .map(Self::Configuration);
         }
+        if intent.starts_with(&CONFIGURATION_WITH_PLAINTEXT_AUDIT_MAGIC) {
+            return ConfigurationWithPlaintextAuditRequest::decode(
+                position,
+                transaction_id,
+                intent,
+            )
+            .map(Self::Configuration);
+        }
         if intent.starts_with(&DURABLE_OPERATION_AUDIT_MAGIC)
             || intent.starts_with(&DURABLE_OPERATION_AUDIT_MAGIC_V3)
             || intent.starts_with(&DURABLE_OPERATION_AUDIT_MAGIC_V4)

@@ -184,6 +184,33 @@ fn plaintext_listener_intents_for(
     .collect()
 }
 
+fn plaintext_listener_audit_requests(
+    configuration: &EffectiveConfiguration,
+) -> Vec<positron_governance::ListenerTransportAuditRequest> {
+    plaintext_listener_intents_for(configuration)
+        .into_iter()
+        .map(|intent| {
+            positron_governance::ListenerTransportAuditRequest::configuration_file_listener(
+                listener_transport_audit_role(intent.role()),
+                intent.listener_target(),
+            )
+        })
+        .collect()
+}
+
+const fn listener_transport_audit_role(
+    role: ListenerRole,
+) -> positron_governance::ListenerTransportRole {
+    match role {
+        ListenerRole::Control => positron_governance::ListenerTransportRole::Control,
+        ListenerRole::Operations => positron_governance::ListenerTransportRole::Operations,
+        ListenerRole::Api => positron_governance::ListenerTransportRole::Api,
+        ListenerRole::OtlpGrpc => positron_governance::ListenerTransportRole::OtlpGrpc,
+        ListenerRole::OtlpHttp => positron_governance::ListenerTransportRole::OtlpHttp,
+        ListenerRole::LokiPush => positron_governance::ListenerTransportRole::LokiPush,
+    }
+}
+
 impl std::fmt::Debug for ServeConfiguration {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -517,7 +544,11 @@ impl RunningProcess {
         let outcome = match if plan == ConfigurationDiffPlan::NoChange {
             runtime.reload_with(Arc::clone(&candidate), publication)
         } else {
-            runtime.publish_staged_listener_reload(Arc::clone(&candidate), publication)
+            runtime.publish_staged_listener_reload(
+                Arc::clone(&candidate),
+                publication,
+                &plaintext_listener_audit_requests(&candidate),
+            )
         } {
             Ok(outcome) => {
                 self.state
@@ -548,7 +579,8 @@ impl RunningProcess {
         };
         let retirement_deadline = std::time::Instant::now() + self.drain_deadline;
         if close_listeners(&mut retired).is_err() {
-            let abort_failed = abort_retired_tasks(&mut retired_tasks).is_err();
+            let abort_failed =
+                abort_retired_tasks(&mut retired_tasks, retirement_deadline).is_err();
             self.state.transition(ProcessPhase::Fenced);
             if abort_failed {
                 return Err(ConfigurationRuntimeFailure::ListenerUnavailable);
@@ -578,7 +610,8 @@ impl RunningProcess {
         if drain_listeners_until(&mut retired, retirement_deadline).is_err()
             || join_retired_tasks_until(&mut retired_tasks, retirement_deadline).is_err()
         {
-            let abort_failed = abort_retired_tasks(&mut retired_tasks).is_err();
+            let abort_failed =
+                abort_retired_tasks(&mut retired_tasks, retirement_deadline).is_err();
             self.state.transition(ProcessPhase::Fenced);
             if abort_failed {
                 return Err(ConfigurationRuntimeFailure::ListenerUnavailable);
@@ -714,23 +747,98 @@ fn join_retired_tasks_until(
     tasks: &mut RunningTasks,
     deadline: std::time::Instant,
 ) -> Result<(), ()> {
-    for (_, task) in tasks {
+    let mut failed = false;
+    for (_, task) in &mut *tasks {
         let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
-            return Err(());
+            failed = true;
+            continue;
         };
-        match task.join_within(remaining).map_err(|_| ())? {
-            TaskJoinOutcome::Joined => {},
-            TaskJoinOutcome::DeadlineExpired | TaskJoinOutcome::SecondSignal => return Err(()),
+        match task.join_within(remaining) {
+            Ok(TaskJoinOutcome::Joined) => {},
+            Ok(TaskJoinOutcome::DeadlineExpired | TaskJoinOutcome::SecondSignal) | Err(_) => {
+                failed = true;
+            },
         }
     }
-    Ok(())
+    if failed { Err(()) } else { Ok(()) }
 }
 
-fn abort_retired_tasks(tasks: &mut RunningTasks) -> Result<(), ()> {
-    for (_, task) in tasks {
-        task.abort().map_err(|_| ())?;
+fn abort_retired_tasks(tasks: &mut RunningTasks, deadline: std::time::Instant) -> Result<(), ()> {
+    let mut failed = false;
+    for (_, task) in &mut *tasks {
+        if task.abort().is_err() {
+            failed = true;
+        }
     }
-    Ok(())
+    if join_retired_tasks_until(tasks, deadline).is_err() {
+        failed = true;
+    }
+    if failed { Err(()) } else { Ok(()) }
+}
+
+#[cfg(test)]
+mod retirement_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::{RunningTasks, abort_retired_tasks};
+    use crate::{RunningTask, TaskFailure, TaskJoinOutcome, TaskRole};
+
+    struct AbortTask {
+        attempts: Arc<AtomicUsize>,
+        fails: bool,
+    }
+
+    impl RunningTask for AbortTask {
+        fn poll_join(&mut self) -> Result<Option<TaskJoinOutcome>, TaskFailure> {
+            Ok(Some(TaskJoinOutcome::Joined))
+        }
+
+        fn join_within(&mut self, _: std::time::Duration) -> Result<TaskJoinOutcome, TaskFailure> {
+            Ok(TaskJoinOutcome::Joined)
+        }
+
+        fn abort(&mut self) -> Result<(), TaskFailure> {
+            self.attempts.fetch_add(1, Ordering::AcqRel);
+            if self.fails {
+                Err(TaskFailure::AbortUnavailable)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn retirement_attempts_every_task_after_an_abort_failure() {
+        let failed = Arc::new(AtomicUsize::new(0));
+        let succeeding = Arc::new(AtomicUsize::new(0));
+        let mut tasks: RunningTasks = vec![
+            (
+                TaskRole::Api,
+                Box::new(AbortTask {
+                    attempts: Arc::clone(&failed),
+                    fails: true,
+                }),
+            ),
+            (
+                TaskRole::OtlpGrpc,
+                Box::new(AbortTask {
+                    attempts: Arc::clone(&succeeding),
+                    fails: false,
+                }),
+            ),
+        ];
+
+        assert_eq!(
+            abort_retired_tasks(
+                &mut tasks,
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            ),
+            Err(())
+        );
+        assert_eq!(failed.load(Ordering::Acquire), 1);
+        assert_eq!(succeeding.load(Ordering::Acquire), 1);
+    }
 }
 
 impl DrainingProcess {

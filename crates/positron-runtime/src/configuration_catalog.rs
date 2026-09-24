@@ -4,6 +4,7 @@ use positron_config::{ConfigurationDiff, EffectiveConfiguration};
 use positron_domain::routing::SignalKind;
 use positron_governance::{
     ConfigurationAuditContext, ConfigurationAuditOutcome, ConfigurationAuditRequest,
+    ConfigurationWithPlaintextAuditRequest, ListenerTransportAuditRequest,
 };
 use positron_kernel::{
     AuditIntent, Catalog, CatalogObject, CatalogProposal, CatalogSecret, FormatEpoch, TransactionId,
@@ -108,6 +109,25 @@ impl ConfigurationPublication for CatalogConfigurationPublication {
     ) -> Result<u64, ConfigurationRuntimeFailure> {
         self.instance
             .publish_configuration_change(active, candidate, diff, disposition)
+            .map_err(|_| ConfigurationRuntimeFailure::PublicationUnavailable)
+    }
+
+    fn publish_with_plaintext_listener_opt_outs(
+        &self,
+        active: &EffectiveConfiguration,
+        candidate: &EffectiveConfiguration,
+        diff: &ConfigurationDiff,
+        disposition: ConfigurationPublicationDisposition,
+        plaintext_listener_opt_outs: &[ListenerTransportAuditRequest],
+    ) -> Result<u64, ConfigurationRuntimeFailure> {
+        self.instance
+            .publish_configuration_change_with_plaintext(
+                active,
+                candidate,
+                diff,
+                disposition,
+                plaintext_listener_opt_outs,
+            )
             .map_err(|_| ConfigurationRuntimeFailure::PublicationUnavailable)
     }
 }
@@ -245,6 +265,17 @@ impl InitializedInstance {
         diff: &ConfigurationDiff,
         disposition: ConfigurationPublicationDisposition,
     ) -> Result<u64, BootstrapFailure> {
+        self.publish_configuration_change_with_plaintext(active, candidate, diff, disposition, &[])
+    }
+
+    pub(crate) fn publish_configuration_change_with_plaintext(
+        &self,
+        active: &EffectiveConfiguration,
+        candidate: &EffectiveConfiguration,
+        diff: &ConfigurationDiff,
+        disposition: ConfigurationPublicationDisposition,
+        plaintext_listener_opt_outs: &[ListenerTransportAuditRequest],
+    ) -> Result<u64, BootstrapFailure> {
         let secret = self
             .key
             .catalog_secret(self.instance)
@@ -273,8 +304,21 @@ impl InitializedInstance {
                 candidate_binding,
             )
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
-        let transaction = TransactionId::new(request.transaction_id())
+        let composite = (!plaintext_listener_opt_outs.is_empty())
+            .then(|| {
+                ConfigurationWithPlaintextAuditRequest::new(
+                    request,
+                    self.instance.to_bytes(),
+                    plaintext_listener_opt_outs.to_vec(),
+                )
+            })
+            .transpose()
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        let transaction = TransactionId::new(composite.as_ref().map_or_else(
+            || request.transaction_id(),
+            ConfigurationWithPlaintextAuditRequest::transaction_id,
+        ))
+        .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
         let replaces_active_configuration = matches!(
             disposition,
             ConfigurationPublicationDisposition::PublishedLive
@@ -291,7 +335,33 @@ impl InitializedInstance {
             persisted_active,
             persisted_binding,
         ));
-        let objects = successor_objects(&basis, transaction, replacement)?;
+        let mut objects = successor_objects(&basis, transaction, replacement)?;
+        if let Some(composite) = composite.as_ref() {
+            let audit_position = basis
+                .governance_audit_frontier()
+                .checked_add(1)
+                .ok_or_else(|| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+            for plaintext in plaintext_listener_opt_outs {
+                objects.push(
+                    positron_governance::plaintext_listener_transport_receipt_object(
+                        self.instance,
+                        transaction,
+                        *plaintext,
+                        audit_position,
+                    )
+                    .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?,
+                );
+            }
+            let audit = AuditIntent::new(composite.encode())
+                .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+            let proposal = CatalogProposal::new(transaction, FormatEpoch::CATALOG_V1, objects)
+                .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+            let committed_generation = catalog
+                .commit(basis.identity(), proposal, Some(audit))
+                .map(|commit| commit.number())
+                .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+            return exact_catalog_generation(committed_generation, catalog_generation);
+        }
         let proposal = CatalogProposal::new(transaction, FormatEpoch::CATALOG_V1, objects)
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
         let audit = AuditIntent::new(request.encode())
