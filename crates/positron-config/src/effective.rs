@@ -1,6 +1,6 @@
 use std::fmt::{Debug, Formatter};
 use std::net::SocketAddr;
-use std::num::NonZeroU8;
+use std::num::{NonZeroU8, NonZeroU16};
 
 use positron_domain::identity::TenantId;
 use sha2::{Digest, Sha256};
@@ -48,6 +48,26 @@ pub struct NetworkListenerProfile<'a> {
     tls_client_ca_file: Option<ProtectedFileReference>,
     trusted_proxy_cidrs: &'a [String],
     forwarded_hops: Option<NonZeroU8>,
+    connection_admission: ConnectionAdmissionProfile,
+}
+
+/// The bounded pre-authentication accepted-socket policy for one network listener.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConnectionAdmissionProfile {
+    global_accepted_socket_limit: NonZeroU16,
+    per_address_accepted_socket_limit: NonZeroU16,
+}
+
+impl ConnectionAdmissionProfile {
+    #[must_use]
+    pub const fn global_accepted_socket_limit(self) -> NonZeroU16 {
+        self.global_accepted_socket_limit
+    }
+
+    #[must_use]
+    pub const fn per_address_accepted_socket_limit(self) -> NonZeroU16 {
+        self.per_address_accepted_socket_limit
+    }
 }
 
 impl NetworkListenerProfile<'_> {
@@ -82,6 +102,10 @@ impl NetworkListenerProfile<'_> {
     #[must_use]
     pub const fn forwarded_hops(&self) -> Option<NonZeroU8> {
         self.forwarded_hops
+    }
+    #[must_use]
+    pub const fn connection_admission(&self) -> ConnectionAdmissionProfile {
+        self.connection_admission
     }
 }
 
@@ -155,6 +179,8 @@ pub struct EffectiveConfiguration {
     pub(crate) control_path: String,
     pub(crate) operations_bind_address: SocketAddr,
     pub(crate) operations_transport: NetworkTransport,
+    pub(crate) operations_accepted_socket_limit: NonZeroU16,
+    pub(crate) operations_per_address_accepted_socket_limit: NonZeroU16,
     pub(crate) operations_tls_certificate_file: ProtectedFileReference,
     pub(crate) operations_tls_private_key_file: ProtectedFileReference,
     pub(crate) operations_tls_client_ca_file: ProtectedFileReference,
@@ -162,6 +188,8 @@ pub struct EffectiveConfiguration {
     pub(crate) operations_forwarded_hops: Option<NonZeroU8>,
     pub(crate) api_bind_address: SocketAddr,
     pub(crate) api_transport: ApiTransport,
+    pub(crate) api_accepted_socket_limit: NonZeroU16,
+    pub(crate) api_per_address_accepted_socket_limit: NonZeroU16,
     pub(crate) api_trusted_proxy_cidrs: Vec<String>,
     pub(crate) api_forwarded_hops: Option<NonZeroU8>,
     pub(crate) api_tls_certificate_file: ProtectedFileReference,
@@ -169,6 +197,8 @@ pub struct EffectiveConfiguration {
     pub(crate) api_tls_client_ca_file: ProtectedFileReference,
     pub(crate) otlp_grpc_bind_address: SocketAddr,
     pub(crate) otlp_grpc_transport: NetworkTransport,
+    pub(crate) otlp_grpc_accepted_socket_limit: NonZeroU16,
+    pub(crate) otlp_grpc_per_address_accepted_socket_limit: NonZeroU16,
     pub(crate) otlp_grpc_tls_certificate_file: ProtectedFileReference,
     pub(crate) otlp_grpc_tls_private_key_file: ProtectedFileReference,
     pub(crate) otlp_grpc_tls_client_ca_file: ProtectedFileReference,
@@ -176,6 +206,8 @@ pub struct EffectiveConfiguration {
     pub(crate) otlp_grpc_forwarded_hops: Option<NonZeroU8>,
     pub(crate) otlp_http_bind_address: SocketAddr,
     pub(crate) otlp_http_transport: NetworkTransport,
+    pub(crate) otlp_http_accepted_socket_limit: NonZeroU16,
+    pub(crate) otlp_http_per_address_accepted_socket_limit: NonZeroU16,
     pub(crate) otlp_http_tls_certificate_file: ProtectedFileReference,
     pub(crate) otlp_http_tls_private_key_file: ProtectedFileReference,
     pub(crate) otlp_http_tls_client_ca_file: ProtectedFileReference,
@@ -183,6 +215,8 @@ pub struct EffectiveConfiguration {
     pub(crate) otlp_http_forwarded_hops: Option<NonZeroU8>,
     pub(crate) loki_push_bind_address: SocketAddr,
     pub(crate) loki_push_transport: NetworkTransport,
+    pub(crate) loki_push_accepted_socket_limit: NonZeroU16,
+    pub(crate) loki_push_per_address_accepted_socket_limit: NonZeroU16,
     pub(crate) loki_push_tls_certificate_file: ProtectedFileReference,
     pub(crate) loki_push_tls_private_key_file: ProtectedFileReference,
     pub(crate) loki_push_tls_client_ca_file: ProtectedFileReference,
@@ -192,7 +226,7 @@ pub struct EffectiveConfiguration {
     pub(crate) secrets_directory: String,
     pub(crate) local_key_file: ProtectedFileReference,
     pub(crate) export_destinations: Vec<ExportDestinationDefinition>,
-    pub(crate) sources: [SettingSource; 44],
+    pub(crate) sources: [SettingSource; 54],
 }
 
 impl EffectiveConfiguration {
@@ -241,6 +275,8 @@ impl EffectiveConfiguration {
             client_ca,
             trusted_proxy_cidrs,
             forwarded_hops,
+            global_accepted_socket_limit,
+            per_address_accepted_socket_limit,
         ) = match role {
             NetworkListenerRole::Operations => (
                 self.operations_bind_address,
@@ -250,6 +286,8 @@ impl EffectiveConfiguration {
                 &self.operations_tls_client_ca_file,
                 &self.operations_trusted_proxy_cidrs,
                 self.operations_forwarded_hops,
+                self.operations_accepted_socket_limit,
+                self.operations_per_address_accepted_socket_limit,
             ),
             NetworkListenerRole::Api => (
                 self.api_bind_address,
@@ -263,6 +301,8 @@ impl EffectiveConfiguration {
                 &self.api_tls_client_ca_file,
                 &self.api_trusted_proxy_cidrs,
                 self.api_forwarded_hops,
+                self.api_accepted_socket_limit,
+                self.api_per_address_accepted_socket_limit,
             ),
             NetworkListenerRole::OtlpGrpc => (
                 self.otlp_grpc_bind_address,
@@ -272,6 +312,8 @@ impl EffectiveConfiguration {
                 &self.otlp_grpc_tls_client_ca_file,
                 &self.otlp_grpc_trusted_proxy_cidrs,
                 self.otlp_grpc_forwarded_hops,
+                self.otlp_grpc_accepted_socket_limit,
+                self.otlp_grpc_per_address_accepted_socket_limit,
             ),
             NetworkListenerRole::OtlpHttp => (
                 self.otlp_http_bind_address,
@@ -281,6 +323,8 @@ impl EffectiveConfiguration {
                 &self.otlp_http_tls_client_ca_file,
                 &self.otlp_http_trusted_proxy_cidrs,
                 self.otlp_http_forwarded_hops,
+                self.otlp_http_accepted_socket_limit,
+                self.otlp_http_per_address_accepted_socket_limit,
             ),
             NetworkListenerRole::LokiPush => (
                 self.loki_push_bind_address,
@@ -290,6 +334,8 @@ impl EffectiveConfiguration {
                 &self.loki_push_tls_client_ca_file,
                 &self.loki_push_trusted_proxy_cidrs,
                 self.loki_push_forwarded_hops,
+                self.loki_push_accepted_socket_limit,
+                self.loki_push_per_address_accepted_socket_limit,
             ),
         };
         Some(NetworkListenerProfile {
@@ -302,6 +348,10 @@ impl EffectiveConfiguration {
                 .then(|| client_ca.clone()),
             trusted_proxy_cidrs,
             forwarded_hops,
+            connection_admission: ConnectionAdmissionProfile {
+                global_accepted_socket_limit,
+                per_address_accepted_socket_limit,
+            },
         })
     }
 
@@ -533,6 +583,12 @@ impl EffectiveConfiguration {
         rendered.push_str(&super::render_toml_basic_string(
             self.operations_transport.as_str(),
         ));
+        append_accepted_socket_limits(
+            &mut rendered,
+            "operations",
+            self.operations_accepted_socket_limit,
+            self.operations_per_address_accepted_socket_limit,
+        );
         append_redacted_listener_tls_references(&mut rendered, "operations");
         rendered.push_str("\napi_bind_address = ");
         rendered.push_str(&super::render_toml_basic_string(
@@ -542,6 +598,12 @@ impl EffectiveConfiguration {
         rendered.push_str(&super::render_toml_basic_string(
             self.api_transport.as_str(),
         ));
+        append_accepted_socket_limits(
+            &mut rendered,
+            "api",
+            self.api_accepted_socket_limit,
+            self.api_per_address_accepted_socket_limit,
+        );
         append_redacted_listener_tls_references(&mut rendered, "api");
         rendered.push_str("\notlp_grpc_bind_address = ");
         rendered.push_str(&super::render_toml_basic_string(
@@ -551,6 +613,12 @@ impl EffectiveConfiguration {
         rendered.push_str(&super::render_toml_basic_string(
             self.otlp_grpc_transport.as_str(),
         ));
+        append_accepted_socket_limits(
+            &mut rendered,
+            "otlp_grpc",
+            self.otlp_grpc_accepted_socket_limit,
+            self.otlp_grpc_per_address_accepted_socket_limit,
+        );
         append_redacted_listener_tls_references(&mut rendered, "otlp_grpc");
         rendered.push_str("\notlp_http_bind_address = ");
         rendered.push_str(&super::render_toml_basic_string(
@@ -560,6 +628,12 @@ impl EffectiveConfiguration {
         rendered.push_str(&super::render_toml_basic_string(
             self.otlp_http_transport.as_str(),
         ));
+        append_accepted_socket_limits(
+            &mut rendered,
+            "otlp_http",
+            self.otlp_http_accepted_socket_limit,
+            self.otlp_http_per_address_accepted_socket_limit,
+        );
         append_redacted_listener_tls_references(&mut rendered, "otlp_http");
         rendered.push_str("\nloki_push_bind_address = ");
         rendered.push_str(&super::render_toml_basic_string(
@@ -569,6 +643,12 @@ impl EffectiveConfiguration {
         rendered.push_str(&super::render_toml_basic_string(
             self.loki_push_transport.as_str(),
         ));
+        append_accepted_socket_limits(
+            &mut rendered,
+            "loki_push",
+            self.loki_push_accepted_socket_limit,
+            self.loki_push_per_address_accepted_socket_limit,
+        );
         append_redacted_listener_tls_references(&mut rendered, "loki_push");
         append_proxy_trust_reference(
             &mut rendered,
@@ -674,6 +754,8 @@ impl EffectiveConfiguration {
                 | Setting::ListenerControlPath
                 | Setting::ListenerOperationsBindAddress
                 | Setting::ListenerOperationsTransport
+                | Setting::ListenerOperationsAcceptedSocketLimit
+                | Setting::ListenerOperationsPerAddressAcceptedSocketLimit
                 | Setting::ListenerOperationsTlsCertificateFile
                 | Setting::ListenerOperationsTlsPrivateKeyFile
                 | Setting::ListenerOperationsTlsClientCaFile
@@ -681,6 +763,8 @@ impl EffectiveConfiguration {
                 | Setting::ListenerOperationsForwardedHops
                 | Setting::ListenerApiBindAddress
                 | Setting::ListenerApiTransport
+                | Setting::ListenerApiAcceptedSocketLimit
+                | Setting::ListenerApiPerAddressAcceptedSocketLimit
                 | Setting::ListenerApiTrustedProxyCidrs
                 | Setting::ListenerApiForwardedHops
                 | Setting::ListenerApiTlsCertificateFile
@@ -688,6 +772,8 @@ impl EffectiveConfiguration {
                 | Setting::ListenerApiTlsClientCaFile
                 | Setting::ListenerOtlpGrpcBindAddress
                 | Setting::ListenerOtlpGrpcTransport
+                | Setting::ListenerOtlpGrpcAcceptedSocketLimit
+                | Setting::ListenerOtlpGrpcPerAddressAcceptedSocketLimit
                 | Setting::ListenerOtlpGrpcTlsCertificateFile
                 | Setting::ListenerOtlpGrpcTlsPrivateKeyFile
                 | Setting::ListenerOtlpGrpcTlsClientCaFile
@@ -695,6 +781,8 @@ impl EffectiveConfiguration {
                 | Setting::ListenerOtlpGrpcForwardedHops
                 | Setting::ListenerOtlpHttpBindAddress
                 | Setting::ListenerOtlpHttpTransport
+                | Setting::ListenerOtlpHttpAcceptedSocketLimit
+                | Setting::ListenerOtlpHttpPerAddressAcceptedSocketLimit
                 | Setting::ListenerOtlpHttpTlsCertificateFile
                 | Setting::ListenerOtlpHttpTlsPrivateKeyFile
                 | Setting::ListenerOtlpHttpTlsClientCaFile
@@ -702,6 +790,8 @@ impl EffectiveConfiguration {
                 | Setting::ListenerOtlpHttpForwardedHops
                 | Setting::ListenerLokiPushBindAddress
                 | Setting::ListenerLokiPushTransport
+                | Setting::ListenerLokiPushAcceptedSocketLimit
+                | Setting::ListenerLokiPushPerAddressAcceptedSocketLimit
                 | Setting::ListenerLokiPushTlsCertificateFile
                 | Setting::ListenerLokiPushTlsPrivateKeyFile
                 | Setting::ListenerLokiPushTlsClientCaFile
@@ -733,6 +823,13 @@ impl EffectiveConfiguration {
             Setting::ListenerOperationsTransport => {
                 self.operations_transport != other.operations_transport
             },
+            Setting::ListenerOperationsAcceptedSocketLimit => {
+                self.operations_accepted_socket_limit != other.operations_accepted_socket_limit
+            },
+            Setting::ListenerOperationsPerAddressAcceptedSocketLimit => {
+                self.operations_per_address_accepted_socket_limit
+                    != other.operations_per_address_accepted_socket_limit
+            },
             Setting::ListenerOperationsTlsCertificateFile => {
                 self.operations_tls_certificate_file != other.operations_tls_certificate_file
             },
@@ -750,6 +847,13 @@ impl EffectiveConfiguration {
             },
             Setting::ListenerApiBindAddress => self.api_bind_address != other.api_bind_address,
             Setting::ListenerApiTransport => self.api_transport != other.api_transport,
+            Setting::ListenerApiAcceptedSocketLimit => {
+                self.api_accepted_socket_limit != other.api_accepted_socket_limit
+            },
+            Setting::ListenerApiPerAddressAcceptedSocketLimit => {
+                self.api_per_address_accepted_socket_limit
+                    != other.api_per_address_accepted_socket_limit
+            },
             Setting::ListenerApiTrustedProxyCidrs => {
                 self.api_trusted_proxy_cidrs != other.api_trusted_proxy_cidrs
             },
@@ -770,6 +874,13 @@ impl EffectiveConfiguration {
             },
             Setting::ListenerOtlpGrpcTransport => {
                 self.otlp_grpc_transport != other.otlp_grpc_transport
+            },
+            Setting::ListenerOtlpGrpcAcceptedSocketLimit => {
+                self.otlp_grpc_accepted_socket_limit != other.otlp_grpc_accepted_socket_limit
+            },
+            Setting::ListenerOtlpGrpcPerAddressAcceptedSocketLimit => {
+                self.otlp_grpc_per_address_accepted_socket_limit
+                    != other.otlp_grpc_per_address_accepted_socket_limit
             },
             Setting::ListenerOtlpGrpcTlsCertificateFile => {
                 self.otlp_grpc_tls_certificate_file != other.otlp_grpc_tls_certificate_file
@@ -792,6 +903,13 @@ impl EffectiveConfiguration {
             Setting::ListenerOtlpHttpTransport => {
                 self.otlp_http_transport != other.otlp_http_transport
             },
+            Setting::ListenerOtlpHttpAcceptedSocketLimit => {
+                self.otlp_http_accepted_socket_limit != other.otlp_http_accepted_socket_limit
+            },
+            Setting::ListenerOtlpHttpPerAddressAcceptedSocketLimit => {
+                self.otlp_http_per_address_accepted_socket_limit
+                    != other.otlp_http_per_address_accepted_socket_limit
+            },
             Setting::ListenerOtlpHttpTlsCertificateFile => {
                 self.otlp_http_tls_certificate_file != other.otlp_http_tls_certificate_file
             },
@@ -812,6 +930,13 @@ impl EffectiveConfiguration {
             },
             Setting::ListenerLokiPushTransport => {
                 self.loki_push_transport != other.loki_push_transport
+            },
+            Setting::ListenerLokiPushAcceptedSocketLimit => {
+                self.loki_push_accepted_socket_limit != other.loki_push_accepted_socket_limit
+            },
+            Setting::ListenerLokiPushPerAddressAcceptedSocketLimit => {
+                self.loki_push_per_address_accepted_socket_limit
+                    != other.loki_push_per_address_accepted_socket_limit
             },
             Setting::ListenerLokiPushTlsCertificateFile => {
                 self.loki_push_tls_certificate_file != other.loki_push_tls_certificate_file
@@ -844,6 +969,13 @@ impl EffectiveConfiguration {
             Setting::ListenerControlPath => self.control_path.clone(),
             Setting::ListenerOperationsBindAddress => self.operations_bind_address.to_string(),
             Setting::ListenerOperationsTransport => self.operations_transport.as_str().to_owned(),
+            Setting::ListenerOperationsAcceptedSocketLimit => {
+                self.operations_accepted_socket_limit.get().to_string()
+            },
+            Setting::ListenerOperationsPerAddressAcceptedSocketLimit => self
+                .operations_per_address_accepted_socket_limit
+                .get()
+                .to_string(),
             Setting::ListenerOperationsTlsCertificateFile => {
                 self.operations_tls_certificate_file.path.clone()
             },
@@ -861,6 +993,12 @@ impl EffectiveConfiguration {
             },
             Setting::ListenerApiBindAddress => self.api_bind_address.to_string(),
             Setting::ListenerApiTransport => self.api_transport.as_str().to_owned(),
+            Setting::ListenerApiAcceptedSocketLimit => {
+                self.api_accepted_socket_limit.get().to_string()
+            },
+            Setting::ListenerApiPerAddressAcceptedSocketLimit => {
+                self.api_per_address_accepted_socket_limit.get().to_string()
+            },
             Setting::ListenerApiTrustedProxyCidrs => {
                 trusted_proxy_cidrs_value(&self.api_trusted_proxy_cidrs)
             },
@@ -870,6 +1008,13 @@ impl EffectiveConfiguration {
             Setting::ListenerApiTlsClientCaFile => self.api_tls_client_ca_file.path.clone(),
             Setting::ListenerOtlpGrpcBindAddress => self.otlp_grpc_bind_address.to_string(),
             Setting::ListenerOtlpGrpcTransport => self.otlp_grpc_transport.as_str().to_owned(),
+            Setting::ListenerOtlpGrpcAcceptedSocketLimit => {
+                self.otlp_grpc_accepted_socket_limit.get().to_string()
+            },
+            Setting::ListenerOtlpGrpcPerAddressAcceptedSocketLimit => self
+                .otlp_grpc_per_address_accepted_socket_limit
+                .get()
+                .to_string(),
             Setting::ListenerOtlpGrpcTlsCertificateFile => {
                 self.otlp_grpc_tls_certificate_file.path.clone()
             },
@@ -887,6 +1032,13 @@ impl EffectiveConfiguration {
             },
             Setting::ListenerOtlpHttpBindAddress => self.otlp_http_bind_address.to_string(),
             Setting::ListenerOtlpHttpTransport => self.otlp_http_transport.as_str().to_owned(),
+            Setting::ListenerOtlpHttpAcceptedSocketLimit => {
+                self.otlp_http_accepted_socket_limit.get().to_string()
+            },
+            Setting::ListenerOtlpHttpPerAddressAcceptedSocketLimit => self
+                .otlp_http_per_address_accepted_socket_limit
+                .get()
+                .to_string(),
             Setting::ListenerOtlpHttpTlsCertificateFile => {
                 self.otlp_http_tls_certificate_file.path.clone()
             },
@@ -904,6 +1056,13 @@ impl EffectiveConfiguration {
             },
             Setting::ListenerLokiPushBindAddress => self.loki_push_bind_address.to_string(),
             Setting::ListenerLokiPushTransport => self.loki_push_transport.as_str().to_owned(),
+            Setting::ListenerLokiPushAcceptedSocketLimit => {
+                self.loki_push_accepted_socket_limit.get().to_string()
+            },
+            Setting::ListenerLokiPushPerAddressAcceptedSocketLimit => self
+                .loki_push_per_address_accepted_socket_limit
+                .get()
+                .to_string(),
             Setting::ListenerLokiPushTlsCertificateFile => {
                 self.loki_push_tls_certificate_file.path.clone()
             },
@@ -938,6 +1097,13 @@ impl EffectiveConfiguration {
             Setting::ListenerControlPath => self.control_path.clone(),
             Setting::ListenerOperationsBindAddress => self.operations_bind_address.to_string(),
             Setting::ListenerOperationsTransport => self.operations_transport.as_str().to_owned(),
+            Setting::ListenerOperationsAcceptedSocketLimit => {
+                self.operations_accepted_socket_limit.get().to_string()
+            },
+            Setting::ListenerOperationsPerAddressAcceptedSocketLimit => self
+                .operations_per_address_accepted_socket_limit
+                .get()
+                .to_string(),
             Setting::ListenerOperationsTrustedProxyCidrs => {
                 trusted_proxy_cidrs_value(&self.operations_trusted_proxy_cidrs)
             },
@@ -946,6 +1112,12 @@ impl EffectiveConfiguration {
             },
             Setting::ListenerApiBindAddress => self.api_bind_address.to_string(),
             Setting::ListenerApiTransport => self.api_transport.as_str().to_owned(),
+            Setting::ListenerApiAcceptedSocketLimit => {
+                self.api_accepted_socket_limit.get().to_string()
+            },
+            Setting::ListenerApiPerAddressAcceptedSocketLimit => {
+                self.api_per_address_accepted_socket_limit.get().to_string()
+            },
             Setting::ListenerApiTrustedProxyCidrs => {
                 trusted_proxy_cidrs_value(&self.api_trusted_proxy_cidrs)
             },
@@ -968,6 +1140,13 @@ impl EffectiveConfiguration {
             | Setting::SecurityLocalKeyFile => "<redacted>".to_owned(),
             Setting::ListenerOtlpGrpcBindAddress => self.otlp_grpc_bind_address.to_string(),
             Setting::ListenerOtlpGrpcTransport => self.otlp_grpc_transport.as_str().to_owned(),
+            Setting::ListenerOtlpGrpcAcceptedSocketLimit => {
+                self.otlp_grpc_accepted_socket_limit.get().to_string()
+            },
+            Setting::ListenerOtlpGrpcPerAddressAcceptedSocketLimit => self
+                .otlp_grpc_per_address_accepted_socket_limit
+                .get()
+                .to_string(),
             Setting::ListenerOtlpGrpcTrustedProxyCidrs => {
                 trusted_proxy_cidrs_value(&self.otlp_grpc_trusted_proxy_cidrs)
             },
@@ -976,6 +1155,13 @@ impl EffectiveConfiguration {
             },
             Setting::ListenerOtlpHttpBindAddress => self.otlp_http_bind_address.to_string(),
             Setting::ListenerOtlpHttpTransport => self.otlp_http_transport.as_str().to_owned(),
+            Setting::ListenerOtlpHttpAcceptedSocketLimit => {
+                self.otlp_http_accepted_socket_limit.get().to_string()
+            },
+            Setting::ListenerOtlpHttpPerAddressAcceptedSocketLimit => self
+                .otlp_http_per_address_accepted_socket_limit
+                .get()
+                .to_string(),
             Setting::ListenerOtlpHttpTrustedProxyCidrs => {
                 trusted_proxy_cidrs_value(&self.otlp_http_trusted_proxy_cidrs)
             },
@@ -984,6 +1170,13 @@ impl EffectiveConfiguration {
             },
             Setting::ListenerLokiPushBindAddress => self.loki_push_bind_address.to_string(),
             Setting::ListenerLokiPushTransport => self.loki_push_transport.as_str().to_owned(),
+            Setting::ListenerLokiPushAcceptedSocketLimit => {
+                self.loki_push_accepted_socket_limit.get().to_string()
+            },
+            Setting::ListenerLokiPushPerAddressAcceptedSocketLimit => self
+                .loki_push_per_address_accepted_socket_limit
+                .get()
+                .to_string(),
             Setting::ListenerLokiPushTrustedProxyCidrs => {
                 trusted_proxy_cidrs_value(&self.loki_push_trusted_proxy_cidrs)
             },
@@ -1049,6 +1242,22 @@ fn append_proxy_trust_reference(
     }
     rendered.push_str("]\nforwarded_hops = ");
     rendered.push_str(&forwarded_hops_value(forwarded_hops));
+}
+
+fn append_accepted_socket_limits(
+    rendered: &mut String,
+    role: &str,
+    global: NonZeroU16,
+    per_address: NonZeroU16,
+) {
+    rendered.push('\n');
+    rendered.push_str(role);
+    rendered.push_str("_accepted_socket_limit = ");
+    rendered.push_str(&global.get().to_string());
+    rendered.push('\n');
+    rendered.push_str(role);
+    rendered.push_str("_per_address_accepted_socket_limit = ");
+    rendered.push_str(&per_address.get().to_string());
 }
 
 fn append_redacted_listener_tls_references(rendered: &mut String, role: &str) {

@@ -3,11 +3,13 @@
 #[path = "support/process_roots.rs"]
 mod roots;
 
+use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use positron_config::{CommandLineOverrides, ConfigurationInputs, EnvironmentOverrides, resolve};
 use positron_governance::{
-    CompatibilityHints, ConfigurationAuditOutcome, PresentedCredential, RequestedIntent,
+    AdministrativeIdempotencyKey, CompatibilityHints, ConfigurationAuditOutcome,
+    PresentedCredential, RequestedIntent, ResourceGeneration,
 };
 use positron_runtime::{
     ApplicationRuntime, ConfigurationReloadOutcome, ConfigurationRuntimeFailure, HealthWarning,
@@ -67,6 +69,15 @@ fn native_listener_reload_updates_visible_plaintext_generation_and_rejected_stag
             HealthWarning::PlaintextListener(ListenerRole::OtlpHttp),
         ]
     );
+    assert!(matches!(
+        process.reload_configuration(Arc::clone(&tls))?,
+        ConfigurationReloadOutcome::PublishedLive { .. }
+    ));
+    assert!(matches!(
+        process.reload_configuration(Arc::clone(&plaintext))?,
+        ConfigurationReloadOutcome::PublishedLive { .. }
+    ));
+    let repeated_plaintext_observation = runtime.observed()?;
 
     let occupied_api_port = process
         .bound_endpoints()
@@ -87,7 +98,7 @@ fn native_listener_reload_updates_visible_plaintext_generation_and_rejected_stag
     ));
     assert_eq!(
         runtime.observed()?.generation(),
-        plaintext_observation.generation()
+        repeated_plaintext_observation.generation()
     );
     assert_eq!(
         process.health().security_warnings(),
@@ -130,7 +141,30 @@ fn native_listener_reload_updates_visible_plaintext_generation_and_rejected_stag
             .iter()
             .any(|entry| { entry.outcome() == ConfigurationAuditOutcome::RejectedListenerStaging })
     );
-    assert_eq!(plaintext_receipts.len(), 2);
+    assert_eq!(plaintext_receipts.len(), 4);
+    assert_eq!(
+        plaintext_receipts
+            .iter()
+            .filter(|receipt| {
+                receipt.listener_role() == Some(positron_governance::ListenerTransportRole::Api)
+                    && receipt.is_configuration_file_intent()
+            })
+            .count(),
+        2,
+        "each separately published plaintext generation remains auditable"
+    );
+    assert_eq!(
+        plaintext_receipts
+            .iter()
+            .filter(|receipt| {
+                receipt.listener_role()
+                    == Some(positron_governance::ListenerTransportRole::OtlpHttp)
+                    && receipt.is_configuration_file_intent()
+            })
+            .count(),
+        2,
+        "each separately published plaintext generation remains auditable"
+    );
     assert!(plaintext_receipts.iter().any(|receipt| {
         receipt.listener_role() == Some(positron_governance::ListenerTransportRole::Api)
             && receipt.is_configuration_file_intent()
@@ -139,6 +173,27 @@ fn native_listener_reload_updates_visible_plaintext_generation_and_rejected_stag
         receipt.listener_role() == Some(positron_governance::ListenerTransportRole::OtlpHttp)
             && receipt.is_configuration_file_intent()
     }));
+    let retention_administrator = reopened.attribute(
+        PresentedCredential::parse(claim.secret())?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    reopened.update_system_audit_retention(
+        retention_administrator,
+        NonZeroU64::new(64).ok_or("nonzero audit retention")?,
+        ResourceGeneration::new(1)?,
+        AdministrativeIdempotencyKey::new([0x77; 16])?,
+    )?;
+    drop(reopened);
+    let resumed_host = NativeHost::new(NativeBindings::from_effective(&plaintext)?);
+    let resumed = ApplicationRuntime::start(
+        ServeConfiguration::new(paths.clone(), InitializationMode::ExistingOnly)
+            .with_effective_configuration(plaintext),
+        HostInputs::new(&resumed_host, &resumed_host),
+    )?;
+    assert_eq!(resumed.health().phase(), ProcessPhase::Serving);
+    assert_eq!(resumed.health().readiness(), Readiness::Ready);
+    let _restart_shutdown = resumed.shutdown(ShutdownTrigger::FirstSignal);
     Ok(())
 }
 

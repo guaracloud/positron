@@ -5,12 +5,15 @@ use positron_kernel::{
     AuditIntent, Catalog, CatalogFailureCode, CatalogObject, CatalogProposal, CatalogSnapshot,
     InstanceId, TransactionId,
 };
+use sha2::{Digest, Sha256};
 
 use crate::audit::plaintext_listener_transport_audit_intent_v3;
 use crate::{GovernanceAuditEntry, ListenerTransportAuditRequest, ListenerTransportRole};
 
 const RECEIPT_MAGIC: [u8; 8] = *b"POSLTR01";
+const COMPOSITE_RECEIPT_MAGIC: [u8; 8] = *b"POSLTR02";
 const RECEIPT_BYTES: usize = 80;
+const COMPOSITE_RECEIPT_KEY_DOMAIN: &[u8] = b"positron.listener-transport.composite-receipt.v1\0";
 
 /// Administration-owned activation of an explicitly selected plaintext
 /// listener transport profile.
@@ -65,9 +68,11 @@ impl ListenerTransportAdministration {
                     .iter()
                     .any(|receipt| receipt.matches_request(instance.to_bytes(), request))
             {
-                if existing.replace(configuration.position()).is_some() {
-                    return Err(ListenerTransportAdministrationFailure::CorruptState);
-                }
+                // A resolved listener can move between TLS and plaintext more
+                // than once. Every composite record remains bound to its
+                // enclosing audit transaction, so the latest match is the
+                // active historical selection.
+                existing = Some(configuration.position());
                 continue;
             }
             let Some(transport) = entry.as_listener_transport() else {
@@ -95,6 +100,7 @@ impl ListenerTransportAdministration {
             .map_err(map_catalog)?;
         objects.push(
             CatalogObject::new(encode_receipt(
+                RECEIPT_MAGIC,
                 instance,
                 transaction,
                 request_digest,
@@ -225,13 +231,14 @@ fn find_receipt(
 }
 
 fn encode_receipt(
+    magic: [u8; 8],
     instance: InstanceId,
     transaction: TransactionId,
     request_digest: [u8; 32],
     audit_position: u64,
 ) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(RECEIPT_BYTES);
-    bytes.extend_from_slice(&RECEIPT_MAGIC);
+    bytes.extend_from_slice(&magic);
     bytes.extend_from_slice(&transaction.to_bytes());
     bytes.extend_from_slice(&instance.to_bytes());
     bytes.extend_from_slice(&request_digest);
@@ -240,8 +247,9 @@ fn encode_receipt(
 }
 
 /// Builds one receipt object for a role record carried by another joint audit
-/// transaction. The caller owns the enclosing Catalog proposal and supplies
-/// its one shared audit position.
+/// transaction. Its terminal identity derives from the exact role-bound
+/// request digest and enclosing transaction, so sibling and successive role
+/// receipts remain distinct.
 pub fn plaintext_listener_transport_receipt_object(
     instance: InstanceId,
     transaction: TransactionId,
@@ -252,6 +260,7 @@ pub fn plaintext_listener_transport_receipt_object(
         return Err(ListenerTransportAdministrationFailure::PersistenceUnavailable);
     }
     CatalogObject::new(encode_receipt(
+        COMPOSITE_RECEIPT_MAGIC,
         instance,
         transaction,
         request.digest_for(instance.to_bytes()),
@@ -275,6 +284,7 @@ pub(crate) fn legacy_receipt_object(
     }
     let transaction = TransactionId::new(request_id).map_err(map_catalog)?;
     CatalogObject::new(encode_receipt(
+        RECEIPT_MAGIC,
         InstanceId::new(entry.instance_id()).map_err(map_catalog)?,
         transaction,
         request_digest,
@@ -284,7 +294,31 @@ pub(crate) fn legacy_receipt_object(
 }
 
 pub(crate) fn retention_terminal_key(bytes: &[u8]) -> Result<Option<[u8; 16]>, ()> {
-    crate::audit::terminal_receipt_key(bytes, &[(RECEIPT_MAGIC, RECEIPT_BYTES, 8)])
+    if bytes.starts_with(&RECEIPT_MAGIC) {
+        crate::audit::terminal_receipt_key(bytes, &[(RECEIPT_MAGIC, RECEIPT_BYTES, 8)])
+    } else {
+        composite_retention_terminal_key(bytes)
+    }
+}
+
+fn composite_retention_terminal_key(bytes: &[u8]) -> Result<Option<[u8; 16]>, ()> {
+    if !bytes.starts_with(&COMPOSITE_RECEIPT_MAGIC) {
+        return Ok(None);
+    }
+    if bytes.len() != RECEIPT_BYTES {
+        return Err(());
+    }
+    let transaction = bytes.get(8..24).ok_or(())?;
+    let request_digest = bytes.get(40..72).ok_or(())?;
+    if transaction.iter().all(|byte| *byte == 0) || request_digest.iter().all(|byte| *byte == 0) {
+        return Err(());
+    }
+    let mut digest = Sha256::new();
+    digest.update(COMPOSITE_RECEIPT_KEY_DOMAIN);
+    digest.update(transaction);
+    digest.update(request_digest);
+    let key: [u8; 16] = digest.finalize()[..16].try_into().map_err(|_| ())?;
+    Ok(Some(key))
 }
 
 fn retained_objects(

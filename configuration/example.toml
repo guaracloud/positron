@@ -10,14 +10,24 @@ log_level = "info"
 control_path = "/var/run/positron/control.sock"
 operations_bind_address = "127.0.0.1:13133"
 operations_transport = "tls"
+operations_accepted_socket_limit = 128
+operations_per_address_accepted_socket_limit = 16
 api_bind_address = "127.0.0.1:8080"
 api_transport = "tls"
+api_accepted_socket_limit = 128
+api_per_address_accepted_socket_limit = 16
 otlp_grpc_bind_address = "127.0.0.1:4317"
 otlp_grpc_transport = "tls"
+otlp_grpc_accepted_socket_limit = 128
+otlp_grpc_per_address_accepted_socket_limit = 16
 otlp_http_bind_address = "127.0.0.1:4318"
 otlp_http_transport = "tls"
+otlp_http_accepted_socket_limit = 128
+otlp_http_per_address_accepted_socket_limit = 16
 loki_push_bind_address = "127.0.0.1:3100"
 loki_push_transport = "tls"
+loki_push_accepted_socket_limit = 128
+loki_push_per_address_accepted_socket_limit = 16
 
 [listener.operations]
 trusted_proxy_cidrs = []

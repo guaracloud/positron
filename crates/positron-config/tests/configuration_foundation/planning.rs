@@ -150,6 +150,53 @@ fn returns_only_checked_mutability_plans_and_rejects_immutable_changes()
 }
 
 #[test]
+fn accepted_socket_limit_changes_are_file_only_drain_and_reload_settings()
+-> Result<(), ConfigurationFailure> {
+    let current = inputs(None, [], []).and_then(resolve)?;
+    let candidate = inputs(
+        Some(
+            "schema_version = 1\n\
+             [listener]\n\
+             api_accepted_socket_limit = 96\n\
+             api_per_address_accepted_socket_limit = 12\n",
+        ),
+        [],
+        [],
+    )
+    .and_then(resolve)?;
+
+    assert!(matches!(
+        current.plan_update(&candidate)?,
+        ConfigurationPlan::DrainThenPublish { changed }
+            if changed
+                == vec![
+                    Setting::ListenerApiAcceptedSocketLimit,
+                    Setting::ListenerApiPerAddressAcceptedSocketLimit,
+                ]
+    ));
+    assert!(candidate
+        .redacted_reference()
+        .contains("api_accepted_socket_limit = 96"));
+    assert!(candidate
+        .redacted_reference()
+        .contains("api_per_address_accepted_socket_limit = 12"));
+
+    let environment = inputs(
+        None,
+        [("POSITRON__LISTENER__API_ACCEPTED_SOCKET_LIMIT", "96")],
+        [],
+    )
+    .and_then(resolve);
+    assert!(matches!(
+        environment,
+        Err(error)
+            if error.code() == ConfigurationFailureCode::UnknownSetting
+                && error.source() == FailureSource::ListenerApiAcceptedSocketLimit
+    ));
+    Ok(())
+}
+
+#[test]
 fn immutable_configuration_digest_follows_the_canonical_mutability_contract()
 -> Result<(), ConfigurationFailure> {
     let current = inputs(None, [], []).and_then(resolve)?;

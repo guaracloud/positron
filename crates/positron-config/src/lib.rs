@@ -12,7 +12,7 @@ use std::{
     fs::{File, OpenOptions},
     io::Write,
     net::{IpAddr, SocketAddr},
-    num::NonZeroU8,
+    num::{NonZeroU8, NonZeroU16},
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
@@ -182,7 +182,7 @@ pub fn setting_for_path(path: &str) -> Option<Setting> {
 
 /// Returns the complete canonical contract in deterministic declaration order.
 #[must_use]
-pub const fn setting_definitions() -> [SettingDefinition; 44] {
+pub const fn setting_definitions() -> [SettingDefinition; 54] {
     contract::SETTING_DEFINITIONS
 }
 
@@ -198,6 +198,8 @@ struct Candidate {
     control_path: String,
     operations_bind_address: SocketAddr,
     operations_transport: NetworkTransport,
+    operations_accepted_socket_limit: NonZeroU16,
+    operations_per_address_accepted_socket_limit: NonZeroU16,
     operations_tls_certificate_file: ProtectedFileReference,
     operations_tls_private_key_file: ProtectedFileReference,
     operations_tls_client_ca_file: ProtectedFileReference,
@@ -205,6 +207,8 @@ struct Candidate {
     operations_forwarded_hops: Option<NonZeroU8>,
     api_bind_address: SocketAddr,
     api_transport: ApiTransport,
+    api_accepted_socket_limit: NonZeroU16,
+    api_per_address_accepted_socket_limit: NonZeroU16,
     api_trusted_proxy_cidrs: Vec<String>,
     api_forwarded_hops: Option<NonZeroU8>,
     api_tls_certificate_file: ProtectedFileReference,
@@ -212,6 +216,8 @@ struct Candidate {
     api_tls_client_ca_file: ProtectedFileReference,
     otlp_grpc_bind_address: SocketAddr,
     otlp_grpc_transport: NetworkTransport,
+    otlp_grpc_accepted_socket_limit: NonZeroU16,
+    otlp_grpc_per_address_accepted_socket_limit: NonZeroU16,
     otlp_grpc_tls_certificate_file: ProtectedFileReference,
     otlp_grpc_tls_private_key_file: ProtectedFileReference,
     otlp_grpc_tls_client_ca_file: ProtectedFileReference,
@@ -219,6 +225,8 @@ struct Candidate {
     otlp_grpc_forwarded_hops: Option<NonZeroU8>,
     otlp_http_bind_address: SocketAddr,
     otlp_http_transport: NetworkTransport,
+    otlp_http_accepted_socket_limit: NonZeroU16,
+    otlp_http_per_address_accepted_socket_limit: NonZeroU16,
     otlp_http_tls_certificate_file: ProtectedFileReference,
     otlp_http_tls_private_key_file: ProtectedFileReference,
     otlp_http_tls_client_ca_file: ProtectedFileReference,
@@ -226,6 +234,8 @@ struct Candidate {
     otlp_http_forwarded_hops: Option<NonZeroU8>,
     loki_push_bind_address: SocketAddr,
     loki_push_transport: NetworkTransport,
+    loki_push_accepted_socket_limit: NonZeroU16,
+    loki_push_per_address_accepted_socket_limit: NonZeroU16,
     loki_push_tls_certificate_file: ProtectedFileReference,
     loki_push_tls_private_key_file: ProtectedFileReference,
     loki_push_tls_client_ca_file: ProtectedFileReference,
@@ -235,7 +245,7 @@ struct Candidate {
     secrets_directory: String,
     local_key_file: ProtectedFileReference,
     export_destinations: Vec<ExportDestinationDefinition>,
-    sources: [SettingSource; 44],
+    sources: [SettingSource; 54],
 }
 
 impl Candidate {
@@ -281,6 +291,15 @@ impl Candidate {
                 operations_transport,
                 FailureSource::ListenerOperationsTransport,
             )?,
+            operations_accepted_socket_limit: parse_accepted_socket_limit(
+                setting_definition(Setting::ListenerOperationsAcceptedSocketLimit).default_value(),
+                Setting::ListenerOperationsAcceptedSocketLimit,
+            )?,
+            operations_per_address_accepted_socket_limit: parse_accepted_socket_limit(
+                setting_definition(Setting::ListenerOperationsPerAddressAcceptedSocketLimit)
+                    .default_value(),
+                Setting::ListenerOperationsPerAddressAcceptedSocketLimit,
+            )?,
             operations_tls_certificate_file: default_protected_reference(
                 Setting::ListenerOperationsTlsCertificateFile,
             )?,
@@ -294,6 +313,15 @@ impl Candidate {
             operations_forwarded_hops: None,
             api_bind_address: parse_socket_address(api, Setting::ListenerApiBindAddress)?,
             api_transport: ApiTransport::parse(api_transport)?,
+            api_accepted_socket_limit: parse_accepted_socket_limit(
+                setting_definition(Setting::ListenerApiAcceptedSocketLimit).default_value(),
+                Setting::ListenerApiAcceptedSocketLimit,
+            )?,
+            api_per_address_accepted_socket_limit: parse_accepted_socket_limit(
+                setting_definition(Setting::ListenerApiPerAddressAcceptedSocketLimit)
+                    .default_value(),
+                Setting::ListenerApiPerAddressAcceptedSocketLimit,
+            )?,
             api_trusted_proxy_cidrs: Vec::new(),
             api_forwarded_hops: None,
             api_tls_certificate_file: ProtectedFileReference::parse(
@@ -315,6 +343,15 @@ impl Candidate {
                 otlp_grpc_transport,
                 FailureSource::ListenerOtlpGrpcTransport,
             )?,
+            otlp_grpc_accepted_socket_limit: parse_accepted_socket_limit(
+                setting_definition(Setting::ListenerOtlpGrpcAcceptedSocketLimit).default_value(),
+                Setting::ListenerOtlpGrpcAcceptedSocketLimit,
+            )?,
+            otlp_grpc_per_address_accepted_socket_limit: parse_accepted_socket_limit(
+                setting_definition(Setting::ListenerOtlpGrpcPerAddressAcceptedSocketLimit)
+                    .default_value(),
+                Setting::ListenerOtlpGrpcPerAddressAcceptedSocketLimit,
+            )?,
             otlp_grpc_tls_certificate_file: default_protected_reference(
                 Setting::ListenerOtlpGrpcTlsCertificateFile,
             )?,
@@ -333,6 +370,15 @@ impl Candidate {
             otlp_http_transport: NetworkTransport::parse(
                 otlp_http_transport,
                 FailureSource::ListenerOtlpHttpTransport,
+            )?,
+            otlp_http_accepted_socket_limit: parse_accepted_socket_limit(
+                setting_definition(Setting::ListenerOtlpHttpAcceptedSocketLimit).default_value(),
+                Setting::ListenerOtlpHttpAcceptedSocketLimit,
+            )?,
+            otlp_http_per_address_accepted_socket_limit: parse_accepted_socket_limit(
+                setting_definition(Setting::ListenerOtlpHttpPerAddressAcceptedSocketLimit)
+                    .default_value(),
+                Setting::ListenerOtlpHttpPerAddressAcceptedSocketLimit,
             )?,
             otlp_http_tls_certificate_file: default_protected_reference(
                 Setting::ListenerOtlpHttpTlsCertificateFile,
@@ -353,6 +399,15 @@ impl Candidate {
                 loki_push_transport,
                 FailureSource::ListenerLokiPushTransport,
             )?,
+            loki_push_accepted_socket_limit: parse_accepted_socket_limit(
+                setting_definition(Setting::ListenerLokiPushAcceptedSocketLimit).default_value(),
+                Setting::ListenerLokiPushAcceptedSocketLimit,
+            )?,
+            loki_push_per_address_accepted_socket_limit: parse_accepted_socket_limit(
+                setting_definition(Setting::ListenerLokiPushPerAddressAcceptedSocketLimit)
+                    .default_value(),
+                Setting::ListenerLokiPushPerAddressAcceptedSocketLimit,
+            )?,
             loki_push_tls_certificate_file: default_protected_reference(
                 Setting::ListenerLokiPushTlsCertificateFile,
             )?,
@@ -371,7 +426,7 @@ impl Candidate {
                 Setting::SecurityLocalKeyFile,
             )?,
             export_destinations: Vec::new(),
-            sources: [SettingSource::CompiledDefault; 44],
+            sources: [SettingSource::CompiledDefault; 54],
         })
     }
 
@@ -411,6 +466,14 @@ impl Candidate {
                 self.operations_transport =
                     NetworkTransport::parse(value, FailureSource::ListenerOperationsTransport)?;
             },
+            Setting::ListenerOperationsAcceptedSocketLimit => {
+                self.operations_accepted_socket_limit =
+                    parse_accepted_socket_limit(value, setting)?;
+            },
+            Setting::ListenerOperationsPerAddressAcceptedSocketLimit => {
+                self.operations_per_address_accepted_socket_limit =
+                    parse_accepted_socket_limit(value, setting)?;
+            },
             Setting::ListenerOperationsTlsCertificateFile => {
                 self.operations_tls_certificate_file =
                     ProtectedFileReference::parse(value, setting)?;
@@ -431,6 +494,13 @@ impl Candidate {
             Setting::ListenerApiTransport => {
                 self.api_transport = ApiTransport::parse(value)?;
             },
+            Setting::ListenerApiAcceptedSocketLimit => {
+                self.api_accepted_socket_limit = parse_accepted_socket_limit(value, setting)?;
+            },
+            Setting::ListenerApiPerAddressAcceptedSocketLimit => {
+                self.api_per_address_accepted_socket_limit =
+                    parse_accepted_socket_limit(value, setting)?;
+            },
             Setting::ListenerApiForwardedHops => {
                 self.api_forwarded_hops = parse_forwarded_hops(value, setting)?;
             },
@@ -449,6 +519,13 @@ impl Candidate {
             Setting::ListenerOtlpGrpcTransport => {
                 self.otlp_grpc_transport =
                     NetworkTransport::parse(value, FailureSource::ListenerOtlpGrpcTransport)?;
+            },
+            Setting::ListenerOtlpGrpcAcceptedSocketLimit => {
+                self.otlp_grpc_accepted_socket_limit = parse_accepted_socket_limit(value, setting)?;
+            },
+            Setting::ListenerOtlpGrpcPerAddressAcceptedSocketLimit => {
+                self.otlp_grpc_per_address_accepted_socket_limit =
+                    parse_accepted_socket_limit(value, setting)?;
             },
             Setting::ListenerOtlpGrpcTlsCertificateFile => {
                 self.otlp_grpc_tls_certificate_file =
@@ -471,6 +548,13 @@ impl Candidate {
                 self.otlp_http_transport =
                     NetworkTransport::parse(value, FailureSource::ListenerOtlpHttpTransport)?;
             },
+            Setting::ListenerOtlpHttpAcceptedSocketLimit => {
+                self.otlp_http_accepted_socket_limit = parse_accepted_socket_limit(value, setting)?;
+            },
+            Setting::ListenerOtlpHttpPerAddressAcceptedSocketLimit => {
+                self.otlp_http_per_address_accepted_socket_limit =
+                    parse_accepted_socket_limit(value, setting)?;
+            },
             Setting::ListenerOtlpHttpTlsCertificateFile => {
                 self.otlp_http_tls_certificate_file =
                     ProtectedFileReference::parse(value, setting)?;
@@ -491,6 +575,13 @@ impl Candidate {
             Setting::ListenerLokiPushTransport => {
                 self.loki_push_transport =
                     NetworkTransport::parse(value, FailureSource::ListenerLokiPushTransport)?;
+            },
+            Setting::ListenerLokiPushAcceptedSocketLimit => {
+                self.loki_push_accepted_socket_limit = parse_accepted_socket_limit(value, setting)?;
+            },
+            Setting::ListenerLokiPushPerAddressAcceptedSocketLimit => {
+                self.loki_push_per_address_accepted_socket_limit =
+                    parse_accepted_socket_limit(value, setting)?;
             },
             Setting::ListenerLokiPushTlsCertificateFile => {
                 self.loki_push_tls_certificate_file =
@@ -623,6 +714,31 @@ impl Candidate {
             Setting::ListenerLokiPushTrustedProxyCidrs,
             Setting::ListenerLokiPushForwardedHops,
         )?;
+        validate_accepted_socket_limits(
+            self.operations_accepted_socket_limit,
+            self.operations_per_address_accepted_socket_limit,
+            Setting::ListenerOperationsPerAddressAcceptedSocketLimit,
+        )?;
+        validate_accepted_socket_limits(
+            self.api_accepted_socket_limit,
+            self.api_per_address_accepted_socket_limit,
+            Setting::ListenerApiPerAddressAcceptedSocketLimit,
+        )?;
+        validate_accepted_socket_limits(
+            self.otlp_grpc_accepted_socket_limit,
+            self.otlp_grpc_per_address_accepted_socket_limit,
+            Setting::ListenerOtlpGrpcPerAddressAcceptedSocketLimit,
+        )?;
+        validate_accepted_socket_limits(
+            self.otlp_http_accepted_socket_limit,
+            self.otlp_http_per_address_accepted_socket_limit,
+            Setting::ListenerOtlpHttpPerAddressAcceptedSocketLimit,
+        )?;
+        validate_accepted_socket_limits(
+            self.loki_push_accepted_socket_limit,
+            self.loki_push_per_address_accepted_socket_limit,
+            Setting::ListenerLokiPushPerAddressAcceptedSocketLimit,
+        )?;
         Ok(EffectiveConfiguration {
             schema_version: self.schema_version,
             log_level: self.log_level,
@@ -631,6 +747,9 @@ impl Candidate {
             control_path: self.control_path,
             operations_bind_address: self.operations_bind_address,
             operations_transport: self.operations_transport,
+            operations_accepted_socket_limit: self.operations_accepted_socket_limit,
+            operations_per_address_accepted_socket_limit: self
+                .operations_per_address_accepted_socket_limit,
             operations_tls_certificate_file: self.operations_tls_certificate_file,
             operations_tls_private_key_file: self.operations_tls_private_key_file,
             operations_tls_client_ca_file: self.operations_tls_client_ca_file,
@@ -638,6 +757,8 @@ impl Candidate {
             operations_forwarded_hops: self.operations_forwarded_hops,
             api_bind_address: self.api_bind_address,
             api_transport: self.api_transport,
+            api_accepted_socket_limit: self.api_accepted_socket_limit,
+            api_per_address_accepted_socket_limit: self.api_per_address_accepted_socket_limit,
             api_trusted_proxy_cidrs: self.api_trusted_proxy_cidrs,
             api_forwarded_hops: self.api_forwarded_hops,
             api_tls_certificate_file: self.api_tls_certificate_file,
@@ -645,6 +766,9 @@ impl Candidate {
             api_tls_client_ca_file: self.api_tls_client_ca_file,
             otlp_grpc_bind_address: self.otlp_grpc_bind_address,
             otlp_grpc_transport: self.otlp_grpc_transport,
+            otlp_grpc_accepted_socket_limit: self.otlp_grpc_accepted_socket_limit,
+            otlp_grpc_per_address_accepted_socket_limit: self
+                .otlp_grpc_per_address_accepted_socket_limit,
             otlp_grpc_tls_certificate_file: self.otlp_grpc_tls_certificate_file,
             otlp_grpc_tls_private_key_file: self.otlp_grpc_tls_private_key_file,
             otlp_grpc_tls_client_ca_file: self.otlp_grpc_tls_client_ca_file,
@@ -652,6 +776,9 @@ impl Candidate {
             otlp_grpc_forwarded_hops: self.otlp_grpc_forwarded_hops,
             otlp_http_bind_address: self.otlp_http_bind_address,
             otlp_http_transport: self.otlp_http_transport,
+            otlp_http_accepted_socket_limit: self.otlp_http_accepted_socket_limit,
+            otlp_http_per_address_accepted_socket_limit: self
+                .otlp_http_per_address_accepted_socket_limit,
             otlp_http_tls_certificate_file: self.otlp_http_tls_certificate_file,
             otlp_http_tls_private_key_file: self.otlp_http_tls_private_key_file,
             otlp_http_tls_client_ca_file: self.otlp_http_tls_client_ca_file,
@@ -659,6 +786,9 @@ impl Candidate {
             otlp_http_forwarded_hops: self.otlp_http_forwarded_hops,
             loki_push_bind_address: self.loki_push_bind_address,
             loki_push_transport: self.loki_push_transport,
+            loki_push_accepted_socket_limit: self.loki_push_accepted_socket_limit,
+            loki_push_per_address_accepted_socket_limit: self
+                .loki_push_per_address_accepted_socket_limit,
             loki_push_tls_certificate_file: self.loki_push_tls_certificate_file,
             loki_push_tls_private_key_file: self.loki_push_tls_private_key_file,
             loki_push_tls_client_ca_file: self.loki_push_tls_client_ca_file,
@@ -731,6 +861,40 @@ fn parse_max_registered_tenants(value: &str) -> Result<u16, ConfigurationFailure
         ));
     }
     Ok(tenants)
+}
+
+fn parse_accepted_socket_limit(
+    value: &str,
+    setting: Setting,
+) -> Result<NonZeroU16, ConfigurationFailure> {
+    let limit = parse_canonical_u16(value, failure_source(setting))?;
+    let ValueDomain::UnsignedIntegerRange(minimum, maximum) = setting_definition(setting).domain()
+    else {
+        return Err(ConfigurationFailure::new(
+            ConfigurationFailureCode::Malformed,
+            failure_source(setting),
+        ));
+    };
+    if !(minimum..=maximum).contains(&limit) {
+        return Err(ConfigurationFailure::unsupported_value(failure_source(
+            setting,
+        )));
+    }
+    NonZeroU16::new(limit)
+        .ok_or_else(|| ConfigurationFailure::unsupported_value(failure_source(setting)))
+}
+
+fn validate_accepted_socket_limits(
+    global: NonZeroU16,
+    per_address: NonZeroU16,
+    per_address_setting: Setting,
+) -> Result<(), ConfigurationFailure> {
+    if per_address > global {
+        return Err(ConfigurationFailure::unsupported_value(failure_source(
+            per_address_setting,
+        )));
+    }
+    Ok(())
 }
 
 fn parse_forwarded_hops(
@@ -924,43 +1088,53 @@ const fn setting_index(setting: Setting) -> usize {
         Setting::ListenerControlPath => 4,
         Setting::ListenerOperationsBindAddress => 5,
         Setting::ListenerOperationsTransport => 6,
-        Setting::ListenerOperationsTlsCertificateFile => 7,
-        Setting::ListenerOperationsTlsPrivateKeyFile => 8,
-        Setting::ListenerOperationsTlsClientCaFile => 9,
-        Setting::ListenerOperationsTrustedProxyCidrs => 10,
-        Setting::ListenerOperationsForwardedHops => 11,
-        Setting::ListenerApiBindAddress => 12,
-        Setting::ListenerApiTransport => 13,
-        Setting::ListenerApiTrustedProxyCidrs => 14,
-        Setting::ListenerApiForwardedHops => 15,
-        Setting::ListenerApiTlsCertificateFile => 16,
-        Setting::ListenerApiTlsPrivateKeyFile => 17,
-        Setting::ListenerApiTlsClientCaFile => 18,
-        Setting::ListenerOtlpGrpcBindAddress => 19,
-        Setting::ListenerOtlpGrpcTransport => 20,
-        Setting::ListenerOtlpGrpcTlsCertificateFile => 21,
-        Setting::ListenerOtlpGrpcTlsPrivateKeyFile => 22,
-        Setting::ListenerOtlpGrpcTlsClientCaFile => 23,
-        Setting::ListenerOtlpGrpcTrustedProxyCidrs => 24,
-        Setting::ListenerOtlpGrpcForwardedHops => 25,
-        Setting::ListenerOtlpHttpBindAddress => 26,
-        Setting::ListenerOtlpHttpTransport => 27,
-        Setting::ListenerOtlpHttpTlsCertificateFile => 28,
-        Setting::ListenerOtlpHttpTlsPrivateKeyFile => 29,
-        Setting::ListenerOtlpHttpTlsClientCaFile => 30,
-        Setting::ListenerOtlpHttpTrustedProxyCidrs => 31,
-        Setting::ListenerOtlpHttpForwardedHops => 32,
-        Setting::ListenerLokiPushBindAddress => 33,
-        Setting::ListenerLokiPushTransport => 34,
-        Setting::ListenerLokiPushTlsCertificateFile => 35,
-        Setting::ListenerLokiPushTlsPrivateKeyFile => 36,
-        Setting::ListenerLokiPushTlsClientCaFile => 37,
-        Setting::ListenerLokiPushTrustedProxyCidrs => 38,
-        Setting::ListenerLokiPushForwardedHops => 39,
-        Setting::StorageDataDirectory => 40,
-        Setting::StorageSecretsDirectory => 41,
-        Setting::SecurityLocalKeyFile => 42,
-        Setting::ExportDestinations => 43,
+        Setting::ListenerOperationsAcceptedSocketLimit => 7,
+        Setting::ListenerOperationsPerAddressAcceptedSocketLimit => 8,
+        Setting::ListenerOperationsTlsCertificateFile => 9,
+        Setting::ListenerOperationsTlsPrivateKeyFile => 10,
+        Setting::ListenerOperationsTlsClientCaFile => 11,
+        Setting::ListenerOperationsTrustedProxyCidrs => 12,
+        Setting::ListenerOperationsForwardedHops => 13,
+        Setting::ListenerApiBindAddress => 14,
+        Setting::ListenerApiTransport => 15,
+        Setting::ListenerApiAcceptedSocketLimit => 16,
+        Setting::ListenerApiPerAddressAcceptedSocketLimit => 17,
+        Setting::ListenerApiTrustedProxyCidrs => 18,
+        Setting::ListenerApiForwardedHops => 19,
+        Setting::ListenerApiTlsCertificateFile => 20,
+        Setting::ListenerApiTlsPrivateKeyFile => 21,
+        Setting::ListenerApiTlsClientCaFile => 22,
+        Setting::ListenerOtlpGrpcBindAddress => 23,
+        Setting::ListenerOtlpGrpcTransport => 24,
+        Setting::ListenerOtlpGrpcAcceptedSocketLimit => 25,
+        Setting::ListenerOtlpGrpcPerAddressAcceptedSocketLimit => 26,
+        Setting::ListenerOtlpGrpcTlsCertificateFile => 27,
+        Setting::ListenerOtlpGrpcTlsPrivateKeyFile => 28,
+        Setting::ListenerOtlpGrpcTlsClientCaFile => 29,
+        Setting::ListenerOtlpGrpcTrustedProxyCidrs => 30,
+        Setting::ListenerOtlpGrpcForwardedHops => 31,
+        Setting::ListenerOtlpHttpBindAddress => 32,
+        Setting::ListenerOtlpHttpTransport => 33,
+        Setting::ListenerOtlpHttpAcceptedSocketLimit => 34,
+        Setting::ListenerOtlpHttpPerAddressAcceptedSocketLimit => 35,
+        Setting::ListenerOtlpHttpTlsCertificateFile => 36,
+        Setting::ListenerOtlpHttpTlsPrivateKeyFile => 37,
+        Setting::ListenerOtlpHttpTlsClientCaFile => 38,
+        Setting::ListenerOtlpHttpTrustedProxyCidrs => 39,
+        Setting::ListenerOtlpHttpForwardedHops => 40,
+        Setting::ListenerLokiPushBindAddress => 41,
+        Setting::ListenerLokiPushTransport => 42,
+        Setting::ListenerLokiPushAcceptedSocketLimit => 43,
+        Setting::ListenerLokiPushPerAddressAcceptedSocketLimit => 44,
+        Setting::ListenerLokiPushTlsCertificateFile => 45,
+        Setting::ListenerLokiPushTlsPrivateKeyFile => 46,
+        Setting::ListenerLokiPushTlsClientCaFile => 47,
+        Setting::ListenerLokiPushTrustedProxyCidrs => 48,
+        Setting::ListenerLokiPushForwardedHops => 49,
+        Setting::StorageDataDirectory => 50,
+        Setting::StorageSecretsDirectory => 51,
+        Setting::SecurityLocalKeyFile => 52,
+        Setting::ExportDestinations => 53,
     }
 }
 
@@ -973,6 +1147,12 @@ const fn failure_source(setting: Setting) -> FailureSource {
         Setting::ListenerControlPath => FailureSource::ListenerControlPath,
         Setting::ListenerOperationsBindAddress => FailureSource::ListenerOperationsBindAddress,
         Setting::ListenerOperationsTransport => FailureSource::ListenerOperationsTransport,
+        Setting::ListenerOperationsAcceptedSocketLimit => {
+            FailureSource::ListenerOperationsAcceptedSocketLimit
+        },
+        Setting::ListenerOperationsPerAddressAcceptedSocketLimit => {
+            FailureSource::ListenerOperationsPerAddressAcceptedSocketLimit
+        },
         Setting::ListenerOperationsTlsCertificateFile => {
             FailureSource::ListenerOperationsTlsCertificateFile
         },
@@ -988,6 +1168,10 @@ const fn failure_source(setting: Setting) -> FailureSource {
         Setting::ListenerOperationsForwardedHops => FailureSource::ListenerOperationsForwardedHops,
         Setting::ListenerApiBindAddress => FailureSource::ListenerApiBindAddress,
         Setting::ListenerApiTransport => FailureSource::ListenerApiTransport,
+        Setting::ListenerApiAcceptedSocketLimit => FailureSource::ListenerApiAcceptedSocketLimit,
+        Setting::ListenerApiPerAddressAcceptedSocketLimit => {
+            FailureSource::ListenerApiPerAddressAcceptedSocketLimit
+        },
         Setting::ListenerApiTrustedProxyCidrs => FailureSource::ListenerApiTrustedProxyCidrs,
         Setting::ListenerApiForwardedHops => FailureSource::ListenerApiForwardedHops,
         Setting::ListenerApiTlsCertificateFile => FailureSource::ListenerApiTlsCertificateFile,
@@ -995,6 +1179,12 @@ const fn failure_source(setting: Setting) -> FailureSource {
         Setting::ListenerApiTlsClientCaFile => FailureSource::ListenerApiTlsClientCaFile,
         Setting::ListenerOtlpGrpcBindAddress => FailureSource::ListenerOtlpGrpcBindAddress,
         Setting::ListenerOtlpGrpcTransport => FailureSource::ListenerOtlpGrpcTransport,
+        Setting::ListenerOtlpGrpcAcceptedSocketLimit => {
+            FailureSource::ListenerOtlpGrpcAcceptedSocketLimit
+        },
+        Setting::ListenerOtlpGrpcPerAddressAcceptedSocketLimit => {
+            FailureSource::ListenerOtlpGrpcPerAddressAcceptedSocketLimit
+        },
         Setting::ListenerOtlpGrpcTlsCertificateFile => {
             FailureSource::ListenerOtlpGrpcTlsCertificateFile
         },
@@ -1008,6 +1198,12 @@ const fn failure_source(setting: Setting) -> FailureSource {
         Setting::ListenerOtlpGrpcForwardedHops => FailureSource::ListenerOtlpGrpcForwardedHops,
         Setting::ListenerOtlpHttpBindAddress => FailureSource::ListenerOtlpHttpBindAddress,
         Setting::ListenerOtlpHttpTransport => FailureSource::ListenerOtlpHttpTransport,
+        Setting::ListenerOtlpHttpAcceptedSocketLimit => {
+            FailureSource::ListenerOtlpHttpAcceptedSocketLimit
+        },
+        Setting::ListenerOtlpHttpPerAddressAcceptedSocketLimit => {
+            FailureSource::ListenerOtlpHttpPerAddressAcceptedSocketLimit
+        },
         Setting::ListenerOtlpHttpTlsCertificateFile => {
             FailureSource::ListenerOtlpHttpTlsCertificateFile
         },
@@ -1021,6 +1217,12 @@ const fn failure_source(setting: Setting) -> FailureSource {
         Setting::ListenerOtlpHttpForwardedHops => FailureSource::ListenerOtlpHttpForwardedHops,
         Setting::ListenerLokiPushBindAddress => FailureSource::ListenerLokiPushBindAddress,
         Setting::ListenerLokiPushTransport => FailureSource::ListenerLokiPushTransport,
+        Setting::ListenerLokiPushAcceptedSocketLimit => {
+            FailureSource::ListenerLokiPushAcceptedSocketLimit
+        },
+        Setting::ListenerLokiPushPerAddressAcceptedSocketLimit => {
+            FailureSource::ListenerLokiPushPerAddressAcceptedSocketLimit
+        },
         Setting::ListenerLokiPushTlsCertificateFile => {
             FailureSource::ListenerLokiPushTlsCertificateFile
         },

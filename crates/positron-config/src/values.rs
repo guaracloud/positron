@@ -223,6 +223,8 @@ pub enum FailureSource {
     ListenerControlPath,
     ListenerOperationsBindAddress,
     ListenerOperationsTransport,
+    ListenerOperationsAcceptedSocketLimit,
+    ListenerOperationsPerAddressAcceptedSocketLimit,
     ListenerOperationsTlsCertificateFile,
     ListenerOperationsTlsPrivateKeyFile,
     ListenerOperationsTlsClientCaFile,
@@ -230,6 +232,8 @@ pub enum FailureSource {
     ListenerOperationsForwardedHops,
     ListenerApiBindAddress,
     ListenerApiTransport,
+    ListenerApiAcceptedSocketLimit,
+    ListenerApiPerAddressAcceptedSocketLimit,
     ListenerApiTrustedProxyCidrs,
     ListenerApiForwardedHops,
     ListenerApiTlsCertificateFile,
@@ -237,6 +241,8 @@ pub enum FailureSource {
     ListenerApiTlsClientCaFile,
     ListenerOtlpGrpcBindAddress,
     ListenerOtlpGrpcTransport,
+    ListenerOtlpGrpcAcceptedSocketLimit,
+    ListenerOtlpGrpcPerAddressAcceptedSocketLimit,
     ListenerOtlpGrpcTlsCertificateFile,
     ListenerOtlpGrpcTlsPrivateKeyFile,
     ListenerOtlpGrpcTlsClientCaFile,
@@ -244,6 +250,8 @@ pub enum FailureSource {
     ListenerOtlpGrpcForwardedHops,
     ListenerOtlpHttpBindAddress,
     ListenerOtlpHttpTransport,
+    ListenerOtlpHttpAcceptedSocketLimit,
+    ListenerOtlpHttpPerAddressAcceptedSocketLimit,
     ListenerOtlpHttpTlsCertificateFile,
     ListenerOtlpHttpTlsPrivateKeyFile,
     ListenerOtlpHttpTlsClientCaFile,
@@ -251,6 +259,8 @@ pub enum FailureSource {
     ListenerOtlpHttpForwardedHops,
     ListenerLokiPushBindAddress,
     ListenerLokiPushTransport,
+    ListenerLokiPushAcceptedSocketLimit,
+    ListenerLokiPushPerAddressAcceptedSocketLimit,
     ListenerLokiPushTlsCertificateFile,
     ListenerLokiPushTlsPrivateKeyFile,
     ListenerLokiPushTlsClientCaFile,
@@ -276,6 +286,12 @@ impl FailureSource {
             Self::ListenerControlPath => "listener.control_path",
             Self::ListenerOperationsBindAddress => "listener.operations_bind_address",
             Self::ListenerOperationsTransport => "listener.operations_transport",
+            Self::ListenerOperationsAcceptedSocketLimit => {
+                "listener.operations_accepted_socket_limit"
+            },
+            Self::ListenerOperationsPerAddressAcceptedSocketLimit => {
+                "listener.operations_per_address_accepted_socket_limit"
+            },
             Self::ListenerOperationsTlsCertificateFile => {
                 "listener.operations_tls_certificate_file"
             },
@@ -285,6 +301,10 @@ impl FailureSource {
             Self::ListenerOperationsForwardedHops => "listener.operations.forwarded_hops",
             Self::ListenerApiBindAddress => "listener.api_bind_address",
             Self::ListenerApiTransport => "listener.api_transport",
+            Self::ListenerApiAcceptedSocketLimit => "listener.api_accepted_socket_limit",
+            Self::ListenerApiPerAddressAcceptedSocketLimit => {
+                "listener.api_per_address_accepted_socket_limit"
+            },
             Self::ListenerApiTrustedProxyCidrs => "listener.api.trusted_proxy_cidrs",
             Self::ListenerApiForwardedHops => "listener.api.forwarded_hops",
             Self::ListenerApiTlsCertificateFile => "listener.api_tls_certificate_file",
@@ -292,6 +312,10 @@ impl FailureSource {
             Self::ListenerApiTlsClientCaFile => "listener.api_tls_client_ca_file",
             Self::ListenerOtlpGrpcBindAddress => "listener.otlp_grpc_bind_address",
             Self::ListenerOtlpGrpcTransport => "listener.otlp_grpc_transport",
+            Self::ListenerOtlpGrpcAcceptedSocketLimit => "listener.otlp_grpc_accepted_socket_limit",
+            Self::ListenerOtlpGrpcPerAddressAcceptedSocketLimit => {
+                "listener.otlp_grpc_per_address_accepted_socket_limit"
+            },
             Self::ListenerOtlpGrpcTlsCertificateFile => "listener.otlp_grpc_tls_certificate_file",
             Self::ListenerOtlpGrpcTlsPrivateKeyFile => "listener.otlp_grpc_tls_private_key_file",
             Self::ListenerOtlpGrpcTlsClientCaFile => "listener.otlp_grpc_tls_client_ca_file",
@@ -299,6 +323,10 @@ impl FailureSource {
             Self::ListenerOtlpGrpcForwardedHops => "listener.otlp_grpc.forwarded_hops",
             Self::ListenerOtlpHttpBindAddress => "listener.otlp_http_bind_address",
             Self::ListenerOtlpHttpTransport => "listener.otlp_http_transport",
+            Self::ListenerOtlpHttpAcceptedSocketLimit => "listener.otlp_http_accepted_socket_limit",
+            Self::ListenerOtlpHttpPerAddressAcceptedSocketLimit => {
+                "listener.otlp_http_per_address_accepted_socket_limit"
+            },
             Self::ListenerOtlpHttpTlsCertificateFile => "listener.otlp_http_tls_certificate_file",
             Self::ListenerOtlpHttpTlsPrivateKeyFile => "listener.otlp_http_tls_private_key_file",
             Self::ListenerOtlpHttpTlsClientCaFile => "listener.otlp_http_tls_client_ca_file",
@@ -306,6 +334,10 @@ impl FailureSource {
             Self::ListenerOtlpHttpForwardedHops => "listener.otlp_http.forwarded_hops",
             Self::ListenerLokiPushBindAddress => "listener.loki_push_bind_address",
             Self::ListenerLokiPushTransport => "listener.loki_push_transport",
+            Self::ListenerLokiPushAcceptedSocketLimit => "listener.loki_push_accepted_socket_limit",
+            Self::ListenerLokiPushPerAddressAcceptedSocketLimit => {
+                "listener.loki_push_per_address_accepted_socket_limit"
+            },
             Self::ListenerLokiPushTlsCertificateFile => "listener.loki_push_tls_certificate_file",
             Self::ListenerLokiPushTlsPrivateKeyFile => "listener.loki_push_tls_private_key_file",
             Self::ListenerLokiPushTlsClientCaFile => "listener.loki_push_tls_client_ca_file",

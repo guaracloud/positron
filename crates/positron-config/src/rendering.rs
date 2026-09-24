@@ -311,6 +311,16 @@ fn reference_domain(definition: SettingDefinition) -> String {
         Setting::RuntimeMaxRegisteredTenants => "`1..=1024`; maximum tenant quotas simultaneously registered in the live Resource Governor, including the default tenant and a pending non-admittable tenant-creation reservation".to_owned(),
         Setting::ListenerApiBindAddress => "socket address; at most 256 bytes; non-loopback requires TLS or the explicit plaintext opt-out".to_owned(),
         Setting::ListenerApiTransport => "`tls`, `mtls`, `plaintext`; plaintext emits a configuration warning, persistent ready health warning, and one redacted governance audit record".to_owned(),
+        Setting::ListenerOperationsAcceptedSocketLimit
+        | Setting::ListenerApiAcceptedSocketLimit
+        | Setting::ListenerOtlpGrpcAcceptedSocketLimit
+        | Setting::ListenerOtlpHttpAcceptedSocketLimit
+        | Setting::ListenerLokiPushAcceptedSocketLimit => "`1..=4096`; maximum accepted sockets awaiting authentication for this listener role".to_owned(),
+        Setting::ListenerOperationsPerAddressAcceptedSocketLimit
+        | Setting::ListenerApiPerAddressAcceptedSocketLimit
+        | Setting::ListenerOtlpGrpcPerAddressAcceptedSocketLimit
+        | Setting::ListenerOtlpHttpPerAddressAcceptedSocketLimit
+        | Setting::ListenerLokiPushPerAddressAcceptedSocketLimit => "`1..=4096`; maximum accepted sockets awaiting authentication from one immediate peer address; cannot exceed this role's accepted-socket limit".to_owned(),
         Setting::SecurityLocalKeyFile => "protected absolute path under `storage.secrets_directory`, named `local-root-key.v1`; at most 256 bytes".to_owned(),
         _ => match definition.domain() {
             ValueDomain::ExactUnsignedInteger(value) => format!("exactly `{value}`"),

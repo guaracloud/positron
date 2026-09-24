@@ -55,6 +55,32 @@ fn rust_owned_definitions_keep_runtime_and_generated_constraints_in_parity()
 }
 
 #[test]
+fn accepted_socket_limits_reject_zero_out_of_range_and_per_address_over_global() {
+    for (document, source) in [
+        (
+            "schema_version = 1\n[listener]\napi_accepted_socket_limit = 0\n",
+            FailureSource::ListenerApiAcceptedSocketLimit,
+        ),
+        (
+            "schema_version = 1\n[listener]\napi_per_address_accepted_socket_limit = 4097\n",
+            FailureSource::ListenerApiPerAddressAcceptedSocketLimit,
+        ),
+        (
+            "schema_version = 1\n[listener]\napi_accepted_socket_limit = 16\napi_per_address_accepted_socket_limit = 17\n",
+            FailureSource::ListenerApiPerAddressAcceptedSocketLimit,
+        ),
+    ] {
+        let result = inputs(Some(document), [], []).and_then(resolve);
+        assert!(matches!(
+            result,
+            Err(error)
+                if error.code() == ConfigurationFailureCode::UnsupportedValue
+                    && error.source() == source
+        ));
+    }
+}
+
+#[test]
 fn accepts_each_closed_value_and_exact_numeric_and_address_boundaries()
 -> Result<(), ConfigurationFailure> {
     for (value, expected) in [

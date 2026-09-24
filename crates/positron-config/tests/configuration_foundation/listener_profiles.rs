@@ -80,3 +80,36 @@ fn canonical_listener_profiles_keep_role_owned_mtls_identity_and_trust()
     }
     Ok(())
 }
+
+#[test]
+fn network_listener_profile_resolves_role_owned_accepted_socket_limits()
+-> Result<(), Box<dyn Error>> {
+    use positron_config::NetworkListenerRole;
+
+    let effective = inputs(
+        Some(
+            "schema_version = 1\n\
+             [listener]\n\
+             otlp_grpc_accepted_socket_limit = 48\n\
+             otlp_grpc_per_address_accepted_socket_limit = 6\n",
+        ),
+        [],
+        [],
+    )
+    .and_then(resolve)?;
+
+    let grpc = effective
+        .network_listener_profile(NetworkListenerRole::OtlpGrpc)
+        .ok_or("OTLP gRPC listener profile missing")?
+        .connection_admission();
+    assert_eq!(grpc.global_accepted_socket_limit().get(), 48);
+    assert_eq!(grpc.per_address_accepted_socket_limit().get(), 6);
+
+    let api = effective
+        .network_listener_profile(NetworkListenerRole::Api)
+        .ok_or("API listener profile missing")?
+        .connection_admission();
+    assert_eq!(api.global_accepted_socket_limit().get(), 128);
+    assert_eq!(api.per_address_accepted_socket_limit().get(), 16);
+    Ok(())
+}
