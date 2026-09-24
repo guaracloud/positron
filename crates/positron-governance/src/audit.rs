@@ -317,7 +317,9 @@ impl ConfigurationAuditRequest {
         hasher.update(self.candidate_digest);
         let digest = hasher.finalize();
         let mut transaction = [0; 16];
-        transaction.copy_from_slice(&digest[..16]);
+        for (destination, source) in transaction.iter_mut().zip(digest.iter()) {
+            *destination = *source;
+        }
         transaction
     }
 

@@ -114,14 +114,13 @@ pub(super) fn wait_for_configuration_status(
     expected_fragments: &[&str],
 ) -> Result<String, Box<dyn std::error::Error>> {
     for _ in 0..100 {
-        if let Ok(response) = configuration_status(port, authorization) {
-            if response.starts_with("HTTP/1.1 200 ")
-                && expected_fragments
-                    .iter()
-                    .all(|fragment| response.contains(fragment))
-            {
-                return Ok(response);
-            }
+        if let Ok(response) = configuration_status(port, authorization)
+            && response.starts_with("HTTP/1.1 200 ")
+            && expected_fragments
+                .iter()
+                .all(|fragment| response.contains(fragment))
+        {
+            return Ok(response);
         }
         std::thread::sleep(Duration::from_millis(25));
     }

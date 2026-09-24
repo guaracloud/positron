@@ -540,7 +540,9 @@ fn configuration_request_id(
     hasher.update(candidate_binding_digest);
     let digest = hasher.finalize();
     let mut request_id = [0; 16];
-    request_id.copy_from_slice(&digest[..16]);
+    for (destination, source) in request_id.iter_mut().zip(digest.iter()) {
+        *destination = *source;
+    }
     if request_id.iter().all(|byte| *byte == 0) {
         request_id[0] = 1;
     }
