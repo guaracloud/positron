@@ -184,7 +184,7 @@ impl ListenerProfile {
             transport,
             global_accepted_socket_limit,
             per_address_accepted_socket_limit,
-            default_connection_protection(),
+            default_connection_protection()?,
         )
     }
 
@@ -289,15 +289,16 @@ impl ListenerProfile {
     }
 }
 
-const fn default_connection_protection() -> ConnectionProtection {
-    ConnectionProtection::new(
-        NonZeroU16::new(16).expect("nonzero TLS handshake default"),
+fn default_connection_protection() -> Result<ConnectionProtection, ListenerFailure> {
+    let tls_handshake_limit = NonZeroU16::new(16).ok_or(ListenerFailure::InvalidEndpoint)?;
+    Ok(ConnectionProtection::new(
+        tls_handshake_limit,
         Duration::from_secs(2),
         Duration::from_secs(2),
         Duration::from_secs(2),
         Duration::from_secs(30),
         Duration::from_secs(30),
-    )
+    ))
 }
 
 /// A complete listener candidate. Constructing it proves every Release 1 role

@@ -9,6 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
+use positron_config::NetworkListenerRole;
 use positron_domain::value::{
     ByteLimit, CollectionLimit, DynamicValueLimits, NestingLimit, RequestLimits, ValueLimitProfile,
     ValueLimitProfileCandidate, ValueLimitSet,
@@ -25,7 +26,7 @@ use positron_kernel::MountQualification;
 use prost::Message;
 
 use super::super::serve;
-use crate::native_host::{Admission, NativeListener, TransportProfile};
+use crate::native_host::{Admission, NativeListener, TransportProfile, compiled_http2_profile};
 use crate::services::ReceiverTestBackend;
 use crate::{
     BootstrapPaths, InitializationPlan, InitializedInstance, InstanceBootstrap, ListenerRole,
@@ -304,7 +305,7 @@ impl ReceiverHarness {
             trusted_proxy: None,
             connection_admission: None,
             connection_protection: None,
-            http2_profile: None,
+            http2_profile: compiled_http2_profile(NetworkListenerRole::OtlpGrpc)?,
         });
         let cancellation = TaskCancellation::new();
         let serve_cancellation = cancellation.clone();

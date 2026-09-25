@@ -424,16 +424,24 @@ fn compiled_http2_profile(
         .ok_or(NativeHostFailure::InvalidBinding)
 }
 
+const DEFAULT_ACCEPTED_SOCKET_LIMIT: NonZeroU16 = nonzero_u16(128);
+const DEFAULT_PEER_SOCKET_LIMIT: NonZeroU16 = nonzero_u16(16);
+const DEFAULT_TLS_HANDSHAKE_LIMIT: NonZeroU16 = nonzero_u16(16);
+
+const fn nonzero_u16(value: u16) -> NonZeroU16 {
+    match NonZeroU16::new(value) {
+        Some(value) => value,
+        None => panic!("native listener default must be nonzero"),
+    }
+}
+
 const fn default_admission_limits() -> (NonZeroU16, NonZeroU16) {
-    (
-        NonZeroU16::new(128).expect("nonzero accepted socket default"),
-        NonZeroU16::new(16).expect("nonzero peer socket default"),
-    )
+    (DEFAULT_ACCEPTED_SOCKET_LIMIT, DEFAULT_PEER_SOCKET_LIMIT)
 }
 
 fn default_connection_protection() -> ConnectionProtection {
     ConnectionProtection::new(
-        NonZeroU16::new(16).unwrap_or(NonZeroU16::MIN),
+        DEFAULT_TLS_HANDSHAKE_LIMIT,
         Duration::from_secs(2),
         Duration::from_secs(2),
         Duration::from_secs(2),
@@ -1564,8 +1572,24 @@ mod listener_generation_tests {
     ) -> Result<ValidatedListenerSet, Box<dyn std::error::Error>> {
         let profiles = candidate.profiles().clone().map(|profile| match profile {
             ListenerProfile::Network {
-                role, transport, ..
-            } if role == changed_role => ListenerProfile::network(role, address, transport),
+                role,
+                transport,
+                global_accepted_socket_limit,
+                per_address_accepted_socket_limit,
+                connection_protection,
+                http2_profile,
+                ..
+            } if role == changed_role => {
+                ListenerProfile::network_with_admission_protection_and_http2(
+                    role,
+                    address,
+                    transport,
+                    global_accepted_socket_limit,
+                    per_address_accepted_socket_limit,
+                    connection_protection,
+                    http2_profile,
+                )
+            },
             profile => Ok(profile),
         });
         let [control, operations, api, otlp_grpc, otlp_http, loki_push] = profiles;
@@ -1609,9 +1633,24 @@ mod listener_generation_tests {
         };
         let profile = |role, original: ListenerProfile| -> Result<_, Box<dyn std::error::Error>> {
             match original {
-                ListenerProfile::Network { transport, .. } => {
-                    Ok(ListenerProfile::network(role, bound(role)?, transport)?)
-                },
+                ListenerProfile::Network {
+                    transport,
+                    global_accepted_socket_limit,
+                    per_address_accepted_socket_limit,
+                    connection_protection,
+                    http2_profile,
+                    ..
+                } => Ok(
+                    ListenerProfile::network_with_admission_protection_and_http2(
+                        role,
+                        bound(role)?,
+                        transport,
+                        global_accepted_socket_limit,
+                        per_address_accepted_socket_limit,
+                        connection_protection,
+                        http2_profile,
+                    )?,
+                ),
                 ListenerProfile::Control { .. } => Ok(control.clone()),
             }
         };

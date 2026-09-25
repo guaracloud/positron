@@ -103,6 +103,10 @@ impl<I: AsyncRead + Unpin> AsyncRead for H2Observer<I> {
                     let index = self.header_len;
                     self.header[index] = *byte;
                     self.header_len += 1;
+                    if self.header_len == 4 && self.header[3] == HEADERS && !self.header_block {
+                        self.header_block = true;
+                        self.deadline = Some(Box::pin(tokio::time::sleep(self.header_deadline)));
+                    }
                     if self.header_len == HEADER {
                         let length = ((usize::from(self.header[0])) << 16)
                             | ((usize::from(self.header[1])) << 8)
@@ -122,14 +126,7 @@ impl<I: AsyncRead + Unpin> AsyncRead for H2Observer<I> {
                             }
                             self.last_ping = Some(now);
                         }
-                        if typ == HEADERS {
-                            if !self.header_block {
-                                self.header_block = true;
-                                self.deadline =
-                                    Some(Box::pin(tokio::time::sleep(self.header_deadline)));
-                            }
-                            self.clear_after_payload = flags & END_HEADERS != 0;
-                        } else if typ == CONTINUATION && self.header_block {
+                        if typ == HEADERS || (typ == CONTINUATION && self.header_block) {
                             self.clear_after_payload = flags & END_HEADERS != 0;
                         }
                         self.payload = length;
@@ -221,6 +218,22 @@ mod tests {
         observed.read_exact(&mut prefix).await.unwrap();
         let mut one = [0; 1];
         let error = observed.read(&mut one).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+    #[tokio::test]
+    async fn header_deadline_starts_when_the_partial_frame_identifies_headers() {
+        let (mut w, r) = tokio::io::duplex(128);
+        w.write_all(PREF).await.unwrap();
+        let partial = frame(1, HEADERS, END_HEADERS);
+        w.write_all(&partial[..4]).await.unwrap();
+        let mut observed = H2Observer::new(r, Duration::from_millis(10), Duration::from_secs(1));
+        let mut prefix = [0; PREF.len() + 4];
+        observed.read_exact(&mut prefix).await.unwrap();
+        let mut one = [0; 1];
+        let error = tokio::time::timeout(Duration::from_secs(1), observed.read(&mut one))
+            .await
+            .expect("partial HEADERS must start an absolute deadline")
+            .expect_err("partial HEADERS must expire without a complete frame header");
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     }
     #[tokio::test]
