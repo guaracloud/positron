@@ -366,6 +366,11 @@ fn authenticated_child_rejects_a_token_retained_after_its_governor_drops()
         drop(source_root);
         token
     };
+    assert_eq!(
+        token.authority.strong_count(),
+        0,
+        "a retained token must not retain the destroyed governor authority"
+    );
     let successor = governor_with_principal_quota(
         capacity,
         capacity,

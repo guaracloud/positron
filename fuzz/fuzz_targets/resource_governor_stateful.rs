@@ -6,7 +6,7 @@ use positron_kernel::{
     DetectedCapacity, DiskObservation, DiskPressureThresholds, GovernorPolicy,
     InventoryCardinalityLimits, OperatorLimits, OrdinaryPool, OrdinaryPoolPolicy, PrincipalQuota,
     RecoveryPoolCapacities, RecoveryReserve, RecoveryWorkClaim, RecoveryWorkKind, ResourceAmounts,
-    ResourceDimension, ResourceGovernor, ResourceInventory, ResourceReservation,
+    OperationToken, ResourceDimension, ResourceGovernor, ResourceInventory, ResourceReservation,
     StorageKernelResourceAuthority, TenantQuota, WorkClaim, WorkClass, WorkKind,
 };
 
@@ -17,13 +17,15 @@ const RECOVERY_RESERVE: u64 = TOTAL_CEILING - ORDINARY_CEILING;
 
 #[derive(Clone, Copy)]
 enum SlotIdentity {
-    Ordinary(WorkClass),
+    Ordinary(WorkKind),
     Recovery { uninterruptible: bool },
 }
 
 struct Slot<'authority> {
     reservation: ResourceReservation<'authority>,
     identity: SlotIdentity,
+    operation: Option<(OperationToken, WorkKind)>,
+    is_operation_root: bool,
 }
 
 fn uniform(value: u64) -> ResourceAmounts {
@@ -121,6 +123,28 @@ fn add_amount(total: &mut [u64; 11], amounts: ResourceAmounts) {
     }
 }
 
+fn charged_footprint(governor: &ResourceGovernor<'_>) -> ([u64; 11], u32) {
+    let snapshot = governor
+        .inspect()
+        .expect("public operations must preserve inspectable state");
+    let usage = ResourceDimension::ALL.map(|dimension| snapshot.usage(dimension));
+    (usage, snapshot.outstanding_total())
+}
+
+fn operation_accepts_children(
+    slots: &[Option<Slot<'_>>; SLOT_COUNT],
+    token: &OperationToken,
+) -> bool {
+    slots.iter().flatten().any(|slot| {
+        slot.reservation.is_active()
+            && slot.is_operation_root
+            && slot
+                .operation
+                .as_ref()
+                .is_some_and(|(candidate, _)| candidate == token)
+    })
+}
+
 fn assert_conservation(governor: &ResourceGovernor<'_>, slots: &[Option<Slot<'_>>; SLOT_COUNT]) {
     let snapshot = governor
         .inspect()
@@ -141,9 +165,9 @@ fn assert_conservation(governor: &ResourceGovernor<'_>, slots: &[Option<Slot<'_>
         outstanding += 1;
         add_amount(&mut total, slot.reservation.granted());
         match slot.identity {
-            SlotIdentity::Ordinary(class) => {
+            SlotIdentity::Ordinary(kind) => {
                 outstanding_ordinary += 1;
-                class_counts[class_index(class)] += 1;
+                class_counts[class_index(kind.class())] += 1;
                 add_amount(&mut ordinary, slot.reservation.granted());
             },
             SlotIdentity::Recovery { uninterruptible } => {
@@ -242,10 +266,12 @@ fuzz_target!(|data: &[u8]| {
     let governor = authority.governor();
     let recovery = authority.recovery();
     let mut slots: [Option<Slot>; SLOT_COUNT] = std::array::from_fn(|_| None);
+    let mut stale_operations: [Option<(OperationToken, WorkKind)>; SLOT_COUNT] =
+        std::array::from_fn(|_| None);
 
     for command in data.chunks_exact(5) {
         let slot_index = usize::from(command[1]) % SLOT_COUNT;
-        match command[0] % 7 {
+        match command[0] % 9 {
             0 => {
                 drop(slots[slot_index].take());
                 let kind = ordinary_kind(command[2]);
@@ -264,9 +290,12 @@ fuzz_target!(|data: &[u8]| {
                 if let Ok(claim) = claim
                     && let Ok(reservation) = governor.reserve(claim)
                 {
+                    let operation = reservation.operation_token().map(|token| (token, kind));
                     slots[slot_index] = Some(Slot {
                         reservation,
-                        identity: SlotIdentity::Ordinary(kind.class()),
+                        identity: SlotIdentity::Ordinary(kind),
+                        operation,
+                        is_operation_root: true,
                     });
                 }
             },
@@ -300,6 +329,8 @@ fuzz_target!(|data: &[u8]| {
                                     | RecoveryWorkKind::SafeShutdown
                             ),
                         },
+                        operation: None,
+                        is_operation_root: false,
                     });
                 }
             },
@@ -313,9 +344,15 @@ fuzz_target!(|data: &[u8]| {
                     let _ = slot.reservation.try_resize(ResourceAmounts::new(values));
                 }
             },
-            3 => drop(slots[slot_index].take()),
+            3 => {
+                if let Some(slot) = slots[slot_index].take() {
+                    stale_operations[slot_index] = slot.operation.clone();
+                    drop(slot);
+                }
+            },
             4 => {
                 if let Some(mut slot) = slots[slot_index].take() {
+                    stale_operations[slot_index] = slot.operation.clone();
                     let _ = slot.reservation.cancel();
                 }
             },
@@ -327,8 +364,97 @@ fuzz_target!(|data: &[u8]| {
                     .unwrap_or_default();
                 let _ = authority.observe_disk_for_fuzz(DiskObservation::new(usable));
             },
-            _ => {
+            6 => {
                 let _ = authority.begin_shutdown();
+            },
+            7 => {
+                let parent = usize::from(command[2]) % SLOT_COUNT;
+                let operation = if command[4] & 0x80 == 0 {
+                    slots[parent]
+                        .as_ref()
+                        .and_then(|slot| slot.operation.as_ref())
+                        .map(|(token, kind)| (token.clone(), *kind))
+                } else {
+                    stale_operations[parent]
+                        .as_ref()
+                        .map(|(token, kind)| (token.clone(), *kind))
+                };
+                drop(slots[slot_index].take());
+                if let Some((token, kind)) = operation {
+                    let operation_is_open = operation_accepts_children(&slots, &token);
+                    let amount = u64::from(command[4] % 20) + 1;
+                    let claim = ResourceAmounts::only(dimension(command[3]), amount)
+                        .and_then(|amounts| WorkClaim::authenticated_child(&token, kind, amounts));
+                    if let Ok(claim) = claim {
+                        let before = charged_footprint(&governor);
+                        let reservation = governor.reserve(claim);
+                        if !operation_is_open {
+                            assert!(
+                                reservation.is_err(),
+                                "a token whose root has released must be refused"
+                            );
+                            assert_eq!(charged_footprint(&governor), before);
+                        } else if let Ok(reservation) = reservation {
+                            slots[slot_index] = Some(Slot {
+                                reservation,
+                                identity: SlotIdentity::Ordinary(kind),
+                                operation: Some((token, kind)),
+                                is_operation_root: false,
+                            });
+                        }
+                    }
+                }
+            },
+            _ => {
+                if command[4] & 1 == 0 {
+                    if let Some(slot) = slots[slot_index].take() {
+                        let Slot {
+                            reservation: owned,
+                            identity,
+                            operation,
+                            is_operation_root,
+                        } = slot;
+                        let transferred = owned.transfer();
+                        if let Ok(reservation) = transferred.reclaim(governor) {
+                            slots[slot_index] = Some(Slot {
+                                reservation,
+                                identity,
+                                operation,
+                                is_operation_root,
+                            });
+                        }
+                    }
+                } else if let Some((foreign_authority, _)) = establish() {
+                    let foreign = foreign_authority.governor();
+                    let kind = WorkKind::InteractiveQueryTail;
+                    let claim = ResourceAmounts::only(ResourceDimension::MemoryBytes, 1).and_then(
+                        |amounts| {
+                            WorkClaim::authenticated(
+                                tenants[0],
+                                PrincipalId::from_bytes([0; 16]).map_err(|_| {
+                                    positron_kernel::GovernorFailure::InvalidConfiguration
+                                })?,
+                                kind,
+                                amounts,
+                            )
+                        },
+                    );
+                    if let Ok(claim) = claim
+                        && let Ok(root) = foreign.reserve(claim)
+                        && let Some(token) = root.operation_token()
+                        && let Ok(amounts) =
+                            ResourceAmounts::only(ResourceDimension::MemoryBytes, 1)
+                        && let Ok(claim) = WorkClaim::authenticated_child(&token, kind, amounts)
+                    {
+                        let before = charged_footprint(&governor);
+                        let reservation = governor.reserve(claim);
+                        assert!(
+                            reservation.is_err(),
+                            "a token minted by another governor must be refused"
+                        );
+                        assert_eq!(charged_footprint(&governor), before);
+                    }
+                }
             },
         }
         assert_conservation(&governor, &slots);
