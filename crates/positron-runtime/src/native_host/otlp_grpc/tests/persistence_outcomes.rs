@@ -289,6 +289,7 @@ impl ReceiverHarness {
             connection_admission: None,
             connection_protection: None,
             http2_profile: compiled_http2_profile(NetworkListenerRole::OtlpGrpc)?,
+            cors_allowed_origins: Vec::new(),
         });
         let cancellation = TaskCancellation::new();
         let serve_cancellation = cancellation.clone();

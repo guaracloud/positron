@@ -166,6 +166,9 @@ fn domain_description(domain: ValueDomain) -> String {
         ValueDomain::TrustedProxyCidrs(maximum, maximum_bytes) => {
             format!("trusted_proxy_cidrs:max_items={maximum},max_bytes={maximum_bytes}")
         },
+        ValueDomain::CorsAllowedOrigins(maximum, maximum_bytes) => {
+            format!("cors_allowed_origins:max_items={maximum},max_bytes={maximum_bytes}")
+        },
         ValueDomain::ExportDestinations(maximum, maximum_name_bytes, maximum_tenants) => format!(
             "export_destinations:max_items={maximum},max_name_bytes={maximum_name_bytes},max_tenants={maximum_tenants}"
         ),

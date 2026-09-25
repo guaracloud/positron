@@ -31,7 +31,7 @@ macro_rules! define_settings {
     };
 }
 
-pub(crate) const SETTING_DEFINITIONS: [SettingDefinition; 97] = define_settings! {
+pub(crate) const SETTING_DEFINITIONS: [SettingDefinition; 98] = define_settings! {
     SchemaVersion | "schema_version" | Integer | "1" | ExactUnsignedInteger(1) | Public | ConfigurationFileOnly | ImmutableAfterInitialization;
     DiagnosticsLogLevel | "diagnostics.log_level" | String | "info" | StringEnumeration(&["error", "warn", "info", "debug"]) | Public | NonSecretOverrides | LiveReloadable;
     RuntimeShutdownGraceSeconds | "runtime.shutdown_grace_seconds" | Integer | "30" | UnsignedIntegerRange(1, 3600) | Public | NonSecretOverrides | RestartRequired;
@@ -68,6 +68,7 @@ pub(crate) const SETTING_DEFINITIONS: [SettingDefinition; 97] = define_settings!
     ListenerApiHttp2MaxFrameBytes | "listener.api_http2_max_frame_bytes" | Integer | "16384" | UnsignedIntegerRange(16384, 16777215) | Public | ConfigurationFileOnly | DrainAndReload;
     ListenerApiHttp2MaxHeaderListBytes | "listener.api_http2_max_header_list_bytes" | Integer | "8192" | UnsignedIntegerRange(1, 1048576) | Public | ConfigurationFileOnly | DrainAndReload;
     ListenerApiHttp2MinimumPingIntervalSeconds | "listener.api_http2_minimum_ping_interval_seconds" | Integer | "5" | UnsignedIntegerRange(1, 300) | Public | ConfigurationFileOnly | DrainAndReload;
+    ListenerApiCorsAllowedOrigins | "listener.api.cors_allowed_origins" | CorsAllowedOrigins | "[]" | CorsAllowedOrigins(16, 256) | Public | ConfigurationFileOnly | DrainAndReload;
     ListenerApiTrustedProxyCidrs | "listener.api.trusted_proxy_cidrs" | TrustedProxyCidrs | "disabled" | TrustedProxyCidrs(16, 64) | Public | ConfigurationFileOnly | DrainAndReload;
     ListenerApiForwardedHops | "listener.api.forwarded_hops" | Integer | "0" | UnsignedIntegerRange(0, 255) | Public | ConfigurationFileOnly | DrainAndReload;
     ListenerApiTlsCertificateFile | "listener.api_tls_certificate_file" | String | "/var/lib/positron-secrets/api-certificate.pem" | ProtectedAbsolutePath(256) | SecretBearing | ProtectedConfigurationFileOnly | DrainAndReload;

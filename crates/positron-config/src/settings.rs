@@ -80,6 +80,8 @@ pub enum SettingKind {
     ExportDestinations,
     /// A bounded list of literal trusted-proxy CIDRs.
     TrustedProxyCidrs,
+    /// A bounded list of exact browser origins permitted on the API listener.
+    CorsAllowedOrigins,
 }
 
 impl SettingKind {
@@ -90,6 +92,7 @@ impl SettingKind {
             Self::String => "string",
             Self::ExportDestinations => "export_destinations",
             Self::TrustedProxyCidrs => "trusted_proxy_cidrs",
+            Self::CorsAllowedOrigins => "cors_allowed_origins",
         }
     }
 }
@@ -115,6 +118,8 @@ pub enum ValueDomain {
     ExportDestinations(usize, usize, usize),
     /// Bounded literal IPv4 or IPv6 CIDRs for one listener profile.
     TrustedProxyCidrs(usize, usize),
+    /// Bounded exact `http` or `https` origins for the API listener.
+    CorsAllowedOrigins(usize, usize),
 }
 
 /// The exact source policy declared for one setting.
@@ -246,6 +251,7 @@ pub enum Setting {
     ListenerApiHttp2MaxFrameBytes,
     ListenerApiHttp2MaxHeaderListBytes,
     ListenerApiHttp2MinimumPingIntervalSeconds,
+    ListenerApiCorsAllowedOrigins,
     ListenerApiTrustedProxyCidrs,
     ListenerApiForwardedHops,
     ListenerApiTlsCertificateFile,

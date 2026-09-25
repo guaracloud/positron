@@ -48,6 +48,7 @@ pub struct NetworkListenerProfile<'a> {
     tls_private_key_file: ProtectedFileReference,
     tls_client_ca_file: Option<ProtectedFileReference>,
     trusted_proxy_cidrs: &'a [String],
+    cors_allowed_origins: Option<&'a [String]>,
     forwarded_hops: Option<NonZeroU8>,
     connection_admission: ConnectionAdmissionProfile,
     connection_protection: ConnectionProtectionProfile,
@@ -183,6 +184,11 @@ impl NetworkListenerProfile<'_> {
     pub fn trusted_proxy_cidrs(&self) -> &[String] {
         self.trusted_proxy_cidrs
     }
+
+    #[must_use]
+    pub fn cors_allowed_origins(&self) -> Option<&[String]> {
+        self.cors_allowed_origins
+    }
     #[must_use]
     pub const fn forwarded_hops(&self) -> Option<NonZeroU8> {
         self.forwarded_hops
@@ -285,6 +291,7 @@ pub struct EffectiveConfiguration {
     pub(crate) api_per_address_accepted_socket_limit: NonZeroU16,
     pub(crate) api_connection_protection: ConnectionProtectionProfile,
     pub(crate) api_http2_profile: Http2Profile,
+    pub(crate) api_cors_allowed_origins: Vec<String>,
     pub(crate) api_trusted_proxy_cidrs: Vec<String>,
     pub(crate) api_forwarded_hops: Option<NonZeroU8>,
     pub(crate) api_tls_certificate_file: ProtectedFileReference,
@@ -325,7 +332,7 @@ pub struct EffectiveConfiguration {
     pub(crate) secrets_directory: String,
     pub(crate) local_key_file: ProtectedFileReference,
     pub(crate) export_destinations: Vec<ExportDestinationDefinition>,
-    pub(crate) sources: [SettingSource; 97],
+    pub(crate) sources: [SettingSource; 98],
 }
 
 impl EffectiveConfiguration {
@@ -378,6 +385,7 @@ impl EffectiveConfiguration {
             per_address_accepted_socket_limit,
             connection_protection,
             http2_profile,
+            cors_allowed_origins,
         ) = match role {
             NetworkListenerRole::Operations => (
                 self.operations_bind_address,
@@ -390,6 +398,7 @@ impl EffectiveConfiguration {
                 self.operations_accepted_socket_limit,
                 self.operations_per_address_accepted_socket_limit,
                 self.operations_connection_protection,
+                None,
                 None,
             ),
             NetworkListenerRole::Api => (
@@ -408,6 +417,7 @@ impl EffectiveConfiguration {
                 self.api_per_address_accepted_socket_limit,
                 self.api_connection_protection,
                 Some(self.api_http2_profile),
+                Some(&self.api_cors_allowed_origins),
             ),
             NetworkListenerRole::OtlpGrpc => (
                 self.otlp_grpc_bind_address,
@@ -421,6 +431,7 @@ impl EffectiveConfiguration {
                 self.otlp_grpc_per_address_accepted_socket_limit,
                 self.otlp_grpc_connection_protection,
                 Some(self.otlp_grpc_http2_profile),
+                None,
             ),
             NetworkListenerRole::OtlpHttp => (
                 self.otlp_http_bind_address,
@@ -433,6 +444,7 @@ impl EffectiveConfiguration {
                 self.otlp_http_accepted_socket_limit,
                 self.otlp_http_per_address_accepted_socket_limit,
                 self.otlp_http_connection_protection,
+                None,
                 None,
             ),
             NetworkListenerRole::LokiPush => (
@@ -447,6 +459,7 @@ impl EffectiveConfiguration {
                 self.loki_push_per_address_accepted_socket_limit,
                 self.loki_push_connection_protection,
                 None,
+                None,
             ),
         };
         Some(NetworkListenerProfile {
@@ -458,6 +471,7 @@ impl EffectiveConfiguration {
             tls_client_ca_file: (transport == NetworkTransport::MutualTls)
                 .then(|| client_ca.clone()),
             trusted_proxy_cidrs,
+            cors_allowed_origins: cors_allowed_origins.map(Vec::as_slice),
             forwarded_hops,
             connection_admission: ConnectionAdmissionProfile {
                 global_accepted_socket_limit,
@@ -953,6 +967,7 @@ impl EffectiveConfiguration {
                 | Setting::ListenerApiHttp2MaxFrameBytes
                 | Setting::ListenerApiHttp2MaxHeaderListBytes
                 | Setting::ListenerApiHttp2MinimumPingIntervalSeconds
+                | Setting::ListenerApiCorsAllowedOrigins
                 | Setting::ListenerOtlpGrpcTlsHandshakeLimit
                 | Setting::ListenerOtlpGrpcTlsHandshakeDeadlineSeconds
                 | Setting::ListenerOtlpGrpcHeaderDeadlineSeconds
@@ -1037,6 +1052,9 @@ impl EffectiveConfiguration {
             },
             Setting::ListenerApiTrustedProxyCidrs => {
                 self.api_trusted_proxy_cidrs != other.api_trusted_proxy_cidrs
+            },
+            Setting::ListenerApiCorsAllowedOrigins => {
+                self.api_cors_allowed_origins != other.api_cors_allowed_origins
             },
             Setting::ListenerApiForwardedHops => {
                 self.api_forwarded_hops != other.api_forwarded_hops
@@ -1392,6 +1410,9 @@ impl EffectiveConfiguration {
             Setting::ListenerApiTrustedProxyCidrs => {
                 trusted_proxy_cidrs_value(&self.api_trusted_proxy_cidrs)
             },
+            Setting::ListenerApiCorsAllowedOrigins => {
+                cors_allowed_origins_value(&self.api_cors_allowed_origins)
+            },
             Setting::ListenerApiForwardedHops => forwarded_hops_value(self.api_forwarded_hops),
             Setting::ListenerApiTlsCertificateFile => self.api_tls_certificate_file.path.clone(),
             Setting::ListenerApiTlsPrivateKeyFile => self.api_tls_private_key_file.path.clone(),
@@ -1725,6 +1746,9 @@ impl EffectiveConfiguration {
             Setting::ListenerApiTrustedProxyCidrs => {
                 trusted_proxy_cidrs_value(&self.api_trusted_proxy_cidrs)
             },
+            Setting::ListenerApiCorsAllowedOrigins => {
+                cors_allowed_origins_value(&self.api_cors_allowed_origins)
+            },
             Setting::ListenerApiForwardedHops => forwarded_hops_value(self.api_forwarded_hops),
             Setting::ListenerOperationsTlsCertificateFile
             | Setting::ListenerOperationsTlsPrivateKeyFile
@@ -2037,6 +2061,10 @@ fn update_digest_string(hasher: &mut Sha256, value: &str) {
 
 fn trusted_proxy_cidrs_value(cidrs: &[String]) -> String {
     cidrs.join(",")
+}
+
+fn cors_allowed_origins_value(origins: &[String]) -> String {
+    origins.join(",")
 }
 
 fn forwarded_hops_value(hops: Option<NonZeroU8>) -> String {

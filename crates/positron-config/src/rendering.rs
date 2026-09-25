@@ -101,6 +101,14 @@ fn append_listener_role_schema(
             .iter()
             .copied()
             .find(|definition| definition.path() == hop_path);
+        let cors = (role == "api")
+            .then(|| {
+                definitions
+                    .iter()
+                    .copied()
+                    .find(|definition| definition.path() == "listener.api.cors_allowed_origins")
+            })
+            .flatten();
         let (Some(cidrs), Some(hops)) = (cidrs, hops) else {
             continue;
         };
@@ -108,9 +116,10 @@ fn append_listener_role_schema(
             output.push_str(", ");
         }
         output.push_str(&format!(
-            "\"{role}\": {{\"type\": \"object\", \"additionalProperties\": false, \"properties\": {{\"trusted_proxy_cidrs\": {}, \"forwarded_hops\": {}}}}}",
+            "\"{role}\": {{\"type\": \"object\", \"additionalProperties\": false, \"properties\": {{\"trusted_proxy_cidrs\": {}, \"forwarded_hops\": {}{}}}}}",
             render_schema_value(cidrs),
             render_schema_value(hops),
+            cors.map_or_else(String::new, |definition| format!(", \"cors_allowed_origins\": {}", render_schema_value(definition))),
         ));
         *first = false;
     }
@@ -145,6 +154,9 @@ fn render_schema_value(definition: SettingDefinition) -> String {
         ),
         ValueDomain::TrustedProxyCidrs(maximum_entries, maximum_entry_bytes) => format!(
             "{{\"type\": \"array\", \"maxItems\": {maximum_entries}, \"items\": {{\"type\": \"string\", \"maxLength\": {maximum_entry_bytes}, \"x-positron-address-kind\": \"literal-ip-cidr\"}}}}"
+        ),
+        ValueDomain::CorsAllowedOrigins(maximum_entries, maximum_entry_bytes) => format!(
+            "{{\"type\": \"array\", \"maxItems\": {maximum_entries}, \"uniqueItems\": true, \"items\": {{\"type\": \"string\", \"maxLength\": {maximum_entry_bytes}, \"x-positron-origin-kind\": \"exact-http-or-https-origin\"}}}}"
         ),
     }
 }
@@ -281,7 +293,9 @@ fn append_example_setting(output: &mut String, definition: SettingDefinition) {
     let value = match definition.kind() {
         SettingKind::Integer => definition.default_value().to_owned(),
         SettingKind::String => render_toml_basic_string(definition.default_value()),
-        SettingKind::ExportDestinations | SettingKind::TrustedProxyCidrs => return,
+        SettingKind::ExportDestinations
+        | SettingKind::TrustedProxyCidrs
+        | SettingKind::CorsAllowedOrigins => return,
     };
     output.push_str(&format!("{field} = {value}\n"));
 }
@@ -297,6 +311,7 @@ fn append_proxy_trust_example(output: &mut String) {
 fn reference_kind(definition: SettingDefinition) -> &'static str {
     match definition.setting() {
         Setting::ExportDestinations => "array of tables",
+        Setting::ListenerApiCorsAllowedOrigins => "array",
         Setting::ListenerOperationsTrustedProxyCidrs
         | Setting::ListenerApiTrustedProxyCidrs
         | Setting::ListenerOtlpGrpcTrustedProxyCidrs
@@ -375,6 +390,7 @@ fn reference_domain(definition: SettingDefinition) -> String {
             ValueDomain::ProtectedAbsolutePath(maximum) => format!("protected absolute path; at most {maximum} bytes"),
             ValueDomain::ExportDestinations(maximum, name, tenants) => format!("at most {maximum} named destinations; each has a lowercase `name` of at most {name} bytes, a nonzero 16-byte lowercase hexadecimal `identity`, and one to {tenants} unique canonical `allowed_tenants`"),
             ValueDomain::TrustedProxyCidrs(maximum, maximum_bytes) => format!("at most {maximum} literal IPv4 or IPv6 CIDRs, each at most {maximum_bytes} bytes; forwarded headers remain ignored unless this list and the matching nonzero fixed hop count are both configured"),
+            ValueDomain::CorsAllowedOrigins(maximum, maximum_bytes) => format!("at most {maximum} exact `http` or `https` origins, each at most {maximum_bytes} bytes; CORS is disabled when the list is empty and never enables credential forwarding"),
         },
     }
 }

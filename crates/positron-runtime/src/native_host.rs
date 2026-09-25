@@ -29,6 +29,7 @@ use crate::{
 
 mod api_http;
 mod connection_admission;
+mod cors;
 mod generation;
 mod h2_observer;
 mod loki_http;
@@ -137,6 +138,7 @@ pub struct NativeBindings {
     otlp_http_protection: ConnectionProtection,
     loki_push_protection: ConnectionProtection,
     api_http2_profile: Option<Http2Profile>,
+    api_cors_allowed_origins: Vec<String>,
     otlp_grpc_http2_profile: Option<Http2Profile>,
     operations_trusted_proxy: Option<TrustedProxy>,
     api_trusted_proxy: Option<TrustedProxy>,
@@ -185,6 +187,7 @@ impl NativeBindings {
         bindings.loki_push_protection = loki_push.4;
         bindings.api_http2_profile = api.5;
         bindings.otlp_grpc_http2_profile = otlp_grpc.5;
+        bindings.api_cors_allowed_origins = api.6;
         Ok(bindings)
     }
 
@@ -316,6 +319,7 @@ impl NativeBindings {
             otlp_http_protection: default_connection_protection(),
             loki_push_protection: default_connection_protection(),
             api_http2_profile: compiled_http2_profile(NetworkListenerRole::Api)?,
+            api_cors_allowed_origins: Vec::new(),
             otlp_grpc_http2_profile: compiled_http2_profile(NetworkListenerRole::OtlpGrpc)?,
             operations_trusted_proxy: None,
             api_trusted_proxy: None,
@@ -405,6 +409,14 @@ impl NativeBindings {
             _ => None,
         }
     }
+
+    fn cors_allowed_origins(&self, role: ListenerRole) -> Vec<String> {
+        if role == ListenerRole::Api {
+            self.api_cors_allowed_origins.clone()
+        } else {
+            Vec::new()
+        }
+    }
 }
 
 fn compiled_http2_profile(
@@ -457,6 +469,7 @@ type EffectiveNativeProfile = (
     (NonZeroU16, NonZeroU16),
     ConnectionProtection,
     Option<Http2Profile>,
+    Vec<String>,
 );
 
 fn effective_profile(
@@ -503,6 +516,9 @@ fn effective_profile(
             profile.connection_protection().idle_deadline(),
         ),
         profile.http2_profile(),
+        profile
+            .cors_allowed_origins()
+            .map_or_else(Vec::new, ToOwned::to_owned),
     ))
 }
 
@@ -647,6 +663,7 @@ struct Admission {
     connection_admission: Option<Arc<connection_admission::ConnectionAdmission>>,
     connection_protection: Option<ConnectionProtection>,
     http2_profile: Option<Http2Profile>,
+    cors_allowed_origins: Vec<String>,
 }
 
 type AdmissionRegistry = Arc<Mutex<Vec<(ListenerRole, Arc<Admission>)>>>;
@@ -937,6 +954,7 @@ impl ListenerFactory for NativeHost {
             connection_admission,
             connection_protection,
             http2_profile: self.bindings.http2_profile(role),
+            cors_allowed_origins: self.bindings.cors_allowed_origins(role),
         });
         self.admissions
             .lock()
@@ -1501,6 +1519,7 @@ mod listener_generation_tests {
             connection_admission: None,
             connection_protection: None,
             http2_profile: None,
+            cors_allowed_origins: Vec::new(),
         });
         let gate = Arc::new(ActivationGate::new());
         let cancellation = crate::TaskCancellation::new();
@@ -1536,6 +1555,7 @@ mod listener_generation_tests {
             connection_admission: None,
             connection_protection: None,
             http2_profile: None,
+            cors_allowed_origins: Vec::new(),
         };
         let cancellation = crate::TaskCancellation::new();
         admission.stop();
@@ -1702,6 +1722,7 @@ fn serve_http(
                 };
                 let connection_protection = admission.connection_protection();
                 let http2_profile = admission.http2_profile;
+                let cors_allowed_origins = admission.cors_allowed_origins.clone();
                 let stream_configured = if admission.role == ListenerRole::Api {
                     stream.set_nonblocking(true).is_ok()
                 } else {
@@ -1743,6 +1764,7 @@ fn serve_http(
                                     services: connection_services,
                                     protection: connection_protection,
                                     http2_profile,
+                                    cors_allowed_origins,
                                 },
                             );
                         } else if let Some(profile) = transport {

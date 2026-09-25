@@ -252,6 +252,7 @@ pub enum FailureSource {
     ListenerApiHttp2MaxFrameBytes,
     ListenerApiHttp2MaxHeaderListBytes,
     ListenerApiHttp2MinimumPingIntervalSeconds,
+    ListenerApiCorsAllowedOrigins,
     ListenerApiTrustedProxyCidrs,
     ListenerApiForwardedHops,
     ListenerApiTlsCertificateFile,
@@ -386,6 +387,7 @@ impl FailureSource {
             Self::ListenerApiHttp2MinimumPingIntervalSeconds => {
                 "listener.api_http2_minimum_ping_interval_seconds"
             },
+            Self::ListenerApiCorsAllowedOrigins => "listener.api.cors_allowed_origins",
             Self::ListenerApiTrustedProxyCidrs => "listener.api.trusted_proxy_cidrs",
             Self::ListenerApiForwardedHops => "listener.api.forwarded_hops",
             Self::ListenerApiTlsCertificateFile => "listener.api_tls_certificate_file",

@@ -185,7 +185,7 @@ pub fn setting_for_path(path: &str) -> Option<Setting> {
 
 /// Returns the complete canonical contract in deterministic declaration order.
 #[must_use]
-pub const fn setting_definitions() -> [SettingDefinition; 97] {
+pub const fn setting_definitions() -> [SettingDefinition; 98] {
     contract::SETTING_DEFINITIONS
 }
 
@@ -215,6 +215,7 @@ struct Candidate {
     api_per_address_accepted_socket_limit: NonZeroU16,
     api_connection_protection: ConnectionProtectionProfile,
     api_http2_profile: Http2Profile,
+    api_cors_allowed_origins: Vec<String>,
     api_trusted_proxy_cidrs: Vec<String>,
     api_forwarded_hops: Option<NonZeroU8>,
     api_tls_certificate_file: ProtectedFileReference,
@@ -255,7 +256,7 @@ struct Candidate {
     secrets_directory: String,
     local_key_file: ProtectedFileReference,
     export_destinations: Vec<ExportDestinationDefinition>,
-    sources: [SettingSource; 97],
+    sources: [SettingSource; 98],
 }
 
 impl Candidate {
@@ -340,6 +341,7 @@ impl Candidate {
                     .default_value(),
                 Setting::ListenerApiPerAddressAcceptedSocketLimit,
             )?,
+            api_cors_allowed_origins: Vec::new(),
             api_trusted_proxy_cidrs: Vec::new(),
             api_forwarded_hops: None,
             api_connection_protection: default_connection_protection([
@@ -498,7 +500,7 @@ impl Candidate {
                 Setting::SecurityLocalKeyFile,
             )?,
             export_destinations: Vec::new(),
-            sources: [SettingSource::CompiledDefault; 97],
+            sources: [SettingSource::CompiledDefault; 98],
         })
     }
 
@@ -852,7 +854,8 @@ impl Candidate {
             Setting::SecurityLocalKeyFile => {
                 self.local_key_file = ProtectedFileReference::parse(value, setting)?
             },
-            Setting::ListenerOperationsTrustedProxyCidrs
+            Setting::ListenerApiCorsAllowedOrigins
+            | Setting::ListenerOperationsTrustedProxyCidrs
             | Setting::ListenerApiTrustedProxyCidrs
             | Setting::ListenerOtlpGrpcTrustedProxyCidrs
             | Setting::ListenerOtlpHttpTrustedProxyCidrs
@@ -896,6 +899,24 @@ impl Candidate {
         };
         *destination = cidrs;
         let Some(entry) = self.sources.get_mut(setting_index(setting)) else {
+            return Err(ConfigurationFailure::new(
+                ConfigurationFailureCode::Malformed,
+                FailureSource::ConfigurationDocument,
+            ));
+        };
+        *entry = SettingSource::ConfigurationFile;
+        Ok(())
+    }
+
+    fn apply_cors_allowed_origins(
+        &mut self,
+        origins: Vec<String>,
+    ) -> Result<(), ConfigurationFailure> {
+        self.api_cors_allowed_origins = origins;
+        let Some(entry) = self
+            .sources
+            .get_mut(setting_index(Setting::ListenerApiCorsAllowedOrigins))
+        else {
             return Err(ConfigurationFailure::new(
                 ConfigurationFailureCode::Malformed,
                 FailureSource::ConfigurationDocument,
@@ -1006,6 +1027,7 @@ impl Candidate {
             api_transport: self.api_transport,
             api_accepted_socket_limit: self.api_accepted_socket_limit,
             api_per_address_accepted_socket_limit: self.api_per_address_accepted_socket_limit,
+            api_cors_allowed_origins: self.api_cors_allowed_origins,
             api_trusted_proxy_cidrs: self.api_trusted_proxy_cidrs,
             api_forwarded_hops: self.api_forwarded_hops,
             api_connection_protection: self.api_connection_protection,
@@ -1344,6 +1366,114 @@ fn parse_trusted_proxy_cidrs(
     Ok(cidrs)
 }
 
+fn parse_cors_allowed_origins(
+    values: &[toml::Value],
+    setting: Setting,
+) -> Result<Vec<String>, ConfigurationFailure> {
+    let ValueDomain::CorsAllowedOrigins(maximum_entries, maximum_entry_bytes) =
+        setting_definition(setting).domain()
+    else {
+        return Err(ConfigurationFailure::new(
+            ConfigurationFailureCode::Malformed,
+            failure_source(setting),
+        ));
+    };
+    if values.len() > maximum_entries {
+        return Err(ConfigurationFailure::unsupported_value(failure_source(
+            setting,
+        )));
+    }
+    let mut origins = Vec::with_capacity(values.len());
+    for value in values {
+        let toml::Value::String(value) = value else {
+            return Err(ConfigurationFailure::unsupported_value(failure_source(
+                setting,
+            )));
+        };
+        validate_cors_allowed_origin(value, maximum_entry_bytes, setting)?;
+        if origins.iter().any(|configured| configured == value) {
+            return Err(ConfigurationFailure::new(
+                ConfigurationFailureCode::ConflictingSetting,
+                failure_source(setting),
+            ));
+        }
+        origins.push(value.clone());
+    }
+    Ok(origins)
+}
+
+fn validate_cors_allowed_origin(
+    value: &str,
+    maximum_bytes: usize,
+    setting: Setting,
+) -> Result<(), ConfigurationFailure> {
+    let invalid = || ConfigurationFailure::unsupported_value(failure_source(setting));
+    if value.is_empty()
+        || value.len() > maximum_bytes
+        || value
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+        || value.contains('*')
+        || value.eq_ignore_ascii_case("null")
+    {
+        return Err(invalid());
+    }
+    let (scheme, authority) = value.split_once("://").ok_or_else(invalid)?;
+    if !matches!(scheme, "http" | "https")
+        || authority.is_empty()
+        || authority.contains(['/', '?', '#', '@'])
+        || authority.bytes().any(|byte| !byte.is_ascii())
+    {
+        return Err(invalid());
+    }
+    let host = if authority.starts_with('[') {
+        let end = authority.find(']').ok_or_else(invalid)?;
+        let suffix = &authority[end + 1..];
+        if end == 1
+            || suffix
+                .strip_prefix(':')
+                .is_some_and(|port| port.contains(':'))
+            || (!suffix.is_empty() && !suffix.starts_with(':'))
+            || suffix
+                .strip_prefix(':')
+                .is_some_and(|port| !canonical_port(port))
+            || authority[1..end]
+                .parse::<std::net::Ipv6Addr>()
+                .map_or(true, |address| address.to_string() != authority[1..end])
+        {
+            return Err(invalid());
+        }
+        &authority[1..end]
+    } else {
+        let (host, port) = authority
+            .rsplit_once(':')
+            .map_or((authority, None), |(host, port)| (host, Some(port)));
+        if host.is_empty()
+            || host.contains(':')
+            || host.bytes().any(|byte| byte.is_ascii_uppercase())
+            || port.is_some_and(|port| !canonical_port(port))
+        {
+            return Err(invalid());
+        }
+        host
+    };
+    if host.is_empty()
+        || !host
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b':'))
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+fn canonical_port(port: &str) -> bool {
+    !port.is_empty()
+        && port.bytes().all(|byte| byte.is_ascii_digit())
+        && (port.len() == 1 || !port.starts_with('0'))
+        && port.parse::<u16>().is_ok()
+}
+
 fn validate_trusted_proxy_cidr(
     value: &str,
     maximum_bytes: usize,
@@ -1558,6 +1688,7 @@ const fn failure_source(setting: Setting) -> FailureSource {
         Setting::ListenerApiHttp2MinimumPingIntervalSeconds => {
             FailureSource::ListenerApiHttp2MinimumPingIntervalSeconds
         },
+        Setting::ListenerApiCorsAllowedOrigins => FailureSource::ListenerApiCorsAllowedOrigins,
         Setting::ListenerApiTrustedProxyCidrs => FailureSource::ListenerApiTrustedProxyCidrs,
         Setting::ListenerApiForwardedHops => FailureSource::ListenerApiForwardedHops,
         Setting::ListenerApiTlsCertificateFile => FailureSource::ListenerApiTlsCertificateFile,

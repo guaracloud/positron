@@ -205,6 +205,23 @@ fn generated_schema_covers_every_canonical_setting_with_its_declared_constraints
                     Some("literal-ip-cidr")
                 );
             },
+            ValueDomain::CorsAllowedOrigins(maximum, maximum_entry_bytes) => {
+                assert_eq!(
+                    property.get("type").and_then(serde_json::Value::as_str),
+                    Some("array")
+                );
+                assert_eq!(
+                    property.get("maxItems").and_then(serde_json::Value::as_u64),
+                    Some(maximum as u64)
+                );
+                assert_eq!(
+                    property
+                        .get("items")
+                        .and_then(|items| items.get("maxLength"))
+                        .and_then(serde_json::Value::as_u64),
+                    Some(maximum_entry_bytes as u64)
+                );
+            },
         }
         assert_eq!(
             property

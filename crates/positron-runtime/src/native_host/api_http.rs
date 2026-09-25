@@ -15,6 +15,7 @@ use tokio::io::ReadBuf;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsAcceptor;
 
+use super::cors;
 use super::h2_observer::H2Observer;
 use super::native_http::{self, Response as NativeResponse};
 use super::{
@@ -36,6 +37,7 @@ pub(super) struct ConnectionContext {
     pub(super) services: Option<ServiceHandle>,
     pub(super) protection: ConnectionProtection,
     pub(super) http2_profile: Option<positron_config::Http2Profile>,
+    pub(super) cors_allowed_origins: Vec<String>,
 }
 
 pub(super) fn serve_connection(
@@ -87,6 +89,7 @@ where
         services,
         protection,
         http2_profile,
+        cors_allowed_origins,
         ..
     } = context;
     let stream = IdleIo::new(stream, protection.idle_deadline());
@@ -144,6 +147,7 @@ where
             let trusted_proxy = trusted_proxy.clone();
             let health = health.clone();
             let services = services.clone();
+            let cors_allowed_origins = cors_allowed_origins.clone();
             let protection = protection;
             async move {
                 Ok::<_, Infallible>(
@@ -156,6 +160,7 @@ where
                             &health,
                             services.as_ref(),
                             protection,
+                            &cors_allowed_origins,
                         ),
                     )
                     .await
@@ -336,8 +341,17 @@ async fn route_request(
     health: &HealthState,
     services: Option<&ServiceHandle>,
     protection: ConnectionProtection,
+    cors_allowed_origins: &[String],
 ) -> Response<ApiResponseBody> {
     let (parts, body) = request.into_parts();
+    if let Some(response) = cors::preflight(
+        &parts.method,
+        parts.uri.path(),
+        &parts.headers,
+        cors_allowed_origins,
+    ) {
+        return response;
+    }
     let body_limit = native_http::api_body_limit(
         parts.method.as_str(),
         parts
@@ -365,7 +379,9 @@ async fn route_request(
             Err(response) => response,
         },
     };
-    response_from_native(response)
+    let mut response = response_from_native(response);
+    cors::decorate(&mut response, &parts.headers, cors_allowed_origins);
+    response
 }
 
 pub(super) struct IdleIo<I> {
@@ -502,7 +518,7 @@ fn response_from_native(response: NativeResponse) -> Response<ApiResponseBody> {
     result
 }
 
-struct ApiResponseBody {
+pub(super) struct ApiResponseBody {
     data: Option<Bytes>,
 }
 
@@ -511,6 +527,10 @@ impl ApiResponseBody {
         Self {
             data: Some(Bytes::copy_from_slice(data)),
         }
+    }
+
+    pub(super) const fn empty() -> Self {
+        Self { data: None }
     }
 }
 

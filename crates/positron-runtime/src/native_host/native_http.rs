@@ -22,6 +22,10 @@ pub(super) fn api_body_limit(method: &str, path: &str) -> usize {
     dispatch::api_body_limit(method, path)
 }
 
+pub(super) fn api_supports(method: &str, path: &str) -> bool {
+    dispatch::api_supports(method, path)
+}
+
 pub(super) fn route_buffered_api(
     head: RequestHead,
     body: Vec<u8>,

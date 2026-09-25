@@ -338,6 +338,10 @@ fn apply_toml_value(
             let cidrs = parse_trusted_proxy_cidrs(values, setting)?;
             candidate.apply_trusted_proxy_cidrs(setting, cidrs)
         },
+        (SettingKind::CorsAllowedOrigins, toml::Value::Array(values)) => {
+            let origins = parse_cors_allowed_origins(values, setting)?;
+            candidate.apply_cors_allowed_origins(origins)
+        },
         (SettingKind::ExportDestinations, _) => Err(ConfigurationFailure::new(
             ConfigurationFailureCode::Malformed,
             FailureSource::ExportDestinations,
