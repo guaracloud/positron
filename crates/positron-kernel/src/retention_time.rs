@@ -100,7 +100,7 @@ impl LifecycleClockStatus {
 }
 
 #[derive(Clone, Copy)]
-struct LifecycleClockSafety {
+pub(crate) struct LifecycleClockSafety {
     anchor: UnixNanoseconds,
     anchor_elapsed: u64,
     state: LifecycleClockState,
@@ -305,7 +305,10 @@ impl RetentionTimeAuthority {
             .safety
             .lock()
             .map_err(|_| LifecycleClockFailure::Unavailable)?;
-        safety.anchor = safety.anchor.max(record.anchor);
+        // The durable anchor is the comparison baseline. A newly observed wall
+        // value must never replace it before reconciliation: doing so would
+        // turn a restart-time forward jump into a zero offset.
+        safety.anchor = record.anchor;
         safety.anchor_elapsed = elapsed;
         safety.last_wall_clock = record.last_wall_clock;
         safety.observed_offset_nanoseconds = record.observed_offset_nanoseconds;
@@ -318,8 +321,6 @@ impl RetentionTimeAuthority {
         &self,
         observed: IngestTime,
     ) -> Result<Vec<u8>, LifecycleClockFailure> {
-        let elapsed = self.elapsed.nanoseconds()?;
-        self.reconcile(observed.instant(), elapsed)?;
         let safety = self
             .safety
             .lock()
@@ -328,6 +329,19 @@ impl RetentionTimeAuthority {
             anchor: safety.anchor.max(observed.instant()),
             ..*safety
         })
+    }
+
+    pub(crate) fn destructive_ingest_time(
+        &self,
+        scope: SegmentScope,
+        durable: Option<IngestTime>,
+    ) -> Result<IngestTime, LifecycleClockFailure> {
+        let ingest = self.ingest_time(scope, durable)?;
+        if self.authorizes_destructive_retention() {
+            Ok(ingest)
+        } else {
+            Err(LifecycleClockFailure::ClockUncertain)
+        }
     }
 
     #[must_use]
@@ -649,5 +663,27 @@ mod clock_safety_tests {
         assert!(clock.ingest_time(scope, None).is_ok());
         assert_eq!(clock.status().state(), LifecycleClockState::ClockUncertain);
         assert!(!clock.authorizes_destructive_retention());
+    }
+
+    #[test]
+    fn restart_forward_jump_compares_wall_clock_with_the_durable_anchor() {
+        let wall = Arc::new(Mutex::new(UnixNanoseconds::new(2_000)));
+        let (clock, _) = RetentionTimeAuthority::establish_with_source_and_manual_elapsed(
+            MutableWallClock(Arc::clone(&wall)),
+            LifecycleClockPolicy::new(10).expect("bounded policy"),
+        )
+        .expect("clock establishes");
+        {
+            let mut safety = clock.safety.lock().expect("safety lock");
+            safety.anchor = UnixNanoseconds::new(1_000);
+            safety.anchor_elapsed = 0;
+        }
+
+        clock
+            .reconcile(UnixNanoseconds::new(1_000), 0)
+            .expect("restart observation");
+
+        assert_eq!(clock.status().state(), LifecycleClockState::ClockUncertain);
+        assert_eq!(clock.status().safe_anchor(), UnixNanoseconds::new(1_000));
     }
 }

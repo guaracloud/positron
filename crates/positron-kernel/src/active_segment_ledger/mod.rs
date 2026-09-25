@@ -221,6 +221,7 @@ fn map_retention_time_failure(failure: crate::LifecycleClockFailure) -> LedgerFa
     let code = match failure {
         crate::LifecycleClockFailure::Unavailable => LedgerFailureCode::StorageUnavailable,
         crate::LifecycleClockFailure::OutOfRange => LedgerFailureCode::LimitExceeded,
+        crate::LifecycleClockFailure::ClockUncertain => LedgerFailureCode::ClockUncertain,
     };
     LedgerFailure::new(code)
 }
@@ -634,9 +635,6 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         let retention_time = self
             .retention_time
             .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::UnsupportedFormat))?;
-        if !retention_time.authorizes_destructive_retention() {
-            return Err(LedgerFailure::new(LedgerFailureCode::ClockUncertain));
-        }
         self.catalog.refresh_state()?;
         let basis = self.catalog.pin()?;
         let state = self
@@ -682,7 +680,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             return Err(LedgerFailure::new(LedgerFailureCode::PhysicalScopeMismatch));
         }
         let frontier = retention_time
-            .ingest_time(self.scope, state.retention_frontier)
+            .destructive_ingest_time(self.scope, state.retention_frontier)
             .map_err(map_retention_time_failure)?;
         let duration_nanos = policy
             .retention_seconds()
