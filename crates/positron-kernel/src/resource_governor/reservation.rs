@@ -132,6 +132,7 @@ impl<'authority> ResourceReservation<'authority> {
                 ReservationIdentity::Ordinary {
                     tenant: reserved_tenant,
                     kind: WorkKind::Ingest,
+                    ..
                 } if reserved_tenant == tenant
             )
             && self.amounts.get(ResourceDimension::MemoryBytes) >= memory_bytes
@@ -148,6 +149,7 @@ impl<'authority> ResourceReservation<'authority> {
             ReservationIdentity::Ordinary {
                 tenant: reserved_tenant,
                 kind: WorkKind::Ingest,
+                ..
             } => reserved_tenant == tenant,
             ReservationIdentity::Recovery {
                 scope: RecoveryScope::Tenant(reserved_tenant),

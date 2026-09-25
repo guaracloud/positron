@@ -68,8 +68,13 @@ pub fn reserve_log_receiver_transport<'authority>(
     governor: ResourceGovernor<'authority>,
 ) -> Result<ResourceReservation<'authority>, ReceiveFailure> {
     let attribution = ingest_attribution(context)?;
-    let claim = WorkClaim::tenant(attribution.tenant_id(), WorkKind::Ingest, RECEIVER_CAPACITY)
-        .map_err(|_| ReceiveFailure::CapacityUnavailable)?;
+    let claim = WorkClaim::authenticated(
+        attribution.tenant_id(),
+        context.principal_id(),
+        WorkKind::Ingest,
+        RECEIVER_CAPACITY,
+    )
+    .map_err(|_| ReceiveFailure::CapacityUnavailable)?;
     governor
         .reserve(claim)
         .map_err(|_| ReceiveFailure::CapacityUnavailable)

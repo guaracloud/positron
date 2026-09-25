@@ -7,9 +7,9 @@ use positron_domain::identity::TenantId;
 use positron_kernel::{
     DiskPressureThresholds, GovernorPolicy, InventoryCardinalityLimits, MountQualification,
     ObservedResourceEnvironment, OperatorLimits, OrdinaryPoolPolicy, PrimaryDataVolume,
-    RecoveryPoolCapacities, RecoveryReserve, RegisteredResourceBounds, ResourceAmounts,
-    ResourceDimension, ResourceGovernorConfiguration, ResourceInventory, RetentionTimeAuthority,
-    StorageKernelResourceAuthority, TenantQuota,
+    PrincipalQuota, RecoveryPoolCapacities, RecoveryReserve, RegisteredResourceBounds,
+    ResourceAmounts, ResourceDimension, ResourceGovernorConfiguration, ResourceInventory,
+    RetentionTimeAuthority, StorageKernelResourceAuthority, TenantQuota,
 };
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
@@ -67,6 +67,18 @@ pub struct Fixture {
 }
 
 pub fn fixture(tenant: TenantId) -> Result<Fixture, Box<dyn Error>> {
+    fixture_with_ordinary_capacity(
+        tenant,
+        ResourceAmounts::new([
+            8_000_000, 32, 32, 5_000_000, 2_048, 32, 32, 32, 800, 32, 2_000_000,
+        ]),
+    )
+}
+
+pub fn fixture_with_ordinary_capacity(
+    tenant: TenantId,
+    ordinary_capacity: ResourceAmounts,
+) -> Result<Fixture, Box<dyn Error>> {
     let root = TemporaryKernelRoot::new()?;
     let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
     let cardinality = InventoryCardinalityLimits::new(1, 16)?;
@@ -80,9 +92,6 @@ pub fn fixture(tenant: TenantId) -> Result<Fixture, Box<dyn Error>> {
     let small = uniform(2);
     let durability = add(add(large, large)?, large)?;
     let recovery_capacity = add(add(add(durability, large)?, large)?, uniform(12))?;
-    let ordinary_capacity = ResourceAmounts::new([
-        8_000_000, 32, 32, 5_000_000, 2_048, 32, 32, 32, 800, 32, 2_000_000,
-    ]);
     let governed = add(recovery_capacity, ordinary_capacity)?;
     let raw = add(governed, cardinality.governor_bootstrap_overhead(1)?)?;
     let disk = observed.initial_disk().usable_bytes();
@@ -101,7 +110,12 @@ pub fn fixture(tenant: TenantId) -> Result<Fixture, Box<dyn Error>> {
     let policy = GovernorPolicy::new(
         [TenantQuota::new(tenant, 1, ordinary_capacity)?],
         OrdinaryPoolPolicy::new(uniform(8), uniform(6), uniform(4), uniform(2))?,
-    )?;
+    )?
+    .with_principal_quota(PrincipalQuota::new(
+        4,
+        ordinary_capacity,
+        ordinary_capacity,
+    )?);
     let recovery =
         RecoveryPoolCapacities::new(durability, small, small, small, large, small, small)?;
     let configuration = ResourceGovernorConfiguration::new(inventory, policy, recovery)?;

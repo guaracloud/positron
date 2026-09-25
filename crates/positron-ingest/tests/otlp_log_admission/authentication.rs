@@ -6,10 +6,10 @@ use positron_ingest::{
     AuthenticatedOtlpLogsRequest, OtlpLogsReceiver, OtlpLogsRequestEncoding, PolicyReceiver,
     ReceiveFailure,
 };
-use positron_kernel::MountQualification;
+use positron_kernel::{MountQualification, ResourceAmounts};
 use positron_runtime::{BootstrapPaths, InitializationPlan, InstanceBootstrap};
 
-use super::support::temporary_roots;
+use super::support::{fixture_with_ordinary_capacity, temporary_roots};
 
 #[test]
 fn bearer_authentication_precedes_malformed_gzip_and_protobuf() -> Result<(), Box<dyn Error>> {
@@ -67,6 +67,54 @@ fn bearer_authentication_precedes_malformed_gzip_and_protobuf() -> Result<(), Bo
         ReceiveFailure::MalformedCompression,
     );
     assert_eq!(governor.inspect()?.outstanding_reservations(), 0);
+    Ok(())
+}
+
+#[test]
+fn authenticated_transport_principal_limit_releases_after_request_drop()
+-> Result<(), Box<dyn Error>> {
+    let roots = temporary_roots()?;
+    let paths = BootstrapPaths::new(
+        &roots.data(),
+        &roots.secrets(),
+        MountQualification::LocalHost,
+    )?;
+    InstanceBootstrap::initialize(&paths, InitializationPlan::non_interactive())?;
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    let context = instance.attribute(
+        PresentedCredential::parse(claim.ingest_secret().ok_or("ingest credential")?)?,
+        RequestedIntent::Ingest,
+        CompatibilityHints::none(),
+    )?;
+    let fixture = fixture_with_ordinary_capacity(
+        instance.default_tenant_id(),
+        ResourceAmounts::new([
+            32_000_000, 32, 32, 5_000_000, 5_000, 32, 32, 32, 800, 32, 2_000_000,
+        ]),
+    )?;
+    let governor = fixture.authority.governor();
+
+    let mut requests = Vec::new();
+    for _ in 0..4 {
+        requests.push(AuthenticatedOtlpLogsRequest::otlp_grpc_protobuf(
+            context,
+            governor,
+            Vec::new(),
+        )?);
+    }
+    assert_eq!(
+        AuthenticatedOtlpLogsRequest::otlp_grpc_protobuf(context, governor, Vec::new()).err(),
+        Some(ReceiveFailure::CapacityUnavailable)
+    );
+    drop(
+        requests
+            .pop()
+            .ok_or("principal retains a transport reservation")?,
+    );
+    let replacement =
+        AuthenticatedOtlpLogsRequest::otlp_grpc_protobuf(context, governor, Vec::new())?;
+    drop((requests, replacement));
     Ok(())
 }
 

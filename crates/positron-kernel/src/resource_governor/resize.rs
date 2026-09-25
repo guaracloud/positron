@@ -29,7 +29,7 @@ pub(super) struct ResizeRequest {
 impl GovernorInner {
     pub(super) fn resize(&self, request: ResizeRequest) -> Result<ResizeCommit, ResizeFailure> {
         match request.identity {
-            ReservationIdentity::Ordinary { tenant, kind } => {
+            ReservationIdentity::Ordinary { tenant, kind, .. } => {
                 let class = kind.class();
                 let ChargeAttribution::Ordinary { tenant_index } = request.owner.attribution else {
                     return Err(retained_resize(class, self.pressure_for_failure()));
@@ -113,6 +113,11 @@ impl GovernorInner {
             return Err(fence_resize(state, class));
         };
 
+        let principal = match identity {
+            ReservationIdentity::Ordinary { principal, .. } => principal,
+            ReservationIdentity::Recovery { .. } => None,
+        };
+
         let planned = if new.is_at_most(old) {
             // This is the sole `shrink_to` call site, so the helper can focus
             // on preserving the existing pool attribution exactly.
@@ -123,6 +128,14 @@ impl GovernorInner {
                 )
             })
         } else {
+            let principal_limit = self.refuse_principal_resize_limit(
+                state,
+                tenant_index,
+                principal,
+                slot,
+                class,
+                new,
+            );
             let live_disk = if new.get(ResourceDimension::DiskHeadroomBytes)
                 > old.get(ResourceDimension::DiskHeadroomBytes)
             {
@@ -136,7 +149,8 @@ impl GovernorInner {
             } else {
                 Ok(())
             };
-            live_disk
+            principal_limit
+                .and(live_disk)
                 .and_then(|()| {
                     let recovery_shared_usage = state
                         .recovery_tenant_pool_usage

@@ -106,6 +106,57 @@ impl OrdinaryPoolPolicy {
 pub struct GovernorPolicy {
     pub(super) tenant_quotas: Box<[TenantQuota]>,
     pub(super) pools: OrdinaryPoolPolicy,
+    pub(super) principal_quota: Option<PrincipalQuota>,
+}
+
+/// Fixed aggregate resource ceiling for one authenticated Principal.
+///
+/// This policy is intentionally distinct from tenant quota: it bounds one
+/// authenticated Principal's live operation grants while the tenant remains
+/// responsible for the aggregate of every Principal below it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PrincipalQuota {
+    maximum_operations: u32,
+    per_operation_limits: ResourceAmounts,
+    aggregate_limits: ResourceAmounts,
+}
+
+impl PrincipalQuota {
+    /// Establishes bounded resources for one authenticated principal.
+    ///
+    /// `per_operation_limits` constrains each live claim. `aggregate_limits`
+    /// constrains their sum, so concurrent small operations cannot bypass the
+    /// individual-operation ceiling.
+    pub fn new(
+        maximum_operations: u32,
+        per_operation_limits: ResourceAmounts,
+        aggregate_limits: ResourceAmounts,
+    ) -> Result<Self, GovernorFailure> {
+        if maximum_operations == 0
+            || per_operation_limits.is_empty()
+            || aggregate_limits.is_empty()
+            || !per_operation_limits.is_at_most(aggregate_limits)
+        {
+            return Err(GovernorFailure::InvalidConfiguration);
+        }
+        Ok(Self {
+            maximum_operations,
+            per_operation_limits,
+            aggregate_limits,
+        })
+    }
+
+    pub(super) const fn maximum_operations(self) -> u32 {
+        self.maximum_operations
+    }
+
+    pub(super) const fn per_operation_limits(self) -> ResourceAmounts {
+        self.per_operation_limits
+    }
+
+    pub(super) const fn aggregate_limits(self) -> ResourceAmounts {
+        self.aggregate_limits
+    }
 }
 
 impl GovernorPolicy {
@@ -147,7 +198,15 @@ impl GovernorPolicy {
         Ok(Self {
             tenant_quotas: into_boxed_exact(tenant_quotas, required)?,
             pools,
+            principal_quota: None,
         })
+    }
+
+    /// Enables a finite authenticated-Principal quota for this authority.
+    #[must_use]
+    pub fn with_principal_quota(mut self, quota: PrincipalQuota) -> Self {
+        self.principal_quota = Some(quota);
+        self
     }
 
     #[cfg(test)]

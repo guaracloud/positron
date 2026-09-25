@@ -201,6 +201,7 @@ const fn observation_for(
     let [
         capacity,
         quota,
+        principal,
         unregistered,
         outstanding,
         protected,
@@ -216,6 +217,7 @@ const fn observation_for(
     match reason {
         AdmissionFailureCode::CapacityExhausted => capacity,
         AdmissionFailureCode::TenantQuotaExceeded => quota,
+        AdmissionFailureCode::PrincipalQuotaExceeded => principal,
         AdmissionFailureCode::UnregisteredTenant => unregistered,
         AdmissionFailureCode::OutstandingReservationLimit => outstanding,
         AdmissionFailureCode::ProtectedCapacityUnavailable => protected,

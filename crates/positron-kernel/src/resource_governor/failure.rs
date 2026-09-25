@@ -74,6 +74,7 @@ impl Error for GovernorFailure {}
 pub enum AdmissionFailureCode {
     CapacityExhausted,
     TenantQuotaExceeded,
+    PrincipalQuotaExceeded,
     UnregisteredTenant,
     OutstandingReservationLimit,
     ProtectedCapacityUnavailable,
@@ -88,23 +89,24 @@ pub enum AdmissionFailureCode {
 }
 
 impl AdmissionFailureCode {
-    pub(super) const COUNT: usize = 13;
+    pub(super) const COUNT: usize = 14;
 
     pub(super) const fn index(self) -> usize {
         match self {
             Self::CapacityExhausted => 0,
             Self::TenantQuotaExceeded => 1,
-            Self::UnregisteredTenant => 2,
-            Self::OutstandingReservationLimit => 3,
-            Self::ProtectedCapacityUnavailable => 4,
-            Self::ClassCapacityUnavailable => 5,
-            Self::TenantFairShareExceeded => 6,
-            Self::CapacityOccupiedByRecovery => 7,
-            Self::DiskPressureAdmissionRefused => 8,
-            Self::RecoveryReserveExhausted => 9,
-            Self::ShuttingDown => 10,
-            Self::InternalFenced => 11,
-            Self::GovernorContended => 12,
+            Self::PrincipalQuotaExceeded => 2,
+            Self::UnregisteredTenant => 3,
+            Self::OutstandingReservationLimit => 4,
+            Self::ProtectedCapacityUnavailable => 5,
+            Self::ClassCapacityUnavailable => 6,
+            Self::TenantFairShareExceeded => 7,
+            Self::CapacityOccupiedByRecovery => 8,
+            Self::DiskPressureAdmissionRefused => 9,
+            Self::RecoveryReserveExhausted => 10,
+            Self::ShuttingDown => 11,
+            Self::InternalFenced => 12,
+            Self::GovernorContended => 13,
         }
     }
 
@@ -112,17 +114,18 @@ impl AdmissionFailureCode {
         Some(match index {
             0 => Self::CapacityExhausted,
             1 => Self::TenantQuotaExceeded,
-            2 => Self::UnregisteredTenant,
-            3 => Self::OutstandingReservationLimit,
-            4 => Self::ProtectedCapacityUnavailable,
-            5 => Self::ClassCapacityUnavailable,
-            6 => Self::TenantFairShareExceeded,
-            7 => Self::CapacityOccupiedByRecovery,
-            8 => Self::DiskPressureAdmissionRefused,
-            9 => Self::RecoveryReserveExhausted,
-            10 => Self::ShuttingDown,
-            11 => Self::InternalFenced,
-            12 => Self::GovernorContended,
+            2 => Self::PrincipalQuotaExceeded,
+            3 => Self::UnregisteredTenant,
+            4 => Self::OutstandingReservationLimit,
+            5 => Self::ProtectedCapacityUnavailable,
+            6 => Self::ClassCapacityUnavailable,
+            7 => Self::TenantFairShareExceeded,
+            8 => Self::CapacityOccupiedByRecovery,
+            9 => Self::DiskPressureAdmissionRefused,
+            10 => Self::RecoveryReserveExhausted,
+            11 => Self::ShuttingDown,
+            12 => Self::InternalFenced,
+            13 => Self::GovernorContended,
             _ => return None,
         })
     }
@@ -149,6 +152,8 @@ pub enum AdmissionRetry {
 pub enum LimitingScope {
     Global,
     Tenant,
+    Principal,
+    Operation,
     RecoveryReserve,
     ProtectedReserve,
     OutstandingReservations,

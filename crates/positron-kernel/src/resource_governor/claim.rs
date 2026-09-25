@@ -1,6 +1,6 @@
 //! Closed work identity and checked admission claims.
 
-use positron_domain::identity::TenantId;
+use positron_domain::identity::{PrincipalId, TenantId};
 
 use super::failure::GovernorFailure;
 use super::model::ResourceAmounts;
@@ -41,6 +41,7 @@ impl WorkKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WorkClaim {
     pub(super) tenant: TenantId,
+    pub(super) principal: Option<PrincipalId>,
     pub(super) kind: WorkKind,
     pub(super) amounts: ResourceAmounts,
 }
@@ -56,6 +57,27 @@ impl WorkClaim {
         }
         Ok(Self {
             tenant,
+            principal: None,
+            kind,
+            amounts,
+        })
+    }
+
+    /// Creates one post-authentication tenant operation attributed to its
+    /// credential Principal. The Governor retains this identity in its fixed
+    /// grant ledger so one Principal cannot consume unbounded concurrent work.
+    pub fn authenticated(
+        tenant: TenantId,
+        principal: PrincipalId,
+        kind: WorkKind,
+        amounts: ResourceAmounts,
+    ) -> Result<Self, GovernorFailure> {
+        if amounts.is_empty() {
+            return Err(GovernorFailure::InvalidConfiguration);
+        }
+        Ok(Self {
+            tenant,
+            principal: Some(principal),
             kind,
             amounts,
         })
@@ -199,6 +221,7 @@ impl RecoveryWorkClaim {
 pub(super) enum ReservationIdentity {
     Ordinary {
         tenant: TenantId,
+        principal: Option<PrincipalId>,
         kind: WorkKind,
     },
     Recovery {

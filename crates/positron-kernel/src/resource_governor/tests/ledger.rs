@@ -5,7 +5,7 @@ use crate::resource_governor::{
 
 #[test]
 fn record_is_compact_and_maximum_ledger_is_bounded() {
-    assert_eq!(record_size_for_test(), 184);
+    assert_eq!(record_size_for_test(), 200);
 }
 
 #[test]
@@ -105,6 +105,7 @@ fn slot_mutations_reject_inactive_corrupt_and_mismatched_records() {
     assert!(!governor.inner.finish_slot(&mut state, u16::MAX));
     let mismatched = ReservationIdentity::Ordinary {
         tenant,
+        principal: None,
         kind: WorkKind::SecurityLifecycle,
     };
     assert!(!governor.inner.replace_slot_record(
@@ -135,6 +136,7 @@ fn unreconstructable_drop_record_fences_without_applying_a_release() {
         amounts: crate::resource_governor::ResourceAmounts::new([1; 11]),
         shared: crate::resource_governor::ResourceAmounts::new([0; 11]),
         tenant_index: SYSTEM_TENANT_INDEX,
+        principal: None,
         kind: GrantKind::Ingest,
     };
     let mut state = governor.inner.state.lock().expect("test lock is healthy");

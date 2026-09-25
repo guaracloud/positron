@@ -1,10 +1,10 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use positron_domain::identity::TenantId;
+use positron_domain::identity::{PrincipalId, TenantId};
 use positron_kernel::{
     DetectedCapacity, DiskObservation, DiskPressureThresholds, GovernorPolicy,
-    InventoryCardinalityLimits, OperatorLimits, OrdinaryPool, OrdinaryPoolPolicy,
+    InventoryCardinalityLimits, OperatorLimits, OrdinaryPool, OrdinaryPoolPolicy, PrincipalQuota,
     RecoveryPoolCapacities, RecoveryReserve, RecoveryWorkClaim, RecoveryWorkKind, ResourceAmounts,
     ResourceDimension, ResourceGovernor, ResourceInventory, ResourceReservation,
     StorageKernelResourceAuthority, TenantQuota, WorkClaim, WorkClass, WorkKind,
@@ -58,7 +58,8 @@ fn establish() -> Option<(StorageKernelResourceAuthority, [TenantId; 2])> {
         ],
         OrdinaryPoolPolicy::new(uniform(20), uniform(15), uniform(10), uniform(5)).ok()?,
     )
-    .ok()?;
+    .ok()?
+    .with_principal_quota(PrincipalQuota::new(4, uniform(20), uniform(40)).ok()?);
     let pools = RecoveryPoolCapacities::new(
         uniform(3),
         uniform(2),
@@ -208,6 +209,7 @@ fn assert_conservation(governor: &ResourceGovernor<'_>, slots: &[Option<Slot<'_>
     let reasons = [
         positron_kernel::AdmissionFailureCode::CapacityExhausted,
         positron_kernel::AdmissionFailureCode::TenantQuotaExceeded,
+        positron_kernel::AdmissionFailureCode::PrincipalQuotaExceeded,
         positron_kernel::AdmissionFailureCode::UnregisteredTenant,
         positron_kernel::AdmissionFailureCode::OutstandingReservationLimit,
         positron_kernel::AdmissionFailureCode::ProtectedCapacityUnavailable,
@@ -250,7 +252,14 @@ fuzz_target!(|data: &[u8]| {
                 let amount = u64::from(command[4] % 20) + 1;
                 let claim =
                     ResourceAmounts::only(dimension(command[3]), amount).and_then(|amounts| {
-                        WorkClaim::tenant(tenants[usize::from(command[2]) % 2], kind, amounts)
+                        WorkClaim::authenticated(
+                            tenants[usize::from(command[2]) % 2],
+                            PrincipalId::from_bytes([command[4] & 1; 16]).map_err(|_| {
+                                positron_kernel::GovernorFailure::InvalidConfiguration
+                            })?,
+                            kind,
+                            amounts,
+                        )
                     });
                 if let Ok(claim) = claim
                     && let Ok(reservation) = governor.reserve(claim)

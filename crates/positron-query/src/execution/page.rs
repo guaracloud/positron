@@ -473,7 +473,13 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         let correlation_reservation = framed!(
             correlations
                 .as_ref()
-                .map(|outcomes| self.reserve_correlation_memory(state.tenant, outcomes.capacity()))
+                .map(|outcomes| {
+                    self.reserve_correlation_memory(
+                        state.tenant,
+                        state.principal,
+                        outcomes.capacity(),
+                    )
+                })
                 .transpose()
         );
         if correlations.is_some() {

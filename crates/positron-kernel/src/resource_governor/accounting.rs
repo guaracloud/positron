@@ -27,7 +27,7 @@ use super::inventory::{DiskObservation, DiskPressureThresholds, TenantQuota};
 use super::ledger::GrantRecord;
 use super::lifecycle::{GovernorLifecycle, class_index, empty_class_counts};
 use super::model::ResourceAmounts;
-use super::policy::{PoolCapacities, PoolCharge};
+use super::policy::{PoolCapacities, PoolCharge, PrincipalQuota};
 use super::recovery_policy::{RecoveryPoolCapacities, RecoveryPoolCharge, RecoveryPoolUsage};
 
 pub(super) struct GovernorInner {
@@ -36,6 +36,7 @@ pub(super) struct GovernorInner {
     pub(super) bootstrap_overhead: ResourceAmounts,
     pub(super) total_ceiling: ResourceAmounts,
     pub(super) ordinary_ceiling: ResourceAmounts,
+    pub(super) principal_quota: Option<PrincipalQuota>,
     pub(super) recovery_reserve: ResourceAmounts,
     pub(super) maximum_outstanding: u32,
     pub(super) pool_capacities: PoolCapacities,
@@ -61,6 +62,7 @@ pub(super) struct GovernorConfiguration {
     bootstrap_overhead: ResourceAmounts,
     total_ceiling: ResourceAmounts,
     ordinary_ceiling: ResourceAmounts,
+    principal_quota: Option<PrincipalQuota>,
     recovery_reserve: ResourceAmounts,
     maximum_outstanding: u32,
     pool_capacities: PoolCapacities,
@@ -77,6 +79,7 @@ pub(super) struct GovernorSetupInput {
     pub(super) bootstrap_overhead: ResourceAmounts,
     pub(super) total_ceiling: ResourceAmounts,
     pub(super) ordinary_ceiling: ResourceAmounts,
+    pub(super) principal_quota: Option<PrincipalQuota>,
     pub(super) tenant_quotas: Box<[TenantQuota]>,
     pub(super) maximum_outstanding: u32,
     pub(super) pool_capacities: PoolCapacities,

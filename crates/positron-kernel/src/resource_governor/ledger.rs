@@ -4,6 +4,8 @@
 use std::mem::size_of;
 use std::sync::atomic::Ordering;
 
+use positron_domain::identity::PrincipalId;
+
 mod allocation;
 mod drop_ledger;
 
@@ -42,6 +44,7 @@ pub(super) struct GrantRecord {
     amounts: ResourceAmounts,
     shared: ResourceAmounts,
     tenant_index: u16,
+    principal: Option<PrincipalId>,
     kind: GrantKind,
 }
 
@@ -51,12 +54,15 @@ impl GrantRecord {
         identity: ReservationIdentity,
         amounts: ResourceAmounts,
     ) -> Option<Self> {
-        let (tenant_index, kind, shared) = match (owner.attribution, identity) {
+        let (tenant_index, principal, kind, shared) = match (owner.attribution, identity) {
             (
                 ChargeAttribution::Ordinary { tenant_index },
-                ReservationIdentity::Ordinary { kind, .. },
+                ReservationIdentity::Ordinary {
+                    principal, kind, ..
+                },
             ) => (
                 u16::try_from(tenant_index).ok()?,
+                principal,
                 GrantKind::from_ordinary(kind),
                 owner.pools?.shared(),
             ),
@@ -69,6 +75,7 @@ impl GrantRecord {
                     .transpose()
                     .ok()?
                     .unwrap_or(SYSTEM_TENANT_INDEX),
+                None,
                 GrantKind::from_recovery(kind),
                 owner.recovery_pools?.shared,
             ),
@@ -78,6 +85,7 @@ impl GrantRecord {
             amounts,
             shared,
             tenant_index,
+            principal,
             kind,
         })
     }
@@ -92,6 +100,10 @@ impl GrantRecord {
         } else {
             Some(self.tenant_index as usize)
         }
+    }
+
+    pub(super) const fn principal(self) -> Option<PrincipalId> {
+        self.principal
     }
 
     pub(super) const fn is_ordinary(self) -> bool {
@@ -143,7 +155,9 @@ impl GrantRecord {
         amounts: ResourceAmounts,
     ) -> Option<Self> {
         let replacement = Self::new(owner, identity, amounts)?;
-        (replacement.kind == self.kind && replacement.tenant_index == self.tenant_index)
+        (replacement.kind == self.kind
+            && replacement.tenant_index == self.tenant_index
+            && replacement.principal == self.principal)
             .then_some(replacement)
     }
 }

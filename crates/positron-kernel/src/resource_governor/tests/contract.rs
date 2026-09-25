@@ -1,10 +1,10 @@
-use positron_domain::identity::TenantId;
+use positron_domain::identity::{PrincipalId, TenantId};
 use positron_kernel::{
     AdmissionFailureCode, DetectedCapacity, DiskObservation, DiskPressureThresholds,
-    GovernorFailure, GovernorPolicy, InventoryCardinalityLimits, MAX_OUTSTANDING_RESERVATIONS,
-    MAX_TENANT_QUOTAS, OperatorLimits, OrdinaryPoolPolicy, RecoveryReserve, ResourceAmounts,
-    ResourceDimension, ResourceGovernorConfiguration, ResourceInventory, TenantQuota, WorkClaim,
-    WorkClass, WorkKind,
+    GovernorFailure, GovernorPolicy, InventoryCardinalityLimits, LimitingScope,
+    MAX_OUTSTANDING_RESERVATIONS, MAX_TENANT_QUOTAS, OperatorLimits, OrdinaryPoolPolicy,
+    PrincipalQuota, RecoveryReserve, ResourceAmounts, ResourceDimension,
+    ResourceGovernorConfiguration, ResourceInventory, TenantQuota, WorkClaim, WorkClass, WorkKind,
 };
 
 fn amounts(memory_bytes: u64) -> ResourceAmounts {
@@ -13,6 +13,10 @@ fn amounts(memory_bytes: u64) -> ResourceAmounts {
 
 fn tenant(byte: u8) -> Result<TenantId, Box<dyn std::error::Error>> {
     Ok(TenantId::from_bytes([byte; 16])?)
+}
+
+fn principal(byte: u8) -> Result<PrincipalId, Box<dyn std::error::Error>> {
+    Ok(PrincipalId::from_bytes([byte; 16])?)
 }
 
 fn pool_policy() -> Result<OrdinaryPoolPolicy, GovernorFailure> {
@@ -33,11 +37,24 @@ fn governor(
     operator: ResourceAmounts,
     quotas: impl IntoIterator<Item = TenantQuota>,
 ) -> Result<TestKernel, Box<dyn std::error::Error>> {
+    governor_with_principal_quota(detected, operator, quotas, None)
+}
+
+fn governor_with_principal_quota(
+    detected: ResourceAmounts,
+    operator: ResourceAmounts,
+    quotas: impl IntoIterator<Item = TenantQuota>,
+    principal_quota: Option<PrincipalQuota>,
+) -> Result<TestKernel, Box<dyn std::error::Error>> {
     let quotas = quotas.into_iter().collect::<Vec<_>>();
     let policy = match quotas.as_slice() {
         [one] => GovernorPolicy::new([*one], pool_policy()?)?,
         [one, two] => GovernorPolicy::new([*one, *two], pool_policy()?)?,
         _ => return Err("test governor requires one or two quotas".into()),
+    };
+    let policy = match principal_quota {
+        Some(quota) => policy.with_principal_quota(quota),
+        None => policy,
     };
     let supported_tenants = 2;
     let reserve_amount =
@@ -95,6 +112,161 @@ fn add_reserve(
         value(ResourceDimension::FileDescriptors)?,
         value(ResourceDimension::DiskHeadroomBytes)?,
     ]))
+}
+
+#[test]
+fn authenticated_principal_admission_is_bounded_and_released()
+-> Result<(), Box<dyn std::error::Error>> {
+    let tenant = tenant(0xa1)?;
+    let first_principal = principal(0xa2)?;
+    let second_principal = principal(0xa3)?;
+    let capacity = amounts(20);
+    let governor = governor_with_principal_quota(
+        capacity,
+        capacity,
+        [TenantQuota::new(tenant, 1, capacity)?],
+        Some(PrincipalQuota::new(4, capacity, capacity)?),
+    )?;
+    let claim = |principal| {
+        WorkClaim::authenticated(
+            tenant,
+            principal,
+            WorkKind::InteractiveQueryTail,
+            ResourceAmounts::only(ResourceDimension::MemoryBytes, 1)?,
+        )
+    };
+
+    let mut first = Vec::new();
+    for _ in 0..4 {
+        first.push(governor.reserve(claim(first_principal)?)?);
+    }
+    first
+        .get_mut(0)
+        .ok_or("first principal retains a grant")?
+        .try_resize(ResourceAmounts::only(ResourceDimension::MemoryBytes, 2)?)?;
+    let refusal = governor
+        .reserve(claim(first_principal)?)
+        .expect_err("one principal reaches the fixed post-auth grant limit");
+    assert_eq!(refusal.code(), AdmissionFailureCode::PrincipalQuotaExceeded);
+    assert_eq!(refusal.limiting_scope(), LimitingScope::Principal);
+    assert_eq!(
+        governor.inspect()?.outstanding_reservations(),
+        4,
+        "a rejected principal claim must not publish a partial charge"
+    );
+
+    let second = governor.reserve(claim(second_principal)?)?;
+    let released = first.pop().ok_or("first principal retains a grant")?;
+    drop(released.transfer());
+    let mut replacement = governor.reserve(claim(first_principal)?)?;
+    assert_eq!(
+        replacement.cancel()?,
+        positron_kernel::ReleaseOutcome::Released
+    );
+    let cancelled_replacement = governor.reserve(claim(first_principal)?)?;
+    drop((first, second, cancelled_replacement));
+    assert_eq!(governor.inspect()?.outstanding_reservations(), 0);
+    Ok(())
+}
+
+#[test]
+fn principal_quota_bounds_each_operation_and_aggregate_on_resize()
+-> Result<(), Box<dyn std::error::Error>> {
+    let tenant = tenant(0xb1)?;
+    let principal = principal(0xb2)?;
+    let capacity = amounts(20);
+    let per_operation = amounts(3);
+    let aggregate = amounts(5);
+    let governor = governor_with_principal_quota(
+        capacity,
+        capacity,
+        [TenantQuota::new(tenant, 1, capacity)?],
+        Some(PrincipalQuota::new(4, per_operation, aggregate)?),
+    )?;
+    let claim = |memory_bytes| {
+        WorkClaim::authenticated(
+            tenant,
+            principal,
+            WorkKind::InteractiveQueryTail,
+            ResourceAmounts::only(ResourceDimension::MemoryBytes, memory_bytes)?,
+        )
+    };
+
+    let mut first = governor.reserve(claim(3)?)?;
+    let operation = governor
+        .reserve(claim(4)?)
+        .expect_err("one operation cannot exceed its principal operation ceiling");
+    assert_eq!(
+        operation.code(),
+        AdmissionFailureCode::PrincipalQuotaExceeded
+    );
+    assert_eq!(operation.limiting_scope(), LimitingScope::Operation);
+
+    let aggregate = governor
+        .reserve(claim(3)?)
+        .expect_err("one principal cannot bypass the aggregate ceiling with another operation");
+    assert_eq!(
+        aggregate.code(),
+        AdmissionFailureCode::PrincipalQuotaExceeded
+    );
+    assert_eq!(aggregate.limiting_scope(), LimitingScope::Principal);
+
+    let resize = first
+        .try_resize_preserving_capacity(ResourceAmounts::only(ResourceDimension::MemoryBytes, 4)?)
+        .expect_err("resize cannot grow a live operation beyond its operation ceiling");
+    assert_eq!(
+        resize.admission_failure().map(|failure| failure.code()),
+        Some(AdmissionFailureCode::PrincipalQuotaExceeded)
+    );
+    assert_eq!(governor.inspect()?.outstanding_reservations(), 1);
+    drop(first);
+    assert_eq!(governor.inspect()?.outstanding_reservations(), 0);
+    Ok(())
+}
+
+#[test]
+fn principal_quota_refusals_do_not_accumulate_charges_or_cross_tenants()
+-> Result<(), Box<dyn std::error::Error>> {
+    let first_tenant = tenant(0xc1)?;
+    let second_tenant = tenant(0xc2)?;
+    let principal = principal(0xc3)?;
+    let capacity = amounts(20);
+    let governor = governor_with_principal_quota(
+        capacity,
+        capacity,
+        [
+            TenantQuota::new(first_tenant, 1, capacity)?,
+            TenantQuota::new(second_tenant, 1, capacity)?,
+        ],
+        Some(PrincipalQuota::new(4, amounts(3), amounts(3))?),
+    )?;
+    let claim = |tenant| {
+        WorkClaim::authenticated(
+            tenant,
+            principal,
+            WorkKind::Ingest,
+            ResourceAmounts::only(ResourceDimension::MemoryBytes, 3)?,
+        )
+    };
+    let first = governor.reserve(claim(first_tenant)?)?;
+    for _ in 0..32 {
+        let refusal = governor
+            .reserve(claim(first_tenant)?)
+            .expect_err("a retry cannot create an uncharged principal operation");
+        assert_eq!(refusal.code(), AdmissionFailureCode::PrincipalQuotaExceeded);
+        assert_eq!(refusal.limiting_scope(), LimitingScope::Principal);
+    }
+    assert_eq!(governor.inspect()?.outstanding_reservations(), 1);
+    assert_eq!(
+        governor
+            .inspect()?
+            .rejection_count_for(AdmissionFailureCode::PrincipalQuotaExceeded),
+        32
+    );
+    let second = governor.reserve(claim(second_tenant)?)?;
+    drop((first, second));
+    assert_eq!(governor.inspect()?.outstanding_reservations(), 0);
+    Ok(())
 }
 
 #[test]
