@@ -5,6 +5,8 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream as StdTcpStream};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
+use h2::client;
+use http::Request as HttpRequest;
 use opentelemetry_proto::tonic::collector::logs::v1::{
     ExportLogsServiceRequest, logs_service_client::LogsServiceClient,
 };
@@ -80,6 +82,145 @@ async fn api_per_address_accepted_socket_cap_closes_the_second_socket_from_one_p
     assert_closed(connect_from(Ipv4Addr::LOCALHOST, api).await?).await?;
     drop(holder);
     assert_status(request_from(Ipv4Addr::LOCALHOST, api).await?, 405);
+    assert_eq!(
+        process.shutdown(ShutdownTrigger::FirstSignal),
+        positron_runtime::ExitOutcome::Graceful
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn api_preauthentication_rate_refuses_by_peer_and_global_window_then_recovers()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _guard = live_async_test_guard().await;
+    let roots = TestRoots::new("api-preauthentication-rate")?;
+    let document = format!(
+        "{}admission_rate_per_second = 2\nper_address_admission_rate_per_second = 1\n",
+        listener_document(&roots, "plaintext", 8, 8, 128, 16),
+    );
+    let effective = effective_configuration(&document)?;
+    let paths = roots.paths()?;
+    let host = NativeHost::new(NativeBindings::from_effective(&effective)?);
+    let process = ApplicationRuntime::start(
+        ServeConfiguration::new(paths, InitializationMode::InitializeIfEmpty)
+            .with_effective_configuration(effective),
+        HostInputs::new(&host, &host),
+    )?;
+    let api = address(&process.bound_endpoints(), ListenerRole::Api)?;
+
+    assert_status(request_from(Ipv4Addr::LOCALHOST, api).await?, 405);
+    assert_closed(connect_from(Ipv4Addr::LOCALHOST, api).await?).await?;
+    assert_status(request_from(Ipv4Addr::LOCALHOST, api).await?, 405);
+    assert_eq!(
+        process.shutdown(ShutdownTrigger::FirstSignal),
+        positron_runtime::ExitOutcome::Graceful
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn api_http2_repeated_requests_are_rate_limited_before_authentication()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _guard = live_async_test_guard().await;
+    let roots = TestRoots::new("api-http2-preauthentication-rate")?;
+    let document = format!(
+        "{}admission_rate_per_second = 3\nper_address_admission_rate_per_second = 3\n",
+        listener_document(&roots, "plaintext", 8, 8, 128, 16),
+    );
+    let effective = effective_configuration(&document)?;
+    let paths = roots.paths()?;
+    let host = NativeHost::new(NativeBindings::from_effective(&effective)?);
+    let process = ApplicationRuntime::start(
+        ServeConfiguration::new(paths, InitializationMode::InitializeIfEmpty)
+            .with_effective_configuration(effective),
+        HostInputs::new(&host, &host),
+    )?;
+    let api = address(&process.bound_endpoints(), ListenerRole::Api)?;
+    let stream = TcpStream::connect(api).await?;
+    let (mut client, connection) = client::handshake(stream).await?;
+    let connection = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    for _ in 0..2 {
+        let request = HttpRequest::builder()
+            .method("GET")
+            .uri("http://localhost/v1/capabilities:negotiate")
+            .body(())?;
+        let (response, _) = client.send_request(request, true)?;
+        let response = tokio::time::timeout(Duration::from_secs(2), response).await??;
+        assert_eq!(response.status(), 405);
+    }
+    let request = HttpRequest::builder()
+        .method("GET")
+        .uri("http://localhost/v1/capabilities:negotiate")
+        .body(())?;
+    let (response, _) = client.send_request(request, true)?;
+    let response = tokio::time::timeout(Duration::from_secs(2), response).await??;
+    assert_eq!(response.status(), 429);
+    assert_eq!(response.headers().get("retry-after"), Some(&"1".parse()?));
+
+    drop(client);
+    connection.abort();
+    let _ = connection.await;
+    assert_eq!(
+        process.shutdown(ShutdownTrigger::FirstSignal),
+        positron_runtime::ExitOutcome::Graceful
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn api_global_rate_exhaustion_leaves_a_queued_socket_in_the_backlog_until_recovery()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _guard = live_async_test_guard().await;
+    let roots = TestRoots::new("api-global-rate-backlog")?;
+    let document = format!(
+        "{}admission_rate_per_second = 3\nper_address_admission_rate_per_second = 3\n",
+        listener_document(&roots, "plaintext", 8, 8, 128, 16),
+    );
+    let effective = effective_configuration(&document)?;
+    let paths = roots.paths()?;
+    let host = NativeHost::new(NativeBindings::from_effective(&effective)?);
+    let process = ApplicationRuntime::start(
+        ServeConfiguration::new(paths, InitializationMode::InitializeIfEmpty)
+            .with_effective_configuration(effective),
+        HostInputs::new(&host, &host),
+    )?;
+    let api = address(&process.bound_endpoints(), ListenerRole::Api)?;
+    let stream = TcpStream::connect(api).await?;
+    let (mut client, connection) = client::handshake(stream).await?;
+    let connection = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    for _ in 0..2 {
+        let request = HttpRequest::builder()
+            .method("GET")
+            .uri("http://localhost/v1/capabilities:negotiate")
+            .body(())?;
+        let (response, _) = client.send_request(request, true)?;
+        let response = tokio::time::timeout(Duration::from_secs(2), response).await??;
+        assert_eq!(response.status(), 405);
+    }
+
+    let mut queued = TcpStream::connect(api).await?;
+    queued
+        .write_all(b"GET /v1/capabilities:negotiate HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await?;
+    let mut first_byte = [0_u8; 1];
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), queued.read(&mut first_byte))
+            .await
+            .is_err(),
+        "an exhausted listener must leave the queued socket in the operating-system backlog"
+    );
+    let mut response = vec![0_u8; 512];
+    let read = tokio::time::timeout(Duration::from_secs(2), queued.read(&mut response)).await??;
+    assert_status(String::from_utf8(response[..read].to_vec())?, 405);
+
+    drop(client);
+    connection.abort();
+    let _ = connection.await;
     assert_eq!(
         process.shutdown(ShutdownTrigger::FirstSignal),
         positron_runtime::ExitOutcome::Graceful
@@ -406,6 +547,115 @@ async fn otlp_grpc_global_accepted_socket_cap_closes_then_releases_for_a_real_rp
     assert_eq!(refusal.code(), Code::Unauthenticated);
     drop(client);
     tokio::time::sleep(Duration::from_millis(25)).await;
+    assert_eq!(
+        process.shutdown(ShutdownTrigger::FirstSignal),
+        positron_runtime::ExitOutcome::Graceful
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn otlp_grpc_repeated_unauthenticated_requests_are_rate_limited_then_recover()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _guard = live_async_test_guard().await;
+    let roots = TestRoots::new("grpc-preauthentication-rate")?;
+    let document = format!(
+        "{}admission_rate_per_second = 2\nper_address_admission_rate_per_second = 2\n",
+        listener_document(&roots, "plaintext", 128, 16, 128, 16),
+    );
+    let effective = effective_configuration(&document)?;
+    let paths = roots.paths()?;
+    drop(InstanceBootstrap::initialize(
+        &paths,
+        positron_runtime::InitializationPlan::non_interactive(),
+    )?);
+    let host = NativeHost::new(NativeBindings::from_effective(&effective)?);
+    let process = ApplicationRuntime::start(
+        ServeConfiguration::new(paths, InitializationMode::ExistingOnly)
+            .with_effective_configuration(effective),
+        HostInputs::new(&host, &host),
+    )?;
+    let grpc = address(&process.bound_endpoints(), ListenerRole::OtlpGrpc)?;
+    let mut client = LogsServiceClient::connect(format!("http://{grpc}")).await?;
+
+    let first = tokio::time::timeout(
+        Duration::from_secs(2),
+        client.export(Request::new(ExportLogsServiceRequest::default())),
+    )
+    .await?
+    .expect_err("the first RPC reaches authentication after connection admission");
+    assert_eq!(first.code(), Code::Unauthenticated);
+    let limited = tokio::time::timeout(
+        Duration::from_secs(2),
+        client.export(Request::new(ExportLogsServiceRequest::default())),
+    )
+    .await?
+    .expect_err("a repeated unauthenticated RPC must consume no more auth work");
+    assert_eq!(limited.code(), Code::ResourceExhausted);
+
+    tokio::time::sleep(Duration::from_secs(1) + Duration::from_millis(100)).await;
+    let recovered = tokio::time::timeout(
+        Duration::from_secs(2),
+        client.export(Request::new(ExportLogsServiceRequest::default())),
+    )
+    .await?
+    .expect_err("the next fixed window restores an existing connection's request admission");
+    assert_eq!(recovered.code(), Code::Unauthenticated);
+    drop(client);
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert_eq!(
+        process.shutdown(ShutdownTrigger::FirstSignal),
+        positron_runtime::ExitOutcome::Graceful
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn otlp_grpc_unknown_methods_are_rate_limited_before_routing()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _guard = live_async_test_guard().await;
+    let roots = TestRoots::new("grpc-unknown-preauthentication-rate")?;
+    let document = format!(
+        "{}admission_rate_per_second = 2\nper_address_admission_rate_per_second = 2\n",
+        listener_document(&roots, "plaintext", 128, 16, 128, 16),
+    );
+    let effective = effective_configuration(&document)?;
+    let paths = roots.paths()?;
+    drop(InstanceBootstrap::initialize(
+        &paths,
+        positron_runtime::InitializationPlan::non_interactive(),
+    )?);
+    let host = NativeHost::new(NativeBindings::from_effective(&effective)?);
+    let process = ApplicationRuntime::start(
+        ServeConfiguration::new(paths, InitializationMode::ExistingOnly)
+            .with_effective_configuration(effective),
+        HostInputs::new(&host, &host),
+    )?;
+    let grpc = address(&process.bound_endpoints(), ListenerRole::OtlpGrpc)?;
+    let stream = TcpStream::connect(grpc).await?;
+    let (mut client, connection) = client::handshake(stream).await?;
+    let connection = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    for expected_status in ["12", "8"] {
+        let request = HttpRequest::builder()
+            .method("POST")
+            .uri("http://localhost/positron.Unknown/Export")
+            .header("content-type", "application/grpc")
+            .header("te", "trailers")
+            .body(())?;
+        let (response, _) = client.send_request(request, true)?;
+        let response = tokio::time::timeout(Duration::from_secs(2), response).await??;
+        assert_eq!(
+            response.headers().get("grpc-status"),
+            Some(&expected_status.parse()?)
+        );
+    }
+
+    drop(client);
+    connection.abort();
+    let _ = connection.await;
     assert_eq!(
         process.shutdown(ShutdownTrigger::FirstSignal),
         positron_runtime::ExitOutcome::Graceful

@@ -8,6 +8,8 @@ log_level = "info"
 
 [listener]
 control_path = "/var/run/positron/control.sock"
+admission_rate_per_second = 1024
+per_address_admission_rate_per_second = 128
 operations_bind_address = "127.0.0.1:13133"
 operations_transport = "tls"
 operations_accepted_socket_limit = 128

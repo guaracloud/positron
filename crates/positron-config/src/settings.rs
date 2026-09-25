@@ -220,6 +220,8 @@ pub enum Setting {
     RuntimeShutdownGraceSeconds,
     RuntimeMaxRegisteredTenants,
     ListenerControlPath,
+    ListenerAdmissionRatePerSecond,
+    ListenerPerAddressAdmissionRatePerSecond,
     ListenerOperationsBindAddress,
     ListenerOperationsTransport,
     ListenerOperationsAcceptedSocketLimit,

@@ -326,6 +326,8 @@ fn reference_domain(definition: SettingDefinition) -> String {
         Setting::RuntimeMaxRegisteredTenants => "`1..=1024`; maximum tenant quotas simultaneously registered in the live Resource Governor, including the default tenant and a pending non-admittable tenant-creation reservation".to_owned(),
         Setting::ListenerApiBindAddress => "socket address; at most 256 bytes; non-loopback requires TLS or the explicit plaintext opt-out".to_owned(),
         Setting::ListenerApiTransport => "`tls`, `mtls`, `plaintext`; plaintext emits a configuration warning, persistent ready health warning, and one redacted governance audit record".to_owned(),
+        Setting::ListenerAdmissionRatePerSecond => "`1..=4096`; maximum pre-authentication attempts per fixed one-second window for each listener generation. Socket admission and each HTTP/2 or gRPC request before credential parsing consume this listener-local budget; a fixed-window boundary may admit two adjacent-window bursts. The compiled default of 1024 is a selected workload allowance, not a fairness guarantee under distributed floods.".to_owned(),
+        Setting::ListenerPerAddressAdmissionRatePerSecond => "`1..=4096`; maximum pre-authentication attempts from one immediate peer address per fixed one-second window; cannot exceed the shared listener attempt rate. A refused peer attempt also consumes the shared listener budget so denied traffic cannot create unbounded admission work. The compiled default of 128 is the selected eight-to-one allowance against the global default, not a fairness guarantee.".to_owned(),
         Setting::ListenerOperationsAcceptedSocketLimit
         | Setting::ListenerApiAcceptedSocketLimit
         | Setting::ListenerOtlpGrpcAcceptedSocketLimit

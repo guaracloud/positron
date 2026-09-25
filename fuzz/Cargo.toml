@@ -274,5 +274,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "connection_admission"
+path = "fuzz_targets/connection_admission.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 members = ["."]

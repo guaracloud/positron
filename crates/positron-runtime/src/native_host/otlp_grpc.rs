@@ -113,7 +113,21 @@ impl PreparedGrpc {
         let services = self.services.clone();
         let blocking_handle = self.blocking_handle.clone();
         let listener = self.listener;
-        let mut server = self.server;
+        let request_admission = Arc::clone(&admission);
+        let mut server = self
+            .server
+            .layer(tonic::service::interceptor::InterceptorLayer::new(
+                move |request: Request<()>| {
+                    let peer = request
+                        .remote_addr()
+                        .ok_or_else(preauthentication_rate_rejected)?;
+                    if request_admission.reserve_preauthentication_attempt(peer.ip()) {
+                        Ok(request)
+                    } else {
+                        Err(preauthentication_rate_rejected())
+                    }
+                },
+            ));
         let tls = self.tls;
         let protection = self.protection;
         let http2_profile = self.http2_profile;
@@ -123,6 +137,7 @@ impl PreparedGrpc {
                 listener,
                 admission: Arc::clone(&admission),
                 cancellation: cancellation.clone(),
+                rate_wait: None,
             }
             .then(move |accepted| {
                 let tls = tls.clone();
@@ -196,6 +211,7 @@ struct AdmittedIncoming {
     listener: tokio::net::TcpListener,
     admission: Arc<Admission>,
     cancellation: TaskCancellation,
+    rate_wait: Option<Pin<Box<tokio::time::Sleep>>>,
 }
 
 struct AdmittedTcpStream {
@@ -263,8 +279,18 @@ impl Stream for AdmittedIncoming {
 
     fn poll_next(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
+        if let Some(wait) = this.rate_wait.as_mut() {
+            if wait.as_mut().poll(context).is_pending() {
+                return Poll::Pending;
+            }
+            this.rate_wait = None;
+        }
         if !super::can_serve_accepted_connection(&this.admission, &this.cancellation) {
             return Poll::Ready(None);
+        }
+        if this.admission.rate_retry_after().is_some() {
+            this.rate_wait = Some(Box::pin(tokio::time::sleep(Duration::from_millis(5))));
+            return Poll::Pending;
         }
         match this.listener.poll_accept(context) {
             Poll::Ready(Ok((stream, peer))) => {
@@ -277,7 +303,13 @@ impl Stream for AdmittedIncoming {
                         _lease: lease,
                     }))),
                     None => {
-                        context.waker().wake_by_ref();
+                        if let Some(retry_after) = this.admission.rate_retry_after() {
+                            this.rate_wait = Some(Box::pin(tokio::time::sleep(
+                                retry_after.min(Duration::from_millis(5)),
+                            )));
+                        } else {
+                            context.waker().wake_by_ref();
+                        }
                         Poll::Pending
                     },
                 }
@@ -454,6 +486,10 @@ fn authenticate(
 
 fn authentication_rejected() -> Status {
     status_from_failure(OtlpSignal::Logs.authentication_rejected())
+}
+
+fn preauthentication_rate_rejected() -> Status {
+    Status::resource_exhausted("OTLP preauthentication admission rate exceeded")
 }
 
 fn authenticate_traces(
@@ -735,6 +771,7 @@ mod admission_tests {
             listener: tokio_listener,
             admission: Arc::clone(&admission),
             cancellation,
+            rate_wait: None,
         };
 
         let next = poll_fn(|context| Pin::new(&mut incoming).poll_next(context)).await;
