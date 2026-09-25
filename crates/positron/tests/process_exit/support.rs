@@ -116,18 +116,32 @@ pub(super) fn wait_for_configuration_status(
     authorization: &str,
     expected_fragments: &[&str],
 ) -> Result<String, Box<dyn std::error::Error>> {
+    let mut last_observation = None;
     for _ in 0..100 {
-        if let Ok(response) = configuration_status(port, authorization)
-            && response.starts_with("HTTP/1.1 200 ")
-            && expected_fragments
-                .iter()
-                .all(|fragment| response.contains(fragment))
-        {
-            return Ok(response);
+        match configuration_status(port, authorization) {
+            Ok(response)
+                if response.starts_with("HTTP/1.1 200 ")
+                    && expected_fragments
+                        .iter()
+                        .all(|fragment| response.contains(fragment)) =>
+            {
+                return Ok(response);
+            },
+            Ok(response) => {
+                last_observation = Some(format!(
+                    "response={:?}",
+                    bounded_status_response(&response, authorization)
+                ));
+            },
+            Err(error) => last_observation = Some(format!("request={error}")),
         }
         std::thread::sleep(Duration::from_millis(25));
     }
-    Err("Positron configuration status did not reach expected state".into())
+    Err(format!(
+        "Positron configuration status did not reach expected state within its bounded probe: {}",
+        last_observation.unwrap_or_else(|| "no request completed".to_owned())
+    )
+    .into())
 }
 
 #[cfg(unix)]
@@ -135,7 +149,10 @@ fn configuration_status(
     port: u16,
     authorization: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let mut stream = TcpStream::connect(("127.0.0.1", port))?;
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_millis(100))?;
+    stream.set_read_timeout(Some(Duration::from_millis(100)))?;
+    stream.set_write_timeout(Some(Duration::from_millis(100)))?;
     let request = format!(
         "GET /status HTTP/1.1\r\nHost: localhost\r\nAuthorization: {authorization}\r\nContent-Length: 0\r\n\r\n"
     );
@@ -143,6 +160,21 @@ fn configuration_status(
     let mut response = String::new();
     stream.read_to_string(&mut response)?;
     Ok(response)
+}
+
+#[cfg(unix)]
+fn bounded_status_response(response: &str, authorization: &str) -> String {
+    const MAX_STATUS_OBSERVATION_CHARS: usize = 512;
+
+    let redacted = response.replace(authorization, "<redacted>");
+    let mut bounded = redacted
+        .chars()
+        .take(MAX_STATUS_OBSERVATION_CHARS)
+        .collect::<String>();
+    if redacted.chars().nth(MAX_STATUS_OBSERVATION_CHARS).is_some() {
+        bounded.push_str("…<truncated>");
+    }
+    bounded
 }
 
 #[cfg(unix)]
