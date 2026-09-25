@@ -110,6 +110,29 @@ async fn grpc_fragmented_header_block_expires_absolutely_and_releases_connection
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn grpc_trickled_initial_preface_expires_absolutely_and_releases_connection_capacity()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _guard = live_async_test_guard().await;
+    for transport in ["plaintext", "tls"] {
+        let mut harness = GrpcHarness::start(
+            &format!("grpc-preface-deadline-{transport}"),
+            transport,
+            1,
+            3,
+        )?;
+        if transport == "plaintext" {
+            trickle_initial_preface(TcpStream::connect(harness.endpoint).await?).await?;
+            assert_unauthenticated(TcpStream::connect(harness.endpoint).await?).await?;
+        } else {
+            trickle_initial_preface(tls_h2(harness.endpoint).await?).await?;
+            assert_unauthenticated(tls_h2(harness.endpoint).await?).await?;
+        }
+        harness.shutdown()?;
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn grpc_idle_connection_after_response_survives_the_header_deadline()
 -> Result<(), Box<dyn std::error::Error>> {
     let _guard = live_async_test_guard().await;
@@ -357,6 +380,17 @@ where
     stream.write_all(&frame(8, 6, 0, 0)).await?;
     stream.write_all(&[1; 8]).await?;
     stream.flush().await?;
+    assert_closed(stream).await
+}
+
+async fn trickle_initial_preface<S>(mut stream: S) -> Result<(), Box<dyn std::error::Error>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    stream.write_all(&H2_PREFACE[..8]).await?;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    stream.write_all(&H2_PREFACE[8..16]).await?;
+    tokio::time::sleep(Duration::from_millis(600)).await;
     assert_closed(stream).await
 }
 

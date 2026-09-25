@@ -39,7 +39,7 @@ impl<I> H2Observer<I> {
             payload: 0,
             header_block: false,
             clear_after_payload: false,
-            deadline: None,
+            deadline: Some(Box::pin(tokio::time::sleep(header_deadline))),
             header_deadline,
             ping_interval,
             last_ping: None,
@@ -89,6 +89,9 @@ impl<I: AsyncRead + Unpin> AsyncRead for H2Observer<I> {
                 for byte in bytes {
                     if self.preface < PREFACE {
                         self.preface += 1;
+                        if self.preface == PREFACE {
+                            self.deadline = None;
+                        }
                         continue;
                     }
                     if self.payload > 0 {
@@ -207,6 +210,44 @@ mod tests {
         observed.read_to_end(&mut out).await.unwrap();
         task.await.unwrap().unwrap();
         assert_eq!(out, expected);
+    }
+    #[tokio::test]
+    async fn initial_preface_deadline_wakes_without_new_input() {
+        let (_writer, reader) = tokio::io::duplex(128);
+        let mut observed =
+            H2Observer::new(reader, Duration::from_millis(10), Duration::from_secs(1));
+        let mut one = [0; 1];
+        let error = tokio::time::timeout(Duration::from_secs(1), observed.read(&mut one))
+            .await
+            .expect("an incomplete initial preface must have an absolute deadline")
+            .expect_err("the initial preface deadline must close a silent connection");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+    #[tokio::test]
+    async fn complete_preface_clears_the_initial_deadline_before_the_first_headers() {
+        let (mut writer, reader) = tokio::io::duplex(128);
+        writer.write_all(PREF).await.unwrap();
+        let mut observed =
+            H2Observer::new(reader, Duration::from_millis(10), Duration::from_secs(1));
+        let mut received = [0; PREFACE];
+        observed.read_exact(&mut received).await.unwrap();
+        let mut one = [0; 1];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), observed.read(&mut one))
+                .await
+                .is_err()
+        );
+    }
+    #[tokio::test]
+    async fn disabled_observer_leaves_a_silent_http1_stream_pending() {
+        let (_writer, reader) = tokio::io::duplex(128);
+        let mut observed = H2Observer::disabled(reader);
+        let mut one = [0; 1];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), observed.read(&mut one))
+                .await
+                .is_err()
+        );
     }
     #[tokio::test]
     async fn header_deadline_wakes_without_new_input_until_end_headers_payload_arrives() {
