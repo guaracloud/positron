@@ -113,3 +113,48 @@ fn network_listener_profile_resolves_role_owned_accepted_socket_limits()
     assert_eq!(api.per_address_accepted_socket_limit().get(), 16);
     Ok(())
 }
+
+#[test]
+fn network_listener_profile_resolves_role_owned_connection_protection()
+-> Result<(), Box<dyn Error>> {
+    use positron_config::NetworkListenerRole;
+
+    let effective = inputs(
+        Some(
+            "schema_version = 1\n\
+             [listener]\n\
+             api_tls_handshake_limit = 8\n\
+             api_tls_handshake_deadline_seconds = 3\n\
+             api_header_deadline_seconds = 4\n\
+             api_body_deadline_seconds = 5\n\
+             api_request_deadline_seconds = 6\n\
+             api_idle_deadline_seconds = 7\n",
+        ),
+        [],
+        [],
+    )
+    .and_then(resolve)?;
+
+    let api = effective
+        .network_listener_profile(NetworkListenerRole::Api)
+        .ok_or("API listener profile missing")?
+        .connection_protection();
+    assert_eq!(api.tls_handshake_limit().get(), 8);
+    assert_eq!(api.tls_handshake_deadline().as_secs(), 3);
+    assert_eq!(api.header_deadline().as_secs(), 4);
+    assert_eq!(api.body_deadline().as_secs(), 5);
+    assert_eq!(api.request_deadline().as_secs(), 6);
+    assert_eq!(api.idle_deadline().as_secs(), 7);
+
+    let operations = effective
+        .network_listener_profile(NetworkListenerRole::Operations)
+        .ok_or("Operations listener profile missing")?
+        .connection_protection();
+    assert_eq!(operations.tls_handshake_limit().get(), 16);
+    assert_eq!(operations.tls_handshake_deadline().as_secs(), 2);
+    assert_eq!(operations.header_deadline().as_secs(), 2);
+    assert_eq!(operations.body_deadline().as_secs(), 2);
+    assert_eq!(operations.request_deadline().as_secs(), 30);
+    assert_eq!(operations.idle_deadline().as_secs(), 30);
+    Ok(())
+}

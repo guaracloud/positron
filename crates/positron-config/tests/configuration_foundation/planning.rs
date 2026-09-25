@@ -197,6 +197,58 @@ fn accepted_socket_limit_changes_are_file_only_drain_and_reload_settings()
 }
 
 #[test]
+fn connection_protection_changes_are_file_only_drain_and_reload_settings()
+-> Result<(), ConfigurationFailure> {
+    let current = inputs(None, [], []).and_then(resolve)?;
+    let candidate = inputs(
+        Some(
+            "schema_version = 1\n\
+             [listener]\n\
+             api_tls_handshake_limit = 8\n\
+             api_tls_handshake_deadline_seconds = 3\n\
+             api_header_deadline_seconds = 4\n\
+             api_body_deadline_seconds = 5\n\
+             api_request_deadline_seconds = 6\n\
+             api_idle_deadline_seconds = 7\n",
+        ),
+        [],
+        [],
+    )
+    .and_then(resolve)?;
+
+    assert!(matches!(
+        current.plan_update(&candidate)?,
+        ConfigurationPlan::DrainThenPublish { changed }
+            if changed
+                == vec![
+                    Setting::ListenerApiTlsHandshakeLimit,
+                    Setting::ListenerApiTlsHandshakeDeadlineSeconds,
+                    Setting::ListenerApiHeaderDeadlineSeconds,
+                    Setting::ListenerApiBodyDeadlineSeconds,
+                    Setting::ListenerApiRequestDeadlineSeconds,
+                    Setting::ListenerApiIdleDeadlineSeconds,
+                ]
+    ));
+    assert!(candidate
+        .redacted_reference()
+        .contains("api_idle_deadline_seconds = 7"));
+
+    let environment = inputs(
+        None,
+        [("POSITRON__LISTENER__API_TLS_HANDSHAKE_LIMIT", "8")],
+        [],
+    )
+    .and_then(resolve);
+    assert!(matches!(
+        environment,
+        Err(error)
+            if error.code() == ConfigurationFailureCode::UnknownSetting
+                && error.source() == FailureSource::ListenerApiTlsHandshakeLimit
+    ));
+    Ok(())
+}
+
+#[test]
 fn immutable_configuration_digest_follows_the_canonical_mutability_contract()
 -> Result<(), ConfigurationFailure> {
     let current = inputs(None, [], []).and_then(resolve)?;

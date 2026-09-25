@@ -31,7 +31,7 @@ macro_rules! define_settings {
     };
 }
 
-pub(crate) const SETTING_DEFINITIONS: [SettingDefinition; 54] = define_settings! {
+pub(crate) const SETTING_DEFINITIONS: [SettingDefinition; 84] = define_settings! {
     SchemaVersion | "schema_version" | Integer | "1" | ExactUnsignedInteger(1) | Public | ConfigurationFileOnly | ImmutableAfterInitialization;
     DiagnosticsLogLevel | "diagnostics.log_level" | String | "info" | StringEnumeration(&["error", "warn", "info", "debug"]) | Public | NonSecretOverrides | LiveReloadable;
     RuntimeShutdownGraceSeconds | "runtime.shutdown_grace_seconds" | Integer | "30" | UnsignedIntegerRange(1, 3600) | Public | NonSecretOverrides | RestartRequired;
@@ -41,6 +41,12 @@ pub(crate) const SETTING_DEFINITIONS: [SettingDefinition; 54] = define_settings!
     ListenerOperationsTransport | "listener.operations_transport" | String | "tls" | StringEnumeration(&["tls", "mtls", "plaintext"]) | Public | ConfigurationFileOnly | DrainAndReload;
     ListenerOperationsAcceptedSocketLimit | "listener.operations_accepted_socket_limit" | Integer | "128" | UnsignedIntegerRange(1, 4096) | Public | ConfigurationFileOnly | DrainAndReload;
     ListenerOperationsPerAddressAcceptedSocketLimit | "listener.operations_per_address_accepted_socket_limit" | Integer | "16" | UnsignedIntegerRange(1, 4096) | Public | ConfigurationFileOnly | DrainAndReload;
+    ListenerOperationsTlsHandshakeLimit | "listener.operations_tls_handshake_limit" | Integer | "16" | UnsignedIntegerRange(1, 128) | Public | ConfigurationFileOnly | DrainAndReload;
+    ListenerOperationsTlsHandshakeDeadlineSeconds | "listener.operations_tls_handshake_deadline_seconds" | Integer | "2" | UnsignedIntegerRange(1, 300) | Public | ConfigurationFileOnly | DrainAndReload;
+    ListenerOperationsHeaderDeadlineSeconds | "listener.operations_header_deadline_seconds" | Integer | "2" | UnsignedIntegerRange(1, 300) | Public | ConfigurationFileOnly | DrainAndReload;
+    ListenerOperationsBodyDeadlineSeconds | "listener.operations_body_deadline_seconds" | Integer | "2" | UnsignedIntegerRange(1, 300) | Public | ConfigurationFileOnly | DrainAndReload;
+    ListenerOperationsRequestDeadlineSeconds | "listener.operations_request_deadline_seconds" | Integer | "30" | UnsignedIntegerRange(1, 300) | Public | ConfigurationFileOnly | DrainAndReload;
+    ListenerOperationsIdleDeadlineSeconds | "listener.operations_idle_deadline_seconds" | Integer | "30" | UnsignedIntegerRange(1, 300) | Public | ConfigurationFileOnly | DrainAndReload;
     ListenerOperationsTlsCertificateFile | "listener.operations_tls_certificate_file" | String | "/var/lib/positron-secrets/operations-certificate.pem" | ProtectedAbsolutePath(256) | SecretBearing | ProtectedConfigurationFileOnly | DrainAndReload;
     ListenerOperationsTlsPrivateKeyFile | "listener.operations_tls_private_key_file" | String | "/var/lib/positron-secrets/operations-private-key.pem" | ProtectedAbsolutePath(256) | SecretBearing | ProtectedConfigurationFileOnly | DrainAndReload;
     ListenerOperationsTlsClientCaFile | "listener.operations_tls_client_ca_file" | String | "/var/lib/positron-secrets/operations-client-ca.pem" | ProtectedAbsolutePath(256) | SecretBearing | ProtectedConfigurationFileOnly | DrainAndReload;
@@ -50,6 +56,12 @@ pub(crate) const SETTING_DEFINITIONS: [SettingDefinition; 54] = define_settings!
     ListenerApiTransport | "listener.api_transport" | String | "tls" | StringEnumeration(&["tls", "mtls", "plaintext"]) | Public | ConfigurationFileOnly | DrainAndReload;
     ListenerApiAcceptedSocketLimit | "listener.api_accepted_socket_limit" | Integer | "128" | UnsignedIntegerRange(1, 4096) | Public | ConfigurationFileOnly | DrainAndReload;
     ListenerApiPerAddressAcceptedSocketLimit | "listener.api_per_address_accepted_socket_limit" | Integer | "16" | UnsignedIntegerRange(1, 4096) | Public | ConfigurationFileOnly | DrainAndReload;
+    ListenerApiTlsHandshakeLimit | "listener.api_tls_handshake_limit" | Integer | "16" | UnsignedIntegerRange(1, 128) | Public | ConfigurationFileOnly | DrainAndReload;
+    ListenerApiTlsHandshakeDeadlineSeconds | "listener.api_tls_handshake_deadline_seconds" | Integer | "2" | UnsignedIntegerRange(1, 300) | Public | ConfigurationFileOnly | DrainAndReload;
+    ListenerApiHeaderDeadlineSeconds | "listener.api_header_deadline_seconds" | Integer | "2" | UnsignedIntegerRange(1, 300) | Public | ConfigurationFileOnly | DrainAndReload;
+    ListenerApiBodyDeadlineSeconds | "listener.api_body_deadline_seconds" | Integer | "2" | UnsignedIntegerRange(1, 300) | Public | ConfigurationFileOnly | DrainAndReload;
+    ListenerApiRequestDeadlineSeconds | "listener.api_request_deadline_seconds" | Integer | "30" | UnsignedIntegerRange(1, 300) | Public | ConfigurationFileOnly | DrainAndReload;
+    ListenerApiIdleDeadlineSeconds | "listener.api_idle_deadline_seconds" | Integer | "30" | UnsignedIntegerRange(1, 300) | Public | ConfigurationFileOnly | DrainAndReload;
     ListenerApiTrustedProxyCidrs | "listener.api.trusted_proxy_cidrs" | TrustedProxyCidrs | "disabled" | TrustedProxyCidrs(16, 64) | Public | ConfigurationFileOnly | DrainAndReload;
     ListenerApiForwardedHops | "listener.api.forwarded_hops" | Integer | "0" | UnsignedIntegerRange(0, 255) | Public | ConfigurationFileOnly | DrainAndReload;
     ListenerApiTlsCertificateFile | "listener.api_tls_certificate_file" | String | "/var/lib/positron-secrets/api-certificate.pem" | ProtectedAbsolutePath(256) | SecretBearing | ProtectedConfigurationFileOnly | DrainAndReload;
@@ -59,6 +71,12 @@ pub(crate) const SETTING_DEFINITIONS: [SettingDefinition; 54] = define_settings!
     ListenerOtlpGrpcTransport | "listener.otlp_grpc_transport" | String | "tls" | StringEnumeration(&["tls", "mtls", "plaintext"]) | Public | ConfigurationFileOnly | DrainAndReload;
     ListenerOtlpGrpcAcceptedSocketLimit | "listener.otlp_grpc_accepted_socket_limit" | Integer | "128" | UnsignedIntegerRange(1, 4096) | Public | ConfigurationFileOnly | DrainAndReload;
     ListenerOtlpGrpcPerAddressAcceptedSocketLimit | "listener.otlp_grpc_per_address_accepted_socket_limit" | Integer | "16" | UnsignedIntegerRange(1, 4096) | Public | ConfigurationFileOnly | DrainAndReload;
+    ListenerOtlpGrpcTlsHandshakeLimit | "listener.otlp_grpc_tls_handshake_limit" | Integer | "16" | UnsignedIntegerRange(1, 128) | Public | ConfigurationFileOnly | DrainAndReload;
+    ListenerOtlpGrpcTlsHandshakeDeadlineSeconds | "listener.otlp_grpc_tls_handshake_deadline_seconds" | Integer | "2" | UnsignedIntegerRange(1, 300) | Public | ConfigurationFileOnly | DrainAndReload;
+    ListenerOtlpGrpcHeaderDeadlineSeconds | "listener.otlp_grpc_header_deadline_seconds" | Integer | "2" | UnsignedIntegerRange(1, 300) | Public | ConfigurationFileOnly | DrainAndReload;
+    ListenerOtlpGrpcBodyDeadlineSeconds | "listener.otlp_grpc_body_deadline_seconds" | Integer | "2" | UnsignedIntegerRange(1, 300) | Public | ConfigurationFileOnly | DrainAndReload;
+    ListenerOtlpGrpcRequestDeadlineSeconds | "listener.otlp_grpc_request_deadline_seconds" | Integer | "30" | UnsignedIntegerRange(1, 300) | Public | ConfigurationFileOnly | DrainAndReload;
+    ListenerOtlpGrpcIdleDeadlineSeconds | "listener.otlp_grpc_idle_deadline_seconds" | Integer | "30" | UnsignedIntegerRange(1, 300) | Public | ConfigurationFileOnly | DrainAndReload;
     ListenerOtlpGrpcTlsCertificateFile | "listener.otlp_grpc_tls_certificate_file" | String | "/var/lib/positron-secrets/otlp-grpc-certificate.pem" | ProtectedAbsolutePath(256) | SecretBearing | ProtectedConfigurationFileOnly | DrainAndReload;
     ListenerOtlpGrpcTlsPrivateKeyFile | "listener.otlp_grpc_tls_private_key_file" | String | "/var/lib/positron-secrets/otlp-grpc-private-key.pem" | ProtectedAbsolutePath(256) | SecretBearing | ProtectedConfigurationFileOnly | DrainAndReload;
     ListenerOtlpGrpcTlsClientCaFile | "listener.otlp_grpc_tls_client_ca_file" | String | "/var/lib/positron-secrets/otlp-grpc-client-ca.pem" | ProtectedAbsolutePath(256) | SecretBearing | ProtectedConfigurationFileOnly | DrainAndReload;
@@ -68,6 +86,12 @@ pub(crate) const SETTING_DEFINITIONS: [SettingDefinition; 54] = define_settings!
     ListenerOtlpHttpTransport | "listener.otlp_http_transport" | String | "tls" | StringEnumeration(&["tls", "mtls", "plaintext"]) | Public | ConfigurationFileOnly | DrainAndReload;
     ListenerOtlpHttpAcceptedSocketLimit | "listener.otlp_http_accepted_socket_limit" | Integer | "128" | UnsignedIntegerRange(1, 4096) | Public | ConfigurationFileOnly | DrainAndReload;
     ListenerOtlpHttpPerAddressAcceptedSocketLimit | "listener.otlp_http_per_address_accepted_socket_limit" | Integer | "16" | UnsignedIntegerRange(1, 4096) | Public | ConfigurationFileOnly | DrainAndReload;
+    ListenerOtlpHttpTlsHandshakeLimit | "listener.otlp_http_tls_handshake_limit" | Integer | "16" | UnsignedIntegerRange(1, 128) | Public | ConfigurationFileOnly | DrainAndReload;
+    ListenerOtlpHttpTlsHandshakeDeadlineSeconds | "listener.otlp_http_tls_handshake_deadline_seconds" | Integer | "2" | UnsignedIntegerRange(1, 300) | Public | ConfigurationFileOnly | DrainAndReload;
+    ListenerOtlpHttpHeaderDeadlineSeconds | "listener.otlp_http_header_deadline_seconds" | Integer | "2" | UnsignedIntegerRange(1, 300) | Public | ConfigurationFileOnly | DrainAndReload;
+    ListenerOtlpHttpBodyDeadlineSeconds | "listener.otlp_http_body_deadline_seconds" | Integer | "2" | UnsignedIntegerRange(1, 300) | Public | ConfigurationFileOnly | DrainAndReload;
+    ListenerOtlpHttpRequestDeadlineSeconds | "listener.otlp_http_request_deadline_seconds" | Integer | "30" | UnsignedIntegerRange(1, 300) | Public | ConfigurationFileOnly | DrainAndReload;
+    ListenerOtlpHttpIdleDeadlineSeconds | "listener.otlp_http_idle_deadline_seconds" | Integer | "30" | UnsignedIntegerRange(1, 300) | Public | ConfigurationFileOnly | DrainAndReload;
     ListenerOtlpHttpTlsCertificateFile | "listener.otlp_http_tls_certificate_file" | String | "/var/lib/positron-secrets/otlp-http-certificate.pem" | ProtectedAbsolutePath(256) | SecretBearing | ProtectedConfigurationFileOnly | DrainAndReload;
     ListenerOtlpHttpTlsPrivateKeyFile | "listener.otlp_http_tls_private_key_file" | String | "/var/lib/positron-secrets/otlp-http-private-key.pem" | ProtectedAbsolutePath(256) | SecretBearing | ProtectedConfigurationFileOnly | DrainAndReload;
     ListenerOtlpHttpTlsClientCaFile | "listener.otlp_http_tls_client_ca_file" | String | "/var/lib/positron-secrets/otlp-http-client-ca.pem" | ProtectedAbsolutePath(256) | SecretBearing | ProtectedConfigurationFileOnly | DrainAndReload;
@@ -77,6 +101,12 @@ pub(crate) const SETTING_DEFINITIONS: [SettingDefinition; 54] = define_settings!
     ListenerLokiPushTransport | "listener.loki_push_transport" | String | "tls" | StringEnumeration(&["tls", "mtls", "plaintext"]) | Public | ConfigurationFileOnly | DrainAndReload;
     ListenerLokiPushAcceptedSocketLimit | "listener.loki_push_accepted_socket_limit" | Integer | "128" | UnsignedIntegerRange(1, 4096) | Public | ConfigurationFileOnly | DrainAndReload;
     ListenerLokiPushPerAddressAcceptedSocketLimit | "listener.loki_push_per_address_accepted_socket_limit" | Integer | "16" | UnsignedIntegerRange(1, 4096) | Public | ConfigurationFileOnly | DrainAndReload;
+    ListenerLokiPushTlsHandshakeLimit | "listener.loki_push_tls_handshake_limit" | Integer | "16" | UnsignedIntegerRange(1, 128) | Public | ConfigurationFileOnly | DrainAndReload;
+    ListenerLokiPushTlsHandshakeDeadlineSeconds | "listener.loki_push_tls_handshake_deadline_seconds" | Integer | "2" | UnsignedIntegerRange(1, 300) | Public | ConfigurationFileOnly | DrainAndReload;
+    ListenerLokiPushHeaderDeadlineSeconds | "listener.loki_push_header_deadline_seconds" | Integer | "2" | UnsignedIntegerRange(1, 300) | Public | ConfigurationFileOnly | DrainAndReload;
+    ListenerLokiPushBodyDeadlineSeconds | "listener.loki_push_body_deadline_seconds" | Integer | "2" | UnsignedIntegerRange(1, 300) | Public | ConfigurationFileOnly | DrainAndReload;
+    ListenerLokiPushRequestDeadlineSeconds | "listener.loki_push_request_deadline_seconds" | Integer | "30" | UnsignedIntegerRange(1, 300) | Public | ConfigurationFileOnly | DrainAndReload;
+    ListenerLokiPushIdleDeadlineSeconds | "listener.loki_push_idle_deadline_seconds" | Integer | "30" | UnsignedIntegerRange(1, 300) | Public | ConfigurationFileOnly | DrainAndReload;
     ListenerLokiPushTlsCertificateFile | "listener.loki_push_tls_certificate_file" | String | "/var/lib/positron-secrets/loki-push-certificate.pem" | ProtectedAbsolutePath(256) | SecretBearing | ProtectedConfigurationFileOnly | DrainAndReload;
     ListenerLokiPushTlsPrivateKeyFile | "listener.loki_push_tls_private_key_file" | String | "/var/lib/positron-secrets/loki-push-private-key.pem" | ProtectedAbsolutePath(256) | SecretBearing | ProtectedConfigurationFileOnly | DrainAndReload;
     ListenerLokiPushTlsClientCaFile | "listener.loki_push_tls_client_ca_file" | String | "/var/lib/positron-secrets/loki-push-client-ca.pem" | ProtectedAbsolutePath(256) | SecretBearing | ProtectedConfigurationFileOnly | DrainAndReload;

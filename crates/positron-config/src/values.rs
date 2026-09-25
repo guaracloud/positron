@@ -225,6 +225,12 @@ pub enum FailureSource {
     ListenerOperationsTransport,
     ListenerOperationsAcceptedSocketLimit,
     ListenerOperationsPerAddressAcceptedSocketLimit,
+    ListenerOperationsTlsHandshakeLimit,
+    ListenerOperationsTlsHandshakeDeadlineSeconds,
+    ListenerOperationsHeaderDeadlineSeconds,
+    ListenerOperationsBodyDeadlineSeconds,
+    ListenerOperationsRequestDeadlineSeconds,
+    ListenerOperationsIdleDeadlineSeconds,
     ListenerOperationsTlsCertificateFile,
     ListenerOperationsTlsPrivateKeyFile,
     ListenerOperationsTlsClientCaFile,
@@ -234,6 +240,12 @@ pub enum FailureSource {
     ListenerApiTransport,
     ListenerApiAcceptedSocketLimit,
     ListenerApiPerAddressAcceptedSocketLimit,
+    ListenerApiTlsHandshakeLimit,
+    ListenerApiTlsHandshakeDeadlineSeconds,
+    ListenerApiHeaderDeadlineSeconds,
+    ListenerApiBodyDeadlineSeconds,
+    ListenerApiRequestDeadlineSeconds,
+    ListenerApiIdleDeadlineSeconds,
     ListenerApiTrustedProxyCidrs,
     ListenerApiForwardedHops,
     ListenerApiTlsCertificateFile,
@@ -243,6 +255,12 @@ pub enum FailureSource {
     ListenerOtlpGrpcTransport,
     ListenerOtlpGrpcAcceptedSocketLimit,
     ListenerOtlpGrpcPerAddressAcceptedSocketLimit,
+    ListenerOtlpGrpcTlsHandshakeLimit,
+    ListenerOtlpGrpcTlsHandshakeDeadlineSeconds,
+    ListenerOtlpGrpcHeaderDeadlineSeconds,
+    ListenerOtlpGrpcBodyDeadlineSeconds,
+    ListenerOtlpGrpcRequestDeadlineSeconds,
+    ListenerOtlpGrpcIdleDeadlineSeconds,
     ListenerOtlpGrpcTlsCertificateFile,
     ListenerOtlpGrpcTlsPrivateKeyFile,
     ListenerOtlpGrpcTlsClientCaFile,
@@ -252,6 +270,12 @@ pub enum FailureSource {
     ListenerOtlpHttpTransport,
     ListenerOtlpHttpAcceptedSocketLimit,
     ListenerOtlpHttpPerAddressAcceptedSocketLimit,
+    ListenerOtlpHttpTlsHandshakeLimit,
+    ListenerOtlpHttpTlsHandshakeDeadlineSeconds,
+    ListenerOtlpHttpHeaderDeadlineSeconds,
+    ListenerOtlpHttpBodyDeadlineSeconds,
+    ListenerOtlpHttpRequestDeadlineSeconds,
+    ListenerOtlpHttpIdleDeadlineSeconds,
     ListenerOtlpHttpTlsCertificateFile,
     ListenerOtlpHttpTlsPrivateKeyFile,
     ListenerOtlpHttpTlsClientCaFile,
@@ -261,6 +285,12 @@ pub enum FailureSource {
     ListenerLokiPushTransport,
     ListenerLokiPushAcceptedSocketLimit,
     ListenerLokiPushPerAddressAcceptedSocketLimit,
+    ListenerLokiPushTlsHandshakeLimit,
+    ListenerLokiPushTlsHandshakeDeadlineSeconds,
+    ListenerLokiPushHeaderDeadlineSeconds,
+    ListenerLokiPushBodyDeadlineSeconds,
+    ListenerLokiPushRequestDeadlineSeconds,
+    ListenerLokiPushIdleDeadlineSeconds,
     ListenerLokiPushTlsCertificateFile,
     ListenerLokiPushTlsPrivateKeyFile,
     ListenerLokiPushTlsClientCaFile,
@@ -292,6 +322,22 @@ impl FailureSource {
             Self::ListenerOperationsPerAddressAcceptedSocketLimit => {
                 "listener.operations_per_address_accepted_socket_limit"
             },
+            Self::ListenerOperationsTlsHandshakeLimit => "listener.operations_tls_handshake_limit",
+            Self::ListenerOperationsTlsHandshakeDeadlineSeconds => {
+                "listener.operations_tls_handshake_deadline_seconds"
+            },
+            Self::ListenerOperationsHeaderDeadlineSeconds => {
+                "listener.operations_header_deadline_seconds"
+            },
+            Self::ListenerOperationsBodyDeadlineSeconds => {
+                "listener.operations_body_deadline_seconds"
+            },
+            Self::ListenerOperationsRequestDeadlineSeconds => {
+                "listener.operations_request_deadline_seconds"
+            },
+            Self::ListenerOperationsIdleDeadlineSeconds => {
+                "listener.operations_idle_deadline_seconds"
+            },
             Self::ListenerOperationsTlsCertificateFile => {
                 "listener.operations_tls_certificate_file"
             },
@@ -305,6 +351,14 @@ impl FailureSource {
             Self::ListenerApiPerAddressAcceptedSocketLimit => {
                 "listener.api_per_address_accepted_socket_limit"
             },
+            Self::ListenerApiTlsHandshakeLimit => "listener.api_tls_handshake_limit",
+            Self::ListenerApiTlsHandshakeDeadlineSeconds => {
+                "listener.api_tls_handshake_deadline_seconds"
+            },
+            Self::ListenerApiHeaderDeadlineSeconds => "listener.api_header_deadline_seconds",
+            Self::ListenerApiBodyDeadlineSeconds => "listener.api_body_deadline_seconds",
+            Self::ListenerApiRequestDeadlineSeconds => "listener.api_request_deadline_seconds",
+            Self::ListenerApiIdleDeadlineSeconds => "listener.api_idle_deadline_seconds",
             Self::ListenerApiTrustedProxyCidrs => "listener.api.trusted_proxy_cidrs",
             Self::ListenerApiForwardedHops => "listener.api.forwarded_hops",
             Self::ListenerApiTlsCertificateFile => "listener.api_tls_certificate_file",
@@ -316,6 +370,18 @@ impl FailureSource {
             Self::ListenerOtlpGrpcPerAddressAcceptedSocketLimit => {
                 "listener.otlp_grpc_per_address_accepted_socket_limit"
             },
+            Self::ListenerOtlpGrpcTlsHandshakeLimit => "listener.otlp_grpc_tls_handshake_limit",
+            Self::ListenerOtlpGrpcTlsHandshakeDeadlineSeconds => {
+                "listener.otlp_grpc_tls_handshake_deadline_seconds"
+            },
+            Self::ListenerOtlpGrpcHeaderDeadlineSeconds => {
+                "listener.otlp_grpc_header_deadline_seconds"
+            },
+            Self::ListenerOtlpGrpcBodyDeadlineSeconds => "listener.otlp_grpc_body_deadline_seconds",
+            Self::ListenerOtlpGrpcRequestDeadlineSeconds => {
+                "listener.otlp_grpc_request_deadline_seconds"
+            },
+            Self::ListenerOtlpGrpcIdleDeadlineSeconds => "listener.otlp_grpc_idle_deadline_seconds",
             Self::ListenerOtlpGrpcTlsCertificateFile => "listener.otlp_grpc_tls_certificate_file",
             Self::ListenerOtlpGrpcTlsPrivateKeyFile => "listener.otlp_grpc_tls_private_key_file",
             Self::ListenerOtlpGrpcTlsClientCaFile => "listener.otlp_grpc_tls_client_ca_file",
@@ -327,6 +393,18 @@ impl FailureSource {
             Self::ListenerOtlpHttpPerAddressAcceptedSocketLimit => {
                 "listener.otlp_http_per_address_accepted_socket_limit"
             },
+            Self::ListenerOtlpHttpTlsHandshakeLimit => "listener.otlp_http_tls_handshake_limit",
+            Self::ListenerOtlpHttpTlsHandshakeDeadlineSeconds => {
+                "listener.otlp_http_tls_handshake_deadline_seconds"
+            },
+            Self::ListenerOtlpHttpHeaderDeadlineSeconds => {
+                "listener.otlp_http_header_deadline_seconds"
+            },
+            Self::ListenerOtlpHttpBodyDeadlineSeconds => "listener.otlp_http_body_deadline_seconds",
+            Self::ListenerOtlpHttpRequestDeadlineSeconds => {
+                "listener.otlp_http_request_deadline_seconds"
+            },
+            Self::ListenerOtlpHttpIdleDeadlineSeconds => "listener.otlp_http_idle_deadline_seconds",
             Self::ListenerOtlpHttpTlsCertificateFile => "listener.otlp_http_tls_certificate_file",
             Self::ListenerOtlpHttpTlsPrivateKeyFile => "listener.otlp_http_tls_private_key_file",
             Self::ListenerOtlpHttpTlsClientCaFile => "listener.otlp_http_tls_client_ca_file",
@@ -338,6 +416,18 @@ impl FailureSource {
             Self::ListenerLokiPushPerAddressAcceptedSocketLimit => {
                 "listener.loki_push_per_address_accepted_socket_limit"
             },
+            Self::ListenerLokiPushTlsHandshakeLimit => "listener.loki_push_tls_handshake_limit",
+            Self::ListenerLokiPushTlsHandshakeDeadlineSeconds => {
+                "listener.loki_push_tls_handshake_deadline_seconds"
+            },
+            Self::ListenerLokiPushHeaderDeadlineSeconds => {
+                "listener.loki_push_header_deadline_seconds"
+            },
+            Self::ListenerLokiPushBodyDeadlineSeconds => "listener.loki_push_body_deadline_seconds",
+            Self::ListenerLokiPushRequestDeadlineSeconds => {
+                "listener.loki_push_request_deadline_seconds"
+            },
+            Self::ListenerLokiPushIdleDeadlineSeconds => "listener.loki_push_idle_deadline_seconds",
             Self::ListenerLokiPushTlsCertificateFile => "listener.loki_push_tls_certificate_file",
             Self::ListenerLokiPushTlsPrivateKeyFile => "listener.loki_push_tls_private_key_file",
             Self::ListenerLokiPushTlsClientCaFile => "listener.loki_push_tls_client_ca_file",

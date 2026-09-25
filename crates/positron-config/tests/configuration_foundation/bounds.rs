@@ -81,6 +81,32 @@ fn accepted_socket_limits_reject_zero_out_of_range_and_per_address_over_global()
 }
 
 #[test]
+fn connection_protection_rejects_zero_and_overflow() {
+    for (document, source) in [
+        (
+            "schema_version = 1\n[listener]\napi_tls_handshake_limit = 0\n",
+            FailureSource::ListenerApiTlsHandshakeLimit,
+        ),
+        (
+            "schema_version = 1\n[listener]\napi_header_deadline_seconds = 0\n",
+            FailureSource::ListenerApiHeaderDeadlineSeconds,
+        ),
+        (
+            "schema_version = 1\n[listener]\napi_idle_deadline_seconds = 301\n",
+            FailureSource::ListenerApiIdleDeadlineSeconds,
+        ),
+    ] {
+        let result = inputs(Some(document), [], []).and_then(resolve);
+        assert!(matches!(
+            result,
+            Err(error)
+                if error.code() == ConfigurationFailureCode::UnsupportedValue
+                    && error.source() == source
+        ));
+    }
+}
+
+#[test]
 fn accepts_each_closed_value_and_exact_numeric_and_address_boundaries()
 -> Result<(), ConfigurationFailure> {
     for (value, expected) in [

@@ -24,7 +24,7 @@ pub use positron_domain::identity::TenantId;
 
 const MAX_CONFIGURATION_BYTES: usize = 16 * 1024;
 const MAX_OVERRIDE_PAIRS: usize = 16;
-const MAX_TOML_ENTRIES: usize = 64;
+const MAX_TOML_ENTRIES: usize = 96;
 const MAX_KEY_BYTES: usize = 64;
 const MAX_VALUE_BYTES: usize = 256;
 const MAX_CANDIDATE_TEMPORARY_ATTEMPTS: u64 = 32;
@@ -182,7 +182,7 @@ pub fn setting_for_path(path: &str) -> Option<Setting> {
 
 /// Returns the complete canonical contract in deterministic declaration order.
 #[must_use]
-pub const fn setting_definitions() -> [SettingDefinition; 54] {
+pub const fn setting_definitions() -> [SettingDefinition; 84] {
     contract::SETTING_DEFINITIONS
 }
 
@@ -200,6 +200,7 @@ struct Candidate {
     operations_transport: NetworkTransport,
     operations_accepted_socket_limit: NonZeroU16,
     operations_per_address_accepted_socket_limit: NonZeroU16,
+    operations_connection_protection: ConnectionProtectionProfile,
     operations_tls_certificate_file: ProtectedFileReference,
     operations_tls_private_key_file: ProtectedFileReference,
     operations_tls_client_ca_file: ProtectedFileReference,
@@ -209,6 +210,7 @@ struct Candidate {
     api_transport: ApiTransport,
     api_accepted_socket_limit: NonZeroU16,
     api_per_address_accepted_socket_limit: NonZeroU16,
+    api_connection_protection: ConnectionProtectionProfile,
     api_trusted_proxy_cidrs: Vec<String>,
     api_forwarded_hops: Option<NonZeroU8>,
     api_tls_certificate_file: ProtectedFileReference,
@@ -218,6 +220,7 @@ struct Candidate {
     otlp_grpc_transport: NetworkTransport,
     otlp_grpc_accepted_socket_limit: NonZeroU16,
     otlp_grpc_per_address_accepted_socket_limit: NonZeroU16,
+    otlp_grpc_connection_protection: ConnectionProtectionProfile,
     otlp_grpc_tls_certificate_file: ProtectedFileReference,
     otlp_grpc_tls_private_key_file: ProtectedFileReference,
     otlp_grpc_tls_client_ca_file: ProtectedFileReference,
@@ -227,6 +230,7 @@ struct Candidate {
     otlp_http_transport: NetworkTransport,
     otlp_http_accepted_socket_limit: NonZeroU16,
     otlp_http_per_address_accepted_socket_limit: NonZeroU16,
+    otlp_http_connection_protection: ConnectionProtectionProfile,
     otlp_http_tls_certificate_file: ProtectedFileReference,
     otlp_http_tls_private_key_file: ProtectedFileReference,
     otlp_http_tls_client_ca_file: ProtectedFileReference,
@@ -236,6 +240,7 @@ struct Candidate {
     loki_push_transport: NetworkTransport,
     loki_push_accepted_socket_limit: NonZeroU16,
     loki_push_per_address_accepted_socket_limit: NonZeroU16,
+    loki_push_connection_protection: ConnectionProtectionProfile,
     loki_push_tls_certificate_file: ProtectedFileReference,
     loki_push_tls_private_key_file: ProtectedFileReference,
     loki_push_tls_client_ca_file: ProtectedFileReference,
@@ -245,7 +250,7 @@ struct Candidate {
     secrets_directory: String,
     local_key_file: ProtectedFileReference,
     export_destinations: Vec<ExportDestinationDefinition>,
-    sources: [SettingSource; 54],
+    sources: [SettingSource; 84],
 }
 
 impl Candidate {
@@ -300,6 +305,14 @@ impl Candidate {
                     .default_value(),
                 Setting::ListenerOperationsPerAddressAcceptedSocketLimit,
             )?,
+            operations_connection_protection: default_connection_protection([
+                Setting::ListenerOperationsTlsHandshakeLimit,
+                Setting::ListenerOperationsTlsHandshakeDeadlineSeconds,
+                Setting::ListenerOperationsHeaderDeadlineSeconds,
+                Setting::ListenerOperationsBodyDeadlineSeconds,
+                Setting::ListenerOperationsRequestDeadlineSeconds,
+                Setting::ListenerOperationsIdleDeadlineSeconds,
+            ])?,
             operations_tls_certificate_file: default_protected_reference(
                 Setting::ListenerOperationsTlsCertificateFile,
             )?,
@@ -324,6 +337,14 @@ impl Candidate {
             )?,
             api_trusted_proxy_cidrs: Vec::new(),
             api_forwarded_hops: None,
+            api_connection_protection: default_connection_protection([
+                Setting::ListenerApiTlsHandshakeLimit,
+                Setting::ListenerApiTlsHandshakeDeadlineSeconds,
+                Setting::ListenerApiHeaderDeadlineSeconds,
+                Setting::ListenerApiBodyDeadlineSeconds,
+                Setting::ListenerApiRequestDeadlineSeconds,
+                Setting::ListenerApiIdleDeadlineSeconds,
+            ])?,
             api_tls_certificate_file: ProtectedFileReference::parse(
                 api_certificate,
                 Setting::ListenerApiTlsCertificateFile,
@@ -352,6 +373,14 @@ impl Candidate {
                     .default_value(),
                 Setting::ListenerOtlpGrpcPerAddressAcceptedSocketLimit,
             )?,
+            otlp_grpc_connection_protection: default_connection_protection([
+                Setting::ListenerOtlpGrpcTlsHandshakeLimit,
+                Setting::ListenerOtlpGrpcTlsHandshakeDeadlineSeconds,
+                Setting::ListenerOtlpGrpcHeaderDeadlineSeconds,
+                Setting::ListenerOtlpGrpcBodyDeadlineSeconds,
+                Setting::ListenerOtlpGrpcRequestDeadlineSeconds,
+                Setting::ListenerOtlpGrpcIdleDeadlineSeconds,
+            ])?,
             otlp_grpc_tls_certificate_file: default_protected_reference(
                 Setting::ListenerOtlpGrpcTlsCertificateFile,
             )?,
@@ -380,6 +409,14 @@ impl Candidate {
                     .default_value(),
                 Setting::ListenerOtlpHttpPerAddressAcceptedSocketLimit,
             )?,
+            otlp_http_connection_protection: default_connection_protection([
+                Setting::ListenerOtlpHttpTlsHandshakeLimit,
+                Setting::ListenerOtlpHttpTlsHandshakeDeadlineSeconds,
+                Setting::ListenerOtlpHttpHeaderDeadlineSeconds,
+                Setting::ListenerOtlpHttpBodyDeadlineSeconds,
+                Setting::ListenerOtlpHttpRequestDeadlineSeconds,
+                Setting::ListenerOtlpHttpIdleDeadlineSeconds,
+            ])?,
             otlp_http_tls_certificate_file: default_protected_reference(
                 Setting::ListenerOtlpHttpTlsCertificateFile,
             )?,
@@ -408,6 +445,14 @@ impl Candidate {
                     .default_value(),
                 Setting::ListenerLokiPushPerAddressAcceptedSocketLimit,
             )?,
+            loki_push_connection_protection: default_connection_protection([
+                Setting::ListenerLokiPushTlsHandshakeLimit,
+                Setting::ListenerLokiPushTlsHandshakeDeadlineSeconds,
+                Setting::ListenerLokiPushHeaderDeadlineSeconds,
+                Setting::ListenerLokiPushBodyDeadlineSeconds,
+                Setting::ListenerLokiPushRequestDeadlineSeconds,
+                Setting::ListenerLokiPushIdleDeadlineSeconds,
+            ])?,
             loki_push_tls_certificate_file: default_protected_reference(
                 Setting::ListenerLokiPushTlsCertificateFile,
             )?,
@@ -426,7 +471,7 @@ impl Candidate {
                 Setting::SecurityLocalKeyFile,
             )?,
             export_destinations: Vec::new(),
-            sources: [SettingSource::CompiledDefault; 54],
+            sources: [SettingSource::CompiledDefault; 84],
         })
     }
 
@@ -474,6 +519,31 @@ impl Candidate {
                 self.operations_per_address_accepted_socket_limit =
                     parse_accepted_socket_limit(value, setting)?;
             },
+            Setting::ListenerOperationsTlsHandshakeLimit => {
+                self.operations_connection_protection.tls_handshake_limit =
+                    parse_connection_protection_value(value, setting)?;
+            },
+            Setting::ListenerOperationsTlsHandshakeDeadlineSeconds => {
+                self.operations_connection_protection
+                    .tls_handshake_deadline_seconds =
+                    parse_connection_protection_value(value, setting)?;
+            },
+            Setting::ListenerOperationsHeaderDeadlineSeconds => {
+                self.operations_connection_protection
+                    .header_deadline_seconds = parse_connection_protection_value(value, setting)?;
+            },
+            Setting::ListenerOperationsBodyDeadlineSeconds => {
+                self.operations_connection_protection.body_deadline_seconds =
+                    parse_connection_protection_value(value, setting)?;
+            },
+            Setting::ListenerOperationsRequestDeadlineSeconds => {
+                self.operations_connection_protection
+                    .request_deadline_seconds = parse_connection_protection_value(value, setting)?;
+            },
+            Setting::ListenerOperationsIdleDeadlineSeconds => {
+                self.operations_connection_protection.idle_deadline_seconds =
+                    parse_connection_protection_value(value, setting)?;
+            },
             Setting::ListenerOperationsTlsCertificateFile => {
                 self.operations_tls_certificate_file =
                     ProtectedFileReference::parse(value, setting)?;
@@ -504,6 +574,31 @@ impl Candidate {
             Setting::ListenerApiForwardedHops => {
                 self.api_forwarded_hops = parse_forwarded_hops(value, setting)?;
             },
+            Setting::ListenerApiTlsHandshakeLimit => {
+                self.api_connection_protection.tls_handshake_limit =
+                    parse_connection_protection_value(value, setting)?;
+            },
+            Setting::ListenerApiTlsHandshakeDeadlineSeconds => {
+                self.api_connection_protection
+                    .tls_handshake_deadline_seconds =
+                    parse_connection_protection_value(value, setting)?;
+            },
+            Setting::ListenerApiHeaderDeadlineSeconds => {
+                self.api_connection_protection.header_deadline_seconds =
+                    parse_connection_protection_value(value, setting)?;
+            },
+            Setting::ListenerApiBodyDeadlineSeconds => {
+                self.api_connection_protection.body_deadline_seconds =
+                    parse_connection_protection_value(value, setting)?;
+            },
+            Setting::ListenerApiRequestDeadlineSeconds => {
+                self.api_connection_protection.request_deadline_seconds =
+                    parse_connection_protection_value(value, setting)?;
+            },
+            Setting::ListenerApiIdleDeadlineSeconds => {
+                self.api_connection_protection.idle_deadline_seconds =
+                    parse_connection_protection_value(value, setting)?;
+            },
             Setting::ListenerApiTlsCertificateFile => {
                 self.api_tls_certificate_file = ProtectedFileReference::parse(value, setting)?;
             },
@@ -526,6 +621,31 @@ impl Candidate {
             Setting::ListenerOtlpGrpcPerAddressAcceptedSocketLimit => {
                 self.otlp_grpc_per_address_accepted_socket_limit =
                     parse_accepted_socket_limit(value, setting)?;
+            },
+            Setting::ListenerOtlpGrpcTlsHandshakeLimit => {
+                self.otlp_grpc_connection_protection.tls_handshake_limit =
+                    parse_connection_protection_value(value, setting)?;
+            },
+            Setting::ListenerOtlpGrpcTlsHandshakeDeadlineSeconds => {
+                self.otlp_grpc_connection_protection
+                    .tls_handshake_deadline_seconds =
+                    parse_connection_protection_value(value, setting)?;
+            },
+            Setting::ListenerOtlpGrpcHeaderDeadlineSeconds => {
+                self.otlp_grpc_connection_protection.header_deadline_seconds =
+                    parse_connection_protection_value(value, setting)?;
+            },
+            Setting::ListenerOtlpGrpcBodyDeadlineSeconds => {
+                self.otlp_grpc_connection_protection.body_deadline_seconds =
+                    parse_connection_protection_value(value, setting)?;
+            },
+            Setting::ListenerOtlpGrpcRequestDeadlineSeconds => {
+                self.otlp_grpc_connection_protection
+                    .request_deadline_seconds = parse_connection_protection_value(value, setting)?;
+            },
+            Setting::ListenerOtlpGrpcIdleDeadlineSeconds => {
+                self.otlp_grpc_connection_protection.idle_deadline_seconds =
+                    parse_connection_protection_value(value, setting)?;
             },
             Setting::ListenerOtlpGrpcTlsCertificateFile => {
                 self.otlp_grpc_tls_certificate_file =
@@ -555,6 +675,31 @@ impl Candidate {
                 self.otlp_http_per_address_accepted_socket_limit =
                     parse_accepted_socket_limit(value, setting)?;
             },
+            Setting::ListenerOtlpHttpTlsHandshakeLimit => {
+                self.otlp_http_connection_protection.tls_handshake_limit =
+                    parse_connection_protection_value(value, setting)?;
+            },
+            Setting::ListenerOtlpHttpTlsHandshakeDeadlineSeconds => {
+                self.otlp_http_connection_protection
+                    .tls_handshake_deadline_seconds =
+                    parse_connection_protection_value(value, setting)?;
+            },
+            Setting::ListenerOtlpHttpHeaderDeadlineSeconds => {
+                self.otlp_http_connection_protection.header_deadline_seconds =
+                    parse_connection_protection_value(value, setting)?;
+            },
+            Setting::ListenerOtlpHttpBodyDeadlineSeconds => {
+                self.otlp_http_connection_protection.body_deadline_seconds =
+                    parse_connection_protection_value(value, setting)?;
+            },
+            Setting::ListenerOtlpHttpRequestDeadlineSeconds => {
+                self.otlp_http_connection_protection
+                    .request_deadline_seconds = parse_connection_protection_value(value, setting)?;
+            },
+            Setting::ListenerOtlpHttpIdleDeadlineSeconds => {
+                self.otlp_http_connection_protection.idle_deadline_seconds =
+                    parse_connection_protection_value(value, setting)?;
+            },
             Setting::ListenerOtlpHttpTlsCertificateFile => {
                 self.otlp_http_tls_certificate_file =
                     ProtectedFileReference::parse(value, setting)?;
@@ -582,6 +727,31 @@ impl Candidate {
             Setting::ListenerLokiPushPerAddressAcceptedSocketLimit => {
                 self.loki_push_per_address_accepted_socket_limit =
                     parse_accepted_socket_limit(value, setting)?;
+            },
+            Setting::ListenerLokiPushTlsHandshakeLimit => {
+                self.loki_push_connection_protection.tls_handshake_limit =
+                    parse_connection_protection_value(value, setting)?;
+            },
+            Setting::ListenerLokiPushTlsHandshakeDeadlineSeconds => {
+                self.loki_push_connection_protection
+                    .tls_handshake_deadline_seconds =
+                    parse_connection_protection_value(value, setting)?;
+            },
+            Setting::ListenerLokiPushHeaderDeadlineSeconds => {
+                self.loki_push_connection_protection.header_deadline_seconds =
+                    parse_connection_protection_value(value, setting)?;
+            },
+            Setting::ListenerLokiPushBodyDeadlineSeconds => {
+                self.loki_push_connection_protection.body_deadline_seconds =
+                    parse_connection_protection_value(value, setting)?;
+            },
+            Setting::ListenerLokiPushRequestDeadlineSeconds => {
+                self.loki_push_connection_protection
+                    .request_deadline_seconds = parse_connection_protection_value(value, setting)?;
+            },
+            Setting::ListenerLokiPushIdleDeadlineSeconds => {
+                self.loki_push_connection_protection.idle_deadline_seconds =
+                    parse_connection_protection_value(value, setting)?;
             },
             Setting::ListenerLokiPushTlsCertificateFile => {
                 self.loki_push_tls_certificate_file =
@@ -750,6 +920,7 @@ impl Candidate {
             operations_accepted_socket_limit: self.operations_accepted_socket_limit,
             operations_per_address_accepted_socket_limit: self
                 .operations_per_address_accepted_socket_limit,
+            operations_connection_protection: self.operations_connection_protection,
             operations_tls_certificate_file: self.operations_tls_certificate_file,
             operations_tls_private_key_file: self.operations_tls_private_key_file,
             operations_tls_client_ca_file: self.operations_tls_client_ca_file,
@@ -761,6 +932,7 @@ impl Candidate {
             api_per_address_accepted_socket_limit: self.api_per_address_accepted_socket_limit,
             api_trusted_proxy_cidrs: self.api_trusted_proxy_cidrs,
             api_forwarded_hops: self.api_forwarded_hops,
+            api_connection_protection: self.api_connection_protection,
             api_tls_certificate_file: self.api_tls_certificate_file,
             api_tls_private_key_file: self.api_tls_private_key_file,
             api_tls_client_ca_file: self.api_tls_client_ca_file,
@@ -769,6 +941,7 @@ impl Candidate {
             otlp_grpc_accepted_socket_limit: self.otlp_grpc_accepted_socket_limit,
             otlp_grpc_per_address_accepted_socket_limit: self
                 .otlp_grpc_per_address_accepted_socket_limit,
+            otlp_grpc_connection_protection: self.otlp_grpc_connection_protection,
             otlp_grpc_tls_certificate_file: self.otlp_grpc_tls_certificate_file,
             otlp_grpc_tls_private_key_file: self.otlp_grpc_tls_private_key_file,
             otlp_grpc_tls_client_ca_file: self.otlp_grpc_tls_client_ca_file,
@@ -779,6 +952,7 @@ impl Candidate {
             otlp_http_accepted_socket_limit: self.otlp_http_accepted_socket_limit,
             otlp_http_per_address_accepted_socket_limit: self
                 .otlp_http_per_address_accepted_socket_limit,
+            otlp_http_connection_protection: self.otlp_http_connection_protection,
             otlp_http_tls_certificate_file: self.otlp_http_tls_certificate_file,
             otlp_http_tls_private_key_file: self.otlp_http_tls_private_key_file,
             otlp_http_tls_client_ca_file: self.otlp_http_tls_client_ca_file,
@@ -789,6 +963,7 @@ impl Candidate {
             loki_push_accepted_socket_limit: self.loki_push_accepted_socket_limit,
             loki_push_per_address_accepted_socket_limit: self
                 .loki_push_per_address_accepted_socket_limit,
+            loki_push_connection_protection: self.loki_push_connection_protection,
             loki_push_tls_certificate_file: self.loki_push_tls_certificate_file,
             loki_push_tls_private_key_file: self.loki_push_tls_private_key_file,
             loki_push_tls_client_ca_file: self.loki_push_tls_client_ca_file,
@@ -861,6 +1036,66 @@ fn parse_max_registered_tenants(value: &str) -> Result<u16, ConfigurationFailure
         ));
     }
     Ok(tenants)
+}
+
+fn default_connection_protection(
+    settings: [Setting; 6],
+) -> Result<ConnectionProtectionProfile, ConfigurationFailure> {
+    let [
+        tls_handshake_limit,
+        tls_handshake_deadline_seconds,
+        header_deadline_seconds,
+        body_deadline_seconds,
+        request_deadline_seconds,
+        idle_deadline_seconds,
+    ] = settings;
+    Ok(ConnectionProtectionProfile {
+        tls_handshake_limit: parse_connection_protection_value(
+            setting_definition(tls_handshake_limit).default_value(),
+            tls_handshake_limit,
+        )?,
+        tls_handshake_deadline_seconds: parse_connection_protection_value(
+            setting_definition(tls_handshake_deadline_seconds).default_value(),
+            tls_handshake_deadline_seconds,
+        )?,
+        header_deadline_seconds: parse_connection_protection_value(
+            setting_definition(header_deadline_seconds).default_value(),
+            header_deadline_seconds,
+        )?,
+        body_deadline_seconds: parse_connection_protection_value(
+            setting_definition(body_deadline_seconds).default_value(),
+            body_deadline_seconds,
+        )?,
+        request_deadline_seconds: parse_connection_protection_value(
+            setting_definition(request_deadline_seconds).default_value(),
+            request_deadline_seconds,
+        )?,
+        idle_deadline_seconds: parse_connection_protection_value(
+            setting_definition(idle_deadline_seconds).default_value(),
+            idle_deadline_seconds,
+        )?,
+    })
+}
+
+fn parse_connection_protection_value(
+    value: &str,
+    setting: Setting,
+) -> Result<NonZeroU16, ConfigurationFailure> {
+    let value = parse_canonical_u16(value, failure_source(setting))?;
+    let ValueDomain::UnsignedIntegerRange(minimum, maximum) = setting_definition(setting).domain()
+    else {
+        return Err(ConfigurationFailure::new(
+            ConfigurationFailureCode::Malformed,
+            failure_source(setting),
+        ));
+    };
+    if !(minimum..=maximum).contains(&value) {
+        return Err(ConfigurationFailure::unsupported_value(failure_source(
+            setting,
+        )));
+    }
+    NonZeroU16::new(value)
+        .ok_or_else(|| ConfigurationFailure::unsupported_value(failure_source(setting)))
 }
 
 fn parse_accepted_socket_limit(
@@ -1080,62 +1315,7 @@ fn validate_path(value: &str, setting: Setting) -> Result<(), ConfigurationFailu
 }
 
 const fn setting_index(setting: Setting) -> usize {
-    match setting {
-        Setting::SchemaVersion => 0,
-        Setting::DiagnosticsLogLevel => 1,
-        Setting::RuntimeShutdownGraceSeconds => 2,
-        Setting::RuntimeMaxRegisteredTenants => 3,
-        Setting::ListenerControlPath => 4,
-        Setting::ListenerOperationsBindAddress => 5,
-        Setting::ListenerOperationsTransport => 6,
-        Setting::ListenerOperationsAcceptedSocketLimit => 7,
-        Setting::ListenerOperationsPerAddressAcceptedSocketLimit => 8,
-        Setting::ListenerOperationsTlsCertificateFile => 9,
-        Setting::ListenerOperationsTlsPrivateKeyFile => 10,
-        Setting::ListenerOperationsTlsClientCaFile => 11,
-        Setting::ListenerOperationsTrustedProxyCidrs => 12,
-        Setting::ListenerOperationsForwardedHops => 13,
-        Setting::ListenerApiBindAddress => 14,
-        Setting::ListenerApiTransport => 15,
-        Setting::ListenerApiAcceptedSocketLimit => 16,
-        Setting::ListenerApiPerAddressAcceptedSocketLimit => 17,
-        Setting::ListenerApiTrustedProxyCidrs => 18,
-        Setting::ListenerApiForwardedHops => 19,
-        Setting::ListenerApiTlsCertificateFile => 20,
-        Setting::ListenerApiTlsPrivateKeyFile => 21,
-        Setting::ListenerApiTlsClientCaFile => 22,
-        Setting::ListenerOtlpGrpcBindAddress => 23,
-        Setting::ListenerOtlpGrpcTransport => 24,
-        Setting::ListenerOtlpGrpcAcceptedSocketLimit => 25,
-        Setting::ListenerOtlpGrpcPerAddressAcceptedSocketLimit => 26,
-        Setting::ListenerOtlpGrpcTlsCertificateFile => 27,
-        Setting::ListenerOtlpGrpcTlsPrivateKeyFile => 28,
-        Setting::ListenerOtlpGrpcTlsClientCaFile => 29,
-        Setting::ListenerOtlpGrpcTrustedProxyCidrs => 30,
-        Setting::ListenerOtlpGrpcForwardedHops => 31,
-        Setting::ListenerOtlpHttpBindAddress => 32,
-        Setting::ListenerOtlpHttpTransport => 33,
-        Setting::ListenerOtlpHttpAcceptedSocketLimit => 34,
-        Setting::ListenerOtlpHttpPerAddressAcceptedSocketLimit => 35,
-        Setting::ListenerOtlpHttpTlsCertificateFile => 36,
-        Setting::ListenerOtlpHttpTlsPrivateKeyFile => 37,
-        Setting::ListenerOtlpHttpTlsClientCaFile => 38,
-        Setting::ListenerOtlpHttpTrustedProxyCidrs => 39,
-        Setting::ListenerOtlpHttpForwardedHops => 40,
-        Setting::ListenerLokiPushBindAddress => 41,
-        Setting::ListenerLokiPushTransport => 42,
-        Setting::ListenerLokiPushAcceptedSocketLimit => 43,
-        Setting::ListenerLokiPushPerAddressAcceptedSocketLimit => 44,
-        Setting::ListenerLokiPushTlsCertificateFile => 45,
-        Setting::ListenerLokiPushTlsPrivateKeyFile => 46,
-        Setting::ListenerLokiPushTlsClientCaFile => 47,
-        Setting::ListenerLokiPushTrustedProxyCidrs => 48,
-        Setting::ListenerLokiPushForwardedHops => 49,
-        Setting::StorageDataDirectory => 50,
-        Setting::StorageSecretsDirectory => 51,
-        Setting::SecurityLocalKeyFile => 52,
-        Setting::ExportDestinations => 53,
-    }
+    setting as usize
 }
 
 const fn failure_source(setting: Setting) -> FailureSource {
@@ -1152,6 +1332,24 @@ const fn failure_source(setting: Setting) -> FailureSource {
         },
         Setting::ListenerOperationsPerAddressAcceptedSocketLimit => {
             FailureSource::ListenerOperationsPerAddressAcceptedSocketLimit
+        },
+        Setting::ListenerOperationsTlsHandshakeLimit => {
+            FailureSource::ListenerOperationsTlsHandshakeLimit
+        },
+        Setting::ListenerOperationsTlsHandshakeDeadlineSeconds => {
+            FailureSource::ListenerOperationsTlsHandshakeDeadlineSeconds
+        },
+        Setting::ListenerOperationsHeaderDeadlineSeconds => {
+            FailureSource::ListenerOperationsHeaderDeadlineSeconds
+        },
+        Setting::ListenerOperationsBodyDeadlineSeconds => {
+            FailureSource::ListenerOperationsBodyDeadlineSeconds
+        },
+        Setting::ListenerOperationsRequestDeadlineSeconds => {
+            FailureSource::ListenerOperationsRequestDeadlineSeconds
+        },
+        Setting::ListenerOperationsIdleDeadlineSeconds => {
+            FailureSource::ListenerOperationsIdleDeadlineSeconds
         },
         Setting::ListenerOperationsTlsCertificateFile => {
             FailureSource::ListenerOperationsTlsCertificateFile
@@ -1172,6 +1370,18 @@ const fn failure_source(setting: Setting) -> FailureSource {
         Setting::ListenerApiPerAddressAcceptedSocketLimit => {
             FailureSource::ListenerApiPerAddressAcceptedSocketLimit
         },
+        Setting::ListenerApiTlsHandshakeLimit => FailureSource::ListenerApiTlsHandshakeLimit,
+        Setting::ListenerApiTlsHandshakeDeadlineSeconds => {
+            FailureSource::ListenerApiTlsHandshakeDeadlineSeconds
+        },
+        Setting::ListenerApiHeaderDeadlineSeconds => {
+            FailureSource::ListenerApiHeaderDeadlineSeconds
+        },
+        Setting::ListenerApiBodyDeadlineSeconds => FailureSource::ListenerApiBodyDeadlineSeconds,
+        Setting::ListenerApiRequestDeadlineSeconds => {
+            FailureSource::ListenerApiRequestDeadlineSeconds
+        },
+        Setting::ListenerApiIdleDeadlineSeconds => FailureSource::ListenerApiIdleDeadlineSeconds,
         Setting::ListenerApiTrustedProxyCidrs => FailureSource::ListenerApiTrustedProxyCidrs,
         Setting::ListenerApiForwardedHops => FailureSource::ListenerApiForwardedHops,
         Setting::ListenerApiTlsCertificateFile => FailureSource::ListenerApiTlsCertificateFile,
@@ -1184,6 +1394,24 @@ const fn failure_source(setting: Setting) -> FailureSource {
         },
         Setting::ListenerOtlpGrpcPerAddressAcceptedSocketLimit => {
             FailureSource::ListenerOtlpGrpcPerAddressAcceptedSocketLimit
+        },
+        Setting::ListenerOtlpGrpcTlsHandshakeLimit => {
+            FailureSource::ListenerOtlpGrpcTlsHandshakeLimit
+        },
+        Setting::ListenerOtlpGrpcTlsHandshakeDeadlineSeconds => {
+            FailureSource::ListenerOtlpGrpcTlsHandshakeDeadlineSeconds
+        },
+        Setting::ListenerOtlpGrpcHeaderDeadlineSeconds => {
+            FailureSource::ListenerOtlpGrpcHeaderDeadlineSeconds
+        },
+        Setting::ListenerOtlpGrpcBodyDeadlineSeconds => {
+            FailureSource::ListenerOtlpGrpcBodyDeadlineSeconds
+        },
+        Setting::ListenerOtlpGrpcRequestDeadlineSeconds => {
+            FailureSource::ListenerOtlpGrpcRequestDeadlineSeconds
+        },
+        Setting::ListenerOtlpGrpcIdleDeadlineSeconds => {
+            FailureSource::ListenerOtlpGrpcIdleDeadlineSeconds
         },
         Setting::ListenerOtlpGrpcTlsCertificateFile => {
             FailureSource::ListenerOtlpGrpcTlsCertificateFile
@@ -1204,6 +1432,24 @@ const fn failure_source(setting: Setting) -> FailureSource {
         Setting::ListenerOtlpHttpPerAddressAcceptedSocketLimit => {
             FailureSource::ListenerOtlpHttpPerAddressAcceptedSocketLimit
         },
+        Setting::ListenerOtlpHttpTlsHandshakeLimit => {
+            FailureSource::ListenerOtlpHttpTlsHandshakeLimit
+        },
+        Setting::ListenerOtlpHttpTlsHandshakeDeadlineSeconds => {
+            FailureSource::ListenerOtlpHttpTlsHandshakeDeadlineSeconds
+        },
+        Setting::ListenerOtlpHttpHeaderDeadlineSeconds => {
+            FailureSource::ListenerOtlpHttpHeaderDeadlineSeconds
+        },
+        Setting::ListenerOtlpHttpBodyDeadlineSeconds => {
+            FailureSource::ListenerOtlpHttpBodyDeadlineSeconds
+        },
+        Setting::ListenerOtlpHttpRequestDeadlineSeconds => {
+            FailureSource::ListenerOtlpHttpRequestDeadlineSeconds
+        },
+        Setting::ListenerOtlpHttpIdleDeadlineSeconds => {
+            FailureSource::ListenerOtlpHttpIdleDeadlineSeconds
+        },
         Setting::ListenerOtlpHttpTlsCertificateFile => {
             FailureSource::ListenerOtlpHttpTlsCertificateFile
         },
@@ -1222,6 +1468,24 @@ const fn failure_source(setting: Setting) -> FailureSource {
         },
         Setting::ListenerLokiPushPerAddressAcceptedSocketLimit => {
             FailureSource::ListenerLokiPushPerAddressAcceptedSocketLimit
+        },
+        Setting::ListenerLokiPushTlsHandshakeLimit => {
+            FailureSource::ListenerLokiPushTlsHandshakeLimit
+        },
+        Setting::ListenerLokiPushTlsHandshakeDeadlineSeconds => {
+            FailureSource::ListenerLokiPushTlsHandshakeDeadlineSeconds
+        },
+        Setting::ListenerLokiPushHeaderDeadlineSeconds => {
+            FailureSource::ListenerLokiPushHeaderDeadlineSeconds
+        },
+        Setting::ListenerLokiPushBodyDeadlineSeconds => {
+            FailureSource::ListenerLokiPushBodyDeadlineSeconds
+        },
+        Setting::ListenerLokiPushRequestDeadlineSeconds => {
+            FailureSource::ListenerLokiPushRequestDeadlineSeconds
+        },
+        Setting::ListenerLokiPushIdleDeadlineSeconds => {
+            FailureSource::ListenerLokiPushIdleDeadlineSeconds
         },
         Setting::ListenerLokiPushTlsCertificateFile => {
             FailureSource::ListenerLokiPushTlsCertificateFile

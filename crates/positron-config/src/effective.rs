@@ -1,6 +1,7 @@
 use std::fmt::{Debug, Formatter};
 use std::net::SocketAddr;
 use std::num::{NonZeroU8, NonZeroU16};
+use std::time::Duration;
 
 use positron_domain::identity::TenantId;
 use sha2::{Digest, Sha256};
@@ -49,6 +50,7 @@ pub struct NetworkListenerProfile<'a> {
     trusted_proxy_cidrs: &'a [String],
     forwarded_hops: Option<NonZeroU8>,
     connection_admission: ConnectionAdmissionProfile,
+    connection_protection: ConnectionProtectionProfile,
 }
 
 /// The bounded pre-authentication accepted-socket policy for one network listener.
@@ -67,6 +69,44 @@ impl ConnectionAdmissionProfile {
     #[must_use]
     pub const fn per_address_accepted_socket_limit(self) -> NonZeroU16 {
         self.per_address_accepted_socket_limit
+    }
+}
+
+/// The bounded pre-authentication handshake and deadline policy for one network listener.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConnectionProtectionProfile {
+    pub(crate) tls_handshake_limit: NonZeroU16,
+    pub(crate) tls_handshake_deadline_seconds: NonZeroU16,
+    pub(crate) header_deadline_seconds: NonZeroU16,
+    pub(crate) body_deadline_seconds: NonZeroU16,
+    pub(crate) request_deadline_seconds: NonZeroU16,
+    pub(crate) idle_deadline_seconds: NonZeroU16,
+}
+
+impl ConnectionProtectionProfile {
+    #[must_use]
+    pub const fn tls_handshake_limit(self) -> NonZeroU16 {
+        self.tls_handshake_limit
+    }
+    #[must_use]
+    pub const fn tls_handshake_deadline(self) -> Duration {
+        Duration::from_secs(self.tls_handshake_deadline_seconds.get() as u64)
+    }
+    #[must_use]
+    pub const fn header_deadline(self) -> Duration {
+        Duration::from_secs(self.header_deadline_seconds.get() as u64)
+    }
+    #[must_use]
+    pub const fn body_deadline(self) -> Duration {
+        Duration::from_secs(self.body_deadline_seconds.get() as u64)
+    }
+    #[must_use]
+    pub const fn request_deadline(self) -> Duration {
+        Duration::from_secs(self.request_deadline_seconds.get() as u64)
+    }
+    #[must_use]
+    pub const fn idle_deadline(self) -> Duration {
+        Duration::from_secs(self.idle_deadline_seconds.get() as u64)
     }
 }
 
@@ -106,6 +146,10 @@ impl NetworkListenerProfile<'_> {
     #[must_use]
     pub const fn connection_admission(&self) -> ConnectionAdmissionProfile {
         self.connection_admission
+    }
+    #[must_use]
+    pub const fn connection_protection(&self) -> ConnectionProtectionProfile {
+        self.connection_protection
     }
 }
 
@@ -181,6 +225,7 @@ pub struct EffectiveConfiguration {
     pub(crate) operations_transport: NetworkTransport,
     pub(crate) operations_accepted_socket_limit: NonZeroU16,
     pub(crate) operations_per_address_accepted_socket_limit: NonZeroU16,
+    pub(crate) operations_connection_protection: ConnectionProtectionProfile,
     pub(crate) operations_tls_certificate_file: ProtectedFileReference,
     pub(crate) operations_tls_private_key_file: ProtectedFileReference,
     pub(crate) operations_tls_client_ca_file: ProtectedFileReference,
@@ -190,6 +235,7 @@ pub struct EffectiveConfiguration {
     pub(crate) api_transport: ApiTransport,
     pub(crate) api_accepted_socket_limit: NonZeroU16,
     pub(crate) api_per_address_accepted_socket_limit: NonZeroU16,
+    pub(crate) api_connection_protection: ConnectionProtectionProfile,
     pub(crate) api_trusted_proxy_cidrs: Vec<String>,
     pub(crate) api_forwarded_hops: Option<NonZeroU8>,
     pub(crate) api_tls_certificate_file: ProtectedFileReference,
@@ -199,6 +245,7 @@ pub struct EffectiveConfiguration {
     pub(crate) otlp_grpc_transport: NetworkTransport,
     pub(crate) otlp_grpc_accepted_socket_limit: NonZeroU16,
     pub(crate) otlp_grpc_per_address_accepted_socket_limit: NonZeroU16,
+    pub(crate) otlp_grpc_connection_protection: ConnectionProtectionProfile,
     pub(crate) otlp_grpc_tls_certificate_file: ProtectedFileReference,
     pub(crate) otlp_grpc_tls_private_key_file: ProtectedFileReference,
     pub(crate) otlp_grpc_tls_client_ca_file: ProtectedFileReference,
@@ -208,6 +255,7 @@ pub struct EffectiveConfiguration {
     pub(crate) otlp_http_transport: NetworkTransport,
     pub(crate) otlp_http_accepted_socket_limit: NonZeroU16,
     pub(crate) otlp_http_per_address_accepted_socket_limit: NonZeroU16,
+    pub(crate) otlp_http_connection_protection: ConnectionProtectionProfile,
     pub(crate) otlp_http_tls_certificate_file: ProtectedFileReference,
     pub(crate) otlp_http_tls_private_key_file: ProtectedFileReference,
     pub(crate) otlp_http_tls_client_ca_file: ProtectedFileReference,
@@ -217,6 +265,7 @@ pub struct EffectiveConfiguration {
     pub(crate) loki_push_transport: NetworkTransport,
     pub(crate) loki_push_accepted_socket_limit: NonZeroU16,
     pub(crate) loki_push_per_address_accepted_socket_limit: NonZeroU16,
+    pub(crate) loki_push_connection_protection: ConnectionProtectionProfile,
     pub(crate) loki_push_tls_certificate_file: ProtectedFileReference,
     pub(crate) loki_push_tls_private_key_file: ProtectedFileReference,
     pub(crate) loki_push_tls_client_ca_file: ProtectedFileReference,
@@ -226,7 +275,7 @@ pub struct EffectiveConfiguration {
     pub(crate) secrets_directory: String,
     pub(crate) local_key_file: ProtectedFileReference,
     pub(crate) export_destinations: Vec<ExportDestinationDefinition>,
-    pub(crate) sources: [SettingSource; 54],
+    pub(crate) sources: [SettingSource; 84],
 }
 
 impl EffectiveConfiguration {
@@ -277,6 +326,7 @@ impl EffectiveConfiguration {
             forwarded_hops,
             global_accepted_socket_limit,
             per_address_accepted_socket_limit,
+            connection_protection,
         ) = match role {
             NetworkListenerRole::Operations => (
                 self.operations_bind_address,
@@ -288,6 +338,7 @@ impl EffectiveConfiguration {
                 self.operations_forwarded_hops,
                 self.operations_accepted_socket_limit,
                 self.operations_per_address_accepted_socket_limit,
+                self.operations_connection_protection,
             ),
             NetworkListenerRole::Api => (
                 self.api_bind_address,
@@ -303,6 +354,7 @@ impl EffectiveConfiguration {
                 self.api_forwarded_hops,
                 self.api_accepted_socket_limit,
                 self.api_per_address_accepted_socket_limit,
+                self.api_connection_protection,
             ),
             NetworkListenerRole::OtlpGrpc => (
                 self.otlp_grpc_bind_address,
@@ -314,6 +366,7 @@ impl EffectiveConfiguration {
                 self.otlp_grpc_forwarded_hops,
                 self.otlp_grpc_accepted_socket_limit,
                 self.otlp_grpc_per_address_accepted_socket_limit,
+                self.otlp_grpc_connection_protection,
             ),
             NetworkListenerRole::OtlpHttp => (
                 self.otlp_http_bind_address,
@@ -325,6 +378,7 @@ impl EffectiveConfiguration {
                 self.otlp_http_forwarded_hops,
                 self.otlp_http_accepted_socket_limit,
                 self.otlp_http_per_address_accepted_socket_limit,
+                self.otlp_http_connection_protection,
             ),
             NetworkListenerRole::LokiPush => (
                 self.loki_push_bind_address,
@@ -336,6 +390,7 @@ impl EffectiveConfiguration {
                 self.loki_push_forwarded_hops,
                 self.loki_push_accepted_socket_limit,
                 self.loki_push_per_address_accepted_socket_limit,
+                self.loki_push_connection_protection,
             ),
         };
         Some(NetworkListenerProfile {
@@ -352,6 +407,7 @@ impl EffectiveConfiguration {
                 global_accepted_socket_limit,
                 per_address_accepted_socket_limit,
             },
+            connection_protection,
         })
     }
 
@@ -589,6 +645,11 @@ impl EffectiveConfiguration {
             self.operations_accepted_socket_limit,
             self.operations_per_address_accepted_socket_limit,
         );
+        append_connection_protection_reference(
+            &mut rendered,
+            "operations",
+            self.operations_connection_protection,
+        );
         append_redacted_listener_tls_references(&mut rendered, "operations");
         rendered.push_str("\napi_bind_address = ");
         rendered.push_str(&super::render_toml_basic_string(
@@ -603,6 +664,11 @@ impl EffectiveConfiguration {
             "api",
             self.api_accepted_socket_limit,
             self.api_per_address_accepted_socket_limit,
+        );
+        append_connection_protection_reference(
+            &mut rendered,
+            "api",
+            self.api_connection_protection,
         );
         append_redacted_listener_tls_references(&mut rendered, "api");
         rendered.push_str("\notlp_grpc_bind_address = ");
@@ -619,6 +685,11 @@ impl EffectiveConfiguration {
             self.otlp_grpc_accepted_socket_limit,
             self.otlp_grpc_per_address_accepted_socket_limit,
         );
+        append_connection_protection_reference(
+            &mut rendered,
+            "otlp_grpc",
+            self.otlp_grpc_connection_protection,
+        );
         append_redacted_listener_tls_references(&mut rendered, "otlp_grpc");
         rendered.push_str("\notlp_http_bind_address = ");
         rendered.push_str(&super::render_toml_basic_string(
@@ -634,6 +705,11 @@ impl EffectiveConfiguration {
             self.otlp_http_accepted_socket_limit,
             self.otlp_http_per_address_accepted_socket_limit,
         );
+        append_connection_protection_reference(
+            &mut rendered,
+            "otlp_http",
+            self.otlp_http_connection_protection,
+        );
         append_redacted_listener_tls_references(&mut rendered, "otlp_http");
         rendered.push_str("\nloki_push_bind_address = ");
         rendered.push_str(&super::render_toml_basic_string(
@@ -648,6 +724,11 @@ impl EffectiveConfiguration {
             "loki_push",
             self.loki_push_accepted_socket_limit,
             self.loki_push_per_address_accepted_socket_limit,
+        );
+        append_connection_protection_reference(
+            &mut rendered,
+            "loki_push",
+            self.loki_push_connection_protection,
         );
         append_redacted_listener_tls_references(&mut rendered, "loki_push");
         append_proxy_trust_reference(
@@ -797,6 +878,36 @@ impl EffectiveConfiguration {
                 | Setting::ListenerLokiPushTlsClientCaFile
                 | Setting::ListenerLokiPushTrustedProxyCidrs
                 | Setting::ListenerLokiPushForwardedHops
+                | Setting::ListenerOperationsTlsHandshakeLimit
+                | Setting::ListenerOperationsTlsHandshakeDeadlineSeconds
+                | Setting::ListenerOperationsHeaderDeadlineSeconds
+                | Setting::ListenerOperationsBodyDeadlineSeconds
+                | Setting::ListenerOperationsRequestDeadlineSeconds
+                | Setting::ListenerOperationsIdleDeadlineSeconds
+                | Setting::ListenerApiTlsHandshakeLimit
+                | Setting::ListenerApiTlsHandshakeDeadlineSeconds
+                | Setting::ListenerApiHeaderDeadlineSeconds
+                | Setting::ListenerApiBodyDeadlineSeconds
+                | Setting::ListenerApiRequestDeadlineSeconds
+                | Setting::ListenerApiIdleDeadlineSeconds
+                | Setting::ListenerOtlpGrpcTlsHandshakeLimit
+                | Setting::ListenerOtlpGrpcTlsHandshakeDeadlineSeconds
+                | Setting::ListenerOtlpGrpcHeaderDeadlineSeconds
+                | Setting::ListenerOtlpGrpcBodyDeadlineSeconds
+                | Setting::ListenerOtlpGrpcRequestDeadlineSeconds
+                | Setting::ListenerOtlpGrpcIdleDeadlineSeconds
+                | Setting::ListenerOtlpHttpTlsHandshakeLimit
+                | Setting::ListenerOtlpHttpTlsHandshakeDeadlineSeconds
+                | Setting::ListenerOtlpHttpHeaderDeadlineSeconds
+                | Setting::ListenerOtlpHttpBodyDeadlineSeconds
+                | Setting::ListenerOtlpHttpRequestDeadlineSeconds
+                | Setting::ListenerOtlpHttpIdleDeadlineSeconds
+                | Setting::ListenerLokiPushTlsHandshakeLimit
+                | Setting::ListenerLokiPushTlsHandshakeDeadlineSeconds
+                | Setting::ListenerLokiPushHeaderDeadlineSeconds
+                | Setting::ListenerLokiPushBodyDeadlineSeconds
+                | Setting::ListenerLokiPushRequestDeadlineSeconds
+                | Setting::ListenerLokiPushIdleDeadlineSeconds
                 | Setting::StorageDataDirectory
                 | Setting::StorageSecretsDirectory
                 | Setting::SecurityLocalKeyFile
@@ -953,6 +1064,162 @@ impl EffectiveConfiguration {
             Setting::ListenerLokiPushForwardedHops => {
                 self.loki_push_forwarded_hops != other.loki_push_forwarded_hops
             },
+            Setting::ListenerOperationsTlsHandshakeLimit => {
+                self.operations_connection_protection.tls_handshake_limit
+                    != other.operations_connection_protection.tls_handshake_limit
+            },
+            Setting::ListenerOperationsTlsHandshakeDeadlineSeconds => {
+                self.operations_connection_protection
+                    .tls_handshake_deadline_seconds
+                    != other
+                        .operations_connection_protection
+                        .tls_handshake_deadline_seconds
+            },
+            Setting::ListenerOperationsHeaderDeadlineSeconds => {
+                self.operations_connection_protection
+                    .header_deadline_seconds
+                    != other
+                        .operations_connection_protection
+                        .header_deadline_seconds
+            },
+            Setting::ListenerOperationsBodyDeadlineSeconds => {
+                self.operations_connection_protection.body_deadline_seconds
+                    != other.operations_connection_protection.body_deadline_seconds
+            },
+            Setting::ListenerOperationsRequestDeadlineSeconds => {
+                self.operations_connection_protection
+                    .request_deadline_seconds
+                    != other
+                        .operations_connection_protection
+                        .request_deadline_seconds
+            },
+            Setting::ListenerOperationsIdleDeadlineSeconds => {
+                self.operations_connection_protection.idle_deadline_seconds
+                    != other.operations_connection_protection.idle_deadline_seconds
+            },
+            Setting::ListenerApiTlsHandshakeLimit => {
+                self.api_connection_protection.tls_handshake_limit
+                    != other.api_connection_protection.tls_handshake_limit
+            },
+            Setting::ListenerApiTlsHandshakeDeadlineSeconds => {
+                self.api_connection_protection
+                    .tls_handshake_deadline_seconds
+                    != other
+                        .api_connection_protection
+                        .tls_handshake_deadline_seconds
+            },
+            Setting::ListenerApiHeaderDeadlineSeconds => {
+                self.api_connection_protection.header_deadline_seconds
+                    != other.api_connection_protection.header_deadline_seconds
+            },
+            Setting::ListenerApiBodyDeadlineSeconds => {
+                self.api_connection_protection.body_deadline_seconds
+                    != other.api_connection_protection.body_deadline_seconds
+            },
+            Setting::ListenerApiRequestDeadlineSeconds => {
+                self.api_connection_protection.request_deadline_seconds
+                    != other.api_connection_protection.request_deadline_seconds
+            },
+            Setting::ListenerApiIdleDeadlineSeconds => {
+                self.api_connection_protection.idle_deadline_seconds
+                    != other.api_connection_protection.idle_deadline_seconds
+            },
+            Setting::ListenerOtlpGrpcTlsHandshakeLimit => {
+                self.otlp_grpc_connection_protection.tls_handshake_limit
+                    != other.otlp_grpc_connection_protection.tls_handshake_limit
+            },
+            Setting::ListenerOtlpGrpcTlsHandshakeDeadlineSeconds => {
+                self.otlp_grpc_connection_protection
+                    .tls_handshake_deadline_seconds
+                    != other
+                        .otlp_grpc_connection_protection
+                        .tls_handshake_deadline_seconds
+            },
+            Setting::ListenerOtlpGrpcHeaderDeadlineSeconds => {
+                self.otlp_grpc_connection_protection.header_deadline_seconds
+                    != other
+                        .otlp_grpc_connection_protection
+                        .header_deadline_seconds
+            },
+            Setting::ListenerOtlpGrpcBodyDeadlineSeconds => {
+                self.otlp_grpc_connection_protection.body_deadline_seconds
+                    != other.otlp_grpc_connection_protection.body_deadline_seconds
+            },
+            Setting::ListenerOtlpGrpcRequestDeadlineSeconds => {
+                self.otlp_grpc_connection_protection
+                    .request_deadline_seconds
+                    != other
+                        .otlp_grpc_connection_protection
+                        .request_deadline_seconds
+            },
+            Setting::ListenerOtlpGrpcIdleDeadlineSeconds => {
+                self.otlp_grpc_connection_protection.idle_deadline_seconds
+                    != other.otlp_grpc_connection_protection.idle_deadline_seconds
+            },
+            Setting::ListenerOtlpHttpTlsHandshakeLimit => {
+                self.otlp_http_connection_protection.tls_handshake_limit
+                    != other.otlp_http_connection_protection.tls_handshake_limit
+            },
+            Setting::ListenerOtlpHttpTlsHandshakeDeadlineSeconds => {
+                self.otlp_http_connection_protection
+                    .tls_handshake_deadline_seconds
+                    != other
+                        .otlp_http_connection_protection
+                        .tls_handshake_deadline_seconds
+            },
+            Setting::ListenerOtlpHttpHeaderDeadlineSeconds => {
+                self.otlp_http_connection_protection.header_deadline_seconds
+                    != other
+                        .otlp_http_connection_protection
+                        .header_deadline_seconds
+            },
+            Setting::ListenerOtlpHttpBodyDeadlineSeconds => {
+                self.otlp_http_connection_protection.body_deadline_seconds
+                    != other.otlp_http_connection_protection.body_deadline_seconds
+            },
+            Setting::ListenerOtlpHttpRequestDeadlineSeconds => {
+                self.otlp_http_connection_protection
+                    .request_deadline_seconds
+                    != other
+                        .otlp_http_connection_protection
+                        .request_deadline_seconds
+            },
+            Setting::ListenerOtlpHttpIdleDeadlineSeconds => {
+                self.otlp_http_connection_protection.idle_deadline_seconds
+                    != other.otlp_http_connection_protection.idle_deadline_seconds
+            },
+            Setting::ListenerLokiPushTlsHandshakeLimit => {
+                self.loki_push_connection_protection.tls_handshake_limit
+                    != other.loki_push_connection_protection.tls_handshake_limit
+            },
+            Setting::ListenerLokiPushTlsHandshakeDeadlineSeconds => {
+                self.loki_push_connection_protection
+                    .tls_handshake_deadline_seconds
+                    != other
+                        .loki_push_connection_protection
+                        .tls_handshake_deadline_seconds
+            },
+            Setting::ListenerLokiPushHeaderDeadlineSeconds => {
+                self.loki_push_connection_protection.header_deadline_seconds
+                    != other
+                        .loki_push_connection_protection
+                        .header_deadline_seconds
+            },
+            Setting::ListenerLokiPushBodyDeadlineSeconds => {
+                self.loki_push_connection_protection.body_deadline_seconds
+                    != other.loki_push_connection_protection.body_deadline_seconds
+            },
+            Setting::ListenerLokiPushRequestDeadlineSeconds => {
+                self.loki_push_connection_protection
+                    .request_deadline_seconds
+                    != other
+                        .loki_push_connection_protection
+                        .request_deadline_seconds
+            },
+            Setting::ListenerLokiPushIdleDeadlineSeconds => {
+                self.loki_push_connection_protection.idle_deadline_seconds
+                    != other.loki_push_connection_protection.idle_deadline_seconds
+            },
             Setting::StorageDataDirectory => self.data_directory != other.data_directory,
             Setting::StorageSecretsDirectory => self.secrets_directory != other.secrets_directory,
             Setting::SecurityLocalKeyFile => self.local_key_file != other.local_key_file,
@@ -1078,6 +1345,156 @@ impl EffectiveConfiguration {
             Setting::ListenerLokiPushForwardedHops => {
                 forwarded_hops_value(self.loki_push_forwarded_hops)
             },
+            Setting::ListenerOperationsTlsHandshakeLimit => self
+                .operations_connection_protection
+                .tls_handshake_limit
+                .get()
+                .to_string(),
+            Setting::ListenerOperationsTlsHandshakeDeadlineSeconds => self
+                .operations_connection_protection
+                .tls_handshake_deadline_seconds
+                .get()
+                .to_string(),
+            Setting::ListenerOperationsHeaderDeadlineSeconds => self
+                .operations_connection_protection
+                .header_deadline_seconds
+                .get()
+                .to_string(),
+            Setting::ListenerOperationsBodyDeadlineSeconds => self
+                .operations_connection_protection
+                .body_deadline_seconds
+                .get()
+                .to_string(),
+            Setting::ListenerOperationsRequestDeadlineSeconds => self
+                .operations_connection_protection
+                .request_deadline_seconds
+                .get()
+                .to_string(),
+            Setting::ListenerOperationsIdleDeadlineSeconds => self
+                .operations_connection_protection
+                .idle_deadline_seconds
+                .get()
+                .to_string(),
+            Setting::ListenerApiTlsHandshakeLimit => self
+                .api_connection_protection
+                .tls_handshake_limit
+                .get()
+                .to_string(),
+            Setting::ListenerApiTlsHandshakeDeadlineSeconds => self
+                .api_connection_protection
+                .tls_handshake_deadline_seconds
+                .get()
+                .to_string(),
+            Setting::ListenerApiHeaderDeadlineSeconds => self
+                .api_connection_protection
+                .header_deadline_seconds
+                .get()
+                .to_string(),
+            Setting::ListenerApiBodyDeadlineSeconds => self
+                .api_connection_protection
+                .body_deadline_seconds
+                .get()
+                .to_string(),
+            Setting::ListenerApiRequestDeadlineSeconds => self
+                .api_connection_protection
+                .request_deadline_seconds
+                .get()
+                .to_string(),
+            Setting::ListenerApiIdleDeadlineSeconds => self
+                .api_connection_protection
+                .idle_deadline_seconds
+                .get()
+                .to_string(),
+            Setting::ListenerOtlpGrpcTlsHandshakeLimit => self
+                .otlp_grpc_connection_protection
+                .tls_handshake_limit
+                .get()
+                .to_string(),
+            Setting::ListenerOtlpGrpcTlsHandshakeDeadlineSeconds => self
+                .otlp_grpc_connection_protection
+                .tls_handshake_deadline_seconds
+                .get()
+                .to_string(),
+            Setting::ListenerOtlpGrpcHeaderDeadlineSeconds => self
+                .otlp_grpc_connection_protection
+                .header_deadline_seconds
+                .get()
+                .to_string(),
+            Setting::ListenerOtlpGrpcBodyDeadlineSeconds => self
+                .otlp_grpc_connection_protection
+                .body_deadline_seconds
+                .get()
+                .to_string(),
+            Setting::ListenerOtlpGrpcRequestDeadlineSeconds => self
+                .otlp_grpc_connection_protection
+                .request_deadline_seconds
+                .get()
+                .to_string(),
+            Setting::ListenerOtlpGrpcIdleDeadlineSeconds => self
+                .otlp_grpc_connection_protection
+                .idle_deadline_seconds
+                .get()
+                .to_string(),
+            Setting::ListenerOtlpHttpTlsHandshakeLimit => self
+                .otlp_http_connection_protection
+                .tls_handshake_limit
+                .get()
+                .to_string(),
+            Setting::ListenerOtlpHttpTlsHandshakeDeadlineSeconds => self
+                .otlp_http_connection_protection
+                .tls_handshake_deadline_seconds
+                .get()
+                .to_string(),
+            Setting::ListenerOtlpHttpHeaderDeadlineSeconds => self
+                .otlp_http_connection_protection
+                .header_deadline_seconds
+                .get()
+                .to_string(),
+            Setting::ListenerOtlpHttpBodyDeadlineSeconds => self
+                .otlp_http_connection_protection
+                .body_deadline_seconds
+                .get()
+                .to_string(),
+            Setting::ListenerOtlpHttpRequestDeadlineSeconds => self
+                .otlp_http_connection_protection
+                .request_deadline_seconds
+                .get()
+                .to_string(),
+            Setting::ListenerOtlpHttpIdleDeadlineSeconds => self
+                .otlp_http_connection_protection
+                .idle_deadline_seconds
+                .get()
+                .to_string(),
+            Setting::ListenerLokiPushTlsHandshakeLimit => self
+                .loki_push_connection_protection
+                .tls_handshake_limit
+                .get()
+                .to_string(),
+            Setting::ListenerLokiPushTlsHandshakeDeadlineSeconds => self
+                .loki_push_connection_protection
+                .tls_handshake_deadline_seconds
+                .get()
+                .to_string(),
+            Setting::ListenerLokiPushHeaderDeadlineSeconds => self
+                .loki_push_connection_protection
+                .header_deadline_seconds
+                .get()
+                .to_string(),
+            Setting::ListenerLokiPushBodyDeadlineSeconds => self
+                .loki_push_connection_protection
+                .body_deadline_seconds
+                .get()
+                .to_string(),
+            Setting::ListenerLokiPushRequestDeadlineSeconds => self
+                .loki_push_connection_protection
+                .request_deadline_seconds
+                .get()
+                .to_string(),
+            Setting::ListenerLokiPushIdleDeadlineSeconds => self
+                .loki_push_connection_protection
+                .idle_deadline_seconds
+                .get()
+                .to_string(),
             Setting::StorageDataDirectory => self.data_directory.clone(),
             Setting::StorageSecretsDirectory => self.secrets_directory.clone(),
             Setting::SecurityLocalKeyFile => self.local_key_file.path.clone(),
@@ -1183,6 +1600,156 @@ impl EffectiveConfiguration {
             Setting::ListenerLokiPushForwardedHops => {
                 forwarded_hops_value(self.loki_push_forwarded_hops)
             },
+            Setting::ListenerOperationsTlsHandshakeLimit => self
+                .operations_connection_protection
+                .tls_handshake_limit
+                .get()
+                .to_string(),
+            Setting::ListenerOperationsTlsHandshakeDeadlineSeconds => self
+                .operations_connection_protection
+                .tls_handshake_deadline_seconds
+                .get()
+                .to_string(),
+            Setting::ListenerOperationsHeaderDeadlineSeconds => self
+                .operations_connection_protection
+                .header_deadline_seconds
+                .get()
+                .to_string(),
+            Setting::ListenerOperationsBodyDeadlineSeconds => self
+                .operations_connection_protection
+                .body_deadline_seconds
+                .get()
+                .to_string(),
+            Setting::ListenerOperationsRequestDeadlineSeconds => self
+                .operations_connection_protection
+                .request_deadline_seconds
+                .get()
+                .to_string(),
+            Setting::ListenerOperationsIdleDeadlineSeconds => self
+                .operations_connection_protection
+                .idle_deadline_seconds
+                .get()
+                .to_string(),
+            Setting::ListenerApiTlsHandshakeLimit => self
+                .api_connection_protection
+                .tls_handshake_limit
+                .get()
+                .to_string(),
+            Setting::ListenerApiTlsHandshakeDeadlineSeconds => self
+                .api_connection_protection
+                .tls_handshake_deadline_seconds
+                .get()
+                .to_string(),
+            Setting::ListenerApiHeaderDeadlineSeconds => self
+                .api_connection_protection
+                .header_deadline_seconds
+                .get()
+                .to_string(),
+            Setting::ListenerApiBodyDeadlineSeconds => self
+                .api_connection_protection
+                .body_deadline_seconds
+                .get()
+                .to_string(),
+            Setting::ListenerApiRequestDeadlineSeconds => self
+                .api_connection_protection
+                .request_deadline_seconds
+                .get()
+                .to_string(),
+            Setting::ListenerApiIdleDeadlineSeconds => self
+                .api_connection_protection
+                .idle_deadline_seconds
+                .get()
+                .to_string(),
+            Setting::ListenerOtlpGrpcTlsHandshakeLimit => self
+                .otlp_grpc_connection_protection
+                .tls_handshake_limit
+                .get()
+                .to_string(),
+            Setting::ListenerOtlpGrpcTlsHandshakeDeadlineSeconds => self
+                .otlp_grpc_connection_protection
+                .tls_handshake_deadline_seconds
+                .get()
+                .to_string(),
+            Setting::ListenerOtlpGrpcHeaderDeadlineSeconds => self
+                .otlp_grpc_connection_protection
+                .header_deadline_seconds
+                .get()
+                .to_string(),
+            Setting::ListenerOtlpGrpcBodyDeadlineSeconds => self
+                .otlp_grpc_connection_protection
+                .body_deadline_seconds
+                .get()
+                .to_string(),
+            Setting::ListenerOtlpGrpcRequestDeadlineSeconds => self
+                .otlp_grpc_connection_protection
+                .request_deadline_seconds
+                .get()
+                .to_string(),
+            Setting::ListenerOtlpGrpcIdleDeadlineSeconds => self
+                .otlp_grpc_connection_protection
+                .idle_deadline_seconds
+                .get()
+                .to_string(),
+            Setting::ListenerOtlpHttpTlsHandshakeLimit => self
+                .otlp_http_connection_protection
+                .tls_handshake_limit
+                .get()
+                .to_string(),
+            Setting::ListenerOtlpHttpTlsHandshakeDeadlineSeconds => self
+                .otlp_http_connection_protection
+                .tls_handshake_deadline_seconds
+                .get()
+                .to_string(),
+            Setting::ListenerOtlpHttpHeaderDeadlineSeconds => self
+                .otlp_http_connection_protection
+                .header_deadline_seconds
+                .get()
+                .to_string(),
+            Setting::ListenerOtlpHttpBodyDeadlineSeconds => self
+                .otlp_http_connection_protection
+                .body_deadline_seconds
+                .get()
+                .to_string(),
+            Setting::ListenerOtlpHttpRequestDeadlineSeconds => self
+                .otlp_http_connection_protection
+                .request_deadline_seconds
+                .get()
+                .to_string(),
+            Setting::ListenerOtlpHttpIdleDeadlineSeconds => self
+                .otlp_http_connection_protection
+                .idle_deadline_seconds
+                .get()
+                .to_string(),
+            Setting::ListenerLokiPushTlsHandshakeLimit => self
+                .loki_push_connection_protection
+                .tls_handshake_limit
+                .get()
+                .to_string(),
+            Setting::ListenerLokiPushTlsHandshakeDeadlineSeconds => self
+                .loki_push_connection_protection
+                .tls_handshake_deadline_seconds
+                .get()
+                .to_string(),
+            Setting::ListenerLokiPushHeaderDeadlineSeconds => self
+                .loki_push_connection_protection
+                .header_deadline_seconds
+                .get()
+                .to_string(),
+            Setting::ListenerLokiPushBodyDeadlineSeconds => self
+                .loki_push_connection_protection
+                .body_deadline_seconds
+                .get()
+                .to_string(),
+            Setting::ListenerLokiPushRequestDeadlineSeconds => self
+                .loki_push_connection_protection
+                .request_deadline_seconds
+                .get()
+                .to_string(),
+            Setting::ListenerLokiPushIdleDeadlineSeconds => self
+                .loki_push_connection_protection
+                .idle_deadline_seconds
+                .get()
+                .to_string(),
             Setting::StorageDataDirectory => self.data_directory.clone(),
             Setting::StorageSecretsDirectory => self.secrets_directory.clone(),
             Setting::ExportDestinations => self.redacted_export_destinations(),
@@ -1258,6 +1825,37 @@ fn append_accepted_socket_limits(
     rendered.push_str(role);
     rendered.push_str("_per_address_accepted_socket_limit = ");
     rendered.push_str(&per_address.get().to_string());
+}
+
+fn append_connection_protection_reference(
+    rendered: &mut String,
+    role: &str,
+    protection: ConnectionProtectionProfile,
+) {
+    for (name, value) in [
+        ("tls_handshake_limit", protection.tls_handshake_limit),
+        (
+            "tls_handshake_deadline_seconds",
+            protection.tls_handshake_deadline_seconds,
+        ),
+        (
+            "header_deadline_seconds",
+            protection.header_deadline_seconds,
+        ),
+        ("body_deadline_seconds", protection.body_deadline_seconds),
+        (
+            "request_deadline_seconds",
+            protection.request_deadline_seconds,
+        ),
+        ("idle_deadline_seconds", protection.idle_deadline_seconds),
+    ] {
+        rendered.push('\n');
+        rendered.push_str(role);
+        rendered.push('_');
+        rendered.push_str(name);
+        rendered.push_str(" = ");
+        rendered.push_str(&value.get().to_string());
+    }
 }
 
 fn append_redacted_listener_tls_references(rendered: &mut String, role: &str) {

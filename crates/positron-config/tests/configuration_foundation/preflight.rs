@@ -212,7 +212,7 @@ fn preflight_rejects_adversarial_toml_before_unbounded_parse_allocation() {
     }
 
     let mut many_entries = String::from("schema_version = 1\n[diagnostics]\n");
-    for index in 0..63 {
+    for index in 0..95 {
         many_entries.push_str(&format!("entry_{index} = \"x\"\n"));
     }
     assert_resource_limit(&many_entries);
@@ -232,12 +232,12 @@ fn preflight_rejects_adversarial_toml_before_unbounded_parse_allocation() {
 
 #[test]
 fn exact_preflight_entry_ceiling_is_not_reclassified_as_a_resource_failure() {
-    let mut header_is_sixteenth = String::from("schema_version = 1\n");
-    for index in 0..62 {
-        header_is_sixteenth.push_str(&format!("unknown_{index} = 1\n"));
+    let mut header_at_entry_ceiling = String::from("schema_version = 1\n");
+    for index in 0..94 {
+        header_at_entry_ceiling.push_str(&format!("unknown_{index} = 1\n"));
     }
-    header_is_sixteenth.push_str("[diagnostics]\n");
-    let header_result = inputs(Some(&header_is_sixteenth), [], []).and_then(resolve);
+    header_at_entry_ceiling.push_str("[diagnostics]\n");
+    let header_result = inputs(Some(&header_at_entry_ceiling), [], []).and_then(resolve);
     assert!(matches!(
         header_result,
         Err(error)
@@ -245,11 +245,11 @@ fn exact_preflight_entry_ceiling_is_not_reclassified_as_a_resource_failure() {
                 && error.source() == FailureSource::ConfigurationDocument
     ));
 
-    let mut scalar_is_sixteenth = String::from("schema_version = 1\n[diagnostics]\n");
-    for index in 0..62 {
-        scalar_is_sixteenth.push_str(&format!("unknown_{index} = 1\n"));
+    let mut scalar_at_entry_ceiling = String::from("schema_version = 1\n[diagnostics]\n");
+    for index in 0..94 {
+        scalar_at_entry_ceiling.push_str(&format!("unknown_{index} = 1\n"));
     }
-    let scalar_result = inputs(Some(&scalar_is_sixteenth), [], []).and_then(resolve);
+    let scalar_result = inputs(Some(&scalar_at_entry_ceiling), [], []).and_then(resolve);
     assert!(matches!(
         scalar_result,
         Err(error)
@@ -257,8 +257,8 @@ fn exact_preflight_entry_ceiling_is_not_reclassified_as_a_resource_failure() {
                 && error.source() == FailureSource::ConfigurationDocument
     ));
 
-    scalar_is_sixteenth.push_str("first_excess_entry = 1\n");
-    assert_resource_limit(&scalar_is_sixteenth);
+    scalar_at_entry_ceiling.push_str("first_excess_entry = 1\n");
+    assert_resource_limit(&scalar_at_entry_ceiling);
 }
 
 #[test]

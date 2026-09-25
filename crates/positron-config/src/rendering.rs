@@ -321,6 +321,36 @@ fn reference_domain(definition: SettingDefinition) -> String {
         | Setting::ListenerOtlpGrpcPerAddressAcceptedSocketLimit
         | Setting::ListenerOtlpHttpPerAddressAcceptedSocketLimit
         | Setting::ListenerLokiPushPerAddressAcceptedSocketLimit => "`1..=4096`; maximum accepted sockets awaiting authentication from one immediate peer address; cannot exceed this role's accepted-socket limit".to_owned(),
+        Setting::ListenerOperationsTlsHandshakeLimit
+        | Setting::ListenerApiTlsHandshakeLimit
+        | Setting::ListenerOtlpGrpcTlsHandshakeLimit
+        | Setting::ListenerOtlpHttpTlsHandshakeLimit
+        | Setting::ListenerLokiPushTlsHandshakeLimit => "`1..=128`; maximum concurrent TLS handshakes for this listener role before authentication".to_owned(),
+        Setting::ListenerOperationsTlsHandshakeDeadlineSeconds
+        | Setting::ListenerApiTlsHandshakeDeadlineSeconds
+        | Setting::ListenerOtlpGrpcTlsHandshakeDeadlineSeconds
+        | Setting::ListenerOtlpHttpTlsHandshakeDeadlineSeconds
+        | Setting::ListenerLokiPushTlsHandshakeDeadlineSeconds => "`1..=300` seconds; deadline for each TLS handshake before authentication".to_owned(),
+        Setting::ListenerOperationsHeaderDeadlineSeconds
+        | Setting::ListenerApiHeaderDeadlineSeconds
+        | Setting::ListenerOtlpGrpcHeaderDeadlineSeconds
+        | Setting::ListenerOtlpHttpHeaderDeadlineSeconds
+        | Setting::ListenerLokiPushHeaderDeadlineSeconds => "`1..=300` seconds; deadline for receiving one request header block".to_owned(),
+        Setting::ListenerOperationsBodyDeadlineSeconds
+        | Setting::ListenerApiBodyDeadlineSeconds
+        | Setting::ListenerOtlpGrpcBodyDeadlineSeconds
+        | Setting::ListenerOtlpHttpBodyDeadlineSeconds
+        | Setting::ListenerLokiPushBodyDeadlineSeconds => "`1..=300` seconds; deadline for receiving one request body".to_owned(),
+        Setting::ListenerOperationsRequestDeadlineSeconds
+        | Setting::ListenerApiRequestDeadlineSeconds
+        | Setting::ListenerOtlpGrpcRequestDeadlineSeconds
+        | Setting::ListenerOtlpHttpRequestDeadlineSeconds
+        | Setting::ListenerLokiPushRequestDeadlineSeconds => "`1..=300` seconds; deadline for handling one request".to_owned(),
+        Setting::ListenerOperationsIdleDeadlineSeconds
+        | Setting::ListenerApiIdleDeadlineSeconds
+        | Setting::ListenerOtlpGrpcIdleDeadlineSeconds
+        | Setting::ListenerOtlpHttpIdleDeadlineSeconds
+        | Setting::ListenerLokiPushIdleDeadlineSeconds => "`1..=300` seconds; maximum idle connection duration".to_owned(),
         Setting::SecurityLocalKeyFile => "protected absolute path under `storage.secrets_directory`, named `local-root-key.v1`; at most 256 bytes".to_owned(),
         _ => match definition.domain() {
             ValueDomain::ExactUnsignedInteger(value) => format!("exactly `{value}`"),
