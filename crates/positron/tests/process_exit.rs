@@ -214,14 +214,23 @@ fn sighup_reloads_a_valid_candidate_and_keeps_serving_after_a_rejected_candidate
             .status()?
             .success()
     );
-    let restored_status = wait_for_configuration_status(
+    let restored_status = match wait_for_configuration_status(
         operations_port,
         &authorization,
         &[
             "\"pending_restart\":false",
             "\"drift_disposition\":\"none\"",
         ],
-    )?;
+    ) {
+        Ok(status) => status,
+        Err(error) => {
+            return Err(format!(
+                "configuration did not restore after reload: {error}; {}",
+                terminate_and_describe_child(&mut child, &authorization)
+            )
+            .into());
+        },
+    };
     assert_eq!(
         status_value(&restored_status, "observed_generation")?,
         pending_generation
@@ -275,6 +284,50 @@ fn status_value<'response>(
         .next()
         .map(|value| value.trim_matches('"'))
         .ok_or_else(|| format!("status field {field} missing value").into())
+}
+
+#[cfg(unix)]
+fn terminate_and_describe_child(child: &mut std::process::Child, authorization: &str) -> String {
+    const MAX_CHILD_STDERR_BYTES: u64 = 4 * 1024;
+
+    let termination = match Command::new("/bin/kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+    {
+        Ok(status) if status.success() => "term=sent".to_owned(),
+        Ok(status) => format!("term=exit_{status}"),
+        Err(error) => format!("term_error={error}"),
+    };
+    let exit = match wait_for_child(child) {
+        Ok(status) => format!("exit={status}"),
+        Err(error) => format!("exit_error={error}"),
+    };
+    let stderr = child
+        .stderr
+        .take()
+        .map(|mut stderr| {
+            let mut bytes = Vec::with_capacity((MAX_CHILD_STDERR_BYTES + 1) as usize);
+            match stderr
+                .by_ref()
+                .take(MAX_CHILD_STDERR_BYTES + 1)
+                .read_to_end(&mut bytes)
+            {
+                Ok(_) => {
+                    let truncated = bytes.len() > MAX_CHILD_STDERR_BYTES as usize;
+                    bytes.truncate(MAX_CHILD_STDERR_BYTES as usize);
+                    let observation = bounded_redacted_observation(
+                        &String::from_utf8_lossy(&bytes),
+                        authorization,
+                    );
+                    truncated
+                        .then_some(format!("{observation}…<truncated>"))
+                        .unwrap_or(observation)
+                },
+                Err(error) => format!("stderr_read_error={error}"),
+            }
+        })
+        .unwrap_or_else(|| "stderr_unavailable".to_owned());
+    format!("child_cleanup {termination} {exit} stderr={stderr:?}")
 }
 
 #[cfg(unix)]

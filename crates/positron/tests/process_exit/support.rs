@@ -130,7 +130,7 @@ pub(super) fn wait_for_configuration_status(
             Ok(response) => {
                 last_observation = Some(format!(
                     "response={:?}",
-                    bounded_status_response(&response, authorization)
+                    bounded_redacted_observation(&response, authorization)
                 ));
             },
             Err(error) => last_observation = Some(format!("request={error}")),
@@ -163,10 +163,10 @@ fn configuration_status(
 }
 
 #[cfg(unix)]
-fn bounded_status_response(response: &str, authorization: &str) -> String {
+pub(super) fn bounded_redacted_observation(observation: &str, authorization: &str) -> String {
     const MAX_STATUS_OBSERVATION_CHARS: usize = 512;
 
-    let redacted = response.replace(authorization, "<redacted>");
+    let redacted = observation.replace(authorization, "<redacted>");
     let mut bounded = redacted
         .chars()
         .take(MAX_STATUS_OBSERVATION_CHARS)
