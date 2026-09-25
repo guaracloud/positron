@@ -99,6 +99,11 @@ pub(super) fn commit(
     ) {
         Ok(latest) => latest,
         Err(failure) => {
+            ledger
+                .retention_time
+                .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::ClockUncertain))?
+                .abandon_catalog_anchor(evaluation.clock_checkpoint)
+                .map_err(|_| LedgerFailure::new(LedgerFailureCode::StorageUnavailable))?;
             if failure.completion_state() != super::LedgerCompletionState::RejectedBeforeMutation {
                 state.poisoned = true;
             }

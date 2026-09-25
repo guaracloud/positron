@@ -204,6 +204,7 @@ pub struct RetentionEvaluation<'ledger, 'kernel, 'catalog> {
     frontier: crate::IngestTime,
     cutoff: positron_domain::time::UnixNanoseconds,
     blocks: Vec<CommittedBlock>,
+    clock_checkpoint: crate::retention_time::LifecycleAnchorCheckpoint,
 }
 
 impl<'ledger, 'kernel, 'catalog> RetentionEvaluation<'ledger, 'kernel, 'catalog> {
@@ -556,6 +557,9 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         if !retention_time.is_destructive_authority() {
             return Err(LedgerFailure::new(LedgerFailureCode::UnsupportedFormat));
         }
+        let clock_checkpoint = retention_time
+            .prepare_catalog_anchor()
+            .map_err(map_retention_time_failure)?;
         let ingest_time = retention_time
             .ingest_time(self.scope, state.retention_frontier)
             .map_err(map_retention_time_failure)?;
@@ -569,6 +573,9 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
                 self.scope,
                 ingest_time,
             ) {
+                retention_time
+                    .abandon_catalog_anchor(clock_checkpoint)
+                    .map_err(map_retention_time_failure)?;
                 if failure.completion_state() != LedgerCompletionState::RejectedBeforeMutation {
                     state.poisoned = true;
                 }
@@ -635,6 +642,9 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         let retention_time = self
             .retention_time
             .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::UnsupportedFormat))?;
+        let clock_checkpoint = retention_time
+            .prepare_catalog_anchor()
+            .map_err(map_retention_time_failure)?;
         self.catalog.refresh_state()?;
         let basis = self.catalog.pin()?;
         let state = self
@@ -704,6 +714,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             frontier,
             cutoff,
             blocks,
+            clock_checkpoint,
         })
     }
 

@@ -109,6 +109,9 @@ pub(crate) struct LifecycleClockSafety {
 }
 
 #[derive(Clone, Copy)]
+pub(crate) struct LifecycleAnchorCheckpoint(LifecycleClockSafety);
+
+#[derive(Clone, Copy)]
 struct ScopeBaseline {
     instant: UnixNanoseconds,
     elapsed_at_start: u64,
@@ -329,6 +332,31 @@ impl RetentionTimeAuthority {
             anchor: safety.anchor.max(observed.instant()),
             ..*safety
         })
+    }
+
+    pub(crate) fn prepare_catalog_anchor(
+        &self,
+    ) -> Result<LifecycleAnchorCheckpoint, LifecycleClockFailure> {
+        self.safety
+            .lock()
+            .map(|safety| LifecycleAnchorCheckpoint(*safety))
+            .map_err(|_| LifecycleClockFailure::Unavailable)
+    }
+
+    pub(crate) fn abandon_catalog_anchor(
+        &self,
+        checkpoint: LifecycleAnchorCheckpoint,
+    ) -> Result<(), LifecycleClockFailure> {
+        let mut safety = self
+            .safety
+            .lock()
+            .map_err(|_| LifecycleClockFailure::Unavailable)?;
+        let sampled_uncertainty = safety.state == LifecycleClockState::ClockUncertain;
+        *safety = checkpoint.0;
+        if sampled_uncertainty {
+            safety.state = LifecycleClockState::ClockUncertain;
+        }
+        Ok(())
     }
 
     pub(crate) fn destructive_ingest_time(
@@ -684,6 +712,25 @@ mod clock_safety_tests {
             .expect("restart observation");
 
         assert_eq!(clock.status().state(), LifecycleClockState::ClockUncertain);
+        assert_eq!(clock.status().safe_anchor(), UnixNanoseconds::new(1_000));
+    }
+
+    #[test]
+    fn rejected_catalog_candidate_restores_its_unpublished_anchor() {
+        let wall = Arc::new(Mutex::new(UnixNanoseconds::new(1_000)));
+        let (clock, elapsed) = RetentionTimeAuthority::establish_with_source_and_manual_elapsed(
+            MutableWallClock(Arc::clone(&wall)),
+            LifecycleClockPolicy::new(10).expect("bounded policy"),
+        )
+        .expect("clock establishes");
+        let checkpoint = clock.prepare_catalog_anchor().expect("checkpoint");
+        elapsed.advance(5).expect("elapsed");
+        clock.reconcile_current(5).expect("candidate observation");
+        assert_eq!(clock.status().safe_anchor(), UnixNanoseconds::new(1_005));
+
+        clock
+            .abandon_catalog_anchor(checkpoint)
+            .expect("publication rejection restores anchor");
         assert_eq!(clock.status().safe_anchor(), UnixNanoseconds::new(1_000));
     }
 }
