@@ -152,11 +152,11 @@ fn outstanding_limit_preserves_one_slot_for_each_absent_work_class()
     let primary = tenant(83)?;
     let governor = establish([TenantQuota::new(primary, 1, uniform(90))?], 6)?;
     let claim = memory_claim(primary, WorkKind::SecurityLifecycle, 1)?;
-    let first = governor.reserve(claim)?;
-    let second = governor.reserve(claim)?;
+    let first = governor.reserve(claim.clone())?;
+    let second = governor.reserve(claim.clone())?;
 
     let failure = governor
-        .reserve(claim)
+        .reserve(claim.clone())
         .expect_err("four absent work classes retain four progress slots additively");
     assert_eq!(
         failure.code(),

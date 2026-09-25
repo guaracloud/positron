@@ -217,7 +217,7 @@ fn sighup_reloads_a_valid_candidate_and_keeps_serving_after_a_rejected_candidate
             .then_some(())
             .ok_or_else(|| format!("reload signal failed with {status}").into())
     };
-    let restored_status = match restore_configuration_with_at_most_one_retry(
+    let (restored_status, restored_with_retry) = match restore_configuration_with_at_most_one_retry(
         &pending,
         &mut send_reload,
         || configuration_status(operations_port, &authorization),
@@ -258,10 +258,10 @@ fn sighup_reloads_a_valid_candidate_and_keeps_serving_after_a_rejected_candidate
     );
     let output = child.wait_with_output()?;
     assert_eq!(output.status.code(), Some(0));
-    assert_eq!(
-        String::from_utf8(output.stderr)?,
-        "positron: warning: operations transport is plaintext\npositron: configuration reload rejected category=source_rejected\n"
-    );
+    assert!(reconciliation_stderr_is_exact(
+        restored_with_retry,
+        &String::from_utf8(output.stderr)?,
+    ));
     fs::remove_dir_all(root)?;
     Ok(())
 }
@@ -344,7 +344,7 @@ fn restore_configuration_with_at_most_one_retry(
     mut observe: impl FnMut() -> Result<String, Box<dyn std::error::Error>>,
     authorization: &str,
     probe_timeout: Duration,
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> Result<(String, bool), Box<dyn std::error::Error>> {
     let deadline = Instant::now() + probe_timeout;
     send_reload()?;
     let mut second_reload_sent = false;
@@ -352,7 +352,7 @@ fn restore_configuration_with_at_most_one_retry(
     loop {
         let last_observation = match observe() {
             Ok(response) => match ConfigurationStatus::from_response(&response) {
-                Ok(status) if status.is_restored() => return Ok(response),
+                Ok(status) if status.is_restored() => return Ok((response, second_reload_sent)),
                 Ok(status)
                     if !second_reload_sent
                         && status.is_unchanged_pending_reconciliation_of(pending) =>
@@ -405,7 +405,7 @@ fn configuration_restore_probe_accepts_immediate_serving_convergence()
     )?)?;
     let restored = configuration_status_response("serving", "12", "base", "base", "none", false)?;
     let mut signals = 0;
-    let response = restore_configuration_with_at_most_one_retry(
+    let (response, retried) = restore_configuration_with_at_most_one_retry(
         &pending,
         &mut || {
             signals += 1;
@@ -416,6 +416,7 @@ fn configuration_restore_probe_accepts_immediate_serving_convergence()
         Duration::ZERO,
     )?;
     assert_eq!(signals, 1);
+    assert!(!retried);
     assert_eq!(
         ConfigurationStatus::from_response(&response)?.observed_generation,
         "12"
@@ -433,7 +434,7 @@ fn configuration_restore_probe_retries_once_for_unchanged_pending_reconciliation
     let restored = configuration_status_response("serving", "12", "base", "base", "none", false)?;
     let mut observations = [pending_response, restored].into_iter();
     let mut signals = 0;
-    let response = restore_configuration_with_at_most_one_retry(
+    let (response, retried) = restore_configuration_with_at_most_one_retry(
         &pending,
         &mut || {
             signals += 1;
@@ -448,6 +449,7 @@ fn configuration_restore_probe_retries_once_for_unchanged_pending_reconciliation
         Duration::from_secs(1),
     )?;
     assert_eq!(signals, 2);
+    assert!(retried);
     assert!(ConfigurationStatus::from_response(&response)?.is_restored());
     Ok(())
 }
@@ -535,6 +537,33 @@ fn configuration_restore_probe_never_sends_a_third_reload_for_unresolved_pending
     assert_eq!(signals, 2);
     assert!(error.to_string().contains("original bounded reload probe"));
     Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn reconciliation_stderr_accepts_only_the_bounded_retry_variants() {
+    let baseline = "positron: warning: operations transport is plaintext\npositron: configuration reload rejected category=source_rejected\n";
+    let publication_before_source = "positron: warning: operations transport is plaintext\npositron: configuration reload rejected category=publication_unavailable\npositron: configuration reload rejected category=source_rejected\n";
+    let duplicate_publication = "positron: warning: operations transport is plaintext\npositron: configuration reload rejected category=publication_unavailable\npositron: configuration reload rejected category=publication_unavailable\npositron: configuration reload rejected category=source_rejected\n";
+
+    assert!(reconciliation_stderr_is_exact(false, baseline));
+    assert!(!reconciliation_stderr_is_exact(
+        false,
+        publication_before_source
+    ));
+    assert!(reconciliation_stderr_is_exact(true, baseline));
+    assert!(reconciliation_stderr_is_exact(
+        true,
+        publication_before_source
+    ));
+    assert!(!reconciliation_stderr_is_exact(true, duplicate_publication));
+}
+
+#[cfg(unix)]
+fn reconciliation_stderr_is_exact(retried: bool, stderr: &str) -> bool {
+    let baseline = "positron: warning: operations transport is plaintext\npositron: configuration reload rejected category=source_rejected\n";
+    let publication_before_source = "positron: warning: operations transport is plaintext\npositron: configuration reload rejected category=publication_unavailable\npositron: configuration reload rejected category=source_rejected\n";
+    stderr == baseline || (retried && stderr == publication_before_source)
 }
 
 #[cfg(unix)]

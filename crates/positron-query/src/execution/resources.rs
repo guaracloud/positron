@@ -1,6 +1,6 @@
 use positron_kernel::{
-    ActiveSegmentLedger, ResourceReservation, SnapshotLeaseAttempt, SnapshotLeaseId,
-    SnapshotLeaseUsage, TransferredResourceReservation,
+    ActiveSegmentLedger, OperationToken, ResourceReservation, SnapshotLeaseAttempt,
+    SnapshotLeaseId, SnapshotLeaseUsage, TransferredResourceReservation,
 };
 
 use crate::QueryFailure;
@@ -10,6 +10,7 @@ use crate::execution_support::map_ledger_failure;
 /// Move-only ownership crossing the eager execution-to-stream boundary.
 pub(crate) struct ExecutionResources {
     admission: TransferredResourceReservation,
+    operation: Option<OperationToken>,
     lease: SnapshotLeaseId,
     usage_before: SnapshotLeaseUsage,
     attempt: Option<SnapshotLeaseAttempt>,
@@ -29,6 +30,7 @@ impl ExecutionResources {
         usage_before: SnapshotLeaseUsage,
     ) -> Self {
         Self {
+            operation: reservation.operation_token(),
             admission: reservation.transfer(),
             lease,
             usage_before,
@@ -44,12 +46,17 @@ impl ExecutionResources {
         attempt: SnapshotLeaseAttempt,
     ) -> Self {
         Self {
+            operation: reservation.operation_token(),
             admission: reservation.transfer(),
             lease,
             usage_before,
             attempt: Some(attempt),
             target_lease: None,
         }
+    }
+
+    pub(super) fn operation_token(&self) -> Option<OperationToken> {
+        self.operation.clone()
     }
 
     pub(super) fn with_target_lease(

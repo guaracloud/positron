@@ -65,6 +65,7 @@ impl BatchMemoryAccount {
 pub(crate) struct BatchMemoryClaim {
     account: Arc<BatchMemoryAccount>,
     bytes: u64,
+    _reservation: Option<TransferredResourceReservation>,
 }
 
 /// The move-owned correlation result sidecar. Its `Vec` allocation is made
@@ -116,7 +117,23 @@ pub(crate) const fn correlation_outcomes_arc_bytes() -> u64 {
 
 impl BatchMemoryClaim {
     pub(crate) fn new(account: Arc<BatchMemoryAccount>, bytes: u64) -> Arc<Self> {
-        Arc::new(Self { account, bytes })
+        Arc::new(Self {
+            account,
+            bytes,
+            _reservation: None,
+        })
+    }
+
+    pub(crate) fn new_with_reservation(
+        account: Arc<BatchMemoryAccount>,
+        bytes: u64,
+        reservation: TransferredResourceReservation,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            account,
+            bytes,
+            _reservation: Some(reservation),
+        })
     }
 
     pub(crate) const fn bytes(&self) -> u64 {

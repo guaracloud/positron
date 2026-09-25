@@ -216,7 +216,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         }
         let lease_id = SnapshotLeaseId::new(state.lease_identity)
             .map_err(|_| QueryFailure::new(QueryFailureCode::InvalidCursor))?;
-        let reservation = self.reserve_query(tenant, state.budget)?;
+        let reservation = self.reserve_query(tenant, context.principal_id(), state.budget)?;
         // Establish the bounded durable attempt marker before reconstructing
         // source/plans, so failures after admission still have a lease-owned
         // usage record to charge and clean up.

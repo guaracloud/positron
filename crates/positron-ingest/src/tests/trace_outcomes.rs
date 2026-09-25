@@ -146,7 +146,7 @@ fn trace_ingest_capacity_refusal_releases_fallback_work_without_ledger_drift()
         ResourceAmounts::new([1_048_576, 1, 1, 1_048_576, 1, 0, 1, 1, 1, 4, 1_048_576]),
     )?;
     let mut held = Vec::new();
-    while let Ok(reservation) = fixture.authority.governor().reserve(claim) {
+    while let Ok(reservation) = fixture.authority.governor().reserve(claim.clone()) {
         held.push(reservation);
     }
     assert!(!held.is_empty());

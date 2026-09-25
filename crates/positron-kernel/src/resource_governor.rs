@@ -53,8 +53,8 @@ pub use capacity_observation::{
 };
 use claim::ReservationIdentity;
 pub use claim::{
-    RecoveryInterruption, RecoveryScope, RecoveryWorkClaim, RecoveryWorkKind, WorkClaim, WorkClass,
-    WorkKind,
+    OperationToken, RecoveryInterruption, RecoveryScope, RecoveryWorkClaim, RecoveryWorkKind,
+    WorkClaim, WorkClass, WorkKind,
 };
 pub use failure::{
     AdmissionCompletionState, AdmissionFailure, AdmissionFailureCode, AdmissionRetry,
@@ -67,7 +67,7 @@ pub use inventory::{
 };
 pub use lifecycle::{GovernorLifecycle, ReleaseOutcome, ShutdownReconciliation};
 pub use model::{RESOURCE_DIMENSION_COUNT, ResourceAmounts, ResourceDimension};
-pub use policy::{GovernorPolicy, OrdinaryPool, OrdinaryPoolPolicy};
+pub use policy::{GovernorPolicy, OrdinaryPool, OrdinaryPoolPolicy, PrincipalQuota};
 pub use recovery_policy::RecoveryPoolCapacities;
 pub use resize_types::{
     ExistingCapacityDisposition, ResizeFailure, ResizeFailureCode, ResizeOutcome,
@@ -257,6 +257,7 @@ pub struct ResourceReservation<'authority> {
     owner: accounting::ChargeOwner,
     identity: ReservationIdentity,
     amounts: ResourceAmounts,
+    operation: Option<OperationToken>,
     active: bool,
 }
 
@@ -272,6 +273,7 @@ pub struct TransferredResourceReservation {
     owner: accounting::ChargeOwner,
     identity: ReservationIdentity,
     amounts: ResourceAmounts,
+    operation: Option<OperationToken>,
     active: bool,
 }
 
@@ -319,7 +321,12 @@ impl ResourceGovernorConfiguration {
         recovery_pools: RecoveryPoolCapacities,
         fail_at: Option<BootstrapAllocationStage>,
     ) -> Result<Self, GovernorFailure> {
-        if policy.tenant_quotas.len() > inventory.cardinality.max_tenant_quotas {
+        let GovernorPolicy {
+            tenant_quotas,
+            pools,
+            principal_quota,
+        } = policy;
+        if tenant_quotas.len() > inventory.cardinality.max_tenant_quotas {
             return Err(GovernorFailure::PolicyCardinalityExceeded);
         }
         let layout = BootstrapInventoryLayout::new(
@@ -340,14 +347,14 @@ impl ResourceGovernorConfiguration {
         if !ordinary_ceiling.all_positive() {
             return Err(unavailable);
         }
-        if policy.tenant_quotas.iter().any(|quota| {
+        if tenant_quotas.iter().any(|quota| {
             ResourceDimension::ALL
                 .iter()
                 .any(|dimension| quota.limits.get(*dimension) > ordinary_ceiling.get(*dimension))
         }) {
             return Err(GovernorFailure::InvalidConfiguration);
         }
-        let pool_capacities = policy.pools.derive(ordinary_ceiling)?;
+        let pool_capacities = pools.derive(ordinary_ceiling)?;
         let protected_recovery = recovery_pools
             .protected_sum()
             .ok_or(GovernorFailure::InvalidConfiguration)?;
@@ -361,7 +368,8 @@ impl ResourceGovernorConfiguration {
             bootstrap_overhead,
             total_ceiling: work_ceiling,
             ordinary_ceiling,
-            tenant_quotas: policy.tenant_quotas,
+            principal_quota,
+            tenant_quotas,
             maximum_outstanding: inventory.cardinality.max_outstanding_reservations,
             pool_capacities,
             recovery_pool_capacities: recovery_pools,

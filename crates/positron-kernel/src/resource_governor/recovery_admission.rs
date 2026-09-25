@@ -225,7 +225,8 @@ impl GovernorInner {
             scope: claim.scope,
             kind: claim.kind,
         };
-        let Some(record) = super::ledger::GrantRecord::new(owner, identity, claim.amounts) else {
+        let Some(record) = super::ledger::GrantRecord::new(owner, identity, claim.amounts, None)
+        else {
             state.lifecycle = GovernorLifecycle::Fenced;
             return Err(internal_failure_at_pressure(class, state.disk_pressure));
         };
@@ -277,6 +278,7 @@ impl GovernorInner {
             identity,
             claim.amounts,
             reservation_slot,
+            None,
         ))
     }
 }

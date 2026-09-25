@@ -3,6 +3,7 @@
 use super::accounting::{ChargeAttribution, ChargeOwner, GovernorInner};
 use super::claim::ReservationIdentity;
 use super::failure::GovernorFailure;
+use super::ledger::OperationRecord;
 use super::lifecycle::{GovernorLifecycle, ReleaseOutcome, class_index};
 use super::model::ResourceAmounts;
 use super::option_ext::TransposeOption;
@@ -46,34 +47,40 @@ impl GovernorInner {
                 };
             },
         };
-        let status = self.release_locked(&mut state, poisoned, owner, identity, amounts);
-        if status.applied && !self.finish_slot(&mut state, slot) {
+        let Some(record) = state
+            .grant_records
+            .get(usize::from(slot))
+            .and_then(|record| *record)
+        else {
+            // Preserve exact accounting before fencing a corrupted external
+            // handle whose slot no longer names the recorded grant.
+            let status = self.release_components(
+                &mut state,
+                poisoned,
+                owner,
+                identity.class(),
+                matches!(identity, ReservationIdentity::Ordinary { .. }),
+                match identity {
+                    ReservationIdentity::Recovery { kind, .. } => Some(kind),
+                    ReservationIdentity::Ordinary { .. } => None,
+                },
+                amounts,
+            );
+            state.lifecycle = GovernorLifecycle::Fenced;
+            return ReleaseStatus {
+                applied: status.applied,
+                result: Err(GovernorFailure::InternalFenced),
+            };
+        };
+        let handle_valid = record.amounts() == amounts
+            && match identity {
+                ReservationIdentity::Ordinary { .. } => owner.pools.is_some(),
+                ReservationIdentity::Recovery { .. } => owner.recovery_pools.is_some(),
+            };
+        if !handle_valid {
             return fence(&mut state);
         }
-        status
-    }
-
-    pub(super) fn release_locked(
-        &self,
-        state: &mut super::accounting::AccountingState,
-        poisoned: bool,
-        owner: ChargeOwner,
-        identity: ReservationIdentity,
-        amounts: ResourceAmounts,
-    ) -> ReleaseStatus {
-        let class = identity.class();
-        self.release_components(
-            state,
-            poisoned,
-            owner,
-            class,
-            matches!(identity, ReservationIdentity::Ordinary { .. }),
-            match identity {
-                ReservationIdentity::Recovery { kind, .. } => Some(kind),
-                ReservationIdentity::Ordinary { .. } => None,
-            },
-            amounts,
-        )
+        self.release_slot_locked(&mut state, poisoned, slot)
     }
 
     pub(super) fn release_record_locked(
@@ -93,6 +100,98 @@ impl GovernorInner {
             record.recovery_kind(),
             record.amounts(),
         )
+    }
+
+    /// Releases one exact ledger slot. Authenticated operation roots retain
+    /// only their fixed metadata after their own charge is released so live
+    /// children retain the same logical-operation identity until they drain.
+    pub(super) fn release_slot_locked(
+        &self,
+        state: &mut super::accounting::AccountingState,
+        poisoned: bool,
+        slot: u16,
+    ) -> ReleaseStatus {
+        let Some(record) = state
+            .grant_records
+            .get(usize::from(slot))
+            .and_then(|record| *record)
+        else {
+            return fence(state);
+        };
+        let status = if poisoned {
+            let Some(owner) = record.owner() else {
+                return fence(state);
+            };
+            self.release_components(
+                state,
+                true,
+                owner,
+                record.class(),
+                record.is_ordinary(),
+                record.recovery_kind(),
+                record.amounts(),
+            )
+        } else {
+            self.release_record_locked(state, record)
+        };
+        if !status.applied {
+            return status;
+        }
+        match record.operation() {
+            Some(OperationRecord::Root { child_count: 0, .. }) | None => {
+                if !self.finish_slot(state, slot) {
+                    return fence(state);
+                }
+            },
+            Some(OperationRecord::Root { child_count: _, .. }) => {
+                let Some(released_root) = record.released_root() else {
+                    return fence(state);
+                };
+                let Some(root_slot) = state.grant_records.get_mut(usize::from(slot)) else {
+                    return fence(state);
+                };
+                *root_slot = Some(released_root);
+            },
+            Some(OperationRecord::Child {
+                root_slot,
+                generation,
+            }) => {
+                let Some(root_record) = state
+                    .grant_records
+                    .get(usize::from(root_slot))
+                    .and_then(|record| *record)
+                else {
+                    return fence(state);
+                };
+                let root_matches = matches!(
+                    root_record.operation(),
+                    Some(OperationRecord::Root { generation: root_generation, .. })
+                        if root_generation == generation
+                );
+                if !root_matches {
+                    return fence(state);
+                }
+                let Some((updated_root, remove_root)) = root_record.decrement_root_child() else {
+                    return fence(state);
+                };
+                if !self.finish_slot(state, slot) {
+                    return fence(state);
+                }
+                if remove_root {
+                    if !self.finish_slot(state, root_slot) {
+                        return fence(state);
+                    }
+                } else {
+                    let Some(root_slot_record) =
+                        state.grant_records.get_mut(usize::from(root_slot))
+                    else {
+                        return fence(state);
+                    };
+                    *root_slot_record = Some(updated_root);
+                }
+            },
+        }
+        status
     }
 
     #[allow(clippy::too_many_arguments)]

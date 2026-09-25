@@ -111,8 +111,13 @@ pub fn reserve_trace_receiver_transport<'authority>(
     governor: ResourceGovernor<'authority>,
 ) -> Result<ResourceReservation<'authority>, TraceReceiveFailure> {
     let attribution = ingest_attribution(context)?;
-    let claim = WorkClaim::tenant(attribution.tenant_id(), WorkKind::Ingest, RECEIVER_CAPACITY)
-        .map_err(|_| TraceReceiveFailure::CapacityUnavailable)?;
+    let claim = WorkClaim::authenticated(
+        attribution.tenant_id(),
+        context.principal_id(),
+        WorkKind::Ingest,
+        RECEIVER_CAPACITY,
+    )
+    .map_err(|_| TraceReceiveFailure::CapacityUnavailable)?;
     governor
         .reserve(claim)
         .map_err(|_| TraceReceiveFailure::CapacityUnavailable)

@@ -7,6 +7,7 @@ impl<'authority> ResourceReservation<'authority> {
         identity: ReservationIdentity,
         amounts: ResourceAmounts,
         slot: u16,
+        operation: Option<OperationToken>,
     ) -> Self {
         Self {
             governor,
@@ -14,6 +15,7 @@ impl<'authority> ResourceReservation<'authority> {
             identity,
             amounts,
             slot,
+            operation,
             active: true,
         }
     }
@@ -42,6 +44,7 @@ impl<'authority> ResourceReservation<'authority> {
             owner: self.owner,
             identity: self.identity,
             amounts: self.amounts,
+            operation: self.operation.clone(),
             active: true,
         }
     }
@@ -118,6 +121,14 @@ impl<'authority> ResourceReservation<'authority> {
         self.amounts
     }
 
+    /// Returns the non-serializable capability for this live authenticated
+    /// root operation. Tenant, system, recovery, and child reservations do
+    /// not mint another root capability.
+    #[must_use]
+    pub fn operation_token(&self) -> Option<OperationToken> {
+        self.active.then(|| self.operation.clone()).flatten()
+    }
+
     /// Confirms that this move-only grant owns enough tenant ingest memory for
     /// signal-specific Store Block preparation.
     #[must_use]
@@ -132,6 +143,7 @@ impl<'authority> ResourceReservation<'authority> {
                 ReservationIdentity::Ordinary {
                     tenant: reserved_tenant,
                     kind: WorkKind::Ingest,
+                    ..
                 } if reserved_tenant == tenant
             )
             && self.amounts.get(ResourceDimension::MemoryBytes) >= memory_bytes
@@ -148,6 +160,7 @@ impl<'authority> ResourceReservation<'authority> {
             ReservationIdentity::Ordinary {
                 tenant: reserved_tenant,
                 kind: WorkKind::Ingest,
+                ..
             } => reserved_tenant == tenant,
             ReservationIdentity::Recovery {
                 scope: RecoveryScope::Tenant(reserved_tenant),
@@ -213,6 +226,7 @@ impl TransferredResourceReservation {
             self.identity,
             self.amounts,
             self.slot,
+            self.operation.clone(),
         ))
     }
 

@@ -299,7 +299,7 @@ fn created_weighted_tenant_has_the_same_live_fair_boundary_after_reopen()
     let reservation = initialized
         ._authority
         .governor()
-        .reserve(claim)
+        .reserve(claim.clone())
         .expect("weight two must receive its 2/3 fair share immediately after creation");
     drop(reservation);
     drop(initialized);

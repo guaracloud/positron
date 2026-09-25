@@ -4,6 +4,8 @@
 use std::mem::size_of;
 use std::sync::atomic::Ordering;
 
+use positron_domain::identity::{PrincipalId, TenantId};
+
 mod allocation;
 mod drop_ledger;
 
@@ -11,7 +13,7 @@ pub(super) use allocation::{LedgerAllocation, allocate};
 pub(super) use drop_ledger::DropLedger;
 
 use super::accounting::{AccountingState, ChargeAttribution, ChargeOwner, GovernorInner};
-use super::claim::{RecoveryWorkKind, ReservationIdentity, WorkKind};
+use super::claim::{OperationToken, RecoveryWorkKind, ReservationIdentity, WorkKind};
 use super::model::ResourceAmounts;
 use super::policy::{OrdinaryPool, PoolCharge};
 use super::recovery_policy::RecoveryPoolCharge;
@@ -42,7 +44,26 @@ pub(super) struct GrantRecord {
     amounts: ResourceAmounts,
     shared: ResourceAmounts,
     tenant_index: u16,
+    tenant: Option<TenantId>,
+    principal: Option<PrincipalId>,
     kind: GrantKind,
+    operation: Option<OperationRecord>,
+}
+
+/// Fixed-size operation metadata retained in the same preallocated grant
+/// ledger. A released root stays occupied until its children are gone, which
+/// prevents a stale child token from attaching to a reused slot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum OperationRecord {
+    Root {
+        generation: u64,
+        accepting_children: bool,
+        child_count: u16,
+    },
+    Child {
+        root_slot: u16,
+        generation: u64,
+    },
 }
 
 impl GrantRecord {
@@ -50,13 +71,20 @@ impl GrantRecord {
         owner: ChargeOwner,
         identity: ReservationIdentity,
         amounts: ResourceAmounts,
+        operation: Option<OperationRecord>,
     ) -> Option<Self> {
-        let (tenant_index, kind, shared) = match (owner.attribution, identity) {
+        let (tenant_index, tenant, principal, kind, shared) = match (owner.attribution, identity) {
             (
                 ChargeAttribution::Ordinary { tenant_index },
-                ReservationIdentity::Ordinary { kind, .. },
+                ReservationIdentity::Ordinary {
+                    tenant,
+                    principal,
+                    kind,
+                },
             ) => (
                 u16::try_from(tenant_index).ok()?,
+                Some(tenant),
+                principal,
                 GrantKind::from_ordinary(kind),
                 owner.pools?.shared(),
             ),
@@ -69,6 +97,8 @@ impl GrantRecord {
                     .transpose()
                     .ok()?
                     .unwrap_or(SYSTEM_TENANT_INDEX),
+                None,
+                None,
                 GrantKind::from_recovery(kind),
                 owner.recovery_pools?.shared,
             ),
@@ -78,7 +108,10 @@ impl GrantRecord {
             amounts,
             shared,
             tenant_index,
+            tenant,
+            principal,
             kind,
+            operation,
         })
     }
 
@@ -91,6 +124,102 @@ impl GrantRecord {
             None
         } else {
             Some(self.tenant_index as usize)
+        }
+    }
+
+    pub(super) const fn principal(self) -> Option<PrincipalId> {
+        self.principal
+    }
+
+    pub(super) const fn tenant(self) -> Option<TenantId> {
+        self.tenant
+    }
+
+    pub(super) const fn operation(self) -> Option<OperationRecord> {
+        self.operation
+    }
+
+    pub(super) const fn is_operation_root(self) -> bool {
+        matches!(self.operation, Some(OperationRecord::Root { .. }))
+    }
+
+    pub(super) fn root_token(self, governor: &GovernorInner, slot: u16) -> Option<OperationToken> {
+        match self.operation {
+            Some(OperationRecord::Root { generation, .. }) => Some(OperationToken {
+                authority: std::sync::Arc::downgrade(&governor.drop_ledger),
+                root_slot: slot,
+                generation,
+                tenant: self.tenant?,
+                principal: self.principal?,
+                kind: self.kind.ordinary_kind()?,
+            }),
+            Some(OperationRecord::Child { .. }) | None => None,
+        }
+    }
+
+    pub(super) fn released_root(self) -> Option<Self> {
+        match self.operation {
+            Some(OperationRecord::Root {
+                generation,
+                child_count,
+                ..
+            }) => Some(Self {
+                amounts: ResourceAmounts::zero(),
+                shared: ResourceAmounts::zero(),
+                tenant_index: self.tenant_index,
+                tenant: self.tenant,
+                principal: self.principal,
+                kind: self.kind,
+                operation: Some(OperationRecord::Root {
+                    generation,
+                    accepting_children: false,
+                    child_count,
+                }),
+            }),
+            Some(OperationRecord::Child { .. }) | None => None,
+        }
+    }
+
+    pub(super) fn increment_root_child(self) -> Option<Self> {
+        match self.operation {
+            Some(OperationRecord::Root {
+                generation,
+                accepting_children: true,
+                child_count,
+            }) => Some(Self {
+                operation: Some(OperationRecord::Root {
+                    generation,
+                    accepting_children: true,
+                    child_count: child_count.checked_add(1)?,
+                }),
+                ..self
+            }),
+            _ => None,
+        }
+    }
+
+    pub(super) fn decrement_root_child(self) -> Option<(Self, bool)> {
+        match self.operation {
+            Some(OperationRecord::Root {
+                generation,
+                accepting_children,
+                child_count,
+            }) => {
+                let remaining = child_count.checked_sub(1)?;
+                let remove = !accepting_children && remaining == 0;
+                Some((
+                    Self {
+                        operation: Some(OperationRecord::Root {
+                            generation,
+                            accepting_children,
+                            child_count: remaining,
+                        }),
+                        ..self
+                    },
+                    remove,
+                ))
+            },
+            _ => None,
         }
     }
 
@@ -142,8 +271,11 @@ impl GrantRecord {
         identity: ReservationIdentity,
         amounts: ResourceAmounts,
     ) -> Option<Self> {
-        let replacement = Self::new(owner, identity, amounts)?;
-        (replacement.kind == self.kind && replacement.tenant_index == self.tenant_index)
+        let replacement = Self::new(owner, identity, amounts, self.operation)?;
+        (replacement.kind == self.kind
+            && replacement.tenant_index == self.tenant_index
+            && replacement.tenant == self.tenant
+            && replacement.principal == self.principal)
             .then_some(replacement)
     }
 }
@@ -220,29 +352,19 @@ impl GovernorInner {
                     state.lifecycle = super::GovernorLifecycle::Fenced;
                     continue;
                 };
-                let Some(record_slot) = state.grant_records.get_mut(index) else {
-                    state.lifecycle = super::GovernorLifecycle::Fenced;
-                    continue;
-                };
                 if signal.load(Ordering::Acquire) != SLOT_RELEASE_PENDING {
                     state.lifecycle = super::GovernorLifecycle::Fenced;
                     continue;
                 }
-                let Some(record) = record_slot.take() else {
-                    state.lifecycle = super::GovernorLifecycle::Fenced;
-                    continue;
-                };
-                let released = self.release_record_locked(state, record);
-                if !released.applied || state.free_slots.len() == state.grant_records.len() {
-                    state.lifecycle = super::GovernorLifecycle::Fenced;
-                    continue;
-                }
-                signal.store(SLOT_FREE, Ordering::Release);
                 let Ok(slot) = u16::try_from(index) else {
                     state.lifecycle = super::GovernorLifecycle::Fenced;
                     continue;
                 };
-                state.free_slots.push(slot);
+                let released = self.release_slot_locked(state, false, slot);
+                if !released.applied {
+                    state.lifecycle = super::GovernorLifecycle::Fenced;
+                    continue;
+                }
             }
         }
     }
@@ -323,7 +445,8 @@ impl GovernorInner {
         let Some(signal) = self.drop_ledger.slot_signals.get(index) else {
             return false;
         };
-        if signal.load(Ordering::Acquire) != SLOT_ACTIVE || record.take().is_none() {
+        let signal_state = signal.load(Ordering::Acquire);
+        if !matches!(signal_state, SLOT_ACTIVE | SLOT_RELEASE_PENDING) || record.take().is_none() {
             return false;
         }
         if state.free_slots.len() == state.grant_records.len() {

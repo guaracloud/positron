@@ -2,8 +2,8 @@ use positron_domain::identity::TenantId;
 use positron_kernel::{
     DiskPressureThresholds, GovernorPolicy, InventoryCardinalityLimits,
     ObservedResourceEnvironment, OperatorLimits, OrdinaryPoolPolicy, OwnedPrimaryDataVolume,
-    RecoveryPoolCapacities, RecoveryReserve, RegisteredResourceBounds, ResourceAmounts,
-    ResourceDimension, ResourceGovernorConfiguration, ResourceInventory,
+    PrincipalQuota, RecoveryPoolCapacities, RecoveryReserve, RegisteredResourceBounds,
+    ResourceAmounts, ResourceDimension, ResourceGovernorConfiguration, ResourceInventory,
     StorageKernelResourceAuthority, TenantQuota,
 };
 
@@ -13,6 +13,18 @@ const DIMENSIONS: usize = 11;
 const DEFAULT_TENANT_QUOTA: [u64; DIMENSIONS] = [
     32_000_000, 32, 32, 5_000_000, 2_048, 32, 32, 32, 32, 32, 2_000_000,
 ];
+// These are conservative engineering defaults under the existing tenant and
+// class-pool policy, not product-specified constants. The operation vector is
+// large enough for the largest currently admissible query lane and the 4 MiB /
+// 1,024-record OTLP receiver claim. The aggregate is deliberately identical:
+// it preserves existing valid single-query and receiver budgets while keeping
+// a Principal's combined live usage finite. QueryBudget and receiver-specific
+// limits remain tighter where they apply.
+const DEFAULT_PRINCIPAL_OPERATION_QUOTA: [u64; DIMENSIONS] = [
+    16_000_000, 16, 16, 5_000_000, 2_000, 16, 16, 16, 16, 16, 1_000_000,
+];
+const DEFAULT_PRINCIPAL_AGGREGATE_QUOTA: [u64; DIMENSIONS] = DEFAULT_PRINCIPAL_OPERATION_QUOTA;
+const DEFAULT_PRINCIPAL_MAXIMUM_OPERATIONS: u32 = 4;
 
 struct ResourceSizing {
     cardinality: InventoryCardinalityLimits,
@@ -125,7 +137,15 @@ fn resource_configuration(
         OrdinaryPoolPolicy::new(uniform(8), uniform(6), uniform(4), uniform(2))
             .map_err(resource_failure)?,
     )
-    .map_err(resource_failure)?;
+    .map_err(resource_failure)?
+    .with_principal_quota(
+        PrincipalQuota::new(
+            DEFAULT_PRINCIPAL_MAXIMUM_OPERATIONS,
+            ResourceAmounts::new(DEFAULT_PRINCIPAL_OPERATION_QUOTA),
+            ResourceAmounts::new(DEFAULT_PRINCIPAL_AGGREGATE_QUOTA),
+        )
+        .map_err(resource_failure)?,
+    );
     ResourceGovernorConfiguration::new(inventory, policy, sizing.recovery).map_err(resource_failure)
 }
 
@@ -261,7 +281,10 @@ mod tests {
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use positron_kernel::{DiskObservation, MountQualification, PrimaryDataVolume};
+    use positron_domain::identity::PrincipalId;
+    use positron_kernel::{
+        DiskObservation, MountQualification, PrimaryDataVolume, WorkClaim, WorkKind,
+    };
 
     use super::*;
 
@@ -330,6 +353,43 @@ mod tests {
             Err(failure) if failure.code() == BootstrapFailureCode::ResourceUnavailable
         ));
         drop(volume);
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn default_principal_policy_preserves_canonical_query_and_receiver_claims()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = std::env::temp_dir().join(format!(
+            "positron-principal-resource-sizing-test-{}-{}",
+            std::process::id(),
+            NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root)?;
+        let volume = PrimaryDataVolume::acquire(&root, MountQualification::LocalHost)?;
+        let tenant = TenantId::from_bytes([0x91; 16])?;
+        let observed = ObservedResourceEnvironment::observe(
+            &volume,
+            RegisteredResourceBounds::new([100, 100, 500_000_000, 500_000, 100, 100, 100])?,
+        )?;
+        let configuration = resource_configuration(tenant, resource_sizing(1)?, observed)?;
+        let authority = StorageKernelResourceAuthority::establish(volume, configuration)?;
+        let principal = PrincipalId::from_bytes([0x92; 16])?;
+        let query = authority.governor().reserve(WorkClaim::authenticated(
+            tenant,
+            principal,
+            WorkKind::InteractiveQueryTail,
+            ResourceAmounts::new([6_850_000, 0, 0, 0, 0, 1, 0, 0, 6, 0, 0]),
+        )?)?;
+        drop(query);
+        let receiver = authority.governor().reserve(WorkClaim::authenticated(
+            tenant,
+            principal,
+            WorkKind::Ingest,
+            ResourceAmounts::new([4_194_304, 1, 1, 1_048_576, 1_024, 0, 0, 0, 1, 1, 0]),
+        )?)?;
+        drop(receiver);
+        drop(authority);
         fs::remove_dir_all(&root)?;
         Ok(())
     }

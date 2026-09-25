@@ -1,6 +1,9 @@
 //! Closed work identity and checked admission claims.
 
-use positron_domain::identity::TenantId;
+use std::fmt;
+use std::sync::Weak;
+
+use positron_domain::identity::{PrincipalId, TenantId};
 
 use super::failure::GovernorFailure;
 use super::model::ResourceAmounts;
@@ -38,12 +41,46 @@ impl WorkKind {
 }
 
 /// A checked, multidimensional request to begin tenant work.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkClaim {
     pub(super) tenant: TenantId,
+    pub(super) principal: Option<PrincipalId>,
     pub(super) kind: WorkKind,
     pub(super) amounts: ResourceAmounts,
+    pub(super) operation: Option<OperationToken>,
 }
+
+/// An opaque, in-memory capability for adding bounded sub-work to one live
+/// authenticated operation. It is intentionally not serializable: resumed
+/// cursors establish a fresh root operation.
+#[derive(Clone)]
+pub struct OperationToken {
+    pub(super) authority: Weak<super::ledger::DropLedger>,
+    pub(super) root_slot: u16,
+    pub(super) generation: u64,
+    pub(super) tenant: TenantId,
+    pub(super) principal: PrincipalId,
+    pub(super) kind: WorkKind,
+}
+
+impl fmt::Debug for OperationToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("OperationToken { <opaque> }")
+    }
+}
+
+impl PartialEq for OperationToken {
+    fn eq(&self, other: &Self) -> bool {
+        Weak::ptr_eq(&self.authority, &other.authority)
+            && self.root_slot == other.root_slot
+            && self.generation == other.generation
+            && self.tenant == other.tenant
+            && self.principal == other.principal
+            && self.kind == other.kind
+    }
+}
+
+impl Eq for OperationToken {}
 
 impl WorkClaim {
     pub fn tenant(
@@ -56,12 +93,56 @@ impl WorkClaim {
         }
         Ok(Self {
             tenant,
+            principal: None,
             kind,
             amounts,
+            operation: None,
         })
     }
 
-    pub(super) const fn class(self) -> WorkClass {
+    /// Creates one post-authentication tenant operation attributed to its
+    /// credential Principal. The Governor retains this identity in its fixed
+    /// grant ledger so one Principal cannot consume unbounded concurrent work.
+    pub fn authenticated(
+        tenant: TenantId,
+        principal: PrincipalId,
+        kind: WorkKind,
+        amounts: ResourceAmounts,
+    ) -> Result<Self, GovernorFailure> {
+        if amounts.is_empty() {
+            return Err(GovernorFailure::InvalidConfiguration);
+        }
+        Ok(Self {
+            tenant,
+            principal: Some(principal),
+            kind,
+            amounts,
+            operation: None,
+        })
+    }
+
+    /// Adds bounded work to a live authenticated operation. The Governor
+    /// validates this opaque capability atomically at admission, including
+    /// its Governor authority, root generation, tenant, Principal, and work
+    /// class.
+    pub fn authenticated_child(
+        operation: &OperationToken,
+        kind: WorkKind,
+        amounts: ResourceAmounts,
+    ) -> Result<Self, GovernorFailure> {
+        if amounts.is_empty() || kind.class() != operation.kind.class() {
+            return Err(GovernorFailure::InvalidConfiguration);
+        }
+        Ok(Self {
+            tenant: operation.tenant,
+            principal: Some(operation.principal),
+            kind,
+            amounts,
+            operation: Some(operation.clone()),
+        })
+    }
+
+    pub(super) const fn class(&self) -> WorkClass {
         self.kind.class()
     }
 }
@@ -199,6 +280,7 @@ impl RecoveryWorkClaim {
 pub(super) enum ReservationIdentity {
     Ordinary {
         tenant: TenantId,
+        principal: Option<PrincipalId>,
         kind: WorkKind,
     },
     Recovery {

@@ -4,9 +4,9 @@ use std::sync::{Arc, Barrier};
 use positron_domain::routing::{SignalKind, VirtualShardId};
 use positron_domain::value::AttributeValueKind;
 use positron_kernel::{
-    ActiveSegmentLedger, CatalogPublicationFault, CommittedLedgerReader, SegmentProtectionKey,
-    SnapshotLeaseId, WorkClass, with_catalog_publication_fault_after,
-    with_catalog_publication_fault_sequence_after,
+    ActiveSegmentLedger, CatalogPublicationFault, CommittedLedgerReader, PrincipalQuota,
+    ResourceAmounts, SegmentProtectionKey, SnapshotLeaseId, WorkClass,
+    with_catalog_publication_fault_after, with_catalog_publication_fault_sequence_after,
 };
 use positron_query::{
     QueryBudget, QueryEvent, QueryFailureCode, QueryService, QueryTerminal, TailCursor,
@@ -30,6 +30,88 @@ impl positron_query::QueryWorkMeter for OperatorOverflowWorkMeter {
     ) -> Result<u64, positron_query::QueryWorkFailure> {
         Ok(u64::from(stage == positron_query::QueryWorkStage::Operators) * u64::MAX)
     }
+}
+
+#[test]
+fn tail_reuses_its_planned_operation_when_the_principal_allows_one_operation()
+-> Result<(), Box<dyn Error>> {
+    let per_operation = ResourceAmounts::new([90_000, 0, 0, 0, 0, 1, 0, 0, 2_000_000, 0, 0]);
+    let aggregate = ResourceAmounts::new([140_000, 0, 0, 0, 0, 2, 0, 0, 4_000_000, 0, 0]);
+    let quota = PrincipalQuota::new(1, per_operation, aggregate)?;
+    QueryFixture::scoped_with_principal_quota("tail-one-planned-operation", quota, |fixture| {
+        fixture.kernel.append_log("one", 1, 1)?;
+        let service = fixture.service(16)?;
+        let budget = QueryBudget::new(1_048_576, 16, 1, 1_048_576, 65_536, 60)?;
+        let query = service.plan_pipeline(
+            fixture.context,
+            "pipeline:v1 logs | range query_time -100 100 | limit all",
+            budget,
+        )?;
+        let mut tail = service
+            .tail(query, TailStart::Historical { max_rows: 1 })
+            .expect("one planned operation must admit one Tail session");
+        assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
+        assert!(matches!(tail.poll(), Some(TailEvent::Batch(_))));
+        Ok(())
+    })
+}
+
+#[test]
+fn tail_retained_batches_saturate_the_authenticated_principal_and_release_for_resume()
+-> Result<(), Box<dyn Error>> {
+    let per_operation = ResourceAmounts::new([100_000, 0, 0, 0, 0, 1, 0, 0, 2_000_000, 0, 0]);
+    let aggregate = ResourceAmounts::new([140_000, 0, 0, 0, 0, 2, 0, 0, 4_000_000, 0, 0]);
+    let quota = PrincipalQuota::new(8, per_operation, aggregate)?;
+    QueryFixture::scoped_with_principal_quota("tail-principal-retained-buffer", quota, |fixture| {
+        let body = "x".repeat(20_000);
+        fixture
+            .kernel
+            .append_log(&body, 1, 1)
+            .expect("ingest fixture record");
+        let service = fixture.service(16).expect("query service");
+        let budget =
+            QueryBudget::new(1_048_576, 16, 1, 1_048_576, 65_536, 60).expect("query budget");
+        let query = service
+            .plan_pipeline(
+                fixture.context,
+                "pipeline:v1 logs | range query_time -100 100 | limit all",
+                budget,
+            )
+            .expect("first plan");
+        let mut first = service
+            .tail(query, TailStart::Historical { max_rows: 1 })
+            .expect("first tail must fit its per-operation ceiling");
+        assert!(matches!(first.poll(), Some(TailEvent::Header(_))));
+        assert!(matches!(first.poll(), Some(TailEvent::Batch(_))));
+        let cursor = first.cursor().clone();
+
+        let refusal = match service.plan_pipeline(
+            fixture.context,
+            "pipeline:v1 logs | range query_time -100 100 | limit all",
+            budget,
+        ) {
+            Ok(_) => return Err("retained Tail memory unexpectedly admitted a second plan".into()),
+            Err(refusal) => refusal,
+        };
+        assert_eq!(refusal.code(), QueryFailureCode::ResourceAdmissionRefused);
+
+        first.disconnect();
+        assert!(matches!(
+            first.poll(),
+            Some(TailEvent::Terminal(TailTerminal::Disconnected { .. }))
+        ));
+        drop(first);
+
+        let query = service.plan_pipeline(
+            fixture.context,
+            "pipeline:v1 logs | range query_time -100 100 | limit all",
+            budget,
+        )?;
+        let mut resumed = service.resume_tail(query, &cursor)?;
+        assert!(matches!(resumed.poll(), Some(TailEvent::Header(_))));
+        assert!(matches!(resumed.poll(), Some(TailEvent::Batch(_))));
+        Ok(())
+    })
 }
 
 #[test]

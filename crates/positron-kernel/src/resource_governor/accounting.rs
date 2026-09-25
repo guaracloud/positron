@@ -27,7 +27,7 @@ use super::inventory::{DiskObservation, DiskPressureThresholds, TenantQuota};
 use super::ledger::GrantRecord;
 use super::lifecycle::{GovernorLifecycle, class_index, empty_class_counts};
 use super::model::ResourceAmounts;
-use super::policy::{PoolCapacities, PoolCharge};
+use super::policy::{PoolCapacities, PoolCharge, PrincipalQuota};
 use super::recovery_policy::{RecoveryPoolCapacities, RecoveryPoolCharge, RecoveryPoolUsage};
 
 pub(super) struct GovernorInner {
@@ -36,6 +36,7 @@ pub(super) struct GovernorInner {
     pub(super) bootstrap_overhead: ResourceAmounts,
     pub(super) total_ceiling: ResourceAmounts,
     pub(super) ordinary_ceiling: ResourceAmounts,
+    pub(super) principal_quota: Option<PrincipalQuota>,
     pub(super) recovery_reserve: ResourceAmounts,
     pub(super) maximum_outstanding: u32,
     pub(super) pool_capacities: PoolCapacities,
@@ -61,6 +62,7 @@ pub(super) struct GovernorConfiguration {
     bootstrap_overhead: ResourceAmounts,
     total_ceiling: ResourceAmounts,
     ordinary_ceiling: ResourceAmounts,
+    principal_quota: Option<PrincipalQuota>,
     recovery_reserve: ResourceAmounts,
     maximum_outstanding: u32,
     pool_capacities: PoolCapacities,
@@ -77,6 +79,7 @@ pub(super) struct GovernorSetupInput {
     pub(super) bootstrap_overhead: ResourceAmounts,
     pub(super) total_ceiling: ResourceAmounts,
     pub(super) ordinary_ceiling: ResourceAmounts,
+    pub(super) principal_quota: Option<PrincipalQuota>,
     pub(super) tenant_quotas: Box<[TenantQuota]>,
     pub(super) maximum_outstanding: u32,
     pub(super) pool_capacities: PoolCapacities,
@@ -100,6 +103,9 @@ pub(super) struct AccountingState {
     pub(super) rejection_counts: [u64; AdmissionFailureCode::COUNT],
     pub(super) grant_records: Box<[Option<GrantRecord>]>,
     pub(super) free_slots: Vec<u16>,
+    /// Monotonic nonzero identity for authenticated operation roots. It is
+    /// never reused while this Governor lives, preventing slot ABA.
+    pub(super) next_operation_generation: u64,
     pub(super) total_usage: ResourceAmounts,
     pub(super) recovery_usage: ResourceAmounts,
     pub(super) tenant_limits: Box<[ResourceAmounts]>,

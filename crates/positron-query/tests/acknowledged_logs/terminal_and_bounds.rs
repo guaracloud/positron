@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use positron_domain::identity::{Scope, TenantId};
 use positron_governance::{CompatibilityHints, PresentedCredential, RequestedIntent};
-use positron_kernel::{ResourceAmounts, ResourceDimension, WorkClaim, WorkKind};
+use positron_kernel::{PrincipalQuota, ResourceAmounts, ResourceDimension, WorkClaim, WorkKind};
 use positron_query::{
     QueryBudget, QueryBudgetDimension, QueryCursor, QueryEvent, QueryFailureCode, QueryService,
     QueryTerminal,
@@ -13,6 +13,7 @@ use positron_runtime::{BootstrapPaths, InitializationPlan, InstanceBootstrap};
 use super::support::{
     KernelFixture, SequenceClock, TemporaryRoots, TestClock,
     with_compaction_kernel_fixture_with_identity, with_kernel_fixture_with_identity,
+    with_kernel_fixture_with_identity_and_principal_quota,
     with_kernel_fixture_with_identity_for_tenants, zero_work_clock_service,
 };
 
@@ -930,6 +931,51 @@ pub(crate) fn with_query_fixture<T>(
     })
 }
 
+pub(crate) fn with_query_fixture_with_principal_quota<T>(
+    label: &str,
+    principal_quota: PrincipalQuota,
+    action: impl for<'fixture, 'kernel, 'catalog> FnOnce(
+        &mut QueryFixture<'fixture, 'kernel, 'catalog>,
+    ) -> Result<T, Box<dyn Error>>,
+) -> Result<T, Box<dyn Error>> {
+    let roots = TemporaryRoots::new(label)?;
+    let paths = BootstrapPaths::new(
+        &roots.data(),
+        &roots.secrets(),
+        positron_kernel::MountQualification::LocalHost,
+    )?;
+    InstanceBootstrap::initialize(&paths, InitializationPlan::non_interactive())?;
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    let context = instance.attribute(
+        PresentedCredential::parse(claim.query_secret().ok_or("query secret missing")?)?,
+        RequestedIntent::Query,
+        CompatibilityHints::none(),
+    )?;
+    let administrator = instance.attribute(
+        PresentedCredential::parse(claim.secret())?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let governance = instance.governance_fixture_for_test()?;
+    with_kernel_fixture_with_identity_and_principal_quota(
+        instance.default_tenant_id(),
+        label,
+        &governance,
+        principal_quota,
+        |kernel| {
+            let mut fixture = QueryFixture {
+                _roots: roots,
+                instance,
+                kernel,
+                context,
+                administrator,
+            };
+            action(&mut fixture)
+        },
+    )
+}
+
 pub(crate) fn with_query_fixture_for_tenants<T>(
     label: &str,
     additional_tenants: &[TenantId],
@@ -1026,6 +1072,16 @@ impl QueryFixture<'_, '_, '_> {
         ) -> Result<T, Box<dyn Error>>,
     ) -> Result<T, Box<dyn Error>> {
         with_query_fixture(label, action)
+    }
+
+    pub(crate) fn scoped_with_principal_quota<T>(
+        label: &str,
+        principal_quota: PrincipalQuota,
+        action: impl for<'scope, 'kernel, 'catalog> FnOnce(
+            &mut QueryFixture<'scope, 'kernel, 'catalog>,
+        ) -> Result<T, Box<dyn Error>>,
+    ) -> Result<T, Box<dyn Error>> {
+        with_query_fixture_with_principal_quota(label, principal_quota, action)
     }
 
     pub(crate) fn scoped_with_tenants<T>(

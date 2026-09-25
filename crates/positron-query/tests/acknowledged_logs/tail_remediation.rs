@@ -1135,6 +1135,7 @@ fn multi_shard_resume_after_ack_and_new_commits_preserves_accounting() -> Result
         };
         assert_eq!(history.records().len(), 2);
         tail.acknowledge(history.sequence(), history.digest())?;
+        drop(history);
         let cursor = tail.cursor().clone();
 
         fixture.kernel.append_log("primary-live", 3, 3)?;
@@ -1163,6 +1164,7 @@ fn multi_shard_resume_after_ack_and_new_commits_preserves_accounting() -> Result
         assert_eq!(live.records().len(), 2);
         assert_eq!(live.sequence(), 1);
         resumed.acknowledge(live.sequence(), live.digest())?;
+        drop(live);
         assert_eq!(
             resumed.poll().ok_or("resumed tail did not become idle")?,
             TailEvent::Idle

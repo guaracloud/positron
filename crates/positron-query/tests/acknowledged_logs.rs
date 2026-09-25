@@ -14,6 +14,8 @@ mod lifecycle;
 mod parity;
 #[path = "acknowledged_logs/query_lifecycle_admission.rs"]
 mod query_lifecycle_admission;
+#[path = "acknowledged_logs/resource_governance.rs"]
+mod resource_governance;
 #[path = "acknowledged_logs/support.rs"]
 mod support;
 #[path = "acknowledged_logs/tail.rs"]

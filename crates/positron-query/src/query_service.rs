@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use positron_domain::identity::{Scope, TenantId};
+use positron_domain::identity::{PrincipalId, Scope, TenantId};
 use positron_governance::{AuthorizedContext, Identity};
 use positron_kernel::{
     ActiveSegmentLedger, CatalogGenerationId, ResourceAmounts, ResourceDimension, ResourceGovernor,
@@ -142,7 +142,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             return Err(QueryFailure::new(QueryFailureCode::UnsupportedQuery));
         }
         let started_at = self.now()?;
-        let reservation = self.reserve_query(tenant, budget)?;
+        let reservation = self.reserve_query(tenant, context.principal_id(), budget)?;
         let planning_memory = crate::planning_memory::PlanningMemory::new(budget.memory_bytes());
         let source_memory = planning_memory.reserve(
             u64::try_from(source.len())
@@ -273,6 +273,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
     pub(crate) fn reserve_query(
         &self,
         tenant: positron_domain::identity::TenantId,
+        principal: PrincipalId,
         budget: QueryBudget,
     ) -> Result<positron_kernel::ResourceReservation<'kernel>, QueryFailure> {
         let amounts = ResourceAmounts::new([
@@ -288,8 +289,9 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             0,
             0,
         ]);
-        let claim = WorkClaim::tenant(tenant, WorkKind::InteractiveQueryTail, amounts)
-            .map_err(|_| QueryFailure::new(QueryFailureCode::InvalidBudget))?;
+        let claim =
+            WorkClaim::authenticated(tenant, principal, WorkKind::InteractiveQueryTail, amounts)
+                .map_err(|_| QueryFailure::new(QueryFailureCode::InvalidBudget))?;
         self.governor
             .reserve(claim)
             .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceAdmissionRefused))
@@ -297,7 +299,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
 
     pub(crate) fn reserve_correlation_memory(
         &self,
-        tenant: positron_domain::identity::TenantId,
+        operation: Option<positron_kernel::OperationToken>,
         capacity: usize,
     ) -> Result<TransferredResourceReservation, QueryFailure> {
         let amounts = ResourceAmounts::only(
@@ -305,8 +307,17 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             crate::memory::correlation_retained_bytes(capacity)?,
         )
         .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
-        let claim = WorkClaim::tenant(tenant, WorkKind::InteractiveQueryTail, amounts)
-            .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
+        let claim = match operation {
+            Some(operation) => {
+                WorkClaim::authenticated_child(&operation, WorkKind::InteractiveQueryTail, amounts)
+            },
+            None => {
+                return Err(QueryFailure::new(
+                    QueryFailureCode::ResourceAdmissionRefused,
+                ));
+            },
+        }
+        .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
         self.governor
             .reserve(claim)
             .map(|reservation| reservation.transfer())

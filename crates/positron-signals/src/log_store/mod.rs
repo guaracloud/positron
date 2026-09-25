@@ -260,6 +260,31 @@ impl LogStore {
         self.scan_observed_inner(
             governor,
             tenant,
+            None,
+            snapshot,
+            scan,
+            cancellation,
+            observer,
+            None,
+        )
+    }
+
+    /// Query-only observed scan attributed to one live authenticated operation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn scan_observed_as_operation<'kernel>(
+        &self,
+        governor: ResourceGovernor<'kernel>,
+        tenant: TenantId,
+        operation: positron_kernel::OperationToken,
+        snapshot: &LedgerSnapshot<'_>,
+        scan: LogScan,
+        cancellation: &dyn ScanCancellation,
+        observer: &dyn ScanObserver,
+    ) -> Result<LogScanResult<'kernel>, LogStoreFailure> {
+        self.scan_observed_inner(
+            governor,
+            tenant,
+            Some(operation),
             snapshot,
             scan,
             cancellation,

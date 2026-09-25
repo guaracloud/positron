@@ -2,8 +2,8 @@ use positron_domain::identity::TenantId;
 use positron_domain::routing::{CommitPosition, RecordOrdinal, SignalKind};
 use positron_domain::value::ValueLimitProfile;
 use positron_kernel::{
-    LedgerSnapshot, ResourceAmounts, ResourceDimension, ResourceGovernor, ResourceReservation,
-    WorkClaim, WorkKind,
+    LedgerSnapshot, OperationToken, ResourceAmounts, ResourceDimension, ResourceGovernor,
+    ResourceReservation, WorkClaim, WorkKind,
 };
 
 use super::codec;
@@ -671,6 +671,36 @@ impl super::TraceStore {
         )
     }
 
+    /// Query-only trace scan attributed to one live authenticated operation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn scan_observed_as_operation<'kernel>(
+        &self,
+        governor: ResourceGovernor<'kernel>,
+        tenant: TenantId,
+        operation: OperationToken,
+        snapshot: &LedgerSnapshot<'_>,
+        scan: TraceScan,
+        cancellation: &dyn ScanCancellation,
+        observer: &dyn ScanObserver,
+    ) -> Result<super::LogicalTraceScanResult<'kernel>, TraceStoreFailure> {
+        self.scan_physical_observed_with_profile_and_work_kind(
+            &ValueLimitProfile::release_1_system_maximum(),
+            governor,
+            tenant,
+            Some(operation),
+            snapshot,
+            scan,
+            cancellation,
+            observer,
+            WorkKind::InteractiveQueryTail,
+        )?
+        .into_logical_spans(
+            &ValueLimitProfile::release_1_system_maximum(),
+            cancellation,
+            observer,
+        )
+    }
+
     /// Scans raw observations with cooperative cancellation and caller-owned work observation.
     pub fn scan_physical_observed<'kernel>(
         &self,
@@ -733,6 +763,7 @@ impl super::TraceStore {
             profile,
             governor,
             tenant,
+            None,
             snapshot,
             scan,
             cancellation,
@@ -755,6 +786,7 @@ impl super::TraceStore {
             &ValueLimitProfile::release_1_system_maximum(),
             governor,
             tenant,
+            None,
             snapshot,
             scan,
             cancellation,
@@ -769,6 +801,7 @@ impl super::TraceStore {
         profile: &ValueLimitProfile,
         governor: ResourceGovernor<'kernel>,
         tenant: TenantId,
+        operation: Option<OperationToken>,
         snapshot: &LedgerSnapshot<'_>,
         scan: TraceScan,
         cancellation: &dyn ScanCancellation,
@@ -787,8 +820,11 @@ impl super::TraceStore {
         let memory = output_memory.max(1);
         let amounts = ResourceAmounts::only(ResourceDimension::MemoryBytes, memory)
             .map_err(|_| TraceStoreFailure::limit_exceeded())?;
-        let claim = WorkClaim::tenant(tenant, work_kind, amounts)
-            .map_err(|_| TraceStoreFailure::limit_exceeded())?;
+        let claim = match operation {
+            Some(operation) => WorkClaim::authenticated_child(&operation, work_kind, amounts),
+            None => WorkClaim::tenant(tenant, work_kind, amounts),
+        }
+        .map_err(|_| TraceStoreFailure::limit_exceeded())?;
         let mut capacity = governor
             .reserve(claim)
             .map_err(|_| TraceStoreFailure::resource_admission_refused())?;

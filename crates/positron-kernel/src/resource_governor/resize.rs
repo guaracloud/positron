@@ -29,7 +29,7 @@ pub(super) struct ResizeRequest {
 impl GovernorInner {
     pub(super) fn resize(&self, request: ResizeRequest) -> Result<ResizeCommit, ResizeFailure> {
         match request.identity {
-            ReservationIdentity::Ordinary { tenant, kind } => {
+            ReservationIdentity::Ordinary { tenant, kind, .. } => {
                 let class = kind.class();
                 let ChargeAttribution::Ordinary { tenant_index } = request.owner.attribution else {
                     return Err(retained_resize(class, self.pressure_for_failure()));
@@ -113,6 +113,11 @@ impl GovernorInner {
             return Err(fence_resize(state, class));
         };
 
+        let principal = match identity {
+            ReservationIdentity::Ordinary { principal, .. } => principal,
+            ReservationIdentity::Recovery { .. } => None,
+        };
+
         let planned = if new.is_at_most(old) {
             // This is the sole `shrink_to` call site, so the helper can focus
             // on preserving the existing pool attribution exactly.
@@ -123,6 +128,14 @@ impl GovernorInner {
                 )
             })
         } else {
+            let principal_limit = self.refuse_principal_resize_limit(
+                state,
+                tenant_index,
+                principal,
+                slot,
+                class,
+                new,
+            );
             let live_disk = if new.get(ResourceDimension::DiskHeadroomBytes)
                 > old.get(ResourceDimension::DiskHeadroomBytes)
             {
@@ -136,7 +149,8 @@ impl GovernorInner {
             } else {
                 Ok(())
             };
-            live_disk
+            principal_limit
+                .and(live_disk)
                 .and_then(|()| {
                     let recovery_shared_usage = state
                         .recovery_tenant_pool_usage
@@ -236,8 +250,66 @@ impl GovernorInner {
                 state.pool_usage = pool_without;
                 state.outstanding = outstanding;
                 state.outstanding_ordinary = ordinary;
-                if !self.finish_slot(state, slot) {
+                let Some(record) = state
+                    .grant_records
+                    .get(usize::from(slot))
+                    .and_then(|record| *record)
+                else {
                     return Err(fence_resize(state, class));
+                };
+                match record.operation() {
+                    Some(super::ledger::OperationRecord::Root { child_count: 0, .. }) | None => {
+                        if !self.finish_slot(state, slot) {
+                            return Err(fence_resize(state, class));
+                        }
+                    },
+                    Some(super::ledger::OperationRecord::Root { .. }) => {
+                        let Some(released_root) = record.released_root() else {
+                            return Err(fence_resize(state, class));
+                        };
+                        let Some(record_slot) = state.grant_records.get_mut(usize::from(slot))
+                        else {
+                            return Err(fence_resize(state, class));
+                        };
+                        *record_slot = Some(released_root);
+                    },
+                    Some(super::ledger::OperationRecord::Child {
+                        root_slot,
+                        generation,
+                    }) => {
+                        let Some(root) = state
+                            .grant_records
+                            .get(usize::from(root_slot))
+                            .and_then(|record| *record)
+                        else {
+                            return Err(fence_resize(state, class));
+                        };
+                        if !matches!(
+                            root.operation(),
+                            Some(super::ledger::OperationRecord::Root { generation: root_generation, .. })
+                                if root_generation == generation
+                        ) {
+                            return Err(fence_resize(state, class));
+                        }
+                        let Some((updated_root, remove_root)) = root.decrement_root_child() else {
+                            return Err(fence_resize(state, class));
+                        };
+                        if !self.finish_slot(state, slot) {
+                            return Err(fence_resize(state, class));
+                        }
+                        if remove_root {
+                            if !self.finish_slot(state, root_slot) {
+                                return Err(fence_resize(state, class));
+                            }
+                        } else {
+                            let Some(root_slot_record) =
+                                state.grant_records.get_mut(usize::from(root_slot))
+                            else {
+                                return Err(fence_resize(state, class));
+                            };
+                            *root_slot_record = Some(updated_root);
+                        }
+                    },
                 }
                 return Err(failure);
             },
