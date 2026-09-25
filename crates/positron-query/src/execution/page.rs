@@ -136,15 +136,27 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             let trace_frontier = framed!(crate::execution_state::commit_position(
                 trace_snapshot.frontier().value(),
             ));
-            let result = positron_signals::TraceStore::new().scan_observed(
-                self.governor,
-                state.tenant,
-                trace_snapshot,
-                positron_signals::TraceScan::through(scan_limit, trace_frontier)
-                    .with_scanned_bytes(scanned_remaining),
-                &state.cancellation,
-                &observer,
-            );
+            let trace_scan = positron_signals::TraceScan::through(scan_limit, trace_frontier)
+                .with_scanned_bytes(scanned_remaining);
+            let result = match resources.operation_token() {
+                Some(operation) => positron_signals::TraceStore::new().scan_observed_as_operation(
+                    self.governor,
+                    state.tenant,
+                    operation,
+                    trace_snapshot,
+                    trace_scan,
+                    &state.cancellation,
+                    &observer,
+                ),
+                None => positron_signals::TraceStore::new().scan_observed(
+                    self.governor,
+                    state.tenant,
+                    trace_snapshot,
+                    trace_scan,
+                    &state.cancellation,
+                    &observer,
+                ),
+            };
             match result {
                 Ok(result) => {
                     observer.harvest(&mut state);
@@ -222,6 +234,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         let scan_result = match super::scan::execute_scan(
             self.governor,
             state.tenant,
+            resources.operation_token(),
             snapshot,
             None,
             frontier,
@@ -475,8 +488,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 .as_ref()
                 .map(|outcomes| {
                     self.reserve_correlation_memory(
-                        state.tenant,
-                        state.principal,
+                        resources.operation_token(),
                         outcomes.capacity(),
                     )
                 })

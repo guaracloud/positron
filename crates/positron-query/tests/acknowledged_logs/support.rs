@@ -17,7 +17,7 @@ use positron_kernel::{
     FixedLifecycleClockSource, FormatEpoch, GovernanceFixtureObject, GovernanceFixtureTarget,
     GovernorFailure, GovernorPolicy, InstanceId, InventoryCardinalityLimits, LifecycleClock,
     MountQualification, ObservedResourceEnvironment, OperatorLimits, OrdinaryPoolPolicy,
-    PreparedStoreBlock, PrimaryDataVolume, RecoveryPoolCapacities, RecoveryReserve,
+    PreparedStoreBlock, PrimaryDataVolume, PrincipalQuota, RecoveryPoolCapacities, RecoveryReserve,
     ResourceAmounts, ResourceDimension, ResourceGovernorConfiguration, ResourceInventory,
     RetentionTimeAuthority, SegmentProtectionKey, SegmentScope, StorageKernelResourceAuthority,
     StoreBlockIdentity, TenantQuota, TransactionId, WorkClaim, WorkKind,
@@ -923,9 +923,49 @@ pub fn with_kernel_fixture_for_tenants<T>(
         &mut KernelFixture<'kernel, 'catalog>,
     ) -> Result<T, Box<dyn Error>>,
 ) -> Result<T, Box<dyn Error>> {
+    with_kernel_fixture_with_principal_quota_for_tenants(
+        tenant,
+        label,
+        additional_tenants,
+        None,
+        action,
+    )
+}
+
+pub fn with_kernel_fixture_with_principal_quota<T>(
+    tenant: TenantId,
+    label: &str,
+    principal_quota: PrincipalQuota,
+    action: impl for<'kernel, 'catalog> FnOnce(
+        &mut KernelFixture<'kernel, 'catalog>,
+    ) -> Result<T, Box<dyn Error>>,
+) -> Result<T, Box<dyn Error>> {
+    with_kernel_fixture_with_principal_quota_for_tenants(
+        tenant,
+        label,
+        &[],
+        Some(principal_quota),
+        action,
+    )
+}
+
+fn with_kernel_fixture_with_principal_quota_for_tenants<T>(
+    tenant: TenantId,
+    label: &str,
+    additional_tenants: &[TenantId],
+    principal_quota: Option<PrincipalQuota>,
+    action: impl for<'kernel, 'catalog> FnOnce(
+        &mut KernelFixture<'kernel, 'catalog>,
+    ) -> Result<T, Box<dyn Error>>,
+) -> Result<T, Box<dyn Error>> {
     let root = TemporaryRoots::new(label)?;
     let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
-    let authority = establish_authority(volume, tenant, additional_tenants)?;
+    let authority = establish_authority_with_principal_quota(
+        volume,
+        tenant,
+        additional_tenants,
+        principal_quota,
+    )?;
     let catalog = Catalog::open(
         &authority,
         InstanceId::new([0x31; 16])?,
@@ -968,6 +1008,21 @@ pub fn with_kernel_fixture_with_identity<T>(
     ) -> Result<T, Box<dyn Error>>,
 ) -> Result<T, Box<dyn Error>> {
     with_kernel_fixture(tenant, label, |fixture| {
+        identity.install_into(fixture)?;
+        action(fixture)
+    })
+}
+
+pub fn with_kernel_fixture_with_identity_and_principal_quota<T>(
+    tenant: TenantId,
+    label: &str,
+    identity: &GovernanceTestFixture,
+    principal_quota: PrincipalQuota,
+    action: impl for<'kernel, 'catalog> FnOnce(
+        &mut KernelFixture<'kernel, 'catalog>,
+    ) -> Result<T, Box<dyn Error>>,
+) -> Result<T, Box<dyn Error>> {
+    with_kernel_fixture_with_principal_quota(tenant, label, principal_quota, |fixture| {
         identity.install_into(fixture)?;
         action(fixture)
     })
@@ -1762,11 +1817,21 @@ fn establish_authority(
     tenant: TenantId,
     additional_tenants: &[TenantId],
 ) -> Result<StorageKernelResourceAuthority, Box<dyn Error>> {
+    establish_authority_with_principal_quota(volume, tenant, additional_tenants, None)
+}
+
+fn establish_authority_with_principal_quota(
+    volume: positron_kernel::OwnedPrimaryDataVolume,
+    tenant: TenantId,
+    additional_tenants: &[TenantId],
+    principal_quota: Option<PrincipalQuota>,
+) -> Result<StorageKernelResourceAuthority, Box<dyn Error>> {
     let configuration = fixture_configuration(
         &volume,
         tenant,
         additional_tenants,
         FixtureInventory::Declared,
+        principal_quota,
     )?;
     StorageKernelResourceAuthority::establish(volume, configuration)
         .map_err(|_| "kernel authority establishment failed".into())
@@ -1783,6 +1848,7 @@ fn fixture_configuration(
     tenant: TenantId,
     additional_tenants: &[TenantId],
     detected_inventory: FixtureInventory,
+    principal_quota: Option<PrincipalQuota>,
 ) -> Result<ResourceGovernorConfiguration, Box<dyn Error>> {
     let tenant_count = additional_tenants
         .len()
@@ -1848,6 +1914,10 @@ fn fixture_configuration(
         )?,
         [..] => return Err("fixture supports one distinct additional tenant quota".into()),
     };
+    let policy = match principal_quota {
+        Some(quota) => policy.with_principal_quota(quota),
+        None => policy,
+    };
     let compaction = if additional_tenants.is_empty() {
         small
     } else {
@@ -1911,6 +1981,7 @@ fn four_core_capacity_cannot_admit_the_declared_acknowledged_logs_fixture_quota(
         TenantId::from_bytes([0xa1; 16])?,
         &[],
         FixtureInventory::DetectedCpu(4_000),
+        None,
     ) {
         Ok(_) => return Err("four logical CPUs unexpectedly admitted the fixture quota".into()),
         Err(failure) => failure,

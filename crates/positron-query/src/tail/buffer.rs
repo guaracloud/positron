@@ -3,10 +3,14 @@ use std::sync::Arc;
 use crate::memory::QUERY_RECORD_SLOT_BYTES;
 use crate::stream::{BatchMemoryAccount, BatchMemoryClaim};
 use crate::{QueryFailure, QueryFailureCode, QueryRecord};
+use positron_kernel::{
+    OperationToken, ResourceAmounts, ResourceDimension, ResourceGovernor,
+    TransferredResourceReservation, WorkClaim, WorkKind,
+};
 
 const MAX_BYTES: u64 = 16 * 1_048_576;
 
-pub(crate) struct TailBuffer {
+pub(crate) struct TailBuffer<'kernel> {
     batch: Option<BufferedBatch>,
     rows: usize,
     bytes: u64,
@@ -15,6 +19,10 @@ pub(crate) struct TailBuffer {
     memory_used: u64,
     memory_peak: u64,
     account: Arc<BatchMemoryAccount>,
+    governor: Option<ResourceGovernor<'kernel>>,
+    operation: Option<OperationToken>,
+    queue_claims: Vec<QueueClaim>,
+    queue_bytes: u64,
 }
 
 struct BufferedBatch {
@@ -22,8 +30,15 @@ struct BufferedBatch {
     claim: Arc<BatchMemoryClaim>,
 }
 
-impl TailBuffer {
+struct QueueClaim {
+    bytes: u64,
+    _reservation: Option<TransferredResourceReservation>,
+}
+
+impl<'kernel> TailBuffer<'kernel> {
     pub(crate) fn new(
+        governor: ResourceGovernor<'kernel>,
+        operation: OperationToken,
         max_rows: usize,
         max_bytes: u64,
         memory_limit: u64,
@@ -40,7 +55,55 @@ impl TailBuffer {
             memory_used: 0,
             memory_peak: 0,
             account: Arc::new(BatchMemoryAccount::new(memory_limit)),
+            governor: Some(governor),
+            operation: Some(operation),
+            queue_claims: Vec::new(),
+            queue_bytes: 0,
         })
+    }
+
+    #[cfg(test)]
+    fn new_for_test(
+        max_rows: usize,
+        max_bytes: u64,
+        memory_limit: u64,
+    ) -> Result<TailBuffer<'static>, QueryFailure> {
+        if max_rows == 0 || max_rows > 1_024 || max_bytes == 0 || max_bytes > MAX_BYTES {
+            return Err(QueryFailure::new(QueryFailureCode::InvalidBudget));
+        }
+        Ok(TailBuffer {
+            batch: None,
+            rows: 0,
+            bytes: 0,
+            max_rows,
+            max_bytes,
+            memory_used: 0,
+            memory_peak: 0,
+            account: Arc::new(BatchMemoryAccount::new(memory_limit)),
+            governor: None,
+            operation: None,
+            queue_claims: Vec::new(),
+            queue_bytes: 0,
+        })
+    }
+
+    fn reserve_governor_memory(
+        &self,
+        bytes: u64,
+    ) -> Result<Option<TransferredResourceReservation>, QueryFailure> {
+        let (Some(governor), Some(operation)) = (self.governor, self.operation) else {
+            return Ok(None);
+        };
+        let amounts = ResourceAmounts::only(ResourceDimension::MemoryBytes, bytes)
+            .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
+        let claim =
+            WorkClaim::authenticated_child(operation, WorkKind::InteractiveQueryTail, amounts)
+                .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
+        governor
+            .reserve(claim)
+            .map(|reservation| reservation.transfer())
+            .map(Some)
+            .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceAdmissionRefused))
     }
 
     pub(crate) fn push(&mut self, batch: Vec<QueryRecord>) -> Result<(), QueryFailure> {
@@ -72,10 +135,14 @@ impl TailBuffer {
                 QueryFailureCode::ResourceAdmissionRefused,
             ));
         }
-        self.account.reserve(
+        let reservation = self.reserve_governor_memory(bytes)?;
+        if let Err(failure) = self.account.reserve(
             bytes,
             QueryFailure::new(QueryFailureCode::ResourceAdmissionRefused),
-        )?;
+        ) {
+            drop(reservation);
+            return Err(failure);
+        }
         self.rows = self
             .rows
             .checked_add(rows)
@@ -84,26 +151,75 @@ impl TailBuffer {
         self.memory_used = self.account.used();
         self.memory_peak = self.memory_peak.max(self.account.peak());
         let records = Arc::from(batch.into_boxed_slice());
-        self.batch = Some(BufferedBatch {
-            records,
-            claim: BatchMemoryClaim::new(Arc::clone(&self.account), bytes),
-        });
+        let claim = match reservation {
+            Some(reservation) => BatchMemoryClaim::new_with_reservation(
+                Arc::clone(&self.account),
+                bytes,
+                reservation,
+            ),
+            None => BatchMemoryClaim::new(Arc::clone(&self.account), bytes),
+        };
+        self.batch = Some(BufferedBatch { records, claim });
         Ok(())
     }
 
     pub(crate) fn reserve_queue_bytes(&mut self, bytes: u64) -> Result<u64, QueryFailure> {
-        self.account.reserve(
+        if bytes == 0 {
+            return Ok(0);
+        }
+        let next = self
+            .queue_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
+        let reservation = self.reserve_governor_memory(bytes)?;
+        if let Err(failure) = self.account.reserve(
             bytes,
             QueryFailure::budget_exhausted(crate::QueryBudgetDimension::MemoryBytes),
-        )?;
+        ) {
+            drop(reservation);
+            return Err(failure);
+        }
+        if let Err(_) = self.queue_claims.try_reserve(1) {
+            self.account.release(bytes);
+            drop(reservation);
+            return Err(QueryFailure::new(QueryFailureCode::ResourceExhausted));
+        }
+        self.queue_claims.push(QueueClaim {
+            bytes,
+            _reservation: reservation,
+        });
+        self.queue_bytes = next;
         self.memory_used = self.account.used();
         self.memory_peak = self.memory_peak.max(self.account.peak());
         Ok(bytes)
     }
 
     pub(crate) fn release_queue(&mut self, bytes: u64) -> Result<(), QueryFailure> {
+        if bytes == 0 {
+            return Ok(());
+        }
         if self.account.used() < bytes {
             return Err(QueryFailure::new(QueryFailureCode::Internal));
+        }
+        if self.queue_bytes < bytes {
+            return Err(QueryFailure::new(QueryFailureCode::Internal));
+        }
+        if self.queue_bytes == bytes {
+            self.queue_claims.clear();
+            self.queue_bytes = 0;
+        } else {
+            let Some(index) = self
+                .queue_claims
+                .iter()
+                .position(|claim| claim.bytes == bytes)
+            else {
+                return Err(QueryFailure::new(QueryFailureCode::Internal));
+            };
+            self.queue_claims.swap_remove(index);
+            self.queue_bytes = self
+                .queue_bytes
+                .checked_sub(bytes)
+                .ok_or_else(|| QueryFailure::new(QueryFailureCode::Internal))?;
         }
         self.account.release(bytes);
         self.memory_used = self.account.used();
@@ -143,6 +259,8 @@ impl TailBuffer {
 
     pub(crate) fn clear(&mut self) {
         self.batch = None;
+        self.queue_claims.clear();
+        self.queue_bytes = 0;
         self.rows = 0;
         self.bytes = 0;
         self.memory_used = self.account.used();
@@ -159,7 +277,7 @@ mod accounting_tests {
 
     #[test]
     fn pop_reconciles_underflow_and_overflowed_dynamic_accounting() {
-        let mut buffer = TailBuffer::new(2, MAX_BYTES, MAX_BYTES).expect("bounded buffer");
+        let mut buffer = TailBuffer::new_for_test(2, MAX_BYTES, MAX_BYTES).expect("bounded buffer");
         buffer
             .push(vec![QueryRecord::count_record(1)])
             .expect("record fits in the buffer");
@@ -168,7 +286,7 @@ mod accounting_tests {
         buffer.memory_used = 0;
         assert!(buffer.pop().is_some());
 
-        let mut buffer = TailBuffer::new(2, MAX_BYTES, MAX_BYTES).expect("bounded buffer");
+        let mut buffer = TailBuffer::new_for_test(2, MAX_BYTES, MAX_BYTES).expect("bounded buffer");
         buffer
             .account
             .reserve(1, QueryFailure::new(QueryFailureCode::Internal))
@@ -197,11 +315,11 @@ mod tests {
     fn invalid_windows_and_empty_batches_are_refused() {
         for (rows, bytes) in [(0, 1), (1, 0), (1_025, 1), (1, MAX_BYTES + 1)] {
             assert!(matches!(
-                TailBuffer::new(rows, bytes, MAX_BYTES),
+                TailBuffer::new_for_test(rows, bytes, MAX_BYTES),
                 Err(failure) if failure.code() == QueryFailureCode::InvalidBudget
             ));
         }
-        let mut buffer = TailBuffer::new(1, 1, 1).expect("valid bounded window");
+        let mut buffer = TailBuffer::new_for_test(1, 1, 1).expect("valid bounded window");
         assert_eq!(
             buffer
                 .push(Vec::new())
@@ -213,7 +331,8 @@ mod tests {
 
     #[test]
     fn retained_slots_are_bounded_before_the_next_batch() {
-        let mut buffer = TailBuffer::new(2, MAX_BYTES, QUERY_RECORD_SLOT_BYTES).expect("window");
+        let mut buffer =
+            TailBuffer::new_for_test(2, MAX_BYTES, QUERY_RECORD_SLOT_BYTES).expect("window");
         assert_eq!(
             buffer
                 .push(vec![
@@ -234,7 +353,7 @@ mod tests {
 
     #[test]
     fn queue_reservation_and_release_are_checked_against_memory() {
-        let mut buffer = TailBuffer::new(1, MAX_BYTES, 1).expect("window");
+        let mut buffer = TailBuffer::new_for_test(1, MAX_BYTES, 1).expect("window");
         assert_eq!(
             buffer
                 .reserve_queue_bytes(2)
@@ -258,7 +377,7 @@ mod tests {
     #[test]
     fn push_checks_existing_batch_byte_window_and_memory_window() {
         let record = crate::stream::QueryRecord::count_record(1);
-        let mut buffer = TailBuffer::new(1, MAX_BYTES, MAX_BYTES).expect("window");
+        let mut buffer = TailBuffer::new_for_test(1, MAX_BYTES, MAX_BYTES).expect("window");
         buffer
             .push(vec![record.clone()])
             .expect("record fits in the buffer");
@@ -270,7 +389,7 @@ mod tests {
             QueryFailureCode::ResourceAdmissionRefused
         );
 
-        let mut bytes = TailBuffer::new(1, QUERY_RECORD_SLOT_BYTES - 1, MAX_BYTES)
+        let mut bytes = TailBuffer::new_for_test(1, QUERY_RECORD_SLOT_BYTES - 1, MAX_BYTES)
             .expect("window below one retained slot");
         assert_eq!(
             bytes
@@ -280,7 +399,7 @@ mod tests {
             QueryFailureCode::ResourceAdmissionRefused
         );
 
-        let mut memory = TailBuffer::new(1, MAX_BYTES, QUERY_RECORD_SLOT_BYTES - 1)
+        let mut memory = TailBuffer::new_for_test(1, MAX_BYTES, QUERY_RECORD_SLOT_BYTES - 1)
             .expect("memory window below one retained slot");
         assert_eq!(
             memory

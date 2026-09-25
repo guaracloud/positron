@@ -44,6 +44,19 @@ pub struct WorkClaim {
     pub(super) principal: Option<PrincipalId>,
     pub(super) kind: WorkKind,
     pub(super) amounts: ResourceAmounts,
+    pub(super) operation: Option<OperationToken>,
+}
+
+/// An opaque, in-memory capability for adding bounded sub-work to one live
+/// authenticated operation. It is intentionally not serializable: resumed
+/// cursors establish a fresh root operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OperationToken {
+    pub(super) root_slot: u16,
+    pub(super) generation: u64,
+    pub(super) tenant: TenantId,
+    pub(super) principal: PrincipalId,
+    pub(super) kind: WorkKind,
 }
 
 impl WorkClaim {
@@ -60,6 +73,7 @@ impl WorkClaim {
             principal: None,
             kind,
             amounts,
+            operation: None,
         })
     }
 
@@ -80,6 +94,27 @@ impl WorkClaim {
             principal: Some(principal),
             kind,
             amounts,
+            operation: None,
+        })
+    }
+
+    /// Adds bounded work to a live authenticated operation. The Governor
+    /// validates this opaque capability atomically at admission, including
+    /// its root generation, tenant, Principal, and work class.
+    pub fn authenticated_child(
+        operation: OperationToken,
+        kind: WorkKind,
+        amounts: ResourceAmounts,
+    ) -> Result<Self, GovernorFailure> {
+        if amounts.is_empty() || kind.class() != operation.kind.class() {
+            return Err(GovernorFailure::InvalidConfiguration);
+        }
+        Ok(Self {
+            tenant: operation.tenant,
+            principal: Some(operation.principal),
+            kind,
+            amounts,
+            operation: Some(operation),
         })
     }
 

@@ -1,11 +1,16 @@
 use super::*;
 use crate::resource_governor::{
-    GovernorFailure, GovernorLifecycle, ResourceDimension, WorkClaim, WorkKind,
+    GovernorFailure, GovernorLifecycle, MAX_OUTSTANDING_RESERVATIONS, ResourceDimension, WorkClaim,
+    WorkKind,
 };
 
 #[test]
 fn record_is_compact_and_maximum_ledger_is_bounded() {
-    assert_eq!(record_size_for_test(), 200);
+    assert!(record_size_for_test() <= 256);
+    let maximum_bytes = record_size_for_test()
+        .checked_mul(usize::try_from(MAX_OUTSTANDING_RESERVATIONS).expect("u16 capacity fits"))
+        .expect("fixed record inventory size fits usize");
+    assert!(maximum_bytes <= 16 * 1024 * 1024);
 }
 
 #[test]
@@ -136,8 +141,10 @@ fn unreconstructable_drop_record_fences_without_applying_a_release() {
         amounts: crate::resource_governor::ResourceAmounts::new([1; 11]),
         shared: crate::resource_governor::ResourceAmounts::new([0; 11]),
         tenant_index: SYSTEM_TENANT_INDEX,
+        tenant: None,
         principal: None,
         kind: GrantKind::Ingest,
+        operation: None,
     };
     let mut state = governor.inner.state.lock().expect("test lock is healthy");
     let status = governor.inner.release_record_locked(&mut state, corrupt);

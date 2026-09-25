@@ -297,10 +297,29 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceAdmissionRefused))
     }
 
-    pub(crate) fn reserve_correlation_memory(
+    /// Establishes a live authenticated operation for an execution path whose
+    /// concrete allocations are admitted by its existing child authorities.
+    /// The one-unit root is finite, released with the session, and gives those
+    /// later allocations one non-serializable operation identity without
+    /// moving their established failure timing into initial admission.
+    pub(crate) fn reserve_operation_root(
         &self,
         tenant: positron_domain::identity::TenantId,
         principal: PrincipalId,
+    ) -> Result<positron_kernel::ResourceReservation<'kernel>, QueryFailure> {
+        let amounts = ResourceAmounts::only(ResourceDimension::MemoryBytes, 1)
+            .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
+        let claim =
+            WorkClaim::authenticated(tenant, principal, WorkKind::InteractiveQueryTail, amounts)
+                .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
+        self.governor
+            .reserve(claim)
+            .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceAdmissionRefused))
+    }
+
+    pub(crate) fn reserve_correlation_memory(
+        &self,
+        operation: Option<positron_kernel::OperationToken>,
         capacity: usize,
     ) -> Result<TransferredResourceReservation, QueryFailure> {
         let amounts = ResourceAmounts::only(
@@ -308,9 +327,17 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             crate::memory::correlation_retained_bytes(capacity)?,
         )
         .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
-        let claim =
-            WorkClaim::authenticated(tenant, principal, WorkKind::InteractiveQueryTail, amounts)
-                .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
+        let claim = match operation {
+            Some(operation) => {
+                WorkClaim::authenticated_child(operation, WorkKind::InteractiveQueryTail, amounts)
+            },
+            None => {
+                return Err(QueryFailure::new(
+                    QueryFailureCode::ResourceAdmissionRefused,
+                ));
+            },
+        }
+        .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
         self.governor
             .reserve(claim)
             .map(|reservation| reservation.transfer())

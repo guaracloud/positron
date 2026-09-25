@@ -225,6 +225,104 @@ fn principal_quota_bounds_each_operation_and_aggregate_on_resize()
 }
 
 #[test]
+fn authenticated_child_claims_share_one_operation_ceiling_and_drain_in_any_order()
+-> Result<(), Box<dyn std::error::Error>> {
+    let tenant = tenant(0xd1)?;
+    let principal = principal(0xd2)?;
+    let capacity = amounts(20);
+    let governor = governor_with_principal_quota(
+        capacity,
+        capacity,
+        [TenantQuota::new(tenant, 1, capacity)?],
+        Some(PrincipalQuota::new(1, amounts(3), amounts(10))?),
+    )?;
+    let root_claim = || {
+        WorkClaim::authenticated(
+            tenant,
+            principal,
+            WorkKind::InteractiveQueryTail,
+            ResourceAmounts::only(ResourceDimension::MemoryBytes, 2)?,
+        )
+    };
+    let root = governor.reserve(root_claim()?)?;
+    let token = root
+        .operation_token()
+        .ok_or("authenticated root mints token")?;
+    let too_large = governor
+        .reserve(WorkClaim::authenticated_child(
+            token,
+            WorkKind::InteractiveQueryTail,
+            ResourceAmounts::only(ResourceDimension::MemoryBytes, 2)?,
+        )?)
+        .expect_err("root plus child cannot exceed one logical operation ceiling");
+    assert_eq!(too_large.limiting_scope(), LimitingScope::Operation);
+
+    let mut child = governor.reserve(WorkClaim::authenticated_child(
+        token,
+        WorkKind::InteractiveQueryTail,
+        ResourceAmounts::only(ResourceDimension::MemoryBytes, 1)?,
+    )?)?;
+    let mut root = root;
+    assert_eq!(root.cancel()?, positron_kernel::ReleaseOutcome::Released);
+    assert_eq!(governor.inspect()?.outstanding_reservations(), 1);
+    let closed = governor
+        .reserve(WorkClaim::authenticated_child(
+            token,
+            WorkKind::InteractiveQueryTail,
+            ResourceAmounts::only(ResourceDimension::MemoryBytes, 1)?,
+        )?)
+        .expect_err("a cancelled root cannot acquire new child work");
+    assert_eq!(closed.limiting_scope(), LimitingScope::Operation);
+    assert_eq!(child.cancel()?, positron_kernel::ReleaseOutcome::Released);
+    assert_eq!(governor.inspect()?.outstanding_reservations(), 0);
+
+    let replacement = governor.reserve(root_claim()?)?;
+    let stale = governor
+        .reserve(WorkClaim::authenticated_child(
+            token,
+            WorkKind::InteractiveQueryTail,
+            ResourceAmounts::only(ResourceDimension::MemoryBytes, 1)?,
+        )?)
+        .expect_err("a released root generation cannot attach after slot reuse");
+    assert_eq!(stale.limiting_scope(), LimitingScope::Operation);
+    drop(replacement);
+    Ok(())
+}
+
+#[test]
+fn operation_token_survives_transfer_and_child_before_root_release()
+-> Result<(), Box<dyn std::error::Error>> {
+    let tenant = tenant(0xd3)?;
+    let principal = principal(0xd4)?;
+    let capacity = amounts(20);
+    let governor = governor_with_principal_quota(
+        capacity,
+        capacity,
+        [TenantQuota::new(tenant, 1, capacity)?],
+        Some(PrincipalQuota::new(1, amounts(4), amounts(8))?),
+    )?;
+    let root = governor.reserve(WorkClaim::authenticated(
+        tenant,
+        principal,
+        WorkKind::InteractiveQueryTail,
+        ResourceAmounts::only(ResourceDimension::MemoryBytes, 2)?,
+    )?)?;
+    let token = root.operation_token().ok_or("root token")?;
+    let transferred = root.transfer();
+    let mut root = transferred.reclaim(governor.governor())?;
+    let child = governor.reserve(WorkClaim::authenticated_child(
+        token,
+        WorkKind::InteractiveQueryTail,
+        ResourceAmounts::only(ResourceDimension::MemoryBytes, 1)?,
+    )?)?;
+    drop(child);
+    assert_eq!(governor.inspect()?.outstanding_reservations(), 1);
+    assert_eq!(root.cancel()?, positron_kernel::ReleaseOutcome::Released);
+    assert_eq!(governor.inspect()?.outstanding_reservations(), 0);
+    Ok(())
+}
+
+#[test]
 fn principal_quota_refusals_do_not_accumulate_charges_or_cross_tenants()
 -> Result<(), Box<dyn std::error::Error>> {
     let first_tenant = tenant(0xc1)?;

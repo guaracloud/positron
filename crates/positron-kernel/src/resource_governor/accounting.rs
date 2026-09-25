@@ -103,6 +103,9 @@ pub(super) struct AccountingState {
     pub(super) rejection_counts: [u64; AdmissionFailureCode::COUNT],
     pub(super) grant_records: Box<[Option<GrantRecord>]>,
     pub(super) free_slots: Vec<u16>,
+    /// Monotonic nonzero identity for authenticated operation roots. It is
+    /// never reused while this Governor lives, preventing slot ABA.
+    pub(super) next_operation_generation: u64,
     pub(super) total_usage: ResourceAmounts,
     pub(super) recovery_usage: ResourceAmounts,
     pub(super) tenant_limits: Box<[ResourceAmounts]>,

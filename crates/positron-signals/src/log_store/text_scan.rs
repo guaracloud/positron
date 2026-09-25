@@ -1,7 +1,8 @@
 use super::scan::{admit_block_bytes, includes_block, skipped_records};
 use positron_domain::routing::SignalKind;
 use positron_kernel::{
-    LedgerSnapshot, ResourceAmounts, ResourceDimension, ResourceGovernor, WorkClaim, WorkKind,
+    LedgerSnapshot, OperationToken, ResourceAmounts, ResourceDimension, ResourceGovernor,
+    WorkClaim, WorkKind,
 };
 
 use super::{
@@ -28,6 +29,34 @@ impl LogStore {
         self.scan_observed_inner(
             governor,
             tenant,
+            None,
+            snapshot,
+            scan,
+            cancellation,
+            observer,
+            Some((schema, candidate)),
+        )
+    }
+
+    /// Query-only scan entrypoint that charges this allocation to one live
+    /// authenticated operation instead of creating a tenant-only claim.
+    #[allow(clippy::too_many_arguments)]
+    pub fn scan_text_observed_as_operation<'kernel>(
+        &self,
+        governor: ResourceGovernor<'kernel>,
+        tenant: positron_domain::identity::TenantId,
+        operation: OperationToken,
+        snapshot: &LedgerSnapshot<'_>,
+        scan: LogScan,
+        schema: &SchemaCatalog,
+        candidate: &TextSearchCandidate,
+        cancellation: &dyn ScanCancellation,
+        observer: &dyn ScanObserver,
+    ) -> Result<LogScanResult<'kernel>, LogStoreFailure> {
+        self.scan_observed_inner(
+            governor,
+            tenant,
+            Some(operation),
             snapshot,
             scan,
             cancellation,
@@ -41,6 +70,7 @@ impl LogStore {
         &self,
         governor: ResourceGovernor<'kernel>,
         tenant: positron_domain::identity::TenantId,
+        operation: Option<OperationToken>,
         snapshot: &LedgerSnapshot<'_>,
         scan: LogScan,
         cancellation: &dyn ScanCancellation,
@@ -80,8 +110,13 @@ impl LogStore {
             .max(1);
         let amounts = ResourceAmounts::only(ResourceDimension::MemoryBytes, memory)
             .map_err(|_| LogStoreFailure::limit_exceeded())?;
-        let claim = WorkClaim::tenant(tenant, WorkKind::InteractiveQueryTail, amounts)
-            .map_err(|_| LogStoreFailure::limit_exceeded())?;
+        let claim = match operation {
+            Some(operation) => {
+                WorkClaim::authenticated_child(operation, WorkKind::InteractiveQueryTail, amounts)
+            },
+            None => WorkClaim::tenant(tenant, WorkKind::InteractiveQueryTail, amounts),
+        }
+        .map_err(|_| LogStoreFailure::limit_exceeded())?;
         let capacity = governor
             .reserve(claim)
             .map_err(|_| LogStoreFailure::resource_admission_refused())?;

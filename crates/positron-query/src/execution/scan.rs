@@ -1,5 +1,5 @@
 use positron_domain::identity::TenantId;
-use positron_kernel::{LedgerSnapshot, ResourceGovernor};
+use positron_kernel::{LedgerSnapshot, OperationToken, ResourceGovernor};
 use positron_signals::{LogScan, LogScanResult, LogStore, ScanLimit};
 
 use crate::execution_support::{QueryScanObserver, map_store_failure};
@@ -23,6 +23,7 @@ pub(crate) enum ScanAfter {
 pub(crate) fn execute_scan<'kernel>(
     governor: ResourceGovernor<'kernel>,
     tenant: TenantId,
+    operation: Option<OperationToken>,
     snapshot: &LedgerSnapshot<'kernel>,
     after: Option<ScanAfter>,
     frontier: positron_domain::routing::CommitPosition,
@@ -43,28 +44,70 @@ pub(crate) fn execute_scan<'kernel>(
     }
     .with_scanned_bytes(scanned_remaining);
     let result = match (schema, schema_query, text_candidate) {
-        (Some(schema), None, Some(candidate)) => LogStore::new().scan_text_observed(
-            governor,
-            tenant,
-            snapshot,
-            scan,
-            schema,
-            candidate,
-            cancellation,
-            observer,
-        ),
-        (Some(schema), Some(query), _) => LogStore::new().scan_schema_observed(
-            governor,
-            tenant,
-            snapshot,
-            scan,
-            schema,
-            query,
-            cancellation,
-            observer,
-        ),
-        _ => {
-            LogStore::new().scan_observed(governor, tenant, snapshot, scan, cancellation, observer)
+        (Some(schema), None, Some(candidate)) => match operation {
+            Some(operation) => LogStore::new().scan_text_observed_as_operation(
+                governor,
+                tenant,
+                operation,
+                snapshot,
+                scan,
+                schema,
+                candidate,
+                cancellation,
+                observer,
+            ),
+            None => LogStore::new().scan_text_observed(
+                governor,
+                tenant,
+                snapshot,
+                scan,
+                schema,
+                candidate,
+                cancellation,
+                observer,
+            ),
+        },
+        (Some(schema), Some(query), _) => match operation {
+            Some(operation) => LogStore::new().scan_schema_observed_as_operation(
+                governor,
+                tenant,
+                operation,
+                snapshot,
+                scan,
+                schema,
+                query,
+                cancellation,
+                observer,
+            ),
+            None => LogStore::new().scan_schema_observed(
+                governor,
+                tenant,
+                snapshot,
+                scan,
+                schema,
+                query,
+                cancellation,
+                observer,
+            ),
+        },
+        _ => match operation {
+            Some(operation) => LogStore::new().scan_observed_as_operation(
+                governor,
+                tenant,
+                operation,
+                snapshot,
+                scan,
+                cancellation,
+                observer,
+            ),
+            None => LogStore::new().scan_observed(
+                governor,
+                tenant,
+                snapshot,
+                scan,
+                cancellation,
+                observer,
+            ),
         },
     };
     result.map_err(map_store_failure)

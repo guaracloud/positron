@@ -1,13 +1,14 @@
 //! Atomic admission planning and commit.
 
 use super::accounting::{ChargeAttribution, ChargeOwner, GovernorInner};
-use super::claim::{ReservationIdentity, WorkClaim};
+use super::claim::{OperationToken, ReservationIdentity, WorkClaim};
 use super::decision::{
     DecisionLimit, OrdinaryCapacity, failure_at_pressure, internal_failure_at_pressure,
     refuse_exceeded, refuse_live_disk_growth, refuse_ordinary_capacity,
     refuse_tenant_recovery_shared_fair_share,
 };
 use super::failure::{AdmissionFailure, AdmissionFailureCode, AdmissionRetry, LimitingScope};
+use super::ledger::OperationRecord;
 use super::lifecycle::GovernorLifecycle;
 use super::pool_admission::{
     PoolAdmission, plan_pool_charge, pressure_eligibility, shutdown_failure,
@@ -39,7 +40,15 @@ impl GovernorInner {
         let tenant_index = Self::tenant_index(state, claim.tenant, class)
             .map_err(|failure| failure.at_pressure(state.disk_pressure))?;
         let outstanding = self.require_healthy_and_slot(state, class, Some(tenant_index))?;
-        self.refuse_principal_limit(state, tenant_index, claim.principal, class, claim.amounts)?;
+        self.validate_operation_child(state, tenant_index, claim.operation, class)?;
+        self.refuse_principal_limit(
+            state,
+            tenant_index,
+            claim.principal,
+            claim.operation,
+            class,
+            claim.amounts,
+        )?;
         let shared_eligible = pressure_eligibility(state.disk_pressure, class, claim.amounts)?;
         refuse_live_disk_growth(
             class,
@@ -190,7 +199,11 @@ impl GovernorInner {
             principal: claim.principal,
             kind: claim.kind,
         };
-        let Some(record) = super::ledger::GrantRecord::new(owner, identity, claim.amounts) else {
+        let operation =
+            self.operation_record_for_claim(state, claim.operation, claim.principal, class)?;
+        let Some(record) =
+            super::ledger::GrantRecord::new(owner, identity, claim.amounts, operation)
+        else {
             state.lifecycle = GovernorLifecycle::Fenced;
             return Err(internal_failure_at_pressure(class, state.disk_pressure));
         };
@@ -198,6 +211,26 @@ impl GovernorInner {
             state.lifecycle = GovernorLifecycle::Fenced;
             return Err(internal_failure_at_pressure(class, state.disk_pressure));
         };
+        if let Some(OperationToken { root_slot, .. }) = claim.operation {
+            let Some(root) = state
+                .grant_records
+                .get_mut(usize::from(root_slot))
+                .and_then(|record| record.as_mut())
+            else {
+                state.lifecycle = GovernorLifecycle::Fenced;
+                return Err(internal_failure_at_pressure(class, state.disk_pressure));
+            };
+            let Some(updated) = root.increment_root_child() else {
+                state.lifecycle = GovernorLifecycle::Fenced;
+                return Err(internal_failure_at_pressure(class, state.disk_pressure));
+            };
+            *root = updated;
+        }
+        let reservation_operation = state
+            .grant_records
+            .get(usize::from(reservation_slot))
+            .and_then(|record| *record)
+            .and_then(|record| record.root_token(reservation_slot));
         let Some(tenant_usage_slot) = state.ordinary_tenant_usage.get_mut(tenant_index) else {
             state.lifecycle = GovernorLifecycle::Fenced;
             return Err(internal_failure_at_pressure(class, state.disk_pressure));
@@ -228,6 +261,7 @@ impl GovernorInner {
             identity,
             claim.amounts,
             reservation_slot,
+            reservation_operation,
         ))
     }
 
@@ -236,6 +270,7 @@ impl GovernorInner {
         state: &super::accounting::AccountingState,
         tenant_index: usize,
         principal: Option<positron_domain::identity::PrincipalId>,
+        operation: Option<OperationToken>,
         class: super::WorkClass,
         requested: super::ResourceAmounts,
     ) -> Result<(), AdmissionFailure> {
@@ -247,7 +282,7 @@ impl GovernorInner {
         };
         let (in_use, usage) = self.principal_usage(state, tenant_index, principal, class)?;
         let allowed = u64::from(quota.maximum_operations());
-        if in_use >= allowed {
+        if operation.is_none() && in_use >= allowed {
             return Err(failure_at_pressure(
                 AdmissionFailureCode::PrincipalQuotaExceeded,
                 AdmissionRetry::AfterCapacityRelease,
@@ -262,11 +297,15 @@ impl GovernorInner {
                 },
             ));
         }
+        let operation_usage = match operation {
+            Some(token) => self.operation_usage(state, token, None, class)?,
+            None => super::ResourceAmounts::zero(),
+        };
         refuse_exceeded(
             AdmissionFailureCode::PrincipalQuotaExceeded,
             LimitingScope::Operation,
             class,
-            super::ResourceAmounts::zero(),
+            operation_usage,
             requested,
             quota.per_operation_limits(),
             state.disk_pressure,
@@ -305,11 +344,44 @@ impl GovernorInner {
             Some(excluded_slot),
             class,
         )?;
+        let operation = state
+            .grant_records
+            .get(usize::from(excluded_slot))
+            .and_then(|record| *record)
+            .and_then(|record| match record.operation() {
+                Some(OperationRecord::Root { generation, .. }) => Some(OperationToken {
+                    root_slot: excluded_slot,
+                    generation,
+                    tenant: match record.root_token(excluded_slot) {
+                        Some(token) => token.tenant,
+                        None => return None,
+                    },
+                    principal,
+                    kind: match record.root_token(excluded_slot) {
+                        Some(token) => token.kind,
+                        None => return None,
+                    },
+                }),
+                Some(OperationRecord::Child {
+                    root_slot,
+                    generation,
+                }) => state
+                    .grant_records
+                    .get(usize::from(root_slot))
+                    .and_then(|root| *root)
+                    .and_then(|root| root.root_token(root_slot))
+                    .filter(|token| token.generation == generation),
+                None => None,
+            });
+        let operation_usage = match operation {
+            Some(token) => self.operation_usage(state, token, Some(excluded_slot), class)?,
+            None => super::ResourceAmounts::zero(),
+        };
         refuse_exceeded(
             AdmissionFailureCode::PrincipalQuotaExceeded,
             LimitingScope::Operation,
             class,
-            super::ResourceAmounts::zero(),
+            operation_usage,
             requested,
             quota.per_operation_limits(),
             state.disk_pressure,
@@ -358,13 +430,132 @@ impl GovernorInner {
             {
                 continue;
             }
-            count = count
-                .checked_add(1)
-                .ok_or_else(|| internal_failure_at_pressure(class, state.disk_pressure))?;
+            if record.is_operation_root() {
+                count = count
+                    .checked_add(1)
+                    .ok_or_else(|| internal_failure_at_pressure(class, state.disk_pressure))?;
+            }
             usage = usage
                 .checked_add(record.amounts())
                 .ok_or_else(|| internal_failure_at_pressure(class, state.disk_pressure))?;
         }
         Ok((count, usage))
+    }
+
+    fn validate_operation_child(
+        &self,
+        state: &super::accounting::AccountingState,
+        tenant_index: usize,
+        operation: Option<OperationToken>,
+        class: super::WorkClass,
+    ) -> Result<(), AdmissionFailure> {
+        let Some(token) = operation else {
+            return Ok(());
+        };
+        let valid = state
+            .grant_records
+            .get(usize::from(token.root_slot))
+            .and_then(|record| *record)
+            .is_some_and(|record| {
+                record.tenant_index() == Some(tenant_index)
+                    && record.tenant() == Some(token.tenant)
+                    && record.principal() == Some(token.principal)
+                    && record.class() == class
+                    && matches!(
+                        record.operation(),
+                        Some(OperationRecord::Root {
+                            generation,
+                            accepting_children: true,
+                            ..
+                        }) if generation == token.generation
+                    )
+            });
+        valid
+            .then_some(())
+            .ok_or_else(|| self.invalid_operation_failure(state, class))
+    }
+
+    fn operation_record_for_claim(
+        &self,
+        state: &mut super::accounting::AccountingState,
+        operation: Option<OperationToken>,
+        principal: Option<positron_domain::identity::PrincipalId>,
+        class: super::WorkClass,
+    ) -> Result<Option<OperationRecord>, AdmissionFailure> {
+        if let Some(token) = operation {
+            return Ok(Some(OperationRecord::Child {
+                root_slot: token.root_slot,
+                generation: token.generation,
+            }));
+        }
+        if principal.is_none() {
+            return Ok(None);
+        }
+        let generation = state.next_operation_generation;
+        let Some(next) = generation.checked_add(1) else {
+            state.lifecycle = GovernorLifecycle::Fenced;
+            return Err(internal_failure_at_pressure(class, state.disk_pressure));
+        };
+        state.next_operation_generation = next;
+        Ok(Some(OperationRecord::Root {
+            generation,
+            accepting_children: true,
+            child_count: 0,
+        }))
+    }
+
+    fn operation_usage(
+        &self,
+        state: &super::accounting::AccountingState,
+        token: OperationToken,
+        excluded_slot: Option<u16>,
+        class: super::WorkClass,
+    ) -> Result<super::ResourceAmounts, AdmissionFailure> {
+        let mut usage = super::ResourceAmounts::zero();
+        for (slot, record) in state.grant_records.iter().enumerate() {
+            let slot = u16::try_from(slot)
+                .map_err(|_| internal_failure_at_pressure(class, state.disk_pressure))?;
+            if Some(slot) == excluded_slot {
+                continue;
+            }
+            let Some(record) = record else {
+                continue;
+            };
+            let belongs = matches!(
+                record.operation(),
+                Some(OperationRecord::Root { generation, .. })
+                    if slot == token.root_slot && generation == token.generation
+            ) || matches!(
+                record.operation(),
+                Some(OperationRecord::Child { root_slot, generation })
+                    if root_slot == token.root_slot && generation == token.generation
+            );
+            if belongs {
+                usage = usage
+                    .checked_add(record.amounts())
+                    .ok_or_else(|| internal_failure_at_pressure(class, state.disk_pressure))?;
+            }
+        }
+        Ok(usage)
+    }
+
+    fn invalid_operation_failure(
+        &self,
+        state: &super::accounting::AccountingState,
+        class: super::WorkClass,
+    ) -> AdmissionFailure {
+        failure_at_pressure(
+            AdmissionFailureCode::PrincipalQuotaExceeded,
+            AdmissionRetry::AfterCapacityRelease,
+            LimitingScope::Operation,
+            class,
+            state.disk_pressure,
+            DecisionLimit {
+                dimension: None,
+                allowed: 0,
+                in_use: 0,
+                requested: 1,
+            },
+        )
     }
 }

@@ -138,6 +138,7 @@ impl GovernorInner {
             rejection_counts: [0; AdmissionFailureCode::COUNT],
             grant_records: records,
             free_slots,
+            next_operation_generation: 1,
             total_usage: ResourceAmounts::zero(),
             recovery_usage: ResourceAmounts::zero(),
             tenant_limits,

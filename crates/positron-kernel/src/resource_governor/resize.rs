@@ -250,8 +250,66 @@ impl GovernorInner {
                 state.pool_usage = pool_without;
                 state.outstanding = outstanding;
                 state.outstanding_ordinary = ordinary;
-                if !self.finish_slot(state, slot) {
+                let Some(record) = state
+                    .grant_records
+                    .get(usize::from(slot))
+                    .and_then(|record| *record)
+                else {
                     return Err(fence_resize(state, class));
+                };
+                match record.operation() {
+                    Some(super::ledger::OperationRecord::Root { child_count: 0, .. }) | None => {
+                        if !self.finish_slot(state, slot) {
+                            return Err(fence_resize(state, class));
+                        }
+                    },
+                    Some(super::ledger::OperationRecord::Root { .. }) => {
+                        let Some(released_root) = record.released_root() else {
+                            return Err(fence_resize(state, class));
+                        };
+                        let Some(record_slot) = state.grant_records.get_mut(usize::from(slot))
+                        else {
+                            return Err(fence_resize(state, class));
+                        };
+                        *record_slot = Some(released_root);
+                    },
+                    Some(super::ledger::OperationRecord::Child {
+                        root_slot,
+                        generation,
+                    }) => {
+                        let Some(root) = state
+                            .grant_records
+                            .get(usize::from(root_slot))
+                            .and_then(|record| *record)
+                        else {
+                            return Err(fence_resize(state, class));
+                        };
+                        if !matches!(
+                            root.operation(),
+                            Some(super::ledger::OperationRecord::Root { generation: root_generation, .. })
+                                if root_generation == generation
+                        ) {
+                            return Err(fence_resize(state, class));
+                        }
+                        let Some((updated_root, remove_root)) = root.decrement_root_child() else {
+                            return Err(fence_resize(state, class));
+                        };
+                        if !self.finish_slot(state, slot) {
+                            return Err(fence_resize(state, class));
+                        }
+                        if remove_root {
+                            if !self.finish_slot(state, root_slot) {
+                                return Err(fence_resize(state, class));
+                            }
+                        } else {
+                            let Some(root_slot_record) =
+                                state.grant_records.get_mut(usize::from(root_slot))
+                            else {
+                                return Err(fence_resize(state, class));
+                            };
+                            *root_slot_record = Some(updated_root);
+                        }
+                    },
                 }
                 return Err(failure);
             },

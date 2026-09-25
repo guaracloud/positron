@@ -7,6 +7,7 @@ impl<'authority> ResourceReservation<'authority> {
         identity: ReservationIdentity,
         amounts: ResourceAmounts,
         slot: u16,
+        operation: Option<OperationToken>,
     ) -> Self {
         Self {
             governor,
@@ -14,6 +15,7 @@ impl<'authority> ResourceReservation<'authority> {
             identity,
             amounts,
             slot,
+            operation,
             active: true,
         }
     }
@@ -42,6 +44,7 @@ impl<'authority> ResourceReservation<'authority> {
             owner: self.owner,
             identity: self.identity,
             amounts: self.amounts,
+            operation: self.operation,
             active: true,
         }
     }
@@ -116,6 +119,14 @@ impl<'authority> ResourceReservation<'authority> {
     #[must_use]
     pub const fn granted(&self) -> ResourceAmounts {
         self.amounts
+    }
+
+    /// Returns the non-serializable capability for this live authenticated
+    /// root operation. Tenant, system, recovery, and child reservations do
+    /// not mint another root capability.
+    #[must_use]
+    pub fn operation_token(&self) -> Option<OperationToken> {
+        if self.active { self.operation } else { None }
     }
 
     /// Confirms that this move-only grant owns enough tenant ingest memory for
@@ -215,6 +226,7 @@ impl TransferredResourceReservation {
             self.identity,
             self.amounts,
             self.slot,
+            self.operation,
         ))
     }
 

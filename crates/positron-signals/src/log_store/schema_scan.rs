@@ -3,7 +3,8 @@ use positron_domain::identity::TenantId;
 use positron_domain::routing::SignalKind;
 use positron_domain::value::{NativeValueObserver, ObservedValueFailure};
 use positron_kernel::{
-    LedgerSnapshot, ResourceAmounts, ResourceDimension, ResourceGovernor, WorkClaim, WorkKind,
+    LedgerSnapshot, OperationToken, ResourceAmounts, ResourceDimension, ResourceGovernor,
+    WorkClaim, WorkKind,
 };
 
 use super::{
@@ -30,6 +31,7 @@ impl LogStore {
         self.scan_schema_inner(
             governor,
             tenant,
+            None,
             snapshot,
             scan,
             schema,
@@ -60,6 +62,38 @@ impl LogStore {
         self.scan_schema_inner(
             governor,
             tenant,
+            None,
+            snapshot,
+            scan,
+            schema,
+            query,
+            cancellation,
+            observer,
+            SchemaScanLimit::DecodedRecords,
+        )
+    }
+
+    /// Query-only schema scan attributed to one live authenticated operation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn scan_schema_observed_as_operation<'kernel, O>(
+        &self,
+        governor: ResourceGovernor<'kernel>,
+        tenant: TenantId,
+        operation: OperationToken,
+        snapshot: &LedgerSnapshot<'_>,
+        scan: LogScan,
+        schema: &SchemaCatalog,
+        query: &SchemaQuery,
+        cancellation: &dyn ScanCancellation,
+        observer: &mut O,
+    ) -> Result<LogScanResult<'kernel>, LogStoreFailure>
+    where
+        O: ScanObserver + NativeValueObserver<Error = ScanObservationFailureCode>,
+    {
+        self.scan_schema_inner(
+            governor,
+            tenant,
+            Some(operation),
             snapshot,
             scan,
             schema,
@@ -75,6 +109,7 @@ impl LogStore {
         &self,
         governor: ResourceGovernor<'kernel>,
         tenant: TenantId,
+        operation: Option<OperationToken>,
         snapshot: &LedgerSnapshot<'_>,
         scan: LogScan,
         schema: &SchemaCatalog,
@@ -117,8 +152,13 @@ impl LogStore {
             .max(1);
         let amounts = ResourceAmounts::only(ResourceDimension::MemoryBytes, memory)
             .map_err(|_| LogStoreFailure::limit_exceeded())?;
-        let claim = WorkClaim::tenant(tenant, WorkKind::InteractiveQueryTail, amounts)
-            .map_err(|_| LogStoreFailure::limit_exceeded())?;
+        let claim = match operation {
+            Some(operation) => {
+                WorkClaim::authenticated_child(operation, WorkKind::InteractiveQueryTail, amounts)
+            },
+            None => WorkClaim::tenant(tenant, WorkKind::InteractiveQueryTail, amounts),
+        }
+        .map_err(|_| LogStoreFailure::limit_exceeded())?;
         let capacity = governor
             .reserve(claim)
             .map_err(|_| LogStoreFailure::resource_admission_refused())?;

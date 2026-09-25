@@ -53,8 +53,8 @@ pub use capacity_observation::{
 };
 use claim::ReservationIdentity;
 pub use claim::{
-    RecoveryInterruption, RecoveryScope, RecoveryWorkClaim, RecoveryWorkKind, WorkClaim, WorkClass,
-    WorkKind,
+    OperationToken, RecoveryInterruption, RecoveryScope, RecoveryWorkClaim, RecoveryWorkKind,
+    WorkClaim, WorkClass, WorkKind,
 };
 pub use failure::{
     AdmissionCompletionState, AdmissionFailure, AdmissionFailureCode, AdmissionRetry,
@@ -257,6 +257,7 @@ pub struct ResourceReservation<'authority> {
     owner: accounting::ChargeOwner,
     identity: ReservationIdentity,
     amounts: ResourceAmounts,
+    operation: Option<OperationToken>,
     active: bool,
 }
 
@@ -272,6 +273,7 @@ pub struct TransferredResourceReservation {
     owner: accounting::ChargeOwner,
     identity: ReservationIdentity,
     amounts: ResourceAmounts,
+    operation: Option<OperationToken>,
     active: bool,
 }
 
