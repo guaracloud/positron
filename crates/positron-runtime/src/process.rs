@@ -184,6 +184,39 @@ fn plaintext_listener_intents_for(
     .collect()
 }
 
+fn tls_material_listener_set(
+    configuration: &EffectiveConfiguration,
+) -> Result<Option<positron_governance::TlsMaterialReloadListenerSet>, ConfigurationRuntimeFailure>
+{
+    let bits = [
+        (NetworkListenerRole::Operations, ListenerRole::Operations),
+        (NetworkListenerRole::Api, ListenerRole::Api),
+        (NetworkListenerRole::OtlpGrpc, ListenerRole::OtlpGrpc),
+        (NetworkListenerRole::OtlpHttp, ListenerRole::OtlpHttp),
+        (NetworkListenerRole::LokiPush, ListenerRole::LokiPush),
+    ]
+    .into_iter()
+    .filter(|(configuration_role, _)| {
+        configuration
+            .network_listener_profile(*configuration_role)
+            .is_some_and(|profile| profile.transport() != NetworkTransport::PlaintextOptOut)
+    })
+    .try_fold(0_u8, |bits, (_, runtime_role)| {
+        positron_governance::TlsMaterialReloadListenerSet::for_role(listener_transport_audit_role(
+            runtime_role,
+        ))
+        .map(|listener_set| bits | listener_set.bits())
+        .map_err(|_| ConfigurationRuntimeFailure::PublicationUnavailable)
+    })?;
+    if bits == 0 {
+        Ok(None)
+    } else {
+        positron_governance::TlsMaterialReloadListenerSet::new(bits)
+            .map(Some)
+            .map_err(|_| ConfigurationRuntimeFailure::PublicationUnavailable)
+    }
+}
+
 fn plaintext_listener_audit_requests(
     configuration: &EffectiveConfiguration,
 ) -> Vec<positron_governance::ListenerTransportAuditRequest> {
@@ -482,6 +515,7 @@ impl RunningProcess {
             .ok_or(ConfigurationRuntimeFailure::Unavailable)?;
         let observed = runtime.observed()?;
         let plan = observed.effective().semantic_diff(&candidate).plan();
+        let tls_material_listener_set = tls_material_listener_set(&candidate)?;
         if !matches!(
             plan,
             ConfigurationDiffPlan::DrainThenPublish | ConfigurationDiffPlan::NoChange
@@ -497,12 +531,11 @@ impl RunningProcess {
                 if plan != ConfigurationDiffPlan::NoChange {
                     publication
                         .record_rejected_listener_staging(observed.effective(), &candidate)?;
-                } else {
+                } else if let Some(listener_set) = tls_material_listener_set {
                     let listener_set_identity =
                         crate::configuration_catalog::configuration_digest(&candidate);
                     publication.record_tls_material_reload(
-                        positron_governance::TlsMaterialReloadListenerSet::new(0b0011_1110)
-                            .map_err(|_| ConfigurationRuntimeFailure::PublicationUnavailable)?,
+                        listener_set,
                         positron_governance::TlsMaterialReloadOutcome::Rejected,
                         listener_set_identity,
                         Self::rejected_tls_attempt_identity(listener_set_identity),
@@ -518,10 +551,11 @@ impl RunningProcess {
                 .map_err(|_| ConfigurationRuntimeFailure::ListenerUnavailable)?;
             if plan != ConfigurationDiffPlan::NoChange {
                 publication.record_rejected_listener_staging(observed.effective(), &candidate)?;
-            } else if let Some(material_identity) = material_identity {
+            } else if let (Some(listener_set), Some(material_identity)) =
+                (tls_material_listener_set, material_identity)
+            {
                 publication.record_tls_material_reload(
-                    positron_governance::TlsMaterialReloadListenerSet::new(0b0011_1110)
-                        .map_err(|_| ConfigurationRuntimeFailure::PublicationUnavailable)?,
+                    listener_set,
                     positron_governance::TlsMaterialReloadOutcome::Rejected,
                     crate::configuration_catalog::configuration_digest(&candidate),
                     material_identity,
@@ -529,13 +563,14 @@ impl RunningProcess {
             }
             return Err(ConfigurationRuntimeFailure::ListenerUnavailable);
         }
-        if plan == ConfigurationDiffPlan::NoChange {
+        if plan == ConfigurationDiffPlan::NoChange
+            && let Some(listener_set) = tls_material_listener_set
+        {
             let material_identity = staged
                 .material_identity()
                 .ok_or(ConfigurationRuntimeFailure::ListenerUnavailable)?;
             publication.record_tls_material_reload(
-                positron_governance::TlsMaterialReloadListenerSet::new(0b0011_1110)
-                    .map_err(|_| ConfigurationRuntimeFailure::PublicationUnavailable)?,
+                listener_set,
                 positron_governance::TlsMaterialReloadOutcome::Applied,
                 crate::configuration_catalog::configuration_digest(&candidate),
                 material_identity,
