@@ -221,6 +221,8 @@ pub enum FailureSource {
     RuntimeShutdownGraceSeconds,
     RuntimeMaxRegisteredTenants,
     ListenerControlPath,
+    ListenerAdmissionRatePerSecond,
+    ListenerPerAddressAdmissionRatePerSecond,
     ListenerOperationsBindAddress,
     ListenerOperationsTransport,
     ListenerOperationsAcceptedSocketLimit,
@@ -328,6 +330,10 @@ impl FailureSource {
             Self::RuntimeShutdownGraceSeconds => "runtime.shutdown_grace_seconds",
             Self::RuntimeMaxRegisteredTenants => "runtime.max_registered_tenants",
             Self::ListenerControlPath => "listener.control_path",
+            Self::ListenerAdmissionRatePerSecond => "listener.admission_rate_per_second",
+            Self::ListenerPerAddressAdmissionRatePerSecond => {
+                "listener.per_address_admission_rate_per_second"
+            },
             Self::ListenerOperationsBindAddress => "listener.operations_bind_address",
             Self::ListenerOperationsTransport => "listener.operations_transport",
             Self::ListenerOperationsAcceptedSocketLimit => {

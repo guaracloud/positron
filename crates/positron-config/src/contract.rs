@@ -31,12 +31,14 @@ macro_rules! define_settings {
     };
 }
 
-pub(crate) const SETTING_DEFINITIONS: [SettingDefinition; 98] = define_settings! {
+pub(crate) const SETTING_DEFINITIONS: [SettingDefinition; 100] = define_settings! {
     SchemaVersion | "schema_version" | Integer | "1" | ExactUnsignedInteger(1) | Public | ConfigurationFileOnly | ImmutableAfterInitialization;
     DiagnosticsLogLevel | "diagnostics.log_level" | String | "info" | StringEnumeration(&["error", "warn", "info", "debug"]) | Public | NonSecretOverrides | LiveReloadable;
     RuntimeShutdownGraceSeconds | "runtime.shutdown_grace_seconds" | Integer | "30" | UnsignedIntegerRange(1, 3600) | Public | NonSecretOverrides | RestartRequired;
     RuntimeMaxRegisteredTenants | "runtime.max_registered_tenants" | Integer | "2" | UnsignedIntegerRange(1, 1024) | Public | NonSecretOverrides | RestartRequired;
     ListenerControlPath | "listener.control_path" | String | "/var/run/positron/control.sock" | AbsolutePath(256) | Public | NonSecretOverrides | DrainAndReload;
+    ListenerAdmissionRatePerSecond | "listener.admission_rate_per_second" | Integer | "1024" | UnsignedIntegerRange(1, 4096) | Public | ConfigurationFileOnly | DrainAndReload;
+    ListenerPerAddressAdmissionRatePerSecond | "listener.per_address_admission_rate_per_second" | Integer | "128" | UnsignedIntegerRange(1, 4096) | Public | ConfigurationFileOnly | DrainAndReload;
     ListenerOperationsBindAddress | "listener.operations_bind_address" | String | "127.0.0.1:13133" | SocketAddress(256) | Public | NonSecretOverrides | DrainAndReload;
     ListenerOperationsTransport | "listener.operations_transport" | String | "tls" | StringEnumeration(&["tls", "mtls", "plaintext"]) | Public | ConfigurationFileOnly | DrainAndReload;
     ListenerOperationsAcceptedSocketLimit | "listener.operations_accepted_socket_limit" | Integer | "128" | UnsignedIntegerRange(1, 4096) | Public | ConfigurationFileOnly | DrainAndReload;

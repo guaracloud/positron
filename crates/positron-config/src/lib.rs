@@ -185,7 +185,7 @@ pub fn setting_for_path(path: &str) -> Option<Setting> {
 
 /// Returns the complete canonical contract in deterministic declaration order.
 #[must_use]
-pub const fn setting_definitions() -> [SettingDefinition; 98] {
+pub const fn setting_definitions() -> [SettingDefinition; 100] {
     contract::SETTING_DEFINITIONS
 }
 
@@ -199,6 +199,8 @@ struct Candidate {
     shutdown_grace_seconds: u16,
     max_registered_tenants: u16,
     control_path: String,
+    admission_rate_per_second: NonZeroU16,
+    per_address_admission_rate_per_second: NonZeroU16,
     operations_bind_address: SocketAddr,
     operations_transport: NetworkTransport,
     operations_accepted_socket_limit: NonZeroU16,
@@ -256,7 +258,7 @@ struct Candidate {
     secrets_directory: String,
     local_key_file: ProtectedFileReference,
     export_destinations: Vec<ExportDestinationDefinition>,
-    sources: [SettingSource; 98],
+    sources: [SettingSource; 100],
 }
 
 impl Candidate {
@@ -294,6 +296,15 @@ impl Candidate {
             shutdown_grace_seconds: parse_shutdown_grace_seconds(shutdown)?,
             max_registered_tenants: parse_max_registered_tenants(max_registered_tenants)?,
             control_path: checked_path(control, Setting::ListenerControlPath)?,
+            admission_rate_per_second: parse_accepted_socket_limit(
+                setting_definition(Setting::ListenerAdmissionRatePerSecond).default_value(),
+                Setting::ListenerAdmissionRatePerSecond,
+            )?,
+            per_address_admission_rate_per_second: parse_accepted_socket_limit(
+                setting_definition(Setting::ListenerPerAddressAdmissionRatePerSecond)
+                    .default_value(),
+                Setting::ListenerPerAddressAdmissionRatePerSecond,
+            )?,
             operations_bind_address: parse_socket_address(
                 operations,
                 Setting::ListenerOperationsBindAddress,
@@ -500,7 +511,7 @@ impl Candidate {
                 Setting::SecurityLocalKeyFile,
             )?,
             export_destinations: Vec::new(),
-            sources: [SettingSource::CompiledDefault; 98],
+            sources: [SettingSource::CompiledDefault; 100],
         })
     }
 
@@ -532,6 +543,13 @@ impl Candidate {
             },
             Setting::ListenerControlPath => {
                 self.control_path = checked_path(value, setting)?;
+            },
+            Setting::ListenerAdmissionRatePerSecond => {
+                self.admission_rate_per_second = parse_accepted_socket_limit(value, setting)?;
+            },
+            Setting::ListenerPerAddressAdmissionRatePerSecond => {
+                self.per_address_admission_rate_per_second =
+                    parse_accepted_socket_limit(value, setting)?;
             },
             Setting::ListenerOperationsBindAddress => {
                 self.operations_bind_address = parse_socket_address(value, setting)?;
@@ -982,6 +1000,11 @@ impl Candidate {
             Setting::ListenerLokiPushForwardedHops,
         )?;
         validate_accepted_socket_limits(
+            self.admission_rate_per_second,
+            self.per_address_admission_rate_per_second,
+            Setting::ListenerPerAddressAdmissionRatePerSecond,
+        )?;
+        validate_accepted_socket_limits(
             self.operations_accepted_socket_limit,
             self.operations_per_address_accepted_socket_limit,
             Setting::ListenerOperationsPerAddressAcceptedSocketLimit,
@@ -1012,6 +1035,8 @@ impl Candidate {
             shutdown_grace_seconds: self.shutdown_grace_seconds,
             max_registered_tenants: self.max_registered_tenants,
             control_path: self.control_path,
+            admission_rate_per_second: self.admission_rate_per_second,
+            per_address_admission_rate_per_second: self.per_address_admission_rate_per_second,
             operations_bind_address: self.operations_bind_address,
             operations_transport: self.operations_transport,
             operations_accepted_socket_limit: self.operations_accepted_socket_limit,
@@ -1615,6 +1640,10 @@ const fn failure_source(setting: Setting) -> FailureSource {
         Setting::RuntimeShutdownGraceSeconds => FailureSource::RuntimeShutdownGraceSeconds,
         Setting::RuntimeMaxRegisteredTenants => FailureSource::RuntimeMaxRegisteredTenants,
         Setting::ListenerControlPath => FailureSource::ListenerControlPath,
+        Setting::ListenerAdmissionRatePerSecond => FailureSource::ListenerAdmissionRatePerSecond,
+        Setting::ListenerPerAddressAdmissionRatePerSecond => {
+            FailureSource::ListenerPerAddressAdmissionRatePerSecond
+        },
         Setting::ListenerOperationsBindAddress => FailureSource::ListenerOperationsBindAddress,
         Setting::ListenerOperationsTransport => FailureSource::ListenerOperationsTransport,
         Setting::ListenerOperationsAcceptedSocketLimit => {

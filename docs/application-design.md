@@ -386,6 +386,19 @@ system backlog is never treated as admission. The listener may read and
 decompress only within that reservation; it performs no structural telemetry
 decoding.
 
+Every Network Listener Profile receives the same canonical global and
+per-address pre-authentication attempt limits, but each listener generation
+owns an independent fixed one-second window. The socket admission attempt and
+each HTTP/2 or gRPC request before credential parsing consume that window.
+Native HTTP/1 closes after its one request and therefore does not charge it a
+second time. A rejected per-address attempt also consumes the global budget;
+when that global budget is exhausted, the listener waits for the next window
+before accepting another queued socket. Those queued peers remain only in the
+bounded operating-system backlog and have no Positron descriptor, task, or
+reservation during the wait. Restart and a replacement generation
+start fresh bounded windows; existing connections retain only their existing
+reservations while draining.
+
 Replacement binds and validates the complete new generation before the old
 generation stops admission. Existing connections drain under the policy that
 admitted them.

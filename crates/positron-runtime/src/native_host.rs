@@ -77,6 +77,35 @@ pub fn fuzz_h2_observer(data: &[u8]) -> usize {
     })
 }
 
+#[cfg(feature = "test-support")]
+pub fn fuzz_connection_admission(data: &[u8]) -> usize {
+    use std::net::Ipv4Addr;
+
+    let Some(global) = NonZeroU16::new(u16::from(data.first().copied().unwrap_or(0) % 32) + 1)
+    else {
+        return 0;
+    };
+    let Some(per_address) = NonZeroU16::new(u16::from(data.get(1).copied().unwrap_or(0) % 32) + 1)
+    else {
+        return 0;
+    };
+    let admission = Arc::new(connection_admission::ConnectionAdmission::new(
+        global,
+        per_address,
+        default_connection_protection(),
+        global,
+        per_address.min(global),
+    ));
+    data.chunks_exact(4)
+        .take(4096)
+        .filter(|address| {
+            admission.reserve_attempt(IpAddr::V4(Ipv4Addr::new(
+                address[0], address[1], address[2], address[3],
+            )))
+        })
+        .count()
+}
+
 use generation::{ActivationGate, NativeGenerationActivation};
 
 pub use tls::{
@@ -127,11 +156,11 @@ pub struct NativeBindings {
     otlp_http_transport: TransportProfile,
     loki_push: SocketAddr,
     loki_push_transport: TransportProfile,
-    operations_admission: (NonZeroU16, NonZeroU16),
-    api_admission: (NonZeroU16, NonZeroU16),
-    otlp_grpc_admission: (NonZeroU16, NonZeroU16),
-    otlp_http_admission: (NonZeroU16, NonZeroU16),
-    loki_push_admission: (NonZeroU16, NonZeroU16),
+    operations_admission: AdmissionLimits,
+    api_admission: AdmissionLimits,
+    otlp_grpc_admission: AdmissionLimits,
+    otlp_http_admission: AdmissionLimits,
+    loki_push_admission: AdmissionLimits,
     operations_protection: ConnectionProtection,
     api_protection: ConnectionProtection,
     otlp_grpc_protection: ConnectionProtection,
@@ -296,6 +325,7 @@ impl NativeBindings {
                 .material_identity()
                 .map_err(|_| NativeHostFailure::InvalidTlsProfile)?;
         }
+        let admission = compiled_admission_limits()?;
         Ok(Self {
             control,
             operations,
@@ -308,11 +338,11 @@ impl NativeBindings {
             otlp_http_transport,
             loki_push,
             loki_push_transport,
-            operations_admission: default_admission_limits(),
-            api_admission: default_admission_limits(),
-            otlp_grpc_admission: default_admission_limits(),
-            otlp_http_admission: default_admission_limits(),
-            loki_push_admission: default_admission_limits(),
+            operations_admission: admission,
+            api_admission: admission,
+            otlp_grpc_admission: admission,
+            otlp_http_admission: admission,
+            loki_push_admission: admission,
             operations_protection: default_connection_protection(),
             api_protection: default_connection_protection(),
             otlp_grpc_protection: default_connection_protection(),
@@ -380,7 +410,7 @@ impl NativeBindings {
         }
     }
 
-    fn admission(&self, role: ListenerRole) -> Option<(NonZeroU16, NonZeroU16)> {
+    fn admission(&self, role: ListenerRole) -> Option<AdmissionLimits> {
         match role {
             ListenerRole::Operations => Some(self.operations_admission),
             ListenerRole::Api => Some(self.api_admission),
@@ -436,8 +466,6 @@ fn compiled_http2_profile(
         .ok_or(NativeHostFailure::InvalidBinding)
 }
 
-const DEFAULT_ACCEPTED_SOCKET_LIMIT: NonZeroU16 = nonzero_u16(128);
-const DEFAULT_PEER_SOCKET_LIMIT: NonZeroU16 = nonzero_u16(16);
 const DEFAULT_TLS_HANDSHAKE_LIMIT: NonZeroU16 = nonzero_u16(16);
 
 const fn nonzero_u16(value: u16) -> NonZeroU16 {
@@ -447,8 +475,48 @@ const fn nonzero_u16(value: u16) -> NonZeroU16 {
     }
 }
 
-const fn default_admission_limits() -> (NonZeroU16, NonZeroU16) {
-    (DEFAULT_ACCEPTED_SOCKET_LIMIT, DEFAULT_PEER_SOCKET_LIMIT)
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AdmissionLimits {
+    global_socket_limit: NonZeroU16,
+    per_address_socket_limit: NonZeroU16,
+    global_rate_per_second: NonZeroU16,
+    per_address_rate_per_second: NonZeroU16,
+}
+
+impl AdmissionLimits {
+    const fn new(
+        global_socket_limit: NonZeroU16,
+        per_address_socket_limit: NonZeroU16,
+        global_rate_per_second: NonZeroU16,
+        per_address_rate_per_second: NonZeroU16,
+    ) -> Self {
+        Self {
+            global_socket_limit,
+            per_address_socket_limit,
+            global_rate_per_second,
+            per_address_rate_per_second,
+        }
+    }
+}
+
+fn compiled_admission_limits() -> Result<AdmissionLimits, NativeHostFailure> {
+    let inputs = ConfigurationInputs::try_from_sources(
+        None,
+        [] as [(&str, &str); 0],
+        [] as [(&str, &str); 0],
+    )
+    .map_err(|_| NativeHostFailure::InvalidBinding)?;
+    let effective = resolve(inputs).map_err(|_| NativeHostFailure::InvalidBinding)?;
+    let profile = effective
+        .network_listener_profile(NetworkListenerRole::Api)
+        .ok_or(NativeHostFailure::InvalidBinding)?;
+    let admission = profile.connection_admission();
+    Ok(AdmissionLimits::new(
+        admission.global_accepted_socket_limit(),
+        admission.per_address_accepted_socket_limit(),
+        admission.global_admission_rate_per_second(),
+        admission.per_address_admission_rate_per_second(),
+    ))
 }
 
 fn default_connection_protection() -> ConnectionProtection {
@@ -466,7 +534,7 @@ type EffectiveNativeProfile = (
     SocketAddr,
     TransportProfile,
     Option<TrustedProxy>,
-    (NonZeroU16, NonZeroU16),
+    AdmissionLimits,
     ConnectionProtection,
     Option<Http2Profile>,
     Vec<String>,
@@ -499,13 +567,19 @@ fn effective_profile(
         profile.bind_address(),
         transport,
         trusted_proxy_from_profile(&profile)?,
-        (
+        AdmissionLimits::new(
             profile
                 .connection_admission()
                 .global_accepted_socket_limit(),
             profile
                 .connection_admission()
                 .per_address_accepted_socket_limit(),
+            profile
+                .connection_admission()
+                .global_admission_rate_per_second(),
+            profile
+                .connection_admission()
+                .per_address_admission_rate_per_second(),
         ),
         ConnectionProtection::new(
             profile.connection_protection().tls_handshake_limit(),
@@ -612,8 +686,16 @@ impl NativeHost {
             role,
             active_address,
             configured.bindings.transport(role)?.listener_transport(),
-            configured.bindings.admission(role)?.0,
-            configured.bindings.admission(role)?.1,
+            configured.bindings.admission(role)?.global_socket_limit,
+            configured
+                .bindings
+                .admission(role)?
+                .per_address_socket_limit,
+            configured.bindings.admission(role)?.global_rate_per_second,
+            configured
+                .bindings
+                .admission(role)?
+                .per_address_rate_per_second,
             configured.bindings.protection(role)?,
             configured.bindings.http2_profile(role),
         )
@@ -706,6 +788,22 @@ impl Admission {
             admission: Arc::clone(self),
             _reservation: reservation,
         })
+    }
+
+    /// Records a request header that will be authenticated before decoding.
+    /// Native HTTP closes each connection after one request, so its socket
+    /// reservation already records that attempt; HTTP/2 and gRPC call this for
+    /// each additional request on an admitted connection.
+    pub(super) fn reserve_preauthentication_attempt(&self, peer: IpAddr) -> bool {
+        self.connection_admission
+            .as_ref()
+            .is_none_or(|admission| admission.reserve_attempt(peer))
+    }
+
+    pub(super) fn rate_retry_after(&self) -> Option<Duration> {
+        self.connection_admission
+            .as_ref()
+            .and_then(|admission| admission.rate_retry_after())
     }
 
     pub(super) fn connection_protection(&self) -> ConnectionProtection {
@@ -823,6 +921,8 @@ impl ListenerFactory for NativeHost {
                     transport,
                     global_accepted_socket_limit,
                     per_address_accepted_socket_limit,
+                    global_admission_rate_per_second,
+                    per_address_admission_rate_per_second,
                     connection_protection,
                     http2_profile,
                 },
@@ -831,6 +931,8 @@ impl ListenerFactory for NativeHost {
                     transport: expected_transport,
                     global_accepted_socket_limit: expected_global_limit,
                     per_address_accepted_socket_limit: expected_per_address_limit,
+                    global_admission_rate_per_second: expected_global_rate,
+                    per_address_admission_rate_per_second: expected_per_address_rate,
                     connection_protection: expected_connection_protection,
                     http2_profile: expected_http2_profile,
                     ..
@@ -839,6 +941,8 @@ impl ListenerFactory for NativeHost {
                 && transport == expected_transport
                 && global_accepted_socket_limit == expected_global_limit
                 && per_address_accepted_socket_limit == expected_per_address_limit
+                && global_admission_rate_per_second == expected_global_rate
+                && per_address_admission_rate_per_second == expected_per_address_rate
                 && connection_protection == expected_connection_protection
                 && http2_profile == expected_http2_profile =>
             {
@@ -937,9 +1041,15 @@ impl ListenerFactory for NativeHost {
         };
         let connection_protection = self.bindings.protection(role);
         let connection_admission = match (self.bindings.admission(role), connection_protection) {
-            (Some((global, per_address)), Some(protection)) => Some(Arc::new(
-                connection_admission::ConnectionAdmission::new(global, per_address, protection),
-            )),
+            (Some(limits), Some(protection)) => {
+                Some(Arc::new(connection_admission::ConnectionAdmission::new(
+                    limits.global_socket_limit,
+                    limits.per_address_socket_limit,
+                    protection,
+                    limits.global_rate_per_second,
+                    limits.per_address_rate_per_second,
+                )))
+            },
             (None, None) => None,
             _ => return Err(ListenerFailure::InvalidEndpoint),
         };
@@ -979,13 +1089,15 @@ impl ListenerFactory for NativeHost {
         }
         let address = self.bindings.address(role)?;
         let transport = self.bindings.transport(role)?.listener_transport();
-        let (global, per_address) = self.bindings.admission(role)?;
+        let limits = self.bindings.admission(role)?;
         ListenerProfile::network_with_admission_protection_and_http2(
             role,
             address,
             transport,
-            global,
-            per_address,
+            limits.global_socket_limit,
+            limits.per_address_socket_limit,
+            limits.global_rate_per_second,
+            limits.per_address_rate_per_second,
             self.bindings.protection(role)?,
             self.bindings.http2_profile(role),
         )
@@ -1596,6 +1708,8 @@ mod listener_generation_tests {
                 transport,
                 global_accepted_socket_limit,
                 per_address_accepted_socket_limit,
+                global_admission_rate_per_second,
+                per_address_admission_rate_per_second,
                 connection_protection,
                 http2_profile,
                 ..
@@ -1606,6 +1720,8 @@ mod listener_generation_tests {
                     transport,
                     global_accepted_socket_limit,
                     per_address_accepted_socket_limit,
+                    global_admission_rate_per_second,
+                    per_address_admission_rate_per_second,
                     connection_protection,
                     http2_profile,
                 )
@@ -1657,6 +1773,8 @@ mod listener_generation_tests {
                     transport,
                     global_accepted_socket_limit,
                     per_address_accepted_socket_limit,
+                    global_admission_rate_per_second,
+                    per_address_admission_rate_per_second,
                     connection_protection,
                     http2_profile,
                     ..
@@ -1667,6 +1785,8 @@ mod listener_generation_tests {
                         transport,
                         global_accepted_socket_limit,
                         per_address_accepted_socket_limit,
+                        global_admission_rate_per_second,
+                        per_address_admission_rate_per_second,
                         connection_protection,
                         http2_profile,
                     )?,
@@ -1718,6 +1838,7 @@ fn serve_http(
                     continue;
                 }
                 let Some(lease) = admission.accept_connection(peer.ip()) else {
+                    wait_for_rate_window(&admission, &cancellation);
                     continue;
                 };
                 let connection_protection = admission.connection_protection();
@@ -1918,12 +2039,22 @@ fn can_serve_accepted_connection(admission: &Admission, cancellation: &TaskCance
     admission.is_accepting() && !cancellation.is_cancelled()
 }
 
+fn wait_for_rate_window(admission: &Admission, cancellation: &TaskCancellation) {
+    while admission.is_accepting() && !cancellation.is_cancelled() {
+        let Some(remaining) = admission.rate_retry_after() else {
+            return;
+        };
+        std::thread::sleep(remaining.min(Duration::from_millis(5)));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
     use std::path::PathBuf;
 
     use super::{NativeBindings, NativeHostFailure};
+    use crate::ListenerRole;
 
     #[test]
     fn legacy_bindings_refuse_public_data_endpoints_without_a_complete_transport_profile() {
@@ -1936,6 +2067,27 @@ mod tests {
             loopback(3_100),
         );
         assert!(matches!(result, Err(NativeHostFailure::InvalidBinding)));
+    }
+
+    #[test]
+    fn native_default_admission_limits_keep_socket_and_rate_fields_distinct()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let bindings = NativeBindings::new(
+            PathBuf::from("/tmp/positron-native-rate-defaults.sock"),
+            loopback(13_133),
+            loopback(8_080),
+            loopback(4_317),
+            loopback(4_318),
+            loopback(3_100),
+        )?;
+        let limits = bindings
+            .admission(ListenerRole::Api)
+            .ok_or("API admission limits")?;
+        assert_eq!(limits.global_socket_limit.get(), 128);
+        assert_eq!(limits.per_address_socket_limit.get(), 16);
+        assert_eq!(limits.global_rate_per_second.get(), 1024);
+        assert_eq!(limits.per_address_rate_per_second.get(), 128);
+        Ok(())
     }
 
     const fn loopback(port: u16) -> SocketAddr {

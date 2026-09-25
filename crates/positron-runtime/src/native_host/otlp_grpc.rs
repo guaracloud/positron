@@ -123,6 +123,7 @@ impl PreparedGrpc {
                 listener,
                 admission: Arc::clone(&admission),
                 cancellation: cancellation.clone(),
+                rate_wait: None,
             }
             .then(move |accepted| {
                 let tls = tls.clone();
@@ -131,6 +132,8 @@ impl PreparedGrpc {
             });
             let authentication = services.clone();
             let trace_authentication = services.clone();
+            let request_admission = Arc::clone(&admission);
+            let trace_request_admission = Arc::clone(&admission);
             let trusted_proxy = admission.trusted_proxy.clone();
             let trace_trusted_proxy = trusted_proxy.clone();
             let receiver = OtlpLogsServer::new(OtlpLogsGrpc {
@@ -148,7 +151,12 @@ impl PreparedGrpc {
             );
             let receiver = MapResponseLayer::new(map_decode_failure).named_layer(receiver);
             let receiver = InterceptedService::new(receiver, move |request| {
-                authenticate(request, &authentication, trusted_proxy.clone())
+                authenticate(
+                    request,
+                    &authentication,
+                    trusted_proxy.clone(),
+                    &request_admission,
+                )
             });
             let trace_receiver = OtlpTracesServer::new(OtlpTracesGrpc {
                 services,
@@ -166,7 +174,12 @@ impl PreparedGrpc {
             let trace_receiver =
                 MapResponseLayer::new(map_trace_decode_failure).named_layer(trace_receiver);
             let trace_receiver = InterceptedService::new(trace_receiver, move |request| {
-                authenticate_traces(request, &trace_authentication, trace_trusted_proxy.clone())
+                authenticate_traces(
+                    request,
+                    &trace_authentication,
+                    trace_trusted_proxy.clone(),
+                    &trace_request_admission,
+                )
             });
             let graceful_admission = Arc::clone(&admission);
             let serving = server
@@ -196,6 +209,7 @@ struct AdmittedIncoming {
     listener: tokio::net::TcpListener,
     admission: Arc<Admission>,
     cancellation: TaskCancellation,
+    rate_wait: Option<Pin<Box<tokio::time::Sleep>>>,
 }
 
 struct AdmittedTcpStream {
@@ -263,8 +277,18 @@ impl Stream for AdmittedIncoming {
 
     fn poll_next(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
+        if let Some(wait) = this.rate_wait.as_mut() {
+            if wait.as_mut().poll(context).is_pending() {
+                return Poll::Pending;
+            }
+            this.rate_wait = None;
+        }
         if !super::can_serve_accepted_connection(&this.admission, &this.cancellation) {
             return Poll::Ready(None);
+        }
+        if this.admission.rate_retry_after().is_some() {
+            this.rate_wait = Some(Box::pin(tokio::time::sleep(Duration::from_millis(5))));
+            return Poll::Pending;
         }
         match this.listener.poll_accept(context) {
             Poll::Ready(Ok((stream, peer))) => {
@@ -277,7 +301,13 @@ impl Stream for AdmittedIncoming {
                         _lease: lease,
                     }))),
                     None => {
-                        context.waker().wake_by_ref();
+                        if let Some(retry_after) = this.admission.rate_retry_after() {
+                            this.rate_wait = Some(Box::pin(tokio::time::sleep(
+                                retry_after.min(Duration::from_millis(5)),
+                            )));
+                        } else {
+                            context.waker().wake_by_ref();
+                        }
                         Poll::Pending
                     },
                 }
@@ -438,7 +468,14 @@ fn authenticate(
     mut request: Request<()>,
     services: &ServiceHandle,
     trusted_proxy: Option<TrustedProxy>,
+    admission: &Admission,
 ) -> Result<Request<()>, Status> {
+    let peer = request
+        .remote_addr()
+        .ok_or_else(preauthentication_rate_rejected)?;
+    if !admission.reserve_preauthentication_attempt(peer.ip()) {
+        return Err(preauthentication_rate_rejected());
+    }
     let bearer = unique_metadata(&request, "authorization", authentication_rejected)?
         .and_then(|value| value.strip_prefix("Bearer "))
         .ok_or_else(authentication_rejected)?;
@@ -456,11 +493,22 @@ fn authentication_rejected() -> Status {
     status_from_failure(OtlpSignal::Logs.authentication_rejected())
 }
 
+fn preauthentication_rate_rejected() -> Status {
+    Status::resource_exhausted("OTLP preauthentication admission rate exceeded")
+}
+
 fn authenticate_traces(
     mut request: Request<()>,
     services: &ServiceHandle,
     trusted_proxy: Option<TrustedProxy>,
+    admission: &Admission,
 ) -> Result<Request<()>, Status> {
+    let peer = request
+        .remote_addr()
+        .ok_or_else(preauthentication_rate_rejected)?;
+    if !admission.reserve_preauthentication_attempt(peer.ip()) {
+        return Err(preauthentication_rate_rejected());
+    }
     let bearer = unique_metadata(&request, "authorization", trace_authentication_rejected)?
         .and_then(|value| value.strip_prefix("Bearer "))
         .ok_or_else(trace_authentication_rejected)?;
@@ -735,6 +783,7 @@ mod admission_tests {
             listener: tokio_listener,
             admission: Arc::clone(&admission),
             cancellation,
+            rate_wait: None,
         };
 
         let next = poll_fn(|context| Pin::new(&mut incoming).poll_next(context)).await;

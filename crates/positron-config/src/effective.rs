@@ -60,6 +60,8 @@ pub struct NetworkListenerProfile<'a> {
 pub struct ConnectionAdmissionProfile {
     global_accepted_socket_limit: NonZeroU16,
     per_address_accepted_socket_limit: NonZeroU16,
+    global_admission_rate_per_second: NonZeroU16,
+    per_address_admission_rate_per_second: NonZeroU16,
 }
 
 impl ConnectionAdmissionProfile {
@@ -71,6 +73,16 @@ impl ConnectionAdmissionProfile {
     #[must_use]
     pub const fn per_address_accepted_socket_limit(self) -> NonZeroU16 {
         self.per_address_accepted_socket_limit
+    }
+
+    #[must_use]
+    pub const fn global_admission_rate_per_second(self) -> NonZeroU16 {
+        self.global_admission_rate_per_second
+    }
+
+    #[must_use]
+    pub const fn per_address_admission_rate_per_second(self) -> NonZeroU16 {
+        self.per_address_admission_rate_per_second
     }
 }
 
@@ -275,6 +287,8 @@ pub struct EffectiveConfiguration {
     pub(crate) shutdown_grace_seconds: u16,
     pub(crate) max_registered_tenants: u16,
     pub(crate) control_path: String,
+    pub(crate) admission_rate_per_second: NonZeroU16,
+    pub(crate) per_address_admission_rate_per_second: NonZeroU16,
     pub(crate) operations_bind_address: SocketAddr,
     pub(crate) operations_transport: NetworkTransport,
     pub(crate) operations_accepted_socket_limit: NonZeroU16,
@@ -332,7 +346,7 @@ pub struct EffectiveConfiguration {
     pub(crate) secrets_directory: String,
     pub(crate) local_key_file: ProtectedFileReference,
     pub(crate) export_destinations: Vec<ExportDestinationDefinition>,
-    pub(crate) sources: [SettingSource; 98],
+    pub(crate) sources: [SettingSource; 100],
 }
 
 impl EffectiveConfiguration {
@@ -476,6 +490,8 @@ impl EffectiveConfiguration {
             connection_admission: ConnectionAdmissionProfile {
                 global_accepted_socket_limit,
                 per_address_accepted_socket_limit,
+                global_admission_rate_per_second: self.admission_rate_per_second,
+                per_address_admission_rate_per_second: self.per_address_admission_rate_per_second,
             },
             connection_protection,
             http2_profile,
@@ -904,6 +920,8 @@ impl EffectiveConfiguration {
                 | Setting::RuntimeShutdownGraceSeconds
                 | Setting::RuntimeMaxRegisteredTenants
                 | Setting::ListenerControlPath
+                | Setting::ListenerAdmissionRatePerSecond
+                | Setting::ListenerPerAddressAdmissionRatePerSecond
                 | Setting::ListenerOperationsBindAddress
                 | Setting::ListenerOperationsTransport
                 | Setting::ListenerOperationsAcceptedSocketLimit
@@ -1013,6 +1031,13 @@ impl EffectiveConfiguration {
                 self.max_registered_tenants != other.max_registered_tenants
             },
             Setting::ListenerControlPath => self.control_path != other.control_path,
+            Setting::ListenerAdmissionRatePerSecond => {
+                self.admission_rate_per_second != other.admission_rate_per_second
+            },
+            Setting::ListenerPerAddressAdmissionRatePerSecond => {
+                self.per_address_admission_rate_per_second
+                    != other.per_address_admission_rate_per_second
+            },
             Setting::ListenerOperationsBindAddress => {
                 self.operations_bind_address != other.operations_bind_address
             },
@@ -1375,6 +1400,12 @@ impl EffectiveConfiguration {
             Setting::RuntimeShutdownGraceSeconds => self.shutdown_grace_seconds.to_string(),
             Setting::RuntimeMaxRegisteredTenants => self.max_registered_tenants.to_string(),
             Setting::ListenerControlPath => self.control_path.clone(),
+            Setting::ListenerAdmissionRatePerSecond => {
+                self.admission_rate_per_second.get().to_string()
+            },
+            Setting::ListenerPerAddressAdmissionRatePerSecond => {
+                self.per_address_admission_rate_per_second.get().to_string()
+            },
             Setting::ListenerOperationsBindAddress => self.operations_bind_address.to_string(),
             Setting::ListenerOperationsTransport => self.operations_transport.as_str().to_owned(),
             Setting::ListenerOperationsAcceptedSocketLimit => {
@@ -1720,6 +1751,12 @@ impl EffectiveConfiguration {
             Setting::RuntimeShutdownGraceSeconds => self.shutdown_grace_seconds.to_string(),
             Setting::RuntimeMaxRegisteredTenants => self.max_registered_tenants.to_string(),
             Setting::ListenerControlPath => self.control_path.clone(),
+            Setting::ListenerAdmissionRatePerSecond => {
+                self.admission_rate_per_second.get().to_string()
+            },
+            Setting::ListenerPerAddressAdmissionRatePerSecond => {
+                self.per_address_admission_rate_per_second.get().to_string()
+            },
             Setting::ListenerOperationsBindAddress => self.operations_bind_address.to_string(),
             Setting::ListenerOperationsTransport => self.operations_transport.as_str().to_owned(),
             Setting::ListenerOperationsAcceptedSocketLimit => {

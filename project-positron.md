@@ -1735,6 +1735,16 @@ Connection Admission runs before API-key parsing and Tenant Attribution.
 It uses bounded per-address and global reservations for accepted sockets,
 TLS handshakes, headers, bodies, decompression, HTTP/2 streams and
 windows, gRPC messages, keepalive, ping frequency, and idle lifetime.
+Each listener generation also applies its own shared global and per-address
+pre-authentication attempt limits in fixed one-second windows. Socket
+admission and every HTTP/2 or gRPC request before credentials are parsed
+consume that listener-local budget; HTTP/1 consumes its socket admission once
+because its native connection closes after one request. A per-address refusal
+also consumes the global window, and global exhaustion pauses acceptance until
+the next window instead of repeatedly accepting and closing queued sockets.
+Queued peers remain only in the bounded operating-system listen backlog during
+that pause; Positron creates no userspace descriptor, task, or reservation for
+them until a later admission succeeds.
 Once authentication succeeds, Principal and Tenant limits account for
 subsequent work without releasing global reservations prematurely.
 

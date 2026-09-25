@@ -35,13 +35,13 @@ pub use listener::{
     ListenerGeneration, ListenerGenerationActivation, ListenerGenerationFactory, ListenerProfile,
     ListenerRequest, ListenerRole, ListenerTransport, ValidatedListenerSet,
 };
-#[cfg(feature = "test-support")]
-pub use native_host::fuzz_h2_observer;
 pub use native_host::{
     ApiTransportProfile, NativeBindings, NativeHost, NativeHostFailure, ProxyTrustFailure,
     TlsFailure, TlsIdentity, TlsProfile, TlsTrust, TransportProfile, TrustedCidr, TrustedProxy,
     TrustedProxyPolicy,
 };
+#[cfg(feature = "test-support")]
+pub use native_host::{fuzz_connection_admission, fuzz_h2_observer};
 pub use process::{
     ApplicationRuntime, CleanupFailure, CleanupPrimary, CleanupRole, DrainingProcess, ExitOutcome,
     HostInputs, InitializationMode, PublicPlaintextApiStartupIntent, RecoveryAttempt,

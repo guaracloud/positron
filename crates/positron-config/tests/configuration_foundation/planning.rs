@@ -197,6 +197,62 @@ fn accepted_socket_limit_changes_are_file_only_drain_and_reload_settings()
 }
 
 #[test]
+fn admission_rate_changes_are_file_only_and_keep_each_listener_bucket_independent()
+-> Result<(), ConfigurationFailure> {
+    let current = inputs(None, [], []).and_then(resolve)?;
+    let candidate = inputs(
+        Some(
+            "schema_version = 1\n\
+             [listener]\n\
+             admission_rate_per_second = 96\n\
+             per_address_admission_rate_per_second = 12\n",
+        ),
+        [],
+        [],
+    )
+    .and_then(resolve)?;
+
+    assert!(matches!(
+        current.plan_update(&candidate)?,
+        ConfigurationPlan::DrainThenPublish { changed }
+            if changed
+                == vec![
+                    Setting::ListenerAdmissionRatePerSecond,
+                    Setting::ListenerPerAddressAdmissionRatePerSecond,
+                ]
+    ));
+    for role in [
+        positron_config::NetworkListenerRole::Api,
+        positron_config::NetworkListenerRole::OtlpGrpc,
+    ] {
+        let admission = candidate
+            .network_listener_profile(role)
+            .expect("configured network profile")
+            .connection_admission();
+        assert_eq!(admission.global_admission_rate_per_second().get(), 96);
+        assert_eq!(admission.per_address_admission_rate_per_second().get(), 12);
+    }
+    let invalid = inputs(
+        Some(
+            "schema_version = 1\n\
+             [listener]\n\
+             admission_rate_per_second = 12\n\
+             per_address_admission_rate_per_second = 96\n",
+        ),
+        [],
+        [],
+    )
+    .and_then(resolve);
+    assert!(matches!(
+        invalid,
+        Err(error)
+            if error.code() == ConfigurationFailureCode::UnsupportedValue
+                && error.source() == FailureSource::ListenerPerAddressAdmissionRatePerSecond
+    ));
+    Ok(())
+}
+
+#[test]
 fn connection_protection_changes_are_file_only_drain_and_reload_settings()
 -> Result<(), ConfigurationFailure> {
     let current = inputs(None, [], []).and_then(resolve)?;

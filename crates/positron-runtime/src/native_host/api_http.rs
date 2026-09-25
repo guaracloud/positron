@@ -141,9 +141,11 @@ where
     } else {
         H2Observer::disabled(stream)
     };
+    let request_admission = Arc::clone(&admission);
     let connection = builder.serve_connection(
         TokioIo::new(stream),
         service_fn(move |request| {
+            let admission = Arc::clone(&request_admission);
             let trusted_proxy = trusted_proxy.clone();
             let health = health.clone();
             let services = services.clone();
@@ -155,6 +157,8 @@ where
                         protection.request_deadline(),
                         route_request(
                             request,
+                            &admission,
+                            is_http2,
                             peer,
                             trusted_proxy,
                             &health,
@@ -334,8 +338,11 @@ async fn wait_for_shutdown(admission: Arc<Admission>, cancellation: TaskCancella
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn route_request(
     request: Request<Incoming>,
+    admission: &Admission,
+    is_http2: bool,
     peer: std::net::SocketAddr,
     trusted_proxy: Option<TrustedProxy>,
     health: &HealthState,
@@ -343,6 +350,9 @@ async fn route_request(
     protection: ConnectionProtection,
     cors_allowed_origins: &[String],
 ) -> Response<ApiResponseBody> {
+    if is_http2 && !admission.reserve_preauthentication_attempt(peer.ip()) {
+        return response_from_native(NativeResponse::empty(429).with_retry_after(1));
+    }
     let (parts, body) = request.into_parts();
     if let Some(response) = cors::preflight(
         &parts.method,

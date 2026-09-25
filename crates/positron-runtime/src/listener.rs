@@ -89,6 +89,8 @@ pub enum ListenerProfile {
         transport: ListenerTransport,
         global_accepted_socket_limit: NonZeroU16,
         per_address_accepted_socket_limit: NonZeroU16,
+        global_admission_rate_per_second: NonZeroU16,
+        per_address_admission_rate_per_second: NonZeroU16,
         connection_protection: ConnectionProtection,
         http2_profile: Option<positron_config::Http2Profile>,
     },
@@ -184,16 +186,21 @@ impl ListenerProfile {
             transport,
             global_accepted_socket_limit,
             per_address_accepted_socket_limit,
+            global_accepted_socket_limit,
+            per_address_accepted_socket_limit,
             default_connection_protection()?,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn network_with_admission_and_protection(
         role: ListenerRole,
         address: SocketAddr,
         transport: ListenerTransport,
         global_accepted_socket_limit: NonZeroU16,
         per_address_accepted_socket_limit: NonZeroU16,
+        global_admission_rate_per_second: NonZeroU16,
+        per_address_admission_rate_per_second: NonZeroU16,
         connection_protection: ConnectionProtection,
     ) -> Result<Self, ListenerFailure> {
         Self::network_with_admission_protection_and_http2(
@@ -202,17 +209,22 @@ impl ListenerProfile {
             transport,
             global_accepted_socket_limit,
             per_address_accepted_socket_limit,
+            global_admission_rate_per_second,
+            per_address_admission_rate_per_second,
             connection_protection,
             None,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn network_with_admission_protection_and_http2(
         role: ListenerRole,
         address: SocketAddr,
         transport: ListenerTransport,
         global_accepted_socket_limit: NonZeroU16,
         per_address_accepted_socket_limit: NonZeroU16,
+        global_admission_rate_per_second: NonZeroU16,
+        per_address_admission_rate_per_second: NonZeroU16,
         connection_protection: ConnectionProtection,
         http2_profile: Option<positron_config::Http2Profile>,
     ) -> Result<Self, ListenerFailure> {
@@ -228,6 +240,8 @@ impl ListenerProfile {
             transport,
             global_accepted_socket_limit,
             per_address_accepted_socket_limit,
+            global_admission_rate_per_second,
+            per_address_admission_rate_per_second,
             connection_protection,
             http2_profile,
         })
@@ -250,16 +264,22 @@ impl ListenerProfile {
     }
 
     #[must_use]
-    pub const fn connection_admission(&self) -> Option<(NonZeroU16, NonZeroU16)> {
+    pub const fn connection_admission(
+        &self,
+    ) -> Option<(NonZeroU16, NonZeroU16, NonZeroU16, NonZeroU16)> {
         match self {
             Self::Control { .. } => None,
             Self::Network {
                 global_accepted_socket_limit,
                 per_address_accepted_socket_limit,
+                global_admission_rate_per_second,
+                per_address_admission_rate_per_second,
                 ..
             } => Some((
                 *global_accepted_socket_limit,
                 *per_address_accepted_socket_limit,
+                *global_admission_rate_per_second,
+                *per_address_admission_rate_per_second,
             )),
         }
     }
