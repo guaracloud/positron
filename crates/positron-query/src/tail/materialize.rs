@@ -205,7 +205,7 @@ impl TailSession<'_, '_, '_, '_> {
         let scan = match execute_scan(
             self.service.governor,
             state.tenant,
-            self.operation,
+            self.operation.clone(),
             snapshot,
             Some(after),
             frontier,

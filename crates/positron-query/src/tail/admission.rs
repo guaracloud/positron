@@ -79,10 +79,14 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             validate_resume_leases(state, &sources, now, self.ledger.scope().shard_id())?;
         }
         let memory_budget = tail_memory_budget(&query)?;
-        // A resumed tail is a fresh, live operation. The opaque token remains
-        // in this session only and is never placed in the durable cursor.
-        let reservation = self.reserve_operation_root(tenant, query.context.principal_id())?;
-        let operation = reservation.operation_token().ok_or_else(super::internal)?;
+        // `query` owns the already-admitted root. Its opaque token remains in
+        // this session only and is never placed in the durable cursor. A
+        // cursor resume receives a newly planned query, so it establishes a
+        // fresh root without adding a second operation to this Tail session.
+        let operation = query
+            ._reservation
+            .operation_token()
+            .ok_or_else(super::internal)?;
         let mut source_lease_owners = TailLeaseSet::with_capacity(sources.readers().len())?;
         let mut source_lease_grants = Vec::new();
         source_lease_grants
@@ -262,7 +266,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             .min(super::MAX_TAIL_BATCH_ROWS);
         let buffer = TailBuffer::new(
             self.governor,
-            operation,
+            operation.clone(),
             maximum_records,
             query.budget.output_bytes(),
             memory_budget.execution_limit,
@@ -349,7 +353,6 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         let mut session = TailSession {
             service: self,
             query,
-            _admission: reservation.transfer(),
             operation: Some(operation),
             sources,
             _lease: Some(lease),

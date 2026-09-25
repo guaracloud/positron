@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::result_key::HistoricalTotalKey;
 use crate::stream::QueryBatch;
 use crate::{PlannedQuery, QueryFailure, QueryFailureCode, QueryService};
-use positron_kernel::{OperationToken, TransferredResourceReservation};
+use positron_kernel::OperationToken;
 
 use super::buffer::TailBuffer;
 use super::cursor::{TailCursor, TailCursorState, TailPosition};
@@ -55,7 +55,6 @@ struct AdvancedBatch<'kernel, 'catalog, 'ledger> {
 pub struct TailSession<'service, 'kernel, 'catalog, 'ledger> {
     pub(super) service: &'service QueryService<'kernel, 'catalog, 'ledger>,
     pub(super) query: PlannedQuery<'kernel>,
-    pub(super) _admission: TransferredResourceReservation,
     pub(super) operation: Option<OperationToken>,
     pub(super) sources: TailSourceSet<'kernel, 'catalog, 'ledger>,
     pub(super) _lease: Option<positron_kernel::SnapshotLeaseGrant<'kernel>>,

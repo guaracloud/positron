@@ -821,7 +821,7 @@ impl super::TraceStore {
         let amounts = ResourceAmounts::only(ResourceDimension::MemoryBytes, memory)
             .map_err(|_| TraceStoreFailure::limit_exceeded())?;
         let claim = match operation {
-            Some(operation) => WorkClaim::authenticated_child(operation, work_kind, amounts),
+            Some(operation) => WorkClaim::authenticated_child(&operation, work_kind, amounts),
             None => WorkClaim::tenant(tenant, work_kind, amounts),
         }
         .map_err(|_| TraceStoreFailure::limit_exceeded())?;

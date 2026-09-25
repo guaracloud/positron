@@ -112,7 +112,7 @@ impl LogStore {
             .map_err(|_| LogStoreFailure::limit_exceeded())?;
         let claim = match operation {
             Some(operation) => {
-                WorkClaim::authenticated_child(operation, WorkKind::InteractiveQueryTail, amounts)
+                WorkClaim::authenticated_child(&operation, WorkKind::InteractiveQueryTail, amounts)
             },
             None => WorkClaim::tenant(tenant, WorkKind::InteractiveQueryTail, amounts),
         }

@@ -250,7 +250,7 @@ fn authenticated_child_claims_share_one_operation_ceiling_and_drain_in_any_order
         .ok_or("authenticated root mints token")?;
     let too_large = governor
         .reserve(WorkClaim::authenticated_child(
-            token,
+            &token,
             WorkKind::InteractiveQueryTail,
             ResourceAmounts::only(ResourceDimension::MemoryBytes, 2)?,
         )?)
@@ -258,7 +258,7 @@ fn authenticated_child_claims_share_one_operation_ceiling_and_drain_in_any_order
     assert_eq!(too_large.limiting_scope(), LimitingScope::Operation);
 
     let mut child = governor.reserve(WorkClaim::authenticated_child(
-        token,
+        &token,
         WorkKind::InteractiveQueryTail,
         ResourceAmounts::only(ResourceDimension::MemoryBytes, 1)?,
     )?)?;
@@ -267,7 +267,7 @@ fn authenticated_child_claims_share_one_operation_ceiling_and_drain_in_any_order
     assert_eq!(governor.inspect()?.outstanding_reservations(), 1);
     let closed = governor
         .reserve(WorkClaim::authenticated_child(
-            token,
+            &token,
             WorkKind::InteractiveQueryTail,
             ResourceAmounts::only(ResourceDimension::MemoryBytes, 1)?,
         )?)
@@ -279,13 +279,110 @@ fn authenticated_child_claims_share_one_operation_ceiling_and_drain_in_any_order
     let replacement = governor.reserve(root_claim()?)?;
     let stale = governor
         .reserve(WorkClaim::authenticated_child(
-            token,
+            &token,
             WorkKind::InteractiveQueryTail,
             ResourceAmounts::only(ResourceDimension::MemoryBytes, 1)?,
         )?)
         .expect_err("a released root generation cannot attach after slot reuse");
     assert_eq!(stale.limiting_scope(), LimitingScope::Operation);
     drop(replacement);
+    Ok(())
+}
+
+#[test]
+fn authenticated_child_rejects_a_token_minted_by_another_governor()
+-> Result<(), Box<dyn std::error::Error>> {
+    let tenant = tenant(0xd5)?;
+    let principal = principal(0xd6)?;
+    let capacity = amounts(20);
+    let quota = PrincipalQuota::new(1, amounts(4), amounts(8))?;
+    let source = governor_with_principal_quota(
+        capacity,
+        capacity,
+        [TenantQuota::new(tenant, 1, capacity)?],
+        Some(quota),
+    )?;
+    let target = governor_with_principal_quota(
+        capacity,
+        capacity,
+        [TenantQuota::new(tenant, 1, capacity)?],
+        Some(quota),
+    )?;
+    let root_claim = WorkClaim::authenticated(
+        tenant,
+        principal,
+        WorkKind::InteractiveQueryTail,
+        ResourceAmounts::only(ResourceDimension::MemoryBytes, 2)?,
+    )?;
+    let source_root = source.reserve(root_claim.clone())?;
+    let token = source_root.operation_token().ok_or("source root token")?;
+    let target_root = target.reserve(root_claim)?;
+    let before = target.inspect()?;
+
+    let refusal = target
+        .reserve(WorkClaim::authenticated_child(
+            &token,
+            WorkKind::InteractiveQueryTail,
+            ResourceAmounts::only(ResourceDimension::MemoryBytes, 1)?,
+        )?)
+        .expect_err("a token cannot cross an independent governor authority");
+    assert_eq!(refusal.code(), AdmissionFailureCode::PrincipalQuotaExceeded);
+    assert_eq!(refusal.limiting_scope(), LimitingScope::Operation);
+    let after = target.inspect()?;
+    assert_eq!(
+        after.outstanding_reservations(),
+        before.outstanding_reservations()
+    );
+    assert_eq!(
+        after.usage(ResourceDimension::MemoryBytes),
+        before.usage(ResourceDimension::MemoryBytes)
+    );
+    drop((source_root, target_root));
+    Ok(())
+}
+
+#[test]
+fn authenticated_child_rejects_a_token_retained_after_its_governor_drops()
+-> Result<(), Box<dyn std::error::Error>> {
+    let tenant = tenant(0xd7)?;
+    let principal = principal(0xd8)?;
+    let capacity = amounts(20);
+    let quota = PrincipalQuota::new(1, amounts(4), amounts(8))?;
+    let root_claim = WorkClaim::authenticated(
+        tenant,
+        principal,
+        WorkKind::InteractiveQueryTail,
+        ResourceAmounts::only(ResourceDimension::MemoryBytes, 2)?,
+    )?;
+    let token = {
+        let source = governor_with_principal_quota(
+            capacity,
+            capacity,
+            [TenantQuota::new(tenant, 1, capacity)?],
+            Some(quota),
+        )?;
+        let source_root = source.reserve(root_claim.clone())?;
+        let token = source_root.operation_token().ok_or("source root token")?;
+        drop(source_root);
+        token
+    };
+    let successor = governor_with_principal_quota(
+        capacity,
+        capacity,
+        [TenantQuota::new(tenant, 1, capacity)?],
+        Some(quota),
+    )?;
+    let successor_root = successor.reserve(root_claim)?;
+    let refusal = successor
+        .reserve(WorkClaim::authenticated_child(
+            &token,
+            WorkKind::InteractiveQueryTail,
+            ResourceAmounts::only(ResourceDimension::MemoryBytes, 1)?,
+        )?)
+        .expect_err("a retained token cannot attach after its governor is destroyed");
+    assert_eq!(refusal.code(), AdmissionFailureCode::PrincipalQuotaExceeded);
+    assert_eq!(refusal.limiting_scope(), LimitingScope::Operation);
+    drop(successor_root);
     Ok(())
 }
 
@@ -311,7 +408,7 @@ fn operation_token_survives_transfer_and_child_before_root_release()
     let transferred = root.transfer();
     let mut root = transferred.reclaim(governor.governor())?;
     let child = governor.reserve(WorkClaim::authenticated_child(
-        token,
+        &token,
         WorkKind::InteractiveQueryTail,
         ResourceAmounts::only(ResourceDimension::MemoryBytes, 1)?,
     )?)?;

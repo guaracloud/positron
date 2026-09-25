@@ -55,8 +55,8 @@ impl ExecutionResources {
         }
     }
 
-    pub(super) const fn operation_token(&self) -> Option<OperationToken> {
-        self.operation
+    pub(super) fn operation_token(&self) -> Option<OperationToken> {
+        self.operation.clone()
     }
 
     pub(super) fn with_target_lease(

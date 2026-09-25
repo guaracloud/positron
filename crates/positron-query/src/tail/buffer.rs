@@ -91,13 +91,13 @@ impl<'kernel> TailBuffer<'kernel> {
         &self,
         bytes: u64,
     ) -> Result<Option<TransferredResourceReservation>, QueryFailure> {
-        let (Some(governor), Some(operation)) = (self.governor, self.operation) else {
+        let (Some(governor), Some(operation)) = (self.governor, self.operation.clone()) else {
             return Ok(None);
         };
         let amounts = ResourceAmounts::only(ResourceDimension::MemoryBytes, bytes)
             .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
         let claim =
-            WorkClaim::authenticated_child(operation, WorkKind::InteractiveQueryTail, amounts)
+            WorkClaim::authenticated_child(&operation, WorkKind::InteractiveQueryTail, amounts)
                 .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
         governor
             .reserve(claim)

@@ -143,9 +143,10 @@ impl GrantRecord {
         matches!(self.operation, Some(OperationRecord::Root { .. }))
     }
 
-    pub(super) fn root_token(self, slot: u16) -> Option<OperationToken> {
+    pub(super) fn root_token(self, governor: &GovernorInner, slot: u16) -> Option<OperationToken> {
         match self.operation {
             Some(OperationRecord::Root { generation, .. }) => Some(OperationToken {
+                authority: std::sync::Arc::downgrade(&governor.drop_ledger),
                 root_slot: slot,
                 generation,
                 tenant: self.tenant?,

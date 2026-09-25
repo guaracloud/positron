@@ -44,7 +44,7 @@ impl<'authority> ResourceReservation<'authority> {
             owner: self.owner,
             identity: self.identity,
             amounts: self.amounts,
-            operation: self.operation,
+            operation: self.operation.clone(),
             active: true,
         }
     }
@@ -126,7 +126,7 @@ impl<'authority> ResourceReservation<'authority> {
     /// not mint another root capability.
     #[must_use]
     pub fn operation_token(&self) -> Option<OperationToken> {
-        if self.active { self.operation } else { None }
+        self.active.then(|| self.operation.clone()).flatten()
     }
 
     /// Confirms that this move-only grant owns enough tenant ingest memory for
@@ -226,7 +226,7 @@ impl TransferredResourceReservation {
             self.identity,
             self.amounts,
             self.slot,
-            self.operation,
+            self.operation.clone(),
         ))
     }
 

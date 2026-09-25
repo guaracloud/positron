@@ -33,9 +33,33 @@ impl positron_query::QueryWorkMeter for OperatorOverflowWorkMeter {
 }
 
 #[test]
+fn tail_reuses_its_planned_operation_when_the_principal_allows_one_operation()
+-> Result<(), Box<dyn Error>> {
+    let per_operation = ResourceAmounts::new([90_000, 0, 0, 0, 0, 1, 0, 0, 2_000_000, 0, 0]);
+    let aggregate = ResourceAmounts::new([140_000, 0, 0, 0, 0, 2, 0, 0, 4_000_000, 0, 0]);
+    let quota = PrincipalQuota::new(1, per_operation, aggregate)?;
+    QueryFixture::scoped_with_principal_quota("tail-one-planned-operation", quota, |fixture| {
+        fixture.kernel.append_log("one", 1, 1)?;
+        let service = fixture.service(16)?;
+        let budget = QueryBudget::new(1_048_576, 16, 1, 1_048_576, 65_536, 60)?;
+        let query = service.plan_pipeline(
+            fixture.context,
+            "pipeline:v1 logs | range query_time -100 100 | limit all",
+            budget,
+        )?;
+        let mut tail = service
+            .tail(query, TailStart::Historical { max_rows: 1 })
+            .expect("one planned operation must admit one Tail session");
+        assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
+        assert!(matches!(tail.poll(), Some(TailEvent::Batch(_))));
+        Ok(())
+    })
+}
+
+#[test]
 fn tail_retained_batches_saturate_the_authenticated_principal_and_release_for_resume()
 -> Result<(), Box<dyn Error>> {
-    let per_operation = ResourceAmounts::new([80_000, 0, 0, 0, 0, 1, 0, 0, 2_000_000, 0, 0]);
+    let per_operation = ResourceAmounts::new([100_000, 0, 0, 0, 0, 1, 0, 0, 2_000_000, 0, 0]);
     let aggregate = ResourceAmounts::new([140_000, 0, 0, 0, 0, 2, 0, 0, 4_000_000, 0, 0]);
     let quota = PrincipalQuota::new(8, per_operation, aggregate)?;
     QueryFixture::scoped_with_principal_quota("tail-principal-retained-buffer", quota, |fixture| {
