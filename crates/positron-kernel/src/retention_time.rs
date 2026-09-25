@@ -9,9 +9,13 @@ use std::time::Instant;
 use positron_domain::time::UnixNanoseconds;
 
 use crate::{
-    IngestTime, LifecycleClockFailure, LifecycleClockSource, SegmentScope,
+    CatalogSnapshot, IngestTime, LifecycleClockFailure, LifecycleClockSource, SegmentScope,
     SystemLifecycleClockSource,
 };
+
+const CLOCK_ANCHOR_MAGIC: &[u8; 8] = b"PLIFCLK1";
+const CLOCK_ANCHOR_VERSION: u8 = 1;
+const CLOCK_ANCHOR_BYTES: usize = 8 + 1 + 1 + 8 + 1 + 8 + 1 + 8;
 
 /// Process-monotonic time authority for the conservative Release 1 retention frontier.
 ///
@@ -22,7 +26,86 @@ pub struct RetentionTimeAuthority {
     epoch: UnixNanoseconds,
     elapsed: ElapsedSource,
     destructive_retention: bool,
+    source: Option<Box<dyn LifecycleClockSource>>,
+    policy: LifecycleClockPolicy,
+    safety: Mutex<LifecycleClockSafety>,
     scopes: Mutex<BTreeMap<SegmentScope, ScopeBaseline>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LifecycleClockPolicy {
+    maximum_reconciliation_offset_nanoseconds: u64,
+}
+
+impl LifecycleClockPolicy {
+    pub const DEFAULT_MAXIMUM_RECONCILIATION_OFFSET_NANOSECONDS: u64 = 300_000_000_000;
+
+    pub const fn new(
+        maximum_reconciliation_offset_nanoseconds: u64,
+    ) -> Result<Self, LifecycleClockFailure> {
+        if maximum_reconciliation_offset_nanoseconds == 0 {
+            return Err(LifecycleClockFailure::OutOfRange);
+        }
+        Ok(Self {
+            maximum_reconciliation_offset_nanoseconds,
+        })
+    }
+
+    #[must_use]
+    pub const fn maximum_reconciliation_offset_nanoseconds(self) -> u64 {
+        self.maximum_reconciliation_offset_nanoseconds
+    }
+}
+
+impl Default for LifecycleClockPolicy {
+    fn default() -> Self {
+        Self {
+            maximum_reconciliation_offset_nanoseconds:
+                Self::DEFAULT_MAXIMUM_RECONCILIATION_OFFSET_NANOSECONDS,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LifecycleClockState {
+    Certain,
+    ClockUncertain,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LifecycleClockStatus {
+    state: LifecycleClockState,
+    safe_anchor: UnixNanoseconds,
+    last_wall_clock: Option<UnixNanoseconds>,
+    observed_offset_nanoseconds: Option<i64>,
+}
+
+impl LifecycleClockStatus {
+    #[must_use]
+    pub const fn state(self) -> LifecycleClockState {
+        self.state
+    }
+    #[must_use]
+    pub const fn safe_anchor(self) -> UnixNanoseconds {
+        self.safe_anchor
+    }
+    #[must_use]
+    pub const fn last_wall_clock(self) -> Option<UnixNanoseconds> {
+        self.last_wall_clock
+    }
+    #[must_use]
+    pub const fn observed_offset_nanoseconds(self) -> Option<i64> {
+        self.observed_offset_nanoseconds
+    }
+}
+
+#[derive(Clone, Copy)]
+struct LifecycleClockSafety {
+    anchor: UnixNanoseconds,
+    anchor_elapsed: u64,
+    state: LifecycleClockState,
+    last_wall_clock: Option<UnixNanoseconds>,
+    observed_offset_nanoseconds: Option<i64>,
 }
 
 #[derive(Clone, Copy)]
@@ -86,13 +169,21 @@ impl ManualRetentionTime {
 
 impl RetentionTimeAuthority {
     pub fn establish() -> Result<Self, LifecycleClockFailure> {
-        let epoch = SystemLifecycleClockSource.read()?;
-        Ok(Self {
+        Self::establish_with_source(SystemLifecycleClockSource, LifecycleClockPolicy::default())
+    }
+
+    pub fn establish_with_source<S: LifecycleClockSource + 'static>(
+        source: S,
+        policy: LifecycleClockPolicy,
+    ) -> Result<Self, LifecycleClockFailure> {
+        let epoch = source.read()?;
+        Ok(Self::with_parts(
             epoch,
-            elapsed: ElapsedSource::System(Instant::now()),
-            destructive_retention: true,
-            scopes: Mutex::new(BTreeMap::new()),
-        })
+            ElapsedSource::System(Instant::now()),
+            true,
+            Some(Box::new(source)),
+            policy,
+        ))
     }
 
     #[cfg(any(test, fuzzing, feature = "test-support"))]
@@ -100,27 +191,29 @@ impl RetentionTimeAuthority {
     pub fn establish_with_manual_elapsed(epoch: UnixNanoseconds) -> (Self, ManualRetentionTime) {
         let elapsed = Arc::new(AtomicU64::new(0));
         (
-            Self {
+            Self::with_parts(
                 epoch,
-                elapsed: ElapsedSource::Manual(Arc::clone(&elapsed)),
-                destructive_retention: true,
-                scopes: Mutex::new(BTreeMap::new()),
-            },
+                ElapsedSource::Manual(Arc::clone(&elapsed)),
+                true,
+                None,
+                LifecycleClockPolicy::default(),
+            ),
             ManualRetentionTime(elapsed),
         )
     }
 
     #[cfg(test)]
     pub(crate) fn establish_with_stepping_elapsed(epoch: UnixNanoseconds, step: u64) -> Self {
-        Self {
+        Self::with_parts(
             epoch,
-            elapsed: ElapsedSource::Stepping {
+            ElapsedSource::Stepping {
                 elapsed: AtomicU64::new(0),
                 step,
             },
-            destructive_retention: true,
-            scopes: Mutex::new(BTreeMap::new()),
-        }
+            true,
+            None,
+            LifecycleClockPolicy::default(),
+        )
     }
 
     /// Constructs deterministic Ingest Time authority for cross-crate tests.
@@ -129,16 +222,130 @@ impl RetentionTimeAuthority {
     #[cfg(feature = "test-support")]
     pub fn for_test_ingest_time(epoch: UnixNanoseconds) -> Self {
         let elapsed = Arc::new(AtomicU64::new(0));
+        Self::with_parts(
+            epoch,
+            ElapsedSource::Manual(elapsed),
+            false,
+            None,
+            LifecycleClockPolicy::default(),
+        )
+    }
+
+    fn with_parts(
+        epoch: UnixNanoseconds,
+        elapsed: ElapsedSource,
+        destructive_retention: bool,
+        source: Option<Box<dyn LifecycleClockSource>>,
+        policy: LifecycleClockPolicy,
+    ) -> Self {
         Self {
             epoch,
-            elapsed: ElapsedSource::Manual(elapsed),
-            destructive_retention: false,
+            elapsed,
+            destructive_retention,
+            source,
+            policy,
+            safety: Mutex::new(LifecycleClockSafety {
+                anchor: epoch,
+                anchor_elapsed: 0,
+                state: LifecycleClockState::Certain,
+                last_wall_clock: Some(epoch),
+                observed_offset_nanoseconds: Some(0),
+            }),
             scopes: Mutex::new(BTreeMap::new()),
         }
     }
 
+    #[cfg(test)]
+    fn establish_with_source_and_manual_elapsed<S: LifecycleClockSource + 'static>(
+        source: S,
+        policy: LifecycleClockPolicy,
+    ) -> Result<(Self, ManualRetentionTime), LifecycleClockFailure> {
+        let epoch = source.read()?;
+        let elapsed = Arc::new(AtomicU64::new(0));
+        Ok((
+            Self::with_parts(
+                epoch,
+                ElapsedSource::Manual(Arc::clone(&elapsed)),
+                true,
+                Some(Box::new(source)),
+                policy,
+            ),
+            ManualRetentionTime(elapsed),
+        ))
+    }
+
     pub(crate) fn authorizes_destructive_retention(&self) -> bool {
+        self.destructive_retention && self.status().state == LifecycleClockState::Certain
+    }
+
+    pub(crate) const fn is_destructive_authority(&self) -> bool {
         self.destructive_retention
+    }
+
+    /// Reconciles this process authority with the one authenticated,
+    /// instance-level Catalog anchor before a scope can mint time.
+    pub(crate) fn recover_catalog_anchor(
+        &self,
+        snapshot: &CatalogSnapshot,
+    ) -> Result<(), LifecycleClockFailure> {
+        let mut record = None;
+        for bytes in snapshot.plaintext_objects() {
+            let Some(candidate) = decode_catalog_anchor(bytes)? else {
+                continue;
+            };
+            if record.replace(candidate).is_some() {
+                return Err(LifecycleClockFailure::OutOfRange);
+            }
+        }
+        let Some(record) = record else {
+            return Ok(());
+        };
+        let elapsed = self.elapsed.nanoseconds()?;
+        let mut safety = self
+            .safety
+            .lock()
+            .map_err(|_| LifecycleClockFailure::Unavailable)?;
+        safety.anchor = safety.anchor.max(record.anchor);
+        safety.anchor_elapsed = elapsed;
+        safety.last_wall_clock = record.last_wall_clock;
+        safety.observed_offset_nanoseconds = record.observed_offset_nanoseconds;
+        safety.state = record.state;
+        drop(safety);
+        self.reconcile(record.anchor, elapsed)
+    }
+
+    pub(crate) fn catalog_anchor_record(
+        &self,
+        observed: IngestTime,
+    ) -> Result<Vec<u8>, LifecycleClockFailure> {
+        let elapsed = self.elapsed.nanoseconds()?;
+        self.reconcile(observed.instant(), elapsed)?;
+        let safety = self
+            .safety
+            .lock()
+            .map_err(|_| LifecycleClockFailure::Unavailable)?;
+        encode_catalog_anchor(LifecycleClockSafety {
+            anchor: safety.anchor.max(observed.instant()),
+            ..*safety
+        })
+    }
+
+    #[must_use]
+    pub fn status(&self) -> LifecycleClockStatus {
+        self.safety.lock().map_or(
+            LifecycleClockStatus {
+                state: LifecycleClockState::ClockUncertain,
+                safe_anchor: self.epoch,
+                last_wall_clock: None,
+                observed_offset_nanoseconds: None,
+            },
+            |safety| LifecycleClockStatus {
+                state: safety.state,
+                safe_anchor: safety.anchor,
+                last_wall_clock: safety.last_wall_clock,
+                observed_offset_nanoseconds: safety.observed_offset_nanoseconds,
+            },
+        )
     }
 
     pub(crate) fn recover_scope(
@@ -147,6 +354,7 @@ impl RetentionTimeAuthority {
         durable: IngestTime,
     ) -> Result<(), LifecycleClockFailure> {
         let elapsed = self.elapsed.nanoseconds()?;
+        self.reconcile(durable.instant(), elapsed)?;
         let mut scopes = self
             .scopes
             .lock()
@@ -179,6 +387,7 @@ impl RetentionTimeAuthority {
         durable: Option<IngestTime>,
     ) -> Result<IngestTime, LifecycleClockFailure> {
         let elapsed = self.elapsed.nanoseconds()?;
+        self.reconcile_current(elapsed)?;
         let mut scopes = self
             .scopes
             .lock()
@@ -236,15 +445,152 @@ impl RetentionTimeAuthority {
     /// Returns process-monotonic trusted time when a retention preview has no
     /// tenant scopes from which to recover a durable lifecycle frontier.
     pub fn governance_now_seconds(&self) -> Result<u64, LifecycleClockFailure> {
-        let elapsed = i64::try_from(self.elapsed.nanoseconds()?)
-            .map_err(|_| LifecycleClockFailure::OutOfRange)?;
-        self.epoch
+        let elapsed = self.elapsed.nanoseconds()?;
+        self.reconcile_current(elapsed)?;
+        let safety = self
+            .safety
+            .lock()
+            .map_err(|_| LifecycleClockFailure::Unavailable)?;
+        advance_global(*safety, elapsed)?
             .value()
-            .checked_add(elapsed)
-            .and_then(|value| value.checked_div(1_000_000_000))
+            .checked_div(1_000_000_000)
             .and_then(|value| u64::try_from(value).ok())
             .ok_or(LifecycleClockFailure::OutOfRange)
     }
+
+    fn reconcile_current(&self, elapsed: u64) -> Result<(), LifecycleClockFailure> {
+        let expected = self
+            .safety
+            .lock()
+            .map_err(|_| LifecycleClockFailure::Unavailable)
+            .and_then(|safety| advance_global(*safety, elapsed))?;
+        self.reconcile(expected, elapsed)
+    }
+
+    fn reconcile(
+        &self,
+        durable_or_expected: UnixNanoseconds,
+        elapsed: u64,
+    ) -> Result<(), LifecycleClockFailure> {
+        let mut safety = self
+            .safety
+            .lock()
+            .map_err(|_| LifecycleClockFailure::Unavailable)?;
+        let expected = advance_global(*safety, elapsed)?.max(durable_or_expected);
+        safety.anchor = expected;
+        safety.anchor_elapsed = elapsed;
+        let Some(source) = &self.source else {
+            return Ok(());
+        };
+        let wall = source.read()?;
+        let offset = wall
+            .value()
+            .checked_sub(expected.value())
+            .ok_or(LifecycleClockFailure::OutOfRange)?;
+        safety.last_wall_clock = Some(wall);
+        safety.observed_offset_nanoseconds = Some(offset);
+        safety.state = if wall.value().abs_diff(expected.value())
+            > self.policy.maximum_reconciliation_offset_nanoseconds
+        {
+            LifecycleClockState::ClockUncertain
+        } else {
+            LifecycleClockState::Certain
+        };
+        Ok(())
+    }
+}
+
+fn advance_global(
+    safety: LifecycleClockSafety,
+    elapsed: u64,
+) -> Result<UnixNanoseconds, LifecycleClockFailure> {
+    elapsed
+        .checked_sub(safety.anchor_elapsed)
+        .and_then(|delta| i64::try_from(delta).ok())
+        .and_then(|delta| safety.anchor.value().checked_add(delta))
+        .map(UnixNanoseconds::new)
+        .ok_or(LifecycleClockFailure::OutOfRange)
+}
+
+fn encode_catalog_anchor(safety: LifecycleClockSafety) -> Result<Vec<u8>, LifecycleClockFailure> {
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(CLOCK_ANCHOR_BYTES)
+        .map_err(|_| LifecycleClockFailure::OutOfRange)?;
+    bytes.extend_from_slice(CLOCK_ANCHOR_MAGIC);
+    bytes.push(CLOCK_ANCHOR_VERSION);
+    bytes.push(match safety.state {
+        LifecycleClockState::Certain => 0,
+        LifecycleClockState::ClockUncertain => 1,
+    });
+    bytes.extend_from_slice(&safety.anchor.value().to_be_bytes());
+    match safety.last_wall_clock {
+        Some(wall) => {
+            bytes.push(1);
+            bytes.extend_from_slice(&wall.value().to_be_bytes());
+        },
+        None => {
+            bytes.push(0);
+            bytes.extend_from_slice(&0_i64.to_be_bytes());
+        },
+    }
+    match safety.observed_offset_nanoseconds {
+        Some(offset) => {
+            bytes.push(1);
+            bytes.extend_from_slice(&offset.to_be_bytes());
+        },
+        None => {
+            bytes.push(0);
+            bytes.extend_from_slice(&0_i64.to_be_bytes());
+        },
+    }
+    Ok(bytes)
+}
+
+fn decode_catalog_anchor(
+    bytes: &[u8],
+) -> Result<Option<LifecycleClockSafety>, LifecycleClockFailure> {
+    if !bytes.starts_with(CLOCK_ANCHOR_MAGIC) {
+        return Ok(None);
+    }
+    if bytes.len() != CLOCK_ANCHOR_BYTES || bytes.get(8).copied() != Some(CLOCK_ANCHOR_VERSION) {
+        return Err(LifecycleClockFailure::OutOfRange);
+    }
+    let state = match bytes.get(9).copied() {
+        Some(0) => LifecycleClockState::Certain,
+        Some(1) => LifecycleClockState::ClockUncertain,
+        _ => return Err(LifecycleClockFailure::OutOfRange),
+    };
+    let anchor = UnixNanoseconds::new(read_i64(bytes, 10)?);
+    let last_wall_clock = match bytes.get(18).copied() {
+        Some(0) => None,
+        Some(1) => Some(UnixNanoseconds::new(read_i64(bytes, 19)?)),
+        _ => return Err(LifecycleClockFailure::OutOfRange),
+    };
+    let observed_offset_nanoseconds = match bytes.get(27).copied() {
+        Some(0) => None,
+        Some(1) => Some(read_i64(bytes, 28)?),
+        _ => return Err(LifecycleClockFailure::OutOfRange),
+    };
+    Ok(Some(LifecycleClockSafety {
+        anchor,
+        anchor_elapsed: 0,
+        state,
+        last_wall_clock,
+        observed_offset_nanoseconds,
+    }))
+}
+
+pub(crate) fn is_catalog_anchor(bytes: &[u8]) -> bool {
+    bytes.starts_with(CLOCK_ANCHOR_MAGIC)
+}
+
+fn read_i64(bytes: &[u8], start: usize) -> Result<i64, LifecycleClockFailure> {
+    bytes
+        .get(start..start.saturating_add(8))
+        .and_then(|value| value.try_into().ok())
+        .map(i64::from_be_bytes)
+        .ok_or(LifecycleClockFailure::OutOfRange)
 }
 
 fn advance(
@@ -262,5 +608,46 @@ fn advance(
 impl std::fmt::Debug for RetentionTimeAuthority {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("RetentionTimeAuthority { <monotonic> }")
+    }
+}
+
+#[cfg(test)]
+mod clock_safety_tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+
+    struct MutableWallClock(Arc<Mutex<UnixNanoseconds>>);
+
+    impl LifecycleClockSource for MutableWallClock {
+        fn read(&self) -> Result<UnixNanoseconds, LifecycleClockFailure> {
+            self.0
+                .lock()
+                .map(|instant| *instant)
+                .map_err(|_| LifecycleClockFailure::Unavailable)
+        }
+    }
+
+    #[test]
+    fn a_wall_clock_step_pauses_destructive_lifecycle_work_but_not_ingest() {
+        let wall = Arc::new(Mutex::new(UnixNanoseconds::new(1_000)));
+        let source = MutableWallClock(Arc::clone(&wall));
+        let (clock, elapsed) = RetentionTimeAuthority::establish_with_source_and_manual_elapsed(
+            source,
+            LifecycleClockPolicy::new(10).expect("bounded policy"),
+        )
+        .expect("clock establishes");
+        let scope = SegmentScope::new(
+            positron_domain::identity::TenantId::from_bytes([1; 16]).expect("tenant"),
+            positron_domain::routing::SignalKind::Logs,
+            positron_domain::routing::VirtualShardId::new(1).expect("shard"),
+        );
+
+        elapsed.advance(1).expect("monotonic elapsed");
+        assert!(clock.ingest_time(scope, None).is_ok());
+        *wall.lock().expect("wall lock") = UnixNanoseconds::new(2_000);
+        assert!(clock.ingest_time(scope, None).is_ok());
+        assert_eq!(clock.status().state(), LifecycleClockState::ClockUncertain);
+        assert!(!clock.authorizes_destructive_retention());
     }
 }

@@ -38,7 +38,7 @@ pub(super) fn publish_segments(
     scope: SegmentScope,
     metadata: &[SegmentMetadata],
 ) -> Result<crate::CatalogSnapshot, LedgerFailure> {
-    publish_scope(catalog, basis, storage, scope, metadata, None, false)
+    publish_scope(catalog, basis, storage, scope, metadata, None, None, false)
 }
 
 pub(super) fn publish_exact_scope_segments(
@@ -48,13 +48,14 @@ pub(super) fn publish_exact_scope_segments(
     scope: SegmentScope,
     metadata: &[SegmentMetadata],
 ) -> Result<crate::CatalogSnapshot, LedgerFailure> {
-    publish_scope(catalog, basis, storage, scope, metadata, None, true)
+    publish_scope(catalog, basis, storage, scope, metadata, None, None, true)
 }
 
 pub(super) fn publish_segments_with_frontier(
     catalog: &Catalog<'_>,
     basis: &crate::CatalogSnapshot,
     storage: &LedgerStorage,
+    lifecycle_clock: &crate::RetentionTimeAuthority,
     scope: SegmentScope,
     metadata: &[SegmentMetadata],
     frontier: IngestTime,
@@ -66,6 +67,7 @@ pub(super) fn publish_segments_with_frontier(
         scope,
         metadata,
         Some(frontier),
+        Some(lifecycle_clock),
         false,
     )
 }
@@ -77,14 +79,17 @@ fn publish_scope(
     scope: SegmentScope,
     metadata: &[SegmentMetadata],
     frontier: Option<IngestTime>,
+    lifecycle_clock: Option<&crate::RetentionTimeAuthority>,
     exact_scope: bool,
 ) -> Result<crate::CatalogSnapshot, LedgerFailure> {
     let mut objects = Vec::new();
     let frontier_objects = usize::from(frontier.is_some());
+    let clock_objects = usize::from(lifecycle_clock.is_some());
     let object_capacity = basis
         .plaintext_object_count()
         .checked_add(metadata.len())
         .and_then(|count| count.checked_add(frontier_objects))
+        .and_then(|count| count.checked_add(clock_objects))
         .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
     objects
         .try_reserve_exact(object_capacity)
@@ -97,6 +102,9 @@ fn publish_scope(
             && super::retention_frontier::decode(bytes)?
                 .is_some_and(|(candidate, _)| candidate == scope)
         {
+            continue;
+        }
+        if lifecycle_clock.is_some() && crate::retention_time::is_catalog_anchor(bytes) {
             continue;
         }
         let mut retained = Vec::new();
@@ -113,6 +121,13 @@ fn publish_scope(
         objects.push(CatalogObject::new(super::retention_frontier::encode(
             scope, frontier,
         ))?);
+    }
+    if let (Some(clock), Some(frontier)) = (lifecycle_clock, frontier) {
+        objects.push(CatalogObject::new(
+            clock
+                .catalog_anchor_record(frontier)
+                .map_err(|_| LedgerFailure::new(LedgerFailureCode::StorageUnavailable))?,
+        )?);
     }
     let random = DataProtection::random_identifier().map_err(map_frame_failure)?;
     let mut transaction = [0_u8; 16];

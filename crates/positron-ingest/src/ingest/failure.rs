@@ -25,6 +25,7 @@ const fn ingest_code_for_log_store(code: LogStoreFailureCode) -> IngestFailureCo
         | LogStoreFailureCode::StorageExhausted
         | LogStoreFailureCode::BudgetExhausted
         | LogStoreFailureCode::ClockUnavailable
+        | LogStoreFailureCode::ClockUncertain
         | LogStoreFailureCode::ResourceAdmissionRefused => IngestFailureCode::CapacityUnavailable,
         LogStoreFailureCode::IdempotencyConflict => IngestFailureCode::IdempotencyConflict,
         LogStoreFailureCode::StorageUnavailable

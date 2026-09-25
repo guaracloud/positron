@@ -22,6 +22,7 @@ pub enum LedgerFailureCode {
     Cancelled,
     SnapshotExpired,
     StaleResumeMarker,
+    ClockUncertain,
 }
 
 /// Whether the failed call is safe to retry in place or requires recovery.

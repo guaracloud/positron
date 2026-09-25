@@ -90,6 +90,9 @@ pub(super) fn commit(
         ledger.catalog,
         &basis,
         &ledger.storage,
+        ledger
+            .retention_time
+            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::ClockUncertain))?,
         ledger.scope,
         &metadata,
         evaluation.frontier,

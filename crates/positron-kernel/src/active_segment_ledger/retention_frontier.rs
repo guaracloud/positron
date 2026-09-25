@@ -4,7 +4,7 @@ use positron_domain::time::UnixNanoseconds;
 
 use crate::catalog::{Catalog, CatalogFailureCode, CatalogObject, CatalogProposal, FormatEpoch};
 use crate::data_protection::DataProtection;
-use crate::{CatalogSnapshot, IngestTime, TransactionId};
+use crate::{CatalogSnapshot, IngestTime, RetentionTimeAuthority, TransactionId};
 
 use super::{FORMAT_EPOCH, LedgerFailure, LedgerFailureCode, SegmentScope, map_frame_failure};
 
@@ -31,17 +31,26 @@ pub(super) fn recover(
 pub(super) fn publish(
     catalog: &Catalog<'_>,
     basis: &CatalogSnapshot,
+    lifecycle_clock: &RetentionTimeAuthority,
     scope: SegmentScope,
     frontier: IngestTime,
 ) -> Result<(), LedgerFailure> {
     let mut objects = Vec::new();
     objects
-        .try_reserve_exact(basis.plaintext_object_count().saturating_add(1))
+        .try_reserve_exact(basis.plaintext_object_count().saturating_add(2))
         .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
     for bytes in basis.plaintext_objects() {
+        if crate::retention_time::is_catalog_anchor(bytes) {
+            continue;
+        }
         objects.push(CatalogObject::new(bytes.to_vec())?);
     }
     objects.push(CatalogObject::new(encode(scope, frontier))?);
+    objects.push(CatalogObject::new(
+        lifecycle_clock
+            .catalog_anchor_record(frontier)
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::StorageUnavailable))?,
+    )?);
     let random = DataProtection::random_identifier().map_err(map_frame_failure)?;
     let mut transaction = [0_u8; 16];
     transaction.copy_from_slice(

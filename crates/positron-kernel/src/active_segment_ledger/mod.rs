@@ -402,6 +402,11 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::StorageUnavailable))?;
         let mut storage = LedgerStorage::open(volume)?;
         let snapshot = catalog.pin()?;
+        if let Some(retention_time) = retention_time {
+            retention_time
+                .recover_catalog_anchor(&snapshot)
+                .map_err(map_retention_time_failure)?;
+        }
         let retention_frontier = retention_frontier::recover(&snapshot, scope)?;
         let recovery_metadata = storage.catalog_segments(&snapshot, scope)?;
         let reconstruction = reconstruct(
@@ -547,7 +552,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         let retention_time = self
             .retention_time
             .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::UnsupportedFormat))?;
-        if !retention_time.authorizes_destructive_retention() {
+        if !retention_time.is_destructive_authority() {
             return Err(LedgerFailure::new(LedgerFailureCode::UnsupportedFormat));
         }
         let ingest_time = retention_time
@@ -556,9 +561,13 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         if state.retention_readiness == RetentionReadiness::EmptyUninitialized {
             self.catalog.refresh_state()?;
             let basis = self.catalog.pin()?;
-            if let Err(failure) =
-                retention_frontier::publish(self.catalog, &basis, self.scope, ingest_time)
-            {
+            if let Err(failure) = retention_frontier::publish(
+                self.catalog,
+                &basis,
+                retention_time,
+                self.scope,
+                ingest_time,
+            ) {
                 if failure.completion_state() != LedgerCompletionState::RejectedBeforeMutation {
                     state.poisoned = true;
                 }
@@ -626,7 +635,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             .retention_time
             .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::UnsupportedFormat))?;
         if !retention_time.authorizes_destructive_retention() {
-            return Err(LedgerFailure::new(LedgerFailureCode::UnsupportedFormat));
+            return Err(LedgerFailure::new(LedgerFailureCode::ClockUncertain));
         }
         self.catalog.refresh_state()?;
         let basis = self.catalog.pin()?;

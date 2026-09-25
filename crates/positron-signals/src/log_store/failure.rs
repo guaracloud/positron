@@ -24,6 +24,7 @@ pub enum LogStoreFailureCode {
     StaleResumeMarker,
     ResourceExhausted,
     ClockUnavailable,
+    ClockUncertain,
     ResourceAdmissionRefused,
     Cancelled,
     BudgetExhausted,
@@ -140,6 +141,7 @@ impl From<positron_kernel::LedgerFailureCode> for LogStoreFailureCode {
             Kernel::Cancelled => LogStoreFailureCode::Cancelled,
             Kernel::SnapshotExpired => LogStoreFailureCode::SnapshotExpired,
             Kernel::StaleResumeMarker => LogStoreFailureCode::StaleResumeMarker,
+            Kernel::ClockUncertain => LogStoreFailureCode::ClockUncertain,
         }
     }
 }

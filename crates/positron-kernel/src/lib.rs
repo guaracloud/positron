@@ -132,6 +132,7 @@ pub use lifecycle_clock::{
 #[cfg(feature = "test-support")]
 pub use retention_time::ManualRetentionTime;
 pub use retention_time::RetentionTimeAuthority;
+pub use retention_time::{LifecycleClockPolicy, LifecycleClockState, LifecycleClockStatus};
 
 pub use resource_governor::{
     AdmissionCompletionState, AdmissionFailure, AdmissionFailureCode, AdmissionRetry,

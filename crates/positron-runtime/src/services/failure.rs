@@ -159,7 +159,8 @@ pub(super) const fn classify_ledger_failure_code(code: LedgerFailureCode) -> Ser
         LedgerFailureCode::StaleGeneration
         | LedgerFailureCode::ConcurrentWriter
         | LedgerFailureCode::IdempotencyConflict
-        | LedgerFailureCode::SnapshotExpired => ServiceFailure::CatalogUnavailable,
+        | LedgerFailureCode::SnapshotExpired
+        | LedgerFailureCode::ClockUncertain => ServiceFailure::CatalogUnavailable,
         LedgerFailureCode::StaleResumeMarker => ServiceFailure::InvalidRequest,
         LedgerFailureCode::Cancelled => ServiceFailure::Cancelled,
     }
