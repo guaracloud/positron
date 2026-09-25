@@ -132,6 +132,12 @@ impl TlsProfile {
         }
     }
 
+    pub(super) fn api_http_server_config(&self) -> Result<Arc<ServerConfig>, TlsFailure> {
+        let mut configuration = (*self.load()?).clone();
+        configuration.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        Ok(Arc::new(configuration))
+    }
+
     pub(super) fn material_identity(&self) -> Result<[u8; 32], TlsFailure> {
         let mut loaded = self
             .loaded
@@ -258,6 +264,18 @@ impl TransportProfile {
         match self {
             Self::Tls(profile) => profile
                 .grpc_server_config()
+                .map(Some)
+                .map_err(|_| NativeHostFailure::InvalidTlsProfile),
+            Self::PlaintextOptOut => Ok(None),
+        }
+    }
+
+    pub(super) fn api_http_server_config(
+        &self,
+    ) -> Result<Option<Arc<ServerConfig>>, NativeHostFailure> {
+        match self {
+            Self::Tls(profile) => profile
+                .api_http_server_config()
                 .map(Some)
                 .map_err(|_| NativeHostFailure::InvalidTlsProfile),
             Self::PlaintextOptOut => Ok(None),

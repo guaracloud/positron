@@ -1,6 +1,6 @@
 //! Native HTTP listener framing with separately owned routing and I/O boundaries.
 
-use std::io::{Read, Write};
+use std::io::{Cursor, Read, Write};
 
 use super::TrustedProxy;
 use crate::{HealthState, ListenerRole, ServiceHandle};
@@ -13,6 +13,36 @@ mod adapters {
 }
 
 pub(super) use io::{RequestHead, Response, read_body};
+
+pub(super) const MAX_API_BODY_BYTES: usize = positron_api::generated::MAX_PUBLIC_REQUEST_BYTES;
+
+pub(super) fn api_body_limit(method: &str, path: &str) -> usize {
+    dispatch::api_body_limit(method, path)
+}
+
+pub(super) fn route_buffered_api(
+    head: RequestHead,
+    body: Vec<u8>,
+    peer: std::net::SocketAddr,
+    trusted_proxy: Option<TrustedProxy>,
+    health: &HealthState,
+    services: Option<&ServiceHandle>,
+) -> Response {
+    let mut stream = Cursor::new(body);
+    match dispatch::route(
+        &mut stream,
+        ListenerRole::Api,
+        peer,
+        trusted_proxy,
+        head,
+        health,
+        services,
+    ) {
+        Ok(response) | Err(response) => response,
+    }
+}
+
+pub(super) use io::head_from_http_parts;
 
 pub(super) fn serve_connection<S: Read + Write>(
     stream: &mut S,

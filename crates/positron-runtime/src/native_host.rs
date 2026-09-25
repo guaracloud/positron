@@ -26,6 +26,7 @@ use crate::{
     TaskRegistrar, TaskRole, ValidatedListenerSet,
 };
 
+mod api_http;
 mod connection_admission;
 mod generation;
 mod loki_http;
@@ -1499,14 +1500,18 @@ fn serve_http(
                 let Some(lease) = admission.accept_connection(peer.ip()) else {
                     continue;
                 };
-                if stream.set_nonblocking(false).is_err()
-                    || stream
-                        .set_read_timeout(Some(Duration::from_secs(2)))
-                        .is_err()
-                    || stream
-                        .set_write_timeout(Some(Duration::from_secs(2)))
-                        .is_err()
-                {
+                let stream_configured = if admission.role == ListenerRole::Api {
+                    stream.set_nonblocking(true).is_ok()
+                } else {
+                    stream.set_nonblocking(false).is_ok()
+                        && stream
+                            .set_read_timeout(Some(Duration::from_secs(2)))
+                            .is_ok()
+                        && stream
+                            .set_write_timeout(Some(Duration::from_secs(2)))
+                            .is_ok()
+                };
+                if !stream_configured {
                     continue;
                 }
                 let role = admission.role;
@@ -1514,6 +1519,8 @@ fn serve_http(
                 let trusted_proxy = admission.trusted_proxy.clone();
                 let connection_health = health.clone();
                 let connection_services = services.clone();
+                let connection_admission = Arc::clone(&admission);
+                let connection_cancellation = cancellation.clone();
                 let Ok(interrupt) = stream.try_clone() else {
                     continue;
                 };
@@ -1527,7 +1534,20 @@ fn serve_http(
                     .name(format!("positron-{role:?}-connection"))
                     .spawn(move || {
                         let _lease = lease;
-                        if let Some(profile) = transport {
+                        if role == ListenerRole::Api {
+                            let _ = api_http::serve_connection(
+                                stream,
+                                api_http::ConnectionContext {
+                                    transport,
+                                    admission: connection_admission,
+                                    cancellation: connection_cancellation,
+                                    peer,
+                                    trusted_proxy,
+                                    health: connection_health,
+                                    services: connection_services,
+                                },
+                            );
+                        } else if let Some(profile) = transport {
                             if profile.is_tls() {
                                 if let Ok(connection) = profile.server_connection() {
                                     let mut tls = rustls::StreamOwned::new(connection, stream);

@@ -103,6 +103,7 @@ impl PreparedGrpc {
             let incoming = AdmittedIncoming {
                 listener,
                 admission: Arc::clone(&admission),
+                cancellation: cancellation.clone(),
             };
             let authentication = services.clone();
             let trace_authentication = services.clone();
@@ -155,6 +156,7 @@ impl PreparedGrpc {
 struct AdmittedIncoming {
     listener: tokio::net::TcpListener,
     admission: Arc<Admission>,
+    cancellation: TaskCancellation,
 }
 
 struct AdmittedTcpStream {
@@ -167,16 +169,24 @@ impl Stream for AdmittedIncoming {
 
     fn poll_next(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
+        if !super::can_serve_accepted_connection(&this.admission, &this.cancellation) {
+            return Poll::Ready(None);
+        }
         match this.listener.poll_accept(context) {
-            Poll::Ready(Ok((stream, peer))) => match this.admission.accept_connection(peer.ip()) {
-                Some(lease) => Poll::Ready(Some(Ok(AdmittedTcpStream {
-                    stream: Box::pin(stream),
-                    _lease: lease,
-                }))),
-                None => {
-                    context.waker().wake_by_ref();
-                    Poll::Pending
-                },
+            Poll::Ready(Ok((stream, peer))) => {
+                if !super::can_serve_accepted_connection(&this.admission, &this.cancellation) {
+                    return Poll::Ready(None);
+                }
+                match this.admission.accept_connection(peer.ip()) {
+                    Some(lease) => Poll::Ready(Some(Ok(AdmittedTcpStream {
+                        stream: Box::pin(stream),
+                        _lease: lease,
+                    }))),
+                    None => {
+                        context.waker().wake_by_ref();
+                        Poll::Pending
+                    },
+                }
             },
             Poll::Ready(Err(error)) => Poll::Ready(Some(Err(error))),
             Poll::Pending => Poll::Pending,
@@ -527,3 +537,52 @@ fn status_from_failure(failure: OtlpFailure) -> Status {
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct GrpcFailure;
+
+#[cfg(test)]
+mod admission_tests {
+    use std::future::poll_fn;
+    use std::net::{Ipv4Addr, TcpListener};
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use tokio_stream::Stream;
+
+    use super::AdmittedIncoming;
+    use crate::native_host::{Admission, NativeListener, TransportProfile};
+    use crate::{ListenerRole, TaskCancellation};
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retired_grpc_listener_does_not_admit_an_already_queued_socket()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let address = listener.local_addr()?;
+        let tokio_listener = listener.try_clone()?;
+        tokio_listener.set_nonblocking(true)?;
+        let tokio_listener = tokio::net::TcpListener::from_std(tokio_listener)?;
+        let client = tokio::net::TcpStream::connect(address).await?;
+        let admission = Arc::new(Admission {
+            role: ListenerRole::OtlpGrpc,
+            listener: NativeListener::Tcp(listener),
+            accepting: AtomicBool::new(true),
+            accepted_connections: AtomicUsize::new(0),
+            control_path: None,
+            transport: Some(TransportProfile::plaintext_opt_out()),
+            trusted_proxy: None,
+            connection_admission: None,
+        });
+        let cancellation = TaskCancellation::new();
+        admission.stop();
+        let mut incoming = AdmittedIncoming {
+            listener: tokio_listener,
+            admission: Arc::clone(&admission),
+            cancellation,
+        };
+
+        let next = poll_fn(|context| Pin::new(&mut incoming).poll_next(context)).await;
+        assert!(next.is_none());
+        assert_eq!(admission.accepted_connections.load(Ordering::Acquire), 0);
+        drop(client);
+        Ok(())
+    }
+}

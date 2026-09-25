@@ -1,5 +1,6 @@
 use std::io::{Read, Write};
 
+use http::{HeaderMap, Method, Uri};
 use positron_api::generated::{ApiError, CapabilityResponse};
 use positron_governance::CompatibilityHints;
 use zeroize::{Zeroize, Zeroizing};
@@ -70,7 +71,7 @@ pub(in crate::native_host) fn read_head<S: Read>(stream: &mut S) -> Result<Reque
     if request.next() != Some("HTTP/1.1") || request.next().is_some() {
         return Err(Response::empty(400));
     }
-    let mut content_length = None;
+    let mut content_length: Option<usize> = None;
     let mut bearer = None;
     let mut authorization_seen = false;
     let mut content_type = None;
@@ -127,6 +128,83 @@ pub(in crate::native_host) fn read_head<S: Read>(stream: &mut S) -> Result<Reque
         method: method.to_owned(),
         path: path.to_owned(),
         content_length: content_length.unwrap_or(0),
+        bearer,
+        content_type,
+        content_encoding,
+        tenant_hint,
+        forwarded_for,
+        forwarded_actor,
+    })
+}
+
+pub(in crate::native_host) fn head_from_http_parts(
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+    body_length: usize,
+) -> Result<RequestHead, Response> {
+    let path = uri
+        .path_and_query()
+        .map_or("/", http::uri::PathAndQuery::as_str);
+    let mut content_length: Option<usize> = None;
+    let mut bearer = None;
+    let mut authorization_seen = false;
+    let mut content_type = None;
+    let mut content_encoding = None;
+    let mut tenant_hint = None;
+    let mut forwarded_for = None;
+    let mut forwarded_actor = None;
+    for (name, value) in headers {
+        let value = value.to_str().map_err(|_| Response::empty(400))?.trim();
+        if name == http::header::CONTENT_LENGTH {
+            if content_length.is_some() {
+                return Err(Response::empty(400));
+            }
+            content_length = Some(value.parse().map_err(|_| Response::empty(400))?);
+        } else if name == http::header::AUTHORIZATION {
+            if authorization_seen {
+                return Err(Response::empty(400));
+            }
+            authorization_seen = true;
+            bearer = value.strip_prefix("Bearer ").map(ToOwned::to_owned);
+        } else if name == http::header::CONTENT_TYPE {
+            if content_type.is_some() {
+                return Err(Response::empty(400));
+            }
+            content_type = Some(value.to_owned());
+        } else if name == http::header::CONTENT_ENCODING {
+            if content_encoding.is_some() {
+                return Err(Response::empty(400));
+            }
+            content_encoding = Some(value.to_owned());
+        } else if name.as_str().eq_ignore_ascii_case("x-scope-orgid") {
+            if tenant_hint.is_some() {
+                return Err(Response::empty(400));
+            }
+            tenant_hint = Some(value.to_owned());
+        } else if name.as_str().eq_ignore_ascii_case("x-forwarded-for") {
+            if forwarded_for.is_some() {
+                return Err(Response::empty(400));
+            }
+            forwarded_for = Some(value.to_owned());
+        } else if name.as_str().eq_ignore_ascii_case("x-forwarded-user")
+            || name.as_str().eq_ignore_ascii_case("x-forwarded-service")
+        {
+            if forwarded_actor.is_some() {
+                return Err(Response::empty(400));
+            }
+            forwarded_actor = Some(value.to_owned());
+        } else if name == http::header::TRANSFER_ENCODING {
+            return Err(Response::empty(400));
+        }
+    }
+    if content_length.is_some_and(|length| length != body_length) {
+        return Err(Response::empty(400));
+    }
+    Ok(RequestHead {
+        method: method.as_str().to_owned(),
+        path: path.to_owned(),
+        content_length: body_length,
         bearer,
         content_type,
         content_encoding,

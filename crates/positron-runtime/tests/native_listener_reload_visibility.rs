@@ -25,7 +25,7 @@ fn native_listener_reload_updates_visible_plaintext_generation_and_rejected_stag
         "positron-native-listener-reload-visibility-{}.sock",
         std::process::id()
     ));
-    let initial = configuration(&listener_document(&control, "plaintext", "plaintext", 0))?;
+    let initial = configuration(&listener_document(&control, "tls", "tls", 0))?;
     let host = NativeHost::new(NativeBindings::from_effective(&initial)?);
     let paths = roots.bootstrap_paths()?;
     let process = ApplicationRuntime::start(
@@ -33,27 +33,11 @@ fn native_listener_reload_updates_visible_plaintext_generation_and_rejected_stag
             .with_effective_configuration(Arc::clone(&initial)),
         HostInputs::new(&host, &host),
     )?;
-    assert_eq!(
-        process.health().security_warnings(),
-        [
-            HealthWarning::PublicPlaintextApi,
-            HealthWarning::PlaintextListener(ListenerRole::OtlpHttp),
-        ]
-    );
+    assert!(process.health().security_warnings().is_empty());
     let runtime = process
         .configuration()
         .ok_or("configuration runtime unavailable")?;
     let initial_generation = runtime.observed()?.generation();
-
-    let tls = configuration(&listener_document(&control, "tls", "tls", 0))?;
-    assert!(matches!(
-        process.reload_configuration(Arc::clone(&tls))?,
-        ConfigurationReloadOutcome::PublishedLive { .. }
-    ));
-    let tls_observation = runtime.observed()?;
-    assert!(tls_observation.generation() > initial_generation);
-    assert_eq!(tls_observation.effective().api_transport().as_str(), "tls");
-    assert!(process.health().security_warnings().is_empty());
 
     let plaintext = configuration(&listener_document(&control, "plaintext", "plaintext", 0))?;
     assert!(matches!(
@@ -61,7 +45,7 @@ fn native_listener_reload_updates_visible_plaintext_generation_and_rejected_stag
         ConfigurationReloadOutcome::PublishedLive { .. }
     ));
     let plaintext_observation = runtime.observed()?;
-    assert!(plaintext_observation.generation() > tls_observation.generation());
+    assert!(plaintext_observation.generation() > initial_generation);
     assert_eq!(
         process.health().security_warnings(),
         [
@@ -70,7 +54,7 @@ fn native_listener_reload_updates_visible_plaintext_generation_and_rejected_stag
         ]
     );
     assert!(matches!(
-        process.reload_configuration(Arc::clone(&tls))?,
+        process.reload_configuration(Arc::clone(&initial))?,
         ConfigurationReloadOutcome::PublishedLive { .. }
     ));
     assert!(matches!(
@@ -180,10 +164,25 @@ fn native_listener_reload_updates_visible_plaintext_generation_and_rejected_stag
     )?;
     reopened.update_system_audit_retention(
         retention_administrator,
-        NonZeroU64::new(64).ok_or("nonzero audit retention")?,
+        NonZeroU64::new(1).ok_or("nonzero audit retention")?,
         ResourceGeneration::new(1)?,
         AdministrativeIdempotencyKey::new([0x77; 16])?,
     )?;
+    let retained_audit_administrator = reopened.attribute(
+        PresentedCredential::parse(claim.secret())?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let retained_history =
+        reopened.inspect_governance_audit_history(retained_audit_administrator)?;
+    assert!(retained_history.retention_anchor_position().is_some());
+    assert!(
+        retained_history
+            .records()
+            .iter()
+            .all(|entry| entry.as_configuration().is_none()),
+        "retention must prune the composite plaintext configuration evidence"
+    );
     drop(reopened);
     let resumed_host = NativeHost::new(NativeBindings::from_effective(&plaintext)?);
     let resumed = ApplicationRuntime::start(
