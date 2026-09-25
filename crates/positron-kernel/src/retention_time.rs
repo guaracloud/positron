@@ -165,9 +165,7 @@ impl StagedCatalogAnchor<'_> {
                 return Err(LifecycleClockFailure::OutOfRange);
             }
         }
-        Ok(durable.is_some_and(|record| {
-            record.state == LifecycleClockState::Certain && record.anchor >= candidate_anchor
-        }))
+        Ok(durable.is_some_and(|record| record.anchor >= candidate_anchor))
     }
 
     pub(crate) fn commit(mut self) {
@@ -353,7 +351,7 @@ impl RetentionTimeAuthority {
     }
 
     #[cfg(test)]
-    fn establish_with_source_and_manual_elapsed<S: LifecycleClockSource + 'static>(
+    pub(crate) fn establish_with_source_and_manual_elapsed<S: LifecycleClockSource + 'static>(
         source: S,
         policy: LifecycleClockPolicy,
     ) -> Result<(Self, ManualRetentionTime), LifecycleClockFailure> {

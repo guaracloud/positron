@@ -1,5 +1,20 @@
 #[cfg(feature = "test-support")]
 use super::*;
+#[cfg(feature = "test-support")]
+use std::sync::{Arc, Mutex};
+
+#[cfg(feature = "test-support")]
+struct MutableWallClock(Arc<Mutex<UnixNanoseconds>>);
+
+#[cfg(feature = "test-support")]
+impl crate::LifecycleClockSource for MutableWallClock {
+    fn read(&self) -> Result<UnixNanoseconds, crate::LifecycleClockFailure> {
+        self.0
+            .lock()
+            .map(|instant| *instant)
+            .map_err(|_| crate::LifecycleClockFailure::Unavailable)
+    }
+}
 
 #[cfg(feature = "test-support")]
 #[test]
@@ -91,6 +106,52 @@ fn retention_frontier_publication_reconciles_only_durable_ambiguity() -> Result<
     assert_eq!(
         reconciled.ingest_time().instant(),
         UnixNanoseconds::new(205)
+    );
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn uncertain_ingest_reconciles_a_durably_published_uncertain_clock_anchor()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0xd8; 16])?,
+        CatalogSecret::from_owned(Box::new([0xd9; 32]), Box::new([0xda; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x64; 16])?;
+    let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(13)?);
+    let wall = Arc::new(Mutex::new(UnixNanoseconds::new(200)));
+    let (retention_time, _) = RetentionTimeAuthority::establish_with_source_and_manual_elapsed(
+        MutableWallClock(Arc::clone(&wall)),
+        crate::LifecycleClockPolicy::new(10)?,
+    )?;
+    *wall.lock().map_err(|_| "wall clock")? = UnixNanoseconds::new(1_000);
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        SegmentProtectionKey::from_owned(Box::new([0xdb; 32])),
+    )?;
+
+    let prepared = with_catalog_publication_fault_after(
+        CatalogPublicationFault::SynchronizeGenerationDirectory,
+        0,
+        || {
+            ledger.begin_store_block(
+                preparation_capacity(&authority, tenant).expect("capacity"),
+                StoreBlockIdentity::new([0xdc; 16]).expect("identity"),
+            )
+        },
+    )?;
+    assert_eq!(prepared.scope(), scope);
+    assert_eq!(
+        retention_time.status().state(),
+        crate::LifecycleClockState::ClockUncertain
     );
     Ok(())
 }
