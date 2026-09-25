@@ -150,14 +150,8 @@ impl GrantRecord {
                 root_slot: slot,
                 generation,
                 tenant: self.tenant?,
-                principal: match self.principal {
-                    Some(principal) => principal,
-                    None => return None,
-                },
-                kind: match self.kind.ordinary_kind() {
-                    Some(kind) => kind,
-                    None => return None,
-                },
+                principal: self.principal?,
+                kind: self.kind.ordinary_kind()?,
             }),
             Some(OperationRecord::Child { .. }) | None => None,
         }
