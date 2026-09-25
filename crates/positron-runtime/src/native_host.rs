@@ -1,6 +1,6 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
-use std::net::{IpAddr, SocketAddr, TcpListener};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::num::NonZeroU8;
 use std::num::NonZeroU16;
 use std::path::PathBuf;
@@ -1052,8 +1052,7 @@ fn serve_exact_listener_role(
             .serve(cancellation, force)
             .map_err(|_| TaskFailure::JoinUnavailable)
     } else {
-        serve_http(admission, cancellation, health, services);
-        Ok(())
+        serve_http(admission, cancellation, force, health, services)
     }
 }
 
@@ -1081,9 +1080,10 @@ fn serve_listener_role(
         serve_http(
             Arc::clone(&admission),
             cancellation.clone(),
+            force,
             health.clone(),
             services.clone(),
-        );
+        )?;
     }
     if cancellation.is_cancelled() || !admission.is_accepting() {
         // A worker belongs to exactly one admitted generation. Replacement
@@ -1467,10 +1467,13 @@ mod listener_generation_tests {
 fn serve_http(
     admission: Arc<Admission>,
     cancellation: TaskCancellation,
+    force: TaskCancellation,
     health: HealthState,
     services: Option<ServiceHandle>,
-) {
+) -> Result<(), TaskFailure> {
+    let mut handlers = Vec::new();
     while admission.accepting.load(Ordering::Acquire) && !cancellation.is_cancelled() {
+        reap_completed_http_handlers(&mut handlers)?;
         let accepted = match &admission.listener {
             NativeListener::Tcp(listener) => listener.accept(),
             #[cfg(unix)]
@@ -1493,7 +1496,7 @@ fn serve_http(
                 if !can_serve_accepted_connection(&admission, &cancellation) {
                     continue;
                 }
-                let Some(_lease) = admission.accept_connection(peer.ip()) else {
+                let Some(lease) = admission.accept_connection(peer.ip()) else {
                     continue;
                 };
                 if stream.set_nonblocking(false).is_err()
@@ -1506,38 +1509,69 @@ fn serve_http(
                 {
                     continue;
                 }
-                if let Some(profile) = &admission.transport {
-                    if profile.is_tls() {
-                        if let Ok(connection) = profile.server_connection() {
-                            let mut tls = rustls::StreamOwned::new(connection, stream);
-                            let _ = native_http::serve_tls_connection(
-                                &mut tls,
-                                admission.role,
+                let role = admission.role;
+                let transport = admission.transport.clone();
+                let trusted_proxy = admission.trusted_proxy.clone();
+                let connection_health = health.clone();
+                let connection_services = services.clone();
+                let Ok(interrupt) = stream.try_clone() else {
+                    continue;
+                };
+                // Register the handler before spawning it. Admission bounds the
+                // registry and its leases identify the exact accepting generation.
+                handlers.push(HttpConnectionHandler {
+                    interrupt,
+                    handle: None,
+                });
+                let handler = std::thread::Builder::new()
+                    .name(format!("positron-{role:?}-connection"))
+                    .spawn(move || {
+                        let _lease = lease;
+                        if let Some(profile) = transport {
+                            if profile.is_tls() {
+                                if let Ok(connection) = profile.server_connection() {
+                                    let mut tls = rustls::StreamOwned::new(connection, stream);
+                                    let _ = native_http::serve_tls_connection(
+                                        &mut tls,
+                                        role,
+                                        peer,
+                                        trusted_proxy,
+                                        &connection_health,
+                                        connection_services.as_ref(),
+                                    );
+                                }
+                            } else {
+                                let _ = native_http::serve_connection(
+                                    &mut stream,
+                                    role,
+                                    peer,
+                                    trusted_proxy,
+                                    &connection_health,
+                                    connection_services.as_ref(),
+                                );
+                            }
+                        } else {
+                            let _ = native_http::serve_connection(
+                                &mut stream,
+                                role,
                                 peer,
-                                admission.trusted_proxy.clone(),
-                                &health,
-                                services.as_ref(),
+                                trusted_proxy,
+                                &connection_health,
+                                connection_services.as_ref(),
                             );
                         }
-                    } else {
-                        let _ = native_http::serve_connection(
-                            &mut stream,
-                            admission.role,
-                            peer,
-                            admission.trusted_proxy.clone(),
-                            &health,
-                            services.as_ref(),
-                        );
-                    }
-                } else {
-                    let _ = native_http::serve_connection(
-                        &mut stream,
-                        admission.role,
-                        peer,
-                        admission.trusted_proxy.clone(),
-                        &health,
-                        services.as_ref(),
-                    );
+                    });
+                match handler {
+                    Ok(handler) => {
+                        if let Some(registered) = handlers.last_mut() {
+                            registered.handle = Some(handler);
+                        } else {
+                            return Err(TaskFailure::SpawnUnavailable);
+                        }
+                    },
+                    Err(_) => {
+                        let _ = handlers.pop();
+                    },
                 }
             },
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -1546,6 +1580,61 @@ fn serve_http(
             Err(_) => break,
         }
     }
+    join_http_handlers(&mut handlers, &force)
+}
+
+struct HttpConnectionHandler {
+    interrupt: TcpStream,
+    handle: Option<JoinHandle<()>>,
+}
+
+fn reap_completed_http_handlers(
+    handlers: &mut Vec<HttpConnectionHandler>,
+) -> Result<(), TaskFailure> {
+    let mut index = 0;
+    while index < handlers.len() {
+        if handlers[index]
+            .handle
+            .as_ref()
+            .is_some_and(JoinHandle::is_finished)
+        {
+            let handler = handlers.swap_remove(index);
+            join_http_handler(handler)?;
+        } else {
+            index = index.saturating_add(1);
+        }
+    }
+    Ok(())
+}
+
+fn join_http_handlers(
+    handlers: &mut Vec<HttpConnectionHandler>,
+    force: &TaskCancellation,
+) -> Result<(), TaskFailure> {
+    while handlers.iter().any(|handler| {
+        handler
+            .handle
+            .as_ref()
+            .is_some_and(|handle| !handle.is_finished())
+    }) {
+        if force.is_cancelled() {
+            for handler in &*handlers {
+                let _ = handler.interrupt.shutdown(std::net::Shutdown::Both);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    while let Some(handler) = handlers.pop() {
+        join_http_handler(handler)?;
+    }
+    Ok(())
+}
+
+fn join_http_handler(mut handler: HttpConnectionHandler) -> Result<(), TaskFailure> {
+    let Some(handle) = handler.handle.take() else {
+        return Err(TaskFailure::SpawnUnavailable);
+    };
+    handle.join().map_err(|_| TaskFailure::JoinUnavailable)
 }
 
 fn can_serve_accepted_connection(admission: &Admission, cancellation: &TaskCancellation) -> bool {

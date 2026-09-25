@@ -148,9 +148,10 @@ impl ReceiverHarness {
         });
         let cancellation = TaskCancellation::new();
         let serve_cancellation = cancellation.clone();
+        let force = TaskCancellation::new();
         let health = ProcessState::starting().health();
         let server = std::thread::spawn(move || {
-            serve_http(admission, serve_cancellation, health, Some(services));
+            let _ = serve_http(admission, serve_cancellation, force, health, Some(services));
         });
         Ok(Self {
             endpoint,
