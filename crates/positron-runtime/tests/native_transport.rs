@@ -28,6 +28,8 @@ use prost::Message;
 mod support;
 use support::*;
 
+#[path = "native_transport/api_framing.rs"]
+mod api_framing;
 #[path = "native_transport/http2_api.rs"]
 mod http2_api;
 #[path = "native_transport/policy_routes.rs"]

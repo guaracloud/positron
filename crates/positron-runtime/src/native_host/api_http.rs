@@ -11,6 +11,7 @@ use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
+use tokio::io::ReadBuf;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsAcceptor;
 
@@ -21,6 +22,8 @@ use super::{
 };
 
 const MAX_HEADER_BYTES: usize = 8 * 1024;
+const HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+const BAD_REQUEST_RESPONSE: &[u8] = b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
 pub(super) struct ConnectionContext {
     pub(super) transport: Option<TransportProfile>,
@@ -83,6 +86,21 @@ where
         protection,
         ..
     } = context;
+    let stream = IdleIo::new(stream, protection.idle_deadline());
+    let header_deadline = tokio::time::Instant::now() + protection.header_deadline();
+    let stream =
+        match tokio::time::timeout_at(header_deadline, preflight_http1_framing(stream)).await {
+            Ok(Ok(FramingPreflight::Continue(stream))) => stream,
+            Ok(Ok(FramingPreflight::Rejected(mut stream))) => {
+                write_bad_request(&mut stream).await;
+                return Ok(());
+            },
+            Ok(Err(())) | Err(_) => return Err(ApiHttpFailure),
+        };
+    let remaining_header_deadline = header_deadline
+        .checked_duration_since(tokio::time::Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or(ApiHttpFailure)?;
     let mut builder = auto::Builder::new(TokioExecutor::new());
     builder
         .http1()
@@ -91,7 +109,7 @@ where
         .keep_alive(false)
         .max_buf_size(MAX_HEADER_BYTES)
         .timer(TokioTimer::new())
-        .header_read_timeout(protection.header_deadline());
+        .header_read_timeout(remaining_header_deadline);
     builder
         .http2()
         .auto_date_header(false)
@@ -99,7 +117,7 @@ where
         .timer(TokioTimer::new())
         .max_header_list_size(MAX_HEADER_BYTES as u32);
     let connection = builder.serve_connection(
-        TokioIo::new(IdleIo::new(stream, protection.idle_deadline())),
+        TokioIo::new(stream),
         service_fn(move |request| {
             let trusted_proxy = trusted_proxy.clone();
             let health = health.clone();
@@ -134,6 +152,151 @@ where
             connection.as_mut().graceful_shutdown();
             connection.await.map_err(|_| ApiHttpFailure)
         },
+    }
+}
+
+enum FramingPreflight<I> {
+    Continue(PrefetchedIo<I>),
+    Rejected(I),
+}
+
+async fn preflight_http1_framing<I>(mut stream: I) -> Result<FramingPreflight<I>, ()>
+where
+    I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let mut prefetched = Vec::with_capacity(512);
+    loop {
+        if prefetched.starts_with(HTTP2_PREFACE) {
+            return Ok(FramingPreflight::Continue(PrefetchedIo::new(
+                stream, prefetched,
+            )));
+        }
+        if let Some(header_end) = http1_header_end(&prefetched) {
+            if has_duplicate_content_length(&prefetched[..header_end]) {
+                return Ok(FramingPreflight::Rejected(stream));
+            }
+            return Ok(FramingPreflight::Continue(PrefetchedIo::new(
+                stream, prefetched,
+            )));
+        }
+        if prefetched.len() == MAX_HEADER_BYTES {
+            return Ok(FramingPreflight::Continue(PrefetchedIo::new(
+                stream, prefetched,
+            )));
+        }
+        let mut buffer = [0_u8; 512];
+        let maximum = buffer.len().min(MAX_HEADER_BYTES - prefetched.len());
+        let mut read = ReadBuf::new(&mut buffer[..maximum]);
+        poll_fn(|context| Pin::new(&mut stream).poll_read(context, &mut read))
+            .await
+            .map_err(|_| ())?;
+        let bytes = read.filled();
+        if bytes.is_empty() {
+            return Err(());
+        }
+        prefetched.extend_from_slice(bytes);
+    }
+}
+
+fn http1_header_end(bytes: &[u8]) -> Option<usize> {
+    bytes
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|position| position + 4)
+}
+
+fn has_duplicate_content_length(header: &[u8]) -> bool {
+    let mut content_length_seen = false;
+    for line in header.split(|byte| *byte == b'\n').skip(1) {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let Some(separator) = line.iter().position(|byte| *byte == b':') else {
+            continue;
+        };
+        let name = &line[..separator];
+        if name.eq_ignore_ascii_case(b"content-length") {
+            if content_length_seen {
+                return true;
+            }
+            content_length_seen = true;
+        }
+    }
+    false
+}
+
+async fn write_bad_request<I>(stream: &mut I)
+where
+    I: tokio::io::AsyncWrite + Unpin,
+{
+    let mut remaining = BAD_REQUEST_RESPONSE;
+    while !remaining.is_empty() {
+        let Ok(written) =
+            poll_fn(|context| Pin::new(&mut *stream).poll_write(context, remaining)).await
+        else {
+            return;
+        };
+        if written == 0 {
+            return;
+        }
+        remaining = &remaining[written..];
+    }
+    let _ = poll_fn(|context| Pin::new(&mut *stream).poll_flush(context)).await;
+    let _ = poll_fn(|context| Pin::new(&mut *stream).poll_shutdown(context)).await;
+}
+
+struct PrefetchedIo<I> {
+    inner: I,
+    prefetched: Vec<u8>,
+    offset: usize,
+}
+
+impl<I> PrefetchedIo<I> {
+    fn new(inner: I, prefetched: Vec<u8>) -> Self {
+        Self {
+            inner,
+            prefetched,
+            offset: 0,
+        }
+    }
+}
+
+impl<I: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for PrefetchedIo<I> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if self.offset < self.prefetched.len() {
+            let available = &self.prefetched[self.offset..];
+            let count = available.len().min(buffer.remaining());
+            buffer.put_slice(&available[..count]);
+            self.offset += count;
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut self.inner).poll_read(context, buffer)
+    }
+}
+
+impl<I: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for PrefetchedIo<I> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(context, buffer)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(context)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(context)
     }
 }
 
