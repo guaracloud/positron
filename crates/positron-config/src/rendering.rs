@@ -351,6 +351,19 @@ fn reference_domain(definition: SettingDefinition) -> String {
         | Setting::ListenerOtlpGrpcIdleDeadlineSeconds
         | Setting::ListenerOtlpHttpIdleDeadlineSeconds
         | Setting::ListenerLokiPushIdleDeadlineSeconds => "`1..=300` seconds; maximum idle connection duration".to_owned(),
+        Setting::ListenerApiHttp2MaxConcurrentStreams
+        | Setting::ListenerOtlpGrpcHttp2MaxConcurrentStreams => "`1..=1024`; maximum concurrent HTTP/2 request streams per accepted connection".to_owned(),
+        Setting::ListenerApiHttp2InitialStreamWindowBytes
+        | Setting::ListenerOtlpGrpcHttp2InitialStreamWindowBytes => "`1..=2147483647` bytes; advertised HTTP/2 flow-control window for each stream".to_owned(),
+        Setting::ListenerApiHttp2InitialConnectionWindowBytes
+        | Setting::ListenerOtlpGrpcHttp2InitialConnectionWindowBytes => "`1..=2147483647` bytes; advertised HTTP/2 connection flow-control window".to_owned(),
+        Setting::ListenerApiHttp2MaxFrameBytes
+        | Setting::ListenerOtlpGrpcHttp2MaxFrameBytes => "`16384..=16777215` bytes; maximum accepted HTTP/2 frame payload".to_owned(),
+        Setting::ListenerApiHttp2MaxHeaderListBytes
+        | Setting::ListenerOtlpGrpcHttp2MaxHeaderListBytes => "`1..=1048576` bytes; maximum decoded HTTP/2 header-list size".to_owned(),
+        Setting::ListenerApiHttp2MinimumPingIntervalSeconds
+        | Setting::ListenerOtlpGrpcHttp2MinimumPingIntervalSeconds => "`1..=300` seconds; minimum interval between non-ACK peer HTTP/2 PING frames; an earlier PING closes the connection".to_owned(),
+        Setting::ListenerOtlpGrpcMaxMessageBytes => "`1..=16777216` bytes; transport gRPC message ceiling before decoding; an authenticated tenant's value profile may narrow it".to_owned(),
         Setting::SecurityLocalKeyFile => "protected absolute path under `storage.secrets_directory`, named `local-root-key.v1`; at most 256 bytes".to_owned(),
         _ => match definition.domain() {
             ValueDomain::ExactUnsignedInteger(value) => format!("exactly `{value}`"),

@@ -249,6 +249,49 @@ fn connection_protection_changes_are_file_only_drain_and_reload_settings()
 }
 
 #[test]
+fn http2_listener_profile_changes_are_file_only_drain_and_reload_settings()
+-> Result<(), ConfigurationFailure> {
+    let current = inputs(None, [], []).and_then(resolve)?;
+    let candidate = inputs(
+        Some(
+            "schema_version = 1\n\
+             [listener]\n\
+             api_http2_max_concurrent_streams = 2\n\
+             api_http2_minimum_ping_interval_seconds = 6\n\
+             otlp_grpc_max_message_bytes = 2048\n",
+        ),
+        [],
+        [],
+    )
+    .and_then(resolve)?;
+
+    assert!(matches!(
+        current.plan_update(&candidate)?,
+        ConfigurationPlan::DrainThenPublish { changed }
+            if changed
+                == vec![
+                    Setting::ListenerApiHttp2MaxConcurrentStreams,
+                    Setting::ListenerApiHttp2MinimumPingIntervalSeconds,
+                    Setting::ListenerOtlpGrpcMaxMessageBytes,
+                ]
+    ));
+
+    let environment = inputs(
+        None,
+        [("POSITRON__LISTENER__API_HTTP2_MAX_CONCURRENT_STREAMS", "2")],
+        [],
+    )
+    .and_then(resolve);
+    assert!(matches!(
+        environment,
+        Err(error)
+            if error.code() == ConfigurationFailureCode::UnknownSetting
+                && error.source() == FailureSource::ListenerApiHttp2MaxConcurrentStreams
+    ));
+    Ok(())
+}
+
+#[test]
 fn immutable_configuration_digest_follows_the_canonical_mutability_contract()
 -> Result<(), ConfigurationFailure> {
     let current = inputs(None, [], []).and_then(resolve)?;

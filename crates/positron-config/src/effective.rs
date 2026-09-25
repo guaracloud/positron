@@ -1,6 +1,6 @@
 use std::fmt::{Debug, Formatter};
 use std::net::SocketAddr;
-use std::num::{NonZeroU8, NonZeroU16};
+use std::num::{NonZeroU8, NonZeroU16, NonZeroU32};
 use std::time::Duration;
 
 use positron_domain::identity::TenantId;
@@ -51,6 +51,7 @@ pub struct NetworkListenerProfile<'a> {
     forwarded_hops: Option<NonZeroU8>,
     connection_admission: ConnectionAdmissionProfile,
     connection_protection: ConnectionProtectionProfile,
+    http2_profile: Option<Http2Profile>,
 }
 
 /// The bounded pre-authentication accepted-socket policy for one network listener.
@@ -81,6 +82,49 @@ pub struct ConnectionProtectionProfile {
     pub(crate) body_deadline_seconds: NonZeroU16,
     pub(crate) request_deadline_seconds: NonZeroU16,
     pub(crate) idle_deadline_seconds: NonZeroU16,
+}
+
+/// Bounded HTTP/2 transport controls for one role that actually serves HTTP/2.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Http2Profile {
+    pub(crate) max_concurrent_streams: NonZeroU16,
+    pub(crate) initial_stream_window_bytes: NonZeroU32,
+    pub(crate) initial_connection_window_bytes: NonZeroU32,
+    pub(crate) max_frame_bytes: NonZeroU32,
+    pub(crate) max_header_list_bytes: NonZeroU32,
+    pub(crate) minimum_ping_interval_seconds: NonZeroU16,
+    pub(crate) max_grpc_message_bytes: Option<NonZeroU32>,
+}
+
+impl Http2Profile {
+    #[must_use]
+    pub const fn max_concurrent_streams(self) -> NonZeroU16 {
+        self.max_concurrent_streams
+    }
+    #[must_use]
+    pub const fn initial_stream_window_bytes(self) -> NonZeroU32 {
+        self.initial_stream_window_bytes
+    }
+    #[must_use]
+    pub const fn initial_connection_window_bytes(self) -> NonZeroU32 {
+        self.initial_connection_window_bytes
+    }
+    #[must_use]
+    pub const fn max_frame_bytes(self) -> NonZeroU32 {
+        self.max_frame_bytes
+    }
+    #[must_use]
+    pub const fn max_header_list_bytes(self) -> NonZeroU32 {
+        self.max_header_list_bytes
+    }
+    #[must_use]
+    pub const fn minimum_ping_interval(self) -> Duration {
+        Duration::from_secs(self.minimum_ping_interval_seconds.get() as u64)
+    }
+    #[must_use]
+    pub const fn max_grpc_message_bytes(self) -> Option<NonZeroU32> {
+        self.max_grpc_message_bytes
+    }
 }
 
 impl ConnectionProtectionProfile {
@@ -150,6 +194,10 @@ impl NetworkListenerProfile<'_> {
     #[must_use]
     pub const fn connection_protection(&self) -> ConnectionProtectionProfile {
         self.connection_protection
+    }
+    #[must_use]
+    pub const fn http2_profile(&self) -> Option<Http2Profile> {
+        self.http2_profile
     }
 }
 
@@ -236,6 +284,7 @@ pub struct EffectiveConfiguration {
     pub(crate) api_accepted_socket_limit: NonZeroU16,
     pub(crate) api_per_address_accepted_socket_limit: NonZeroU16,
     pub(crate) api_connection_protection: ConnectionProtectionProfile,
+    pub(crate) api_http2_profile: Http2Profile,
     pub(crate) api_trusted_proxy_cidrs: Vec<String>,
     pub(crate) api_forwarded_hops: Option<NonZeroU8>,
     pub(crate) api_tls_certificate_file: ProtectedFileReference,
@@ -246,6 +295,7 @@ pub struct EffectiveConfiguration {
     pub(crate) otlp_grpc_accepted_socket_limit: NonZeroU16,
     pub(crate) otlp_grpc_per_address_accepted_socket_limit: NonZeroU16,
     pub(crate) otlp_grpc_connection_protection: ConnectionProtectionProfile,
+    pub(crate) otlp_grpc_http2_profile: Http2Profile,
     pub(crate) otlp_grpc_tls_certificate_file: ProtectedFileReference,
     pub(crate) otlp_grpc_tls_private_key_file: ProtectedFileReference,
     pub(crate) otlp_grpc_tls_client_ca_file: ProtectedFileReference,
@@ -275,7 +325,7 @@ pub struct EffectiveConfiguration {
     pub(crate) secrets_directory: String,
     pub(crate) local_key_file: ProtectedFileReference,
     pub(crate) export_destinations: Vec<ExportDestinationDefinition>,
-    pub(crate) sources: [SettingSource; 84],
+    pub(crate) sources: [SettingSource; 97],
 }
 
 impl EffectiveConfiguration {
@@ -327,6 +377,7 @@ impl EffectiveConfiguration {
             global_accepted_socket_limit,
             per_address_accepted_socket_limit,
             connection_protection,
+            http2_profile,
         ) = match role {
             NetworkListenerRole::Operations => (
                 self.operations_bind_address,
@@ -339,6 +390,7 @@ impl EffectiveConfiguration {
                 self.operations_accepted_socket_limit,
                 self.operations_per_address_accepted_socket_limit,
                 self.operations_connection_protection,
+                None,
             ),
             NetworkListenerRole::Api => (
                 self.api_bind_address,
@@ -355,6 +407,7 @@ impl EffectiveConfiguration {
                 self.api_accepted_socket_limit,
                 self.api_per_address_accepted_socket_limit,
                 self.api_connection_protection,
+                Some(self.api_http2_profile),
             ),
             NetworkListenerRole::OtlpGrpc => (
                 self.otlp_grpc_bind_address,
@@ -367,6 +420,7 @@ impl EffectiveConfiguration {
                 self.otlp_grpc_accepted_socket_limit,
                 self.otlp_grpc_per_address_accepted_socket_limit,
                 self.otlp_grpc_connection_protection,
+                Some(self.otlp_grpc_http2_profile),
             ),
             NetworkListenerRole::OtlpHttp => (
                 self.otlp_http_bind_address,
@@ -379,6 +433,7 @@ impl EffectiveConfiguration {
                 self.otlp_http_accepted_socket_limit,
                 self.otlp_http_per_address_accepted_socket_limit,
                 self.otlp_http_connection_protection,
+                None,
             ),
             NetworkListenerRole::LokiPush => (
                 self.loki_push_bind_address,
@@ -391,6 +446,7 @@ impl EffectiveConfiguration {
                 self.loki_push_accepted_socket_limit,
                 self.loki_push_per_address_accepted_socket_limit,
                 self.loki_push_connection_protection,
+                None,
             ),
         };
         Some(NetworkListenerProfile {
@@ -408,6 +464,7 @@ impl EffectiveConfiguration {
                 per_address_accepted_socket_limit,
             },
             connection_protection,
+            http2_profile,
         })
     }
 
@@ -890,12 +947,25 @@ impl EffectiveConfiguration {
                 | Setting::ListenerApiBodyDeadlineSeconds
                 | Setting::ListenerApiRequestDeadlineSeconds
                 | Setting::ListenerApiIdleDeadlineSeconds
+                | Setting::ListenerApiHttp2MaxConcurrentStreams
+                | Setting::ListenerApiHttp2InitialStreamWindowBytes
+                | Setting::ListenerApiHttp2InitialConnectionWindowBytes
+                | Setting::ListenerApiHttp2MaxFrameBytes
+                | Setting::ListenerApiHttp2MaxHeaderListBytes
+                | Setting::ListenerApiHttp2MinimumPingIntervalSeconds
                 | Setting::ListenerOtlpGrpcTlsHandshakeLimit
                 | Setting::ListenerOtlpGrpcTlsHandshakeDeadlineSeconds
                 | Setting::ListenerOtlpGrpcHeaderDeadlineSeconds
                 | Setting::ListenerOtlpGrpcBodyDeadlineSeconds
                 | Setting::ListenerOtlpGrpcRequestDeadlineSeconds
                 | Setting::ListenerOtlpGrpcIdleDeadlineSeconds
+                | Setting::ListenerOtlpGrpcHttp2MaxConcurrentStreams
+                | Setting::ListenerOtlpGrpcHttp2InitialStreamWindowBytes
+                | Setting::ListenerOtlpGrpcHttp2InitialConnectionWindowBytes
+                | Setting::ListenerOtlpGrpcHttp2MaxFrameBytes
+                | Setting::ListenerOtlpGrpcHttp2MaxHeaderListBytes
+                | Setting::ListenerOtlpGrpcHttp2MinimumPingIntervalSeconds
+                | Setting::ListenerOtlpGrpcMaxMessageBytes
                 | Setting::ListenerOtlpHttpTlsHandshakeLimit
                 | Setting::ListenerOtlpHttpTlsHandshakeDeadlineSeconds
                 | Setting::ListenerOtlpHttpHeaderDeadlineSeconds
@@ -1124,6 +1194,29 @@ impl EffectiveConfiguration {
                 self.api_connection_protection.idle_deadline_seconds
                     != other.api_connection_protection.idle_deadline_seconds
             },
+            Setting::ListenerApiHttp2MaxConcurrentStreams => {
+                self.api_http2_profile.max_concurrent_streams
+                    != other.api_http2_profile.max_concurrent_streams
+            },
+            Setting::ListenerApiHttp2InitialStreamWindowBytes => {
+                self.api_http2_profile.initial_stream_window_bytes
+                    != other.api_http2_profile.initial_stream_window_bytes
+            },
+            Setting::ListenerApiHttp2InitialConnectionWindowBytes => {
+                self.api_http2_profile.initial_connection_window_bytes
+                    != other.api_http2_profile.initial_connection_window_bytes
+            },
+            Setting::ListenerApiHttp2MaxFrameBytes => {
+                self.api_http2_profile.max_frame_bytes != other.api_http2_profile.max_frame_bytes
+            },
+            Setting::ListenerApiHttp2MaxHeaderListBytes => {
+                self.api_http2_profile.max_header_list_bytes
+                    != other.api_http2_profile.max_header_list_bytes
+            },
+            Setting::ListenerApiHttp2MinimumPingIntervalSeconds => {
+                self.api_http2_profile.minimum_ping_interval_seconds
+                    != other.api_http2_profile.minimum_ping_interval_seconds
+            },
             Setting::ListenerOtlpGrpcTlsHandshakeLimit => {
                 self.otlp_grpc_connection_protection.tls_handshake_limit
                     != other.otlp_grpc_connection_protection.tls_handshake_limit
@@ -1155,6 +1248,36 @@ impl EffectiveConfiguration {
             Setting::ListenerOtlpGrpcIdleDeadlineSeconds => {
                 self.otlp_grpc_connection_protection.idle_deadline_seconds
                     != other.otlp_grpc_connection_protection.idle_deadline_seconds
+            },
+            Setting::ListenerOtlpGrpcHttp2MaxConcurrentStreams => {
+                self.otlp_grpc_http2_profile.max_concurrent_streams
+                    != other.otlp_grpc_http2_profile.max_concurrent_streams
+            },
+            Setting::ListenerOtlpGrpcHttp2InitialStreamWindowBytes => {
+                self.otlp_grpc_http2_profile.initial_stream_window_bytes
+                    != other.otlp_grpc_http2_profile.initial_stream_window_bytes
+            },
+            Setting::ListenerOtlpGrpcHttp2InitialConnectionWindowBytes => {
+                self.otlp_grpc_http2_profile.initial_connection_window_bytes
+                    != other
+                        .otlp_grpc_http2_profile
+                        .initial_connection_window_bytes
+            },
+            Setting::ListenerOtlpGrpcHttp2MaxFrameBytes => {
+                self.otlp_grpc_http2_profile.max_frame_bytes
+                    != other.otlp_grpc_http2_profile.max_frame_bytes
+            },
+            Setting::ListenerOtlpGrpcHttp2MaxHeaderListBytes => {
+                self.otlp_grpc_http2_profile.max_header_list_bytes
+                    != other.otlp_grpc_http2_profile.max_header_list_bytes
+            },
+            Setting::ListenerOtlpGrpcHttp2MinimumPingIntervalSeconds => {
+                self.otlp_grpc_http2_profile.minimum_ping_interval_seconds
+                    != other.otlp_grpc_http2_profile.minimum_ping_interval_seconds
+            },
+            Setting::ListenerOtlpGrpcMaxMessageBytes => {
+                self.otlp_grpc_http2_profile.max_grpc_message_bytes
+                    != other.otlp_grpc_http2_profile.max_grpc_message_bytes
             },
             Setting::ListenerOtlpHttpTlsHandshakeLimit => {
                 self.otlp_http_connection_protection.tls_handshake_limit
@@ -1405,6 +1528,34 @@ impl EffectiveConfiguration {
                 .idle_deadline_seconds
                 .get()
                 .to_string(),
+            Setting::ListenerApiHttp2MaxConcurrentStreams => self
+                .api_http2_profile
+                .max_concurrent_streams
+                .get()
+                .to_string(),
+            Setting::ListenerApiHttp2InitialStreamWindowBytes => self
+                .api_http2_profile
+                .initial_stream_window_bytes
+                .get()
+                .to_string(),
+            Setting::ListenerApiHttp2InitialConnectionWindowBytes => self
+                .api_http2_profile
+                .initial_connection_window_bytes
+                .get()
+                .to_string(),
+            Setting::ListenerApiHttp2MaxFrameBytes => {
+                self.api_http2_profile.max_frame_bytes.get().to_string()
+            },
+            Setting::ListenerApiHttp2MaxHeaderListBytes => self
+                .api_http2_profile
+                .max_header_list_bytes
+                .get()
+                .to_string(),
+            Setting::ListenerApiHttp2MinimumPingIntervalSeconds => self
+                .api_http2_profile
+                .minimum_ping_interval_seconds
+                .get()
+                .to_string(),
             Setting::ListenerOtlpGrpcTlsHandshakeLimit => self
                 .otlp_grpc_connection_protection
                 .tls_handshake_limit
@@ -1434,6 +1585,42 @@ impl EffectiveConfiguration {
                 .otlp_grpc_connection_protection
                 .idle_deadline_seconds
                 .get()
+                .to_string(),
+            Setting::ListenerOtlpGrpcHttp2MaxConcurrentStreams => self
+                .otlp_grpc_http2_profile
+                .max_concurrent_streams
+                .get()
+                .to_string(),
+            Setting::ListenerOtlpGrpcHttp2InitialStreamWindowBytes => self
+                .otlp_grpc_http2_profile
+                .initial_stream_window_bytes
+                .get()
+                .to_string(),
+            Setting::ListenerOtlpGrpcHttp2InitialConnectionWindowBytes => self
+                .otlp_grpc_http2_profile
+                .initial_connection_window_bytes
+                .get()
+                .to_string(),
+            Setting::ListenerOtlpGrpcHttp2MaxFrameBytes => self
+                .otlp_grpc_http2_profile
+                .max_frame_bytes
+                .get()
+                .to_string(),
+            Setting::ListenerOtlpGrpcHttp2MaxHeaderListBytes => self
+                .otlp_grpc_http2_profile
+                .max_header_list_bytes
+                .get()
+                .to_string(),
+            Setting::ListenerOtlpGrpcHttp2MinimumPingIntervalSeconds => self
+                .otlp_grpc_http2_profile
+                .minimum_ping_interval_seconds
+                .get()
+                .to_string(),
+            Setting::ListenerOtlpGrpcMaxMessageBytes => self
+                .otlp_grpc_http2_profile
+                .max_grpc_message_bytes
+                .map(NonZeroU32::get)
+                .unwrap_or_default()
                 .to_string(),
             Setting::ListenerOtlpHttpTlsHandshakeLimit => self
                 .otlp_http_connection_protection
@@ -1660,6 +1847,34 @@ impl EffectiveConfiguration {
                 .idle_deadline_seconds
                 .get()
                 .to_string(),
+            Setting::ListenerApiHttp2MaxConcurrentStreams => self
+                .api_http2_profile
+                .max_concurrent_streams
+                .get()
+                .to_string(),
+            Setting::ListenerApiHttp2InitialStreamWindowBytes => self
+                .api_http2_profile
+                .initial_stream_window_bytes
+                .get()
+                .to_string(),
+            Setting::ListenerApiHttp2InitialConnectionWindowBytes => self
+                .api_http2_profile
+                .initial_connection_window_bytes
+                .get()
+                .to_string(),
+            Setting::ListenerApiHttp2MaxFrameBytes => {
+                self.api_http2_profile.max_frame_bytes.get().to_string()
+            },
+            Setting::ListenerApiHttp2MaxHeaderListBytes => self
+                .api_http2_profile
+                .max_header_list_bytes
+                .get()
+                .to_string(),
+            Setting::ListenerApiHttp2MinimumPingIntervalSeconds => self
+                .api_http2_profile
+                .minimum_ping_interval_seconds
+                .get()
+                .to_string(),
             Setting::ListenerOtlpGrpcTlsHandshakeLimit => self
                 .otlp_grpc_connection_protection
                 .tls_handshake_limit
@@ -1689,6 +1904,42 @@ impl EffectiveConfiguration {
                 .otlp_grpc_connection_protection
                 .idle_deadline_seconds
                 .get()
+                .to_string(),
+            Setting::ListenerOtlpGrpcHttp2MaxConcurrentStreams => self
+                .otlp_grpc_http2_profile
+                .max_concurrent_streams
+                .get()
+                .to_string(),
+            Setting::ListenerOtlpGrpcHttp2InitialStreamWindowBytes => self
+                .otlp_grpc_http2_profile
+                .initial_stream_window_bytes
+                .get()
+                .to_string(),
+            Setting::ListenerOtlpGrpcHttp2InitialConnectionWindowBytes => self
+                .otlp_grpc_http2_profile
+                .initial_connection_window_bytes
+                .get()
+                .to_string(),
+            Setting::ListenerOtlpGrpcHttp2MaxFrameBytes => self
+                .otlp_grpc_http2_profile
+                .max_frame_bytes
+                .get()
+                .to_string(),
+            Setting::ListenerOtlpGrpcHttp2MaxHeaderListBytes => self
+                .otlp_grpc_http2_profile
+                .max_header_list_bytes
+                .get()
+                .to_string(),
+            Setting::ListenerOtlpGrpcHttp2MinimumPingIntervalSeconds => self
+                .otlp_grpc_http2_profile
+                .minimum_ping_interval_seconds
+                .get()
+                .to_string(),
+            Setting::ListenerOtlpGrpcMaxMessageBytes => self
+                .otlp_grpc_http2_profile
+                .max_grpc_message_bytes
+                .map(NonZeroU32::get)
+                .unwrap_or_default()
                 .to_string(),
             Setting::ListenerOtlpHttpTlsHandshakeLimit => self
                 .otlp_http_connection_protection

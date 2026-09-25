@@ -158,3 +158,66 @@ fn network_listener_profile_resolves_role_owned_connection_protection()
     assert_eq!(operations.idle_deadline().as_secs(), 30);
     Ok(())
 }
+
+#[test]
+fn http2_listener_profiles_resolve_only_their_role_owned_bounds()
+-> Result<(), Box<dyn Error>> {
+    use positron_config::NetworkListenerRole;
+
+    let effective = inputs(
+        Some(
+            "schema_version = 1\n\
+             [listener]\n\
+             api_http2_max_concurrent_streams = 3\n\
+             api_http2_initial_stream_window_bytes = 65536\n\
+             api_http2_initial_connection_window_bytes = 65537\n\
+             api_http2_max_frame_bytes = 32768\n\
+             api_http2_max_header_list_bytes = 16384\n\
+             api_http2_minimum_ping_interval_seconds = 4\n\
+             otlp_grpc_http2_max_concurrent_streams = 5\n\
+             otlp_grpc_http2_initial_stream_window_bytes = 65538\n\
+             otlp_grpc_http2_initial_connection_window_bytes = 65539\n\
+             otlp_grpc_http2_max_frame_bytes = 49152\n\
+             otlp_grpc_http2_max_header_list_bytes = 32768\n\
+             otlp_grpc_http2_minimum_ping_interval_seconds = 6\n\
+             otlp_grpc_max_message_bytes = 1048576\n",
+        ),
+        [],
+        [],
+    )
+    .and_then(resolve)?;
+
+    let api = effective
+        .network_listener_profile(NetworkListenerRole::Api)
+        .ok_or("API listener profile missing")?
+        .http2_profile()
+        .ok_or("API HTTP/2 profile missing")?;
+    assert_eq!(api.max_concurrent_streams().get(), 3);
+    assert_eq!(api.initial_stream_window_bytes().get(), 65_536);
+    assert_eq!(api.initial_connection_window_bytes().get(), 65_537);
+    assert_eq!(api.max_frame_bytes().get(), 32_768);
+    assert_eq!(api.max_header_list_bytes().get(), 16_384);
+    assert_eq!(api.minimum_ping_interval().as_secs(), 4);
+    assert_eq!(api.max_grpc_message_bytes(), None);
+
+    let grpc = effective
+        .network_listener_profile(NetworkListenerRole::OtlpGrpc)
+        .ok_or("OTLP gRPC listener profile missing")?
+        .http2_profile()
+        .ok_or("OTLP gRPC HTTP/2 profile missing")?;
+    assert_eq!(grpc.max_concurrent_streams().get(), 5);
+    assert_eq!(grpc.initial_stream_window_bytes().get(), 65_538);
+    assert_eq!(grpc.initial_connection_window_bytes().get(), 65_539);
+    assert_eq!(grpc.max_frame_bytes().get(), 49_152);
+    assert_eq!(grpc.max_header_list_bytes().get(), 32_768);
+    assert_eq!(grpc.minimum_ping_interval().as_secs(), 6);
+    assert_eq!(grpc.max_grpc_message_bytes().map(NonZeroU32::get), Some(1_048_576));
+
+    assert!(effective
+        .network_listener_profile(NetworkListenerRole::Operations)
+        .ok_or("Operations listener profile missing")?
+        .http2_profile()
+        .is_none());
+    Ok(())
+}
+use std::num::NonZeroU32;

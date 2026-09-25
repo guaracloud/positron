@@ -31,7 +31,7 @@ macro_rules! define_settings {
     };
 }
 
-pub(crate) const SETTING_DEFINITIONS: [SettingDefinition; 84] = define_settings! {
+pub(crate) const SETTING_DEFINITIONS: [SettingDefinition; 97] = define_settings! {
     SchemaVersion | "schema_version" | Integer | "1" | ExactUnsignedInteger(1) | Public | ConfigurationFileOnly | ImmutableAfterInitialization;
     DiagnosticsLogLevel | "diagnostics.log_level" | String | "info" | StringEnumeration(&["error", "warn", "info", "debug"]) | Public | NonSecretOverrides | LiveReloadable;
     RuntimeShutdownGraceSeconds | "runtime.shutdown_grace_seconds" | Integer | "30" | UnsignedIntegerRange(1, 3600) | Public | NonSecretOverrides | RestartRequired;
@@ -62,6 +62,12 @@ pub(crate) const SETTING_DEFINITIONS: [SettingDefinition; 84] = define_settings!
     ListenerApiBodyDeadlineSeconds | "listener.api_body_deadline_seconds" | Integer | "2" | UnsignedIntegerRange(1, 300) | Public | ConfigurationFileOnly | DrainAndReload;
     ListenerApiRequestDeadlineSeconds | "listener.api_request_deadline_seconds" | Integer | "30" | UnsignedIntegerRange(1, 300) | Public | ConfigurationFileOnly | DrainAndReload;
     ListenerApiIdleDeadlineSeconds | "listener.api_idle_deadline_seconds" | Integer | "30" | UnsignedIntegerRange(1, 300) | Public | ConfigurationFileOnly | DrainAndReload;
+    ListenerApiHttp2MaxConcurrentStreams | "listener.api_http2_max_concurrent_streams" | Integer | "1" | UnsignedIntegerRange(1, 1024) | Public | ConfigurationFileOnly | DrainAndReload;
+    ListenerApiHttp2InitialStreamWindowBytes | "listener.api_http2_initial_stream_window_bytes" | Integer | "65535" | UnsignedIntegerRange(1, 2147483647) | Public | ConfigurationFileOnly | DrainAndReload;
+    ListenerApiHttp2InitialConnectionWindowBytes | "listener.api_http2_initial_connection_window_bytes" | Integer | "65535" | UnsignedIntegerRange(1, 2147483647) | Public | ConfigurationFileOnly | DrainAndReload;
+    ListenerApiHttp2MaxFrameBytes | "listener.api_http2_max_frame_bytes" | Integer | "16384" | UnsignedIntegerRange(16384, 16777215) | Public | ConfigurationFileOnly | DrainAndReload;
+    ListenerApiHttp2MaxHeaderListBytes | "listener.api_http2_max_header_list_bytes" | Integer | "8192" | UnsignedIntegerRange(1, 1048576) | Public | ConfigurationFileOnly | DrainAndReload;
+    ListenerApiHttp2MinimumPingIntervalSeconds | "listener.api_http2_minimum_ping_interval_seconds" | Integer | "5" | UnsignedIntegerRange(1, 300) | Public | ConfigurationFileOnly | DrainAndReload;
     ListenerApiTrustedProxyCidrs | "listener.api.trusted_proxy_cidrs" | TrustedProxyCidrs | "disabled" | TrustedProxyCidrs(16, 64) | Public | ConfigurationFileOnly | DrainAndReload;
     ListenerApiForwardedHops | "listener.api.forwarded_hops" | Integer | "0" | UnsignedIntegerRange(0, 255) | Public | ConfigurationFileOnly | DrainAndReload;
     ListenerApiTlsCertificateFile | "listener.api_tls_certificate_file" | String | "/var/lib/positron-secrets/api-certificate.pem" | ProtectedAbsolutePath(256) | SecretBearing | ProtectedConfigurationFileOnly | DrainAndReload;
@@ -77,6 +83,13 @@ pub(crate) const SETTING_DEFINITIONS: [SettingDefinition; 84] = define_settings!
     ListenerOtlpGrpcBodyDeadlineSeconds | "listener.otlp_grpc_body_deadline_seconds" | Integer | "2" | UnsignedIntegerRange(1, 300) | Public | ConfigurationFileOnly | DrainAndReload;
     ListenerOtlpGrpcRequestDeadlineSeconds | "listener.otlp_grpc_request_deadline_seconds" | Integer | "30" | UnsignedIntegerRange(1, 300) | Public | ConfigurationFileOnly | DrainAndReload;
     ListenerOtlpGrpcIdleDeadlineSeconds | "listener.otlp_grpc_idle_deadline_seconds" | Integer | "30" | UnsignedIntegerRange(1, 300) | Public | ConfigurationFileOnly | DrainAndReload;
+    ListenerOtlpGrpcHttp2MaxConcurrentStreams | "listener.otlp_grpc_http2_max_concurrent_streams" | Integer | "16" | UnsignedIntegerRange(1, 1024) | Public | ConfigurationFileOnly | DrainAndReload;
+    ListenerOtlpGrpcHttp2InitialStreamWindowBytes | "listener.otlp_grpc_http2_initial_stream_window_bytes" | Integer | "65535" | UnsignedIntegerRange(1, 2147483647) | Public | ConfigurationFileOnly | DrainAndReload;
+    ListenerOtlpGrpcHttp2InitialConnectionWindowBytes | "listener.otlp_grpc_http2_initial_connection_window_bytes" | Integer | "65535" | UnsignedIntegerRange(1, 2147483647) | Public | ConfigurationFileOnly | DrainAndReload;
+    ListenerOtlpGrpcHttp2MaxFrameBytes | "listener.otlp_grpc_http2_max_frame_bytes" | Integer | "16384" | UnsignedIntegerRange(16384, 16777215) | Public | ConfigurationFileOnly | DrainAndReload;
+    ListenerOtlpGrpcHttp2MaxHeaderListBytes | "listener.otlp_grpc_http2_max_header_list_bytes" | Integer | "8192" | UnsignedIntegerRange(1, 1048576) | Public | ConfigurationFileOnly | DrainAndReload;
+    ListenerOtlpGrpcHttp2MinimumPingIntervalSeconds | "listener.otlp_grpc_http2_minimum_ping_interval_seconds" | Integer | "5" | UnsignedIntegerRange(1, 300) | Public | ConfigurationFileOnly | DrainAndReload;
+    ListenerOtlpGrpcMaxMessageBytes | "listener.otlp_grpc_max_message_bytes" | Integer | "1048576" | UnsignedIntegerRange(1, 16777216) | Public | ConfigurationFileOnly | DrainAndReload;
     ListenerOtlpGrpcTlsCertificateFile | "listener.otlp_grpc_tls_certificate_file" | String | "/var/lib/positron-secrets/otlp-grpc-certificate.pem" | ProtectedAbsolutePath(256) | SecretBearing | ProtectedConfigurationFileOnly | DrainAndReload;
     ListenerOtlpGrpcTlsPrivateKeyFile | "listener.otlp_grpc_tls_private_key_file" | String | "/var/lib/positron-secrets/otlp-grpc-private-key.pem" | ProtectedAbsolutePath(256) | SecretBearing | ProtectedConfigurationFileOnly | DrainAndReload;
     ListenerOtlpGrpcTlsClientCaFile | "listener.otlp_grpc_tls_client_ca_file" | String | "/var/lib/positron-secrets/otlp-grpc-client-ca.pem" | ProtectedAbsolutePath(256) | SecretBearing | ProtectedConfigurationFileOnly | DrainAndReload;

@@ -12,7 +12,7 @@ use std::{
     fs::{File, OpenOptions},
     io::Write,
     net::{IpAddr, SocketAddr},
-    num::{NonZeroU8, NonZeroU16},
+    num::{NonZeroU8, NonZeroU16, NonZeroU32},
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
@@ -24,7 +24,10 @@ pub use positron_domain::identity::TenantId;
 
 const MAX_CONFIGURATION_BYTES: usize = 16 * 1024;
 const MAX_OVERRIDE_PAIRS: usize = 16;
-const MAX_TOML_ENTRIES: usize = 96;
+// The generated public example includes every public setting and nested
+// listener-policy table. Keep enough bounded headroom for the canonical
+// configuration contract without admitting an unbounded document shape.
+const MAX_TOML_ENTRIES: usize = 128;
 const MAX_KEY_BYTES: usize = 64;
 const MAX_VALUE_BYTES: usize = 256;
 const MAX_CANDIDATE_TEMPORARY_ATTEMPTS: u64 = 32;
@@ -182,7 +185,7 @@ pub fn setting_for_path(path: &str) -> Option<Setting> {
 
 /// Returns the complete canonical contract in deterministic declaration order.
 #[must_use]
-pub const fn setting_definitions() -> [SettingDefinition; 84] {
+pub const fn setting_definitions() -> [SettingDefinition; 97] {
     contract::SETTING_DEFINITIONS
 }
 
@@ -211,6 +214,7 @@ struct Candidate {
     api_accepted_socket_limit: NonZeroU16,
     api_per_address_accepted_socket_limit: NonZeroU16,
     api_connection_protection: ConnectionProtectionProfile,
+    api_http2_profile: Http2Profile,
     api_trusted_proxy_cidrs: Vec<String>,
     api_forwarded_hops: Option<NonZeroU8>,
     api_tls_certificate_file: ProtectedFileReference,
@@ -221,6 +225,7 @@ struct Candidate {
     otlp_grpc_accepted_socket_limit: NonZeroU16,
     otlp_grpc_per_address_accepted_socket_limit: NonZeroU16,
     otlp_grpc_connection_protection: ConnectionProtectionProfile,
+    otlp_grpc_http2_profile: Http2Profile,
     otlp_grpc_tls_certificate_file: ProtectedFileReference,
     otlp_grpc_tls_private_key_file: ProtectedFileReference,
     otlp_grpc_tls_client_ca_file: ProtectedFileReference,
@@ -250,7 +255,7 @@ struct Candidate {
     secrets_directory: String,
     local_key_file: ProtectedFileReference,
     export_destinations: Vec<ExportDestinationDefinition>,
-    sources: [SettingSource; 84],
+    sources: [SettingSource; 97],
 }
 
 impl Candidate {
@@ -345,6 +350,17 @@ impl Candidate {
                 Setting::ListenerApiRequestDeadlineSeconds,
                 Setting::ListenerApiIdleDeadlineSeconds,
             ])?,
+            api_http2_profile: default_http2_profile(
+                [
+                    Setting::ListenerApiHttp2MaxConcurrentStreams,
+                    Setting::ListenerApiHttp2InitialStreamWindowBytes,
+                    Setting::ListenerApiHttp2InitialConnectionWindowBytes,
+                    Setting::ListenerApiHttp2MaxFrameBytes,
+                    Setting::ListenerApiHttp2MaxHeaderListBytes,
+                    Setting::ListenerApiHttp2MinimumPingIntervalSeconds,
+                ],
+                None,
+            )?,
             api_tls_certificate_file: ProtectedFileReference::parse(
                 api_certificate,
                 Setting::ListenerApiTlsCertificateFile,
@@ -381,6 +397,17 @@ impl Candidate {
                 Setting::ListenerOtlpGrpcRequestDeadlineSeconds,
                 Setting::ListenerOtlpGrpcIdleDeadlineSeconds,
             ])?,
+            otlp_grpc_http2_profile: default_http2_profile(
+                [
+                    Setting::ListenerOtlpGrpcHttp2MaxConcurrentStreams,
+                    Setting::ListenerOtlpGrpcHttp2InitialStreamWindowBytes,
+                    Setting::ListenerOtlpGrpcHttp2InitialConnectionWindowBytes,
+                    Setting::ListenerOtlpGrpcHttp2MaxFrameBytes,
+                    Setting::ListenerOtlpGrpcHttp2MaxHeaderListBytes,
+                    Setting::ListenerOtlpGrpcHttp2MinimumPingIntervalSeconds,
+                ],
+                Some(Setting::ListenerOtlpGrpcMaxMessageBytes),
+            )?,
             otlp_grpc_tls_certificate_file: default_protected_reference(
                 Setting::ListenerOtlpGrpcTlsCertificateFile,
             )?,
@@ -471,7 +498,7 @@ impl Candidate {
                 Setting::SecurityLocalKeyFile,
             )?,
             export_destinations: Vec::new(),
-            sources: [SettingSource::CompiledDefault; 84],
+            sources: [SettingSource::CompiledDefault; 97],
         })
     }
 
@@ -599,6 +626,28 @@ impl Candidate {
                 self.api_connection_protection.idle_deadline_seconds =
                     parse_connection_protection_value(value, setting)?;
             },
+            Setting::ListenerApiHttp2MaxConcurrentStreams => {
+                self.api_http2_profile.max_concurrent_streams =
+                    parse_http2_stream_limit(value, setting)?;
+            },
+            Setting::ListenerApiHttp2InitialStreamWindowBytes => {
+                self.api_http2_profile.initial_stream_window_bytes =
+                    parse_http2_value(value, setting)?;
+            },
+            Setting::ListenerApiHttp2InitialConnectionWindowBytes => {
+                self.api_http2_profile.initial_connection_window_bytes =
+                    parse_http2_value(value, setting)?;
+            },
+            Setting::ListenerApiHttp2MaxFrameBytes => {
+                self.api_http2_profile.max_frame_bytes = parse_http2_value(value, setting)?;
+            },
+            Setting::ListenerApiHttp2MaxHeaderListBytes => {
+                self.api_http2_profile.max_header_list_bytes = parse_http2_value(value, setting)?;
+            },
+            Setting::ListenerApiHttp2MinimumPingIntervalSeconds => {
+                self.api_http2_profile.minimum_ping_interval_seconds =
+                    parse_connection_protection_value(value, setting)?;
+            },
             Setting::ListenerApiTlsCertificateFile => {
                 self.api_tls_certificate_file = ProtectedFileReference::parse(value, setting)?;
             },
@@ -646,6 +695,33 @@ impl Candidate {
             Setting::ListenerOtlpGrpcIdleDeadlineSeconds => {
                 self.otlp_grpc_connection_protection.idle_deadline_seconds =
                     parse_connection_protection_value(value, setting)?;
+            },
+            Setting::ListenerOtlpGrpcHttp2MaxConcurrentStreams => {
+                self.otlp_grpc_http2_profile.max_concurrent_streams =
+                    parse_http2_stream_limit(value, setting)?;
+            },
+            Setting::ListenerOtlpGrpcHttp2InitialStreamWindowBytes => {
+                self.otlp_grpc_http2_profile.initial_stream_window_bytes =
+                    parse_http2_value(value, setting)?;
+            },
+            Setting::ListenerOtlpGrpcHttp2InitialConnectionWindowBytes => {
+                self.otlp_grpc_http2_profile.initial_connection_window_bytes =
+                    parse_http2_value(value, setting)?;
+            },
+            Setting::ListenerOtlpGrpcHttp2MaxFrameBytes => {
+                self.otlp_grpc_http2_profile.max_frame_bytes = parse_http2_value(value, setting)?;
+            },
+            Setting::ListenerOtlpGrpcHttp2MaxHeaderListBytes => {
+                self.otlp_grpc_http2_profile.max_header_list_bytes =
+                    parse_http2_value(value, setting)?;
+            },
+            Setting::ListenerOtlpGrpcHttp2MinimumPingIntervalSeconds => {
+                self.otlp_grpc_http2_profile.minimum_ping_interval_seconds =
+                    parse_connection_protection_value(value, setting)?;
+            },
+            Setting::ListenerOtlpGrpcMaxMessageBytes => {
+                self.otlp_grpc_http2_profile.max_grpc_message_bytes =
+                    Some(parse_http2_value(value, setting)?);
             },
             Setting::ListenerOtlpGrpcTlsCertificateFile => {
                 self.otlp_grpc_tls_certificate_file =
@@ -933,6 +1009,7 @@ impl Candidate {
             api_trusted_proxy_cidrs: self.api_trusted_proxy_cidrs,
             api_forwarded_hops: self.api_forwarded_hops,
             api_connection_protection: self.api_connection_protection,
+            api_http2_profile: self.api_http2_profile,
             api_tls_certificate_file: self.api_tls_certificate_file,
             api_tls_private_key_file: self.api_tls_private_key_file,
             api_tls_client_ca_file: self.api_tls_client_ca_file,
@@ -942,6 +1019,7 @@ impl Candidate {
             otlp_grpc_per_address_accepted_socket_limit: self
                 .otlp_grpc_per_address_accepted_socket_limit,
             otlp_grpc_connection_protection: self.otlp_grpc_connection_protection,
+            otlp_grpc_http2_profile: self.otlp_grpc_http2_profile,
             otlp_grpc_tls_certificate_file: self.otlp_grpc_tls_certificate_file,
             otlp_grpc_tls_private_key_file: self.otlp_grpc_tls_private_key_file,
             otlp_grpc_tls_client_ca_file: self.otlp_grpc_tls_client_ca_file,
@@ -1012,7 +1090,7 @@ fn parse_shutdown_grace_seconds(value: &str) -> Result<u16, ConfigurationFailure
             FailureSource::RuntimeShutdownGraceSeconds,
         ));
     };
-    if !(minimum..=maximum).contains(&seconds) {
+    if !(minimum..=maximum).contains(&u32::from(seconds)) {
         return Err(ConfigurationFailure::unsupported_value(
             FailureSource::RuntimeShutdownGraceSeconds,
         ));
@@ -1030,7 +1108,7 @@ fn parse_max_registered_tenants(value: &str) -> Result<u16, ConfigurationFailure
             FailureSource::RuntimeMaxRegisteredTenants,
         ));
     };
-    if !(minimum..=maximum).contains(&tenants) {
+    if !(minimum..=maximum).contains(&u32::from(tenants)) {
         return Err(ConfigurationFailure::unsupported_value(
             FailureSource::RuntimeMaxRegisteredTenants,
         ));
@@ -1077,6 +1155,49 @@ fn default_connection_protection(
     })
 }
 
+fn default_http2_profile(
+    settings: [Setting; 6],
+    grpc_message_setting: Option<Setting>,
+) -> Result<Http2Profile, ConfigurationFailure> {
+    let [
+        max_concurrent_streams,
+        initial_stream_window_bytes,
+        initial_connection_window_bytes,
+        max_frame_bytes,
+        max_header_list_bytes,
+        minimum_ping_interval_seconds,
+    ] = settings;
+    Ok(Http2Profile {
+        max_concurrent_streams: parse_http2_stream_limit(
+            setting_definition(max_concurrent_streams).default_value(),
+            max_concurrent_streams,
+        )?,
+        initial_stream_window_bytes: parse_http2_value(
+            setting_definition(initial_stream_window_bytes).default_value(),
+            initial_stream_window_bytes,
+        )?,
+        initial_connection_window_bytes: parse_http2_value(
+            setting_definition(initial_connection_window_bytes).default_value(),
+            initial_connection_window_bytes,
+        )?,
+        max_frame_bytes: parse_http2_value(
+            setting_definition(max_frame_bytes).default_value(),
+            max_frame_bytes,
+        )?,
+        max_header_list_bytes: parse_http2_value(
+            setting_definition(max_header_list_bytes).default_value(),
+            max_header_list_bytes,
+        )?,
+        minimum_ping_interval_seconds: parse_connection_protection_value(
+            setting_definition(minimum_ping_interval_seconds).default_value(),
+            minimum_ping_interval_seconds,
+        )?,
+        max_grpc_message_bytes: grpc_message_setting
+            .map(|setting| parse_http2_value(setting_definition(setting).default_value(), setting))
+            .transpose()?,
+    })
+}
+
 fn parse_connection_protection_value(
     value: &str,
     setting: Setting,
@@ -1089,7 +1210,7 @@ fn parse_connection_protection_value(
             failure_source(setting),
         ));
     };
-    if !(minimum..=maximum).contains(&value) {
+    if !(minimum..=maximum).contains(&u32::from(value)) {
         return Err(ConfigurationFailure::unsupported_value(failure_source(
             setting,
         )));
@@ -1110,7 +1231,7 @@ fn parse_accepted_socket_limit(
             failure_source(setting),
         ));
     };
-    if !(minimum..=maximum).contains(&limit) {
+    if !(minimum..=maximum).contains(&u32::from(limit)) {
         return Err(ConfigurationFailure::unsupported_value(failure_source(
             setting,
         )));
@@ -1132,6 +1253,45 @@ fn validate_accepted_socket_limits(
     Ok(())
 }
 
+fn parse_http2_stream_limit(
+    value: &str,
+    setting: Setting,
+) -> Result<NonZeroU16, ConfigurationFailure> {
+    let value = parse_http2_value(value, setting)?;
+    u16::try_from(value.get())
+        .ok()
+        .and_then(NonZeroU16::new)
+        .ok_or_else(|| ConfigurationFailure::unsupported_value(failure_source(setting)))
+}
+
+fn parse_http2_value(value: &str, setting: Setting) -> Result<NonZeroU32, ConfigurationFailure> {
+    let source = failure_source(setting);
+    if value.is_empty()
+        || value.len() > 10
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+        || (value.len() > 1 && value.starts_with('0'))
+    {
+        return Err(ConfigurationFailure::new(
+            ConfigurationFailureCode::Malformed,
+            source,
+        ));
+    }
+    let value = value.parse::<u32>().map_err(|_| {
+        ConfigurationFailure::new(ConfigurationFailureCode::UnsupportedValue, source)
+    })?;
+    let ValueDomain::UnsignedIntegerRange(minimum, maximum) = setting_definition(setting).domain()
+    else {
+        return Err(ConfigurationFailure::new(
+            ConfigurationFailureCode::Malformed,
+            source,
+        ));
+    };
+    if !(minimum..=maximum).contains(&value) {
+        return Err(ConfigurationFailure::unsupported_value(source));
+    }
+    NonZeroU32::new(value).ok_or_else(|| ConfigurationFailure::unsupported_value(source))
+}
+
 fn parse_forwarded_hops(
     value: &str,
     setting: Setting,
@@ -1144,7 +1304,7 @@ fn parse_forwarded_hops(
             failure_source(setting),
         ));
     };
-    if !(minimum..=maximum).contains(&hops) {
+    if !(minimum..=maximum).contains(&u32::from(hops)) {
         return Err(ConfigurationFailure::unsupported_value(failure_source(
             setting,
         )));
@@ -1382,6 +1542,22 @@ const fn failure_source(setting: Setting) -> FailureSource {
             FailureSource::ListenerApiRequestDeadlineSeconds
         },
         Setting::ListenerApiIdleDeadlineSeconds => FailureSource::ListenerApiIdleDeadlineSeconds,
+        Setting::ListenerApiHttp2MaxConcurrentStreams => {
+            FailureSource::ListenerApiHttp2MaxConcurrentStreams
+        },
+        Setting::ListenerApiHttp2InitialStreamWindowBytes => {
+            FailureSource::ListenerApiHttp2InitialStreamWindowBytes
+        },
+        Setting::ListenerApiHttp2InitialConnectionWindowBytes => {
+            FailureSource::ListenerApiHttp2InitialConnectionWindowBytes
+        },
+        Setting::ListenerApiHttp2MaxFrameBytes => FailureSource::ListenerApiHttp2MaxFrameBytes,
+        Setting::ListenerApiHttp2MaxHeaderListBytes => {
+            FailureSource::ListenerApiHttp2MaxHeaderListBytes
+        },
+        Setting::ListenerApiHttp2MinimumPingIntervalSeconds => {
+            FailureSource::ListenerApiHttp2MinimumPingIntervalSeconds
+        },
         Setting::ListenerApiTrustedProxyCidrs => FailureSource::ListenerApiTrustedProxyCidrs,
         Setting::ListenerApiForwardedHops => FailureSource::ListenerApiForwardedHops,
         Setting::ListenerApiTlsCertificateFile => FailureSource::ListenerApiTlsCertificateFile,
@@ -1413,6 +1589,25 @@ const fn failure_source(setting: Setting) -> FailureSource {
         Setting::ListenerOtlpGrpcIdleDeadlineSeconds => {
             FailureSource::ListenerOtlpGrpcIdleDeadlineSeconds
         },
+        Setting::ListenerOtlpGrpcHttp2MaxConcurrentStreams => {
+            FailureSource::ListenerOtlpGrpcHttp2MaxConcurrentStreams
+        },
+        Setting::ListenerOtlpGrpcHttp2InitialStreamWindowBytes => {
+            FailureSource::ListenerOtlpGrpcHttp2InitialStreamWindowBytes
+        },
+        Setting::ListenerOtlpGrpcHttp2InitialConnectionWindowBytes => {
+            FailureSource::ListenerOtlpGrpcHttp2InitialConnectionWindowBytes
+        },
+        Setting::ListenerOtlpGrpcHttp2MaxFrameBytes => {
+            FailureSource::ListenerOtlpGrpcHttp2MaxFrameBytes
+        },
+        Setting::ListenerOtlpGrpcHttp2MaxHeaderListBytes => {
+            FailureSource::ListenerOtlpGrpcHttp2MaxHeaderListBytes
+        },
+        Setting::ListenerOtlpGrpcHttp2MinimumPingIntervalSeconds => {
+            FailureSource::ListenerOtlpGrpcHttp2MinimumPingIntervalSeconds
+        },
+        Setting::ListenerOtlpGrpcMaxMessageBytes => FailureSource::ListenerOtlpGrpcMaxMessageBytes,
         Setting::ListenerOtlpGrpcTlsCertificateFile => {
             FailureSource::ListenerOtlpGrpcTlsCertificateFile
         },

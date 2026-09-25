@@ -246,6 +246,12 @@ pub enum FailureSource {
     ListenerApiBodyDeadlineSeconds,
     ListenerApiRequestDeadlineSeconds,
     ListenerApiIdleDeadlineSeconds,
+    ListenerApiHttp2MaxConcurrentStreams,
+    ListenerApiHttp2InitialStreamWindowBytes,
+    ListenerApiHttp2InitialConnectionWindowBytes,
+    ListenerApiHttp2MaxFrameBytes,
+    ListenerApiHttp2MaxHeaderListBytes,
+    ListenerApiHttp2MinimumPingIntervalSeconds,
     ListenerApiTrustedProxyCidrs,
     ListenerApiForwardedHops,
     ListenerApiTlsCertificateFile,
@@ -261,6 +267,13 @@ pub enum FailureSource {
     ListenerOtlpGrpcBodyDeadlineSeconds,
     ListenerOtlpGrpcRequestDeadlineSeconds,
     ListenerOtlpGrpcIdleDeadlineSeconds,
+    ListenerOtlpGrpcHttp2MaxConcurrentStreams,
+    ListenerOtlpGrpcHttp2InitialStreamWindowBytes,
+    ListenerOtlpGrpcHttp2InitialConnectionWindowBytes,
+    ListenerOtlpGrpcHttp2MaxFrameBytes,
+    ListenerOtlpGrpcHttp2MaxHeaderListBytes,
+    ListenerOtlpGrpcHttp2MinimumPingIntervalSeconds,
+    ListenerOtlpGrpcMaxMessageBytes,
     ListenerOtlpGrpcTlsCertificateFile,
     ListenerOtlpGrpcTlsPrivateKeyFile,
     ListenerOtlpGrpcTlsClientCaFile,
@@ -359,6 +372,20 @@ impl FailureSource {
             Self::ListenerApiBodyDeadlineSeconds => "listener.api_body_deadline_seconds",
             Self::ListenerApiRequestDeadlineSeconds => "listener.api_request_deadline_seconds",
             Self::ListenerApiIdleDeadlineSeconds => "listener.api_idle_deadline_seconds",
+            Self::ListenerApiHttp2MaxConcurrentStreams => {
+                "listener.api_http2_max_concurrent_streams"
+            },
+            Self::ListenerApiHttp2InitialStreamWindowBytes => {
+                "listener.api_http2_initial_stream_window_bytes"
+            },
+            Self::ListenerApiHttp2InitialConnectionWindowBytes => {
+                "listener.api_http2_initial_connection_window_bytes"
+            },
+            Self::ListenerApiHttp2MaxFrameBytes => "listener.api_http2_max_frame_bytes",
+            Self::ListenerApiHttp2MaxHeaderListBytes => "listener.api_http2_max_header_list_bytes",
+            Self::ListenerApiHttp2MinimumPingIntervalSeconds => {
+                "listener.api_http2_minimum_ping_interval_seconds"
+            },
             Self::ListenerApiTrustedProxyCidrs => "listener.api.trusted_proxy_cidrs",
             Self::ListenerApiForwardedHops => "listener.api.forwarded_hops",
             Self::ListenerApiTlsCertificateFile => "listener.api_tls_certificate_file",
@@ -382,6 +409,23 @@ impl FailureSource {
                 "listener.otlp_grpc_request_deadline_seconds"
             },
             Self::ListenerOtlpGrpcIdleDeadlineSeconds => "listener.otlp_grpc_idle_deadline_seconds",
+            Self::ListenerOtlpGrpcHttp2MaxConcurrentStreams => {
+                "listener.otlp_grpc_http2_max_concurrent_streams"
+            },
+            Self::ListenerOtlpGrpcHttp2InitialStreamWindowBytes => {
+                "listener.otlp_grpc_http2_initial_stream_window_bytes"
+            },
+            Self::ListenerOtlpGrpcHttp2InitialConnectionWindowBytes => {
+                "listener.otlp_grpc_http2_initial_connection_window_bytes"
+            },
+            Self::ListenerOtlpGrpcHttp2MaxFrameBytes => "listener.otlp_grpc_http2_max_frame_bytes",
+            Self::ListenerOtlpGrpcHttp2MaxHeaderListBytes => {
+                "listener.otlp_grpc_http2_max_header_list_bytes"
+            },
+            Self::ListenerOtlpGrpcHttp2MinimumPingIntervalSeconds => {
+                "listener.otlp_grpc_http2_minimum_ping_interval_seconds"
+            },
+            Self::ListenerOtlpGrpcMaxMessageBytes => "listener.otlp_grpc_max_message_bytes",
             Self::ListenerOtlpGrpcTlsCertificateFile => "listener.otlp_grpc_tls_certificate_file",
             Self::ListenerOtlpGrpcTlsPrivateKeyFile => "listener.otlp_grpc_tls_private_key_file",
             Self::ListenerOtlpGrpcTlsClientCaFile => "listener.otlp_grpc_tls_client_ca_file",

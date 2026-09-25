@@ -102,7 +102,7 @@ pub enum ValueDomain {
     /// One of the listed stable string values.
     StringEnumeration(&'static [&'static str]),
     /// An inclusive unsigned-integer range.
-    UnsignedIntegerRange(u16, u16),
+    UnsignedIntegerRange(u32, u32),
     /// A socket address with a byte ceiling whose IP must be loopback.
     LoopbackSocketAddress(usize),
     /// A socket address whose transport policy decides whether public binding is safe.
@@ -240,6 +240,12 @@ pub enum Setting {
     ListenerApiBodyDeadlineSeconds,
     ListenerApiRequestDeadlineSeconds,
     ListenerApiIdleDeadlineSeconds,
+    ListenerApiHttp2MaxConcurrentStreams,
+    ListenerApiHttp2InitialStreamWindowBytes,
+    ListenerApiHttp2InitialConnectionWindowBytes,
+    ListenerApiHttp2MaxFrameBytes,
+    ListenerApiHttp2MaxHeaderListBytes,
+    ListenerApiHttp2MinimumPingIntervalSeconds,
     ListenerApiTrustedProxyCidrs,
     ListenerApiForwardedHops,
     ListenerApiTlsCertificateFile,
@@ -255,6 +261,13 @@ pub enum Setting {
     ListenerOtlpGrpcBodyDeadlineSeconds,
     ListenerOtlpGrpcRequestDeadlineSeconds,
     ListenerOtlpGrpcIdleDeadlineSeconds,
+    ListenerOtlpGrpcHttp2MaxConcurrentStreams,
+    ListenerOtlpGrpcHttp2InitialStreamWindowBytes,
+    ListenerOtlpGrpcHttp2InitialConnectionWindowBytes,
+    ListenerOtlpGrpcHttp2MaxFrameBytes,
+    ListenerOtlpGrpcHttp2MaxHeaderListBytes,
+    ListenerOtlpGrpcHttp2MinimumPingIntervalSeconds,
+    ListenerOtlpGrpcMaxMessageBytes,
     ListenerOtlpGrpcTlsCertificateFile,
     ListenerOtlpGrpcTlsPrivateKeyFile,
     ListenerOtlpGrpcTlsClientCaFile,

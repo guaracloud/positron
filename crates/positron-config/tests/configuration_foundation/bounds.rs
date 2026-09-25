@@ -107,6 +107,32 @@ fn connection_protection_rejects_zero_and_overflow() {
 }
 
 #[test]
+fn http2_listener_bounds_reject_zero_and_overflow() {
+    for (document, source) in [
+        (
+            "schema_version = 1\n[listener]\napi_http2_max_concurrent_streams = 0\n",
+            FailureSource::ListenerApiHttp2MaxConcurrentStreams,
+        ),
+        (
+            "schema_version = 1\n[listener]\notlp_grpc_http2_max_frame_bytes = 16383\n",
+            FailureSource::ListenerOtlpGrpcHttp2MaxFrameBytes,
+        ),
+        (
+            "schema_version = 1\n[listener]\notlp_grpc_max_message_bytes = 16777217\n",
+            FailureSource::ListenerOtlpGrpcMaxMessageBytes,
+        ),
+    ] {
+        let result = inputs(Some(document), [], []).and_then(resolve);
+        assert!(matches!(
+            result,
+            Err(error)
+                if error.code() == ConfigurationFailureCode::UnsupportedValue
+                    && error.source() == source
+        ));
+    }
+}
+
+#[test]
 fn accepts_each_closed_value_and_exact_numeric_and_address_boundaries()
 -> Result<(), ConfigurationFailure> {
     for (value, expected) in [
