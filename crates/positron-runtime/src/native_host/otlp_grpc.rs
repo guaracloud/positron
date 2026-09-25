@@ -113,7 +113,21 @@ impl PreparedGrpc {
         let services = self.services.clone();
         let blocking_handle = self.blocking_handle.clone();
         let listener = self.listener;
-        let mut server = self.server;
+        let request_admission = Arc::clone(&admission);
+        let mut server = self
+            .server
+            .layer(tonic::service::interceptor::InterceptorLayer::new(
+                move |request: Request<()>| {
+                    let peer = request
+                        .remote_addr()
+                        .ok_or_else(preauthentication_rate_rejected)?;
+                    if request_admission.reserve_preauthentication_attempt(peer.ip()) {
+                        Ok(request)
+                    } else {
+                        Err(preauthentication_rate_rejected())
+                    }
+                },
+            ));
         let tls = self.tls;
         let protection = self.protection;
         let http2_profile = self.http2_profile;
@@ -132,8 +146,6 @@ impl PreparedGrpc {
             });
             let authentication = services.clone();
             let trace_authentication = services.clone();
-            let request_admission = Arc::clone(&admission);
-            let trace_request_admission = Arc::clone(&admission);
             let trusted_proxy = admission.trusted_proxy.clone();
             let trace_trusted_proxy = trusted_proxy.clone();
             let receiver = OtlpLogsServer::new(OtlpLogsGrpc {
@@ -151,12 +163,7 @@ impl PreparedGrpc {
             );
             let receiver = MapResponseLayer::new(map_decode_failure).named_layer(receiver);
             let receiver = InterceptedService::new(receiver, move |request| {
-                authenticate(
-                    request,
-                    &authentication,
-                    trusted_proxy.clone(),
-                    &request_admission,
-                )
+                authenticate(request, &authentication, trusted_proxy.clone())
             });
             let trace_receiver = OtlpTracesServer::new(OtlpTracesGrpc {
                 services,
@@ -174,12 +181,7 @@ impl PreparedGrpc {
             let trace_receiver =
                 MapResponseLayer::new(map_trace_decode_failure).named_layer(trace_receiver);
             let trace_receiver = InterceptedService::new(trace_receiver, move |request| {
-                authenticate_traces(
-                    request,
-                    &trace_authentication,
-                    trace_trusted_proxy.clone(),
-                    &trace_request_admission,
-                )
+                authenticate_traces(request, &trace_authentication, trace_trusted_proxy.clone())
             });
             let graceful_admission = Arc::clone(&admission);
             let serving = server
@@ -468,14 +470,7 @@ fn authenticate(
     mut request: Request<()>,
     services: &ServiceHandle,
     trusted_proxy: Option<TrustedProxy>,
-    admission: &Admission,
 ) -> Result<Request<()>, Status> {
-    let peer = request
-        .remote_addr()
-        .ok_or_else(preauthentication_rate_rejected)?;
-    if !admission.reserve_preauthentication_attempt(peer.ip()) {
-        return Err(preauthentication_rate_rejected());
-    }
     let bearer = unique_metadata(&request, "authorization", authentication_rejected)?
         .and_then(|value| value.strip_prefix("Bearer "))
         .ok_or_else(authentication_rejected)?;
@@ -501,14 +496,7 @@ fn authenticate_traces(
     mut request: Request<()>,
     services: &ServiceHandle,
     trusted_proxy: Option<TrustedProxy>,
-    admission: &Admission,
 ) -> Result<Request<()>, Status> {
-    let peer = request
-        .remote_addr()
-        .ok_or_else(preauthentication_rate_rejected)?;
-    if !admission.reserve_preauthentication_attempt(peer.ip()) {
-        return Err(preauthentication_rate_rejected());
-    }
     let bearer = unique_metadata(&request, "authorization", trace_authentication_rejected)?
         .and_then(|value| value.strip_prefix("Bearer "))
         .ok_or_else(trace_authentication_rejected)?;

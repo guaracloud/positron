@@ -1815,6 +1815,10 @@ fn serve_http(
     let mut handlers = Vec::new();
     while admission.accepting.load(Ordering::Acquire) && !cancellation.is_cancelled() {
         reap_completed_http_handlers(&mut handlers)?;
+        if admission.rate_retry_after().is_some() {
+            wait_for_rate_window(&admission, &cancellation);
+            continue;
+        }
         let accepted = match &admission.listener {
             NativeListener::Tcp(listener) => listener.accept(),
             #[cfg(unix)]

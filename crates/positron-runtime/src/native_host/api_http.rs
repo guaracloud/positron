@@ -40,6 +40,18 @@ pub(super) struct ConnectionContext {
     pub(super) cors_allowed_origins: Vec<String>,
 }
 
+#[derive(Clone)]
+struct RequestContext {
+    admission: Arc<Admission>,
+    is_http2: bool,
+    peer: std::net::SocketAddr,
+    trusted_proxy: Option<TrustedProxy>,
+    health: HealthState,
+    services: Option<ServiceHandle>,
+    protection: ConnectionProtection,
+    cors_allowed_origins: Vec<String>,
+}
+
 pub(super) fn serve_connection(
     stream: std::net::TcpStream,
     context: ConnectionContext,
@@ -141,31 +153,25 @@ where
     } else {
         H2Observer::disabled(stream)
     };
-    let request_admission = Arc::clone(&admission);
+    let request_context = RequestContext {
+        admission: Arc::clone(&admission),
+        is_http2,
+        peer,
+        trusted_proxy,
+        health,
+        services,
+        protection,
+        cors_allowed_origins,
+    };
     let connection = builder.serve_connection(
         TokioIo::new(stream),
         service_fn(move |request| {
-            let admission = Arc::clone(&request_admission);
-            let trusted_proxy = trusted_proxy.clone();
-            let health = health.clone();
-            let services = services.clone();
-            let cors_allowed_origins = cors_allowed_origins.clone();
-            let protection = protection;
+            let context = request_context.clone();
             async move {
                 Ok::<_, Infallible>(
                     match tokio::time::timeout(
-                        protection.request_deadline(),
-                        route_request(
-                            request,
-                            &admission,
-                            is_http2,
-                            peer,
-                            trusted_proxy,
-                            &health,
-                            services.as_ref(),
-                            protection,
-                            &cors_allowed_origins,
-                        ),
+                        context.protection.request_deadline(),
+                        route_request(request, context),
                     )
                     .await
                     {
@@ -338,19 +344,15 @@ async fn wait_for_shutdown(admission: Arc<Admission>, cancellation: TaskCancella
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn route_request(
     request: Request<Incoming>,
-    admission: &Admission,
-    is_http2: bool,
-    peer: std::net::SocketAddr,
-    trusted_proxy: Option<TrustedProxy>,
-    health: &HealthState,
-    services: Option<&ServiceHandle>,
-    protection: ConnectionProtection,
-    cors_allowed_origins: &[String],
+    context: RequestContext,
 ) -> Response<ApiResponseBody> {
-    if is_http2 && !admission.reserve_preauthentication_attempt(peer.ip()) {
+    if context.is_http2
+        && !context
+            .admission
+            .reserve_preauthentication_attempt(context.peer.ip())
+    {
         return response_from_native(NativeResponse::empty(429).with_retry_after(1));
     }
     let (parts, body) = request.into_parts();
@@ -358,7 +360,7 @@ async fn route_request(
         &parts.method,
         parts.uri.path(),
         &parts.headers,
-        cors_allowed_origins,
+        &context.cors_allowed_origins,
     ) {
         return response;
     }
@@ -370,7 +372,7 @@ async fn route_request(
             .map_or("/", http::uri::PathAndQuery::as_str),
     );
     let response = match tokio::time::timeout(
-        protection.body_deadline(),
+        context.protection.body_deadline(),
         collect_body(body, body_limit),
     )
     .await
@@ -383,14 +385,19 @@ async fn route_request(
             &parts.headers,
             body.len(),
         ) {
-            Ok(head) => {
-                native_http::route_buffered_api(head, body, peer, trusted_proxy, health, services)
-            },
+            Ok(head) => native_http::route_buffered_api(
+                head,
+                body,
+                context.peer,
+                context.trusted_proxy,
+                &context.health,
+                context.services.as_ref(),
+            ),
             Err(response) => response,
         },
     };
     let mut response = response_from_native(response);
-    cors::decorate(&mut response, &parts.headers, cors_allowed_origins);
+    cors::decorate(&mut response, &parts.headers, &context.cors_allowed_origins);
     response
 }
 
