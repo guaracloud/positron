@@ -4,7 +4,7 @@ use positron_domain::time::UnixNanoseconds;
 
 use crate::catalog::{Catalog, CatalogFailureCode, CatalogObject, CatalogProposal, FormatEpoch};
 use crate::data_protection::DataProtection;
-use crate::{CatalogSnapshot, IngestTime, RetentionTimeAuthority, TransactionId};
+use crate::{CatalogSnapshot, IngestTime, TransactionId};
 
 use super::{FORMAT_EPOCH, LedgerFailure, LedgerFailureCode, SegmentScope, map_frame_failure};
 
@@ -31,7 +31,7 @@ pub(super) fn recover(
 pub(super) fn publish(
     catalog: &Catalog<'_>,
     basis: &CatalogSnapshot,
-    lifecycle_clock: &RetentionTimeAuthority,
+    lifecycle_clock: &crate::retention_time::StagedCatalogAnchor<'_>,
     scope: SegmentScope,
     frontier: IngestTime,
 ) -> Result<(), LedgerFailure> {

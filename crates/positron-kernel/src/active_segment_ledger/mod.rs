@@ -204,7 +204,7 @@ pub struct RetentionEvaluation<'ledger, 'kernel, 'catalog> {
     frontier: crate::IngestTime,
     cutoff: positron_domain::time::UnixNanoseconds,
     blocks: Vec<CommittedBlock>,
-    clock_checkpoint: crate::retention_time::LifecycleAnchorCheckpoint,
+    clock_anchor: crate::retention_time::StagedCatalogAnchor<'ledger>,
 }
 
 impl<'ledger, 'kernel, 'catalog> RetentionEvaluation<'ledger, 'kernel, 'catalog> {
@@ -557,10 +557,10 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         if !retention_time.is_destructive_authority() {
             return Err(LedgerFailure::new(LedgerFailureCode::UnsupportedFormat));
         }
-        let clock_checkpoint = retention_time
-            .prepare_catalog_anchor()
+        let mut clock_anchor = retention_time
+            .stage_catalog_anchor()
             .map_err(map_retention_time_failure)?;
-        let ingest_time = retention_time
+        let ingest_time = clock_anchor
             .ingest_time(self.scope, state.retention_frontier)
             .map_err(map_retention_time_failure)?;
         if state.retention_readiness == RetentionReadiness::EmptyUninitialized {
@@ -569,13 +569,10 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             if let Err(failure) = retention_frontier::publish(
                 self.catalog,
                 &basis,
-                retention_time,
+                &clock_anchor,
                 self.scope,
                 ingest_time,
             ) {
-                retention_time
-                    .abandon_catalog_anchor(clock_checkpoint)
-                    .map_err(map_retention_time_failure)?;
                 if failure.completion_state() != LedgerCompletionState::RejectedBeforeMutation {
                     state.poisoned = true;
                 }
@@ -583,6 +580,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             }
             state.retention_frontier = Some(ingest_time);
             state.retention_readiness = RetentionReadiness::TrustedPersisted;
+            clock_anchor.commit();
         }
         Ok(StoreBlockPreparation {
             scope: self.scope,
@@ -642,8 +640,8 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         let retention_time = self
             .retention_time
             .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::UnsupportedFormat))?;
-        let clock_checkpoint = retention_time
-            .prepare_catalog_anchor()
+        let mut clock_anchor = retention_time
+            .stage_catalog_anchor()
             .map_err(map_retention_time_failure)?;
         self.catalog.refresh_state()?;
         let basis = self.catalog.pin()?;
@@ -689,7 +687,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         {
             return Err(LedgerFailure::new(LedgerFailureCode::PhysicalScopeMismatch));
         }
-        let frontier = retention_time
+        let frontier = clock_anchor
             .destructive_ingest_time(self.scope, state.retention_frontier)
             .map_err(map_retention_time_failure)?;
         let duration_nanos = policy
@@ -714,7 +712,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             frontier,
             cutoff,
             blocks,
-            clock_checkpoint,
+            clock_anchor,
         })
     }
 

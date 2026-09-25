@@ -55,7 +55,7 @@ pub(super) fn publish_segments_with_frontier(
     catalog: &Catalog<'_>,
     basis: &crate::CatalogSnapshot,
     storage: &LedgerStorage,
-    lifecycle_clock: &crate::RetentionTimeAuthority,
+    lifecycle_clock: &crate::retention_time::StagedCatalogAnchor<'_>,
     scope: SegmentScope,
     metadata: &[SegmentMetadata],
     frontier: IngestTime,
@@ -79,7 +79,7 @@ fn publish_scope(
     scope: SegmentScope,
     metadata: &[SegmentMetadata],
     frontier: Option<IngestTime>,
-    lifecycle_clock: Option<&crate::RetentionTimeAuthority>,
+    lifecycle_clock: Option<&crate::retention_time::StagedCatalogAnchor<'_>>,
     exact_scope: bool,
 ) -> Result<crate::CatalogSnapshot, LedgerFailure> {
     let mut objects = Vec::new();
