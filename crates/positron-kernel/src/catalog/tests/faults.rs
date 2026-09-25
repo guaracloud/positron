@@ -2,7 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use positron_kernel::{MountQualification, PrimaryDataVolume};
+use positron_kernel::{MountQualification, PrimaryDataVolume, RecoveryWorkClaim, RecoveryWorkKind};
 
 use super::super::storage::fault::CatalogFileEvent;
 use super::super::storage::{with_catalog_fault, with_catalog_fault_after};
@@ -13,7 +13,7 @@ use super::super::{
 };
 #[cfg(feature = "test-support")]
 use super::super::{GovernanceFixtureObject, GovernanceFixtureTarget};
-use super::support::establish_catalog_authority;
+use super::support::{establish_catalog_authority, establish_catalog_authority_with_repair_memory};
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
 
@@ -92,6 +92,26 @@ fn id(last: u8) -> [u8; 16] {
 
 fn secret() -> CatalogSecret {
     CatalogSecret::from_owned(Box::new([0xd1; 32]), Box::new([0xe1; 32]))
+}
+
+#[test]
+fn catalog_open_is_refused_while_a_same_authority_repair_claim_is_held_then_recovers()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = TemporaryRoot::new()?;
+    let instance = InstanceId::new(id(1))?;
+    let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
+    let authority = establish_catalog_authority_with_repair_memory(volume, 90_000_000)?;
+    let claim = RecoveryWorkClaim::system(
+        RecoveryWorkKind::Repair,
+        super::super::recovery_resource_claim(),
+    )?;
+    let reservation = authority.recovery().reserve(claim)?;
+    let failure = Catalog::open(&authority, instance, secret())
+        .expect_err("one 70 MB repair claim must exclude a second claim from a 90 MB pool");
+    assert_eq!(failure.code(), CatalogFailureCode::ResourceAdmissionRefused);
+    drop(reservation);
+    drop(Catalog::open(&authority, instance, secret())?);
+    Ok(())
 }
 
 fn rotating_secret(

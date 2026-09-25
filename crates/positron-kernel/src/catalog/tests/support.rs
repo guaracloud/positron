@@ -9,9 +9,26 @@ use positron_domain::identity::TenantId;
 pub(super) fn establish_catalog_authority(
     volume: OwnedPrimaryDataVolume,
 ) -> Result<StorageKernelResourceAuthority, Box<dyn std::error::Error>> {
+    establish_catalog_authority_with_repair_memory(volume, 70_000_001)
+}
+
+pub(super) fn establish_catalog_authority_with_repair_memory(
+    volume: OwnedPrimaryDataVolume,
+    repair_memory_bytes: u64,
+) -> Result<StorageKernelResourceAuthority, Box<dyn std::error::Error>> {
     let cardinality = InventoryCardinalityLimits::new(1, 16)?;
     let large = ResourceAmounts::new([
-        70_000_001, 2, 2, 70_000_001, 65_541, 2, 2, 2, 2, 9, 20_000_001,
+        repair_memory_bytes,
+        2,
+        2,
+        repair_memory_bytes,
+        65_541,
+        2,
+        2,
+        2,
+        2,
+        9,
+        20_000_001,
     ]);
     let small = uniform(1);
     let dual = uniform(2);

@@ -145,7 +145,7 @@ pub(super) fn wait_for_configuration_status(
 }
 
 #[cfg(unix)]
-fn configuration_status(
+pub(super) fn configuration_status(
     port: u16,
     authorization: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {

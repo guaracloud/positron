@@ -11,7 +11,7 @@ use std::fs;
 #[cfg(unix)]
 use std::process::Stdio;
 #[cfg(unix)]
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[cfg(unix)]
 use std::{io::Read, io::Write, net::TcpStream};
 
@@ -201,26 +201,28 @@ fn sighup_reloads_a_valid_candidate_and_keeps_serving_after_a_rejected_candidate
             "\"drift_disposition\":\"reconcile\"",
         ],
     )?;
-    let pending_generation = status_value(&pending_status, "observed_generation")?;
-    assert_ne!(
-        status_value(&pending_status, "effective_digest")?,
-        status_value(&pending_status, "desired_digest")?
-    );
+    let pending = ConfigurationStatus::from_response(&pending_status)?;
+    assert_eq!(pending.phase, "serving");
+    assert!(pending.pending_restart);
+    assert_eq!(pending.drift_disposition, "reconcile");
+    assert_ne!(pending.effective_digest, pending.desired_digest);
 
     fs::write(&config_path, &base_configuration)?;
-    assert!(
-        Command::new("/bin/kill")
+    let mut send_reload = || -> Result<(), Box<dyn std::error::Error>> {
+        let status = Command::new("/bin/kill")
             .args(["-HUP", &child.id().to_string()])
-            .status()?
+            .status()?;
+        status
             .success()
-    );
-    let restored_status = match wait_for_configuration_status(
-        operations_port,
+            .then_some(())
+            .ok_or_else(|| format!("reload signal failed with {status}").into())
+    };
+    let restored_status = match restore_configuration_with_at_most_one_retry(
+        &pending,
+        &mut send_reload,
+        || configuration_status(operations_port, &authorization),
         &authorization,
-        &[
-            "\"pending_restart\":false",
-            "\"drift_disposition\":\"none\"",
-        ],
+        CONFIGURATION_RESTORE_PROBE_TIMEOUT,
     ) {
         Ok(status) => status,
         Err(error) => {
@@ -231,14 +233,9 @@ fn sighup_reloads_a_valid_candidate_and_keeps_serving_after_a_rejected_candidate
             .into());
         },
     };
-    assert_eq!(
-        status_value(&restored_status, "observed_generation")?,
-        pending_generation
-    );
-    assert_eq!(
-        status_value(&restored_status, "effective_digest")?,
-        status_value(&restored_status, "desired_digest")?
-    );
+    let restored = ConfigurationStatus::from_response(&restored_status)?;
+    assert_eq!(restored.observed_generation, pending.observed_generation);
+    assert!(restored.is_restored());
 
     fs::write(
         &config_path,
@@ -284,6 +281,243 @@ fn status_value<'response>(
         .next()
         .map(|value| value.trim_matches('"'))
         .ok_or_else(|| format!("status field {field} missing value").into())
+}
+
+#[cfg(unix)]
+const CONFIGURATION_RESTORE_PROBE_TIMEOUT: Duration = Duration::from_millis(2_500);
+
+#[cfg(unix)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ConfigurationStatus {
+    phase: String,
+    observed_generation: String,
+    effective_digest: String,
+    desired_digest: String,
+    drift_disposition: String,
+    pending_restart: bool,
+}
+
+#[cfg(unix)]
+impl ConfigurationStatus {
+    fn from_response(response: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        if !response.starts_with("HTTP/1.1 200 ") {
+            return Err("configuration status did not return HTTP 200".into());
+        }
+        let pending_restart = match status_value(response, "pending_restart")? {
+            "true" => true,
+            "false" => false,
+            value => {
+                return Err(format!("configuration pending_restart was invalid: {value}").into());
+            },
+        };
+        Ok(Self {
+            phase: status_value(response, "phase")?.to_owned(),
+            observed_generation: status_value(response, "observed_generation")?.to_owned(),
+            effective_digest: status_value(response, "effective_digest")?.to_owned(),
+            desired_digest: status_value(response, "desired_digest")?.to_owned(),
+            drift_disposition: status_value(response, "drift_disposition")?.to_owned(),
+            pending_restart,
+        })
+    }
+
+    fn is_restored(&self) -> bool {
+        self.phase == "serving"
+            && !self.pending_restart
+            && self.drift_disposition == "none"
+            && self.effective_digest == self.desired_digest
+    }
+
+    fn is_unchanged_pending_reconciliation_of(&self, pending: &Self) -> bool {
+        self.phase == "serving"
+            && self.pending_restart
+            && self.drift_disposition == "reconcile"
+            && self.effective_digest == pending.effective_digest
+            && self.desired_digest == pending.desired_digest
+    }
+}
+
+#[cfg(unix)]
+fn restore_configuration_with_at_most_one_retry(
+    pending: &ConfigurationStatus,
+    send_reload: &mut impl FnMut() -> Result<(), Box<dyn std::error::Error>>,
+    mut observe: impl FnMut() -> Result<String, Box<dyn std::error::Error>>,
+    authorization: &str,
+    probe_timeout: Duration,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + probe_timeout;
+    send_reload()?;
+    let mut second_reload_sent = false;
+
+    loop {
+        let last_observation = match observe() {
+            Ok(response) => match ConfigurationStatus::from_response(&response) {
+                Ok(status) if status.is_restored() => return Ok(response),
+                Ok(status)
+                    if !second_reload_sent
+                        && status.is_unchanged_pending_reconciliation_of(pending) =>
+                {
+                    second_reload_sent = true;
+                    send_reload()?;
+                    "unchanged_pending_reconciliation".to_owned()
+                },
+                Ok(status) => {
+                    format!(
+                        "phase={} pending_restart={} drift_disposition={} effective_digest={} desired_digest={}",
+                        status.phase,
+                        status.pending_restart,
+                        status.drift_disposition,
+                        status.effective_digest,
+                        status.desired_digest,
+                    )
+                },
+                Err(error) => {
+                    format!(
+                        "parse={error} response={:?}",
+                        bounded_redacted_observation(&response, authorization)
+                    )
+                },
+            },
+            Err(error) => format!("request={error}"),
+        };
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "configuration did not restore within the original bounded reload probe: {}",
+                last_observation
+            )
+            .into());
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn configuration_restore_probe_accepts_immediate_serving_convergence()
+-> Result<(), Box<dyn std::error::Error>> {
+    let pending = ConfigurationStatus::from_response(&configuration_status_response(
+        "serving",
+        "12",
+        "old",
+        "new",
+        "reconcile",
+        true,
+    )?)?;
+    let restored = configuration_status_response("serving", "12", "base", "base", "none", false)?;
+    let mut signals = 0;
+    let response = restore_configuration_with_at_most_one_retry(
+        &pending,
+        &mut || {
+            signals += 1;
+            Ok(())
+        },
+        || Ok(restored.clone()),
+        "Bearer test-token",
+        Duration::ZERO,
+    )?;
+    assert_eq!(signals, 1);
+    assert_eq!(
+        ConfigurationStatus::from_response(&response)?.observed_generation,
+        "12"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn configuration_restore_probe_retries_once_for_unchanged_pending_reconciliation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let pending_response =
+        configuration_status_response("serving", "12", "old", "new", "reconcile", true)?;
+    let pending = ConfigurationStatus::from_response(&pending_response)?;
+    let restored = configuration_status_response("serving", "12", "base", "base", "none", false)?;
+    let mut observations = [pending_response, restored].into_iter();
+    let mut signals = 0;
+    let response = restore_configuration_with_at_most_one_retry(
+        &pending,
+        &mut || {
+            signals += 1;
+            Ok(())
+        },
+        || {
+            observations
+                .next()
+                .ok_or_else(|| "configuration status observations exhausted".into())
+        },
+        "Bearer test-token",
+        Duration::from_secs(1),
+    )?;
+    assert_eq!(signals, 2);
+    assert!(ConfigurationStatus::from_response(&response)?.is_restored());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn configuration_restore_probe_never_retries_a_changed_pending_status()
+-> Result<(), Box<dyn std::error::Error>> {
+    let pending = ConfigurationStatus::from_response(&configuration_status_response(
+        "serving",
+        "12",
+        "old",
+        "new",
+        "reconcile",
+        true,
+    )?)?;
+    let changed =
+        configuration_status_response("serving", "12", "old", "other", "reconcile", true)?;
+    let mut signals = 0;
+    let error = restore_configuration_with_at_most_one_retry(
+        &pending,
+        &mut || {
+            signals += 1;
+            Ok(())
+        },
+        || Ok(changed.clone()),
+        "Bearer test-token",
+        Duration::ZERO,
+    )
+    .expect_err("a changed pending status must not trigger a second reload");
+    assert_eq!(signals, 1);
+    assert!(error.to_string().contains("original bounded reload probe"));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn configuration_restore_probe_never_sends_a_third_reload_for_unresolved_pending_status()
+-> Result<(), Box<dyn std::error::Error>> {
+    let pending_response =
+        configuration_status_response("serving", "12", "old", "new", "reconcile", true)?;
+    let pending = ConfigurationStatus::from_response(&pending_response)?;
+    let mut signals = 0;
+    let error = restore_configuration_with_at_most_one_retry(
+        &pending,
+        &mut || {
+            signals += 1;
+            Ok(())
+        },
+        || Ok(pending_response.clone()),
+        "Bearer test-token",
+        Duration::ZERO,
+    )
+    .expect_err("an unresolved pending status must fail after the single permitted retry");
+    assert_eq!(signals, 2);
+    assert!(error.to_string().contains("original bounded reload probe"));
+    Ok(())
+}
+
+#[cfg(unix)]
+fn configuration_status_response(
+    phase: &str,
+    generation: &str,
+    effective_digest: &str,
+    desired_digest: &str,
+    disposition: &str,
+    pending_restart: bool,
+) -> Result<String, Box<dyn std::error::Error>> {
+    Ok(format!(
+        "HTTP/1.1 200 OK\r\n\r\n{{\"phase\":\"{phase}\",\"observed_generation\":{generation},\"effective_digest\":\"{effective_digest}\",\"desired_digest\":\"{desired_digest}\",\"drift_disposition\":\"{disposition}\",\"pending_restart\":{pending_restart}}}"
+    ))
 }
 
 #[cfg(unix)]
