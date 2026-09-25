@@ -331,6 +331,7 @@ impl ConfigurationStatus {
         self.phase == "serving"
             && self.pending_restart
             && self.drift_disposition == "reconcile"
+            && self.observed_generation == pending.observed_generation
             && self.effective_digest == pending.effective_digest
             && self.desired_digest == pending.desired_digest
     }
@@ -477,6 +478,36 @@ fn configuration_restore_probe_never_retries_a_changed_pending_status()
         Duration::ZERO,
     )
     .expect_err("a changed pending status must not trigger a second reload");
+    assert_eq!(signals, 1);
+    assert!(error.to_string().contains("original bounded reload probe"));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn configuration_restore_probe_never_retries_a_generation_changed_pending_status()
+-> Result<(), Box<dyn std::error::Error>> {
+    let pending = ConfigurationStatus::from_response(&configuration_status_response(
+        "serving",
+        "12",
+        "old",
+        "new",
+        "reconcile",
+        true,
+    )?)?;
+    let changed = configuration_status_response("serving", "13", "old", "new", "reconcile", true)?;
+    let mut signals = 0;
+    let error = restore_configuration_with_at_most_one_retry(
+        &pending,
+        &mut || {
+            signals += 1;
+            Ok(())
+        },
+        || Ok(changed.clone()),
+        "Bearer test-token",
+        Duration::ZERO,
+    )
+    .expect_err("a changed generation must not trigger a second reload");
     assert_eq!(signals, 1);
     assert!(error.to_string().contains("original bounded reload probe"));
     Ok(())
