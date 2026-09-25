@@ -31,9 +31,9 @@ pub use instance_bootstrap::{
     InitializationPlan, InitializedInstance, InstanceBootstrap, TenantRetentionImpactPreview,
 };
 pub use listener::{
-    BoundEndpoint, BoundListener, ListenerFactory, ListenerFailure, ListenerGeneration,
-    ListenerGenerationActivation, ListenerGenerationFactory, ListenerProfile, ListenerRequest,
-    ListenerRole, ListenerTransport, ValidatedListenerSet,
+    BoundEndpoint, BoundListener, ConnectionProtection, ListenerFactory, ListenerFailure,
+    ListenerGeneration, ListenerGenerationActivation, ListenerGenerationFactory, ListenerProfile,
+    ListenerRequest, ListenerRole, ListenerTransport, ValidatedListenerSet,
 };
 pub use native_host::{
     ApiTransportProfile, NativeBindings, NativeHost, NativeHostFailure, ProxyTrustFailure,

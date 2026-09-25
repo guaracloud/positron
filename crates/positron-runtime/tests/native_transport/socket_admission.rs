@@ -120,6 +120,190 @@ async fn failed_api_tls_handshake_releases_its_accepted_socket_permit()
     Ok(())
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn api_tls_handshake_cap_refuses_a_second_pending_handshake_and_releases_after_deadline()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _guard = live_async_test_guard().await;
+    let roots = TestRoots::new("api-tls-handshake-cap")?;
+    let document = format!(
+        "{}api_tls_handshake_limit = 1\napi_tls_handshake_deadline_seconds = 1\n",
+        listener_document(&roots, "tls", 2, 2, 128, 16),
+    );
+    let effective = effective_configuration(&document)?;
+    let paths = roots.paths()?;
+    let host = NativeHost::new(NativeBindings::from_effective(&effective)?);
+    let process = ApplicationRuntime::start(
+        ServeConfiguration::new(paths, InitializationMode::InitializeIfEmpty)
+            .with_effective_configuration(effective),
+        HostInputs::new(&host, &host),
+    )?;
+    let api = address(&process.bound_endpoints(), ListenerRole::Api)?;
+
+    let holder = connect_from(Ipv4Addr::LOCALHOST, api).await?;
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert_closed(connect_from(Ipv4Addr::LOCALHOST, api).await?).await?;
+
+    tokio::time::sleep(Duration::from_secs(1) + Duration::from_millis(100)).await;
+    drop(holder);
+    let accepted = wait_for_tls_response(api, &fixture("api-test-cert.pem"))?;
+    assert_status(accepted, 405);
+    assert_eq!(
+        process.shutdown(ShutdownTrigger::FirstSignal),
+        positron_runtime::ExitOutcome::Graceful
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn api_header_deadline_is_absolute_despite_trickled_bytes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _guard = live_async_test_guard().await;
+    let roots = TestRoots::new("api-absolute-header-deadline")?;
+    let document = format!(
+        "{}api_header_deadline_seconds = 1\n",
+        listener_document(&roots, "plaintext", 2, 2, 128, 16),
+    );
+    let effective = effective_configuration(&document)?;
+    let paths = roots.paths()?;
+    let host = NativeHost::new(NativeBindings::from_effective(&effective)?);
+    let process = ApplicationRuntime::start(
+        ServeConfiguration::new(paths, InitializationMode::InitializeIfEmpty)
+            .with_effective_configuration(effective),
+        HostInputs::new(&host, &host),
+    )?;
+    let api = address(&process.bound_endpoints(), ListenerRole::Api)?;
+
+    let mut client = connect_from(Ipv4Addr::LOCALHOST, api).await?;
+    for bytes in [
+        b"GET ".as_slice(),
+        b"/v1/capabilities:negotiate ",
+        b"HTTP/1.1\r\n",
+    ] {
+        client.write_all(bytes).await?;
+        tokio::time::sleep(Duration::from_millis(450)).await;
+    }
+    assert_closed(client).await?;
+    assert_eq!(
+        process.shutdown(ShutdownTrigger::FirstSignal),
+        positron_runtime::ExitOutcome::Graceful
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn api_body_deadline_is_absolute_despite_trickled_bytes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _guard = live_async_test_guard().await;
+    let roots = TestRoots::new("api-absolute-body-deadline")?;
+    let document = format!(
+        "{}api_body_deadline_seconds = 1\napi_request_deadline_seconds = 5\n",
+        listener_document(&roots, "plaintext", 2, 2, 128, 16),
+    );
+    let effective = effective_configuration(&document)?;
+    let paths = roots.paths()?;
+    let host = NativeHost::new(NativeBindings::from_effective(&effective)?);
+    let process = ApplicationRuntime::start(
+        ServeConfiguration::new(paths, InitializationMode::InitializeIfEmpty)
+            .with_effective_configuration(effective),
+        HostInputs::new(&host, &host),
+    )?;
+    let api = address(&process.bound_endpoints(), ListenerRole::Api)?;
+
+    let mut client = connect_from(Ipv4Addr::LOCALHOST, api).await?;
+    client
+        .write_all(
+            b"POST /v1/capabilities:negotiate HTTP/1.1\r\nHost: localhost\r\nContent-Length: 3\r\n\r\n",
+        )
+        .await?;
+    for byte in [b'a', b'b', b'c'] {
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        client.write_all(&[byte]).await?;
+    }
+    assert_status(read_response(&mut client).await?, 408);
+    assert_eq!(
+        process.shutdown(ShutdownTrigger::FirstSignal),
+        positron_runtime::ExitOutcome::Graceful
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn api_request_deadline_bounds_a_slow_request_even_when_its_body_phase_allows_longer()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _guard = live_async_test_guard().await;
+    let roots = TestRoots::new("api-absolute-request-deadline")?;
+    let document = format!(
+        "{}api_body_deadline_seconds = 5\napi_request_deadline_seconds = 1\n",
+        listener_document(&roots, "plaintext", 2, 2, 128, 16),
+    );
+    let effective = effective_configuration(&document)?;
+    let paths = roots.paths()?;
+    let host = NativeHost::new(NativeBindings::from_effective(&effective)?);
+    let process = ApplicationRuntime::start(
+        ServeConfiguration::new(paths, InitializationMode::InitializeIfEmpty)
+            .with_effective_configuration(effective),
+        HostInputs::new(&host, &host),
+    )?;
+    let api = address(&process.bound_endpoints(), ListenerRole::Api)?;
+
+    let mut client = connect_from(Ipv4Addr::LOCALHOST, api).await?;
+    client
+        .write_all(
+            b"POST /v1/capabilities:negotiate HTTP/1.1\r\nHost: localhost\r\nContent-Length: 3\r\n\r\n",
+        )
+        .await?;
+    for byte in [b'a', b'b', b'c'] {
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        client.write_all(&[byte]).await?;
+    }
+    assert_status(read_response(&mut client).await?, 408);
+    assert_eq!(
+        process.shutdown(ShutdownTrigger::FirstSignal),
+        positron_runtime::ExitOutcome::Graceful
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn api_idle_deadline_allows_active_traffic_but_closes_an_idle_connection()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _guard = live_async_test_guard().await;
+    let roots = TestRoots::new("api-idle-deadline")?;
+    let document = format!(
+        "{}api_header_deadline_seconds = 3\napi_idle_deadline_seconds = 1\n",
+        listener_document(&roots, "plaintext", 2, 2, 128, 16),
+    );
+    let effective = effective_configuration(&document)?;
+    let paths = roots.paths()?;
+    let host = NativeHost::new(NativeBindings::from_effective(&effective)?);
+    let process = ApplicationRuntime::start(
+        ServeConfiguration::new(paths, InitializationMode::InitializeIfEmpty)
+            .with_effective_configuration(effective),
+        HostInputs::new(&host, &host),
+    )?;
+    let api = address(&process.bound_endpoints(), ListenerRole::Api)?;
+
+    let mut active = connect_from(Ipv4Addr::LOCALHOST, api).await?;
+    for bytes in [
+        b"GET ".as_slice(),
+        b"/v1/capabilities:negotiate ",
+        b"HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    ] {
+        active.write_all(bytes).await?;
+        tokio::time::sleep(Duration::from_millis(450)).await;
+    }
+    assert_status(read_response(&mut active).await?, 405);
+
+    let idle = connect_from(Ipv4Addr::LOCALHOST, api).await?;
+    tokio::time::sleep(Duration::from_secs(1) + Duration::from_millis(100)).await;
+    assert_closed(idle).await?;
+    assert_eq!(
+        process.shutdown(ShutdownTrigger::FirstSignal),
+        positron_runtime::ExitOutcome::Graceful
+    );
+    Ok(())
+}
+
 #[test]
 fn old_api_generation_keeps_its_lease_until_the_held_socket_releases_drain()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -243,6 +427,13 @@ async fn assert_closed(mut stream: TcpStream) -> Result<(), Box<dyn std::error::
         Ok(read) => Err(format!("admission-refused socket produced {read} response bytes").into()),
         Err(error) => Err(error.into()),
     }
+}
+
+async fn read_response(client: &mut TcpStream) -> Result<String, Box<dyn std::error::Error>> {
+    let mut response = vec![0; 1024];
+    let length = tokio::time::timeout(Duration::from_secs(2), client.read(&mut response)).await??;
+    response.truncate(length);
+    String::from_utf8(response).map_err(Into::into)
 }
 
 async fn request_from(

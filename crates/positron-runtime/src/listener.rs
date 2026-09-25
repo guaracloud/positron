@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::{HealthState, RunningTask, ServiceHandle, TaskCancellation, TaskRole};
 use positron_config::EffectiveConfiguration;
@@ -88,7 +89,65 @@ pub enum ListenerProfile {
         transport: ListenerTransport,
         global_accepted_socket_limit: NonZeroU16,
         per_address_accepted_socket_limit: NonZeroU16,
+        connection_protection: ConnectionProtection,
     },
+}
+
+/// Bounded pre-authentication TLS and request timing for one listener role.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConnectionProtection {
+    tls_handshake_limit: NonZeroU16,
+    tls_handshake_deadline: Duration,
+    header_deadline: Duration,
+    body_deadline: Duration,
+    request_deadline: Duration,
+    idle_deadline: Duration,
+}
+
+impl ConnectionProtection {
+    #[must_use]
+    pub const fn new(
+        tls_handshake_limit: NonZeroU16,
+        tls_handshake_deadline: Duration,
+        header_deadline: Duration,
+        body_deadline: Duration,
+        request_deadline: Duration,
+        idle_deadline: Duration,
+    ) -> Self {
+        Self {
+            tls_handshake_limit,
+            tls_handshake_deadline,
+            header_deadline,
+            body_deadline,
+            request_deadline,
+            idle_deadline,
+        }
+    }
+
+    #[must_use]
+    pub const fn tls_handshake_limit(self) -> NonZeroU16 {
+        self.tls_handshake_limit
+    }
+    #[must_use]
+    pub const fn tls_handshake_deadline(self) -> Duration {
+        self.tls_handshake_deadline
+    }
+    #[must_use]
+    pub const fn header_deadline(self) -> Duration {
+        self.header_deadline
+    }
+    #[must_use]
+    pub const fn body_deadline(self) -> Duration {
+        self.body_deadline
+    }
+    #[must_use]
+    pub const fn request_deadline(self) -> Duration {
+        self.request_deadline
+    }
+    #[must_use]
+    pub const fn idle_deadline(self) -> Duration {
+        self.idle_deadline
+    }
 }
 
 impl ListenerProfile {
@@ -118,6 +177,24 @@ impl ListenerProfile {
         global_accepted_socket_limit: NonZeroU16,
         per_address_accepted_socket_limit: NonZeroU16,
     ) -> Result<Self, ListenerFailure> {
+        Self::network_with_admission_and_protection(
+            role,
+            address,
+            transport,
+            global_accepted_socket_limit,
+            per_address_accepted_socket_limit,
+            default_connection_protection(),
+        )
+    }
+
+    pub fn network_with_admission_and_protection(
+        role: ListenerRole,
+        address: SocketAddr,
+        transport: ListenerTransport,
+        global_accepted_socket_limit: NonZeroU16,
+        per_address_accepted_socket_limit: NonZeroU16,
+        connection_protection: ConnectionProtection,
+    ) -> Result<Self, ListenerFailure> {
         if !role.is_network() {
             return Err(ListenerFailure::InvalidEndpoint);
         }
@@ -130,6 +207,7 @@ impl ListenerProfile {
             transport,
             global_accepted_socket_limit,
             per_address_accepted_socket_limit,
+            connection_protection,
         })
     }
 
@@ -168,6 +246,28 @@ impl ListenerProfile {
     pub const fn has_plaintext_opt_out(&self) -> bool {
         matches!(self.transport(), Some(ListenerTransport::PlaintextOptOut))
     }
+
+    #[must_use]
+    pub const fn connection_protection(&self) -> Option<ConnectionProtection> {
+        match self {
+            Self::Control { .. } => None,
+            Self::Network {
+                connection_protection,
+                ..
+            } => Some(*connection_protection),
+        }
+    }
+}
+
+const fn default_connection_protection() -> ConnectionProtection {
+    ConnectionProtection::new(
+        NonZeroU16::new(16).expect("nonzero TLS handshake default"),
+        Duration::from_secs(2),
+        Duration::from_secs(2),
+        Duration::from_secs(2),
+        Duration::from_secs(30),
+        Duration::from_secs(30),
+    )
 }
 
 /// A complete listener candidate. Constructing it proves every Release 1 role

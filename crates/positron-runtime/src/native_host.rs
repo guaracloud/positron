@@ -20,10 +20,10 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 
 use crate::{
-    BoundEndpoint, BoundListener, HealthState, ListenerFactory, ListenerFailure,
-    ListenerGeneration, ListenerGenerationFactory, ListenerProfile, ListenerRequest, ListenerRole,
-    RegisteredTask, RunningTask, ServiceHandle, TaskCancellation, TaskFailure, TaskJoinOutcome,
-    TaskRegistrar, TaskRole, ValidatedListenerSet,
+    BoundEndpoint, BoundListener, ConnectionProtection, HealthState, ListenerFactory,
+    ListenerFailure, ListenerGeneration, ListenerGenerationFactory, ListenerProfile,
+    ListenerRequest, ListenerRole, RegisteredTask, RunningTask, ServiceHandle, TaskCancellation,
+    TaskFailure, TaskJoinOutcome, TaskRegistrar, TaskRole, ValidatedListenerSet,
 };
 
 mod api_http;
@@ -92,6 +92,11 @@ pub struct NativeBindings {
     otlp_grpc_admission: (NonZeroU16, NonZeroU16),
     otlp_http_admission: (NonZeroU16, NonZeroU16),
     loki_push_admission: (NonZeroU16, NonZeroU16),
+    operations_protection: ConnectionProtection,
+    api_protection: ConnectionProtection,
+    otlp_grpc_protection: ConnectionProtection,
+    otlp_http_protection: ConnectionProtection,
+    loki_push_protection: ConnectionProtection,
     operations_trusted_proxy: Option<TrustedProxy>,
     api_trusted_proxy: Option<TrustedProxy>,
     otlp_grpc_trusted_proxy: Option<TrustedProxy>,
@@ -132,6 +137,11 @@ impl NativeBindings {
         bindings.otlp_grpc_admission = otlp_grpc.3;
         bindings.otlp_http_admission = otlp_http.3;
         bindings.loki_push_admission = loki_push.3;
+        bindings.operations_protection = operations.4;
+        bindings.api_protection = api.4;
+        bindings.otlp_grpc_protection = otlp_grpc.4;
+        bindings.otlp_http_protection = otlp_http.4;
+        bindings.loki_push_protection = loki_push.4;
         Ok(bindings)
     }
 
@@ -257,6 +267,11 @@ impl NativeBindings {
             otlp_grpc_admission: default_admission_limits(),
             otlp_http_admission: default_admission_limits(),
             loki_push_admission: default_admission_limits(),
+            operations_protection: default_connection_protection(),
+            api_protection: default_connection_protection(),
+            otlp_grpc_protection: default_connection_protection(),
+            otlp_http_protection: default_connection_protection(),
+            loki_push_protection: default_connection_protection(),
             operations_trusted_proxy: None,
             api_trusted_proxy: None,
             otlp_grpc_trusted_proxy: None,
@@ -326,6 +341,17 @@ impl NativeBindings {
             ListenerRole::Control => None,
         }
     }
+
+    fn protection(&self, role: ListenerRole) -> Option<ConnectionProtection> {
+        match role {
+            ListenerRole::Operations => Some(self.operations_protection),
+            ListenerRole::Api => Some(self.api_protection),
+            ListenerRole::OtlpGrpc => Some(self.otlp_grpc_protection),
+            ListenerRole::OtlpHttp => Some(self.otlp_http_protection),
+            ListenerRole::LokiPush => Some(self.loki_push_protection),
+            ListenerRole::Control => None,
+        }
+    }
 }
 
 const fn default_admission_limits() -> (NonZeroU16, NonZeroU16) {
@@ -335,11 +361,23 @@ const fn default_admission_limits() -> (NonZeroU16, NonZeroU16) {
     )
 }
 
+fn default_connection_protection() -> ConnectionProtection {
+    ConnectionProtection::new(
+        NonZeroU16::new(16).unwrap_or(NonZeroU16::MIN),
+        Duration::from_secs(2),
+        Duration::from_secs(2),
+        Duration::from_secs(2),
+        Duration::from_secs(30),
+        Duration::from_secs(30),
+    )
+}
+
 type EffectiveNativeProfile = (
     SocketAddr,
     TransportProfile,
     Option<TrustedProxy>,
     (NonZeroU16, NonZeroU16),
+    ConnectionProtection,
 );
 
 fn effective_profile(
@@ -376,6 +414,14 @@ fn effective_profile(
             profile
                 .connection_admission()
                 .per_address_accepted_socket_limit(),
+        ),
+        ConnectionProtection::new(
+            profile.connection_protection().tls_handshake_limit(),
+            profile.connection_protection().tls_handshake_deadline(),
+            profile.connection_protection().header_deadline(),
+            profile.connection_protection().body_deadline(),
+            profile.connection_protection().request_deadline(),
+            profile.connection_protection().idle_deadline(),
         ),
     ))
 }
@@ -466,12 +512,13 @@ impl NativeHost {
                         NativeListener::Unix(_) => None,
                     })?
                 })?;
-        ListenerProfile::network_with_admission(
+        ListenerProfile::network_with_admission_and_protection(
             role,
             active_address,
             configured.bindings.transport(role)?.listener_transport(),
             configured.bindings.admission(role)?.0,
             configured.bindings.admission(role)?.1,
+            configured.bindings.protection(role)?,
         )
         .ok()
     }
@@ -517,6 +564,7 @@ struct Admission {
     transport: Option<TransportProfile>,
     trusted_proxy: Option<TrustedProxy>,
     connection_admission: Option<Arc<connection_admission::ConnectionAdmission>>,
+    connection_protection: Option<ConnectionProtection>,
 }
 
 type AdmissionRegistry = Arc<Mutex<Vec<(ListenerRole, Arc<Admission>)>>>;
@@ -561,6 +609,17 @@ impl Admission {
         })
     }
 
+    pub(super) fn connection_protection(&self) -> ConnectionProtection {
+        self.connection_protection
+            .unwrap_or_else(default_connection_protection)
+    }
+
+    pub(super) fn reserve_tls_handshake(
+        &self,
+    ) -> Option<connection_admission::HandshakeReservation> {
+        self.connection_admission.as_ref()?.reserve_tls_handshake()
+    }
+
     fn drain_within(&self, deadline: Instant) -> bool {
         self.stop();
         while self.accepted_connections.load(Ordering::Acquire) != 0 {
@@ -574,7 +633,7 @@ impl Admission {
 
     pub(super) fn grpc_tls_config(
         &self,
-    ) -> Result<Option<tonic::transport::ServerTlsConfig>, NativeHostFailure> {
+    ) -> Result<Option<Arc<rustls::ServerConfig>>, NativeHostFailure> {
         self.transport
             .as_ref()
             .ok_or(NativeHostFailure::InvalidTlsProfile)?
@@ -661,18 +720,21 @@ impl ListenerFactory for NativeHost {
                     transport,
                     global_accepted_socket_limit,
                     per_address_accepted_socket_limit,
+                    connection_protection,
                 },
                 ListenerProfile::Network {
                     role: expected_role,
                     transport: expected_transport,
                     global_accepted_socket_limit: expected_global_limit,
                     per_address_accepted_socket_limit: expected_per_address_limit,
+                    connection_protection: expected_connection_protection,
                     ..
                 },
             ) if requested_role == expected_role
                 && transport == expected_transport
                 && global_accepted_socket_limit == expected_global_limit
-                && per_address_accepted_socket_limit == expected_per_address_limit =>
+                && per_address_accepted_socket_limit == expected_per_address_limit
+                && connection_protection == expected_connection_protection =>
             {
                 Some(*address)
             },
@@ -767,6 +829,14 @@ impl ListenerFactory for NativeHost {
                 None,
             )
         };
+        let connection_protection = self.bindings.protection(role);
+        let connection_admission = match (self.bindings.admission(role), connection_protection) {
+            (Some((global, per_address)), Some(protection)) => Some(Arc::new(
+                connection_admission::ConnectionAdmission::new(global, per_address, protection),
+            )),
+            (None, None) => None,
+            _ => return Err(ListenerFailure::InvalidEndpoint),
+        };
         let admission = Arc::new(Admission {
             role,
             listener,
@@ -775,12 +845,8 @@ impl ListenerFactory for NativeHost {
             control_path,
             transport: self.bindings.transport(role),
             trusted_proxy: self.bindings.trusted_proxy(role),
-            connection_admission: self.bindings.admission(role).map(|(global, per_address)| {
-                Arc::new(connection_admission::ConnectionAdmission::new(
-                    global,
-                    per_address,
-                ))
-            }),
+            connection_admission,
+            connection_protection,
         });
         self.admissions
             .lock()
@@ -806,7 +872,15 @@ impl ListenerFactory for NativeHost {
         let address = self.bindings.address(role)?;
         let transport = self.bindings.transport(role)?.listener_transport();
         let (global, per_address) = self.bindings.admission(role)?;
-        ListenerProfile::network_with_admission(role, address, transport, global, per_address).ok()
+        ListenerProfile::network_with_admission_and_protection(
+            role,
+            address,
+            transport,
+            global,
+            per_address,
+            self.bindings.protection(role)?,
+        )
+        .ok()
     }
 
     fn generation_factory(&self) -> Option<Arc<dyn ListenerGenerationFactory>> {
@@ -1334,6 +1408,7 @@ mod listener_generation_tests {
             transport: Some(TransportProfile::plaintext_opt_out()),
             trusted_proxy: None,
             connection_admission: None,
+            connection_protection: None,
         });
         let gate = Arc::new(ActivationGate::new());
         let cancellation = crate::TaskCancellation::new();
@@ -1367,6 +1442,7 @@ mod listener_generation_tests {
             transport: Some(TransportProfile::plaintext_opt_out()),
             trusted_proxy: None,
             connection_admission: None,
+            connection_protection: None,
         };
         let cancellation = crate::TaskCancellation::new();
         admission.stop();
@@ -1500,16 +1576,11 @@ fn serve_http(
                 let Some(lease) = admission.accept_connection(peer.ip()) else {
                     continue;
                 };
+                let connection_protection = admission.connection_protection();
                 let stream_configured = if admission.role == ListenerRole::Api {
                     stream.set_nonblocking(true).is_ok()
                 } else {
                     stream.set_nonblocking(false).is_ok()
-                        && stream
-                            .set_read_timeout(Some(Duration::from_secs(2)))
-                            .is_ok()
-                        && stream
-                            .set_write_timeout(Some(Duration::from_secs(2)))
-                            .is_ok()
                 };
                 if !stream_configured {
                     continue;
@@ -1545,20 +1616,36 @@ fn serve_http(
                                     trusted_proxy,
                                     health: connection_health,
                                     services: connection_services,
+                                    protection: connection_protection,
                                 },
                             );
                         } else if let Some(profile) = transport {
                             if profile.is_tls() {
                                 if let Ok(connection) = profile.server_connection() {
                                     let mut tls = rustls::StreamOwned::new(connection, stream);
-                                    let _ = native_http::serve_tls_connection(
-                                        &mut tls,
-                                        role,
-                                        peer,
-                                        trusted_proxy,
-                                        &connection_health,
-                                        connection_services.as_ref(),
-                                    );
+                                    let handshaken = {
+                                        let Some(_handshake) =
+                                            connection_admission.reserve_tls_handshake()
+                                        else {
+                                            return;
+                                        };
+                                        complete_tls_handshake(
+                                            &mut tls,
+                                            connection_protection.tls_handshake_deadline(),
+                                        )
+                                        .is_ok()
+                                    };
+                                    if handshaken {
+                                        let _ = native_http::serve_tls_connection(
+                                            &mut tls,
+                                            role,
+                                            peer,
+                                            trusted_proxy,
+                                            &connection_health,
+                                            connection_services.as_ref(),
+                                            connection_protection,
+                                        );
+                                    }
                                 }
                             } else {
                                 let _ = native_http::serve_connection(
@@ -1568,6 +1655,7 @@ fn serve_http(
                                     trusted_proxy,
                                     &connection_health,
                                     connection_services.as_ref(),
+                                    connection_protection,
                                 );
                             }
                         } else {
@@ -1578,6 +1666,7 @@ fn serve_http(
                                 trusted_proxy,
                                 &connection_health,
                                 connection_services.as_ref(),
+                                connection_protection,
                             );
                         }
                     });
@@ -1601,6 +1690,26 @@ fn serve_http(
         }
     }
     join_http_handlers(&mut handlers, &force)
+}
+
+fn complete_tls_handshake(
+    stream: &mut rustls::StreamOwned<rustls::ServerConnection, TcpStream>,
+    deadline: Duration,
+) -> Result<(), std::io::Error> {
+    let expires = Instant::now() + deadline;
+    while stream.conn.is_handshaking() {
+        let remaining = expires.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "TLS handshake deadline elapsed",
+            ));
+        }
+        stream.sock.set_read_timeout(Some(remaining))?;
+        stream.sock.set_write_timeout(Some(remaining))?;
+        stream.conn.complete_io(&mut stream.sock)?;
+    }
+    Ok(())
 }
 
 struct HttpConnectionHandler {

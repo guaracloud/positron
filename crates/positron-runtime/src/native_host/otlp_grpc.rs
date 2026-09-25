@@ -15,7 +15,8 @@ use opentelemetry_proto::tonic::collector::trace::v1::{
 use positron_governance::{AuthorizedContext, CompatibilityHints};
 use positron_ingest::{IngestRequestOutcome, OtlpGrpcTransportEvidence};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio_stream::Stream;
+use tokio_rustls::TlsAcceptor;
+use tokio_stream::{Stream, StreamExt};
 use tonic::codec::CompressionEncoding;
 use tonic::service::LayerExt;
 use tonic::service::interceptor::InterceptedService;
@@ -24,6 +25,7 @@ use tonic::transport::server::{Connected, TcpConnectInfo};
 use tonic::{Request, Response, Status};
 use tower::util::MapResponseLayer;
 
+use super::api_http::IdleIo;
 use super::otlp_outcome::{OtlpFailure, OtlpSignal};
 use super::{Admission, ConnectionLease, TrustedProxy};
 use crate::{ServiceFailure, ServiceHandle, TaskCancellation};
@@ -45,6 +47,8 @@ pub(super) struct PreparedGrpc {
     runtime: tokio::runtime::Runtime,
     listener: tokio::net::TcpListener,
     server: Server,
+    tls: Option<Arc<rustls::ServerConfig>>,
+    protection: crate::ConnectionProtection,
     services: ServiceHandle,
     blocking: BlockingIngestExecutor,
     blocking_handle: BlockingIngestHandle,
@@ -56,6 +60,7 @@ pub(super) fn prepare(
 ) -> Result<PreparedGrpc, GrpcFailure> {
     let services = services.ok_or(GrpcFailure)?;
     let listener = admission.tcp_listener().map_err(|_| GrpcFailure)?;
+    let protection = admission.connection_protection();
     let tls = admission.grpc_tls_config().map_err(|_| GrpcFailure)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -65,12 +70,7 @@ pub(super) fn prepare(
         let _entered = runtime.enter();
         tokio::net::TcpListener::from_std(listener).map_err(|_| GrpcFailure)?
     };
-    let server = match tls {
-        Some(configuration) => Server::builder()
-            .tls_config(configuration)
-            .map_err(|_| GrpcFailure)?,
-        None => Server::builder(),
-    };
+    let server = Server::builder().timeout(protection.request_deadline());
     let blocking = BlockingIngestExecutor::start()?;
     let blocking_handle = blocking.handle()?;
     Ok(PreparedGrpc {
@@ -78,6 +78,8 @@ pub(super) fn prepare(
         runtime,
         listener,
         server,
+        tls,
+        protection,
         services,
         blocking,
         blocking_handle,
@@ -99,12 +101,20 @@ impl PreparedGrpc {
         let blocking_handle = self.blocking_handle.clone();
         let listener = self.listener;
         let mut server = self.server;
+        let tls = self.tls;
+        let protection = self.protection;
         let (result, forced) = self.runtime.block_on(async move {
+            let handshake_admission = Arc::clone(&admission);
             let incoming = AdmittedIncoming {
                 listener,
                 admission: Arc::clone(&admission),
                 cancellation: cancellation.clone(),
-            };
+            }
+            .then(move |accepted| {
+                let tls = tls.clone();
+                let admission = Arc::clone(&handshake_admission);
+                async move { secure_grpc_connection(accepted, admission, tls, protection).await }
+            });
             let authentication = services.clone();
             let trace_authentication = services.clone();
             let trusted_proxy = admission.trusted_proxy.clone();
@@ -164,6 +174,50 @@ struct AdmittedTcpStream {
     _lease: ConnectionLease,
 }
 
+enum AdmittedIo {
+    Plain(AdmittedTcpStream),
+    Tls {
+        stream: Pin<Box<tokio_rustls::server::TlsStream<AdmittedTcpStream>>>,
+        connection_info: TcpConnectInfo,
+    },
+}
+
+async fn secure_grpc_connection(
+    stream: Result<AdmittedTcpStream, io::Error>,
+    admission: Arc<Admission>,
+    tls: Option<Arc<rustls::ServerConfig>>,
+    protection: crate::ConnectionProtection,
+) -> Result<IdleIo<AdmittedIo>, io::Error> {
+    let stream = stream?;
+    let Some(configuration) = tls else {
+        return Ok(IdleIo::new(
+            AdmittedIo::Plain(stream),
+            protection.idle_deadline(),
+        ));
+    };
+    let connection_info = stream.connect_info();
+    let _handshake = admission.reserve_tls_handshake().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "TLS handshake admission limit reached",
+        )
+    })?;
+    let stream = tokio::time::timeout(
+        protection.tls_handshake_deadline(),
+        TlsAcceptor::from(configuration).accept(stream),
+    )
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TLS handshake deadline elapsed"))?
+    .map_err(io::Error::other)?;
+    Ok(IdleIo::new(
+        AdmittedIo::Tls {
+            stream: Box::pin(stream),
+            connection_info,
+        },
+        protection.idle_deadline(),
+    ))
+}
+
 impl Stream for AdmittedIncoming {
     type Item = Result<AdmittedTcpStream, io::Error>;
 
@@ -204,6 +258,19 @@ impl AsyncRead for AdmittedTcpStream {
     }
 }
 
+impl AsyncRead for AdmittedIo {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_read(context, buffer),
+            Self::Tls { stream, .. } => stream.as_mut().poll_read(context, buffer),
+        }
+    }
+}
+
 impl AsyncWrite for AdmittedTcpStream {
     fn poll_write(
         mut self: Pin<&mut Self>,
@@ -222,11 +289,59 @@ impl AsyncWrite for AdmittedTcpStream {
     }
 }
 
+impl AsyncWrite for AdmittedIo {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_write(context, buffer),
+            Self::Tls { stream, .. } => stream.as_mut().poll_write(context, buffer),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_flush(context),
+            Self::Tls { stream, .. } => stream.as_mut().poll_flush(context),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_shutdown(context),
+            Self::Tls { stream, .. } => stream.as_mut().poll_shutdown(context),
+        }
+    }
+}
+
 impl Connected for AdmittedTcpStream {
     type ConnectInfo = TcpConnectInfo;
 
     fn connect_info(&self) -> Self::ConnectInfo {
         self.stream.as_ref().get_ref().connect_info()
+    }
+}
+
+impl Connected for AdmittedIo {
+    type ConnectInfo = TcpConnectInfo;
+
+    fn connect_info(&self) -> Self::ConnectInfo {
+        match self {
+            Self::Plain(stream) => stream.connect_info(),
+            Self::Tls {
+                connection_info, ..
+            } => connection_info.clone(),
+        }
+    }
+}
+
+impl Connected for IdleIo<AdmittedIo> {
+    type ConnectInfo = TcpConnectInfo;
+
+    fn connect_info(&self) -> Self::ConnectInfo {
+        self.inner().connect_info()
     }
 }
 
@@ -570,6 +685,7 @@ mod admission_tests {
             transport: Some(TransportProfile::plaintext_opt_out()),
             trusted_proxy: None,
             connection_admission: None,
+            connection_protection: None,
         });
         let cancellation = TaskCancellation::new();
         admission.stop();

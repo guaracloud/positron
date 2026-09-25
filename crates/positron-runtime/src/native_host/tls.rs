@@ -8,7 +8,6 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use rustls::server::WebPkiClientVerifier;
 use rustls::{RootCertStore, ServerConfig, ServerConnection};
 use sha2::{Digest, Sha256};
-use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 use zeroize::Zeroizing;
 
 use super::NativeHostFailure;
@@ -66,7 +65,6 @@ pub struct TlsProfile {
 struct LoadedTls {
     server: Arc<ServerConfig>,
     certificate_pem: Vec<u8>,
-    private_key_pem: Zeroizing<Vec<u8>>,
     trust_pem: Option<Vec<u8>>,
 }
 
@@ -108,28 +106,10 @@ impl TlsProfile {
         self.client_trust.is_some()
     }
 
-    pub(super) fn grpc_server_config(&self) -> Result<ServerTlsConfig, TlsFailure> {
-        let mut loaded = self
-            .loaded
-            .lock()
-            .map_err(|_| TlsFailure::LoadUnavailable)?;
-        if loaded.is_none() {
-            *loaded = Some(Arc::new(load_tls(
-                &self.identity,
-                self.client_trust.as_ref(),
-            )?));
-        }
-        let material = loaded.as_ref().ok_or(TlsFailure::LoadUnavailable)?;
-        let configuration = ServerTlsConfig::new().identity(Identity::from_pem(
-            material.certificate_pem.clone(),
-            &material.private_key_pem,
-        ));
-        match material.trust_pem.as_ref() {
-            Some(authority) => {
-                Ok(configuration.client_ca_root(Certificate::from_pem(authority.clone())))
-            },
-            None => Ok(configuration),
-        }
+    pub(super) fn grpc_server_config(&self) -> Result<Arc<ServerConfig>, TlsFailure> {
+        let mut configuration = (*self.load()?).clone();
+        configuration.alpn_protocols = vec![b"h2".to_vec()];
+        Ok(Arc::new(configuration))
     }
 
     pub(super) fn api_http_server_config(&self) -> Result<Arc<ServerConfig>, TlsFailure> {
@@ -260,7 +240,9 @@ impl TransportProfile {
         }
     }
 
-    pub(super) fn grpc_server_config(&self) -> Result<Option<ServerTlsConfig>, NativeHostFailure> {
+    pub(super) fn grpc_server_config(
+        &self,
+    ) -> Result<Option<Arc<ServerConfig>>, NativeHostFailure> {
         match self {
             Self::Tls(profile) => profile
                 .grpc_server_config()
@@ -320,7 +302,6 @@ fn load_tls(
     Ok(LoadedTls {
         server: Arc::new(configuration),
         certificate_pem,
-        private_key_pem,
         trust_pem,
     })
 }

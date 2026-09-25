@@ -145,6 +145,7 @@ impl ReceiverHarness {
             transport: None,
             trusted_proxy: None,
             connection_admission: None,
+            connection_protection: None,
         });
         let cancellation = TaskCancellation::new();
         let serve_cancellation = cancellation.clone();

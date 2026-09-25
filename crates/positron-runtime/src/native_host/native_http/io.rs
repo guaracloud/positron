@@ -455,7 +455,7 @@ pub(in crate::native_host) fn write_response<S: Write>(
 mod tests {
     use std::io::{Cursor, Read, Write};
 
-    use super::super::serve_tls_connection;
+    use super::super::{TimeoutStream, serve_tls_connection};
 
     struct MemoryStream {
         input: Cursor<Vec<u8>>,
@@ -491,6 +491,12 @@ mod tests {
         }
     }
 
+    impl TimeoutStream for MemoryStream {
+        fn set_timeouts(&mut self, _timeout: std::time::Duration) -> Result<(), std::io::Error> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn tls_api_dispatch_reaches_each_existing_authenticated_route() {
         let health = crate::health::ProcessState::starting().health();
@@ -508,6 +514,14 @@ mod tests {
                     None,
                     &health,
                     None,
+                    crate::ConnectionProtection::new(
+                        std::num::NonZeroU16::MIN,
+                        std::time::Duration::from_secs(1),
+                        std::time::Duration::from_secs(1),
+                        std::time::Duration::from_secs(1),
+                        std::time::Duration::from_secs(1),
+                        std::time::Duration::from_secs(1),
+                    ),
                 )
                 .is_ok()
             );
