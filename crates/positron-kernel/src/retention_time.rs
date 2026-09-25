@@ -254,11 +254,6 @@ impl ManualRetentionTime {
             .map(|_| ())
             .map_err(|_| LifecycleClockFailure::OutOfRange)
     }
-
-    #[cfg(fuzzing)]
-    pub(crate) fn nanoseconds(&self) -> u64 {
-        self.0.load(Ordering::Acquire)
-    }
 }
 
 impl RetentionTimeAuthority {
@@ -350,7 +345,7 @@ impl RetentionTimeAuthority {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn establish_with_source_and_manual_elapsed<S: LifecycleClockSource + 'static>(
         source: S,
         policy: LifecycleClockPolicy,
@@ -775,6 +770,83 @@ impl std::fmt::Debug for RetentionTimeAuthority {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("RetentionTimeAuthority { <monotonic> }")
     }
+}
+
+#[cfg(feature = "test-support")]
+/// Exercises the lifecycle-clock state machine and its untrusted durable
+/// anchor decoder without a storage fixture.  The public fuzz target supplies
+/// arbitrary wall movement, elapsed time, and encoded-anchor bytes.
+pub fn fuzz_retention_time_stateful(data: &[u8]) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    struct MutableSource(Arc<AtomicI64>);
+
+    impl LifecycleClockSource for MutableSource {
+        fn read(&self) -> Result<UnixNanoseconds, LifecycleClockFailure> {
+            Ok(UnixNanoseconds::new(self.0.load(Ordering::Acquire)))
+        }
+    }
+
+    let initial = data
+        .get(..8)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(i64::from_be_bytes)
+        .unwrap_or(1_000);
+    let wall = Arc::new(AtomicI64::new(initial));
+    let Ok(policy) = LifecycleClockPolicy::new(10) else {
+        return;
+    };
+    let Ok((clock, elapsed)) = RetentionTimeAuthority::establish_with_source_and_manual_elapsed(
+        MutableSource(Arc::clone(&wall)),
+        policy,
+    ) else {
+        return;
+    };
+    let Ok(tenant) = positron_domain::identity::TenantId::from_bytes([0x71; 16]) else {
+        return;
+    };
+    let Ok(shard) = positron_domain::routing::VirtualShardId::new(71) else {
+        return;
+    };
+    let scope = crate::SegmentScope::new(tenant, positron_domain::routing::SignalKind::Logs, shard);
+    let mut cursor = 8_usize;
+    while let Some(operation) = data.get(cursor).copied() {
+        cursor = cursor.saturating_add(1);
+        match operation % 5 {
+            0 => {
+                if let Some(bytes) = data.get(cursor..cursor.saturating_add(8))
+                    && let Ok(bytes) = <[u8; 8]>::try_from(bytes)
+                {
+                    wall.store(i64::from_be_bytes(bytes), Ordering::Release);
+                    cursor = cursor.saturating_add(8);
+                }
+            },
+            1 => {
+                if let Some(bytes) = data.get(cursor..cursor.saturating_add(8))
+                    && let Ok(bytes) = <[u8; 8]>::try_from(bytes)
+                {
+                    let _ = elapsed.advance(u64::from_be_bytes(bytes));
+                    cursor = cursor.saturating_add(8);
+                }
+            },
+            2 => {
+                let _ = clock.ingest_time(scope, None);
+            },
+            3 => {
+                let _ = clock.destructive_ingest_time(scope, None);
+            },
+            _ => {
+                if let Ok(mut staged) = clock.stage_catalog_anchor() {
+                    let _ = staged.ingest_time(scope, None);
+                }
+            },
+        }
+    }
+    let _ = clock.catalog_anchor_record(IngestTime::from_authenticated_durable(
+        clock.status().safe_anchor(),
+    ));
+    let _ = decode_catalog_anchor(data);
 }
 
 #[cfg(test)]

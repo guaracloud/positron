@@ -132,6 +132,9 @@ pub use lifecycle_clock::{
 #[cfg(feature = "test-support")]
 pub use retention_time::ManualRetentionTime;
 pub use retention_time::RetentionTimeAuthority;
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub use retention_time::fuzz_retention_time_stateful;
 pub use retention_time::{LifecycleClockPolicy, LifecycleClockState, LifecycleClockStatus};
 
 pub use resource_governor::{
