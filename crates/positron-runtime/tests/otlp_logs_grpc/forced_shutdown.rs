@@ -48,20 +48,66 @@ async fn force_stalled_rpc(trigger: ShutdownTrigger) -> Result<(), Box<dyn std::
     drop(response);
     drop(sender);
     connection.abort();
-    match connection.await {
-        Ok(Ok(())) | Err(_) => {},
-        Ok(Err(error)) => return Err(error.into()),
-    }
+    let client_cleanup = match connection.await {
+        Ok(Ok(())) | Err(_) => Ok(()),
+        Ok(Err(error)) => Err(error.into()),
+    };
     let eventual = match bounded {
-        Ok(outcome) => outcome,
-        Err(_) => harness.outcome_within(Duration::from_secs(2))?,
+        Ok(outcome) => Ok(outcome),
+        Err(_) => harness
+            .outcome_within(Duration::from_secs(2))
+            .map_err(Into::into),
     };
 
-    assert!(
+    finish_forced_rpc(
         completed_boundedly,
-        "forced shutdown waited for the stalled RPC beyond its deadline"
-    );
-    assert_eq!(eventual, ExitOutcome::Forced);
-    assert!(harness.finish()?);
-    Ok(())
+        eventual,
+        client_cleanup,
+        harness.finish(),
+    )
+}
+
+fn finish_forced_rpc(
+    completed_boundedly: bool,
+    outcome: Result<ExitOutcome, Box<dyn std::error::Error>>,
+    client_cleanup: Result<(), Box<dyn std::error::Error>>,
+    ownership_released: Result<bool, Box<dyn std::error::Error>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut failures = Vec::new();
+    if !completed_boundedly {
+        failures.push("forced shutdown waited for the stalled RPC beyond its deadline".to_owned());
+    }
+    match outcome {
+        Ok(ExitOutcome::Forced) => {},
+        Ok(outcome) => failures.push(format!("forced shutdown exited as {outcome:?}")),
+        Err(error) => failures.push(format!("forced shutdown did not complete: {error}")),
+    }
+    if let Err(error) = client_cleanup {
+        failures.push(format!("stalled gRPC client cleanup failed: {error}"));
+    }
+    match ownership_released {
+        Ok(true) => {},
+        Ok(false) => failures.push("forced shutdown retained primary-volume ownership".to_owned()),
+        Err(error) => failures.push(format!("forced shutdown server cleanup failed: {error}")),
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; ").into())
+    }
+}
+
+#[test]
+fn forced_shutdown_failure_reports_the_outcome_and_cleanup_failures() {
+    let failure = finish_forced_rpc(
+        false,
+        Err(std::io::Error::other("outcome timeout").into()),
+        Err(std::io::Error::other("client teardown").into()),
+        Err(std::io::Error::other("server join").into()),
+    )
+    .expect_err("the original force result and both cleanup failures must remain visible");
+    let message = failure.to_string();
+    assert!(message.contains("outcome timeout"));
+    assert!(message.contains("client teardown"));
+    assert!(message.contains("server join"));
 }
