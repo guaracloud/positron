@@ -267,5 +267,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "h2_observer"
+path = "fuzz_targets/h2_observer.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 members = ["."]

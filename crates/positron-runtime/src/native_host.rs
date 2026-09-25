@@ -10,7 +10,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use positron_config::{
-    EffectiveConfiguration, NetworkListenerProfile, NetworkListenerRole, NetworkTransport,
+    ConfigurationInputs, EffectiveConfiguration, Http2Profile, NetworkListenerProfile,
+    NetworkListenerRole, NetworkTransport, resolve,
 };
 use sha2::{Digest, Sha256};
 
@@ -29,6 +30,7 @@ use crate::{
 mod api_http;
 mod connection_admission;
 mod generation;
+mod h2_observer;
 mod loki_http;
 mod native_http;
 mod otlp_grpc;
@@ -36,6 +38,43 @@ mod otlp_http;
 mod otlp_outcome;
 mod tls;
 mod trusted_proxy;
+
+#[cfg(feature = "test-support")]
+pub fn fuzz_h2_observer(data: &[u8]) -> usize {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let bounded = &data[..data.len().min(4096)];
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(_) => return 0,
+    };
+    runtime.block_on(async {
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let bytes = bounded.to_vec();
+        let writer = tokio::spawn(async move {
+            let _ = writer.write_all(&bytes).await;
+            let _ = writer.shutdown().await;
+        });
+        let mut observer = h2_observer::H2Observer::new(
+            reader,
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+        );
+        let mut buffer = [0_u8; 37];
+        let mut replayed = 0;
+        loop {
+            match observer.read(&mut buffer).await {
+                Ok(0) => break,
+                Ok(read) => replayed += read,
+                Err(_) => break,
+            }
+        }
+        let _ = writer.await;
+        replayed
+    })
+}
 
 use generation::{ActivationGate, NativeGenerationActivation};
 
@@ -97,6 +136,8 @@ pub struct NativeBindings {
     otlp_grpc_protection: ConnectionProtection,
     otlp_http_protection: ConnectionProtection,
     loki_push_protection: ConnectionProtection,
+    api_http2_profile: Option<Http2Profile>,
+    otlp_grpc_http2_profile: Option<Http2Profile>,
     operations_trusted_proxy: Option<TrustedProxy>,
     api_trusted_proxy: Option<TrustedProxy>,
     otlp_grpc_trusted_proxy: Option<TrustedProxy>,
@@ -142,6 +183,8 @@ impl NativeBindings {
         bindings.otlp_grpc_protection = otlp_grpc.4;
         bindings.otlp_http_protection = otlp_http.4;
         bindings.loki_push_protection = loki_push.4;
+        bindings.api_http2_profile = api.5;
+        bindings.otlp_grpc_http2_profile = otlp_grpc.5;
         Ok(bindings)
     }
 
@@ -272,6 +315,8 @@ impl NativeBindings {
             otlp_grpc_protection: default_connection_protection(),
             otlp_http_protection: default_connection_protection(),
             loki_push_protection: default_connection_protection(),
+            api_http2_profile: compiled_http2_profile(NetworkListenerRole::Api)?,
+            otlp_grpc_http2_profile: compiled_http2_profile(NetworkListenerRole::OtlpGrpc)?,
             operations_trusted_proxy: None,
             api_trusted_proxy: None,
             otlp_grpc_trusted_proxy: None,
@@ -352,6 +397,31 @@ impl NativeBindings {
             ListenerRole::Control => None,
         }
     }
+
+    fn http2_profile(&self, role: ListenerRole) -> Option<Http2Profile> {
+        match role {
+            ListenerRole::Api => self.api_http2_profile,
+            ListenerRole::OtlpGrpc => self.otlp_grpc_http2_profile,
+            _ => None,
+        }
+    }
+}
+
+fn compiled_http2_profile(
+    role: NetworkListenerRole,
+) -> Result<Option<Http2Profile>, NativeHostFailure> {
+    let inputs = ConfigurationInputs::try_from_sources(
+        None,
+        [] as [(&str, &str); 0],
+        [] as [(&str, &str); 0],
+    )
+    .map_err(|_| NativeHostFailure::InvalidBinding)?;
+    let effective = resolve(inputs).map_err(|_| NativeHostFailure::InvalidBinding)?;
+    effective
+        .network_listener_profile(role)
+        .and_then(|profile| profile.http2_profile())
+        .map(Some)
+        .ok_or(NativeHostFailure::InvalidBinding)
 }
 
 const fn default_admission_limits() -> (NonZeroU16, NonZeroU16) {
@@ -378,6 +448,7 @@ type EffectiveNativeProfile = (
     Option<TrustedProxy>,
     (NonZeroU16, NonZeroU16),
     ConnectionProtection,
+    Option<Http2Profile>,
 );
 
 fn effective_profile(
@@ -423,6 +494,7 @@ fn effective_profile(
             profile.connection_protection().request_deadline(),
             profile.connection_protection().idle_deadline(),
         ),
+        profile.http2_profile(),
     ))
 }
 
@@ -512,13 +584,14 @@ impl NativeHost {
                         NativeListener::Unix(_) => None,
                     })?
                 })?;
-        ListenerProfile::network_with_admission_and_protection(
+        ListenerProfile::network_with_admission_protection_and_http2(
             role,
             active_address,
             configured.bindings.transport(role)?.listener_transport(),
             configured.bindings.admission(role)?.0,
             configured.bindings.admission(role)?.1,
             configured.bindings.protection(role)?,
+            configured.bindings.http2_profile(role),
         )
         .ok()
     }
@@ -565,6 +638,7 @@ struct Admission {
     trusted_proxy: Option<TrustedProxy>,
     connection_admission: Option<Arc<connection_admission::ConnectionAdmission>>,
     connection_protection: Option<ConnectionProtection>,
+    http2_profile: Option<Http2Profile>,
 }
 
 type AdmissionRegistry = Arc<Mutex<Vec<(ListenerRole, Arc<Admission>)>>>;
@@ -612,6 +686,10 @@ impl Admission {
     pub(super) fn connection_protection(&self) -> ConnectionProtection {
         self.connection_protection
             .unwrap_or_else(default_connection_protection)
+    }
+
+    pub(super) fn http2_profile(&self) -> Option<Http2Profile> {
+        self.http2_profile
     }
 
     pub(super) fn reserve_tls_handshake(
@@ -721,6 +799,7 @@ impl ListenerFactory for NativeHost {
                     global_accepted_socket_limit,
                     per_address_accepted_socket_limit,
                     connection_protection,
+                    http2_profile,
                 },
                 ListenerProfile::Network {
                     role: expected_role,
@@ -728,13 +807,15 @@ impl ListenerFactory for NativeHost {
                     global_accepted_socket_limit: expected_global_limit,
                     per_address_accepted_socket_limit: expected_per_address_limit,
                     connection_protection: expected_connection_protection,
+                    http2_profile: expected_http2_profile,
                     ..
                 },
             ) if requested_role == expected_role
                 && transport == expected_transport
                 && global_accepted_socket_limit == expected_global_limit
                 && per_address_accepted_socket_limit == expected_per_address_limit
-                && connection_protection == expected_connection_protection =>
+                && connection_protection == expected_connection_protection
+                && http2_profile == expected_http2_profile =>
             {
                 Some(*address)
             },
@@ -847,6 +928,7 @@ impl ListenerFactory for NativeHost {
             trusted_proxy: self.bindings.trusted_proxy(role),
             connection_admission,
             connection_protection,
+            http2_profile: self.bindings.http2_profile(role),
         });
         self.admissions
             .lock()
@@ -872,13 +954,14 @@ impl ListenerFactory for NativeHost {
         let address = self.bindings.address(role)?;
         let transport = self.bindings.transport(role)?.listener_transport();
         let (global, per_address) = self.bindings.admission(role)?;
-        ListenerProfile::network_with_admission_and_protection(
+        ListenerProfile::network_with_admission_protection_and_http2(
             role,
             address,
             transport,
             global,
             per_address,
             self.bindings.protection(role)?,
+            self.bindings.http2_profile(role),
         )
         .ok()
     }
@@ -1409,6 +1492,7 @@ mod listener_generation_tests {
             trusted_proxy: None,
             connection_admission: None,
             connection_protection: None,
+            http2_profile: None,
         });
         let gate = Arc::new(ActivationGate::new());
         let cancellation = crate::TaskCancellation::new();
@@ -1443,6 +1527,7 @@ mod listener_generation_tests {
             trusted_proxy: None,
             connection_admission: None,
             connection_protection: None,
+            http2_profile: None,
         };
         let cancellation = crate::TaskCancellation::new();
         admission.stop();
@@ -1577,6 +1662,7 @@ fn serve_http(
                     continue;
                 };
                 let connection_protection = admission.connection_protection();
+                let http2_profile = admission.http2_profile;
                 let stream_configured = if admission.role == ListenerRole::Api {
                     stream.set_nonblocking(true).is_ok()
                 } else {
@@ -1617,6 +1703,7 @@ fn serve_http(
                                     health: connection_health,
                                     services: connection_services,
                                     protection: connection_protection,
+                                    http2_profile,
                                 },
                             );
                         } else if let Some(profile) = transport {
@@ -1792,5 +1879,14 @@ mod tests {
 
     const fn loopback(port: u16) -> SocketAddr {
         SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn h2_fuzz_hook_replays_a_complete_fragmented_header_block() {
+        let mut seed = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+        seed.extend_from_slice(&[0, 0, 1, 1, 0, 0, 0, 0, 1, b'a']);
+        seed.extend_from_slice(&[0, 0, 1, 9, 4, 0, 0, 0, 1, b'b']);
+        assert_eq!(super::fuzz_h2_observer(&seed), seed.len());
     }
 }

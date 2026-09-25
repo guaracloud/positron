@@ -1,7 +1,9 @@
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
+use bytes::Bytes;
 use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsService;
 use opentelemetry_proto::tonic::collector::logs::v1::{
     ExportLogsServiceRequest, ExportLogsServiceResponse,
@@ -15,6 +17,8 @@ use tonic::codec::{
 use tonic::codegen::{Body, BoxFuture, Service, StdError};
 use tonic::{Request, Response, Status};
 
+use super::deadline_body::DeadlineBody;
+
 const EXPORT_PATH: &str = "/opentelemetry.proto.collector.logs.v1.LogsService/Export";
 const SERVICE_NAME: &str = "opentelemetry.proto.collector.logs.v1.LogsService";
 
@@ -23,6 +27,7 @@ pub(super) struct OtlpLogsServer<T> {
     inner: Arc<T>,
     accepted_compression: EnabledCompressionEncodings,
     maximum_decoding_bytes: Option<usize>,
+    body_deadline: Duration,
 }
 
 impl<T> OtlpLogsServer<T> {
@@ -31,6 +36,7 @@ impl<T> OtlpLogsServer<T> {
             inner: Arc::new(inner),
             accepted_compression: EnabledCompressionEncodings::default(),
             maximum_decoding_bytes: None,
+            body_deadline: Duration::from_secs(2),
         }
     }
 
@@ -43,6 +49,11 @@ impl<T> OtlpLogsServer<T> {
         self.maximum_decoding_bytes = Some(limit);
         self
     }
+
+    pub(super) const fn body_deadline(mut self, deadline: Duration) -> Self {
+        self.body_deadline = deadline;
+        self
+    }
 }
 
 impl<T> Clone for OtlpLogsServer<T> {
@@ -51,6 +62,7 @@ impl<T> Clone for OtlpLogsServer<T> {
             inner: Arc::clone(&self.inner),
             accepted_compression: self.accepted_compression,
             maximum_decoding_bytes: self.maximum_decoding_bytes,
+            body_deadline: self.body_deadline,
         }
     }
 }
@@ -58,7 +70,7 @@ impl<T> Clone for OtlpLogsServer<T> {
 impl<T, B> Service<http::Request<B>> for OtlpLogsServer<T>
 where
     T: LogsService,
-    B: Body + Send + 'static,
+    B: Body<Data = Bytes> + Send + 'static,
     B::Error: Into<StdError> + Send + 'static,
 {
     type Response = http::Response<tonic::body::Body>;
@@ -76,6 +88,7 @@ where
         let method = ExportService(Arc::clone(&self.inner));
         let accepted_compression = self.accepted_compression;
         let maximum_decoding_bytes = self.maximum_decoding_bytes;
+        let body_deadline = self.body_deadline;
         Box::pin(async move {
             let mut grpc = tonic::server::Grpc::new(OtlpLogsCodec)
                 .apply_compression_config(
@@ -83,6 +96,7 @@ where
                     EnabledCompressionEncodings::default(),
                 )
                 .apply_max_message_size_config(maximum_decoding_bytes, None);
+            let request = request.map(|body| DeadlineBody::new(body, body_deadline));
             Ok(grpc.unary(method, request).await)
         })
     }

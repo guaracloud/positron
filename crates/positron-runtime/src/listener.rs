@@ -90,6 +90,7 @@ pub enum ListenerProfile {
         global_accepted_socket_limit: NonZeroU16,
         per_address_accepted_socket_limit: NonZeroU16,
         connection_protection: ConnectionProtection,
+        http2_profile: Option<positron_config::Http2Profile>,
     },
 }
 
@@ -195,6 +196,26 @@ impl ListenerProfile {
         per_address_accepted_socket_limit: NonZeroU16,
         connection_protection: ConnectionProtection,
     ) -> Result<Self, ListenerFailure> {
+        Self::network_with_admission_protection_and_http2(
+            role,
+            address,
+            transport,
+            global_accepted_socket_limit,
+            per_address_accepted_socket_limit,
+            connection_protection,
+            None,
+        )
+    }
+
+    pub fn network_with_admission_protection_and_http2(
+        role: ListenerRole,
+        address: SocketAddr,
+        transport: ListenerTransport,
+        global_accepted_socket_limit: NonZeroU16,
+        per_address_accepted_socket_limit: NonZeroU16,
+        connection_protection: ConnectionProtection,
+        http2_profile: Option<positron_config::Http2Profile>,
+    ) -> Result<Self, ListenerFailure> {
         if !role.is_network() {
             return Err(ListenerFailure::InvalidEndpoint);
         }
@@ -208,6 +229,7 @@ impl ListenerProfile {
             global_accepted_socket_limit,
             per_address_accepted_socket_limit,
             connection_protection,
+            http2_profile,
         })
     }
 
@@ -255,6 +277,14 @@ impl ListenerProfile {
                 connection_protection,
                 ..
             } => Some(*connection_protection),
+        }
+    }
+
+    #[must_use]
+    pub const fn http2_profile(&self) -> Option<positron_config::Http2Profile> {
+        match self {
+            Self::Control { .. } => None,
+            Self::Network { http2_profile, .. } => *http2_profile,
         }
     }
 }

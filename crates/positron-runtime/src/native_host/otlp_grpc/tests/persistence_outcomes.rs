@@ -287,6 +287,7 @@ impl ReceiverHarness {
             trusted_proxy: None,
             connection_admission: None,
             connection_protection: None,
+            http2_profile: None,
         });
         let cancellation = TaskCancellation::new();
         let serve_cancellation = cancellation.clone();

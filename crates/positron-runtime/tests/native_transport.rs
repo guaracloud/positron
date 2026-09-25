@@ -30,6 +30,8 @@ use support::*;
 
 #[path = "native_transport/api_framing.rs"]
 mod api_framing;
+#[path = "native_transport/h2_protection.rs"]
+mod h2_protection;
 #[path = "native_transport/http2_api.rs"]
 mod http2_api;
 #[path = "native_transport/policy_routes.rs"]

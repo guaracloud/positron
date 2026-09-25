@@ -26,6 +26,7 @@ use tonic::{Request, Response, Status};
 use tower::util::MapResponseLayer;
 
 use super::api_http::IdleIo;
+use super::h2_observer::H2Observer;
 use super::otlp_outcome::{OtlpFailure, OtlpSignal};
 use super::{Admission, ConnectionLease, TrustedProxy};
 use crate::{ServiceFailure, ServiceHandle, TaskCancellation};
@@ -36,6 +37,7 @@ mod blocking;
 use blocking::{BlockingIngestExecutor, BlockingIngestHandle};
 mod codec;
 use codec::OtlpLogsServer;
+mod deadline_body;
 mod trace_codec;
 use trace_codec::OtlpTracesServer;
 
@@ -49,6 +51,7 @@ pub(super) struct PreparedGrpc {
     server: Server,
     tls: Option<Arc<rustls::ServerConfig>>,
     protection: crate::ConnectionProtection,
+    http2_profile: positron_config::Http2Profile,
     services: ServiceHandle,
     blocking: BlockingIngestExecutor,
     blocking_handle: BlockingIngestHandle,
@@ -61,6 +64,7 @@ pub(super) fn prepare(
     let services = services.ok_or(GrpcFailure)?;
     let listener = admission.tcp_listener().map_err(|_| GrpcFailure)?;
     let protection = admission.connection_protection();
+    let http2_profile = admission.http2_profile().ok_or(GrpcFailure)?;
     let tls = admission.grpc_tls_config().map_err(|_| GrpcFailure)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -70,7 +74,15 @@ pub(super) fn prepare(
         let _entered = runtime.enter();
         tokio::net::TcpListener::from_std(listener).map_err(|_| GrpcFailure)?
     };
-    let server = Server::builder().timeout(protection.request_deadline());
+    let server = Server::builder()
+        .timeout(protection.request_deadline())
+        .max_concurrent_streams(Some(u32::from(
+            http2_profile.max_concurrent_streams().get(),
+        )))
+        .initial_stream_window_size(Some(http2_profile.initial_stream_window_bytes().get()))
+        .initial_connection_window_size(Some(http2_profile.initial_connection_window_bytes().get()))
+        .max_frame_size(Some(http2_profile.max_frame_bytes().get()))
+        .http2_max_header_list_size(Some(http2_profile.max_header_list_bytes().get()));
     let blocking = BlockingIngestExecutor::start()?;
     let blocking_handle = blocking.handle()?;
     Ok(PreparedGrpc {
@@ -80,6 +92,7 @@ pub(super) fn prepare(
         server,
         tls,
         protection,
+        http2_profile,
         services,
         blocking,
         blocking_handle,
@@ -103,6 +116,7 @@ impl PreparedGrpc {
         let mut server = self.server;
         let tls = self.tls;
         let protection = self.protection;
+        let http2_profile = self.http2_profile;
         let (result, forced) = self.runtime.block_on(async move {
             let handshake_admission = Arc::clone(&admission);
             let incoming = AdmittedIncoming {
@@ -124,7 +138,14 @@ impl PreparedGrpc {
                 blocking: blocking_handle.clone(),
             })
             .accept_compressed(CompressionEncoding::Gzip)
-            .max_decoding_message_size(MAX_MESSAGE_BYTES);
+            .body_deadline(protection.body_deadline())
+            .max_decoding_message_size(
+                http2_profile
+                    .max_grpc_message_bytes()
+                    .map_or(MAX_MESSAGE_BYTES, |limit| {
+                        usize::try_from(limit.get()).unwrap_or(MAX_MESSAGE_BYTES)
+                    }),
+            );
             let receiver = MapResponseLayer::new(map_decode_failure).named_layer(receiver);
             let receiver = InterceptedService::new(receiver, move |request| {
                 authenticate(request, &authentication, trusted_proxy.clone())
@@ -133,7 +154,15 @@ impl PreparedGrpc {
                 services,
                 blocking: blocking_handle,
             })
-            .accept_compressed(CompressionEncoding::Gzip);
+            .accept_compressed(CompressionEncoding::Gzip)
+            .body_deadline(protection.body_deadline())
+            .max_decoding_message_size(
+                http2_profile
+                    .max_grpc_message_bytes()
+                    .map_or(MAX_MESSAGE_BYTES, |limit| {
+                        usize::try_from(limit.get()).unwrap_or(MAX_MESSAGE_BYTES)
+                    }),
+            );
             let trace_receiver =
                 MapResponseLayer::new(map_trace_decode_failure).named_layer(trace_receiver);
             let trace_receiver = InterceptedService::new(trace_receiver, move |request| {
@@ -187,12 +216,16 @@ async fn secure_grpc_connection(
     admission: Arc<Admission>,
     tls: Option<Arc<rustls::ServerConfig>>,
     protection: crate::ConnectionProtection,
-) -> Result<IdleIo<AdmittedIo>, io::Error> {
+) -> Result<H2Observer<IdleIo<AdmittedIo>>, io::Error> {
     let stream = stream?;
     let Some(configuration) = tls else {
-        return Ok(IdleIo::new(
-            AdmittedIo::Plain(stream),
-            protection.idle_deadline(),
+        return Ok(H2Observer::new(
+            IdleIo::new(AdmittedIo::Plain(stream), protection.idle_deadline()),
+            protection.header_deadline(),
+            admission
+                .http2_profile()
+                .ok_or_else(|| io::Error::other("missing HTTP/2 profile"))?
+                .minimum_ping_interval(),
         ));
     };
     let connection_info = stream.connect_info();
@@ -209,12 +242,19 @@ async fn secure_grpc_connection(
     .await
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TLS handshake deadline elapsed"))?
     .map_err(io::Error::other)?;
-    Ok(IdleIo::new(
-        AdmittedIo::Tls {
-            stream: Box::pin(stream),
-            connection_info,
-        },
-        protection.idle_deadline(),
+    Ok(H2Observer::new(
+        IdleIo::new(
+            AdmittedIo::Tls {
+                stream: Box::pin(stream),
+                connection_info,
+            },
+            protection.idle_deadline(),
+        ),
+        protection.header_deadline(),
+        admission
+            .http2_profile()
+            .ok_or_else(|| io::Error::other("missing HTTP/2 profile"))?
+            .minimum_ping_interval(),
     ))
 }
 
@@ -686,6 +726,7 @@ mod admission_tests {
             trusted_proxy: None,
             connection_admission: None,
             connection_protection: None,
+            http2_profile: None,
         });
         let cancellation = TaskCancellation::new();
         admission.stop();

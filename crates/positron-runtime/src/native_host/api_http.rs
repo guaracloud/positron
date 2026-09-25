@@ -15,6 +15,7 @@ use tokio::io::ReadBuf;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsAcceptor;
 
+use super::h2_observer::H2Observer;
 use super::native_http::{self, Response as NativeResponse};
 use super::{
     Admission, ConnectionProtection, HealthState, ServiceHandle, TaskCancellation,
@@ -34,6 +35,7 @@ pub(super) struct ConnectionContext {
     pub(super) health: HealthState,
     pub(super) services: Option<ServiceHandle>,
     pub(super) protection: ConnectionProtection,
+    pub(super) http2_profile: Option<positron_config::Http2Profile>,
 }
 
 pub(super) fn serve_connection(
@@ -84,13 +86,15 @@ where
         health,
         services,
         protection,
+        http2_profile,
         ..
     } = context;
     let stream = IdleIo::new(stream, protection.idle_deadline());
     let header_deadline = tokio::time::Instant::now() + protection.header_deadline();
-    let stream =
+    let (stream, is_http2) =
         match tokio::time::timeout_at(header_deadline, preflight_http1_framing(stream)).await {
-            Ok(Ok(FramingPreflight::Continue(stream))) => stream,
+            Ok(Ok(FramingPreflight::Continue(stream))) => (stream, false),
+            Ok(Ok(FramingPreflight::Http2(stream))) => (stream, true),
             Ok(Ok(FramingPreflight::Rejected(mut stream))) => {
                 write_bad_request(&mut stream).await;
                 return Ok(());
@@ -116,6 +120,24 @@ where
         .max_concurrent_streams(1)
         .timer(TokioTimer::new())
         .max_header_list_size(MAX_HEADER_BYTES as u32);
+    if let Some(profile) = http2_profile {
+        builder
+            .http2()
+            .max_concurrent_streams(Some(u32::from(profile.max_concurrent_streams().get())))
+            .initial_stream_window_size(Some(profile.initial_stream_window_bytes().get()))
+            .initial_connection_window_size(Some(profile.initial_connection_window_bytes().get()))
+            .max_frame_size(Some(profile.max_frame_bytes().get()))
+            .max_header_list_size(profile.max_header_list_bytes().get());
+    }
+    let stream = if is_http2 {
+        H2Observer::new(
+            stream,
+            protection.header_deadline(),
+            http2_profile.ok_or(ApiHttpFailure)?.minimum_ping_interval(),
+        )
+    } else {
+        H2Observer::disabled(stream)
+    };
     let connection = builder.serve_connection(
         TokioIo::new(stream),
         service_fn(move |request| {
@@ -157,6 +179,7 @@ where
 
 enum FramingPreflight<I> {
     Continue(PrefetchedIo<I>),
+    Http2(PrefetchedIo<I>),
     Rejected(I),
 }
 
@@ -167,7 +190,7 @@ where
     let mut prefetched = Vec::with_capacity(512);
     loop {
         if prefetched.starts_with(HTTP2_PREFACE) {
-            return Ok(FramingPreflight::Continue(PrefetchedIo::new(
+            return Ok(FramingPreflight::Http2(PrefetchedIo::new(
                 stream, prefetched,
             )));
         }
