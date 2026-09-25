@@ -173,6 +173,9 @@ fn reload(
         Err(ConfigurationRuntimeFailure::Unavailable) => {
             panic!("single-threaded reload must not lose its configuration lock");
         },
+        Err(ConfigurationRuntimeFailure::ListenerUnavailable) => {
+            panic!("direct runtime reload does not stage a listener generation");
+        },
     }
 }
 
