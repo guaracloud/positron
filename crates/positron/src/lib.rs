@@ -265,22 +265,15 @@ fn wait_for_shutdown(
         match reload.resolve() {
             Ok(candidate) => {
                 let outcome = process.reload_configuration(candidate);
-                if !matches!(
-                    outcome,
-                    Ok(
-                        positron_runtime::ConfigurationReloadOutcome::NoChange { .. }
-                            | positron_runtime::ConfigurationReloadOutcome::PublishedLive { .. }
-                            | positron_runtime::ConfigurationReloadOutcome::PendingRestart { .. }
-                    )
-                ) {
-                    eprintln!("positron: configuration reload rejected");
+                if let Some(category) = reload_rejection_category(&outcome) {
+                    eprintln!("positron: configuration reload rejected category={category}");
                 }
             },
             Err(()) => {
                 if process.record_invalid_configuration_reload().is_err() {
                     eprintln!("positron: configuration reload audit unavailable");
                 }
-                eprintln!("positron: configuration reload rejected");
+                eprintln!("positron: configuration reload rejected category=source_rejected");
             },
         }
     }
@@ -298,6 +291,31 @@ fn wait_for_shutdown(
             Ok(false) => std::thread::yield_now(),
             Err(_) => return Ok(draining.finish(ShutdownTrigger::DeadlineExpired)),
         }
+    }
+}
+
+fn reload_rejection_category(
+    outcome: &Result<
+        positron_runtime::ConfigurationReloadOutcome,
+        positron_runtime::ConfigurationRuntimeFailure,
+    >,
+) -> Option<&'static str> {
+    use positron_runtime::{ConfigurationReloadOutcome, ConfigurationRuntimeFailure};
+
+    match outcome {
+        Ok(
+            ConfigurationReloadOutcome::NoChange { .. }
+            | ConfigurationReloadOutcome::PublishedLive { .. }
+            | ConfigurationReloadOutcome::PendingRestart { .. },
+        ) => None,
+        Ok(ConfigurationReloadOutcome::RejectedImmutable { .. })
+        | Err(ConfigurationRuntimeFailure::ImmutableConfiguration) => {
+            Some("immutable_configuration")
+        },
+        Ok(ConfigurationReloadOutcome::RequiresDrain { .. }) => Some("requires_drain"),
+        Err(ConfigurationRuntimeFailure::Unavailable) => Some("runtime_unavailable"),
+        Err(ConfigurationRuntimeFailure::PublicationUnavailable) => Some("publication_unavailable"),
+        Err(ConfigurationRuntimeFailure::ListenerUnavailable) => Some("listener_unavailable"),
     }
 }
 
@@ -390,9 +408,12 @@ fn exit_code(outcome: ExitOutcome) -> ExitCode {
 mod tests {
     use super::{
         ExitOutcome, LaunchFailure, NativeRecovery, RecoveryAttemptHost, RecoveryDecision,
-        ShutdownTrigger, exit_code, pending_termination_trigger,
+        ShutdownTrigger, exit_code, pending_termination_trigger, reload_rejection_category,
     };
-    use positron_runtime::{BootstrapFailureCode, ListenerRole, RecoveryAttempt, TaskRole};
+    use positron_runtime::{
+        BootstrapFailureCode, ConfigurationReloadOutcome, ConfigurationRuntimeFailure,
+        ListenerRole, RecoveryAttempt, TaskRole,
+    };
     use signal_hook::iterator::Signals;
 
     #[test]
@@ -420,6 +441,33 @@ mod tests {
             LaunchFailure::Signal.message(),
             "signal handling unavailable"
         );
+    }
+
+    #[test]
+    fn reload_rejection_categories_are_static_and_typed() {
+        let no_change = Ok(ConfigurationReloadOutcome::NoChange { generation: 1 });
+        assert_eq!(reload_rejection_category(&no_change), None);
+
+        for (outcome, expected) in [
+            (
+                Err(ConfigurationRuntimeFailure::Unavailable),
+                "runtime_unavailable",
+            ),
+            (
+                Err(ConfigurationRuntimeFailure::PublicationUnavailable),
+                "publication_unavailable",
+            ),
+            (
+                Err(ConfigurationRuntimeFailure::ListenerUnavailable),
+                "listener_unavailable",
+            ),
+            (
+                Err(ConfigurationRuntimeFailure::ImmutableConfiguration),
+                "immutable_configuration",
+            ),
+        ] {
+            assert_eq!(reload_rejection_category(&outcome), Some(expected));
+        }
     }
 
     #[test]
