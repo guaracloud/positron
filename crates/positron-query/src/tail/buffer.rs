@@ -179,7 +179,7 @@ impl<'kernel> TailBuffer<'kernel> {
             drop(reservation);
             return Err(failure);
         }
-        if let Err(_) = self.queue_claims.try_reserve(1) {
+        if self.queue_claims.try_reserve(1).is_err() {
             self.account.release(bytes);
             drop(reservation);
             return Err(QueryFailure::new(QueryFailureCode::ResourceExhausted));

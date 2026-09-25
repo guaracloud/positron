@@ -268,7 +268,7 @@ fn cancellation_and_capacity_refusal_are_retryable_and_release_reservations() {
     let amounts = ResourceAmounts::new([1_048_576, 1, 1, 1_048_576, 1, 0, 1, 1, 1, 4, 1_048_576]);
     let claim = WorkClaim::tenant(fixture.tenant, WorkKind::Ingest, amounts).expect("claim");
     let mut held = Vec::new();
-    while let Ok(reservation) = fixture.authority.governor().reserve(claim) {
+    while let Ok(reservation) = fixture.authority.governor().reserve(claim.clone()) {
         held.push(reservation);
     }
     assert!(!held.is_empty());

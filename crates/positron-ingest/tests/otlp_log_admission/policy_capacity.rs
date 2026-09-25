@@ -80,7 +80,7 @@ fn later_group_capacity_refusal_wins_before_policy_and_never_rolls_back_prior_co
         ResourceAmounts::new([1_000_000, 1, 1, 1_000_000, 1, 1, 1, 1, 1, 1, 100_000]),
     )?;
     let mut held = Vec::new();
-    while let Ok(reservation) = fixture.authority.governor().reserve(claim) {
+    while let Ok(reservation) = fixture.authority.governor().reserve(claim.clone()) {
         held.push(reservation);
     }
     assert_eq!(

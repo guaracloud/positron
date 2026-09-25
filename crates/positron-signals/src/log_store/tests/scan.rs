@@ -790,7 +790,7 @@ fn insufficient_query_budget_refuses_before_decode_and_releases_on_error()
         ResourceAmounts::only(ResourceDimension::MemoryBytes, 1)?,
     )?;
     let mut saturation = Vec::new();
-    while let Ok(grant) = authority.governor().reserve(claim) {
+    while let Ok(grant) = authority.governor().reserve(claim.clone()) {
         saturation.push(grant);
     }
     let failure = LogStore::new()
@@ -867,7 +867,7 @@ fn cancellable_scan_stops_during_snapshot_preflight_before_admission() -> Result
         ResourceAmounts::only(ResourceDimension::MemoryBytes, 1)?,
     )?;
     let mut saturation = Vec::new();
-    while let Ok(grant) = authority.governor().reserve(claim) {
+    while let Ok(grant) = authority.governor().reserve(claim.clone()) {
         saturation.push(grant);
     }
 

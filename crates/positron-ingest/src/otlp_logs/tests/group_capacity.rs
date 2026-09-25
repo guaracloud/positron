@@ -81,7 +81,7 @@ fn second_group_capacity_is_reserved_before_its_configured_policy_result() {
     let group_claim =
         WorkClaim::tenant(fixture.tenant, WorkKind::Ingest, group_amounts).expect("group claim");
     let mut held = Vec::new();
-    while let Ok(reservation) = fixture.authority.governor().reserve(group_claim) {
+    while let Ok(reservation) = fixture.authority.governor().reserve(group_claim.clone()) {
         held.push(reservation);
     }
     assert!(!held.is_empty());
