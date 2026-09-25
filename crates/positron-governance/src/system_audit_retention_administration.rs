@@ -392,7 +392,8 @@ fn receipt_for_pruned_entry(
         | GovernanceAuditEntry::CatalogRootRotation(_)
         | GovernanceAuditEntry::SchemaCheckpoint(_)
         | GovernanceAuditEntry::DurableOperation(_)
-        | GovernanceAuditEntry::Configuration(_) => return Ok(None),
+        | GovernanceAuditEntry::Configuration(_)
+        | GovernanceAuditEntry::TlsMaterialReload(_) => return Ok(None),
         GovernanceAuditEntry::TenantCreation(entry) => (
             crate::tenant_administration::legacy_receipt_object(entry)
                 .map_err(|_| SystemAuditRetentionAdministrationFailure::PersistenceUnavailable)?,

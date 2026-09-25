@@ -5,15 +5,18 @@ use positron_kernel::{
     AuditIntent, Catalog, CatalogFailureCode, CatalogObject, CatalogProposal, CatalogSnapshot,
     InstanceId, TransactionId,
 };
+use sha2::{Digest, Sha256};
 
-use crate::audit::plaintext_api_transport_audit_intent_v2;
-use crate::{GovernanceAuditEntry, ListenerTransportAuditRequest};
+use crate::audit::plaintext_listener_transport_audit_intent_v3;
+use crate::{GovernanceAuditEntry, ListenerTransportAuditRequest, ListenerTransportRole};
 
 const RECEIPT_MAGIC: [u8; 8] = *b"POSLTR01";
+const COMPOSITE_RECEIPT_MAGIC: [u8; 8] = *b"POSLTR02";
 const RECEIPT_BYTES: usize = 80;
+const COMPOSITE_RECEIPT_KEY_DOMAIN: &[u8] = b"positron.listener-transport.composite-receipt.v1\0";
 
-/// Administration-owned activation of the explicitly selected public
-/// plaintext API transport profile.
+/// Administration-owned activation of an explicitly selected plaintext
+/// listener transport profile.
 pub enum ListenerTransportAdministration {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -44,32 +47,38 @@ impl Error for ListenerTransportAdministrationFailure {}
 
 impl ListenerTransportAdministration {
     /// Records one exact configured plaintext opt-out intent. Legacy records
-    /// remain readable but cannot prove a later configuration's target.
-    pub fn activate_public_plaintext_api(
+    /// remain readable and API receipts remain resolvable through their
+    /// historical request identity.
+    pub fn activate_plaintext_listener(
         catalog: &Catalog<'_>,
         instance: InstanceId,
         request: ListenerTransportAuditRequest,
     ) -> Result<ListenerTransportActivation, ListenerTransportAdministrationFailure> {
-        let request_digest = request.digest_for(instance.to_bytes());
-        let transaction = TransactionId::new(request.transaction_id_for(instance.to_bytes()))
-            .map_err(map_catalog)?;
         let snapshot = catalog.pin().map_err(map_catalog)?;
-        if let Some(audit_position) =
-            find_receipt(&snapshot, instance, transaction, request_digest)?
-        {
+        if let Some(audit_position) = find_receipt(&snapshot, instance, request)? {
             return Ok(ListenerTransportActivation { audit_position });
         }
         let mut existing = None;
         for record in catalog.governance_audit_records().map_err(map_catalog)? {
             let entry = GovernanceAuditEntry::decode(&record)
                 .map_err(|_| ListenerTransportAdministrationFailure::CorruptState)?;
+            if let Some(configuration) = entry.as_configuration()
+                && configuration
+                    .plaintext_listener_opt_outs()
+                    .iter()
+                    .any(|receipt| receipt.matches_request(instance.to_bytes(), request))
+            {
+                // A resolved listener can move between TLS and plaintext more
+                // than once. Every composite record remains bound to its
+                // enclosing audit transaction, so the latest match is the
+                // active historical selection.
+                existing = Some(configuration.position());
+                continue;
+            }
             let Some(transport) = entry.as_listener_transport() else {
                 continue;
             };
-            if transport.instance_id() != instance.to_bytes() {
-                continue;
-            }
-            if transport.request_digest() != Some(request_digest) {
+            if !transport.matches_request(instance.to_bytes(), request) {
                 continue;
             }
             if existing.replace(transport.position()).is_some() {
@@ -86,8 +95,12 @@ impl ListenerTransportAdministration {
             .checked_add(1)
             .ok_or(ListenerTransportAdministrationFailure::PersistenceUnavailable)?;
         let mut objects = objects;
+        let request_digest = request.digest_for(instance.to_bytes());
+        let transaction = TransactionId::new(request.transaction_id_for(instance.to_bytes()))
+            .map_err(map_catalog)?;
         objects.push(
             CatalogObject::new(encode_receipt(
+                RECEIPT_MAGIC,
                 instance,
                 transaction,
                 request_digest,
@@ -95,7 +108,7 @@ impl ListenerTransportAdministration {
             ))
             .map_err(map_catalog)?,
         );
-        let audit = AuditIntent::new(plaintext_api_transport_audit_intent_v2(
+        let audit = AuditIntent::new(plaintext_listener_transport_audit_intent_v3(
             instance.to_bytes(),
             request,
         ))
@@ -133,14 +146,31 @@ impl ListenerTransportAdministration {
             Err(ListenerTransportAdministrationFailure::CorruptState)
         }
     }
+
+    /// Compatibility entry point for callers that explicitly select the API
+    /// listener. New runtime composition should use `activate_plaintext_listener`.
+    pub fn activate_public_plaintext_api(
+        catalog: &Catalog<'_>,
+        instance: InstanceId,
+        request: ListenerTransportAuditRequest,
+    ) -> Result<ListenerTransportActivation, ListenerTransportAdministrationFailure> {
+        Self::activate_plaintext_listener(catalog, instance, request)
+    }
 }
 
 fn find_receipt(
     snapshot: &CatalogSnapshot,
     instance: InstanceId,
-    transaction: TransactionId,
-    request_digest: [u8; 32],
+    request: ListenerTransportAuditRequest,
 ) -> Result<Option<u64>, ListenerTransportAdministrationFailure> {
+    let transaction = request.transaction_id_for(instance.to_bytes());
+    let request_digest = request.digest_for(instance.to_bytes());
+    let legacy = (request.listener_role() == ListenerTransportRole::Api).then(|| {
+        (
+            request.legacy_transaction_id_for(instance.to_bytes()),
+            request.legacy_digest_for(instance.to_bytes()),
+        )
+    });
     let mut found = None;
     for identity in snapshot.object_identities() {
         let bytes = snapshot
@@ -158,9 +188,18 @@ fn find_receipt(
             .ok_or(ListenerTransportAdministrationFailure::CorruptState)?
             .try_into()
             .map_err(|_| ListenerTransportAdministrationFailure::CorruptState)?;
-        if stored_transaction != transaction.to_bytes() {
-            continue;
-        }
+        let expected_digest = if stored_transaction == transaction {
+            request_digest
+        } else {
+            match legacy {
+                Some((legacy_transaction, legacy_digest))
+                    if stored_transaction == legacy_transaction =>
+                {
+                    legacy_digest
+                },
+                _ => continue,
+            }
+        };
         let stored_instance: [u8; 16] = bytes
             .get(24..40)
             .ok_or(ListenerTransportAdministrationFailure::CorruptState)?
@@ -179,7 +218,7 @@ fn find_receipt(
                 .map_err(|_| ListenerTransportAdministrationFailure::CorruptState)?,
         );
         if stored_instance != instance.to_bytes()
-            || stored_digest != request_digest
+            || stored_digest != expected_digest
             || audit_position == 0
         {
             return Err(ListenerTransportAdministrationFailure::CorruptState);
@@ -192,18 +231,42 @@ fn find_receipt(
 }
 
 fn encode_receipt(
+    magic: [u8; 8],
     instance: InstanceId,
     transaction: TransactionId,
     request_digest: [u8; 32],
     audit_position: u64,
 ) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(RECEIPT_BYTES);
-    bytes.extend_from_slice(&RECEIPT_MAGIC);
+    bytes.extend_from_slice(&magic);
     bytes.extend_from_slice(&transaction.to_bytes());
     bytes.extend_from_slice(&instance.to_bytes());
     bytes.extend_from_slice(&request_digest);
     bytes.extend_from_slice(&audit_position.to_be_bytes());
     bytes
+}
+
+/// Builds one receipt object for a role record carried by another joint audit
+/// transaction. Its terminal identity derives from the exact role-bound
+/// request digest and enclosing transaction, so sibling and successive role
+/// receipts remain distinct.
+pub fn plaintext_listener_transport_receipt_object(
+    instance: InstanceId,
+    transaction: TransactionId,
+    request: ListenerTransportAuditRequest,
+    audit_position: u64,
+) -> Result<CatalogObject, ListenerTransportAdministrationFailure> {
+    if audit_position == 0 {
+        return Err(ListenerTransportAdministrationFailure::PersistenceUnavailable);
+    }
+    CatalogObject::new(encode_receipt(
+        COMPOSITE_RECEIPT_MAGIC,
+        instance,
+        transaction,
+        request.digest_for(instance.to_bytes()),
+        audit_position,
+    ))
+    .map_err(map_catalog)
 }
 
 pub(crate) fn legacy_receipt_object(
@@ -221,6 +284,7 @@ pub(crate) fn legacy_receipt_object(
     }
     let transaction = TransactionId::new(request_id).map_err(map_catalog)?;
     CatalogObject::new(encode_receipt(
+        RECEIPT_MAGIC,
         InstanceId::new(entry.instance_id()).map_err(map_catalog)?,
         transaction,
         request_digest,
@@ -230,7 +294,31 @@ pub(crate) fn legacy_receipt_object(
 }
 
 pub(crate) fn retention_terminal_key(bytes: &[u8]) -> Result<Option<[u8; 16]>, ()> {
-    crate::audit::terminal_receipt_key(bytes, &[(RECEIPT_MAGIC, RECEIPT_BYTES, 8)])
+    if bytes.starts_with(&RECEIPT_MAGIC) {
+        crate::audit::terminal_receipt_key(bytes, &[(RECEIPT_MAGIC, RECEIPT_BYTES, 8)])
+    } else {
+        composite_retention_terminal_key(bytes)
+    }
+}
+
+fn composite_retention_terminal_key(bytes: &[u8]) -> Result<Option<[u8; 16]>, ()> {
+    if !bytes.starts_with(&COMPOSITE_RECEIPT_MAGIC) {
+        return Ok(None);
+    }
+    if bytes.len() != RECEIPT_BYTES {
+        return Err(());
+    }
+    let transaction = bytes.get(8..24).ok_or(())?;
+    let request_digest = bytes.get(40..72).ok_or(())?;
+    if transaction.iter().all(|byte| *byte == 0) || request_digest.iter().all(|byte| *byte == 0) {
+        return Err(());
+    }
+    let mut digest = Sha256::new();
+    digest.update(COMPOSITE_RECEIPT_KEY_DOMAIN);
+    digest.update(transaction);
+    digest.update(request_digest);
+    let key: [u8; 16] = digest.finalize()[..16].try_into().map_err(|_| ())?;
+    Ok(Some(key))
 }
 
 fn retained_objects(

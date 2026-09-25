@@ -2,15 +2,16 @@ use super::*;
 use rustls::pki_types::{CertificateDer, ServerName, pem::PemObject};
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 use std::sync::Arc;
-use std::sync::{Mutex, MutexGuard};
+use tokio::sync::{Mutex, MutexGuard};
 
-static LIVE_NATIVE_TEST: Mutex<()> = Mutex::new(());
+static LIVE_NATIVE_TEST: Mutex<()> = Mutex::const_new(());
 
 pub(super) fn live_test_guard() -> MutexGuard<'static, ()> {
-    match LIVE_NATIVE_TEST.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    }
+    LIVE_NATIVE_TEST.blocking_lock()
+}
+
+pub(super) async fn live_async_test_guard() -> MutexGuard<'static, ()> {
+    LIVE_NATIVE_TEST.lock().await
 }
 
 pub(super) fn bindings(

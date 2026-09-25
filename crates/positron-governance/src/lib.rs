@@ -34,12 +34,13 @@ pub use api_key_administration::{
 pub use audit::{
     ApiKeyLifecycleAction, CatalogRootRotationAuditEntry, CatalogRootRotationStage,
     ConfigurationAuditContext, ConfigurationAuditEntry, ConfigurationAuditOutcome,
-    ConfigurationAuditRequest, DurableOperationAuditEntry, GovernanceAuditEntry,
-    IngestPolicyActivationAuditEntry, InitialAuditMetadata, InitializationAuditEntry,
-    ListenerTransportAuditEntry, ListenerTransportAuditRequest,
-    ListenerTransportConfigurationProvenance, SchemaCheckpointAuditEntry,
+    ConfigurationAuditRequest, ConfigurationWithPlaintextAuditRequest, DurableOperationAuditEntry,
+    GovernanceAuditEntry, IngestPolicyActivationAuditEntry, InitialAuditMetadata,
+    InitializationAuditEntry, ListenerTransportAuditEntry, ListenerTransportAuditRequest,
+    ListenerTransportConfigurationProvenance, ListenerTransportRole, SchemaCheckpointAuditEntry,
     SystemAuditRetentionUpdateAuditEntry, TenantDisplayNameUpdateAuditEntry,
-    TenantQuotaUpdateAuditEntry, schema_checkpoint_audit_intent,
+    TenantQuotaUpdateAuditEntry, TlsMaterialReloadAuditEntry, TlsMaterialReloadAuditRequest,
+    TlsMaterialReloadListenerSet, TlsMaterialReloadOutcome, schema_checkpoint_audit_intent,
 };
 #[cfg(fuzzing)]
 pub use durable_operation_administration::fuzz_durable_operation_record;
@@ -60,7 +61,7 @@ pub use identity::{
 };
 pub use listener_transport_administration::{
     ListenerTransportActivation, ListenerTransportAdministration,
-    ListenerTransportAdministrationFailure,
+    ListenerTransportAdministrationFailure, plaintext_listener_transport_receipt_object,
 };
 pub use policy_administration::{
     AdministrativeIdempotencyKey, IngestPolicyActivation, IngestPolicyAdministration,

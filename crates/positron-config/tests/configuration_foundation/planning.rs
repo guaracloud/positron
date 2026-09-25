@@ -150,6 +150,148 @@ fn returns_only_checked_mutability_plans_and_rejects_immutable_changes()
 }
 
 #[test]
+fn accepted_socket_limit_changes_are_file_only_drain_and_reload_settings()
+-> Result<(), ConfigurationFailure> {
+    let current = inputs(None, [], []).and_then(resolve)?;
+    let candidate = inputs(
+        Some(
+            "schema_version = 1\n\
+             [listener]\n\
+             api_accepted_socket_limit = 96\n\
+             api_per_address_accepted_socket_limit = 12\n",
+        ),
+        [],
+        [],
+    )
+    .and_then(resolve)?;
+
+    assert!(matches!(
+        current.plan_update(&candidate)?,
+        ConfigurationPlan::DrainThenPublish { changed }
+            if changed
+                == vec![
+                    Setting::ListenerApiAcceptedSocketLimit,
+                    Setting::ListenerApiPerAddressAcceptedSocketLimit,
+                ]
+    ));
+    assert!(candidate
+        .redacted_reference()
+        .contains("api_accepted_socket_limit = 96"));
+    assert!(candidate
+        .redacted_reference()
+        .contains("api_per_address_accepted_socket_limit = 12"));
+
+    let environment = inputs(
+        None,
+        [("POSITRON__LISTENER__API_ACCEPTED_SOCKET_LIMIT", "96")],
+        [],
+    )
+    .and_then(resolve);
+    assert!(matches!(
+        environment,
+        Err(error)
+            if error.code() == ConfigurationFailureCode::UnknownSetting
+                && error.source() == FailureSource::ListenerApiAcceptedSocketLimit
+    ));
+    Ok(())
+}
+
+#[test]
+fn connection_protection_changes_are_file_only_drain_and_reload_settings()
+-> Result<(), ConfigurationFailure> {
+    let current = inputs(None, [], []).and_then(resolve)?;
+    let candidate = inputs(
+        Some(
+            "schema_version = 1\n\
+             [listener]\n\
+             api_tls_handshake_limit = 8\n\
+             api_tls_handshake_deadline_seconds = 3\n\
+             api_header_deadline_seconds = 4\n\
+             api_body_deadline_seconds = 5\n\
+             api_request_deadline_seconds = 6\n\
+             api_idle_deadline_seconds = 7\n",
+        ),
+        [],
+        [],
+    )
+    .and_then(resolve)?;
+
+    assert!(matches!(
+        current.plan_update(&candidate)?,
+        ConfigurationPlan::DrainThenPublish { changed }
+            if changed
+                == vec![
+                    Setting::ListenerApiTlsHandshakeLimit,
+                    Setting::ListenerApiTlsHandshakeDeadlineSeconds,
+                    Setting::ListenerApiHeaderDeadlineSeconds,
+                    Setting::ListenerApiBodyDeadlineSeconds,
+                    Setting::ListenerApiRequestDeadlineSeconds,
+                    Setting::ListenerApiIdleDeadlineSeconds,
+                ]
+    ));
+    assert!(candidate
+        .redacted_reference()
+        .contains("api_idle_deadline_seconds = 7"));
+
+    let environment = inputs(
+        None,
+        [("POSITRON__LISTENER__API_TLS_HANDSHAKE_LIMIT", "8")],
+        [],
+    )
+    .and_then(resolve);
+    assert!(matches!(
+        environment,
+        Err(error)
+            if error.code() == ConfigurationFailureCode::UnknownSetting
+                && error.source() == FailureSource::ListenerApiTlsHandshakeLimit
+    ));
+    Ok(())
+}
+
+#[test]
+fn http2_listener_profile_changes_are_file_only_drain_and_reload_settings()
+-> Result<(), ConfigurationFailure> {
+    let current = inputs(None, [], []).and_then(resolve)?;
+    let candidate = inputs(
+        Some(
+            "schema_version = 1\n\
+             [listener]\n\
+             api_http2_max_concurrent_streams = 2\n\
+             api_http2_minimum_ping_interval_seconds = 6\n\
+             otlp_grpc_max_message_bytes = 2048\n",
+        ),
+        [],
+        [],
+    )
+    .and_then(resolve)?;
+
+    assert!(matches!(
+        current.plan_update(&candidate)?,
+        ConfigurationPlan::DrainThenPublish { changed }
+            if changed
+                == vec![
+                    Setting::ListenerApiHttp2MaxConcurrentStreams,
+                    Setting::ListenerApiHttp2MinimumPingIntervalSeconds,
+                    Setting::ListenerOtlpGrpcMaxMessageBytes,
+                ]
+    ));
+
+    let environment = inputs(
+        None,
+        [("POSITRON__LISTENER__API_HTTP2_MAX_CONCURRENT_STREAMS", "2")],
+        [],
+    )
+    .and_then(resolve);
+    assert!(matches!(
+        environment,
+        Err(error)
+            if error.code() == ConfigurationFailureCode::UnknownSetting
+                && error.source() == FailureSource::ListenerApiHttp2MaxConcurrentStreams
+    ));
+    Ok(())
+}
+
+#[test]
 fn immutable_configuration_digest_follows_the_canonical_mutability_contract()
 -> Result<(), ConfigurationFailure> {
     let current = inputs(None, [], []).and_then(resolve)?;

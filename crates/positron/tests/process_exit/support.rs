@@ -92,7 +92,10 @@ impl positron_runtime::RunningTask for BlockedTaskHandle {
         Ok(None)
     }
 
-    fn join(&mut self) -> Result<positron_runtime::TaskJoinOutcome, positron_runtime::TaskFailure> {
+    fn join_within(
+        &mut self,
+        _: std::time::Duration,
+    ) -> Result<positron_runtime::TaskJoinOutcome, positron_runtime::TaskFailure> {
         panic!("blocked child join must remain interruptible")
     }
 
@@ -113,18 +116,32 @@ pub(super) fn wait_for_configuration_status(
     authorization: &str,
     expected_fragments: &[&str],
 ) -> Result<String, Box<dyn std::error::Error>> {
+    let mut last_observation = None;
     for _ in 0..100 {
-        if let Ok(response) = configuration_status(port, authorization)
-            && response.starts_with("HTTP/1.1 200 ")
-            && expected_fragments
-                .iter()
-                .all(|fragment| response.contains(fragment))
-        {
-            return Ok(response);
+        match configuration_status(port, authorization) {
+            Ok(response)
+                if response.starts_with("HTTP/1.1 200 ")
+                    && expected_fragments
+                        .iter()
+                        .all(|fragment| response.contains(fragment)) =>
+            {
+                return Ok(response);
+            },
+            Ok(response) => {
+                last_observation = Some(format!(
+                    "response={:?}",
+                    bounded_redacted_observation(&response, authorization)
+                ));
+            },
+            Err(error) => last_observation = Some(format!("request={error}")),
         }
         std::thread::sleep(Duration::from_millis(25));
     }
-    Err("Positron configuration status did not reach expected state".into())
+    Err(format!(
+        "Positron configuration status did not reach expected state within its bounded probe: {}",
+        last_observation.unwrap_or_else(|| "no request completed".to_owned())
+    )
+    .into())
 }
 
 #[cfg(unix)]
@@ -132,7 +149,10 @@ fn configuration_status(
     port: u16,
     authorization: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let mut stream = TcpStream::connect(("127.0.0.1", port))?;
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_millis(100))?;
+    stream.set_read_timeout(Some(Duration::from_millis(100)))?;
+    stream.set_write_timeout(Some(Duration::from_millis(100)))?;
     let request = format!(
         "GET /status HTTP/1.1\r\nHost: localhost\r\nAuthorization: {authorization}\r\nContent-Length: 0\r\n\r\n"
     );
@@ -143,26 +163,51 @@ fn configuration_status(
 }
 
 #[cfg(unix)]
+pub(super) fn bounded_redacted_observation(observation: &str, authorization: &str) -> String {
+    const MAX_STATUS_OBSERVATION_CHARS: usize = 512;
+
+    let redacted = observation.replace(authorization, "<redacted>");
+    let mut bounded = redacted
+        .chars()
+        .take(MAX_STATUS_OBSERVATION_CHARS)
+        .collect::<String>();
+    if redacted.chars().nth(MAX_STATUS_OBSERVATION_CHARS).is_some() {
+        bounded.push_str("…<truncated>");
+    }
+    bounded
+}
+
+#[cfg(unix)]
 pub(super) fn wait_for_readiness(
     port: u16,
     expected_status: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let mut last_observation = None;
     for _ in 0..100 {
-        if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) {
-            stream.write_all(
-                b"GET /health/ready HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
-            )?;
-            let mut response = String::new();
-            stream.read_to_string(&mut response)?;
-            if response.starts_with(expected_status) {
-                return Ok(());
-            }
+        match TcpStream::connect(("127.0.0.1", port)) {
+            Ok(mut stream) => {
+                stream.set_read_timeout(Some(Duration::from_millis(100)))?;
+                stream.set_write_timeout(Some(Duration::from_millis(100)))?;
+                stream.write_all(
+                    b"GET /health/ready HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+                )?;
+                let mut response = String::new();
+                match stream.read_to_string(&mut response) {
+                    Ok(_) if response.starts_with(expected_status) => return Ok(()),
+                    Ok(_) => last_observation = Some(format!("response={response:?}")),
+                    Err(error) => last_observation = Some(format!("read={error}")),
+                }
+            },
+            Err(error) => last_observation = Some(format!("connect={error}")),
         }
         std::thread::sleep(Duration::from_millis(25));
     }
-    Err("Positron did not become ready".into())
+    Err(format!(
+        "Positron readiness listener did not return the expected response within its bounded probe: {}",
+        last_observation.unwrap_or_else(|| "no connection attempt completed".to_owned())
+    )
+    .into())
 }
-
 #[cfg(unix)]
 pub(super) fn wait_for_file(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     for _ in 0..100 {
@@ -230,11 +275,17 @@ pub(super) fn process_configuration(
     let certificate = runtime_directory.join("api-test-cert.pem");
     let private_key = runtime_directory.join("api-test-key.pem");
     format!(
-        "schema_version = 1\n[runtime]\nshutdown_grace_seconds = 2\n[listener]\ncontrol_path = \"{}\"\noperations_bind_address = \"127.0.0.1:{operations_port}\"\napi_bind_address = \"127.0.0.1:{api_port}\"\napi_transport = \"tls\"\napi_tls_certificate_file = \"{}\"\napi_tls_private_key_file = \"{}\"\notlp_grpc_bind_address = \"127.0.0.1:{otlp_grpc_port}\"\notlp_http_bind_address = \"127.0.0.1:{otlp_http_port}\"\nloki_push_bind_address = \"127.0.0.1:{loki_push_port}\"\n[storage]\ndata_directory = \"{}\"\nsecrets_directory = \"{}\"\n[security]\nlocal_key_file = \"{}\"\n",
+        "schema_version = 1\n[runtime]\nshutdown_grace_seconds = 2\n[listener]\ncontrol_path = \"{}\"\noperations_bind_address = \"127.0.0.1:{operations_port}\"\noperations_transport = \"plaintext\"\napi_bind_address = \"127.0.0.1:{api_port}\"\napi_transport = \"tls\"\napi_tls_certificate_file = \"{}\"\napi_tls_private_key_file = \"{}\"\notlp_grpc_bind_address = \"127.0.0.1:{otlp_grpc_port}\"\notlp_grpc_tls_certificate_file = \"{}\"\notlp_grpc_tls_private_key_file = \"{}\"\notlp_http_bind_address = \"127.0.0.1:{otlp_http_port}\"\notlp_http_tls_certificate_file = \"{}\"\notlp_http_tls_private_key_file = \"{}\"\nloki_push_bind_address = \"127.0.0.1:{loki_push_port}\"\nloki_push_tls_certificate_file = \"{}\"\nloki_push_tls_private_key_file = \"{}\"\n[storage]\ndata_directory = \"{}\"\nsecrets_directory = \"{}\"\n[security]\nlocal_key_file = \"{}\"\n",
         std::path::Path::new("/tmp")
             .join(root.file_name().unwrap_or_default())
             .with_extension("sock")
             .display(),
+        certificate.display(),
+        private_key.display(),
+        certificate.display(),
+        private_key.display(),
+        certificate.display(),
+        private_key.display(),
         certificate.display(),
         private_key.display(),
         data.display(),

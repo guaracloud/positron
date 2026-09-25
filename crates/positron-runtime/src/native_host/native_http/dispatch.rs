@@ -1,5 +1,4 @@
 use std::io::{Read, Write};
-use std::net::TcpStream;
 
 use zeroize::Zeroizing;
 
@@ -18,8 +17,68 @@ use super::io::{
 };
 use crate::{HealthState, ListenerRole, Liveness, Readiness, ServiceHandle};
 
-const MAX_API_BODY_BYTES: usize = positron_api::generated::MAX_PUBLIC_REQUEST_BYTES;
+use super::MAX_API_BODY_BYTES;
 
+pub(super) fn api_body_limit(method: &str, path: &str) -> usize {
+    if method != "POST" {
+        return MAX_API_BODY_BYTES;
+    }
+    match path {
+        positron_api::api_keys::HTTP_PATH => positron_api::api_keys::MAX_REQUEST_BYTES,
+        positron_api::tenant_quotas::HTTP_PATH => positron_api::tenant_quotas::MAX_REQUEST_BYTES,
+        positron_api::tenant_lifecycle::HTTP_PATH => {
+            positron_api::tenant_lifecycle::MAX_REQUEST_BYTES
+        },
+        positron_api::tenant_retention::PREVIEW_HTTP_PATH
+        | positron_api::tenant_retention::UPDATE_HTTP_PATH => {
+            positron_api::tenant_retention::MAX_REQUEST_BYTES
+        },
+        positron_api::tenant_aliases::HTTP_PATH => positron_api::tenant_aliases::MAX_REQUEST_BYTES,
+        positron_api::tenant_service::CREATE_HTTP_PATH
+        | positron_api::tenant_service::INSPECT_HTTP_PATH
+        | positron_api::tenant_service::LIST_HTTP_PATH
+        | positron_api::tenant_service::UPDATE_DISPLAY_NAME_HTTP_PATH => {
+            positron_api::tenant_service::MAX_REQUEST_BYTES
+        },
+        positron_api::policy::HTTP_VALIDATE_PATH => positron_api::policy::MAX_REQUEST_BYTES,
+        positron_api::policy::HTTP_TEST_PATH => positron_api::policy::MAX_TEST_REQUEST_BYTES,
+        positron_api::policy::HTTP_DIFF_PATH => positron_api::policy::MAX_DIFF_REQUEST_BYTES,
+        positron_api::policy::HTTP_EXPLAIN_PATH => positron_api::policy::MAX_EXPLAIN_REQUEST_BYTES,
+        positron_api::policy::HTTP_ACTIVATE_PATH => {
+            positron_api::policy::MAX_ACTIVATE_REQUEST_BYTES
+        },
+        "/v1/capabilities:negotiate" => MAX_API_BODY_BYTES,
+        _ => MAX_API_BODY_BYTES,
+    }
+}
+
+pub(super) fn api_supports(method: &str, path: &str) -> bool {
+    method == "POST" && api_path_is_known(path)
+}
+
+fn api_path_is_known(path: &str) -> bool {
+    matches!(
+        path,
+        positron_api::api_keys::HTTP_PATH
+            | positron_api::tenant_quotas::HTTP_PATH
+            | positron_api::tenant_lifecycle::HTTP_PATH
+            | positron_api::tenant_retention::PREVIEW_HTTP_PATH
+            | positron_api::tenant_retention::UPDATE_HTTP_PATH
+            | positron_api::tenant_aliases::HTTP_PATH
+            | positron_api::tenant_service::CREATE_HTTP_PATH
+            | positron_api::tenant_service::INSPECT_HTTP_PATH
+            | positron_api::tenant_service::LIST_HTTP_PATH
+            | positron_api::tenant_service::UPDATE_DISPLAY_NAME_HTTP_PATH
+            | positron_api::policy::HTTP_VALIDATE_PATH
+            | positron_api::policy::HTTP_TEST_PATH
+            | positron_api::policy::HTTP_DIFF_PATH
+            | positron_api::policy::HTTP_EXPLAIN_PATH
+            | positron_api::policy::HTTP_ACTIVATE_PATH
+            | "/v1/capabilities:negotiate"
+    )
+}
+
+#[allow(dead_code)]
 pub(super) fn route_tls_api<S: Read + Write>(
     stream: &mut S,
     mut head: RequestHead,
@@ -234,31 +293,13 @@ pub(super) fn route_tls_api<S: Read + Write>(
             let body = read_body(stream, head.content_length, MAX_API_BODY_BYTES)?;
             Ok(capability_response(services.negotiate_capability(&body)))
         },
-        (
-            _,
-            positron_api::api_keys::HTTP_PATH
-            | positron_api::tenant_quotas::HTTP_PATH
-            | positron_api::tenant_lifecycle::HTTP_PATH
-            | positron_api::tenant_retention::PREVIEW_HTTP_PATH
-            | positron_api::tenant_retention::UPDATE_HTTP_PATH
-            | positron_api::tenant_aliases::HTTP_PATH
-            | positron_api::tenant_service::CREATE_HTTP_PATH
-            | positron_api::tenant_service::INSPECT_HTTP_PATH
-            | positron_api::tenant_service::LIST_HTTP_PATH
-            | positron_api::tenant_service::UPDATE_DISPLAY_NAME_HTTP_PATH
-            | positron_api::policy::HTTP_VALIDATE_PATH
-            | positron_api::policy::HTTP_TEST_PATH
-            | positron_api::policy::HTTP_DIFF_PATH
-            | positron_api::policy::HTTP_EXPLAIN_PATH
-            | positron_api::policy::HTTP_ACTIVATE_PATH
-            | "/v1/capabilities:negotiate",
-        ) => Ok(Response::empty(405)),
+        (_, path) if api_path_is_known(path) => Ok(Response::empty(405)),
         _ => Ok(Response::empty(404)),
     }
 }
 
-pub(super) fn route(
-    stream: &mut TcpStream,
+pub(super) fn route<S: Read + Write>(
+    stream: &mut S,
     role: ListenerRole,
     peer: std::net::SocketAddr,
     trusted_proxy: Option<TrustedProxy>,
@@ -479,12 +520,12 @@ pub(super) fn route(
         (ListenerRole::Operations, "GET", "/health/live") => Ok(health_response(
             health.liveness() == Liveness::Live,
             "live",
-            health.security_warning(),
+            &health.security_warnings(),
         )),
         (ListenerRole::Operations, "GET", "/health/ready") => Ok(health_response(
             health.readiness() == Readiness::Ready,
             "ready",
-            health.security_warning(),
+            &health.security_warnings(),
         )),
         (ListenerRole::Operations, "GET", "/status") => {
             let bearer = Zeroizing::new(head.bearer.take().ok_or_else(|| {
@@ -531,22 +572,8 @@ pub(super) fn route(
             super::super::otlp_http::receive_from(stream, head, peer, trusted_proxy, services)
         },
         (ListenerRole::Operations, _, "/health/live" | "/health/ready" | "/status")
-        | (ListenerRole::Api, _, "/v1/capabilities:negotiate")
-        | (ListenerRole::Api, _, positron_api::api_keys::HTTP_PATH)
-        | (ListenerRole::Api, _, positron_api::tenant_quotas::HTTP_PATH)
-        | (ListenerRole::Api, _, positron_api::tenant_retention::PREVIEW_HTTP_PATH)
-        | (ListenerRole::Api, _, positron_api::tenant_retention::UPDATE_HTTP_PATH)
-        | (ListenerRole::Api, _, positron_api::tenant_aliases::HTTP_PATH)
-        | (ListenerRole::Api, _, positron_api::tenant_service::CREATE_HTTP_PATH)
-        | (ListenerRole::Api, _, positron_api::tenant_service::INSPECT_HTTP_PATH)
-        | (ListenerRole::Api, _, positron_api::tenant_service::LIST_HTTP_PATH)
-        | (ListenerRole::Api, _, positron_api::tenant_service::UPDATE_DISPLAY_NAME_HTTP_PATH)
-        | (ListenerRole::Api, _, positron_api::policy::HTTP_VALIDATE_PATH)
-        | (ListenerRole::Api, _, positron_api::policy::HTTP_TEST_PATH)
-        | (ListenerRole::Api, _, positron_api::policy::HTTP_DIFF_PATH)
-        | (ListenerRole::Api, _, positron_api::policy::HTTP_EXPLAIN_PATH)
-        | (ListenerRole::Api, _, positron_api::policy::HTTP_ACTIVATE_PATH)
         | (ListenerRole::OtlpHttp, _, "/v1/logs" | "/v1/traces") => Ok(Response::empty(405)),
+        (ListenerRole::Api, _, path) if api_path_is_known(path) => Ok(Response::empty(405)),
         (ListenerRole::LokiPush, _, "/loki/api/v1/push" | "/otlp/v1/logs") => {
             Ok(Response::empty(405))
         },

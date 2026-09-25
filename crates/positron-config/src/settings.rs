@@ -78,6 +78,10 @@ pub enum SettingKind {
     String,
     /// A bounded list of named durable-export destination scopes.
     ExportDestinations,
+    /// A bounded list of literal trusted-proxy CIDRs.
+    TrustedProxyCidrs,
+    /// A bounded list of exact browser origins permitted on the API listener.
+    CorsAllowedOrigins,
 }
 
 impl SettingKind {
@@ -87,6 +91,8 @@ impl SettingKind {
             Self::Integer => "integer",
             Self::String => "string",
             Self::ExportDestinations => "export_destinations",
+            Self::TrustedProxyCidrs => "trusted_proxy_cidrs",
+            Self::CorsAllowedOrigins => "cors_allowed_origins",
         }
     }
 }
@@ -99,7 +105,7 @@ pub enum ValueDomain {
     /// One of the listed stable string values.
     StringEnumeration(&'static [&'static str]),
     /// An inclusive unsigned-integer range.
-    UnsignedIntegerRange(u16, u16),
+    UnsignedIntegerRange(u32, u32),
     /// A socket address with a byte ceiling whose IP must be loopback.
     LoopbackSocketAddress(usize),
     /// A socket address whose transport policy decides whether public binding is safe.
@@ -110,6 +116,10 @@ pub enum ValueDomain {
     ProtectedAbsolutePath(usize),
     /// Bounded named durable-export destination definitions.
     ExportDestinations(usize, usize, usize),
+    /// Bounded literal IPv4 or IPv6 CIDRs for one listener profile.
+    TrustedProxyCidrs(usize, usize),
+    /// Bounded exact `http` or `https` origins for the API listener.
+    CorsAllowedOrigins(usize, usize),
 }
 
 /// The exact source policy declared for one setting.
@@ -203,6 +213,7 @@ impl SettingDefinition {
 
 /// Canonical settings owned by the Configuration Contract.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
 pub enum Setting {
     SchemaVersion,
     DiagnosticsLogLevel,
@@ -210,13 +221,94 @@ pub enum Setting {
     RuntimeMaxRegisteredTenants,
     ListenerControlPath,
     ListenerOperationsBindAddress,
+    ListenerOperationsTransport,
+    ListenerOperationsAcceptedSocketLimit,
+    ListenerOperationsPerAddressAcceptedSocketLimit,
+    ListenerOperationsTlsHandshakeLimit,
+    ListenerOperationsTlsHandshakeDeadlineSeconds,
+    ListenerOperationsHeaderDeadlineSeconds,
+    ListenerOperationsBodyDeadlineSeconds,
+    ListenerOperationsRequestDeadlineSeconds,
+    ListenerOperationsIdleDeadlineSeconds,
+    ListenerOperationsTlsCertificateFile,
+    ListenerOperationsTlsPrivateKeyFile,
+    ListenerOperationsTlsClientCaFile,
+    ListenerOperationsTrustedProxyCidrs,
+    ListenerOperationsForwardedHops,
     ListenerApiBindAddress,
     ListenerApiTransport,
+    ListenerApiAcceptedSocketLimit,
+    ListenerApiPerAddressAcceptedSocketLimit,
+    ListenerApiTlsHandshakeLimit,
+    ListenerApiTlsHandshakeDeadlineSeconds,
+    ListenerApiHeaderDeadlineSeconds,
+    ListenerApiBodyDeadlineSeconds,
+    ListenerApiRequestDeadlineSeconds,
+    ListenerApiIdleDeadlineSeconds,
+    ListenerApiHttp2MaxConcurrentStreams,
+    ListenerApiHttp2InitialStreamWindowBytes,
+    ListenerApiHttp2InitialConnectionWindowBytes,
+    ListenerApiHttp2MaxFrameBytes,
+    ListenerApiHttp2MaxHeaderListBytes,
+    ListenerApiHttp2MinimumPingIntervalSeconds,
+    ListenerApiCorsAllowedOrigins,
+    ListenerApiTrustedProxyCidrs,
+    ListenerApiForwardedHops,
     ListenerApiTlsCertificateFile,
     ListenerApiTlsPrivateKeyFile,
+    ListenerApiTlsClientCaFile,
     ListenerOtlpGrpcBindAddress,
+    ListenerOtlpGrpcTransport,
+    ListenerOtlpGrpcAcceptedSocketLimit,
+    ListenerOtlpGrpcPerAddressAcceptedSocketLimit,
+    ListenerOtlpGrpcTlsHandshakeLimit,
+    ListenerOtlpGrpcTlsHandshakeDeadlineSeconds,
+    ListenerOtlpGrpcHeaderDeadlineSeconds,
+    ListenerOtlpGrpcBodyDeadlineSeconds,
+    ListenerOtlpGrpcRequestDeadlineSeconds,
+    ListenerOtlpGrpcIdleDeadlineSeconds,
+    ListenerOtlpGrpcHttp2MaxConcurrentStreams,
+    ListenerOtlpGrpcHttp2InitialStreamWindowBytes,
+    ListenerOtlpGrpcHttp2InitialConnectionWindowBytes,
+    ListenerOtlpGrpcHttp2MaxFrameBytes,
+    ListenerOtlpGrpcHttp2MaxHeaderListBytes,
+    ListenerOtlpGrpcHttp2MinimumPingIntervalSeconds,
+    ListenerOtlpGrpcMaxMessageBytes,
+    ListenerOtlpGrpcTlsCertificateFile,
+    ListenerOtlpGrpcTlsPrivateKeyFile,
+    ListenerOtlpGrpcTlsClientCaFile,
+    ListenerOtlpGrpcTrustedProxyCidrs,
+    ListenerOtlpGrpcForwardedHops,
     ListenerOtlpHttpBindAddress,
+    ListenerOtlpHttpTransport,
+    ListenerOtlpHttpAcceptedSocketLimit,
+    ListenerOtlpHttpPerAddressAcceptedSocketLimit,
+    ListenerOtlpHttpTlsHandshakeLimit,
+    ListenerOtlpHttpTlsHandshakeDeadlineSeconds,
+    ListenerOtlpHttpHeaderDeadlineSeconds,
+    ListenerOtlpHttpBodyDeadlineSeconds,
+    ListenerOtlpHttpRequestDeadlineSeconds,
+    ListenerOtlpHttpIdleDeadlineSeconds,
+    ListenerOtlpHttpTlsCertificateFile,
+    ListenerOtlpHttpTlsPrivateKeyFile,
+    ListenerOtlpHttpTlsClientCaFile,
+    ListenerOtlpHttpTrustedProxyCidrs,
+    ListenerOtlpHttpForwardedHops,
     ListenerLokiPushBindAddress,
+    ListenerLokiPushTransport,
+    ListenerLokiPushAcceptedSocketLimit,
+    ListenerLokiPushPerAddressAcceptedSocketLimit,
+    ListenerLokiPushTlsHandshakeLimit,
+    ListenerLokiPushTlsHandshakeDeadlineSeconds,
+    ListenerLokiPushHeaderDeadlineSeconds,
+    ListenerLokiPushBodyDeadlineSeconds,
+    ListenerLokiPushRequestDeadlineSeconds,
+    ListenerLokiPushIdleDeadlineSeconds,
+    ListenerLokiPushTlsCertificateFile,
+    ListenerLokiPushTlsPrivateKeyFile,
+    ListenerLokiPushTlsClientCaFile,
+    ListenerLokiPushTrustedProxyCidrs,
+    ListenerLokiPushForwardedHops,
     StorageDataDirectory,
     StorageSecretsDirectory,
     SecurityLocalKeyFile,
@@ -249,8 +341,21 @@ impl Setting {
             Self::SchemaVersion
                 | Self::ListenerControlPath
                 | Self::ListenerApiTransport
+                | Self::ListenerOperationsTlsCertificateFile
+                | Self::ListenerOperationsTlsPrivateKeyFile
+                | Self::ListenerOperationsTlsClientCaFile
                 | Self::ListenerApiTlsCertificateFile
                 | Self::ListenerApiTlsPrivateKeyFile
+                | Self::ListenerApiTlsClientCaFile
+                | Self::ListenerOtlpGrpcTlsCertificateFile
+                | Self::ListenerOtlpGrpcTlsPrivateKeyFile
+                | Self::ListenerOtlpGrpcTlsClientCaFile
+                | Self::ListenerOtlpHttpTlsCertificateFile
+                | Self::ListenerOtlpHttpTlsPrivateKeyFile
+                | Self::ListenerOtlpHttpTlsClientCaFile
+                | Self::ListenerLokiPushTlsCertificateFile
+                | Self::ListenerLokiPushTlsPrivateKeyFile
+                | Self::ListenerLokiPushTlsClientCaFile
                 | Self::StorageDataDirectory
                 | Self::StorageSecretsDirectory
                 | Self::SecurityLocalKeyFile
@@ -262,42 +367,5 @@ impl Setting {
 /// Returns the Rust-owned canonical definition for one setting.
 #[must_use]
 pub const fn setting_definition(setting: Setting) -> SettingDefinition {
-    let [
-        schema_version,
-        diagnostics_log_level,
-        runtime_shutdown_grace_seconds,
-        runtime_max_registered_tenants,
-        listener_control_path,
-        listener_operations_bind_address,
-        listener_api_bind_address,
-        listener_api_transport,
-        listener_api_tls_certificate_file,
-        listener_api_tls_private_key_file,
-        listener_otlp_grpc_bind_address,
-        listener_otlp_http_bind_address,
-        listener_loki_push_bind_address,
-        storage_data_directory,
-        storage_secrets_directory,
-        security_local_key_file,
-        export_destinations,
-    ] = contract::SETTING_DEFINITIONS;
-    match setting {
-        Setting::SchemaVersion => schema_version,
-        Setting::DiagnosticsLogLevel => diagnostics_log_level,
-        Setting::RuntimeShutdownGraceSeconds => runtime_shutdown_grace_seconds,
-        Setting::RuntimeMaxRegisteredTenants => runtime_max_registered_tenants,
-        Setting::ListenerControlPath => listener_control_path,
-        Setting::ListenerOperationsBindAddress => listener_operations_bind_address,
-        Setting::ListenerApiBindAddress => listener_api_bind_address,
-        Setting::ListenerApiTransport => listener_api_transport,
-        Setting::ListenerApiTlsCertificateFile => listener_api_tls_certificate_file,
-        Setting::ListenerApiTlsPrivateKeyFile => listener_api_tls_private_key_file,
-        Setting::ListenerOtlpGrpcBindAddress => listener_otlp_grpc_bind_address,
-        Setting::ListenerOtlpHttpBindAddress => listener_otlp_http_bind_address,
-        Setting::ListenerLokiPushBindAddress => listener_loki_push_bind_address,
-        Setting::StorageDataDirectory => storage_data_directory,
-        Setting::StorageSecretsDirectory => storage_secrets_directory,
-        Setting::SecurityLocalKeyFile => security_local_key_file,
-        Setting::ExportDestinations => export_destinations,
-    }
+    contract::SETTING_DEFINITIONS[super::setting_index(setting)]
 }

@@ -91,7 +91,10 @@ pub trait RegisteredTask {
 
 pub trait RunningTask {
     fn poll_join(&mut self) -> Result<Option<TaskJoinOutcome>, TaskFailure>;
-    fn join(&mut self) -> Result<TaskJoinOutcome, TaskFailure>;
+    fn join_within(
+        &mut self,
+        remaining: std::time::Duration,
+    ) -> Result<TaskJoinOutcome, TaskFailure>;
     fn abort(&mut self) -> Result<(), TaskFailure>;
 }
 

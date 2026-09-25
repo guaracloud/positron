@@ -14,6 +14,7 @@ use opentelemetry_proto::tonic::collector::trace::v1::trace_service_client::Trac
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
+use positron_config::NetworkListenerRole;
 use positron_ingest::{
     AdmissionGroupOutcome, IngestFailureCode, IngestOutcome, IngestRequestOutcome,
     NativeLogAdmissionGroups,
@@ -22,7 +23,7 @@ use positron_kernel::MountQualification;
 use tonic::Code;
 
 use super::super::serve;
-use crate::native_host::{Admission, NativeListener};
+use crate::native_host::{Admission, NativeListener, TransportProfile, compiled_http2_profile};
 use crate::services::ReceiverTestBackend;
 use crate::{
     BootstrapPaths, InitializationPlan, InstanceBootstrap, ListenerRole, ServiceHandle,
@@ -281,9 +282,14 @@ impl ReceiverHarness {
             role: ListenerRole::OtlpGrpc,
             listener: NativeListener::Tcp(listener),
             accepting: AtomicBool::new(true),
+            accepted_connections: AtomicUsize::new(0),
             control_path: None,
-            api_transport: None,
+            transport: Some(TransportProfile::plaintext_opt_out()),
             trusted_proxy: None,
+            connection_admission: None,
+            connection_protection: None,
+            http2_profile: compiled_http2_profile(NetworkListenerRole::OtlpGrpc)?,
+            cors_allowed_origins: Vec::new(),
         });
         let cancellation = TaskCancellation::new();
         let serve_cancellation = cancellation.clone();

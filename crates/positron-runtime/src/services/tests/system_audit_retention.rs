@@ -1,10 +1,11 @@
 use std::error::Error;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::num::NonZeroU64;
 
 use positron_domain::identity::{Scope, TenantId, TenantSlug};
 use positron_governance::{
-    AdministrativeIdempotencyKey, CompatibilityHints, PresentedCredential, RequestedIntent,
-    ResourceGeneration,
+    AdministrativeIdempotencyKey, CompatibilityHints, ListenerTransportAuditRequest,
+    ListenerTransportRole, PresentedCredential, RequestedIntent, ResourceGeneration,
 };
 use positron_kernel::{
     CatalogObject, CatalogProposal, CatalogPublicationFault, FormatEpoch, TransactionId,
@@ -13,6 +14,57 @@ use positron_kernel::{
 
 use super::schema_maintenance::{Fixture, open_catalog};
 use crate::BootstrapFailureCode;
+
+#[test]
+fn retention_accepts_distinct_role_receipts_from_one_joint_plaintext_transaction()
+-> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let (initialized, _, _, administrator_secret) = fixture.initialized_with_admin()?;
+    let catalog = open_catalog(&initialized)?;
+    let snapshot = catalog.pin()?;
+    let mut objects = snapshot
+        .object_identities()
+        .map(|identity| {
+            snapshot
+                .object(identity)?
+                .ok_or_else(|| "catalog object".into())
+                .and_then(|bytes| CatalogObject::new(bytes.to_vec()).map_err(Into::into))
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    let transaction = TransactionId::new([0x77; 16])?;
+    let target = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8_080);
+    let audit_position = snapshot.governance_audit_frontier() + 1;
+    for role in [ListenerTransportRole::Api, ListenerTransportRole::OtlpHttp] {
+        objects.push(
+            positron_governance::plaintext_listener_transport_receipt_object(
+                initialized.instance_id(),
+                transaction,
+                ListenerTransportAuditRequest::configuration_file_listener(role, target),
+                audit_position,
+            )?,
+        );
+    }
+    catalog.commit(
+        snapshot.identity(),
+        CatalogProposal::new(transaction, FormatEpoch::CATALOG_V1, objects)?,
+        None,
+    )?;
+    drop((snapshot, catalog));
+
+    let actor = initialized.attribute(
+        PresentedCredential::parse(&administrator_secret)?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let update = initialized.update_system_audit_retention(
+        actor,
+        NonZeroU64::new(64).ok_or("nonzero retained audit-record limit")?,
+        ResourceGeneration::new(1)?,
+        AdministrativeIdempotencyKey::new([0x78; 16])?,
+    )?;
+    assert_eq!(update.policy_generation(), ResourceGeneration::new(2)?);
+    Ok(())
+}
 
 #[test]
 fn system_audit_retention_replays_an_immutable_receipt_after_successor_compaction_and_reopen()

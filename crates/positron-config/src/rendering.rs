@@ -65,6 +65,7 @@ pub fn render_json_schema() -> String {
                 .path()
                 .split_once('.')
                 .is_some_and(|(path_section, _)| path_section == section)
+                && definition.path().split('.').count() == 2
         }) {
             let Some((_, field)) = definition.path().split_once('.') else {
                 continue;
@@ -75,10 +76,53 @@ pub fn render_json_schema() -> String {
             output.push_str(&format!("\"{field}\": {}", render_schema_value(definition)));
             first = false;
         }
+        if section == "listener" {
+            append_listener_role_schema(&mut output, &mut first, &definitions);
+        }
         output.push_str("}}");
     }
     output.push_str("\n  },\n  \"required\": [\"schema_version\"]\n}\n");
     output
+}
+
+fn append_listener_role_schema(
+    output: &mut String,
+    first: &mut bool,
+    definitions: &[SettingDefinition],
+) {
+    for role in ["operations", "api", "otlp_grpc", "otlp_http", "loki_push"] {
+        let cidr_path = format!("listener.{role}.trusted_proxy_cidrs");
+        let hop_path = format!("listener.{role}.forwarded_hops");
+        let cidrs = definitions
+            .iter()
+            .copied()
+            .find(|definition| definition.path() == cidr_path);
+        let hops = definitions
+            .iter()
+            .copied()
+            .find(|definition| definition.path() == hop_path);
+        let cors = (role == "api")
+            .then(|| {
+                definitions
+                    .iter()
+                    .copied()
+                    .find(|definition| definition.path() == "listener.api.cors_allowed_origins")
+            })
+            .flatten();
+        let (Some(cidrs), Some(hops)) = (cidrs, hops) else {
+            continue;
+        };
+        if !*first {
+            output.push_str(", ");
+        }
+        output.push_str(&format!(
+            "\"{role}\": {{\"type\": \"object\", \"additionalProperties\": false, \"properties\": {{\"trusted_proxy_cidrs\": {}, \"forwarded_hops\": {}{}}}}}",
+            render_schema_value(cidrs),
+            render_schema_value(hops),
+            cors.map_or_else(String::new, |definition| format!(", \"cors_allowed_origins\": {}", render_schema_value(definition))),
+        ));
+        *first = false;
+    }
 }
 
 fn render_schema_value(definition: SettingDefinition) -> String {
@@ -108,6 +152,12 @@ fn render_schema_value(definition: SettingDefinition) -> String {
         ValueDomain::ExportDestinations(maximum, maximum_name_bytes, maximum_tenants) => format!(
             "{{\"type\": \"array\", \"maxItems\": {maximum}, \"items\": {{\"type\": \"object\", \"additionalProperties\": false, \"required\": [\"name\", \"identity\", \"allowed_tenants\"], \"properties\": {{\"name\": {{\"type\": \"string\", \"minLength\": 1, \"maxLength\": {maximum_name_bytes}, \"pattern\": \"^[a-z0-9]+(?:-[a-z0-9]+)*$\"}}, \"identity\": {{\"type\": \"string\", \"pattern\": \"^[0-9a-f]{{32}}$\", \"not\": {{\"const\": \"00000000000000000000000000000000\"}}}}, \"allowed_tenants\": {{\"type\": \"array\", \"minItems\": 1, \"maxItems\": {maximum_tenants}, \"uniqueItems\": true, \"items\": {{\"type\": \"string\", \"pattern\": \"^[0-9a-f]{{8}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{12}}$\"}}}}}}}}}}"
         ),
+        ValueDomain::TrustedProxyCidrs(maximum_entries, maximum_entry_bytes) => format!(
+            "{{\"type\": \"array\", \"maxItems\": {maximum_entries}, \"items\": {{\"type\": \"string\", \"maxLength\": {maximum_entry_bytes}, \"x-positron-address-kind\": \"literal-ip-cidr\"}}}}"
+        ),
+        ValueDomain::CorsAllowedOrigins(maximum_entries, maximum_entry_bytes) => format!(
+            "{{\"type\": \"array\", \"maxItems\": {maximum_entries}, \"uniqueItems\": true, \"items\": {{\"type\": \"string\", \"maxLength\": {maximum_entry_bytes}, \"x-positron-origin-kind\": \"exact-http-or-https-origin\"}}}}"
+        ),
     }
 }
 
@@ -118,7 +168,21 @@ fn render_path_schema(definition: SettingDefinition, maximum: usize, protected: 
     }
     match definition.setting() {
         Setting::ListenerControlPath => output.push_str(", \"x-positron-path-kind\": \"absolute\""),
-        Setting::ListenerApiTlsCertificateFile | Setting::ListenerApiTlsPrivateKeyFile => {
+        Setting::ListenerOperationsTlsCertificateFile
+        | Setting::ListenerOperationsTlsPrivateKeyFile
+        | Setting::ListenerOperationsTlsClientCaFile
+        | Setting::ListenerApiTlsCertificateFile
+        | Setting::ListenerApiTlsPrivateKeyFile
+        | Setting::ListenerApiTlsClientCaFile
+        | Setting::ListenerOtlpGrpcTlsCertificateFile
+        | Setting::ListenerOtlpGrpcTlsPrivateKeyFile
+        | Setting::ListenerOtlpGrpcTlsClientCaFile
+        | Setting::ListenerOtlpHttpTlsCertificateFile
+        | Setting::ListenerOtlpHttpTlsPrivateKeyFile
+        | Setting::ListenerOtlpHttpTlsClientCaFile
+        | Setting::ListenerLokiPushTlsCertificateFile
+        | Setting::ListenerLokiPushTlsPrivateKeyFile
+        | Setting::ListenerLokiPushTlsClientCaFile => {
             output.push_str(", \"x-positron-path-kind\": \"protected-absolute\"");
         },
         Setting::SecurityLocalKeyFile if protected => output.push_str(
@@ -139,12 +203,28 @@ pub fn render_reference() -> String {
     for definition in setting_definitions() {
         let default = if definition.secrecy() == SecrecyClass::SecretBearing {
             "<redacted protected-file reference>"
-        } else if definition.setting() == Setting::ExportDestinations {
+        } else if matches!(
+            definition.setting(),
+            Setting::ExportDestinations
+                | Setting::ListenerOperationsTrustedProxyCidrs
+                | Setting::ListenerApiTrustedProxyCidrs
+                | Setting::ListenerOtlpGrpcTrustedProxyCidrs
+                | Setting::ListenerOtlpHttpTrustedProxyCidrs
+                | Setting::ListenerLokiPushTrustedProxyCidrs
+        ) {
             "disabled"
         } else {
             definition.default_value()
         };
-        let default = if definition.setting() == Setting::ExportDestinations {
+        let default = if matches!(
+            definition.setting(),
+            Setting::ExportDestinations
+                | Setting::ListenerOperationsTrustedProxyCidrs
+                | Setting::ListenerApiTrustedProxyCidrs
+                | Setting::ListenerOtlpGrpcTrustedProxyCidrs
+                | Setting::ListenerOtlpHttpTrustedProxyCidrs
+                | Setting::ListenerLokiPushTrustedProxyCidrs
+        ) {
             default.to_owned()
         } else {
             format!("`{default}`")
@@ -186,6 +266,7 @@ pub fn render_example() -> String {
             .filter(|definition| {
                 definition.secrecy() == SecrecyClass::Public
                     && definition.kind() != SettingKind::ExportDestinations
+                    && definition.path().split('.').count() == 2
                     && definition.path().starts_with(&format!("{section}."))
             })
             .collect::<Vec<_>>();
@@ -195,6 +276,9 @@ pub fn render_example() -> String {
         output.push_str(&format!("\n[{section}]\n"));
         for definition in settings {
             append_example_setting(&mut output, definition);
+        }
+        if section == "listener" {
+            append_proxy_trust_example(&mut output);
         }
     }
     output
@@ -209,14 +293,30 @@ fn append_example_setting(output: &mut String, definition: SettingDefinition) {
     let value = match definition.kind() {
         SettingKind::Integer => definition.default_value().to_owned(),
         SettingKind::String => render_toml_basic_string(definition.default_value()),
-        SettingKind::ExportDestinations => return,
+        SettingKind::ExportDestinations
+        | SettingKind::TrustedProxyCidrs
+        | SettingKind::CorsAllowedOrigins => return,
     };
     output.push_str(&format!("{field} = {value}\n"));
+}
+
+fn append_proxy_trust_example(output: &mut String) {
+    for role in ["operations", "api", "otlp_grpc", "otlp_http", "loki_push"] {
+        output.push_str("\n[listener.");
+        output.push_str(role);
+        output.push_str("]\ntrusted_proxy_cidrs = []\nforwarded_hops = 0\n");
+    }
 }
 
 fn reference_kind(definition: SettingDefinition) -> &'static str {
     match definition.setting() {
         Setting::ExportDestinations => "array of tables",
+        Setting::ListenerApiCorsAllowedOrigins => "array",
+        Setting::ListenerOperationsTrustedProxyCidrs
+        | Setting::ListenerApiTrustedProxyCidrs
+        | Setting::ListenerOtlpGrpcTrustedProxyCidrs
+        | Setting::ListenerOtlpHttpTrustedProxyCidrs
+        | Setting::ListenerLokiPushTrustedProxyCidrs => "array",
         _ => definition.kind().as_str(),
     }
 }
@@ -225,7 +325,60 @@ fn reference_domain(definition: SettingDefinition) -> String {
     match definition.setting() {
         Setting::RuntimeMaxRegisteredTenants => "`1..=1024`; maximum tenant quotas simultaneously registered in the live Resource Governor, including the default tenant and a pending non-admittable tenant-creation reservation".to_owned(),
         Setting::ListenerApiBindAddress => "socket address; at most 256 bytes; non-loopback requires TLS or the explicit plaintext opt-out".to_owned(),
-        Setting::ListenerApiTransport => "`tls`, `plaintext`; plaintext emits a configuration warning, persistent ready health warning, and one redacted governance audit record".to_owned(),
+        Setting::ListenerApiTransport => "`tls`, `mtls`, `plaintext`; plaintext emits a configuration warning, persistent ready health warning, and one redacted governance audit record".to_owned(),
+        Setting::ListenerOperationsAcceptedSocketLimit
+        | Setting::ListenerApiAcceptedSocketLimit
+        | Setting::ListenerOtlpGrpcAcceptedSocketLimit
+        | Setting::ListenerOtlpHttpAcceptedSocketLimit
+        | Setting::ListenerLokiPushAcceptedSocketLimit => "`1..=4096`; maximum accepted sockets awaiting authentication for this listener role".to_owned(),
+        Setting::ListenerOperationsPerAddressAcceptedSocketLimit
+        | Setting::ListenerApiPerAddressAcceptedSocketLimit
+        | Setting::ListenerOtlpGrpcPerAddressAcceptedSocketLimit
+        | Setting::ListenerOtlpHttpPerAddressAcceptedSocketLimit
+        | Setting::ListenerLokiPushPerAddressAcceptedSocketLimit => "`1..=4096`; maximum accepted sockets awaiting authentication from one immediate peer address; cannot exceed this role's accepted-socket limit".to_owned(),
+        Setting::ListenerOperationsTlsHandshakeLimit
+        | Setting::ListenerApiTlsHandshakeLimit
+        | Setting::ListenerOtlpGrpcTlsHandshakeLimit
+        | Setting::ListenerOtlpHttpTlsHandshakeLimit
+        | Setting::ListenerLokiPushTlsHandshakeLimit => "`1..=128`; maximum concurrent TLS handshakes for this listener role before authentication".to_owned(),
+        Setting::ListenerOperationsTlsHandshakeDeadlineSeconds
+        | Setting::ListenerApiTlsHandshakeDeadlineSeconds
+        | Setting::ListenerOtlpGrpcTlsHandshakeDeadlineSeconds
+        | Setting::ListenerOtlpHttpTlsHandshakeDeadlineSeconds
+        | Setting::ListenerLokiPushTlsHandshakeDeadlineSeconds => "`1..=300` seconds; deadline for each TLS handshake before authentication".to_owned(),
+        Setting::ListenerOperationsHeaderDeadlineSeconds
+        | Setting::ListenerApiHeaderDeadlineSeconds
+        | Setting::ListenerOtlpGrpcHeaderDeadlineSeconds
+        | Setting::ListenerOtlpHttpHeaderDeadlineSeconds
+        | Setting::ListenerLokiPushHeaderDeadlineSeconds => "`1..=300` seconds; deadline for receiving one request header block".to_owned(),
+        Setting::ListenerOperationsBodyDeadlineSeconds
+        | Setting::ListenerApiBodyDeadlineSeconds
+        | Setting::ListenerOtlpGrpcBodyDeadlineSeconds
+        | Setting::ListenerOtlpHttpBodyDeadlineSeconds
+        | Setting::ListenerLokiPushBodyDeadlineSeconds => "`1..=300` seconds; deadline for receiving one request body".to_owned(),
+        Setting::ListenerOperationsRequestDeadlineSeconds
+        | Setting::ListenerApiRequestDeadlineSeconds
+        | Setting::ListenerOtlpGrpcRequestDeadlineSeconds
+        | Setting::ListenerOtlpHttpRequestDeadlineSeconds
+        | Setting::ListenerLokiPushRequestDeadlineSeconds => "`1..=300` seconds; deadline for handling one request".to_owned(),
+        Setting::ListenerOperationsIdleDeadlineSeconds
+        | Setting::ListenerApiIdleDeadlineSeconds
+        | Setting::ListenerOtlpGrpcIdleDeadlineSeconds
+        | Setting::ListenerOtlpHttpIdleDeadlineSeconds
+        | Setting::ListenerLokiPushIdleDeadlineSeconds => "`1..=300` seconds; maximum idle connection duration".to_owned(),
+        Setting::ListenerApiHttp2MaxConcurrentStreams
+        | Setting::ListenerOtlpGrpcHttp2MaxConcurrentStreams => "`1..=1024`; maximum concurrent HTTP/2 request streams per accepted connection".to_owned(),
+        Setting::ListenerApiHttp2InitialStreamWindowBytes
+        | Setting::ListenerOtlpGrpcHttp2InitialStreamWindowBytes => "`1..=2147483647` bytes; advertised HTTP/2 flow-control window for each stream".to_owned(),
+        Setting::ListenerApiHttp2InitialConnectionWindowBytes
+        | Setting::ListenerOtlpGrpcHttp2InitialConnectionWindowBytes => "`1..=2147483647` bytes; advertised HTTP/2 connection flow-control window".to_owned(),
+        Setting::ListenerApiHttp2MaxFrameBytes
+        | Setting::ListenerOtlpGrpcHttp2MaxFrameBytes => "`16384..=16777215` bytes; maximum accepted HTTP/2 frame payload".to_owned(),
+        Setting::ListenerApiHttp2MaxHeaderListBytes
+        | Setting::ListenerOtlpGrpcHttp2MaxHeaderListBytes => "`1..=1048576` bytes; maximum decoded HTTP/2 header-list size".to_owned(),
+        Setting::ListenerApiHttp2MinimumPingIntervalSeconds
+        | Setting::ListenerOtlpGrpcHttp2MinimumPingIntervalSeconds => "`1..=300` seconds; minimum interval between non-ACK peer HTTP/2 PING frames; an earlier PING closes the connection".to_owned(),
+        Setting::ListenerOtlpGrpcMaxMessageBytes => "`1..=16777216` bytes; transport gRPC message ceiling before decoding; an authenticated tenant's value profile may narrow it".to_owned(),
         Setting::SecurityLocalKeyFile => "protected absolute path under `storage.secrets_directory`, named `local-root-key.v1`; at most 256 bytes".to_owned(),
         _ => match definition.domain() {
             ValueDomain::ExactUnsignedInteger(value) => format!("exactly `{value}`"),
@@ -236,6 +389,8 @@ fn reference_domain(definition: SettingDefinition) -> String {
             ValueDomain::AbsolutePath(maximum) => format!("absolute path; at most {maximum} bytes"),
             ValueDomain::ProtectedAbsolutePath(maximum) => format!("protected absolute path; at most {maximum} bytes"),
             ValueDomain::ExportDestinations(maximum, name, tenants) => format!("at most {maximum} named destinations; each has a lowercase `name` of at most {name} bytes, a nonzero 16-byte lowercase hexadecimal `identity`, and one to {tenants} unique canonical `allowed_tenants`"),
+            ValueDomain::TrustedProxyCidrs(maximum, maximum_bytes) => format!("at most {maximum} literal IPv4 or IPv6 CIDRs, each at most {maximum_bytes} bytes; forwarded headers remain ignored unless this list and the matching nonzero fixed hop count are both configured"),
+            ValueDomain::CorsAllowedOrigins(maximum, maximum_bytes) => format!("at most {maximum} exact `http` or `https` origins, each at most {maximum_bytes} bytes; CORS is disabled when the list is empty and never enables credential forwarding"),
         },
     }
 }

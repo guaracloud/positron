@@ -23,7 +23,10 @@ fn generated_validation_fixtures_execute_through_the_public_resolver() -> Result
         include_str!("../../../../configuration/reference.md")
     );
     let example = generated_example();
-    assert_eq!(example, include_str!("../../../../configuration/example.toml"));
+    assert_eq!(
+        example,
+        include_str!("../../../../configuration/example.toml")
+    );
     inputs(Some(&example), [], []).and_then(resolve)?;
 
     for fixture in fixtures {
@@ -70,13 +73,17 @@ fn generated_schema_covers_every_canonical_setting_with_its_declared_constraints
         let property = schema_property(properties, definition.path())?;
         match definition.domain() {
             ValueDomain::ExactUnsignedInteger(value) => {
-                assert_eq!(property.get("const").and_then(serde_json::Value::as_u64), Some(u64::from(value)));
+                assert_eq!(
+                    property.get("const").and_then(serde_json::Value::as_u64),
+                    Some(u64::from(value))
+                );
             },
             ValueDomain::StringEnumeration(values) => {
-                let generated_values = property
-                    .get("enum")
-                    .and_then(serde_json::Value::as_array)
-                    .ok_or_else(|| io::Error::other("generated enum is missing"))?;
+                let generated_values =
+                    property
+                        .get("enum")
+                        .and_then(serde_json::Value::as_array)
+                        .ok_or_else(|| io::Error::other("generated enum is missing"))?;
                 assert_eq!(generated_values.len(), values.len());
                 for expected in values {
                     assert!(
@@ -87,30 +94,81 @@ fn generated_schema_covers_every_canonical_setting_with_its_declared_constraints
                 }
             },
             ValueDomain::UnsignedIntegerRange(minimum, maximum) => {
-                assert_eq!(property.get("type").and_then(serde_json::Value::as_str), Some("integer"));
-                assert_eq!(property.get("minimum").and_then(serde_json::Value::as_u64), Some(u64::from(minimum)));
-                assert_eq!(property.get("maximum").and_then(serde_json::Value::as_u64), Some(u64::from(maximum)));
+                assert_eq!(
+                    property.get("type").and_then(serde_json::Value::as_str),
+                    Some("integer")
+                );
+                assert_eq!(
+                    property.get("minimum").and_then(serde_json::Value::as_u64),
+                    Some(u64::from(minimum))
+                );
+                assert_eq!(
+                    property.get("maximum").and_then(serde_json::Value::as_u64),
+                    Some(u64::from(maximum))
+                );
             },
             ValueDomain::LoopbackSocketAddress(maximum) => {
-                assert_eq!(property.get("maxLength").and_then(serde_json::Value::as_u64), Some(maximum as u64));
-                assert_eq!(property.get("x-positron-address-scope").and_then(serde_json::Value::as_str), Some("loopback-only"));
+                assert_eq!(
+                    property
+                        .get("maxLength")
+                        .and_then(serde_json::Value::as_u64),
+                    Some(maximum as u64)
+                );
+                assert_eq!(
+                    property
+                        .get("x-positron-address-scope")
+                        .and_then(serde_json::Value::as_str),
+                    Some("loopback-only")
+                );
             },
             ValueDomain::SocketAddress(maximum) => {
-                assert_eq!(property.get("maxLength").and_then(serde_json::Value::as_u64), Some(maximum as u64));
-                assert_eq!(property.get("x-positron-address-scope").and_then(serde_json::Value::as_str), Some("tls-or-explicit-plaintext-opt-out-off-loopback"));
+                assert_eq!(
+                    property
+                        .get("maxLength")
+                        .and_then(serde_json::Value::as_u64),
+                    Some(maximum as u64)
+                );
+                assert_eq!(
+                    property
+                        .get("x-positron-address-scope")
+                        .and_then(serde_json::Value::as_str),
+                    Some("tls-or-explicit-plaintext-opt-out-off-loopback")
+                );
             },
             ValueDomain::AbsolutePath(maximum) | ValueDomain::ProtectedAbsolutePath(maximum) => {
-                assert_eq!(property.get("maxLength").and_then(serde_json::Value::as_u64), Some(maximum as u64));
+                assert_eq!(
+                    property
+                        .get("maxLength")
+                        .and_then(serde_json::Value::as_u64),
+                    Some(maximum as u64)
+                );
             },
             ValueDomain::ExportDestinations(maximum, maximum_name_bytes, maximum_tenants) => {
-                assert_eq!(property.get("maxItems").and_then(serde_json::Value::as_u64), Some(maximum as u64));
+                assert_eq!(
+                    property.get("maxItems").and_then(serde_json::Value::as_u64),
+                    Some(maximum as u64)
+                );
                 let item_properties = property
                     .get("items")
                     .and_then(|items| items.get("properties"))
                     .and_then(serde_json::Value::as_object)
-                    .ok_or_else(|| io::Error::other("generated export destination item is missing properties"))?;
-                assert_eq!(item_properties.get("name").and_then(|name| name.get("maxLength")).and_then(serde_json::Value::as_u64), Some(maximum_name_bytes as u64));
-                assert_eq!(item_properties.get("allowed_tenants").and_then(|tenants| tenants.get("maxItems")).and_then(serde_json::Value::as_u64), Some(maximum_tenants as u64));
+                    .ok_or_else(|| {
+                        io::Error::other("generated export destination item is missing properties")
+                    })?;
+                assert_eq!(
+                    item_properties
+                        .get("name")
+                        .and_then(|name| name.get("maxLength"))
+                        .and_then(serde_json::Value::as_u64),
+                    Some(maximum_name_bytes as u64)
+                );
+                assert_eq!(
+                    item_properties
+                        .get("allowed_tenants")
+                        .and_then(|tenants| tenants.get("maxItems"))
+                        .and_then(serde_json::Value::as_u64),
+                    Some(maximum_tenants as u64)
+                );
                 assert_eq!(
                     item_properties
                         .get("identity")
@@ -120,9 +178,56 @@ fn generated_schema_covers_every_canonical_setting_with_its_declared_constraints
                     Some("00000000000000000000000000000000")
                 );
             },
+            ValueDomain::TrustedProxyCidrs(maximum, maximum_entry_bytes) => {
+                assert_eq!(
+                    property.get("type").and_then(serde_json::Value::as_str),
+                    Some("array")
+                );
+                assert_eq!(
+                    property.get("maxItems").and_then(serde_json::Value::as_u64),
+                    Some(maximum as u64)
+                );
+                let items = property.get("items").ok_or_else(|| {
+                    io::Error::other("generated trusted proxy CIDR items missing")
+                })?;
+                assert_eq!(
+                    items.get("type").and_then(serde_json::Value::as_str),
+                    Some("string")
+                );
+                assert_eq!(
+                    items.get("maxLength").and_then(serde_json::Value::as_u64),
+                    Some(maximum_entry_bytes as u64)
+                );
+                assert_eq!(
+                    items
+                        .get("x-positron-address-kind")
+                        .and_then(serde_json::Value::as_str),
+                    Some("literal-ip-cidr")
+                );
+            },
+            ValueDomain::CorsAllowedOrigins(maximum, maximum_entry_bytes) => {
+                assert_eq!(
+                    property.get("type").and_then(serde_json::Value::as_str),
+                    Some("array")
+                );
+                assert_eq!(
+                    property.get("maxItems").and_then(serde_json::Value::as_u64),
+                    Some(maximum as u64)
+                );
+                assert_eq!(
+                    property
+                        .get("items")
+                        .and_then(|items| items.get("maxLength"))
+                        .and_then(serde_json::Value::as_u64),
+                    Some(maximum_entry_bytes as u64)
+                );
+            },
         }
         assert_eq!(
-            property.get("writeOnly").and_then(serde_json::Value::as_bool).unwrap_or(false),
+            property
+                .get("writeOnly")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
             definition.secrecy() == SecrecyClass::SecretBearing,
             "{}",
             definition.path()
@@ -135,18 +240,20 @@ fn schema_property<'a>(
     root: &'a serde_json::Map<String, serde_json::Value>,
     path: &str,
 ) -> Result<&'a serde_json::Value, Box<dyn Error>> {
-    if !path.contains('.') {
-        return root
-            .get(path)
-            .ok_or_else(|| io::Error::other(format!("generated schema is missing `{path}`")).into());
+    let mut segments = path.split('.');
+    let Some(first) = segments.next() else {
+        return Err(io::Error::other("invalid empty setting path").into());
+    };
+    let mut property = root
+        .get(first)
+        .ok_or_else(|| io::Error::other(format!("generated schema is missing `{path}`")))?;
+    for segment in segments {
+        property = property
+            .get("properties")
+            .and_then(|properties| properties.get(segment))
+            .ok_or_else(|| io::Error::other(format!("generated schema is missing `{path}`")))?;
     }
-    let (section, field) = path
-        .split_once('.')
-        .ok_or_else(|| io::Error::other(format!("invalid setting path `{path}`")))?;
-    root.get(section)
-        .and_then(|section| section.get("properties"))
-        .and_then(|properties| properties.get(field))
-        .ok_or_else(|| io::Error::other(format!("generated schema is missing `{path}`")).into())
+    Ok(property)
 }
 
 fn parse_generated_configuration_fixtures(
@@ -331,7 +438,7 @@ fn exposes_the_complete_canonical_setting_contract_and_compiled_defaults()
             "listener.operations_bind_address",
             SettingKind::String,
             "127.0.0.1:13133",
-            ValueDomain::LoopbackSocketAddress(256),
+            ValueDomain::SocketAddress(256),
             SecrecyClass::Public,
             ProvenancePolicy::NonSecretOverrides,
             MutabilityClass::DrainAndReload,
@@ -351,7 +458,7 @@ fn exposes_the_complete_canonical_setting_contract_and_compiled_defaults()
             "listener.api_transport",
             SettingKind::String,
             "tls",
-            ValueDomain::StringEnumeration(&["tls", "plaintext"]),
+            ValueDomain::StringEnumeration(&["tls", "mtls", "plaintext"]),
             SecrecyClass::Public,
             ProvenancePolicy::ConfigurationFileOnly,
             MutabilityClass::DrainAndReload,
@@ -381,7 +488,7 @@ fn exposes_the_complete_canonical_setting_contract_and_compiled_defaults()
             "listener.otlp_grpc_bind_address",
             SettingKind::String,
             "127.0.0.1:4317",
-            ValueDomain::LoopbackSocketAddress(256),
+            ValueDomain::SocketAddress(256),
             SecrecyClass::Public,
             ProvenancePolicy::NonSecretOverrides,
             MutabilityClass::DrainAndReload,
@@ -391,7 +498,7 @@ fn exposes_the_complete_canonical_setting_contract_and_compiled_defaults()
             "listener.otlp_http_bind_address",
             SettingKind::String,
             "127.0.0.1:4318",
-            ValueDomain::LoopbackSocketAddress(256),
+            ValueDomain::SocketAddress(256),
             SecrecyClass::Public,
             ProvenancePolicy::NonSecretOverrides,
             MutabilityClass::DrainAndReload,
@@ -401,7 +508,7 @@ fn exposes_the_complete_canonical_setting_contract_and_compiled_defaults()
             "listener.loki_push_bind_address",
             SettingKind::String,
             "127.0.0.1:3100",
-            ValueDomain::LoopbackSocketAddress(256),
+            ValueDomain::SocketAddress(256),
             SecrecyClass::Public,
             ProvenancePolicy::NonSecretOverrides,
             MutabilityClass::DrainAndReload,
@@ -500,13 +607,75 @@ fn exposes_the_complete_canonical_setting_contract_and_compiled_defaults()
          [runtime]\nshutdown_grace_seconds = 30\nmax_registered_tenants = 2\n\n\
          [listener]\ncontrol_path = \"/var/run/positron/control.sock\"\n\
          operations_bind_address = \"127.0.0.1:13133\"\n\
+         operations_transport = \"tls\"\n\
+         operations_accepted_socket_limit = 128\n\
+         operations_per_address_accepted_socket_limit = 16\n\
+         operations_tls_handshake_limit = 16\n\
+         operations_tls_handshake_deadline_seconds = 2\n\
+         operations_header_deadline_seconds = 2\n\
+         operations_body_deadline_seconds = 2\n\
+         operations_request_deadline_seconds = 30\n\
+         operations_idle_deadline_seconds = 30\n\
+         operations_tls_certificate_file = \"<redacted>\"\n\
+         operations_tls_private_key_file = \"<redacted>\"\n\
+         operations_tls_client_ca_file = \"<redacted>\"\n\
          api_bind_address = \"127.0.0.1:8080\"\n\
          api_transport = \"tls\"\n\
+         api_accepted_socket_limit = 128\n\
+         api_per_address_accepted_socket_limit = 16\n\
+         api_tls_handshake_limit = 16\n\
+         api_tls_handshake_deadline_seconds = 2\n\
+         api_header_deadline_seconds = 2\n\
+         api_body_deadline_seconds = 2\n\
+         api_request_deadline_seconds = 30\n\
+         api_idle_deadline_seconds = 30\n\
          api_tls_certificate_file = \"<redacted>\"\n\
          api_tls_private_key_file = \"<redacted>\"\n\
+         api_tls_client_ca_file = \"<redacted>\"\n\
          otlp_grpc_bind_address = \"127.0.0.1:4317\"\n\
+         otlp_grpc_transport = \"tls\"\n\
+         otlp_grpc_accepted_socket_limit = 128\n\
+         otlp_grpc_per_address_accepted_socket_limit = 16\n\
+         otlp_grpc_tls_handshake_limit = 16\n\
+         otlp_grpc_tls_handshake_deadline_seconds = 2\n\
+         otlp_grpc_header_deadline_seconds = 2\n\
+         otlp_grpc_body_deadline_seconds = 2\n\
+         otlp_grpc_request_deadline_seconds = 30\n\
+         otlp_grpc_idle_deadline_seconds = 30\n\
+         otlp_grpc_tls_certificate_file = \"<redacted>\"\n\
+         otlp_grpc_tls_private_key_file = \"<redacted>\"\n\
+         otlp_grpc_tls_client_ca_file = \"<redacted>\"\n\
          otlp_http_bind_address = \"127.0.0.1:4318\"\n\
-         loki_push_bind_address = \"127.0.0.1:3100\"\n\n\
+         otlp_http_transport = \"tls\"\n\
+         otlp_http_accepted_socket_limit = 128\n\
+         otlp_http_per_address_accepted_socket_limit = 16\n\
+         otlp_http_tls_handshake_limit = 16\n\
+         otlp_http_tls_handshake_deadline_seconds = 2\n\
+         otlp_http_header_deadline_seconds = 2\n\
+         otlp_http_body_deadline_seconds = 2\n\
+         otlp_http_request_deadline_seconds = 30\n\
+         otlp_http_idle_deadline_seconds = 30\n\
+         otlp_http_tls_certificate_file = \"<redacted>\"\n\
+         otlp_http_tls_private_key_file = \"<redacted>\"\n\
+         otlp_http_tls_client_ca_file = \"<redacted>\"\n\
+         loki_push_bind_address = \"127.0.0.1:3100\"\n\
+         loki_push_transport = \"tls\"\n\
+         loki_push_accepted_socket_limit = 128\n\
+         loki_push_per_address_accepted_socket_limit = 16\n\
+         loki_push_tls_handshake_limit = 16\n\
+         loki_push_tls_handshake_deadline_seconds = 2\n\
+         loki_push_header_deadline_seconds = 2\n\
+         loki_push_body_deadline_seconds = 2\n\
+         loki_push_request_deadline_seconds = 30\n\
+         loki_push_idle_deadline_seconds = 30\n\
+         loki_push_tls_certificate_file = \"<redacted>\"\n\
+         loki_push_tls_private_key_file = \"<redacted>\"\n\
+         loki_push_tls_client_ca_file = \"<redacted>\"\n\n\
+         [listener.operations]\ntrusted_proxy_cidrs = []\nforwarded_hops = 0\n\n\
+         [listener.api]\ntrusted_proxy_cidrs = []\nforwarded_hops = 0\n\n\
+         [listener.otlp_grpc]\ntrusted_proxy_cidrs = []\nforwarded_hops = 0\n\n\
+         [listener.otlp_http]\ntrusted_proxy_cidrs = []\nforwarded_hops = 0\n\n\
+         [listener.loki_push]\ntrusted_proxy_cidrs = []\nforwarded_hops = 0\n\n\
          [storage]\ndata_directory = \"/var/lib/positron\"\n\
          secrets_directory = \"/var/lib/positron-secrets\"\n\n\
          [security]\nlocal_key_file = \"<redacted>\"\n"

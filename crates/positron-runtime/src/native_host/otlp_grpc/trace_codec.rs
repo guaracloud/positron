@@ -3,6 +3,7 @@ use std::io::Read;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use bytes::Bytes;
 use http_body::{Frame, SizeHint};
@@ -24,6 +25,8 @@ use tonic::{Request, Response, Status};
 
 use crate::services::ReceiverAdmissionLease;
 
+use super::deadline_body::DeadlineBody;
+
 const EXPORT_PATH: &str = "/opentelemetry.proto.collector.trace.v1.TraceService/Export";
 const SERVICE_NAME: &str = "opentelemetry.proto.collector.trace.v1.TraceService";
 
@@ -31,6 +34,8 @@ const SERVICE_NAME: &str = "opentelemetry.proto.collector.trace.v1.TraceService"
 pub(super) struct OtlpTracesServer<T> {
     inner: Arc<T>,
     accepted_compression: EnabledCompressionEncodings,
+    body_deadline: Duration,
+    maximum_decoding_bytes: Option<usize>,
 }
 
 impl<T> OtlpTracesServer<T> {
@@ -38,11 +43,23 @@ impl<T> OtlpTracesServer<T> {
         Self {
             inner: Arc::new(inner),
             accepted_compression: EnabledCompressionEncodings::default(),
+            body_deadline: Duration::from_secs(2),
+            maximum_decoding_bytes: None,
         }
     }
 
     pub(super) fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
         self.accepted_compression.enable(encoding);
+        self
+    }
+
+    pub(super) const fn body_deadline(mut self, deadline: Duration) -> Self {
+        self.body_deadline = deadline;
+        self
+    }
+
+    pub(super) const fn max_decoding_message_size(mut self, limit: usize) -> Self {
+        self.maximum_decoding_bytes = Some(limit);
         self
     }
 }
@@ -52,6 +69,8 @@ impl<T> Clone for OtlpTracesServer<T> {
         Self {
             inner: Arc::clone(&self.inner),
             accepted_compression: self.accepted_compression,
+            body_deadline: self.body_deadline,
+            maximum_decoding_bytes: self.maximum_decoding_bytes,
         }
     }
 }
@@ -59,7 +78,7 @@ impl<T> Clone for OtlpTracesServer<T> {
 impl<T, B> Service<http::Request<B>> for OtlpTracesServer<T>
 where
     T: TraceService,
-    B: Body + Send + 'static,
+    B: Body<Data = Bytes> + Send + 'static,
     B::Error: Into<StdError> + Send + 'static,
 {
     type Response = http::Response<tonic::body::Body>;
@@ -96,7 +115,10 @@ where
             .get("grpc-encoding")
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
+        let body_deadline = self.body_deadline;
+        let maximum_decoding_bytes = self.maximum_decoding_bytes;
         let request = request.map(|body| {
+            let body = DeadlineBody::new(body, body_deadline);
             BoundedGrpcBody::new(
                 body,
                 compressed_limit,
@@ -114,6 +136,8 @@ where
             let tonic_message_limit = decompressed_limit
                 .checked_add(5)
                 .map_or(usize::MAX, |limit| compressed_limit.max(limit));
+            let tonic_message_limit = maximum_decoding_bytes
+                .map_or(tonic_message_limit, |limit| tonic_message_limit.min(limit));
             let mut grpc = tonic::server::Grpc::new(OtlpTracesCodec {
                 profile,
                 measurement,

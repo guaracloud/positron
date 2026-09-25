@@ -22,6 +22,8 @@ bytes = "=1.12.1"
 flate2 = { version = "=1.0.24", default-features = false, features = ["rust_backend"] }
 http-body = "=1.1.0"
 http = { version = "=1.5.0", default-features = false }
+hyper = { version = "=1.11.1", default-features = false, features = ["http1", "http2", "server"] }
+hyper-util = { version = "=0.1.20", default-features = false, features = ["server-auto", "tokio"] }
 opentelemetry-proto = { version = "=0.32.0", default-features = false, features = ["gen-tonic", "logs", "trace", "with-serde"] }
 positron-api = { path = "../positron-api" }
 positron-config = { path = "../positron-config" }
@@ -37,8 +39,9 @@ serde_json = "=1.0.149"
 sha2 = { version = "=0.11.0", default-features = false }
 rustls = { version = "=0.23.43", default-features = false, features = ["ring", "std", "tls12"] }
 tokio = { version = "=1.53.1", default-features = false, features = ["net", "rt", "time"] }
+tokio-rustls = { version = "=0.26.5", default-features = false }
 tokio-stream = { version = "=0.1.19", default-features = false, features = ["net"] }
-tonic = { version = "=0.14.6", default-features = false, features = ["gzip", "router", "transport"] }
+tonic = { version = "=0.14.6", default-features = false, features = ["gzip", "router", "transport", "tls-ring"] }
 tower = { version = "=0.5.3", default-features = false, features = ["util"] }
 zeroize = { version = "=1.9.0", default-features = false, features = ["alloc"] }
 
@@ -51,8 +54,8 @@ opentelemetry-http = { version = "=0.32.0", default-features = false }
 opentelemetry-otlp = { version = "=0.32.0", default-features = false, features = ["grpc-tonic", "http-proto", "logs"] }
 opentelemetry-proto = { version = "=0.32.0", default-features = false, features = ["gen-tonic", "logs", "trace"] }
 opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["logs"] }
-tokio = { version = "=1.53.1", default-features = false, features = ["macros", "rt", "time"] }
-tonic = { version = "=0.14.6", default-features = false, features = ["router", "transport"] }
+tokio = { version = "=1.53.1", default-features = false, features = ["macros", "rt", "rt-multi-thread", "time"] }
+tonic = { version = "=0.14.6", default-features = false, features = ["router", "transport", "tls-ring"] }
 tracing = "=0.1.44"
 tracing-loki = { version = "=0.2.7", default-features = false, features = ["compat-0-2-1"] }
 tracing-subscriber = { version = "=0.3.22", default-features = false, features = ["registry"] }

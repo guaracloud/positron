@@ -33,7 +33,7 @@ fn rust_owned_definitions_keep_runtime_and_generated_constraints_in_parity()
     }
 
     let listener = setting_definition(Setting::ListenerOperationsBindAddress);
-    assert_eq!(listener.domain(), ValueDomain::LoopbackSocketAddress(256));
+    assert_eq!(listener.domain(), ValueDomain::SocketAddress(256));
     let non_loopback = inputs(
         Some(
             "schema_version = 1\n\
@@ -44,18 +44,92 @@ fn rust_owned_definitions_keep_runtime_and_generated_constraints_in_parity()
         [],
     )
     .and_then(resolve);
-    assert!(matches!(
-        non_loopback,
-        Err(error)
-            if error.code() == ConfigurationFailureCode::UnsafeCombination
-                && error.source()
-                    == positron_config::FailureSource::ListenerOperationsBindAddress
-    ));
+    assert!(non_loopback.is_ok());
 
     let schema = generated_json_schema();
     assert!(schema.contains("\"minimum\": 1, \"maximum\": 3600"));
-    assert!(schema.contains("\"x-positron-address-scope\": \"loopback-only\""));
+    assert!(schema.contains(
+        "\"x-positron-address-scope\": \"tls-or-explicit-plaintext-opt-out-off-loopback\""
+    ));
     Ok(())
+}
+
+#[test]
+fn accepted_socket_limits_reject_zero_out_of_range_and_per_address_over_global() {
+    for (document, source) in [
+        (
+            "schema_version = 1\n[listener]\napi_accepted_socket_limit = 0\n",
+            FailureSource::ListenerApiAcceptedSocketLimit,
+        ),
+        (
+            "schema_version = 1\n[listener]\napi_per_address_accepted_socket_limit = 4097\n",
+            FailureSource::ListenerApiPerAddressAcceptedSocketLimit,
+        ),
+        (
+            "schema_version = 1\n[listener]\napi_accepted_socket_limit = 16\napi_per_address_accepted_socket_limit = 17\n",
+            FailureSource::ListenerApiPerAddressAcceptedSocketLimit,
+        ),
+    ] {
+        let result = inputs(Some(document), [], []).and_then(resolve);
+        assert!(matches!(
+            result,
+            Err(error)
+                if error.code() == ConfigurationFailureCode::UnsupportedValue
+                    && error.source() == source
+        ));
+    }
+}
+
+#[test]
+fn connection_protection_rejects_zero_and_overflow() {
+    for (document, source) in [
+        (
+            "schema_version = 1\n[listener]\napi_tls_handshake_limit = 0\n",
+            FailureSource::ListenerApiTlsHandshakeLimit,
+        ),
+        (
+            "schema_version = 1\n[listener]\napi_header_deadline_seconds = 0\n",
+            FailureSource::ListenerApiHeaderDeadlineSeconds,
+        ),
+        (
+            "schema_version = 1\n[listener]\napi_idle_deadline_seconds = 301\n",
+            FailureSource::ListenerApiIdleDeadlineSeconds,
+        ),
+    ] {
+        let result = inputs(Some(document), [], []).and_then(resolve);
+        assert!(matches!(
+            result,
+            Err(error)
+                if error.code() == ConfigurationFailureCode::UnsupportedValue
+                    && error.source() == source
+        ));
+    }
+}
+
+#[test]
+fn http2_listener_bounds_reject_zero_and_overflow() {
+    for (document, source) in [
+        (
+            "schema_version = 1\n[listener]\napi_http2_max_concurrent_streams = 0\n",
+            FailureSource::ListenerApiHttp2MaxConcurrentStreams,
+        ),
+        (
+            "schema_version = 1\n[listener]\notlp_grpc_http2_max_frame_bytes = 16383\n",
+            FailureSource::ListenerOtlpGrpcHttp2MaxFrameBytes,
+        ),
+        (
+            "schema_version = 1\n[listener]\notlp_grpc_max_message_bytes = 16777217\n",
+            FailureSource::ListenerOtlpGrpcMaxMessageBytes,
+        ),
+    ] {
+        let result = inputs(Some(document), [], []).and_then(resolve);
+        assert!(matches!(
+            result,
+            Err(error)
+                if error.code() == ConfigurationFailureCode::UnsupportedValue
+                    && error.source() == source
+        ));
+    }
 }
 
 #[test]
@@ -225,12 +299,7 @@ fn rejects_invalid_shapes_and_values_from_each_closed_value_domain() {
         [],
     )
     .and_then(resolve);
-    assert!(matches!(
-        non_loopback,
-        Err(error)
-            if error.code() == ConfigurationFailureCode::UnsafeCombination
-                && error.source() == FailureSource::ListenerOperationsBindAddress
-    ));
+    assert!(non_loopback.is_ok());
 
     for value in ["", "01", "not-a-number"] {
         let result = inputs(

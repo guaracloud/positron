@@ -112,7 +112,7 @@ fn api_transport_profile_allows_explicit_public_tls_and_plaintext() {
     assert!(
         plaintext
             .redacted_reference()
-            .contains("warning = \"public API transport is plaintext\"")
+            .contains("public API transport is plaintext")
     );
     let unused_server_trust = inputs(
         Some("schema_version = 1\n[listener]\napi_tls_trust_file = \"/secrets/ca.pem\"\n"),
@@ -124,6 +124,96 @@ fn api_transport_profile_allows_explicit_public_tls_and_plaintext() {
         unused_server_trust.is_err(),
         "server configuration must not accept an unused trust file"
     );
+}
+
+#[test]
+fn api_cors_allowed_origins_is_an_explicit_file_only_drain_and_reload_setting() {
+    let definition = setting_definition(Setting::ListenerApiCorsAllowedOrigins);
+    assert_eq!(definition.path(), "listener.api.cors_allowed_origins");
+    assert_eq!(definition.default_value(), "[]");
+    assert_eq!(definition.provenance(), ProvenancePolicy::ConfigurationFileOnly);
+    assert_eq!(definition.mutability(), MutabilityClass::DrainAndReload);
+}
+
+#[test]
+fn api_cors_allowed_origins_accept_only_bounded_exact_web_origins() {
+    let effective = inputs(
+        Some(
+            "schema_version = 1\n[listener.api]\ncors_allowed_origins = [\"https://console.example\", \"http://[2001:db8::1]:8080\"]\n",
+        ),
+        [],
+        [],
+    )
+    .and_then(resolve)
+    .expect("exact configured origins resolve");
+    let profile = effective
+        .network_listener_profile(positron_config::NetworkListenerRole::Api)
+        .expect("API profile");
+    assert_eq!(
+        profile
+            .cors_allowed_origins()
+            .expect("API CORS setting")
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["https://console.example", "http://[2001:db8::1]:8080"]
+    );
+
+    for invalid in [
+        "*",
+        "null",
+        "https://user@example.test",
+        "https://example.test/path",
+        "https://example.test?query",
+        "https://example.test#fragment",
+        "https://example.test\\r\\nInjected: value",
+        "https://[2001:0db8::1]",
+        "https://example.test:080",
+    ] {
+        let document = format!(
+            "schema_version = 1\n[listener.api]\ncors_allowed_origins = [\"{invalid}\"]\n"
+        );
+        assert!(
+            inputs(Some(&document), [], []).and_then(resolve).is_err(),
+            "must reject {invalid:?}"
+        );
+    }
+    assert!(inputs(
+        Some("schema_version = 1\n[listener.api]\ncors_allowed_origins = [\"https://console.example\", \"https://console.example\"]\n"),
+        [],
+        [],
+    )
+    .and_then(resolve)
+    .is_err());
+}
+
+#[test]
+fn complete_listener_profiles_keep_public_plaintext_an_explicit_visible_role_choice() {
+    let effective = inputs(
+        Some(
+            "schema_version = 1\n[listener]\n\
+             otlp_grpc_bind_address = \"192.0.2.9:4317\"\n\
+             otlp_grpc_transport = \"plaintext\"\n",
+        ),
+        [],
+        [],
+    )
+    .and_then(resolve)
+    .expect("an explicit per-role plaintext opt-out resolves");
+
+    let profile = effective
+        .network_listener_profile(positron_config::NetworkListenerRole::OtlpGrpc)
+        .expect("OTLP gRPC profile");
+    assert_eq!(profile.bind_address().to_string(), "192.0.2.9:4317");
+    assert_eq!(profile.transport(), positron_config::NetworkTransport::PlaintextOptOut);
+    assert!(effective.security_warnings().contains(
+        &positron_config::ConfigurationWarning::PublicPlaintextListener(
+            positron_config::NetworkListenerRole::OtlpGrpc
+        )
+    ));
+    assert!(effective
+        .redacted_reference()
+        .contains("OTLP gRPC transport is plaintext"));
 }
 
 fn assert_document_rejection<T>(

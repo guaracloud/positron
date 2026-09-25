@@ -140,15 +140,21 @@ impl ReceiverHarness {
             role: ListenerRole::LokiPush,
             listener: NativeListener::Tcp(listener),
             accepting: AtomicBool::new(true),
+            accepted_connections: AtomicUsize::new(0),
             control_path: None,
-            api_transport: None,
+            transport: None,
             trusted_proxy: None,
+            connection_admission: None,
+            connection_protection: None,
+            http2_profile: None,
+            cors_allowed_origins: Vec::new(),
         });
         let cancellation = TaskCancellation::new();
         let serve_cancellation = cancellation.clone();
+        let force = TaskCancellation::new();
         let health = ProcessState::starting().health();
         let server = std::thread::spawn(move || {
-            serve_http(admission, serve_cancellation, health, Some(services));
+            let _ = serve_http(admission, serve_cancellation, force, health, Some(services));
         });
         Ok(Self {
             endpoint,

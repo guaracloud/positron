@@ -28,8 +28,20 @@ use prost::Message;
 mod support;
 use support::*;
 
+#[path = "native_transport/api_framing.rs"]
+mod api_framing;
+#[path = "native_transport/cors.rs"]
+mod cors;
+#[path = "native_transport/h2_protection.rs"]
+mod h2_protection;
+#[path = "native_transport/http2_api.rs"]
+mod http2_api;
 #[path = "native_transport/policy_routes.rs"]
 mod policy_routes;
+#[path = "native_transport/proxy_trust.rs"]
+mod proxy_trust;
+#[path = "native_transport/socket_admission.rs"]
+mod socket_admission;
 #[path = "native_transport/tenant_administration.rs"]
 mod tenant_administration;
 #[path = "native_transport/tls_profiles.rs"]

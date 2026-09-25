@@ -140,7 +140,7 @@ impl InitializedInstance {
             )
     }
 
-    /// Records the active explicit plaintext API transport selection through
+    /// Records the active explicit plaintext listener transport selection through
     /// the Catalog's single joint governance-audit publication path.
     pub(crate) fn activate_public_plaintext_api_transport(
         &self,
@@ -152,14 +152,67 @@ impl InitializedInstance {
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
         let catalog = Catalog::open(&self._authority, self.instance, secret)
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
-        ListenerTransportAdministration::activate_public_plaintext_api(
+        ListenerTransportAdministration::activate_plaintext_listener(
             &catalog,
             self.instance,
-            positron_governance::ListenerTransportAuditRequest::configuration_file(
-                intent.api_bind_address(),
+            positron_governance::ListenerTransportAuditRequest::configuration_file_listener(
+                listener_transport_audit_role(intent.role()),
+                intent.listener_target(),
             ),
         )
         .map(|_| ())
         .map_err(map_listener_transport_failure)
+    }
+
+    pub(crate) fn record_tls_material_reload(
+        &self,
+        listener_set: positron_governance::TlsMaterialReloadListenerSet,
+        outcome: positron_governance::TlsMaterialReloadOutcome,
+        listener_set_identity: [u8; 32],
+        material_identity: [u8; 32],
+    ) -> Result<(), BootstrapFailure> {
+        let secret = self
+            .key
+            .catalog_secret(self.instance)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
+        let catalog = Catalog::open(&self._authority, self.instance, secret)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        let basis = catalog
+            .pin()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        let request = positron_governance::TlsMaterialReloadAuditRequest::new(
+            listener_set,
+            outcome,
+            listener_set_identity,
+            material_identity,
+            self.key
+                .random_identifier()
+                .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?,
+        )
+        .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        let transaction = TransactionId::new(request.transaction_id(self.instance.to_bytes()))
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        let objects = crate::configuration_catalog::successor_objects(&basis, transaction, None)?;
+        let proposal = CatalogProposal::new(transaction, FormatEpoch::CATALOG_V1, objects)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        let audit = AuditIntent::new(request.encode(self.instance.to_bytes()))
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        catalog
+            .commit(basis.identity(), proposal, Some(audit))
+            .map(|_| ())
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))
+    }
+}
+
+const fn listener_transport_audit_role(
+    role: crate::ListenerRole,
+) -> positron_governance::ListenerTransportRole {
+    match role {
+        crate::ListenerRole::Control => positron_governance::ListenerTransportRole::Control,
+        crate::ListenerRole::Operations => positron_governance::ListenerTransportRole::Operations,
+        crate::ListenerRole::Api => positron_governance::ListenerTransportRole::Api,
+        crate::ListenerRole::OtlpGrpc => positron_governance::ListenerTransportRole::OtlpGrpc,
+        crate::ListenerRole::OtlpHttp => positron_governance::ListenerTransportRole::OtlpHttp,
+        crate::ListenerRole::LokiPush => positron_governance::ListenerTransportRole::LokiPush,
     }
 }

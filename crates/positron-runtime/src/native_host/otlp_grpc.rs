@@ -1,4 +1,7 @@
+use std::io;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsService;
@@ -11,16 +14,21 @@ use opentelemetry_proto::tonic::collector::trace::v1::{
 };
 use positron_governance::{AuthorizedContext, CompatibilityHints};
 use positron_ingest::{IngestRequestOutcome, OtlpGrpcTransportEvidence};
-use tokio_stream::wrappers::TcpListenerStream;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio_rustls::TlsAcceptor;
+use tokio_stream::{Stream, StreamExt};
 use tonic::codec::CompressionEncoding;
 use tonic::service::LayerExt;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Server;
+use tonic::transport::server::{Connected, TcpConnectInfo};
 use tonic::{Request, Response, Status};
 use tower::util::MapResponseLayer;
 
+use super::api_http::IdleIo;
+use super::h2_observer::H2Observer;
 use super::otlp_outcome::{OtlpFailure, OtlpSignal};
-use super::{Admission, TrustedProxy};
+use super::{Admission, ConnectionLease, TrustedProxy};
 use crate::{ServiceFailure, ServiceHandle, TaskCancellation};
 
 const MAX_MESSAGE_BYTES: usize = 1_048_576;
@@ -29,11 +37,353 @@ mod blocking;
 use blocking::{BlockingIngestExecutor, BlockingIngestHandle};
 mod codec;
 use codec::OtlpLogsServer;
+mod deadline_body;
 mod trace_codec;
 use trace_codec::OtlpTracesServer;
 
 #[cfg(test)]
 mod tests;
+
+pub(super) struct PreparedGrpc {
+    admission: Arc<Admission>,
+    runtime: tokio::runtime::Runtime,
+    listener: tokio::net::TcpListener,
+    server: Server,
+    tls: Option<Arc<rustls::ServerConfig>>,
+    protection: crate::ConnectionProtection,
+    http2_profile: positron_config::Http2Profile,
+    services: ServiceHandle,
+    blocking: BlockingIngestExecutor,
+    blocking_handle: BlockingIngestHandle,
+}
+
+pub(super) fn prepare(
+    admission: Arc<Admission>,
+    services: Option<ServiceHandle>,
+) -> Result<PreparedGrpc, GrpcFailure> {
+    let services = services.ok_or(GrpcFailure)?;
+    let listener = admission.tcp_listener().map_err(|_| GrpcFailure)?;
+    let protection = admission.connection_protection();
+    let http2_profile = admission.http2_profile().ok_or(GrpcFailure)?;
+    let tls = admission.grpc_tls_config().map_err(|_| GrpcFailure)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| GrpcFailure)?;
+    let listener = {
+        let _entered = runtime.enter();
+        tokio::net::TcpListener::from_std(listener).map_err(|_| GrpcFailure)?
+    };
+    let server = Server::builder()
+        .timeout(protection.request_deadline())
+        .max_concurrent_streams(Some(u32::from(
+            http2_profile.max_concurrent_streams().get(),
+        )))
+        .initial_stream_window_size(Some(http2_profile.initial_stream_window_bytes().get()))
+        .initial_connection_window_size(Some(http2_profile.initial_connection_window_bytes().get()))
+        .max_frame_size(Some(http2_profile.max_frame_bytes().get()))
+        .http2_max_header_list_size(Some(http2_profile.max_header_list_bytes().get()));
+    let blocking = BlockingIngestExecutor::start()?;
+    let blocking_handle = blocking.handle()?;
+    Ok(PreparedGrpc {
+        admission,
+        runtime,
+        listener,
+        server,
+        tls,
+        protection,
+        http2_profile,
+        services,
+        blocking,
+        blocking_handle,
+    })
+}
+
+impl PreparedGrpc {
+    pub(super) fn discard(mut self) -> Result<(), GrpcFailure> {
+        self.blocking.shutdown()
+    }
+
+    pub(super) fn serve(
+        mut self,
+        cancellation: TaskCancellation,
+        force: TaskCancellation,
+    ) -> Result<(), GrpcFailure> {
+        let admission = Arc::clone(&self.admission);
+        let services = self.services.clone();
+        let blocking_handle = self.blocking_handle.clone();
+        let listener = self.listener;
+        let mut server = self.server;
+        let tls = self.tls;
+        let protection = self.protection;
+        let http2_profile = self.http2_profile;
+        let (result, forced) = self.runtime.block_on(async move {
+            let handshake_admission = Arc::clone(&admission);
+            let incoming = AdmittedIncoming {
+                listener,
+                admission: Arc::clone(&admission),
+                cancellation: cancellation.clone(),
+            }
+            .then(move |accepted| {
+                let tls = tls.clone();
+                let admission = Arc::clone(&handshake_admission);
+                async move { secure_grpc_connection(accepted, admission, tls, protection).await }
+            });
+            let authentication = services.clone();
+            let trace_authentication = services.clone();
+            let trusted_proxy = admission.trusted_proxy.clone();
+            let trace_trusted_proxy = trusted_proxy.clone();
+            let receiver = OtlpLogsServer::new(OtlpLogsGrpc {
+                services: services.clone(),
+                blocking: blocking_handle.clone(),
+            })
+            .accept_compressed(CompressionEncoding::Gzip)
+            .body_deadline(protection.body_deadline())
+            .max_decoding_message_size(
+                http2_profile
+                    .max_grpc_message_bytes()
+                    .map_or(MAX_MESSAGE_BYTES, |limit| {
+                        usize::try_from(limit.get()).unwrap_or(MAX_MESSAGE_BYTES)
+                    }),
+            );
+            let receiver = MapResponseLayer::new(map_decode_failure).named_layer(receiver);
+            let receiver = InterceptedService::new(receiver, move |request| {
+                authenticate(request, &authentication, trusted_proxy.clone())
+            });
+            let trace_receiver = OtlpTracesServer::new(OtlpTracesGrpc {
+                services,
+                blocking: blocking_handle,
+            })
+            .accept_compressed(CompressionEncoding::Gzip)
+            .body_deadline(protection.body_deadline())
+            .max_decoding_message_size(
+                http2_profile
+                    .max_grpc_message_bytes()
+                    .map_or(MAX_MESSAGE_BYTES, |limit| {
+                        usize::try_from(limit.get()).unwrap_or(MAX_MESSAGE_BYTES)
+                    }),
+            );
+            let trace_receiver =
+                MapResponseLayer::new(map_trace_decode_failure).named_layer(trace_receiver);
+            let trace_receiver = InterceptedService::new(trace_receiver, move |request| {
+                authenticate_traces(request, &trace_authentication, trace_trusted_proxy.clone())
+            });
+            let graceful_admission = Arc::clone(&admission);
+            let serving = server
+                .add_service(receiver)
+                .add_service(trace_receiver)
+                .serve_with_incoming_shutdown(incoming, async move {
+                    while graceful_admission.is_accepting() && !cancellation.is_cancelled() {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                });
+            tokio::pin!(serving);
+            tokio::select! {
+                result = &mut serving => (result.map_err(|_| GrpcFailure), false),
+                () = wait_for(force) => (Ok(()), true),
+            }
+        });
+        if forced {
+            let _worker_joined = self.blocking.shutdown_within(Duration::from_millis(100))?;
+        } else {
+            self.blocking.shutdown()?;
+        }
+        result
+    }
+}
+
+struct AdmittedIncoming {
+    listener: tokio::net::TcpListener,
+    admission: Arc<Admission>,
+    cancellation: TaskCancellation,
+}
+
+struct AdmittedTcpStream {
+    stream: Pin<Box<tokio::net::TcpStream>>,
+    _lease: ConnectionLease,
+}
+
+enum AdmittedIo {
+    Plain(AdmittedTcpStream),
+    Tls {
+        stream: Pin<Box<tokio_rustls::server::TlsStream<AdmittedTcpStream>>>,
+        connection_info: TcpConnectInfo,
+    },
+}
+
+async fn secure_grpc_connection(
+    stream: Result<AdmittedTcpStream, io::Error>,
+    admission: Arc<Admission>,
+    tls: Option<Arc<rustls::ServerConfig>>,
+    protection: crate::ConnectionProtection,
+) -> Result<H2Observer<IdleIo<AdmittedIo>>, io::Error> {
+    let stream = stream?;
+    let Some(configuration) = tls else {
+        return Ok(H2Observer::new(
+            IdleIo::new(AdmittedIo::Plain(stream), protection.idle_deadline()),
+            protection.header_deadline(),
+            admission
+                .http2_profile()
+                .ok_or_else(|| io::Error::other("missing HTTP/2 profile"))?
+                .minimum_ping_interval(),
+        ));
+    };
+    let connection_info = stream.connect_info();
+    let _handshake = admission.reserve_tls_handshake().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "TLS handshake admission limit reached",
+        )
+    })?;
+    let stream = tokio::time::timeout(
+        protection.tls_handshake_deadline(),
+        TlsAcceptor::from(configuration).accept(stream),
+    )
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TLS handshake deadline elapsed"))?
+    .map_err(io::Error::other)?;
+    Ok(H2Observer::new(
+        IdleIo::new(
+            AdmittedIo::Tls {
+                stream: Box::pin(stream),
+                connection_info,
+            },
+            protection.idle_deadline(),
+        ),
+        protection.header_deadline(),
+        admission
+            .http2_profile()
+            .ok_or_else(|| io::Error::other("missing HTTP/2 profile"))?
+            .minimum_ping_interval(),
+    ))
+}
+
+impl Stream for AdmittedIncoming {
+    type Item = Result<AdmittedTcpStream, io::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if !super::can_serve_accepted_connection(&this.admission, &this.cancellation) {
+            return Poll::Ready(None);
+        }
+        match this.listener.poll_accept(context) {
+            Poll::Ready(Ok((stream, peer))) => {
+                if !super::can_serve_accepted_connection(&this.admission, &this.cancellation) {
+                    return Poll::Ready(None);
+                }
+                match this.admission.accept_connection(peer.ip()) {
+                    Some(lease) => Poll::Ready(Some(Ok(AdmittedTcpStream {
+                        stream: Box::pin(stream),
+                        _lease: lease,
+                    }))),
+                    None => {
+                        context.waker().wake_by_ref();
+                        Poll::Pending
+                    },
+                }
+            },
+            Poll::Ready(Err(error)) => Poll::Ready(Some(Err(error))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl AsyncRead for AdmittedTcpStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        self.stream.as_mut().poll_read(context, buffer)
+    }
+}
+
+impl AsyncRead for AdmittedIo {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_read(context, buffer),
+            Self::Tls { stream, .. } => stream.as_mut().poll_read(context, buffer),
+        }
+    }
+}
+
+impl AsyncWrite for AdmittedTcpStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.stream.as_mut().poll_write(context, buffer)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.stream.as_mut().poll_flush(context)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.stream.as_mut().poll_shutdown(context)
+    }
+}
+
+impl AsyncWrite for AdmittedIo {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_write(context, buffer),
+            Self::Tls { stream, .. } => stream.as_mut().poll_write(context, buffer),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_flush(context),
+            Self::Tls { stream, .. } => stream.as_mut().poll_flush(context),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_shutdown(context),
+            Self::Tls { stream, .. } => stream.as_mut().poll_shutdown(context),
+        }
+    }
+}
+
+impl Connected for AdmittedTcpStream {
+    type ConnectInfo = TcpConnectInfo;
+
+    fn connect_info(&self) -> Self::ConnectInfo {
+        self.stream.as_ref().get_ref().connect_info()
+    }
+}
+
+impl Connected for AdmittedIo {
+    type ConnectInfo = TcpConnectInfo;
+
+    fn connect_info(&self) -> Self::ConnectInfo {
+        match self {
+            Self::Plain(stream) => stream.connect_info(),
+            Self::Tls {
+                connection_info, ..
+            } => connection_info.clone(),
+        }
+    }
+}
+
+impl Connected for IdleIo<AdmittedIo> {
+    type ConnectInfo = TcpConnectInfo;
+
+    fn connect_info(&self) -> Self::ConnectInfo {
+        self.inner().connect_info()
+    }
+}
 
 pub(super) fn serve(
     admission: Arc<Admission>,
@@ -41,64 +391,7 @@ pub(super) fn serve(
     force: TaskCancellation,
     services: Option<ServiceHandle>,
 ) -> Result<(), GrpcFailure> {
-    let services = services.ok_or(GrpcFailure)?;
-    let listener = admission.tcp_listener().map_err(|_| GrpcFailure)?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|_| GrpcFailure)?;
-    let mut blocking = BlockingIngestExecutor::start()?;
-    let blocking_handle = blocking.handle()?;
-    let (result, forced) = runtime.block_on(async move {
-        let listener = match tokio::net::TcpListener::from_std(listener) {
-            Ok(listener) => listener,
-            Err(_) => return (Err(GrpcFailure), false),
-        };
-        let incoming = TcpListenerStream::new(listener);
-        let authentication = services.clone();
-        let trace_authentication = services.clone();
-        let trusted_proxy = admission.trusted_proxy;
-        let receiver = OtlpLogsServer::new(OtlpLogsGrpc {
-            services: services.clone(),
-            blocking: blocking_handle.clone(),
-        })
-        .accept_compressed(CompressionEncoding::Gzip)
-        .max_decoding_message_size(MAX_MESSAGE_BYTES);
-        let receiver = MapResponseLayer::new(map_decode_failure).named_layer(receiver);
-        let receiver = InterceptedService::new(receiver, move |request| {
-            authenticate(request, &authentication, trusted_proxy)
-        });
-        let trace_receiver = OtlpTracesServer::new(OtlpTracesGrpc {
-            services,
-            blocking: blocking_handle,
-        })
-        .accept_compressed(CompressionEncoding::Gzip);
-        let trace_receiver =
-            MapResponseLayer::new(map_trace_decode_failure).named_layer(trace_receiver);
-        let trace_receiver = InterceptedService::new(trace_receiver, move |request| {
-            authenticate_traces(request, &trace_authentication, trusted_proxy)
-        });
-        let graceful_admission = Arc::clone(&admission);
-        let serving = Server::builder()
-            .add_service(receiver)
-            .add_service(trace_receiver)
-            .serve_with_incoming_shutdown(incoming, async move {
-                while graceful_admission.is_accepting() && !cancellation.is_cancelled() {
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-            });
-        tokio::pin!(serving);
-        tokio::select! {
-            result = &mut serving => (result.map_err(|_| GrpcFailure), false),
-            () = wait_for(force) => (Ok(()), true),
-        }
-    });
-    if forced {
-        let _worker_joined = blocking.shutdown_within(Duration::from_millis(100))?;
-    } else {
-        blocking.shutdown()?;
-    }
-    result
+    prepare(admission, services)?.serve(cancellation, force)
 }
 
 fn map_decode_failure<B>(response: http::Response<B>) -> http::Response<B> {
@@ -399,3 +692,55 @@ fn status_from_failure(failure: OtlpFailure) -> Status {
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct GrpcFailure;
+
+#[cfg(test)]
+mod admission_tests {
+    use std::future::poll_fn;
+    use std::net::{Ipv4Addr, TcpListener};
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use tokio_stream::Stream;
+
+    use super::AdmittedIncoming;
+    use crate::native_host::{Admission, NativeListener, TransportProfile};
+    use crate::{ListenerRole, TaskCancellation};
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retired_grpc_listener_does_not_admit_an_already_queued_socket()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let address = listener.local_addr()?;
+        let tokio_listener = listener.try_clone()?;
+        tokio_listener.set_nonblocking(true)?;
+        let tokio_listener = tokio::net::TcpListener::from_std(tokio_listener)?;
+        let client = tokio::net::TcpStream::connect(address).await?;
+        let admission = Arc::new(Admission {
+            role: ListenerRole::OtlpGrpc,
+            listener: NativeListener::Tcp(listener),
+            accepting: AtomicBool::new(true),
+            accepted_connections: AtomicUsize::new(0),
+            control_path: None,
+            transport: Some(TransportProfile::plaintext_opt_out()),
+            trusted_proxy: None,
+            connection_admission: None,
+            connection_protection: None,
+            http2_profile: None,
+            cors_allowed_origins: Vec::new(),
+        });
+        let cancellation = TaskCancellation::new();
+        admission.stop();
+        let mut incoming = AdmittedIncoming {
+            listener: tokio_listener,
+            admission: Arc::clone(&admission),
+            cancellation,
+        };
+
+        let next = poll_fn(|context| Pin::new(&mut incoming).poll_next(context)).await;
+        assert!(next.is_none());
+        assert_eq!(admission.accepted_connections.load(Ordering::Acquire), 0);
+        drop(client);
+        Ok(())
+    }
+}

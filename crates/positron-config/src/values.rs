@@ -7,13 +7,69 @@ use super::{Setting, ValueDomain, setting_definition, validate_path};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ApiTransport {
     Tls,
+    MutualTls,
     PlaintextOptOut,
+}
+
+/// Transport selected explicitly for one network listener role.
+///
+/// Plaintext is never a fallback: its setting is configuration-file-only and
+/// is surfaced by the resolved configuration as a durable warning.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NetworkTransport {
+    Tls,
+    MutualTls,
+    PlaintextOptOut,
+}
+
+impl NetworkTransport {
+    pub(crate) fn parse(value: &str, source: FailureSource) -> Result<Self, ConfigurationFailure> {
+        match value {
+            "tls" => Ok(Self::Tls),
+            "mtls" => Ok(Self::MutualTls),
+            "plaintext" => Ok(Self::PlaintextOptOut),
+            _ => Err(ConfigurationFailure::unsupported_value(source)),
+        }
+    }
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Tls => "tls",
+            Self::MutualTls => "mtls",
+            Self::PlaintextOptOut => "plaintext",
+        }
+    }
+}
+
+/// The closed network-facing listener roles configured by the contract.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NetworkListenerRole {
+    Operations,
+    Api,
+    OtlpGrpc,
+    OtlpHttp,
+    LokiPush,
+}
+
+impl NetworkListenerRole {
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Operations => "operations",
+            Self::Api => "API",
+            Self::OtlpGrpc => "OTLP gRPC",
+            Self::OtlpHttp => "OTLP HTTP",
+            Self::LokiPush => "Loki push",
+        }
+    }
 }
 
 impl ApiTransport {
     pub(crate) fn parse(value: &str) -> Result<Self, ConfigurationFailure> {
         match value {
             "tls" => Ok(Self::Tls),
+            "mtls" => Ok(Self::MutualTls),
             "plaintext" => Ok(Self::PlaintextOptOut),
             _ => Err(ConfigurationFailure::unsupported_value(
                 FailureSource::ListenerApiTransport,
@@ -25,6 +81,7 @@ impl ApiTransport {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Tls => "tls",
+            Self::MutualTls => "mtls",
             Self::PlaintextOptOut => "plaintext",
         }
     }
@@ -165,13 +222,94 @@ pub enum FailureSource {
     RuntimeMaxRegisteredTenants,
     ListenerControlPath,
     ListenerOperationsBindAddress,
+    ListenerOperationsTransport,
+    ListenerOperationsAcceptedSocketLimit,
+    ListenerOperationsPerAddressAcceptedSocketLimit,
+    ListenerOperationsTlsHandshakeLimit,
+    ListenerOperationsTlsHandshakeDeadlineSeconds,
+    ListenerOperationsHeaderDeadlineSeconds,
+    ListenerOperationsBodyDeadlineSeconds,
+    ListenerOperationsRequestDeadlineSeconds,
+    ListenerOperationsIdleDeadlineSeconds,
+    ListenerOperationsTlsCertificateFile,
+    ListenerOperationsTlsPrivateKeyFile,
+    ListenerOperationsTlsClientCaFile,
+    ListenerOperationsTrustedProxyCidrs,
+    ListenerOperationsForwardedHops,
     ListenerApiBindAddress,
     ListenerApiTransport,
+    ListenerApiAcceptedSocketLimit,
+    ListenerApiPerAddressAcceptedSocketLimit,
+    ListenerApiTlsHandshakeLimit,
+    ListenerApiTlsHandshakeDeadlineSeconds,
+    ListenerApiHeaderDeadlineSeconds,
+    ListenerApiBodyDeadlineSeconds,
+    ListenerApiRequestDeadlineSeconds,
+    ListenerApiIdleDeadlineSeconds,
+    ListenerApiHttp2MaxConcurrentStreams,
+    ListenerApiHttp2InitialStreamWindowBytes,
+    ListenerApiHttp2InitialConnectionWindowBytes,
+    ListenerApiHttp2MaxFrameBytes,
+    ListenerApiHttp2MaxHeaderListBytes,
+    ListenerApiHttp2MinimumPingIntervalSeconds,
+    ListenerApiCorsAllowedOrigins,
+    ListenerApiTrustedProxyCidrs,
+    ListenerApiForwardedHops,
     ListenerApiTlsCertificateFile,
     ListenerApiTlsPrivateKeyFile,
+    ListenerApiTlsClientCaFile,
     ListenerOtlpGrpcBindAddress,
+    ListenerOtlpGrpcTransport,
+    ListenerOtlpGrpcAcceptedSocketLimit,
+    ListenerOtlpGrpcPerAddressAcceptedSocketLimit,
+    ListenerOtlpGrpcTlsHandshakeLimit,
+    ListenerOtlpGrpcTlsHandshakeDeadlineSeconds,
+    ListenerOtlpGrpcHeaderDeadlineSeconds,
+    ListenerOtlpGrpcBodyDeadlineSeconds,
+    ListenerOtlpGrpcRequestDeadlineSeconds,
+    ListenerOtlpGrpcIdleDeadlineSeconds,
+    ListenerOtlpGrpcHttp2MaxConcurrentStreams,
+    ListenerOtlpGrpcHttp2InitialStreamWindowBytes,
+    ListenerOtlpGrpcHttp2InitialConnectionWindowBytes,
+    ListenerOtlpGrpcHttp2MaxFrameBytes,
+    ListenerOtlpGrpcHttp2MaxHeaderListBytes,
+    ListenerOtlpGrpcHttp2MinimumPingIntervalSeconds,
+    ListenerOtlpGrpcMaxMessageBytes,
+    ListenerOtlpGrpcTlsCertificateFile,
+    ListenerOtlpGrpcTlsPrivateKeyFile,
+    ListenerOtlpGrpcTlsClientCaFile,
+    ListenerOtlpGrpcTrustedProxyCidrs,
+    ListenerOtlpGrpcForwardedHops,
     ListenerOtlpHttpBindAddress,
+    ListenerOtlpHttpTransport,
+    ListenerOtlpHttpAcceptedSocketLimit,
+    ListenerOtlpHttpPerAddressAcceptedSocketLimit,
+    ListenerOtlpHttpTlsHandshakeLimit,
+    ListenerOtlpHttpTlsHandshakeDeadlineSeconds,
+    ListenerOtlpHttpHeaderDeadlineSeconds,
+    ListenerOtlpHttpBodyDeadlineSeconds,
+    ListenerOtlpHttpRequestDeadlineSeconds,
+    ListenerOtlpHttpIdleDeadlineSeconds,
+    ListenerOtlpHttpTlsCertificateFile,
+    ListenerOtlpHttpTlsPrivateKeyFile,
+    ListenerOtlpHttpTlsClientCaFile,
+    ListenerOtlpHttpTrustedProxyCidrs,
+    ListenerOtlpHttpForwardedHops,
     ListenerLokiPushBindAddress,
+    ListenerLokiPushTransport,
+    ListenerLokiPushAcceptedSocketLimit,
+    ListenerLokiPushPerAddressAcceptedSocketLimit,
+    ListenerLokiPushTlsHandshakeLimit,
+    ListenerLokiPushTlsHandshakeDeadlineSeconds,
+    ListenerLokiPushHeaderDeadlineSeconds,
+    ListenerLokiPushBodyDeadlineSeconds,
+    ListenerLokiPushRequestDeadlineSeconds,
+    ListenerLokiPushIdleDeadlineSeconds,
+    ListenerLokiPushTlsCertificateFile,
+    ListenerLokiPushTlsPrivateKeyFile,
+    ListenerLokiPushTlsClientCaFile,
+    ListenerLokiPushTrustedProxyCidrs,
+    ListenerLokiPushForwardedHops,
     StorageDataDirectory,
     StorageSecretsDirectory,
     SecurityLocalKeyFile,
@@ -191,13 +329,156 @@ impl FailureSource {
             Self::RuntimeMaxRegisteredTenants => "runtime.max_registered_tenants",
             Self::ListenerControlPath => "listener.control_path",
             Self::ListenerOperationsBindAddress => "listener.operations_bind_address",
+            Self::ListenerOperationsTransport => "listener.operations_transport",
+            Self::ListenerOperationsAcceptedSocketLimit => {
+                "listener.operations_accepted_socket_limit"
+            },
+            Self::ListenerOperationsPerAddressAcceptedSocketLimit => {
+                "listener.operations_per_address_accepted_socket_limit"
+            },
+            Self::ListenerOperationsTlsHandshakeLimit => "listener.operations_tls_handshake_limit",
+            Self::ListenerOperationsTlsHandshakeDeadlineSeconds => {
+                "listener.operations_tls_handshake_deadline_seconds"
+            },
+            Self::ListenerOperationsHeaderDeadlineSeconds => {
+                "listener.operations_header_deadline_seconds"
+            },
+            Self::ListenerOperationsBodyDeadlineSeconds => {
+                "listener.operations_body_deadline_seconds"
+            },
+            Self::ListenerOperationsRequestDeadlineSeconds => {
+                "listener.operations_request_deadline_seconds"
+            },
+            Self::ListenerOperationsIdleDeadlineSeconds => {
+                "listener.operations_idle_deadline_seconds"
+            },
+            Self::ListenerOperationsTlsCertificateFile => {
+                "listener.operations_tls_certificate_file"
+            },
+            Self::ListenerOperationsTlsPrivateKeyFile => "listener.operations_tls_private_key_file",
+            Self::ListenerOperationsTlsClientCaFile => "listener.operations_tls_client_ca_file",
+            Self::ListenerOperationsTrustedProxyCidrs => "listener.operations.trusted_proxy_cidrs",
+            Self::ListenerOperationsForwardedHops => "listener.operations.forwarded_hops",
             Self::ListenerApiBindAddress => "listener.api_bind_address",
             Self::ListenerApiTransport => "listener.api_transport",
+            Self::ListenerApiAcceptedSocketLimit => "listener.api_accepted_socket_limit",
+            Self::ListenerApiPerAddressAcceptedSocketLimit => {
+                "listener.api_per_address_accepted_socket_limit"
+            },
+            Self::ListenerApiTlsHandshakeLimit => "listener.api_tls_handshake_limit",
+            Self::ListenerApiTlsHandshakeDeadlineSeconds => {
+                "listener.api_tls_handshake_deadline_seconds"
+            },
+            Self::ListenerApiHeaderDeadlineSeconds => "listener.api_header_deadline_seconds",
+            Self::ListenerApiBodyDeadlineSeconds => "listener.api_body_deadline_seconds",
+            Self::ListenerApiRequestDeadlineSeconds => "listener.api_request_deadline_seconds",
+            Self::ListenerApiIdleDeadlineSeconds => "listener.api_idle_deadline_seconds",
+            Self::ListenerApiHttp2MaxConcurrentStreams => {
+                "listener.api_http2_max_concurrent_streams"
+            },
+            Self::ListenerApiHttp2InitialStreamWindowBytes => {
+                "listener.api_http2_initial_stream_window_bytes"
+            },
+            Self::ListenerApiHttp2InitialConnectionWindowBytes => {
+                "listener.api_http2_initial_connection_window_bytes"
+            },
+            Self::ListenerApiHttp2MaxFrameBytes => "listener.api_http2_max_frame_bytes",
+            Self::ListenerApiHttp2MaxHeaderListBytes => "listener.api_http2_max_header_list_bytes",
+            Self::ListenerApiHttp2MinimumPingIntervalSeconds => {
+                "listener.api_http2_minimum_ping_interval_seconds"
+            },
+            Self::ListenerApiCorsAllowedOrigins => "listener.api.cors_allowed_origins",
+            Self::ListenerApiTrustedProxyCidrs => "listener.api.trusted_proxy_cidrs",
+            Self::ListenerApiForwardedHops => "listener.api.forwarded_hops",
             Self::ListenerApiTlsCertificateFile => "listener.api_tls_certificate_file",
             Self::ListenerApiTlsPrivateKeyFile => "listener.api_tls_private_key_file",
+            Self::ListenerApiTlsClientCaFile => "listener.api_tls_client_ca_file",
             Self::ListenerOtlpGrpcBindAddress => "listener.otlp_grpc_bind_address",
+            Self::ListenerOtlpGrpcTransport => "listener.otlp_grpc_transport",
+            Self::ListenerOtlpGrpcAcceptedSocketLimit => "listener.otlp_grpc_accepted_socket_limit",
+            Self::ListenerOtlpGrpcPerAddressAcceptedSocketLimit => {
+                "listener.otlp_grpc_per_address_accepted_socket_limit"
+            },
+            Self::ListenerOtlpGrpcTlsHandshakeLimit => "listener.otlp_grpc_tls_handshake_limit",
+            Self::ListenerOtlpGrpcTlsHandshakeDeadlineSeconds => {
+                "listener.otlp_grpc_tls_handshake_deadline_seconds"
+            },
+            Self::ListenerOtlpGrpcHeaderDeadlineSeconds => {
+                "listener.otlp_grpc_header_deadline_seconds"
+            },
+            Self::ListenerOtlpGrpcBodyDeadlineSeconds => "listener.otlp_grpc_body_deadline_seconds",
+            Self::ListenerOtlpGrpcRequestDeadlineSeconds => {
+                "listener.otlp_grpc_request_deadline_seconds"
+            },
+            Self::ListenerOtlpGrpcIdleDeadlineSeconds => "listener.otlp_grpc_idle_deadline_seconds",
+            Self::ListenerOtlpGrpcHttp2MaxConcurrentStreams => {
+                "listener.otlp_grpc_http2_max_concurrent_streams"
+            },
+            Self::ListenerOtlpGrpcHttp2InitialStreamWindowBytes => {
+                "listener.otlp_grpc_http2_initial_stream_window_bytes"
+            },
+            Self::ListenerOtlpGrpcHttp2InitialConnectionWindowBytes => {
+                "listener.otlp_grpc_http2_initial_connection_window_bytes"
+            },
+            Self::ListenerOtlpGrpcHttp2MaxFrameBytes => "listener.otlp_grpc_http2_max_frame_bytes",
+            Self::ListenerOtlpGrpcHttp2MaxHeaderListBytes => {
+                "listener.otlp_grpc_http2_max_header_list_bytes"
+            },
+            Self::ListenerOtlpGrpcHttp2MinimumPingIntervalSeconds => {
+                "listener.otlp_grpc_http2_minimum_ping_interval_seconds"
+            },
+            Self::ListenerOtlpGrpcMaxMessageBytes => "listener.otlp_grpc_max_message_bytes",
+            Self::ListenerOtlpGrpcTlsCertificateFile => "listener.otlp_grpc_tls_certificate_file",
+            Self::ListenerOtlpGrpcTlsPrivateKeyFile => "listener.otlp_grpc_tls_private_key_file",
+            Self::ListenerOtlpGrpcTlsClientCaFile => "listener.otlp_grpc_tls_client_ca_file",
+            Self::ListenerOtlpGrpcTrustedProxyCidrs => "listener.otlp_grpc.trusted_proxy_cidrs",
+            Self::ListenerOtlpGrpcForwardedHops => "listener.otlp_grpc.forwarded_hops",
             Self::ListenerOtlpHttpBindAddress => "listener.otlp_http_bind_address",
+            Self::ListenerOtlpHttpTransport => "listener.otlp_http_transport",
+            Self::ListenerOtlpHttpAcceptedSocketLimit => "listener.otlp_http_accepted_socket_limit",
+            Self::ListenerOtlpHttpPerAddressAcceptedSocketLimit => {
+                "listener.otlp_http_per_address_accepted_socket_limit"
+            },
+            Self::ListenerOtlpHttpTlsHandshakeLimit => "listener.otlp_http_tls_handshake_limit",
+            Self::ListenerOtlpHttpTlsHandshakeDeadlineSeconds => {
+                "listener.otlp_http_tls_handshake_deadline_seconds"
+            },
+            Self::ListenerOtlpHttpHeaderDeadlineSeconds => {
+                "listener.otlp_http_header_deadline_seconds"
+            },
+            Self::ListenerOtlpHttpBodyDeadlineSeconds => "listener.otlp_http_body_deadline_seconds",
+            Self::ListenerOtlpHttpRequestDeadlineSeconds => {
+                "listener.otlp_http_request_deadline_seconds"
+            },
+            Self::ListenerOtlpHttpIdleDeadlineSeconds => "listener.otlp_http_idle_deadline_seconds",
+            Self::ListenerOtlpHttpTlsCertificateFile => "listener.otlp_http_tls_certificate_file",
+            Self::ListenerOtlpHttpTlsPrivateKeyFile => "listener.otlp_http_tls_private_key_file",
+            Self::ListenerOtlpHttpTlsClientCaFile => "listener.otlp_http_tls_client_ca_file",
+            Self::ListenerOtlpHttpTrustedProxyCidrs => "listener.otlp_http.trusted_proxy_cidrs",
+            Self::ListenerOtlpHttpForwardedHops => "listener.otlp_http.forwarded_hops",
             Self::ListenerLokiPushBindAddress => "listener.loki_push_bind_address",
+            Self::ListenerLokiPushTransport => "listener.loki_push_transport",
+            Self::ListenerLokiPushAcceptedSocketLimit => "listener.loki_push_accepted_socket_limit",
+            Self::ListenerLokiPushPerAddressAcceptedSocketLimit => {
+                "listener.loki_push_per_address_accepted_socket_limit"
+            },
+            Self::ListenerLokiPushTlsHandshakeLimit => "listener.loki_push_tls_handshake_limit",
+            Self::ListenerLokiPushTlsHandshakeDeadlineSeconds => {
+                "listener.loki_push_tls_handshake_deadline_seconds"
+            },
+            Self::ListenerLokiPushHeaderDeadlineSeconds => {
+                "listener.loki_push_header_deadline_seconds"
+            },
+            Self::ListenerLokiPushBodyDeadlineSeconds => "listener.loki_push_body_deadline_seconds",
+            Self::ListenerLokiPushRequestDeadlineSeconds => {
+                "listener.loki_push_request_deadline_seconds"
+            },
+            Self::ListenerLokiPushIdleDeadlineSeconds => "listener.loki_push_idle_deadline_seconds",
+            Self::ListenerLokiPushTlsCertificateFile => "listener.loki_push_tls_certificate_file",
+            Self::ListenerLokiPushTlsPrivateKeyFile => "listener.loki_push_tls_private_key_file",
+            Self::ListenerLokiPushTlsClientCaFile => "listener.loki_push_tls_client_ca_file",
+            Self::ListenerLokiPushTrustedProxyCidrs => "listener.loki_push.trusted_proxy_cidrs",
+            Self::ListenerLokiPushForwardedHops => "listener.loki_push.forwarded_hops",
             Self::StorageDataDirectory => "storage.data_directory",
             Self::StorageSecretsDirectory => "storage.secrets_directory",
             Self::SecurityLocalKeyFile => "security.local_key_file",

@@ -1,5 +1,6 @@
 use super::*;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::num::NonZeroU8;
 use std::sync::Arc;
 
 use positron_config::{CommandLineOverrides, ConfigurationInputs, EnvironmentOverrides, resolve};
@@ -345,7 +346,7 @@ fn loopback_otlp_is_authenticated_durable_and_observable_across_restart()
 }
 
 #[test]
-fn configured_proxy_metadata_requires_the_exact_peer_and_fixed_hop_before_ingest()
+fn configured_proxy_cidr_metadata_requires_the_trusted_peer_and_fixed_hop_before_ingest()
 -> Result<(), Box<dyn std::error::Error>> {
     let _guard = live_test_guard();
     let roots = TestRoots::new("trusted-proxy-attribution")?;
@@ -363,7 +364,13 @@ fn configured_proxy_metadata_requires_the_exact_peer_and_fixed_hop_before_ingest
         .query_secret()
         .ok_or("query secret missing")?
         .to_owned();
-    let policy = TrustedProxy::exact_peer(Ipv4Addr::LOCALHOST.into(), 1)?;
+    let policy = TrustedProxy::cidrs(
+        vec![positron_runtime::TrustedCidr::new(
+            Ipv4Addr::new(127, 0, 0, 0).into(),
+            8,
+        )?],
+        NonZeroU8::new(1).ok_or("nonzero proxy hop required")?,
+    )?;
     let host = NativeHost::new(bindings(&roots, "trusted-proxy")?.with_trusted_proxy(policy));
     let process = ApplicationRuntime::start(
         ServeConfiguration::new(paths.clone(), InitializationMode::ExistingOnly),
@@ -438,7 +445,13 @@ fn configured_proxy_metadata_requires_the_exact_peer_and_fixed_hop_before_ingest
         positron_runtime::ExitOutcome::Graceful
     );
 
-    let wrong_peer = TrustedProxy::exact_peer(Ipv4Addr::new(127, 0, 0, 2).into(), 1)?;
+    let wrong_peer = TrustedProxy::cidrs(
+        vec![positron_runtime::TrustedCidr::new(
+            Ipv4Addr::new(127, 0, 0, 2).into(),
+            32,
+        )?],
+        NonZeroU8::new(1).ok_or("nonzero proxy hop required")?,
+    )?;
     let wrong_peer_host =
         NativeHost::new(bindings(&roots, "wrong-trusted-proxy")?.with_trusted_proxy(wrong_peer));
     let wrong_peer_process = ApplicationRuntime::start(

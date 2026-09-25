@@ -64,7 +64,10 @@ impl RunningTask for TaskHandle {
         Ok(Some(TaskJoinOutcome::Joined))
     }
 
-    fn join(&mut self) -> Result<TaskJoinOutcome, TaskFailure> {
+    fn join_within(
+        &mut self,
+        _remaining: std::time::Duration,
+    ) -> Result<TaskJoinOutcome, TaskFailure> {
         Ok(TaskJoinOutcome::Joined)
     }
 

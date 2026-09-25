@@ -98,6 +98,13 @@ fn preflight_table_header(line: &str) -> Result<(), ConfigurationFailure> {
         .and_then(|value| value.strip_suffix(']'))
         .ok_or_else(|| document_failure(ConfigurationFailureCode::Malformed))?
         .trim();
+    if let Some(role) = name.strip_prefix("listener.") {
+        return if is_known_listener_role(role) {
+            Ok(())
+        } else {
+            Err(document_failure(ConfigurationFailureCode::UnknownSetting))
+        };
+    }
     if name.len() > MAX_KEY_BYTES {
         return Err(document_failure(ConfigurationFailureCode::ResourceLimit));
     }
@@ -256,6 +263,12 @@ pub(super) fn apply_toml(
             continue;
         }
         for (key, setting_value) in settings {
+            if section == "listener"
+                && let toml::Value::Table(role_settings) = setting_value
+            {
+                apply_listener_role_table(candidate, key, role_settings)?;
+                continue;
+            }
             let mut path = String::with_capacity(section.len() + key.len() + 1);
             path.push_str(section);
             path.push('.');
@@ -270,6 +283,31 @@ pub(super) fn apply_toml(
         }
     }
     Ok(())
+}
+
+fn apply_listener_role_table(
+    candidate: &mut Candidate,
+    role: &str,
+    settings: &toml::map::Map<String, toml::Value>,
+) -> Result<(), ConfigurationFailure> {
+    if !is_known_listener_role(role) {
+        return Err(document_failure(ConfigurationFailureCode::UnknownSetting));
+    }
+    for (key, value) in settings {
+        let path = format!("listener.{role}.{key}");
+        let Some(setting) = setting_for_path(&path) else {
+            return Err(document_failure(ConfigurationFailureCode::UnknownSetting));
+        };
+        apply_toml_value(candidate, setting, value)?;
+    }
+    Ok(())
+}
+
+fn is_known_listener_role(role: &str) -> bool {
+    matches!(
+        role,
+        "operations" | "api" | "otlp_grpc" | "otlp_http" | "loki_push"
+    )
 }
 
 fn is_known_toml_section(section: &str) -> bool {
@@ -295,6 +333,14 @@ fn apply_toml_value(
         ),
         (SettingKind::String, toml::Value::String(value)) => {
             candidate.apply(setting, value, SettingSource::ConfigurationFile)
+        },
+        (SettingKind::TrustedProxyCidrs, toml::Value::Array(values)) => {
+            let cidrs = parse_trusted_proxy_cidrs(values, setting)?;
+            candidate.apply_trusted_proxy_cidrs(setting, cidrs)
+        },
+        (SettingKind::CorsAllowedOrigins, toml::Value::Array(values)) => {
+            let origins = parse_cors_allowed_origins(values, setting)?;
+            candidate.apply_cors_allowed_origins(origins)
         },
         (SettingKind::ExportDestinations, _) => Err(ConfigurationFailure::new(
             ConfigurationFailureCode::Malformed,

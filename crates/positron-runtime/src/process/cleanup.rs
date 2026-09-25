@@ -143,7 +143,7 @@ impl CleanupAccumulator {
 
     pub(crate) fn cleanup_listeners(&mut self, listeners: &mut Vec<Box<dyn BoundListener>>) {
         for listener in listeners.iter_mut().rev() {
-            if listener.close().is_err() && listener.close().is_err() {
+            if listener.close().is_err() {
                 self.record(CleanupRole::Listener(listener.endpoint().role()));
             }
         }
