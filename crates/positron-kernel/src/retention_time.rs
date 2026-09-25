@@ -121,6 +121,7 @@ pub(crate) struct StagedCatalogAnchor<'authority> {
     authority: &'authority RetentionTimeAuthority,
     checkpoint: LifecycleAnchorCheckpoint,
     candidate_revision: Option<u64>,
+    candidate_anchor: Option<UnixNanoseconds>,
     committed: bool,
 }
 
@@ -130,9 +131,7 @@ impl StagedCatalogAnchor<'_> {
         scope: SegmentScope,
         durable: Option<IngestTime>,
     ) -> Result<IngestTime, LifecycleClockFailure> {
-        let value = self.authority.ingest_time(scope, durable)?;
-        self.candidate_revision = Some(self.authority.safety_revision()?);
-        Ok(value)
+        self.observe_candidate(|authority| authority.ingest_time(scope, durable))
     }
 
     pub(crate) fn destructive_ingest_time(
@@ -140,9 +139,7 @@ impl StagedCatalogAnchor<'_> {
         scope: SegmentScope,
         durable: Option<IngestTime>,
     ) -> Result<IngestTime, LifecycleClockFailure> {
-        let value = self.authority.destructive_ingest_time(scope, durable)?;
-        self.candidate_revision = Some(self.authority.safety_revision()?);
-        Ok(value)
+        self.observe_candidate(|authority| authority.destructive_ingest_time(scope, durable))
     }
 
     pub(crate) fn catalog_anchor_record(
@@ -152,8 +149,49 @@ impl StagedCatalogAnchor<'_> {
         self.authority.catalog_anchor_record(observed)
     }
 
+    pub(crate) fn catalog_anchor_subsumed(
+        &self,
+        snapshot: &CatalogSnapshot,
+    ) -> Result<bool, LifecycleClockFailure> {
+        let Some(candidate_anchor) = self.candidate_anchor else {
+            return Ok(false);
+        };
+        let mut durable = None;
+        for bytes in snapshot.plaintext_objects() {
+            let Some(record) = decode_catalog_anchor(bytes)? else {
+                continue;
+            };
+            if durable.replace(record).is_some() {
+                return Err(LifecycleClockFailure::OutOfRange);
+            }
+        }
+        Ok(durable.is_some_and(|record| {
+            record.state == LifecycleClockState::Certain && record.anchor >= candidate_anchor
+        }))
+    }
+
     pub(crate) fn commit(mut self) {
         self.committed = true;
+    }
+
+    fn observe_candidate<T>(
+        &mut self,
+        operation: impl FnOnce(&RetentionTimeAuthority) -> Result<T, LifecycleClockFailure>,
+    ) -> Result<T, LifecycleClockFailure> {
+        let before = self.authority.safety_revision()?;
+        let result = operation(self.authority);
+        match self.authority.safety_revision() {
+            Ok(after) if after != before => self.candidate_revision = Some(after),
+            Ok(_) => {},
+            // A poisoned or unavailable safety state already fences callers;
+            // make Drop take the same conservative path if it regains the
+            // lock after this operation returns.
+            Err(_) => self.candidate_revision = Some(u64::MAX),
+        }
+        if self.candidate_revision.is_some() {
+            self.candidate_anchor = Some(self.authority.status().safe_anchor());
+        }
+        result
     }
 }
 
@@ -403,6 +441,7 @@ impl RetentionTimeAuthority {
                 authority: self,
                 checkpoint: LifecycleAnchorCheckpoint(*safety),
                 candidate_revision: None,
+                candidate_anchor: None,
                 committed: false,
             })
             .map_err(|_| LifecycleClockFailure::Unavailable)
@@ -416,8 +455,10 @@ impl RetentionTimeAuthority {
         let Ok(mut safety) = self.safety.lock() else {
             return;
         };
-        let can_restore = candidate_revision.is_none_or(|revision| safety.revision == revision);
-        if can_restore {
+        let Some(candidate_revision) = candidate_revision else {
+            return;
+        };
+        if safety.revision == candidate_revision {
             let sampled_uncertainty = safety.state == LifecycleClockState::ClockUncertain;
             *safety = checkpoint.0;
             if sampled_uncertainty {
@@ -740,6 +781,7 @@ impl std::fmt::Debug for RetentionTimeAuthority {
 
 #[cfg(test)]
 mod clock_safety_tests {
+    use std::sync::atomic::{AtomicU8, Ordering};
     use std::sync::{Arc, Mutex};
 
     use super::*;
@@ -752,6 +794,18 @@ mod clock_safety_tests {
                 .lock()
                 .map(|instant| *instant)
                 .map_err(|_| LifecycleClockFailure::Unavailable)
+        }
+    }
+
+    struct FailingAfterEstablishment(AtomicU8);
+
+    impl LifecycleClockSource for FailingAfterEstablishment {
+        fn read(&self) -> Result<UnixNanoseconds, LifecycleClockFailure> {
+            if self.0.fetch_add(1, Ordering::AcqRel) == 0 {
+                Ok(UnixNanoseconds::new(1_000))
+            } else {
+                Err(LifecycleClockFailure::Unavailable)
+            }
         }
     }
 
@@ -853,5 +907,28 @@ mod clock_safety_tests {
 
         assert_eq!(clock.status().safe_anchor(), UnixNanoseconds::new(1_010));
         assert_eq!(clock.status().state(), LifecycleClockState::ClockUncertain);
+    }
+
+    #[test]
+    fn source_failure_after_candidate_mutation_restores_the_durable_anchor() {
+        let (clock, elapsed) = RetentionTimeAuthority::establish_with_source_and_manual_elapsed(
+            FailingAfterEstablishment(AtomicU8::new(0)),
+            LifecycleClockPolicy::new(10).expect("bounded policy"),
+        )
+        .expect("clock establishes");
+        let scope = SegmentScope::new(
+            positron_domain::identity::TenantId::from_bytes([5; 16]).expect("tenant"),
+            positron_domain::routing::SignalKind::Logs,
+            positron_domain::routing::VirtualShardId::new(5).expect("shard"),
+        );
+        let mut candidate = clock.stage_catalog_anchor().expect("candidate");
+        elapsed.advance(5).expect("elapsed");
+        assert_eq!(
+            candidate.ingest_time(scope, None),
+            Err(LifecycleClockFailure::Unavailable)
+        );
+        drop(candidate);
+        assert_eq!(clock.status().safe_anchor(), UnixNanoseconds::new(1_000));
+        assert_eq!(clock.status().state(), LifecycleClockState::Certain);
     }
 }

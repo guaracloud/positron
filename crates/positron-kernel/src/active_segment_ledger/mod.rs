@@ -640,6 +640,9 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         let retention_time = self
             .retention_time
             .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::UnsupportedFormat))?;
+        if !retention_time.is_destructive_authority() {
+            return Err(LedgerFailure::new(LedgerFailureCode::UnsupportedFormat));
+        }
         let mut clock_anchor = retention_time
             .stage_catalog_anchor()
             .map_err(map_retention_time_failure)?;

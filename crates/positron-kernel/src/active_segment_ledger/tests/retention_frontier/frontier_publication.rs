@@ -15,7 +15,7 @@ fn retention_frontier_publication_reconciles_only_durable_ambiguity() -> Result<
     )?;
     let tenant = TenantId::from_bytes([0x64; 16])?;
     let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(12)?);
-    let (retention_time, _) =
+    let (retention_time, elapsed) =
         RetentionTimeAuthority::establish_with_manual_elapsed(UnixNanoseconds::new(200));
     let ledger = ActiveSegmentLedger::open_with_retention_time(
         &authority,
@@ -56,6 +56,7 @@ fn retention_frontier_publication_reconciles_only_durable_ambiguity() -> Result<
         0
     );
 
+    elapsed.advance(5)?;
     let rejected = match with_catalog_publication_fault_after(
         CatalogPublicationFault::SynchronizeCommit,
         0,
@@ -70,7 +71,11 @@ fn retention_frontier_publication_reconciles_only_durable_ambiguity() -> Result<
         Err(failure) => failure,
     };
     assert_eq!(rejected.code(), LedgerFailureCode::StorageUnavailable);
-
+    assert_eq!(
+        retention_time.status().safe_anchor(),
+        UnixNanoseconds::new(200),
+        "a rejected Catalog proposal must not leave its unpublished clock anchor live"
+    );
     let reconciled = with_catalog_publication_fault_after(
         CatalogPublicationFault::SynchronizeGenerationDirectory,
         0,
@@ -85,7 +90,7 @@ fn retention_frontier_publication_reconciles_only_durable_ambiguity() -> Result<
     assert_eq!(reconciled.identity(), StoreBlockIdentity::new([0xd6; 16])?);
     assert_eq!(
         reconciled.ingest_time().instant(),
-        UnixNanoseconds::new(200)
+        UnixNanoseconds::new(205)
     );
     Ok(())
 }
@@ -205,7 +210,7 @@ fn divergent_successor_after_ambiguous_initial_frontier_fences_the_live_ledger()
             let basis = catalog.pin().expect("pin durable initial frontier");
             let objects = basis
                 .plaintext_objects()
-                .filter(|bytes| !bytes.starts_with(b"PRETFR01"))
+                .filter(|bytes| !bytes.starts_with(b"PLIFCLK1"))
                 .map(|bytes| CatalogObject::new(bytes.to_vec()).expect("copy bounded object"))
                 .collect::<Vec<_>>();
             catalog

@@ -80,7 +80,10 @@ pub(super) fn publish(
             let latest = catalog.pin().map_err(ambiguous_catalog)?;
             let recovered = recover(&latest, scope)
                 .map_err(|recovery| LedgerFailure::ambiguous(recovery.code()))?;
-            if recovered.is_some_and(|durable| durable >= frontier) {
+            let anchor_subsumed = lifecycle_clock
+                .catalog_anchor_subsumed(&latest)
+                .map_err(|_| LedgerFailure::ambiguous(LedgerFailureCode::StorageUnavailable))?;
+            if recovered.is_some_and(|durable| durable >= frontier) && anchor_subsumed {
                 Ok(())
             } else if latest.identity() == basis.identity() {
                 Err(failure.into())
