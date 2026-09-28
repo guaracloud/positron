@@ -14,6 +14,7 @@ use crate::{
     ResourceDimension, ResourceReservation, StorageKernelResourceAuthority, WorkClaim, WorkKind,
 };
 
+mod persistence;
 mod record;
 
 use record::{decode_record, encode_record};
@@ -126,6 +127,7 @@ impl MaintenanceExecution<'_> {
         &self.reservation
     }
 
+    #[cfg(any(test, fuzzing))]
     fn checkpoint_dispatch(
         &self,
         coordinator: &MaintenanceCoordinator,
@@ -159,6 +161,7 @@ impl MaintenanceExecution<'_> {
         Ok(())
     }
 
+    #[cfg(any(test, fuzzing))]
     pub fn checkpoint(
         &self,
         coordinator: &MaintenanceCoordinator,
@@ -167,6 +170,7 @@ impl MaintenanceExecution<'_> {
         self.checkpoint_dispatch(coordinator, checkpoint)
     }
 
+    #[cfg(any(test, fuzzing))]
     fn complete_dispatch(
         &self,
         coordinator: &MaintenanceCoordinator,
@@ -201,6 +205,7 @@ impl MaintenanceExecution<'_> {
         assign_terminal_order(&mut state, self.dispatch.identity)
     }
 
+    #[cfg(any(test, fuzzing))]
     pub fn complete(
         self,
         coordinator: &MaintenanceCoordinator,
@@ -320,7 +325,9 @@ impl MaintenanceCoordinator {
             }
             return Ok(existing.task.clone());
         }
-        if state.tasks.len() >= MAX_MAINTENANCE_TASKS && !reclaim_terminal_slot(&mut state)? {
+        if state.tasks.len() >= MAX_MAINTENANCE_TASKS
+            && reclaim_terminal_slot(&mut state)?.is_none()
+        {
             return Err(MaintenanceFailure::CapacityExceeded);
         }
         state.tasks.insert(

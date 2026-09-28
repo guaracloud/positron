@@ -369,3 +369,12 @@ impl<'a> RecordCursor<'a> {
         self.position == self.bytes.len()
     }
 }
+
+pub(super) fn record_identity(
+    bytes: &[u8],
+) -> Result<Option<MaintenanceTaskId>, MaintenanceFailure> {
+    if !bytes.starts_with(RECORD_MAGIC) {
+        return Ok(None);
+    }
+    decode_record(bytes).map(|state| Some(state.task.identity))
+}

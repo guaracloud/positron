@@ -208,7 +208,7 @@ pub(super) fn assign_terminal_order(
 
 pub(super) fn reclaim_terminal_slot(
     state: &mut CoordinatorState,
-) -> Result<bool, MaintenanceFailure> {
+) -> Result<Option<MaintenanceTaskId>, MaintenanceFailure> {
     let candidate = state
         .tasks
         .iter()
@@ -229,7 +229,7 @@ pub(super) fn reclaim_terminal_slot(
         })
         .map(|(identity, _)| *identity);
     let Some(identity) = candidate else {
-        return Ok(false);
+        return Ok(None);
     };
     let removed = state
         .tasks
@@ -244,7 +244,7 @@ pub(super) fn reclaim_terminal_slot(
             .fairness
             .retain(|(_, scope), _| *scope != removed.task.scope);
     }
-    Ok(true)
+    Ok(Some(identity))
 }
 
 fn tasks_conflict(left: &MaintenanceTask, right: &MaintenanceTask) -> bool {

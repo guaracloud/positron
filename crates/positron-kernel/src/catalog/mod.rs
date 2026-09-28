@@ -14,7 +14,7 @@ mod storage;
 mod types;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use std::collections::BTreeMap;
 use std::fs::File;

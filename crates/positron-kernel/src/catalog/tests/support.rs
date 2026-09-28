@@ -6,7 +6,7 @@ use crate::{
 };
 use positron_domain::identity::TenantId;
 
-pub(super) fn establish_catalog_authority(
+pub(crate) fn establish_catalog_authority(
     volume: OwnedPrimaryDataVolume,
 ) -> Result<StorageKernelResourceAuthority, Box<dyn std::error::Error>> {
     establish_catalog_authority_with_repair_memory(volume, 70_000_001)

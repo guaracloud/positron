@@ -1,9 +1,43 @@
+use std::fs;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use super::*;
 use crate::{
-    DetectedCapacity, DiskObservation, DiskPressureThresholds, GovernorPolicy,
-    InventoryCardinalityLimits, OperatorLimits, OrdinaryPoolPolicy, RecoveryPoolCapacities,
-    RecoveryReserve, ResourceInventory, StorageKernelResourceAuthority, TenantQuota,
+    Catalog, CatalogObject, CatalogProposal, CatalogSecret, DetectedCapacity, DiskObservation,
+    DiskPressureThresholds, FormatEpoch, GovernorPolicy, InstanceId, InventoryCardinalityLimits,
+    MountQualification, OperatorLimits, OrdinaryPoolPolicy, PrimaryDataVolume,
+    RecoveryPoolCapacities, RecoveryReserve, ResourceInventory, StorageKernelResourceAuthority,
+    TenantQuota, TransactionId,
 };
+
+static NEXT_CATALOG_ROOT: AtomicU64 = AtomicU64::new(0);
+
+struct CatalogRoot(PathBuf);
+
+impl CatalogRoot {
+    fn new() -> Result<Self, std::io::Error> {
+        let sequence = NEXT_CATALOG_ROOT.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "positron-maintenance-catalog-test-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir(&path)?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for CatalogRoot {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn nonzero_id(last: u8) -> [u8; 16] {
+    let mut bytes = [0; 16];
+    bytes[15] = last;
+    bytes
+}
 
 fn task(
     identity: u8,
@@ -847,4 +881,162 @@ fn durable_checkpoint_restores_the_same_task_after_a_process_restart() {
             .map(MaintenanceCheckpoint::opaque_progress),
         Some(&[9, 8][..])
     );
+}
+
+#[test]
+fn catalog_checkpoint_reopen_restores_one_queued_task_with_its_progress()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = CatalogRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
+    let authority = crate::catalog::tests::support::establish_catalog_authority(volume)?;
+    let instance = InstanceId::new(nonzero_id(1))?;
+    let secret = CatalogSecret::from_owned(Box::new([0x51; 32]), Box::new([0x52; 32]));
+    let catalog = Catalog::open(&authority, instance, secret)?;
+    let initial = CatalogProposal::new(
+        TransactionId::new(nonzero_id(2))?,
+        FormatEpoch::CATALOG_V1,
+        vec![CatalogObject::new(b"maintenance catalog basis".to_vec())?],
+    )?;
+    catalog.commit(catalog.pin()?.identity(), initial, None)?;
+
+    let coordinator = MaintenanceCoordinator::new();
+    let task = MaintenanceTask::with_contract(
+        MaintenanceTaskId::new([42; 16]).expect("stable task identity"),
+        MaintenanceTaskClass::Compaction,
+        MaintenanceScope::system(),
+        MaintenanceTrigger::Event,
+        MaintenancePreconditions::new(4, 9).expect("preconditions"),
+        Vec::new(),
+        Vec::new(),
+        ResourceAmounts::new([1; 11]),
+    );
+    let task = task.expect("bounded task");
+    let identity = task.identity();
+    coordinator
+        .submit_and_persist(&catalog, task, 7)
+        .expect("submission must publish its record");
+    let execution = coordinator
+        .start_next_with_reservation(&authority, 8, false)
+        .expect("dispatch admission")
+        .expect("persisted task must dispatch");
+    execution
+        .checkpoint_and_persist(
+            &coordinator,
+            &catalog,
+            MaintenanceCheckpoint::new(1, 0, vec![4, 2]).expect("checkpoint"),
+        )
+        .expect("checkpoint must publish");
+    drop(execution);
+    drop(catalog);
+
+    let reopened = Catalog::open(
+        &authority,
+        instance,
+        CatalogSecret::from_owned(Box::new([0x51; 32]), Box::new([0x52; 32])),
+    )?;
+    let restored = MaintenanceCoordinator::restore_from_catalog(&reopened).expect("restore");
+    let status = restored.status(identity).expect("restored status");
+    assert_eq!(status.phase(), MaintenanceTaskPhase::Queued);
+    assert_eq!(
+        status
+            .checkpoint()
+            .map(MaintenanceCheckpoint::opaque_progress),
+        Some(&[4, 2][..])
+    );
+    let execution = restored
+        .start_next_with_reservation(&authority, 9, false)
+        .expect("resumed dispatch admission")
+        .expect("recovered task must dispatch");
+    execution
+        .complete_and_persist(&restored, &reopened, true)
+        .expect("terminal outcome must publish");
+    assert_eq!(
+        restored.status(identity).expect("terminal status").phase(),
+        MaintenanceTaskPhase::Succeeded
+    );
+    let durable = reopened.pin()?;
+    assert_eq!(
+        durable
+            .plaintext_objects()
+            .filter(|bytes| bytes.starts_with(b"PMTC"))
+            .count(),
+        1,
+        "each task owns one replacement record"
+    );
+    assert!(
+        durable
+            .plaintext_objects()
+            .any(|bytes| bytes == b"maintenance catalog basis")
+    );
+    Ok(())
+}
+
+#[test]
+fn catalog_submission_fault_leaves_no_in_memory_task_and_exact_retry_publishes_once()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = CatalogRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
+    let authority = crate::catalog::tests::support::establish_catalog_authority(volume)?;
+    let instance = InstanceId::new(nonzero_id(11))?;
+    let catalog = Catalog::open(
+        &authority,
+        instance,
+        CatalogSecret::from_owned(Box::new([0x61; 32]), Box::new([0x62; 32])),
+    )?;
+    catalog.commit(
+        catalog.pin()?.identity(),
+        CatalogProposal::new(
+            TransactionId::new(nonzero_id(12))?,
+            FormatEpoch::CATALOG_V1,
+            vec![CatalogObject::new(b"maintenance fault basis".to_vec())?],
+        )?,
+        None,
+    )?;
+    let coordinator = MaintenanceCoordinator::new();
+    let task = MaintenanceTask::with_contract(
+        MaintenanceTaskId::new([43; 16]).expect("stable task identity"),
+        MaintenanceTaskClass::Compaction,
+        MaintenanceScope::system(),
+        MaintenanceTrigger::Event,
+        MaintenancePreconditions::new(4, 9).expect("preconditions"),
+        Vec::new(),
+        Vec::new(),
+        ResourceAmounts::new([1; 11]),
+    )
+    .expect("bounded task");
+    let identity = task.identity();
+    let result =
+        crate::catalog::with_catalog_fault(crate::catalog::CatalogFileEvent::WriteMarker, || {
+            coordinator.submit_and_persist(&catalog, task.clone(), 7)
+        });
+    assert_eq!(
+        result.expect_err("publication must fail"),
+        MaintenanceFailure::CatalogUnavailable
+    );
+    assert_eq!(
+        coordinator
+            .status(identity)
+            .expect_err("state cannot outrun durable publication"),
+        MaintenanceFailure::UnknownTask
+    );
+    assert_eq!(
+        catalog
+            .pin()?
+            .plaintext_objects()
+            .filter(|bytes| bytes.starts_with(b"PMTC"))
+            .count(),
+        0
+    );
+    coordinator
+        .submit_and_persist(&catalog, task, 7)
+        .expect("exact retry must publish the queued task");
+    assert_eq!(
+        catalog
+            .pin()?
+            .plaintext_objects()
+            .filter(|bytes| bytes.starts_with(b"PMTC"))
+            .count(),
+        1
+    );
+    Ok(())
 }
