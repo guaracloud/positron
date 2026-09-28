@@ -18,12 +18,10 @@ impl InitializedInstance {
             .key
             .catalog_secret(self.instance)
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
-        let catalog = Catalog::open(&self._authority, self.instance, secret)
+        let view = Catalog::read_current_view(&self._authority, self.instance, secret)
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
-        let snapshot = catalog
-            .pin()
-            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
-        let identity = positron_governance::Identity::open(&snapshot)
+        let snapshot = view.snapshot();
+        let identity = positron_governance::Identity::open(snapshot)
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
         let (_, governance) = snapshot
             .governance_object()
@@ -40,7 +38,7 @@ impl InitializedInstance {
         );
         if let Some((update, snapshot)) =
             positron_governance::LifecycleClockAcceptanceAdministration::replay_retained(
-                &catalog,
+                &view,
                 &identity,
                 request,
                 expected_safe_anchor,
@@ -60,7 +58,7 @@ impl InitializedInstance {
             Err(positron_kernel::LifecycleClockAcceptanceFailure::NotUncertain) => {
                 let Some((update, snapshot)) =
                     positron_governance::LifecycleClockAcceptanceAdministration::replay_retained(
-                        &catalog,
+                        &view,
                         &identity,
                         request,
                         expected_safe_anchor,
@@ -78,6 +76,17 @@ impl InitializedInstance {
             },
             Err(failure) => return Err(map_lifecycle_clock_acceptance_failure(failure)),
         };
+        let secret = self
+            .key
+            .catalog_secret(self.instance)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
+        let catalog = Catalog::open(&self._authority, self.instance, secret)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        let snapshot = catalog
+            .pin()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        let identity = positron_governance::Identity::open(&snapshot)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
         let (update, commit) = positron_governance::LifecycleClockAcceptanceAdministration::accept(
             &catalog, &identity, request, &prepared,
         )

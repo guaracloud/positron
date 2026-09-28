@@ -5,9 +5,9 @@ use std::fmt::{Display, Formatter};
 
 use positron_kernel::{
     AuditIntent, Catalog, CatalogCommit, CatalogFailureCode, CatalogObject, CatalogProposal,
-    CatalogSnapshot, FormatEpoch, PreparedLifecycleClockAcceptance, PreparedTransactionResolution,
-    TransactionId, catalog_anchor_matches_accepted_discontinuity, validate_catalog_anchor_record,
-    validate_catalog_anchor_singleton,
+    CatalogReadView, CatalogSnapshot, FormatEpoch, PreparedLifecycleClockAcceptance,
+    PreparedTransactionResolution, TransactionId, catalog_anchor_matches_accepted_discontinuity,
+    validate_catalog_anchor_record, validate_catalog_anchor_singleton,
 };
 use sha2::{Digest, Sha256};
 
@@ -73,7 +73,7 @@ impl LifecycleClockAcceptanceAdministration {
     /// Resolves a compact terminal receipt retained after its corresponding
     /// governance audit entry has been reclaimed.
     pub fn replay_retained(
-        catalog: &Catalog<'_>,
+        view: &CatalogReadView,
         identity: &Identity,
         request: LifecycleClockAcceptanceRequest,
         expected_safe_anchor: positron_domain::time::UnixNanoseconds,
@@ -84,8 +84,8 @@ impl LifecycleClockAcceptanceAdministration {
         let actor = identity
             .authorize_system_audit_retention(request.actor)
             .map_err(|_| LifecycleClockAcceptanceAdministrationFailure::Unauthorized)?;
-        let snapshot = catalog.pin().map_err(map_catalog)?;
-        let Some(receipt) = find_retained_receipt(&snapshot, request.idempotency_key)? else {
+        let snapshot = view.snapshot();
+        let Some(receipt) = find_retained_receipt(snapshot, request.idempotency_key)? else {
             return Ok(None);
         };
         if receipt.actor != actor
@@ -128,11 +128,13 @@ impl LifecycleClockAcceptanceAdministration {
         if !anchor_seen {
             return Err(LifecycleClockAcceptanceAdministrationFailure::PersistenceUnavailable);
         }
+        let audit_position = match receipt.audit_position {
+            Some(position) => position,
+            None => legacy_audit_position(view, actor, request, receipt)?,
+        };
         Ok(Some((
-            LifecycleClockAcceptanceUpdate {
-                audit_position: receipt.audit_position,
-            },
-            snapshot,
+            LifecycleClockAcceptanceUpdate { audit_position },
+            snapshot.clone(),
         )))
     }
 
@@ -242,6 +244,43 @@ fn update_from_commit(
         },
         commit,
     ))
+}
+
+fn legacy_audit_position(
+    view: &CatalogReadView,
+    actor: positron_domain::identity::PrincipalId,
+    request: LifecycleClockAcceptanceRequest,
+    receipt: RetainedReceipt,
+) -> Result<u64, LifecycleClockAcceptanceAdministrationFailure> {
+    let transaction =
+        TransactionId::new(request.idempotency_key.to_bytes()).map_err(map_catalog)?;
+    let mut position = None;
+    for record in view.governance_audit_records() {
+        if record.transaction() != transaction {
+            continue;
+        }
+        let entry = crate::GovernanceAuditEntry::decode(record)
+            .map_err(|_| LifecycleClockAcceptanceAdministrationFailure::PersistenceUnavailable)?;
+        let Some(audit) = entry.as_lifecycle_clock_acceptance() else {
+            return Err(LifecycleClockAcceptanceAdministrationFailure::PersistenceUnavailable);
+        };
+        if audit.idempotency_key() != request.idempotency_key
+            || audit.actor_id() != actor
+            || audit.expected_catalog() != request.expected_catalog.to_bytes()
+            || audit.safe_anchor() != receipt.safe_anchor
+            || audit.observed_wall_clock() != receipt.observed_wall_clock
+            || audit.observed_offset_nanoseconds() != receipt.observed_offset_nanoseconds
+            || audit.request_digest() != receipt.request_digest
+            || audit.position() == 0
+            || audit.position() != record.position()
+        {
+            return Err(LifecycleClockAcceptanceAdministrationFailure::PersistenceUnavailable);
+        }
+        if position.replace(record.position()).is_some() {
+            return Err(LifecycleClockAcceptanceAdministrationFailure::PersistenceUnavailable);
+        }
+    }
+    position.ok_or(LifecycleClockAcceptanceAdministrationFailure::PersistenceUnavailable)
 }
 
 fn retained_objects(
@@ -368,7 +407,7 @@ struct RetainedReceipt {
     observed_wall_clock: positron_domain::time::UnixNanoseconds,
     observed_offset_nanoseconds: i64,
     request_digest: [u8; 32],
-    audit_position: u64,
+    audit_position: Option<u64>,
 }
 
 fn find_retained_receipt(
@@ -436,14 +475,16 @@ fn decode_retained_receipt(
         .and_then(|value| value.try_into().ok())
         .ok_or(LifecycleClockAcceptanceAdministrationFailure::PersistenceUnavailable)?;
     let audit_position = if has_v2_magic {
-        bytes
-            .get(128..136)
-            .and_then(|value| value.try_into().ok())
-            .map(u64::from_be_bytes)
-            .filter(|position| *position != 0)
-            .ok_or(LifecycleClockAcceptanceAdministrationFailure::PersistenceUnavailable)?
+        Some(
+            bytes
+                .get(128..136)
+                .and_then(|value| value.try_into().ok())
+                .map(u64::from_be_bytes)
+                .filter(|position| *position != 0)
+                .ok_or(LifecycleClockAcceptanceAdministrationFailure::PersistenceUnavailable)?,
+        )
     } else {
-        0
+        None
     };
     Ok(Some((
         key,
@@ -501,7 +542,7 @@ mod receipt_tests {
             observed_offset_nanoseconds
         );
         assert_eq!(decoded.request_digest, digest);
-        assert_eq!(decoded.audit_position, 0);
+        assert_eq!(decoded.audit_position, None);
 
         for invalid_length in [
             RETENTION_RECEIPT_V1_BYTES - 1,

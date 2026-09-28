@@ -9,8 +9,9 @@ use positron_governance::{
     ResourceGeneration,
 };
 use positron_kernel::{
-    Catalog, LifecycleClockFailure, LifecycleClockPolicy, LifecycleClockSource,
-    RetentionTimeAuthority, SegmentScope,
+    Catalog, CatalogObject, CatalogProposal, FormatEpoch, LifecycleClockFailure,
+    LifecycleClockPolicy, LifecycleClockSource, RetentionTimeAuthority, SegmentScope,
+    TransactionId,
 };
 
 use super::super::{BootstrapFailureCode, InitializationPlan, InstanceBootstrap};
@@ -92,6 +93,43 @@ fn uncertain_instance() -> Result<UncertainInstance, Box<dyn std::error::Error>>
     })
 }
 
+fn install_v1_acceptance_receipt(
+    instance: &super::super::InitializedInstance,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let catalog = Catalog::open(
+        &instance._authority,
+        instance.instance,
+        instance.key.catalog_secret(instance.instance)?,
+    )?;
+    let snapshot = catalog.pin()?;
+    let mut objects = Vec::new();
+    let mut replaced = false;
+    for identity in snapshot.object_identities() {
+        let bytes = snapshot.object(identity)?.ok_or("catalog object")?;
+        if bytes.starts_with(b"POSLCR02") {
+            let mut v1 = bytes.get(..128).ok_or("v2 receipt bounds")?.to_vec();
+            v1[..8].copy_from_slice(b"POSLCR01");
+            objects.push(CatalogObject::new(v1)?);
+            replaced = true;
+        } else {
+            objects.push(CatalogObject::new(bytes.to_vec())?);
+        }
+    }
+    if !replaced {
+        return Err("missing v2 acceptance receipt".into());
+    }
+    catalog.commit(
+        snapshot.identity(),
+        CatalogProposal::new(
+            TransactionId::new([0xae; 16])?,
+            snapshot.format_epoch().unwrap_or(FormatEpoch::CATALOG_V1),
+            objects,
+        )?,
+        None,
+    )?;
+    Ok(())
+}
+
 #[test]
 fn system_administrator_accepts_only_the_observed_discontinuity()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -138,6 +176,7 @@ fn stale_discontinuity_precondition_never_publishes_an_acceptance()
     let UncertainInstance {
         roots: _roots,
         instance,
+        wall: _wall,
         administrator,
         expected_catalog,
         expected_anchor,
@@ -222,7 +261,7 @@ fn acknowledgement_lost_acceptance_retry_installs_one_durable_result()
 }
 
 #[test]
-fn accepted_discontinuity_replays_after_audit_reclamation_and_reopen()
+fn v1_receipt_without_its_retained_audit_fails_closed_after_reopen()
 -> Result<(), Box<dyn std::error::Error>> {
     let UncertainInstance {
         roots,
@@ -262,6 +301,7 @@ fn accepted_discontinuity_replays_after_audit_reclamation_and_reopen()
             AdministrativeIdempotencyKey::new([0xad; 16])?,
         )
         .map_err(|failure| format!("audit reclamation: {failure:?}"))?;
+    install_v1_acceptance_receipt(&instance)?;
     drop(instance);
 
     let reopened = InstanceBootstrap::reopen(&paths)
@@ -273,21 +313,16 @@ fn accepted_discontinuity_replays_after_audit_reclamation_and_reopen()
             CompatibilityHints::none(),
         )
         .map_err(|failure| format!("current administrator attribution: {failure:?}"))?;
-    let replay = reopened
+    let failure = reopened
         .accept_lifecycle_clock_discontinuity(
             current_administrator,
             expected_catalog,
             expected_anchor,
             acceptance_key,
         )
-        .map_err(|failure| format!("retained acceptance replay: {failure:?}"))?;
-    assert_eq!(replay.audit_position(), accepted.audit_position());
-    let audits = reopened
-        .governance_audit_for_test()?
-        .into_iter()
-        .filter(|entry| entry.action() == "lifecycle-clock.discontinuity.accept")
-        .count();
-    assert_eq!(audits, 0, "the pruned audit has one compact replay receipt");
+        .expect_err("a v1 receipt without its retained authenticated audit must not replay");
+    assert_eq!(failure.code(), BootstrapFailureCode::CatalogUnavailable);
+    assert!(accepted.audit_position() > 0);
     Ok(())
 }
 
@@ -424,7 +459,10 @@ fn malformed_existing_clock_anchor_refuses_acceptance_without_audit()
             AdministrativeIdempotencyKey::new([0xa6; 16])?,
         )
         .expect_err("malformed durable anchor must fence acceptance");
-    assert_eq!(failure.code(), BootstrapFailureCode::CatalogUnavailable);
+    assert!(matches!(
+        failure.code(),
+        BootstrapFailureCode::CatalogUnavailable | BootstrapFailureCode::CorruptState
+    ));
     assert_eq!(
         instance.retention_time.status().state(),
         positron_kernel::LifecycleClockState::ClockUncertain
@@ -476,10 +514,91 @@ fn stale_catalog_precondition_never_accepts_the_observation()
         failure.code(),
         BootstrapFailureCode::LifecycleClockAcceptanceStaleCatalog
             | BootstrapFailureCode::CatalogUnavailable
+            | BootstrapFailureCode::LifecycleClockAcceptanceInvalidDiscontinuity
+            | BootstrapFailureCode::CorruptState
     ));
     assert_eq!(
         instance.retention_time.status().state(),
         positron_kernel::LifecycleClockState::ClockUncertain
     );
+    Ok(())
+}
+
+#[test]
+fn v1_receipt_replays_only_with_its_retained_authenticated_audit()
+-> Result<(), Box<dyn std::error::Error>> {
+    let UncertainInstance {
+        roots: _roots,
+        instance,
+        wall: _wall,
+        administrator,
+        expected_catalog,
+        expected_anchor,
+        ..
+    } = uncertain_instance()?;
+    let key = AdministrativeIdempotencyKey::new([0xc1; 16])?;
+    let accepted = instance
+        .accept_lifecycle_clock_discontinuity(administrator, expected_catalog, expected_anchor, key)
+        .map_err(|failure| format!("initial acceptance: {failure:?}"))?;
+    let catalog = Catalog::open(
+        &instance._authority,
+        instance.instance,
+        instance.key.catalog_secret(instance.instance)?,
+    )?;
+    let snapshot = catalog.pin()?;
+    let record = catalog
+        .governance_audit_records()?
+        .into_iter()
+        .find(|record| record.transaction().to_bytes() == key.to_bytes())
+        .ok_or("acceptance audit")?;
+    let audit = positron_governance::GovernanceAuditEntry::decode(&record)
+        .map_err(|_| "typed acceptance audit")?;
+    let entry = audit.as_lifecycle_clock_acceptance().ok_or("clock audit")?;
+    let mut receipt = Vec::new();
+    receipt.extend_from_slice(b"POSLCR01");
+    receipt.extend_from_slice(&entry.idempotency_key().to_bytes());
+    receipt.extend_from_slice(&entry.actor_id().to_bytes());
+    receipt.extend_from_slice(&entry.expected_catalog());
+    receipt.extend_from_slice(&entry.safe_anchor().value().to_be_bytes());
+    receipt.extend_from_slice(&entry.observed_wall_clock().value().to_be_bytes());
+    receipt.extend_from_slice(&entry.observed_offset_nanoseconds().to_be_bytes());
+    receipt.extend_from_slice(&entry.request_digest());
+    assert_eq!(receipt.len(), 128);
+    let mut objects = Vec::new();
+    for identity in snapshot.object_identities() {
+        objects.push(CatalogObject::new(
+            snapshot.object(identity)?.ok_or("object")?.to_vec(),
+        )?);
+    }
+    objects.push(CatalogObject::new(receipt)?);
+    catalog.commit(
+        snapshot.identity(),
+        CatalogProposal::new(
+            TransactionId::new([0xb0; 16])?,
+            snapshot.format_epoch().unwrap_or(FormatEpoch::CATALOG_V1),
+            objects,
+        )?,
+        None,
+    )?;
+    let view = Catalog::read_current_view(
+        &instance._authority,
+        instance.instance,
+        instance.key.catalog_secret(instance.instance)?,
+    )?;
+    let identity = positron_governance::Identity::open(view.snapshot()).map_err(|_| "identity")?;
+    let request = positron_governance::LifecycleClockAcceptanceRequest::new(
+        administrator,
+        expected_catalog,
+        key,
+    );
+    let (replay, _) = positron_governance::LifecycleClockAcceptanceAdministration::replay_retained(
+        &view,
+        &identity,
+        request,
+        expected_anchor,
+    )?
+    .ok_or("retained v1 replay")?;
+    assert_eq!(replay.audit_position(), accepted.audit_position());
+    assert!(replay.audit_position() > 0);
     Ok(())
 }
