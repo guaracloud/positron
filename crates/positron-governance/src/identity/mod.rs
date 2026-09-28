@@ -312,10 +312,12 @@ impl Identity {
                         &candidate.hash,
                     )
                     .map_err(|_| AttributionFailure)?;
-                if matches && candidate.active && candidate.scope == scope {
-                    if credential_is_unexpired(candidate, &mut expiry_time)? {
-                        selected = Some((candidate.principal, self.tenant, self.lifecycle));
-                    }
+                if matches
+                    && candidate.active
+                    && candidate.scope == scope
+                    && credential_is_unexpired(candidate, &mut expiry_time)?
+                {
+                    selected = Some((candidate.principal, self.tenant, self.lifecycle));
                 }
             }
             for identity in &self.additional_tenants {
@@ -327,14 +329,15 @@ impl Identity {
                             &candidate.hash,
                         )
                         .map_err(|_| AttributionFailure)?;
-                    if matches && candidate.active && candidate.scope == scope {
-                        if credential_is_unexpired(candidate, &mut expiry_time)?
-                            && selected
-                                .replace((candidate.principal, identity.tenant, identity.lifecycle))
-                                .is_some()
-                        {
-                            return Err(AttributionFailure);
-                        }
+                    if matches
+                        && candidate.active
+                        && candidate.scope == scope
+                        && credential_is_unexpired(candidate, &mut expiry_time)?
+                        && selected
+                            .replace((candidate.principal, identity.tenant, identity.lifecycle))
+                            .is_some()
+                    {
+                        return Err(AttributionFailure);
                     }
                 }
             }
