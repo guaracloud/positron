@@ -22,7 +22,7 @@ impl StorageKernelResourceAuthority {
     }
 
     #[cfg(test)]
-    pub(super) fn establish_for_test(
+    pub(crate) fn establish_for_test(
         inventory: ResourceInventory,
         policy: GovernorPolicy,
         recovery_pools: RecoveryPoolCapacities,
