@@ -903,6 +903,102 @@ mod clock_safety_tests {
     }
 
     #[test]
+    fn a_live_backward_wall_clock_step_pauses_destructive_work_but_keeps_ingest_monotonic() {
+        let wall = Arc::new(Mutex::new(UnixNanoseconds::new(1_000)));
+        let (clock, elapsed) = RetentionTimeAuthority::establish_with_source_and_manual_elapsed(
+            MutableWallClock(Arc::clone(&wall)),
+            LifecycleClockPolicy::new(10).expect("bounded policy"),
+        )
+        .expect("clock establishes");
+        let scope = SegmentScope::new(
+            positron_domain::identity::TenantId::from_bytes([6; 16]).expect("tenant"),
+            positron_domain::routing::SignalKind::Logs,
+            positron_domain::routing::VirtualShardId::new(6).expect("shard"),
+        );
+
+        elapsed.advance(1).expect("monotonic elapsed");
+        assert_eq!(
+            clock
+                .ingest_time(scope, None)
+                .expect("initial ingest")
+                .instant(),
+            UnixNanoseconds::new(1_001)
+        );
+        *wall.lock().expect("wall lock") = UnixNanoseconds::new(500);
+
+        assert_eq!(
+            clock
+                .ingest_time(scope, None)
+                .expect("ingest remains available")
+                .instant(),
+            UnixNanoseconds::new(1_001)
+        );
+        assert_eq!(clock.status().state(), LifecycleClockState::ClockUncertain);
+        assert_eq!(
+            clock.destructive_ingest_time(scope, None),
+            Err(LifecycleClockFailure::ClockUncertain)
+        );
+    }
+
+    #[test]
+    fn bounded_slew_and_in_bound_source_recovery_restore_clock_certainty() {
+        let wall = Arc::new(Mutex::new(UnixNanoseconds::new(1_000)));
+        let (clock, elapsed) = RetentionTimeAuthority::establish_with_source_and_manual_elapsed(
+            MutableWallClock(Arc::clone(&wall)),
+            LifecycleClockPolicy::new(10).expect("bounded policy"),
+        )
+        .expect("clock establishes");
+        let scope = SegmentScope::new(
+            positron_domain::identity::TenantId::from_bytes([7; 16]).expect("tenant"),
+            positron_domain::routing::SignalKind::Logs,
+            positron_domain::routing::VirtualShardId::new(7).expect("shard"),
+        );
+
+        elapsed.advance(1).expect("monotonic elapsed");
+        *wall.lock().expect("wall lock") = UnixNanoseconds::new(1_008);
+        assert!(clock.ingest_time(scope, None).is_ok());
+        assert_eq!(clock.status().state(), LifecycleClockState::Certain);
+
+        *wall.lock().expect("wall lock") = UnixNanoseconds::new(2_000);
+        assert!(clock.ingest_time(scope, None).is_ok());
+        assert_eq!(clock.status().state(), LifecycleClockState::ClockUncertain);
+
+        *wall.lock().expect("wall lock") = UnixNanoseconds::new(1_005);
+        assert!(clock.ingest_time(scope, None).is_ok());
+        assert_eq!(clock.status().state(), LifecycleClockState::Certain);
+        assert!(clock.authorizes_destructive_retention());
+    }
+
+    #[test]
+    fn retention_time_uses_unix_epochs_without_timezone_or_dst_conversion() {
+        let epoch = UnixNanoseconds::new(1_730_614_400_000_000_000);
+        let wall = Arc::new(Mutex::new(epoch));
+        let (clock, elapsed) = RetentionTimeAuthority::establish_with_source_and_manual_elapsed(
+            MutableWallClock(Arc::clone(&wall)),
+            LifecycleClockPolicy::new(10).expect("bounded policy"),
+        )
+        .expect("clock establishes");
+        let scope = SegmentScope::new(
+            positron_domain::identity::TenantId::from_bytes([8; 16]).expect("tenant"),
+            positron_domain::routing::SignalKind::Logs,
+            positron_domain::routing::VirtualShardId::new(8).expect("shard"),
+        );
+
+        elapsed.advance(123).expect("monotonic elapsed");
+        assert_eq!(
+            clock
+                .ingest_time(scope, None)
+                .expect("ingest time")
+                .instant(),
+            UnixNanoseconds::new(1_730_614_400_000_000_123)
+        );
+        assert_eq!(
+            clock.governance_now_seconds().expect("governance time"),
+            1_730_614_400
+        );
+    }
+
+    #[test]
     fn restart_forward_jump_compares_wall_clock_with_the_durable_anchor() {
         let wall = Arc::new(Mutex::new(UnixNanoseconds::new(2_000)));
         let (clock, _) = RetentionTimeAuthority::establish_with_source_and_manual_elapsed(

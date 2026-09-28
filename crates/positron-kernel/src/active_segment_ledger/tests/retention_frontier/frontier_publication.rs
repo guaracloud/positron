@@ -157,6 +157,91 @@ fn uncertain_ingest_reconciles_a_durably_published_uncertain_clock_anchor()
 }
 
 #[cfg(feature = "test-support")]
+fn catalog_backed_restart_fences_wall_clock_step(
+    restarted_wall: UnixNanoseconds,
+    discriminator: u8,
+) -> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_authority(volume)?;
+    let instance = InstanceId::new([discriminator; 16])?;
+    let secret = || {
+        CatalogSecret::from_owned(
+            Box::new([discriminator.wrapping_add(1); 32]),
+            Box::new([discriminator.wrapping_add(2); 32]),
+        )
+    };
+    let catalog = Catalog::open(&authority, instance, secret())?;
+    let tenant = TenantId::from_bytes([0x64; 16])?;
+    let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(14)?);
+    let wall = Arc::new(Mutex::new(UnixNanoseconds::new(200)));
+    let (initial_time, _) = RetentionTimeAuthority::establish_with_source_and_manual_elapsed(
+        MutableWallClock(Arc::clone(&wall)),
+        crate::LifecycleClockPolicy::new(10)?,
+    )?;
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &initial_time,
+        &catalog,
+        scope,
+        SegmentProtectionKey::from_owned(Box::new([discriminator.wrapping_add(3); 32])),
+    )?;
+    let preparation = ledger.begin_store_block(
+        preparation_capacity(&authority, tenant)?,
+        StoreBlockIdentity::new([discriminator.wrapping_add(4); 16])?,
+    )?;
+    drop(preparation);
+    assert!(
+        catalog
+            .pin()?
+            .plaintext_objects()
+            .any(|object| object.starts_with(b"PLIFCLK1")),
+        "initial publication must persist the instance-wide lifecycle anchor"
+    );
+    drop(ledger);
+    drop(catalog);
+
+    *wall.lock().map_err(|_| "wall clock")? = restarted_wall;
+    let recovered_catalog = Catalog::open(&authority, instance, secret())?;
+    let (restarted_time, _) = RetentionTimeAuthority::establish_with_source_and_manual_elapsed(
+        MutableWallClock(Arc::clone(&wall)),
+        crate::LifecycleClockPolicy::new(10)?,
+    )?;
+    let _reopened = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &restarted_time,
+        &recovered_catalog,
+        scope,
+        SegmentProtectionKey::from_owned(Box::new([discriminator.wrapping_add(3); 32])),
+    )?;
+
+    assert_eq!(
+        restarted_time.status().state(),
+        crate::LifecycleClockState::ClockUncertain
+    );
+    assert!(restarted_time.ingest_time(scope, None).is_ok());
+    assert_eq!(
+        restarted_time.destructive_ingest_time(scope, None),
+        Err(crate::LifecycleClockFailure::ClockUncertain)
+    );
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn catalog_backed_backward_restart_fences_retention_but_keeps_ingest_available()
+-> Result<(), Box<dyn Error>> {
+    catalog_backed_restart_fences_wall_clock_step(UnixNanoseconds::new(100), 0xb1)
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn catalog_backed_forward_restart_fences_retention_but_keeps_ingest_available()
+-> Result<(), Box<dyn Error>> {
+    catalog_backed_restart_fences_wall_clock_step(UnixNanoseconds::new(1_000), 0xc1)
+}
+
+#[cfg(feature = "test-support")]
 #[test]
 fn uncertain_initial_frontier_fences_live_retries_until_reopen_recovers_the_marker()
 -> Result<(), Box<dyn Error>> {
