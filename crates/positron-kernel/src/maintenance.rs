@@ -14,6 +14,7 @@ use crate::{
 const MAX_MAINTENANCE_TASKS: usize = 128;
 const MAX_TASK_OBJECTS: usize = 16;
 const MAX_CHECKPOINT_BYTES: usize = 4_096;
+const MAX_PRIORITY_DISPATCH_LEAD: u64 = 2;
 
 /// A stable, caller-supplied identity for one idempotent maintenance task.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -958,12 +959,16 @@ fn scheduling_order(
     right: &TaskState,
     fairness: &BTreeMap<MaintenanceScope, u64>,
 ) -> std::cmp::Ordering {
-    fairness
-        .get(&left.task.scope)
-        .copied()
-        .unwrap_or(0)
-        .cmp(&fairness.get(&right.task.scope).copied().unwrap_or(0))
-        .then_with(|| right.task.priority.cmp(&left.task.priority))
+    let left_dispatches = fairness.get(&left.task.scope).copied().unwrap_or(0);
+    let right_dispatches = fairness.get(&right.task.scope).copied().unwrap_or(0);
+    let fairness_order = left_dispatches.abs_diff(right_dispatches);
+    if fairness_order >= MAX_PRIORITY_DISPATCH_LEAD {
+        return left_dispatches.cmp(&right_dispatches);
+    }
+    right
+        .task
+        .priority
+        .cmp(&left.task.priority)
         .then_with(|| left.dispatches.cmp(&right.dispatches))
         .then_with(|| left.submitted_at.cmp(&right.submitted_at))
         .then_with(|| left.task.identity.cmp(&right.task.identity))
@@ -1516,6 +1521,82 @@ mod tests {
     }
 
     #[test]
+    fn task_and_checkpoint_bounds_reject_overflow_without_evicting_live_work() {
+        let coordinator = MaintenanceCoordinator::new();
+        for identity in 1..=u8::try_from(MAX_MAINTENANCE_TASKS).expect("task bound fits in u8") {
+            coordinator
+                .submit(task(
+                    identity,
+                    MaintenanceTaskClass::Compaction,
+                    MaintenanceTrigger::Event,
+                    MaintenancePriority::Ordinary,
+                    Vec::new(),
+                ))
+                .expect("bounded task accepted");
+        }
+
+        assert!(matches!(
+            coordinator.submit(task(
+                129,
+                MaintenanceTaskClass::Compaction,
+                MaintenanceTrigger::Event,
+                MaintenancePriority::Ordinary,
+                Vec::new(),
+            )),
+            Err(MaintenanceFailure::CapacityExceeded)
+        ));
+        assert!(
+            coordinator
+                .status(MaintenanceTaskId::new([1; 16]).expect("identity"))
+                .is_ok()
+        );
+        assert!(MaintenanceCheckpoint::new(1, 0, vec![0; MAX_CHECKPOINT_BYTES]).is_ok());
+        assert_eq!(
+            MaintenanceCheckpoint::new(1, 0, vec![0; MAX_CHECKPOINT_BYTES + 1]),
+            Err(MaintenanceFailure::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn cooperative_cancellation_prevents_terminal_success() {
+        let coordinator = MaintenanceCoordinator::new();
+        let task = task(
+            8,
+            MaintenanceTaskClass::Compaction,
+            MaintenanceTrigger::Event,
+            MaintenancePriority::Ordinary,
+            Vec::new(),
+        );
+        let identity = task.identity();
+        coordinator.submit(task.clone()).expect("accepted");
+        assert_eq!(
+            coordinator.start_next(1, false).expect("starts"),
+            Some(task)
+        );
+        coordinator
+            .cancel(identity)
+            .expect("cancellation requested");
+        assert!(
+            coordinator
+                .status(identity)
+                .expect("status")
+                .cancellation_requested()
+        );
+        coordinator
+            .complete(identity, true)
+            .expect("handler returns");
+
+        assert_eq!(
+            coordinator
+                .status(identity)
+                .expect("terminal status")
+                .phase(),
+            MaintenanceTaskPhase::Cancelled
+        );
+        assert_eq!(coordinator.start_next(2, false).expect("no rerun"), None);
+    }
+
+    #[test]
     fn a_repeated_urgent_scope_cannot_starve_an_unserved_tenant() {
         let coordinator = MaintenanceCoordinator::new();
         let first = MaintenanceTask::with_contract(
@@ -1556,7 +1637,7 @@ mod tests {
         .expect("task");
         coordinator.submit(first.clone()).expect("first");
         coordinator.submit(second.clone()).expect("second");
-        coordinator.submit(third).expect("third");
+        coordinator.submit(third.clone()).expect("third");
         assert_eq!(
             coordinator.start_next(1, false).expect("start"),
             Some(first)
@@ -1566,6 +1647,13 @@ mod tests {
             .expect("complete");
         assert_eq!(
             coordinator.start_next(2, false).expect("fair next"),
+            Some(third)
+        );
+        coordinator
+            .complete(MaintenanceTaskId::new([12; 16]).expect("identity"), true)
+            .expect("complete");
+        assert_eq!(
+            coordinator.start_next(3, false).expect("bounded fair next"),
             Some(second)
         );
     }
