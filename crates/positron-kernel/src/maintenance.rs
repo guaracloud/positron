@@ -349,6 +349,7 @@ impl MaintenanceCoordinator {
 
     /// Defers only declared optional work for a finite Lifecycle Clock interval.
     /// Required work and event-driven emergency compaction stay schedulable.
+    #[cfg(any(test, fuzzing))]
     pub fn set_window(
         &self,
         deferred: impl IntoIterator<Item = MaintenanceTaskClass>,
@@ -377,6 +378,7 @@ impl MaintenanceCoordinator {
     }
 
     /// Pauses one optional task until a finite monotonic deadline.
+    #[cfg(any(test, fuzzing))]
     pub fn pause(
         &self,
         identity: MaintenanceTaskId,
@@ -411,6 +413,7 @@ impl MaintenanceCoordinator {
         Ok(())
     }
 
+    #[cfg(any(test, fuzzing))]
     pub fn resume(&self, identity: MaintenanceTaskId) -> Result<(), MaintenanceFailure> {
         let mut state = self
             .state
@@ -430,6 +433,7 @@ impl MaintenanceCoordinator {
 
     /// Requests cooperative cancellation. A running handler observes this at
     /// its existing safe checkpoint; no output is made current by cancellation.
+    #[cfg(any(test, fuzzing))]
     pub fn cancel(&self, identity: MaintenanceTaskId) -> Result<(), MaintenanceFailure> {
         let mut state = self
             .state
@@ -494,6 +498,7 @@ impl MaintenanceCoordinator {
     /// Selects and reserves one task in one operation. A refusal returns the
     /// task to the bounded queue, preserving its identity and checkpoint for a
     /// later wakeup instead of creating a retry loop or a second scheduler.
+    #[cfg(any(test, fuzzing))]
     pub fn start_next_with_reservation<'authority>(
         &self,
         authority: &'authority StorageKernelResourceAuthority,
@@ -590,6 +595,7 @@ impl MaintenanceCoordinator {
 
     /// Crash recovery releases ephemeral reservations and makes any nonterminal
     /// checkpointed task eligible to resume through its same stable identity.
+    #[cfg(any(test, fuzzing))]
     pub fn recover_after_crash(&self) -> Result<(), MaintenanceFailure> {
         let mut state = self
             .state

@@ -378,3 +378,55 @@ pub(super) fn record_identity(
     }
     decode_record(bytes).map(|state| Some(state.task.identity))
 }
+
+const WINDOW_MAGIC: &[u8; 8] = b"PMTW0001";
+
+pub(super) fn encode_window(window: &MaintenanceWindow) -> Result<Vec<u8>, MaintenanceFailure> {
+    let count = window.deferred.len();
+    let capacity = WINDOW_MAGIC
+        .len()
+        .checked_add(8)
+        .and_then(|size| size.checked_add(1))
+        .and_then(|size| size.checked_add(count))
+        .ok_or(MaintenanceFailure::CapacityExceeded)?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(capacity)
+        .map_err(|_| MaintenanceFailure::CapacityExceeded)?;
+    bytes.extend_from_slice(WINDOW_MAGIC);
+    bytes.extend_from_slice(&window.until.to_be_bytes());
+    bytes.push(u8::try_from(count).map_err(|_| MaintenanceFailure::CapacityExceeded)?);
+    for class in &window.deferred {
+        bytes.push(class_code(*class));
+    }
+    Ok(bytes)
+}
+
+pub(super) fn window_record(bytes: &[u8]) -> Result<Option<MaintenanceWindow>, MaintenanceFailure> {
+    if !bytes.starts_with(WINDOW_MAGIC) {
+        return Ok(None);
+    }
+    let mut cursor = RecordCursor::new(bytes);
+    if cursor.take_exact(WINDOW_MAGIC.len())? != WINDOW_MAGIC {
+        return Err(MaintenanceFailure::InvalidInput);
+    }
+    let until = cursor.u64()?;
+    if until == 0 {
+        return Err(MaintenanceFailure::InvalidInput);
+    }
+    let count = usize::from(cursor.byte()?);
+    if count > MaintenanceTaskClass::COUNT {
+        return Err(MaintenanceFailure::InvalidInput);
+    }
+    let mut deferred = BTreeSet::new();
+    for _ in 0..count {
+        let class = class_from_code(cursor.byte()?)?;
+        if !class.deferrable() || !deferred.insert(class) {
+            return Err(MaintenanceFailure::InvalidInput);
+        }
+    }
+    if !cursor.is_finished() {
+        return Err(MaintenanceFailure::InvalidInput);
+    }
+    Ok(Some(MaintenanceWindow { deferred, until }))
+}

@@ -12,6 +12,56 @@ use super::*;
 use crate::{Catalog, CatalogObject, CatalogProposal, TransactionId};
 
 impl MaintenanceCoordinator {
+    /// Selects, reserves, and durably marks one task Running before handing its
+    /// execution to a handler. A failed publication drops the fresh reservation
+    /// and leaves the task queued for the same stable retry.
+    pub fn start_next_with_reservation_and_persist<'authority>(
+        &self,
+        catalog: &Catalog<'_>,
+        authority: &'authority StorageKernelResourceAuthority,
+        now: u64,
+        clock_uncertain: bool,
+    ) -> Result<Option<MaintenanceExecution<'authority>>, MaintenanceFailure> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
+        let mut prospective = state.clone();
+        let candidates = eligible_task_ids(&mut prospective, now, clock_uncertain)?;
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+        for identity in candidates {
+            let task = prospective
+                .tasks
+                .get(&identity)
+                .map(|stored| stored.task.clone())
+                .ok_or(MaintenanceFailure::UnknownTask)?;
+            let reservation = match reserve_task(authority, &task) {
+                Ok(reservation) => reservation,
+                Err(()) => continue,
+            };
+            let dispatch = dispatch_task(&mut prospective, self.coordinator_id, identity, now)?;
+            let updated = prospective
+                .tasks
+                .get(&identity)
+                .ok_or(MaintenanceFailure::UnknownTask)?;
+            if let Err(failure) = persist_task_state(catalog, updated, None) {
+                drop(reservation);
+                return Err(failure);
+            }
+            let updated = updated.clone();
+            state.tasks.insert(identity, updated);
+            state.fairness = prospective.fairness;
+            return Ok(Some(MaintenanceExecution {
+                task,
+                reservation,
+                dispatch,
+            }));
+        }
+        Err(MaintenanceFailure::ResourceAdmissionRefused)
+    }
+
     /// Submits a task only after its queued state is durably reachable through
     /// the current Catalog generation. Retrying the same stable task identity
     /// attaches to the already published record.
@@ -55,6 +105,116 @@ impl MaintenanceCoordinator {
         Ok(task)
     }
 
+    /// Publishes a finite pause before exposing it to the scheduler.
+    pub fn pause_and_persist(
+        &self,
+        catalog: &Catalog<'_>,
+        identity: MaintenanceTaskId,
+        resource_generation: u64,
+        until: u64,
+        now: u64,
+    ) -> Result<(), MaintenanceFailure> {
+        if until <= now {
+            return Err(MaintenanceFailure::InvalidInput);
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
+        let mut next = state.clone();
+        let task = next
+            .tasks
+            .get_mut(&identity)
+            .ok_or(MaintenanceFailure::UnknownTask)?;
+        if !task.task.class.deferrable()
+            || task.task.preconditions.resource_generation != resource_generation
+        {
+            return Err(MaintenanceFailure::PreconditionFailed);
+        }
+        if !matches!(
+            task.phase,
+            MaintenanceTaskPhase::Queued | MaintenanceTaskPhase::Deferred
+        ) {
+            return Err(MaintenanceFailure::InvalidTransition);
+        }
+        task.phase = MaintenanceTaskPhase::Deferred;
+        task.pause_until = Some(until);
+        persist_task_state(catalog, task, None)?;
+        *state = next;
+        Ok(())
+    }
+
+    /// Removes a durable pause before returning the task to the queue.
+    pub fn resume_and_persist(
+        &self,
+        catalog: &Catalog<'_>,
+        identity: MaintenanceTaskId,
+    ) -> Result<(), MaintenanceFailure> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
+        let mut next = state.clone();
+        let task = next
+            .tasks
+            .get_mut(&identity)
+            .ok_or(MaintenanceFailure::UnknownTask)?;
+        if task.phase != MaintenanceTaskPhase::Deferred {
+            return Err(MaintenanceFailure::InvalidTransition);
+        }
+        task.phase = MaintenanceTaskPhase::Queued;
+        task.pause_until = None;
+        persist_task_state(catalog, task, None)?;
+        *state = next;
+        Ok(())
+    }
+
+    /// Durably requests cancellation before it is visible to the handler or
+    /// scheduler. A protected durability completion remains non-cancellable.
+    pub fn cancel_and_persist(
+        &self,
+        catalog: &Catalog<'_>,
+        identity: MaintenanceTaskId,
+    ) -> Result<(), MaintenanceFailure> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
+        let mut next = state.clone();
+        let terminal = {
+            let task = next
+                .tasks
+                .get_mut(&identity)
+                .ok_or(MaintenanceFailure::UnknownTask)?;
+            if retains_until_completion(&task.task) {
+                return Err(MaintenanceFailure::PreconditionFailed);
+            }
+            match task.phase {
+                MaintenanceTaskPhase::Queued | MaintenanceTaskPhase::Deferred => {
+                    task.phase = MaintenanceTaskPhase::Cancelled;
+                    true
+                },
+                MaintenanceTaskPhase::Running => {
+                    task.cancellation_requested = true;
+                    false
+                },
+                MaintenanceTaskPhase::Cancelled
+                | MaintenanceTaskPhase::Succeeded
+                | MaintenanceTaskPhase::Failed => false,
+            }
+        };
+        if terminal {
+            assign_terminal_order(&mut next, identity)?;
+        }
+        let task = next
+            .tasks
+            .get(&identity)
+            .ok_or(MaintenanceFailure::UnknownTask)?;
+        persist_task_state(catalog, task, None)?;
+        *state = next;
+        Ok(())
+    }
+
     /// Recovers the complete bounded task registry from authenticated Catalog
     /// objects. Running work never owns durable capacity after a process exit,
     /// so it is returned to its queued checkpoint before any handler resumes.
@@ -62,19 +222,64 @@ impl MaintenanceCoordinator {
         let snapshot = catalog.pin().map_err(map_catalog_failure)?;
         let mut identities = BTreeSet::new();
         let mut records = Vec::new();
+        let mut window = None;
         records
             .try_reserve_exact(snapshot.object_count())
             .map_err(|_| MaintenanceFailure::CapacityExceeded)?;
         for bytes in snapshot.plaintext_objects() {
-            let Some(identity) = record::record_identity(bytes)? else {
+            if let Some(identity) = record::record_identity(bytes)? {
+                if !identities.insert(identity) {
+                    return Err(MaintenanceFailure::CatalogUnavailable);
+                }
+                records.push(MaintenanceTaskRecord(bytes.to_vec()));
                 continue;
-            };
-            if !identities.insert(identity) {
+            }
+            if let Some(candidate) = record::window_record(bytes)?
+                && window.replace(candidate).is_some()
+            {
                 return Err(MaintenanceFailure::CatalogUnavailable);
             }
-            records.push(MaintenanceTaskRecord(bytes.to_vec()));
         }
-        Self::restore(records)
+        let coordinator = Self::restore(records)?;
+        let mut state = coordinator
+            .state
+            .lock()
+            .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
+        state.window = window;
+        drop(state);
+        Ok(coordinator)
+    }
+
+    /// Publishes the bounded, finite maintenance-window intent before it
+    /// defers optional work.
+    pub fn set_window_and_persist(
+        &self,
+        catalog: &Catalog<'_>,
+        deferred: impl IntoIterator<Item = MaintenanceTaskClass>,
+        until: u64,
+        now: u64,
+    ) -> Result<(), MaintenanceFailure> {
+        if until <= now {
+            return Err(MaintenanceFailure::InvalidInput);
+        }
+        let mut classes = BTreeSet::new();
+        for class in deferred {
+            if !class.deferrable() {
+                return Err(MaintenanceFailure::InvalidInput);
+            }
+            classes.insert(class);
+        }
+        let window = MaintenanceWindow {
+            deferred: classes,
+            until,
+        };
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
+        persist_window(catalog, &window)?;
+        state.window = Some(window);
+        Ok(())
     }
 
     fn checkpoint_and_persist_dispatch(
@@ -174,7 +379,7 @@ impl MaintenanceExecution<'_> {
     /// Durably publishes the terminal coordinator outcome before releasing the
     /// execution and its governor reservation.
     pub fn complete_and_persist(
-        self,
+        &self,
         coordinator: &MaintenanceCoordinator,
         catalog: &Catalog<'_>,
         succeeded: bool,
@@ -195,23 +400,32 @@ fn persist_task_state(
         .try_reserve_exact(snapshot.object_count())
         .map_err(|_| MaintenanceFailure::CapacityExceeded)?;
     let mut same_record_is_current = false;
+    let mut identities = BTreeSet::new();
     for bytes in snapshot.plaintext_objects() {
-        match record::record_identity(bytes)? {
-            Some(identity) if identity == task.task.identity || Some(identity) == removed => {
-                if identity == task.task.identity && bytes == record.as_bytes() {
-                    same_record_is_current = true;
+        match record::record_identity(bytes).map_err(|_| MaintenanceFailure::CatalogUnavailable)? {
+            Some(identity) => {
+                if !identities.insert(identity) {
+                    return Err(MaintenanceFailure::CatalogUnavailable);
+                }
+                if identity == task.task.identity || Some(identity) == removed {
+                    if identity == task.task.identity && bytes == record.as_bytes() {
+                        same_record_is_current = true;
+                    }
+                } else {
+                    objects.push(CatalogObject::new(bytes.to_vec()).map_err(map_catalog_failure)?);
                 }
             },
-            Some(_) | None => {
-                objects.push(CatalogObject::new(bytes.to_vec()).map_err(map_catalog_failure)?)
-            },
+            None => objects.push(CatalogObject::new(bytes.to_vec()).map_err(map_catalog_failure)?),
         }
     }
     if same_record_is_current && removed.is_none() {
         return Ok(());
     }
     let record_object = record.catalog_object()?;
-    let transaction = record_transaction(record_object.identity().to_bytes())?;
+    let transaction = record_transaction(
+        snapshot.identity().to_bytes(),
+        record_object.identity().to_bytes(),
+    )?;
     objects.push(record_object);
     let epoch = snapshot
         .format_epoch()
@@ -224,10 +438,78 @@ fn persist_task_state(
     Ok(())
 }
 
-fn record_transaction(identity: [u8; 32]) -> Result<TransactionId, MaintenanceFailure> {
+fn persist_window(
+    catalog: &Catalog<'_>,
+    window: &MaintenanceWindow,
+) -> Result<(), MaintenanceFailure> {
+    let encoded = record::encode_window(window)?;
+    let snapshot = catalog.pin().map_err(map_catalog_failure)?;
+    let mut objects = Vec::new();
+    objects
+        .try_reserve_exact(snapshot.object_count())
+        .map_err(|_| MaintenanceFailure::CapacityExceeded)?;
+    let mut same_window_is_current = false;
+    let mut identities = BTreeSet::new();
+    let mut saw_window = false;
+    for bytes in snapshot.plaintext_objects() {
+        if let Some(identity) =
+            record::record_identity(bytes).map_err(|_| MaintenanceFailure::CatalogUnavailable)?
+        {
+            if !identities.insert(identity) {
+                return Err(MaintenanceFailure::CatalogUnavailable);
+            }
+            objects.push(CatalogObject::new(bytes.to_vec()).map_err(map_catalog_failure)?);
+            continue;
+        }
+        if record::window_record(bytes)
+            .map_err(|_| MaintenanceFailure::CatalogUnavailable)?
+            .is_some()
+        {
+            if saw_window {
+                return Err(MaintenanceFailure::CatalogUnavailable);
+            }
+            saw_window = true;
+            same_window_is_current |= bytes == encoded;
+            continue;
+        }
+        objects.push(CatalogObject::new(bytes.to_vec()).map_err(map_catalog_failure)?);
+    }
+    if same_window_is_current {
+        return Ok(());
+    }
+    let object = CatalogObject::new(encoded).map_err(map_catalog_failure)?;
+    let transaction =
+        record_transaction(snapshot.identity().to_bytes(), object.identity().to_bytes())?;
+    objects.push(object);
+    let epoch = snapshot
+        .format_epoch()
+        .ok_or(MaintenanceFailure::CatalogUnavailable)?;
+    let proposal =
+        CatalogProposal::new(transaction, epoch, objects).map_err(map_catalog_failure)?;
+    catalog
+        .commit(snapshot.identity(), proposal, None)
+        .map_err(map_catalog_failure)?;
+    Ok(())
+}
+
+fn record_transaction(
+    predecessor: [u8; 32],
+    identity: [u8; 32],
+) -> Result<TransactionId, MaintenanceFailure> {
+    let mut material = Vec::new();
+    material
+        .try_reserve_exact(77)
+        .map_err(|_| MaintenanceFailure::CapacityExceeded)?;
+    material.extend_from_slice(b"maintenance-transaction-v1");
+    material.extend_from_slice(&predecessor);
+    material.extend_from_slice(&identity);
+    let transaction_identity = CatalogObject::new(material)
+        .map_err(map_catalog_failure)?
+        .identity()
+        .to_bytes();
     let mut transaction = [0; 16];
     transaction.copy_from_slice(
-        identity
+        transaction_identity
             .get(..16)
             .ok_or(MaintenanceFailure::CatalogUnavailable)?,
     );

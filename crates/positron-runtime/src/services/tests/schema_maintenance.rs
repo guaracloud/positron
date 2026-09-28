@@ -9,8 +9,8 @@ use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use positron_governance::GovernanceAuditEntry;
 use positron_ingest::load_schema_checkpoint;
 use positron_kernel::{
-    AuditIntent, Catalog, CatalogObject, CatalogProposal, FormatEpoch, MountQualification,
-    TransactionId, WorkClass,
+    AuditIntent, Catalog, CatalogObject, CatalogProposal, FormatEpoch, MaintenanceTask,
+    MaintenanceTaskClass, MaintenanceTaskId, MountQualification, TransactionId, WorkClass,
 };
 use positron_query::QueryBudget;
 use prost::Message;
@@ -19,6 +19,41 @@ use super::super::{ServiceFailure, ServiceHandle, schema_maintenance};
 use crate::{BootstrapPaths, InitializationPlan, InstanceBootstrap};
 
 type InitializedCredentials = (Arc<crate::InitializedInstance>, String, String, String);
+
+#[test]
+fn service_startup_restores_catalog_backed_maintenance_before_serving() -> Result<(), Box<dyn Error>>
+{
+    let fixture = Fixture::new()?;
+    let (initialized, _, _) = fixture.initialized()?;
+    let task = MaintenanceTask::new(
+        MaintenanceTaskId::new([0x91; 16]).expect("stable maintenance identity"),
+        MaintenanceTaskClass::SchemaPromotion,
+    );
+    let identity = task.identity();
+    let catalog = open_catalog(&initialized)?;
+    initialized
+        .maintenance_coordinator()
+        .lock()
+        .map_err(|_| "maintenance lock")?
+        .submit_and_persist(&catalog, task, 7)
+        .expect("durable task submission");
+    drop(catalog);
+
+    let services = ServiceHandle::new(Arc::clone(&initialized))?;
+    assert_eq!(
+        initialized
+            .maintenance_coordinator()
+            .lock()
+            .map_err(|_| "maintenance lock")?
+            .status(identity)
+            .expect("restored task")
+            .task()
+            .class(),
+        MaintenanceTaskClass::SchemaPromotion
+    );
+    drop(services);
+    Ok(())
+}
 
 #[test]
 fn startup_rebuild_publishes_before_service_and_preserves_unrelated_objects()

@@ -46,6 +46,8 @@ pub enum MaintenanceTaskClass {
 }
 
 impl MaintenanceTaskClass {
+    pub(super) const COUNT: usize = 22;
+
     pub(super) const fn deferrable(self) -> bool {
         matches!(
             self,
