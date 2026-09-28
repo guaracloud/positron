@@ -14,7 +14,6 @@ use crate::{
 const MAX_MAINTENANCE_TASKS: usize = 128;
 const MAX_TASK_OBJECTS: usize = 16;
 const MAX_CHECKPOINT_BYTES: usize = 4_096;
-const MAX_PRIORITY_DISPATCH_LEAD: u64 = 2;
 
 /// A stable, caller-supplied identity for one idempotent maintenance task.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -86,16 +85,49 @@ impl MaintenanceTaskClass {
                 | Self::CompletedOperationExpiry
         )
     }
+
+    const fn priority(self, trigger: MaintenanceTrigger) -> MaintenancePriority {
+        match self {
+            Self::ActiveSegmentRoll
+            | Self::RetentionPublication
+            | Self::RetentionReclamation
+            | Self::CatalogReclamation
+            | Self::OrphanReclamation
+            | Self::IntegrityScrub
+            | Self::QuarantineFollowUp
+            | Self::GovernanceAuditCheckpoint
+            | Self::KeyRewrap
+            | Self::EnvelopeVerification
+            | Self::Migration
+            | Self::SnapshotLeaseExpiry
+            | Self::CompletedOperationExpiry
+            | Self::TenantPurge => MaintenancePriority::Urgent,
+            Self::SchemaStatistics | Self::RepositoryCleanup => MaintenancePriority::Required,
+            Self::Compaction => match trigger {
+                MaintenanceTrigger::Event => MaintenancePriority::Required,
+                MaintenanceTrigger::Scheduled | MaintenanceTrigger::AgeDerived => {
+                    MaintenancePriority::Ordinary
+                },
+            },
+
+            Self::SchemaPromotion
+            | Self::SchemaDemotion
+            | Self::RepositoryVerification
+            | Self::BackupSnapshot
+            | Self::DurableExport => MaintenancePriority::Ordinary,
+        }
+    }
 }
 
 /// The bounded task scope used for fairness and conflicts.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum MaintenanceScope {
     System,
-    Tenant {
+    Tenant(TenantId),
+    Segment {
         tenant: TenantId,
-        signal: Option<SignalKind>,
-        shard: Option<VirtualShardId>,
+        signal: SignalKind,
+        shard: VirtualShardId,
     },
 }
 
@@ -107,19 +139,15 @@ impl MaintenanceScope {
 
     #[must_use]
     pub const fn tenant(tenant: TenantId) -> Self {
-        Self::Tenant {
-            tenant,
-            signal: None,
-            shard: None,
-        }
+        Self::Tenant(tenant)
     }
 
     #[must_use]
     pub const fn segment(tenant: TenantId, signal: SignalKind, shard: VirtualShardId) -> Self {
-        Self::Tenant {
+        Self::Segment {
             tenant,
-            signal: Some(signal),
-            shard: Some(shard),
+            signal,
+            shard,
         }
     }
 
@@ -127,7 +155,7 @@ impl MaintenanceScope {
     pub const fn tenant_id(self) -> Option<TenantId> {
         match self {
             Self::System => None,
-            Self::Tenant { tenant, .. } => Some(tenant),
+            Self::Tenant(tenant) | Self::Segment { tenant, .. } => Some(tenant),
         }
     }
 }
@@ -158,7 +186,7 @@ pub enum MaintenanceTrigger {
     AgeDerived,
 }
 
-/// Scheduling urgency. Fairness still selects the least-served eligible tenant.
+/// A coordinator-derived scheduling class. Callers cannot promote arbitrary work.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum MaintenancePriority {
     Ordinary,
@@ -252,7 +280,6 @@ pub struct MaintenanceTask {
     class: MaintenanceTaskClass,
     scope: MaintenanceScope,
     trigger: MaintenanceTrigger,
-    priority: MaintenancePriority,
     preconditions: MaintenancePreconditions,
     inputs: Vec<MaintenanceObjectId>,
     outputs: Vec<MaintenanceObjectId>,
@@ -270,7 +297,6 @@ impl MaintenanceTask {
             class,
             scope: MaintenanceScope::System,
             trigger: MaintenanceTrigger::Event,
-            priority: MaintenancePriority::Ordinary,
             preconditions: MaintenancePreconditions {
                 catalog_generation: 0,
                 resource_generation: 1,
@@ -287,7 +313,6 @@ impl MaintenanceTask {
         class: MaintenanceTaskClass,
         scope: MaintenanceScope,
         trigger: MaintenanceTrigger,
-        priority: MaintenancePriority,
         preconditions: MaintenancePreconditions,
         mut inputs: Vec<MaintenanceObjectId>,
         mut outputs: Vec<MaintenanceObjectId>,
@@ -313,7 +338,6 @@ impl MaintenanceTask {
             class,
             scope,
             trigger,
-            priority,
             preconditions,
             inputs,
             outputs,
@@ -341,7 +365,7 @@ impl MaintenanceTask {
     }
     #[must_use]
     pub const fn priority(&self) -> MaintenancePriority {
-        self.priority
+        self.class.priority(self.trigger)
     }
     #[must_use]
     pub const fn preconditions(&self) -> MaintenancePreconditions {
@@ -385,6 +409,7 @@ struct CoordinatorState {
     tasks: BTreeMap<MaintenanceTaskId, TaskState>,
     windows: BTreeSet<MaintenanceTaskClass>,
     fairness: BTreeMap<MaintenanceScope, u64>,
+    next_terminal_order: u64,
 }
 
 #[derive(Clone)]
@@ -396,6 +421,7 @@ struct TaskState {
     pause_until: Option<u64>,
     cancellation_requested: bool,
     dispatches: u64,
+    terminal_order: Option<u64>,
 }
 
 /// Read-only task status. It exposes no unbounded object identifiers in telemetry.
@@ -499,6 +525,7 @@ impl MaintenanceCoordinator {
                 tasks: BTreeMap::new(),
                 windows: BTreeSet::new(),
                 fairness: BTreeMap::new(),
+                next_terminal_order: 1,
             }),
         }
     }
@@ -525,7 +552,7 @@ impl MaintenanceCoordinator {
             }
             return Ok(existing.task.clone());
         }
-        if state.tasks.len() >= MAX_MAINTENANCE_TASKS {
+        if state.tasks.len() >= MAX_MAINTENANCE_TASKS && !reclaim_terminal_slot(&mut state)? {
             return Err(MaintenanceFailure::CapacityExceeded);
         }
         state.tasks.insert(
@@ -538,6 +565,7 @@ impl MaintenanceCoordinator {
                 pause_until: None,
                 cancellation_requested: false,
                 dispatches: 0,
+                terminal_order: None,
             },
         );
         Ok(task)
@@ -623,18 +651,30 @@ impl MaintenanceCoordinator {
             .state
             .lock()
             .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
-        let task = state
-            .tasks
-            .get_mut(&identity)
-            .ok_or(MaintenanceFailure::UnknownTask)?;
-        match task.phase {
-            MaintenanceTaskPhase::Queued | MaintenanceTaskPhase::Deferred => {
-                task.phase = MaintenanceTaskPhase::Cancelled;
-            },
-            MaintenanceTaskPhase::Running => task.cancellation_requested = true,
-            MaintenanceTaskPhase::Cancelled
-            | MaintenanceTaskPhase::Succeeded
-            | MaintenanceTaskPhase::Failed => {},
+        let terminal = {
+            let task = state
+                .tasks
+                .get_mut(&identity)
+                .ok_or(MaintenanceFailure::UnknownTask)?;
+            if retains_until_completion(&task.task) {
+                return Err(MaintenanceFailure::PreconditionFailed);
+            }
+            match task.phase {
+                MaintenanceTaskPhase::Queued | MaintenanceTaskPhase::Deferred => {
+                    task.phase = MaintenanceTaskPhase::Cancelled;
+                    true
+                },
+                MaintenanceTaskPhase::Running => {
+                    task.cancellation_requested = true;
+                    false
+                },
+                MaintenanceTaskPhase::Cancelled
+                | MaintenanceTaskPhase::Succeeded
+                | MaintenanceTaskPhase::Failed => false,
+            }
+        };
+        if terminal {
+            assign_terminal_order(&mut state, identity)?;
         }
         Ok(())
     }
@@ -664,7 +704,7 @@ impl MaintenanceCoordinator {
             .filter(|task| task.phase == MaintenanceTaskPhase::Running)
             .map(|task| task.task.clone())
             .collect::<Vec<_>>();
-        let candidate = state
+        let eligible = state
             .tasks
             .values()
             .filter(|task| {
@@ -679,6 +719,10 @@ impl MaintenanceCoordinator {
                     && !clock_blocks
                     && !conflicts
             })
+            .collect::<Vec<_>>();
+        let candidate = eligible
+            .iter()
+            .copied()
             .min_by(|left, right| scheduling_order(left, right, &state.fairness));
         let Some(identity) = candidate.map(|task| task.task.identity) else {
             return Ok(None);
@@ -771,20 +815,23 @@ impl MaintenanceCoordinator {
             .state
             .lock()
             .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
-        let task = state
-            .tasks
-            .get_mut(&identity)
-            .ok_or(MaintenanceFailure::UnknownTask)?;
-        if task.phase != MaintenanceTaskPhase::Running {
-            return Err(MaintenanceFailure::InvalidTransition);
+        {
+            let task = state
+                .tasks
+                .get_mut(&identity)
+                .ok_or(MaintenanceFailure::UnknownTask)?;
+            if task.phase != MaintenanceTaskPhase::Running {
+                return Err(MaintenanceFailure::InvalidTransition);
+            }
+            task.phase = if task.cancellation_requested {
+                MaintenanceTaskPhase::Cancelled
+            } else if succeeded {
+                MaintenanceTaskPhase::Succeeded
+            } else {
+                MaintenanceTaskPhase::Failed
+            };
         }
-        task.phase = if task.cancellation_requested {
-            MaintenanceTaskPhase::Cancelled
-        } else if succeeded {
-            MaintenanceTaskPhase::Succeeded
-        } else {
-            MaintenanceTaskPhase::Failed
-        };
+        assign_terminal_order(&mut state, identity)?;
         Ok(())
     }
 
@@ -795,11 +842,21 @@ impl MaintenanceCoordinator {
             .state
             .lock()
             .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
-        for task in state.tasks.values_mut() {
+        let mut terminal = Vec::new();
+        for (identity, task) in &mut state.tasks {
             if task.phase == MaintenanceTaskPhase::Running {
-                task.phase = MaintenanceTaskPhase::Queued;
-                task.cancellation_requested = false;
+                task.phase = if task.cancellation_requested {
+                    MaintenanceTaskPhase::Cancelled
+                } else {
+                    MaintenanceTaskPhase::Queued
+                };
+                if task.phase == MaintenanceTaskPhase::Cancelled {
+                    terminal.push(*identity);
+                }
             }
+        }
+        for identity in terminal {
+            assign_terminal_order(&mut state, identity)?;
         }
         Ok(())
     }
@@ -841,8 +898,11 @@ impl MaintenanceCoordinator {
         for record in records {
             let mut state = decode_record(record.as_bytes())?;
             if state.phase == MaintenanceTaskPhase::Running {
-                state.phase = MaintenanceTaskPhase::Queued;
-                state.cancellation_requested = false;
+                state.phase = if state.cancellation_requested {
+                    MaintenanceTaskPhase::Cancelled
+                } else {
+                    MaintenanceTaskPhase::Queued
+                };
             }
             let mut inner = coordinator
                 .state
@@ -895,27 +955,7 @@ fn reserve_task<'authority>(
     authority: &'authority StorageKernelResourceAuthority,
     task: &MaintenanceTask,
 ) -> Result<MaintenanceReservation<'authority>, ()> {
-    let recovery_kind = match task.class {
-        MaintenanceTaskClass::ActiveSegmentRoll
-        | MaintenanceTaskClass::GovernanceAuditCheckpoint => {
-            Some(RecoveryWorkKind::DurabilityCompletion)
-        },
-        MaintenanceTaskClass::Compaction if task.priority == MaintenancePriority::Urgent => {
-            Some(RecoveryWorkKind::EmergencyCompaction)
-        },
-        MaintenanceTaskClass::RetentionPublication | MaintenanceTaskClass::RetentionReclamation => {
-            Some(RecoveryWorkKind::Retention)
-        },
-        MaintenanceTaskClass::TenantPurge => Some(RecoveryWorkKind::Purge),
-        MaintenanceTaskClass::IntegrityScrub
-        | MaintenanceTaskClass::QuarantineFollowUp
-        | MaintenanceTaskClass::CatalogReclamation
-        | MaintenanceTaskClass::OrphanReclamation
-        | MaintenanceTaskClass::KeyRewrap
-        | MaintenanceTaskClass::EnvelopeVerification
-        | MaintenanceTaskClass::Migration => Some(RecoveryWorkKind::Repair),
-        _ => None,
-    };
+    let recovery_kind = recovery_kind(task);
     if let Some(kind) = recovery_kind {
         let claim = match task.scope.tenant_id() {
             Some(tenant) => RecoveryWorkClaim::tenant(tenant, kind, task.reservations),
@@ -942,8 +982,93 @@ fn reserve_task<'authority>(
         .map_err(|_| ())
 }
 
+fn recovery_kind(task: &MaintenanceTask) -> Option<RecoveryWorkKind> {
+    match task.class {
+        MaintenanceTaskClass::ActiveSegmentRoll
+        | MaintenanceTaskClass::GovernanceAuditCheckpoint => {
+            Some(RecoveryWorkKind::DurabilityCompletion)
+        },
+        MaintenanceTaskClass::Compaction if task.priority() == MaintenancePriority::Urgent => {
+            Some(RecoveryWorkKind::EmergencyCompaction)
+        },
+        MaintenanceTaskClass::RetentionPublication | MaintenanceTaskClass::RetentionReclamation => {
+            Some(RecoveryWorkKind::Retention)
+        },
+        MaintenanceTaskClass::TenantPurge => Some(RecoveryWorkKind::Purge),
+        MaintenanceTaskClass::IntegrityScrub
+        | MaintenanceTaskClass::QuarantineFollowUp
+        | MaintenanceTaskClass::CatalogReclamation
+        | MaintenanceTaskClass::OrphanReclamation
+        | MaintenanceTaskClass::KeyRewrap
+        | MaintenanceTaskClass::EnvelopeVerification
+        | MaintenanceTaskClass::Migration => Some(RecoveryWorkKind::Repair),
+        _ => None,
+    }
+}
+
+fn retains_until_completion(task: &MaintenanceTask) -> bool {
+    matches!(
+        recovery_kind(task),
+        Some(RecoveryWorkKind::DurabilityCompletion)
+    )
+}
+
+fn assign_terminal_order(
+    state: &mut CoordinatorState,
+    identity: MaintenanceTaskId,
+) -> Result<(), MaintenanceFailure> {
+    let order = state.next_terminal_order;
+    state.next_terminal_order = state
+        .next_terminal_order
+        .checked_add(1)
+        .ok_or(MaintenanceFailure::CapacityExceeded)?;
+    let task = state
+        .tasks
+        .get_mut(&identity)
+        .ok_or(MaintenanceFailure::UnknownTask)?;
+    task.terminal_order = Some(order);
+    Ok(())
+}
+
+fn reclaim_terminal_slot(state: &mut CoordinatorState) -> Result<bool, MaintenanceFailure> {
+    let candidate = state
+        .tasks
+        .iter()
+        .filter(|(_, task)| {
+            matches!(
+                task.phase,
+                MaintenanceTaskPhase::Cancelled
+                    | MaintenanceTaskPhase::Succeeded
+                    | MaintenanceTaskPhase::Failed
+            )
+        })
+        .min_by_key(|(identity, task)| {
+            (
+                task.terminal_order.unwrap_or(u64::MAX),
+                task.submitted_at,
+                **identity,
+            )
+        })
+        .map(|(identity, _)| *identity);
+    let Some(identity) = candidate else {
+        return Ok(false);
+    };
+    let removed = state
+        .tasks
+        .remove(&identity)
+        .ok_or(MaintenanceFailure::UnknownTask)?;
+    if !state
+        .tasks
+        .values()
+        .any(|task| task.task.scope == removed.task.scope)
+    {
+        state.fairness.remove(&removed.task.scope);
+    }
+    Ok(true)
+}
+
 fn tasks_conflict(left: &MaintenanceTask, right: &MaintenanceTask) -> bool {
-    if left.scope != right.scope {
+    if !scopes_overlap(left.scope, right.scope) {
         return false;
     }
     left.inputs.iter().any(|object| {
@@ -954,6 +1079,32 @@ fn tasks_conflict(left: &MaintenanceTask, right: &MaintenanceTask) -> bool {
         || matches!(right.class, MaintenanceTaskClass::TenantPurge)
 }
 
+fn scopes_overlap(left: MaintenanceScope, right: MaintenanceScope) -> bool {
+    match (left, right) {
+        (MaintenanceScope::System, MaintenanceScope::System) => true,
+        (MaintenanceScope::Tenant(left), MaintenanceScope::Tenant(right)) => left == right,
+        (MaintenanceScope::Tenant(left), MaintenanceScope::Segment { tenant, .. })
+        | (MaintenanceScope::Segment { tenant, .. }, MaintenanceScope::Tenant(left)) => {
+            left == tenant
+        },
+        (
+            MaintenanceScope::Segment {
+                tenant: left_tenant,
+                signal: left_signal,
+                shard: left_shard,
+            },
+            MaintenanceScope::Segment {
+                tenant: right_tenant,
+                signal: right_signal,
+                shard: right_shard,
+            },
+        ) => {
+            left_tenant == right_tenant && left_signal == right_signal && left_shard == right_shard
+        },
+        (MaintenanceScope::System, _) | (_, MaintenanceScope::System) => false,
+    }
+}
+
 fn scheduling_order(
     left: &TaskState,
     right: &TaskState,
@@ -961,14 +1112,11 @@ fn scheduling_order(
 ) -> std::cmp::Ordering {
     let left_dispatches = fairness.get(&left.task.scope).copied().unwrap_or(0);
     let right_dispatches = fairness.get(&right.task.scope).copied().unwrap_or(0);
-    let fairness_order = left_dispatches.abs_diff(right_dispatches);
-    if fairness_order >= MAX_PRIORITY_DISPATCH_LEAD {
-        return left_dispatches.cmp(&right_dispatches);
-    }
     right
         .task
-        .priority
-        .cmp(&left.task.priority)
+        .priority()
+        .cmp(&left.task.priority())
+        .then_with(|| left_dispatches.cmp(&right_dispatches))
         .then_with(|| left.dispatches.cmp(&right.dispatches))
         .then_with(|| left.submitted_at.cmp(&right.submitted_at))
         .then_with(|| left.task.identity.cmp(&right.task.identity))
@@ -1004,7 +1152,7 @@ fn encode_record(state: &TaskState) -> Result<MaintenanceTaskRecord, Maintenance
     bytes.push(class_code(task.class));
     encode_scope(&mut bytes, task.scope);
     bytes.push(trigger_code(task.trigger));
-    bytes.push(priority_code(task.priority));
+    bytes.push(priority_code(task.priority()));
     push_u64(&mut bytes, task.preconditions.catalog_generation);
     push_u64(&mut bytes, task.preconditions.resource_generation);
     bytes.push(u8::try_from(task.inputs.len()).map_err(|_| MaintenanceFailure::CapacityExceeded)?);
@@ -1060,12 +1208,14 @@ fn decode_record(bytes: &[u8]) -> Result<TaskState, MaintenanceFailure> {
         class,
         scope,
         trigger,
-        priority,
         preconditions,
         inputs,
         outputs,
         ResourceAmounts::new(amounts),
     )?;
+    if priority != task.priority() {
+        return Err(MaintenanceFailure::InvalidInput);
+    }
     let phase = phase_from_code(cursor.byte()?)?;
     let submitted_at = cursor.u64()?;
     let pause_until = match cursor.byte()? {
@@ -1105,6 +1255,7 @@ fn decode_record(bytes: &[u8]) -> Result<TaskState, MaintenanceFailure> {
         pause_until,
         cancellation_requested,
         dispatches,
+        terminal_order: None,
     })
 }
 
@@ -1128,7 +1279,13 @@ fn decode_objects(
 fn encode_scope(bytes: &mut Vec<u8>, scope: MaintenanceScope) {
     match scope {
         MaintenanceScope::System => bytes.push(0),
-        MaintenanceScope::Tenant {
+        MaintenanceScope::Tenant(tenant) => {
+            bytes.push(1);
+            bytes.extend_from_slice(&tenant.to_bytes());
+            bytes.push(0);
+            push_u32(bytes, 0);
+        },
+        MaintenanceScope::Segment {
             tenant,
             signal,
             shard,
@@ -1136,11 +1293,10 @@ fn encode_scope(bytes: &mut Vec<u8>, scope: MaintenanceScope) {
             bytes.push(1);
             bytes.extend_from_slice(&tenant.to_bytes());
             bytes.push(match signal {
-                None => 0,
-                Some(SignalKind::Logs) => 1,
-                Some(SignalKind::Traces) => 2,
+                SignalKind::Logs => 1,
+                SignalKind::Traces => 2,
             });
-            push_u32(bytes, shard.map_or(0, VirtualShardId::value));
+            push_u32(bytes, shard.value());
         },
     }
 }
@@ -1166,11 +1322,11 @@ fn decode_scope(cursor: &mut RecordCursor<'_>) -> Result<MaintenanceScope, Maint
             if signal.is_some() != shard.is_some() {
                 return Err(MaintenanceFailure::InvalidInput);
             }
-            Ok(MaintenanceScope::Tenant {
-                tenant,
-                signal,
-                shard,
-            })
+            match (signal, shard) {
+                (None, None) => Ok(MaintenanceScope::tenant(tenant)),
+                (Some(signal), Some(shard)) => Ok(MaintenanceScope::segment(tenant, signal, shard)),
+                (None, Some(_)) | (Some(_), None) => Err(MaintenanceFailure::InvalidInput),
+            }
         },
         _ => Err(MaintenanceFailure::InvalidInput),
     }
@@ -1336,7 +1492,7 @@ mod tests {
         identity: u8,
         class: MaintenanceTaskClass,
         trigger: MaintenanceTrigger,
-        priority: MaintenancePriority,
+        _priority: MaintenancePriority,
         inputs: Vec<MaintenanceObjectId>,
     ) -> MaintenanceTask {
         MaintenanceTask::with_contract(
@@ -1344,7 +1500,6 @@ mod tests {
             class,
             MaintenanceScope::system(),
             trigger,
-            priority,
             MaintenancePreconditions::new(4, 9).expect("valid preconditions"),
             inputs,
             Vec::new(),
@@ -1558,6 +1713,43 @@ mod tests {
     }
 
     #[test]
+    fn terminal_outcomes_are_retired_only_to_admit_new_live_work() {
+        let coordinator = MaintenanceCoordinator::new();
+        for identity in 1..=u8::try_from(MAX_MAINTENANCE_TASKS).expect("task bound fits in u8") {
+            coordinator
+                .submit(task(
+                    identity,
+                    MaintenanceTaskClass::Compaction,
+                    MaintenanceTrigger::Event,
+                    MaintenancePriority::Ordinary,
+                    Vec::new(),
+                ))
+                .expect("bounded task accepted");
+        }
+        let completed = coordinator
+            .start_next(1, false)
+            .expect("start")
+            .expect("queued work");
+        coordinator
+            .complete(completed.identity(), true)
+            .expect("complete");
+
+        coordinator
+            .submit(task(
+                129,
+                MaintenanceTaskClass::Compaction,
+                MaintenanceTrigger::Event,
+                MaintenancePriority::Ordinary,
+                Vec::new(),
+            ))
+            .expect("terminal slot is retired for live work");
+        assert_eq!(
+            coordinator.status(completed.identity()),
+            Err(MaintenanceFailure::UnknownTask)
+        );
+    }
+
+    #[test]
     fn cooperative_cancellation_prevents_terminal_success() {
         let coordinator = MaintenanceCoordinator::new();
         let task = task(
@@ -1597,6 +1789,144 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_order_has_no_priority_fairness_cycle() {
+        let scope =
+            |byte| MaintenanceScope::tenant(TenantId::from_bytes([byte; 16]).expect("tenant"));
+        let state = |identity, class, task_scope| TaskState {
+            task: MaintenanceTask::with_contract(
+                MaintenanceTaskId::new([identity; 16]).expect("identity"),
+                class,
+                task_scope,
+                MaintenanceTrigger::Event,
+                MaintenancePreconditions::new(1, 1).expect("preconditions"),
+                Vec::new(),
+                Vec::new(),
+                ResourceAmounts::new([1, 1, 1, 0, 1, 0, 1, 1, 1, 1, 0]),
+            )
+            .expect("task"),
+            phase: MaintenanceTaskPhase::Queued,
+            submitted_at: 0,
+            checkpoint: None,
+            pause_until: None,
+            cancellation_requested: false,
+            dispatches: 0,
+            terminal_order: None,
+        };
+        let ordinary = state(20, MaintenanceTaskClass::SchemaPromotion, scope(1));
+        let required = state(21, MaintenanceTaskClass::SchemaStatistics, scope(2));
+        let urgent = state(22, MaintenanceTaskClass::RetentionPublication, scope(3));
+        let fairness = BTreeMap::from([
+            (ordinary.task.scope(), 0),
+            (required.task.scope(), 1),
+            (urgent.task.scope(), 2),
+        ]);
+
+        let cycle = scheduling_order(&ordinary, &required, &fairness)
+            == std::cmp::Ordering::Greater
+            && scheduling_order(&required, &urgent, &fairness) == std::cmp::Ordering::Greater
+            && scheduling_order(&urgent, &ordinary, &fairness) == std::cmp::Ordering::Greater;
+
+        assert!(!cycle, "priority and fairness must form a total order");
+    }
+
+    #[test]
+    fn tenant_purge_excludes_a_segment_task_for_the_same_tenant() {
+        let coordinator = MaintenanceCoordinator::new();
+        let tenant = TenantId::from_bytes([4; 16]).expect("tenant");
+        let task = |identity, class, scope| {
+            MaintenanceTask::with_contract(
+                MaintenanceTaskId::new([identity; 16]).expect("identity"),
+                class,
+                scope,
+                MaintenanceTrigger::Event,
+                MaintenancePreconditions::new(1, 1).expect("preconditions"),
+                Vec::new(),
+                Vec::new(),
+                ResourceAmounts::new([1, 1, 1, 0, 1, 0, 1, 1, 1, 1, 0]),
+            )
+            .expect("task")
+        };
+        let purge = task(
+            30,
+            MaintenanceTaskClass::TenantPurge,
+            MaintenanceScope::tenant(tenant),
+        );
+        let segment = task(
+            31,
+            MaintenanceTaskClass::Compaction,
+            MaintenanceScope::segment(
+                tenant,
+                SignalKind::Logs,
+                VirtualShardId::new(1).expect("shard"),
+            ),
+        );
+        coordinator.submit(purge.clone()).expect("purge accepted");
+        coordinator.submit(segment).expect("segment accepted");
+
+        assert_eq!(
+            coordinator.start_next(1, false).expect("purge starts"),
+            Some(purge)
+        );
+        assert_eq!(
+            coordinator.start_next(2, false).expect("purge owns tenant"),
+            None
+        );
+    }
+
+    #[test]
+    fn crash_recovery_honors_cooperative_cancellation_and_retains_durability_work() {
+        let coordinator = MaintenanceCoordinator::new();
+        let cancellable = task(
+            32,
+            MaintenanceTaskClass::Compaction,
+            MaintenanceTrigger::Scheduled,
+            MaintenancePriority::Ordinary,
+            Vec::new(),
+        );
+        let durability = task(
+            33,
+            MaintenanceTaskClass::ActiveSegmentRoll,
+            MaintenanceTrigger::Event,
+            MaintenancePriority::Urgent,
+            Vec::new(),
+        );
+        let cancellable_id = cancellable.identity();
+        let durability_id = durability.identity();
+        coordinator
+            .submit(cancellable.clone())
+            .expect("cancellable accepted");
+        coordinator
+            .submit(durability.clone())
+            .expect("durability accepted");
+        assert_eq!(
+            coordinator.start_next(1, false).expect("durability starts"),
+            Some(durability)
+        );
+        assert_eq!(
+            coordinator.cancel(durability_id),
+            Err(MaintenanceFailure::PreconditionFailed)
+        );
+        coordinator
+            .complete(durability_id, true)
+            .expect("durability completes");
+        assert_eq!(
+            coordinator
+                .start_next(2, false)
+                .expect("cancellable starts"),
+            Some(cancellable)
+        );
+        coordinator
+            .cancel(cancellable_id)
+            .expect("cancellation requested");
+        coordinator.recover_after_crash().expect("recovered");
+
+        assert_eq!(
+            coordinator.status(cancellable_id).expect("status").phase(),
+            MaintenanceTaskPhase::Cancelled
+        );
+    }
+
+    #[test]
     fn a_repeated_urgent_scope_cannot_starve_an_unserved_tenant() {
         let coordinator = MaintenanceCoordinator::new();
         let first = MaintenanceTask::with_contract(
@@ -1604,7 +1934,6 @@ mod tests {
             MaintenanceTaskClass::RetentionPublication,
             MaintenanceScope::tenant(TenantId::from_bytes([1; 16]).expect("tenant")),
             MaintenanceTrigger::Event,
-            MaintenancePriority::Urgent,
             MaintenancePreconditions::new(1, 1).expect("preconditions"),
             Vec::new(),
             Vec::new(),
@@ -1615,8 +1944,7 @@ mod tests {
             MaintenanceTaskId::new([11; 16]).expect("identity"),
             MaintenanceTaskClass::Compaction,
             MaintenanceScope::tenant(TenantId::from_bytes([2; 16]).expect("tenant")),
-            MaintenanceTrigger::Event,
-            MaintenancePriority::Ordinary,
+            MaintenanceTrigger::Scheduled,
             MaintenancePreconditions::new(1, 1).expect("preconditions"),
             Vec::new(),
             Vec::new(),
@@ -1628,7 +1956,6 @@ mod tests {
             MaintenanceTaskClass::RetentionPublication,
             first.scope(),
             MaintenanceTrigger::Event,
-            MaintenancePriority::Urgent,
             MaintenancePreconditions::new(1, 1).expect("preconditions"),
             Vec::new(),
             Vec::new(),
