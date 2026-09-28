@@ -255,6 +255,73 @@ fn reservation_refusal_leaves_the_task_queued_without_a_dispatch_attempt() {
 }
 
 #[test]
+fn system_scoped_ordinary_maintenance_reserves_global_governor_capacity() {
+    let (authority, _) = authority();
+    let coordinator = MaintenanceCoordinator::new();
+    let task = MaintenanceTask::with_contract(
+        MaintenanceTaskId::new([18; 16]).expect("identity"),
+        MaintenanceTaskClass::RepositoryVerification,
+        MaintenanceScope::system(),
+        MaintenanceTrigger::Scheduled,
+        MaintenancePreconditions::new(1, 1).expect("preconditions"),
+        Vec::new(),
+        Vec::new(),
+        ResourceAmounts::new([51; 11]),
+    )
+    .expect("task");
+    coordinator.submit(task).expect("accepted");
+    let next = MaintenanceTask::with_contract(
+        MaintenanceTaskId::new([19; 16]).expect("identity"),
+        MaintenanceTaskClass::RepositoryVerification,
+        MaintenanceScope::system(),
+        MaintenanceTrigger::Scheduled,
+        MaintenancePreconditions::new(1, 1).expect("preconditions"),
+        Vec::new(),
+        Vec::new(),
+        ResourceAmounts::new([51; 11]),
+    )
+    .expect("task");
+    let next_identity = next.identity();
+    coordinator.submit(next).expect("accepted");
+
+    let execution = coordinator
+        .start_next_with_reservation(&authority, 1, false)
+        .expect("global ordinary capacity admits system work")
+        .expect("execution");
+    assert_eq!(
+        authority
+            .governor()
+            .inspect()
+            .expect("snapshot")
+            .outstanding_ordinary(),
+        1
+    );
+    assert_eq!(
+        authority
+            .governor()
+            .inspect()
+            .expect("snapshot")
+            .outstanding_recovery(),
+        0
+    );
+    assert!(matches!(
+        coordinator.start_next_with_reservation(&authority, 1, false),
+        Err(MaintenanceFailure::ResourceAdmissionRefused)
+    ));
+    execution
+        .complete(&coordinator, true)
+        .expect("completion applies to the admitted attempt");
+    let replacement = coordinator
+        .start_next_with_reservation(&authority, 2, false)
+        .expect("released global capacity admits the queued task")
+        .expect("execution");
+    assert_eq!(replacement.task().identity(), next_identity);
+    replacement
+        .complete(&coordinator, true)
+        .expect("replacement completes");
+}
+
+#[test]
 fn stale_execution_cannot_checkpoint_after_crash_resume_starts_a_new_attempt() {
     let (authority, tenant) = authority();
     let coordinator = MaintenanceCoordinator::new();

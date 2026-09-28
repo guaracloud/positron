@@ -10,6 +10,7 @@ use super::decision::{
 use super::failure::{AdmissionFailure, AdmissionFailureCode, AdmissionRetry, LimitingScope};
 use super::ledger::OperationRecord;
 use super::lifecycle::GovernorLifecycle;
+use super::policy::PoolCapacities;
 use super::pool_admission::{
     PoolAdmission, plan_pool_charge, pressure_eligibility, shutdown_failure,
 };
@@ -37,7 +38,10 @@ impl GovernorInner {
         if state.lifecycle == GovernorLifecycle::ShuttingDown {
             return Err(shutdown_failure(class, state.disk_pressure));
         }
-        let tenant_index = Self::tenant_index(state, claim.tenant, class)
+        let Some(tenant) = claim.tenant else {
+            return self.reserve_system_ordinary_locked(claim, state);
+        };
+        let tenant_index = Self::tenant_index(state, tenant, class)
             .map_err(|failure| failure.at_pressure(state.disk_pressure))?;
         let outstanding = self.require_healthy_and_slot(state, class, Some(tenant_index))?;
         let operation = claim.operation.clone();
@@ -191,7 +195,9 @@ impl GovernorInner {
             return Err(internal_failure_at_pressure(class, state.disk_pressure));
         }
         let owner = ChargeOwner {
-            attribution: ChargeAttribution::Ordinary { tenant_index },
+            attribution: ChargeAttribution::Ordinary {
+                tenant_index: Some(tenant_index),
+            },
             pools: Some(pools),
             recovery_pools: None,
         };
@@ -263,6 +269,121 @@ impl GovernorInner {
             claim.amounts,
             reservation_slot,
             reservation_operation,
+        ))
+    }
+
+    fn reserve_system_ordinary_locked(
+        &self,
+        claim: WorkClaim,
+        state: &mut super::accounting::AccountingState,
+    ) -> Result<super::ResourceReservation<'_>, AdmissionFailure> {
+        let class = claim.class();
+        if claim.principal.is_some() || claim.operation.is_some() {
+            state.lifecycle = GovernorLifecycle::Fenced;
+            return Err(internal_failure_at_pressure(class, state.disk_pressure));
+        }
+        let outstanding = self.require_healthy_and_slot(state, class, None)?;
+        let shared_eligible = pressure_eligibility(state.disk_pressure, class, claim.amounts)?;
+        refuse_live_disk_growth(
+            class,
+            state.total_usage,
+            claim.amounts,
+            state.usable_disk_bytes,
+            state.disk_pressure,
+        )?;
+        let Some(ordinary_usage) = state.total_usage.checked_sub(state.recovery_usage) else {
+            state.lifecycle = GovernorLifecycle::Fenced;
+            return Err(internal_failure_at_pressure(class, state.disk_pressure));
+        };
+        refuse_ordinary_capacity(
+            class,
+            claim.amounts,
+            OrdinaryCapacity {
+                ordinary_usage,
+                recovery_shared_usage: state.recovery_pool_usage.shared(),
+                ordinary_ceiling: self.ordinary_ceiling,
+                total_ceiling: self.total_ceiling,
+                pressure: state.disk_pressure,
+            },
+        )?;
+        let Some(total_candidate) = state.total_usage.checked_add(claim.amounts) else {
+            state.lifecycle = GovernorLifecycle::Fenced;
+            return Err(internal_failure_at_pressure(class, state.disk_pressure));
+        };
+        let pools = match plan_pool_charge(
+            class,
+            claim.amounts,
+            PoolAdmission {
+                global_capacity: self.pool_capacities,
+                global_usage: state.pool_usage,
+                // System work has no tenant accounting; use an empty local
+                // charge only to select the same bounded global pool split.
+                tenant_capacity: self.pool_capacities,
+                tenant_usage: PoolCapacities::zero(),
+            },
+            state.disk_pressure,
+            shared_eligible,
+        ) {
+            Ok(pools) => pools,
+            Err(failure) => {
+                if failure.code() == AdmissionFailureCode::InternalFenced {
+                    state.lifecycle = GovernorLifecycle::Fenced;
+                }
+                return Err(failure);
+            },
+        };
+        let pool_amounts = pools.capacities();
+        let Some(pool_candidate) = state.pool_usage.checked_add(pool_amounts) else {
+            state.lifecycle = GovernorLifecycle::Fenced;
+            return Err(internal_failure_at_pressure(class, state.disk_pressure));
+        };
+        let Some(ordinary_count) = state.outstanding_ordinary.checked_add(1) else {
+            state.lifecycle = GovernorLifecycle::Fenced;
+            return Err(internal_failure_at_pressure(class, state.disk_pressure));
+        };
+        let Some((class_index, class_count)) = Self::next_class_count(state, class) else {
+            state.lifecycle = GovernorLifecycle::Fenced;
+            return Err(internal_failure_at_pressure(class, state.disk_pressure));
+        };
+        if state.class_counts.get(class_index).is_none() {
+            state.lifecycle = GovernorLifecycle::Fenced;
+            return Err(internal_failure_at_pressure(class, state.disk_pressure));
+        }
+        let owner = ChargeOwner {
+            attribution: ChargeAttribution::Ordinary { tenant_index: None },
+            pools: Some(pools),
+            recovery_pools: None,
+        };
+        let identity = ReservationIdentity::Ordinary {
+            tenant: None,
+            principal: None,
+            kind: claim.kind,
+        };
+        let Some(record) = super::ledger::GrantRecord::new(owner, identity, claim.amounts, None)
+        else {
+            state.lifecycle = GovernorLifecycle::Fenced;
+            return Err(internal_failure_at_pressure(class, state.disk_pressure));
+        };
+        let Some(reservation_slot) = self.activate_slot(state, record) else {
+            state.lifecycle = GovernorLifecycle::Fenced;
+            return Err(internal_failure_at_pressure(class, state.disk_pressure));
+        };
+        let Some(class_slot) = state.class_counts.get_mut(class_index) else {
+            state.lifecycle = GovernorLifecycle::Fenced;
+            return Err(internal_failure_at_pressure(class, state.disk_pressure));
+        };
+        *class_slot = class_count;
+        state.total_usage = total_candidate;
+        state.pool_usage = pool_candidate;
+        state.outstanding = outstanding;
+        state.outstanding_ordinary = ordinary_count;
+        Ok(super::ResourceReservation::new(
+            self,
+            owner,
+            identity,
+            claim.amounts,
+            reservation_slot,
+            None,
         ))
     }
 

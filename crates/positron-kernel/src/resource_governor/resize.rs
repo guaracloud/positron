@@ -29,13 +29,17 @@ pub(super) struct ResizeRequest {
 impl GovernorInner {
     pub(super) fn resize(&self, request: ResizeRequest) -> Result<ResizeCommit, ResizeFailure> {
         match request.identity {
-            ReservationIdentity::Ordinary { tenant, kind, .. } => {
+            ReservationIdentity::Ordinary {
+                tenant: _, kind, ..
+            } => {
                 let class = kind.class();
                 let ChargeAttribution::Ordinary { tenant_index } = request.owner.attribution else {
                     return Err(retained_resize(class, self.pressure_for_failure()));
                 };
-                let _ = tenant;
-                self.resize_ordinary(request, tenant_index, class)
+                match tenant_index {
+                    Some(tenant_index) => self.resize_ordinary(request, tenant_index, class),
+                    None => Err(retained_resize(class, self.pressure_for_failure())),
+                }
             },
             ReservationIdentity::Recovery { scope, kind } => {
                 let ChargeAttribution::Recovery { tenant_index } = request.owner.attribution else {

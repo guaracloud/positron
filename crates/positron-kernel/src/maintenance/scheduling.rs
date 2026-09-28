@@ -142,12 +142,14 @@ pub(super) fn reserve_task<'authority>(
             .map(MaintenanceReservation::Recovery)
             .map_err(|_| ());
     }
-    let tenant = task.scope.tenant_id().ok_or(())?;
-    let claim = WorkClaim::tenant(
-        tenant,
-        WorkKind::OrdinaryMaintenanceBackup,
-        task.reservations,
-    )
+    let claim = match task.scope.tenant_id() {
+        Some(tenant) => WorkClaim::tenant(
+            tenant,
+            WorkKind::OrdinaryMaintenanceBackup,
+            task.reservations,
+        ),
+        None => WorkClaim::system_maintenance(task.reservations),
+    }
     .map_err(|_| ())?;
     authority
         .governor()

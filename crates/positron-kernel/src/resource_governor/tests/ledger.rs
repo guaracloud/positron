@@ -109,7 +109,7 @@ fn slot_mutations_reject_inactive_corrupt_and_mismatched_records() {
     let mut state = governor.inner.state.lock().expect("test lock is healthy");
     assert!(!governor.inner.finish_slot(&mut state, u16::MAX));
     let mismatched = ReservationIdentity::Ordinary {
-        tenant,
+        tenant: Some(tenant),
         principal: None,
         kind: WorkKind::SecurityLifecycle,
     };

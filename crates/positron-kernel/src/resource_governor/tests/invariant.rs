@@ -126,7 +126,9 @@ fn mismatched_resize_ownership_and_missing_pool_charge_fail_closed() {
             .expect("claim is valid"),
         )
         .expect("admission succeeds");
-    recovery_grant.owner.attribution = ChargeAttribution::Ordinary { tenant_index: 0 };
+    recovery_grant.owner.attribution = ChargeAttribution::Ordinary {
+        tenant_index: Some(0),
+    };
     assert_internal_resize(recovery_grant);
 
     let (missing_pool_governor, _) = established();

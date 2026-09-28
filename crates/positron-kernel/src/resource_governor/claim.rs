@@ -40,10 +40,10 @@ impl WorkKind {
     }
 }
 
-/// A checked, multidimensional request to begin tenant work.
+/// A checked, multidimensional request to begin ordinary work.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkClaim {
-    pub(super) tenant: TenantId,
+    pub(super) tenant: Option<TenantId>,
     pub(super) principal: Option<PrincipalId>,
     pub(super) kind: WorkKind,
     pub(super) amounts: ResourceAmounts,
@@ -92,9 +92,25 @@ impl WorkClaim {
             return Err(GovernorFailure::InvalidConfiguration);
         }
         Ok(Self {
-            tenant,
+            tenant: Some(tenant),
             principal: None,
             kind,
+            amounts,
+            operation: None,
+        })
+    }
+
+    /// Creates one system-scoped maintenance claim. It consumes the bounded
+    /// global ordinary pools but deliberately has no tenant quota or fair-share
+    /// attribution.
+    pub(crate) fn system_maintenance(amounts: ResourceAmounts) -> Result<Self, GovernorFailure> {
+        if amounts.is_empty() {
+            return Err(GovernorFailure::InvalidConfiguration);
+        }
+        Ok(Self {
+            tenant: None,
+            principal: None,
+            kind: WorkKind::OrdinaryMaintenanceBackup,
             amounts,
             operation: None,
         })
@@ -113,7 +129,7 @@ impl WorkClaim {
             return Err(GovernorFailure::InvalidConfiguration);
         }
         Ok(Self {
-            tenant,
+            tenant: Some(tenant),
             principal: Some(principal),
             kind,
             amounts,
@@ -134,7 +150,7 @@ impl WorkClaim {
             return Err(GovernorFailure::InvalidConfiguration);
         }
         Ok(Self {
-            tenant: operation.tenant,
+            tenant: Some(operation.tenant),
             principal: Some(operation.principal),
             kind,
             amounts,
@@ -279,7 +295,7 @@ impl RecoveryWorkClaim {
 #[derive(Clone, Copy)]
 pub(super) enum ReservationIdentity {
     Ordinary {
-        tenant: TenantId,
+        tenant: Option<TenantId>,
         principal: Option<PrincipalId>,
         kind: WorkKind,
     },

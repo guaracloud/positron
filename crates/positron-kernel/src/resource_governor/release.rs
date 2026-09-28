@@ -238,7 +238,7 @@ impl GovernorInner {
             return fence(state);
         }
         let tenant_index = match owner.attribution {
-            ChargeAttribution::Ordinary { tenant_index } => Some(tenant_index),
+            ChargeAttribution::Ordinary { tenant_index } => tenant_index,
             ChargeAttribution::Recovery { tenant_index } => tenant_index,
         };
         let tenant_count_candidate = tenant_index
@@ -259,31 +259,38 @@ impl GovernorInner {
                 let Some(pools) = owner.pools.map(|charge| charge.capacities()) else {
                     return fence(state);
                 };
-                let tenant_candidate = state
-                    .ordinary_tenant_usage
-                    .get(tenant_index)
-                    .copied()
-                    .and_then(|usage| usage.checked_sub(amounts));
-                let tenant_pool_candidate = state
-                    .ordinary_tenant_pool_usage
-                    .get(tenant_index)
-                    .copied()
-                    .and_then(|usage| usage.checked_sub(pools));
                 let pool_candidate = state.pool_usage.checked_sub(pools);
-                let (Some(tenant_candidate), Some(tenant_pool_candidate), Some(pool_candidate)) =
-                    (tenant_candidate, tenant_pool_candidate, pool_candidate)
-                else {
+                let Some(pool_candidate) = pool_candidate else {
                     return fence(state);
                 };
-                let Some(tenant_slot) = state.ordinary_tenant_usage.get_mut(tenant_index) else {
-                    return fence(state);
-                };
-                *tenant_slot = tenant_candidate;
-                let Some(tenant_pool_slot) = state.ordinary_tenant_pool_usage.get_mut(tenant_index)
-                else {
-                    return fence(state);
-                };
-                *tenant_pool_slot = tenant_pool_candidate;
+                if let Some(tenant_index) = tenant_index {
+                    let tenant_candidate = state
+                        .ordinary_tenant_usage
+                        .get(tenant_index)
+                        .copied()
+                        .and_then(|usage| usage.checked_sub(amounts));
+                    let tenant_pool_candidate = state
+                        .ordinary_tenant_pool_usage
+                        .get(tenant_index)
+                        .copied()
+                        .and_then(|usage| usage.checked_sub(pools));
+                    let (Some(tenant_candidate), Some(tenant_pool_candidate)) =
+                        (tenant_candidate, tenant_pool_candidate)
+                    else {
+                        return fence(state);
+                    };
+                    let Some(tenant_slot) = state.ordinary_tenant_usage.get_mut(tenant_index)
+                    else {
+                        return fence(state);
+                    };
+                    *tenant_slot = tenant_candidate;
+                    let Some(tenant_pool_slot) =
+                        state.ordinary_tenant_pool_usage.get_mut(tenant_index)
+                    else {
+                        return fence(state);
+                    };
+                    *tenant_pool_slot = tenant_pool_candidate;
+                }
                 state.pool_usage = pool_candidate;
             },
             ChargeAttribution::Recovery { tenant_index } => {
