@@ -122,6 +122,7 @@ fn publish_scope(
     objects
         .try_reserve_exact(object_capacity)
         .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
+    let mut lifecycle_anchor_seen = false;
     for bytes in basis.plaintext_objects() {
         if storage.is_scope_metadata(bytes, scope) {
             continue;
@@ -132,7 +133,12 @@ fn publish_scope(
         {
             continue;
         }
-        if options.lifecycle_clock.is_some() && crate::retention_time::is_catalog_anchor(bytes) {
+        let lifecycle_anchor = crate::retention_time::validate_catalog_anchor_singleton(
+            bytes,
+            &mut lifecycle_anchor_seen,
+        )
+        .map_err(|_| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?;
+        if options.lifecycle_clock.is_some() && lifecycle_anchor {
             continue;
         }
         let mut retained = Vec::new();

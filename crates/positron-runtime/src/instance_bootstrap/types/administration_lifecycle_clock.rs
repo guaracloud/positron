@@ -33,15 +33,51 @@ impl InitializedInstance {
                 BootstrapFailureCode::IdentityMismatch,
             ));
         }
-        let prepared = self
-            .retention_time
-            .prepare_discontinuity_acceptance(expected_safe_anchor)
-            .map_err(map_lifecycle_clock_acceptance_failure)?;
         let request = positron_governance::LifecycleClockAcceptanceRequest::new(
             actor,
             expected_catalog,
             idempotency,
         );
+        if let Some((update, snapshot)) =
+            positron_governance::LifecycleClockAcceptanceAdministration::replay_retained(
+                &catalog,
+                &identity,
+                request,
+                expected_safe_anchor,
+            )
+            .map_err(map_lifecycle_clock_acceptance_administration_failure)?
+        {
+            self.retention_time
+                .recover_catalog_anchor(&snapshot)
+                .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+            return Ok(update);
+        }
+        let prepared = match self
+            .retention_time
+            .prepare_discontinuity_acceptance(expected_safe_anchor)
+        {
+            Ok(prepared) => prepared,
+            Err(positron_kernel::LifecycleClockAcceptanceFailure::NotUncertain) => {
+                let Some((update, snapshot)) =
+                    positron_governance::LifecycleClockAcceptanceAdministration::replay_retained(
+                        &catalog,
+                        &identity,
+                        request,
+                        expected_safe_anchor,
+                    )
+                    .map_err(map_lifecycle_clock_acceptance_administration_failure)?
+                else {
+                    return Err(map_lifecycle_clock_acceptance_failure(
+                        positron_kernel::LifecycleClockAcceptanceFailure::NotUncertain,
+                    ));
+                };
+                self.retention_time
+                    .recover_catalog_anchor(&snapshot)
+                    .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+                return Ok(update);
+            },
+            Err(failure) => return Err(map_lifecycle_clock_acceptance_failure(failure)),
+        };
         let (update, commit) = positron_governance::LifecycleClockAcceptanceAdministration::accept(
             &catalog, &identity, request, &prepared,
         )

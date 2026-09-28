@@ -112,6 +112,138 @@ fn retention_frontier_publication_reconciles_only_durable_ambiguity() -> Result<
 
 #[cfg(feature = "test-support")]
 #[test]
+fn normal_initial_frontier_publication_refuses_a_malformed_clock_anchor()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0xe7; 16])?,
+        CatalogSecret::from_owned(Box::new([0xe8; 32]), Box::new([0xe9; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x64; 16])?;
+    let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(44)?);
+    let (retention_time, _) =
+        RetentionTimeAuthority::establish_with_manual_elapsed(UnixNanoseconds::new(500));
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        SegmentProtectionKey::from_owned(Box::new([0xeb; 32])),
+    )?;
+    catalog.commit(
+        catalog.pin()?.identity(),
+        CatalogProposal::new(
+            TransactionId::new([0xea; 16])?,
+            FormatEpoch::CATALOG_V1,
+            vec![CatalogObject::new(b"PLIFCLK1\x02\x00".to_vec())?],
+        )?,
+        None,
+    )?;
+    let failure = match ledger.begin_store_block(
+        preparation_capacity(&authority, tenant)?,
+        StoreBlockIdentity::new([0xec; 16])?,
+    ) {
+        Ok(_) => return Err("a malformed anchor was replaced by normal publication".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(failure.code(), LedgerFailureCode::IntegrityCorruption);
+    assert!(
+        catalog
+            .pin()?
+            .plaintext_objects()
+            .any(|object| object == b"PLIFCLK1\x02\x00")
+    );
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn normal_initial_frontier_publication_refuses_duplicate_valid_clock_anchors()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0xf1; 16])?,
+        CatalogSecret::from_owned(Box::new([0xf2; 32]), Box::new([0xf3; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x64; 16])?;
+    let scope_a = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(45)?);
+    let scope_b = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(46)?);
+    let (retention_time, _) =
+        RetentionTimeAuthority::establish_with_manual_elapsed(UnixNanoseconds::new(500));
+    let ledger_a = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope_a,
+        SegmentProtectionKey::from_owned(Box::new([0xf4; 32])),
+    )?;
+    drop(ledger_a.begin_store_block(
+        preparation_capacity(&authority, tenant)?,
+        StoreBlockIdentity::new([0xf5; 16])?,
+    )?);
+    let ledger_b = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope_b,
+        SegmentProtectionKey::from_owned(Box::new([0xf6; 32])),
+    )?;
+    drop(ledger_b);
+    let mut anchor = catalog
+        .pin()?
+        .plaintext_objects()
+        .find(|object| object.starts_with(b"PLIFCLK1"))
+        .ok_or("initial anchor was not published")?
+        .to_vec();
+    anchor[8] = 1;
+    anchor.truncate(35);
+    let basis = catalog.pin()?;
+    let mut objects = basis
+        .plaintext_objects()
+        .map(|object| CatalogObject::new(object.to_vec()))
+        .collect::<Result<Vec<_>, _>>()?;
+    objects.push(CatalogObject::new(anchor)?);
+    catalog.commit(
+        basis.identity(),
+        CatalogProposal::new(
+            TransactionId::new([0xf7; 16])?,
+            FormatEpoch::CATALOG_V1,
+            objects,
+        )?,
+        None,
+    )?;
+
+    let generation_before_refusal = catalog.pin()?.number();
+    let failure = match ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        scope_b,
+        SegmentProtectionKey::from_owned(Box::new([0xf6; 32])),
+    ) {
+        Ok(_) => return Err("duplicate anchors were replaced by normal publication".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(failure.code(), LedgerFailureCode::IntegrityCorruption);
+    assert_eq!(catalog.pin()?.number(), generation_before_refusal);
+    assert_eq!(
+        catalog
+            .pin()?
+            .plaintext_objects()
+            .filter(|object| object.starts_with(b"PLIFCLK1"))
+            .count(),
+        2
+    );
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+#[test]
 fn uncertain_ingest_reconciles_a_durably_published_uncertain_clock_anchor()
 -> Result<(), Box<dyn Error>> {
     let root = TemporaryRoot::new()?;

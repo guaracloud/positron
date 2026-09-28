@@ -39,8 +39,14 @@ pub(super) fn publish(
     objects
         .try_reserve_exact(basis.plaintext_object_count().saturating_add(2))
         .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+    let mut lifecycle_anchor_seen = false;
     for bytes in basis.plaintext_objects() {
-        if crate::retention_time::is_catalog_anchor(bytes) {
+        if crate::retention_time::validate_catalog_anchor_singleton(
+            bytes,
+            &mut lifecycle_anchor_seen,
+        )
+        .map_err(|_| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?
+        {
             continue;
         }
         objects.push(CatalogObject::new(bytes.to_vec())?);

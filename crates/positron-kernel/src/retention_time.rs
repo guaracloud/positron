@@ -515,7 +515,7 @@ impl RetentionTimeAuthority {
 
     /// Reconciles this process authority with the one authenticated,
     /// instance-level Catalog anchor before a scope can mint time.
-    pub(crate) fn recover_catalog_anchor(
+    pub fn recover_catalog_anchor(
         &self,
         snapshot: &CatalogSnapshot,
     ) -> Result<(), LifecycleClockFailure> {
@@ -767,6 +767,36 @@ impl RetentionTimeAuthority {
             .ok_or(LifecycleClockFailure::OutOfRange)
     }
 
+    /// Reads the trusted security clock used for credential expiry. A sampled
+    /// discontinuity makes this authority unavailable so an API credential
+    /// cannot be extended by an uncertain wall-clock observation.
+    pub fn security_time_seconds(&self) -> Result<u64, LifecycleClockFailure> {
+        let state = self
+            .safety
+            .lock()
+            .map_err(|_| LifecycleClockFailure::Unavailable)?
+            .state;
+        if state != LifecycleClockState::Certain {
+            return Err(LifecycleClockFailure::ClockUncertain);
+        }
+        let elapsed = self.elapsed.nanoseconds()?;
+        self.reconcile_current(elapsed)?;
+        let safety = self
+            .safety
+            .lock()
+            .map_err(|_| LifecycleClockFailure::Unavailable)?;
+        if safety.state != LifecycleClockState::Certain {
+            return Err(LifecycleClockFailure::ClockUncertain);
+        }
+        safety
+            .last_wall_clock
+            .ok_or(LifecycleClockFailure::Unavailable)?
+            .value()
+            .checked_div(1_000_000_000)
+            .and_then(|value| u64::try_from(value).ok())
+            .ok_or(LifecycleClockFailure::OutOfRange)
+    }
+
     fn reconcile_current(&self, elapsed: u64) -> Result<(), LifecycleClockFailure> {
         let expected = self
             .safety
@@ -932,8 +962,40 @@ pub fn validate_catalog_anchor_record(bytes: &[u8]) -> Result<bool, LifecycleClo
     decode_catalog_anchor(bytes).map(|record| record.is_some())
 }
 
-pub(crate) fn is_catalog_anchor(bytes: &[u8]) -> bool {
-    bytes.starts_with(CLOCK_ANCHOR_MAGIC)
+/// Classifies one Catalog object while a caller replaces the singleton
+/// lifecycle anchor. Malformed prefixed records and duplicate valid anchors
+/// are integrity failures; neither may be silently replaced by a new anchor.
+pub fn validate_catalog_anchor_singleton(
+    bytes: &[u8],
+    anchor_seen: &mut bool,
+) -> Result<bool, LifecycleClockFailure> {
+    let is_anchor = validate_catalog_anchor_record(bytes)?;
+    if is_anchor && std::mem::replace(anchor_seen, true) {
+        return Err(LifecycleClockFailure::OutOfRange);
+    }
+    Ok(is_anchor)
+}
+
+/// Verifies that a durable anchor is the exact correction described by a
+/// lifecycle-clock acceptance receipt.
+pub fn catalog_anchor_matches_accepted_discontinuity(
+    bytes: &[u8],
+    safe_anchor: UnixNanoseconds,
+    observed_wall_clock: UnixNanoseconds,
+    observed_offset_nanoseconds: i64,
+) -> Result<bool, LifecycleClockFailure> {
+    let Some(record) = decode_catalog_anchor(bytes)? else {
+        return Ok(false);
+    };
+    let correction = safe_anchor
+        .value()
+        .checked_sub(observed_wall_clock.value())
+        .ok_or(LifecycleClockFailure::OutOfRange)?;
+    Ok(record.state == LifecycleClockState::Certain
+        && record.anchor == safe_anchor
+        && record.last_wall_clock == Some(observed_wall_clock)
+        && record.observed_offset_nanoseconds == Some(observed_offset_nanoseconds)
+        && record.wall_clock_correction_nanoseconds == correction)
 }
 
 fn read_i64(bytes: &[u8], start: usize) -> Result<i64, LifecycleClockFailure> {
@@ -1292,6 +1354,29 @@ mod clock_safety_tests {
         malformed.extend_from_slice(&[2, 0]);
         assert_eq!(
             validate_catalog_anchor_record(&malformed),
+            Err(LifecycleClockFailure::OutOfRange)
+        );
+    }
+
+    #[test]
+    fn singleton_replacement_rejects_duplicate_valid_v1_and_v2_anchors() {
+        let safety = LifecycleClockSafety {
+            anchor: UnixNanoseconds::new(100),
+            anchor_elapsed: 0,
+            state: LifecycleClockState::Certain,
+            last_wall_clock: Some(UnixNanoseconds::new(100)),
+            observed_offset_nanoseconds: Some(0),
+            wall_clock_correction_nanoseconds: 0,
+            revision: 0,
+        };
+        let v2 = encode_catalog_anchor(safety).expect("v2 anchor");
+        let mut v1 = v2.clone();
+        v1[8] = 1;
+        v1.truncate(CLOCK_ANCHOR_V1_BYTES);
+        let mut seen = false;
+        assert!(validate_catalog_anchor_singleton(&v1, &mut seen).expect("v1 anchor"));
+        assert_eq!(
+            validate_catalog_anchor_singleton(&v2, &mut seen),
             Err(LifecycleClockFailure::OutOfRange)
         );
     }

@@ -271,6 +271,25 @@ impl Identity {
         hints: CompatibilityHints,
         lifecycle_seconds: Option<u64>,
     ) -> Result<AuthorizedContext, AttributionFailure> {
+        self.attribute_with_expiry_time(keys, credential, intent, hints, || {
+            lifecycle_seconds.ok_or(AttributionFailure)
+        })
+    }
+
+    /// Attributes a credential while consulting a security-time authority only
+    /// when the matching credential has an expiry. This preserves availability
+    /// for unrelated non-expiring credentials when that authority is absent.
+    pub fn attribute_with_expiry_time<F>(
+        &self,
+        keys: &BootstrapKeyCustody,
+        credential: PresentedCredential,
+        intent: RequestedIntent,
+        hints: CompatibilityHints,
+        mut expiry_time: F,
+    ) -> Result<AuthorizedContext, AttributionFailure>
+    where
+        F: FnMut() -> Result<u64, AttributionFailure>,
+    {
         if hints.has_untrusted_authority_claims()
             || (matches!(intent, RequestedIntent::SystemAdministration)
                 && hints.external_alias.is_some())
@@ -293,11 +312,10 @@ impl Identity {
                         &candidate.hash,
                     )
                     .map_err(|_| AttributionFailure)?;
-                let unexpired = candidate
-                    .expires_at_unix_seconds
-                    .is_none_or(|expiry| lifecycle_seconds.is_some_and(|now| now < expiry));
-                if matches && candidate.active && unexpired && candidate.scope == scope {
-                    selected = Some((candidate.principal, self.tenant, self.lifecycle));
+                if matches && candidate.active && candidate.scope == scope {
+                    if credential_is_unexpired(candidate, &mut expiry_time)? {
+                        selected = Some((candidate.principal, self.tenant, self.lifecycle));
+                    }
                 }
             }
             for identity in &self.additional_tenants {
@@ -309,18 +327,14 @@ impl Identity {
                             &candidate.hash,
                         )
                         .map_err(|_| AttributionFailure)?;
-                    let unexpired = candidate
-                        .expires_at_unix_seconds
-                        .is_none_or(|expiry| lifecycle_seconds.is_some_and(|now| now < expiry));
-                    if matches
-                        && candidate.active
-                        && unexpired
-                        && candidate.scope == scope
-                        && selected
-                            .replace((candidate.principal, identity.tenant, identity.lifecycle))
-                            .is_some()
-                    {
-                        return Err(AttributionFailure);
+                    if matches && candidate.active && candidate.scope == scope {
+                        if credential_is_unexpired(candidate, &mut expiry_time)?
+                            && selected
+                                .replace((candidate.principal, identity.tenant, identity.lifecycle))
+                                .is_some()
+                        {
+                            return Err(AttributionFailure);
+                        }
                     }
                 }
             }
@@ -580,6 +594,15 @@ impl Identity {
         self.authorize_policy_activation(context, tenant)?;
         Ok(GovernanceAuditInspection::tenant(audit, tenant))
     }
+}
+
+fn credential_is_unexpired(
+    candidate: &CredentialIdentity,
+    expiry_time: &mut impl FnMut() -> Result<u64, AttributionFailure>,
+) -> Result<bool, AttributionFailure> {
+    candidate
+        .expires_at_unix_seconds
+        .map_or(Ok(true), |expiry| expiry_time().map(|now| now < expiry))
 }
 
 impl std::fmt::Debug for Identity {

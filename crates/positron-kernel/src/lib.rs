@@ -137,7 +137,9 @@ pub use retention_time::RetentionTimeAuthority;
 pub use retention_time::fuzz_retention_time_stateful;
 pub use retention_time::{
     LifecycleClockAcceptanceFailure, LifecycleClockPolicy, LifecycleClockState,
-    LifecycleClockStatus, PreparedLifecycleClockAcceptance, validate_catalog_anchor_record,
+    LifecycleClockStatus, PreparedLifecycleClockAcceptance,
+    catalog_anchor_matches_accepted_discontinuity, validate_catalog_anchor_record,
+    validate_catalog_anchor_singleton,
 };
 
 pub use resource_governor::{
