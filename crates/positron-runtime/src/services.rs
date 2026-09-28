@@ -134,6 +134,12 @@ impl ServiceHandle {
         cancellation: Option<&crate::TaskCancellation>,
         export_destination_resolver: Option<Arc<dyn positron_query::ExportDestinationResolver>>,
     ) -> Result<Self, ServiceFailure> {
+        instance
+            .maintenance_coordinator()
+            .lock()
+            .map_err(|_| ServiceFailure::Internal)?
+            .recover_after_crash()
+            .map_err(|_| ServiceFailure::Internal)?;
         let fallback = crate::TaskCancellation::new();
         let cancellation = cancellation.unwrap_or(&fallback);
         let recovered = schema_bootstrap::recover(&instance, cancellation)?;

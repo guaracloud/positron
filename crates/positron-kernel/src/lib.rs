@@ -74,6 +74,7 @@ mod data_protection;
 mod export_output;
 mod instance_bootstrap_storage;
 mod lifecycle_clock;
+mod maintenance;
 mod resource_governor;
 mod retention_time;
 
@@ -128,6 +129,12 @@ pub use instance_bootstrap_storage::{
 pub use lifecycle_clock::{
     FixedLifecycleClockSource, IngestTime, LifecycleClock, LifecycleClockFailure,
     LifecycleClockSource, RetentionCutoffProvenance, SystemLifecycleClockSource,
+};
+pub use maintenance::{
+    MaintenanceCheckpoint, MaintenanceCoordinator, MaintenanceExecution, MaintenanceFailure,
+    MaintenanceObjectId, MaintenancePreconditions, MaintenancePriority, MaintenanceReservation,
+    MaintenanceScope, MaintenanceTask, MaintenanceTaskClass, MaintenanceTaskId,
+    MaintenanceTaskPhase, MaintenanceTaskRecord, MaintenanceTaskStatus, MaintenanceTrigger,
 };
 #[cfg(feature = "test-support")]
 pub use retention_time::ManualRetentionTime;
@@ -197,6 +204,10 @@ pub use catalog::fuzz_compaction_publication_fault;
 #[cfg(fuzzing)]
 #[doc(hidden)]
 pub use active_segment_ledger::fuzz_snapshot_lease_record;
+
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub use maintenance::fuzz_maintenance_stateful;
 
 use std::error::Error;
 use std::fmt::{Display, Formatter};
