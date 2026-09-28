@@ -84,6 +84,19 @@ pub enum LifecycleClockAcceptanceFailure {
     OutOfRange,
 }
 
+/// Relationship between the current authenticated Catalog anchor and one
+/// durable discontinuity-acceptance receipt.
+///
+/// A receipt may be replayed after ordinary lifecycle work has advanced the
+/// global anchor. Equal anchors remain valid only when they preserve the
+/// exact accepted correction; a successor must be strictly later so a replay
+/// can never certify altered provenance at the historical instant.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CatalogAnchorAcceptanceRelation {
+    ExactHistorical,
+    ProvablyLater,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LifecycleClockStatus {
     state: LifecycleClockState,
@@ -984,18 +997,44 @@ pub fn catalog_anchor_matches_accepted_discontinuity(
     observed_wall_clock: UnixNanoseconds,
     observed_offset_nanoseconds: i64,
 ) -> Result<bool, LifecycleClockFailure> {
+    Ok(matches!(
+        catalog_anchor_acceptance_relation(
+            bytes,
+            safe_anchor,
+            observed_wall_clock,
+            observed_offset_nanoseconds,
+        )?,
+        Some(CatalogAnchorAcceptanceRelation::ExactHistorical)
+    ))
+}
+
+/// Classifies an authenticated lifecycle anchor against an acceptance receipt.
+/// A newer anchor preserves replay safety without restoring historical state.
+pub fn catalog_anchor_acceptance_relation(
+    bytes: &[u8],
+    safe_anchor: UnixNanoseconds,
+    observed_wall_clock: UnixNanoseconds,
+    observed_offset_nanoseconds: i64,
+) -> Result<Option<CatalogAnchorAcceptanceRelation>, LifecycleClockFailure> {
     let Some(record) = decode_catalog_anchor(bytes)? else {
-        return Ok(false);
+        return Ok(None);
     };
     let correction = safe_anchor
         .value()
         .checked_sub(observed_wall_clock.value())
         .ok_or(LifecycleClockFailure::OutOfRange)?;
-    Ok(record.state == LifecycleClockState::Certain
+    if record.state == LifecycleClockState::Certain
         && record.anchor == safe_anchor
         && record.last_wall_clock == Some(observed_wall_clock)
         && record.observed_offset_nanoseconds == Some(observed_offset_nanoseconds)
-        && record.wall_clock_correction_nanoseconds == correction)
+        && record.wall_clock_correction_nanoseconds == correction
+    {
+        return Ok(Some(CatalogAnchorAcceptanceRelation::ExactHistorical));
+    }
+    if record.anchor > safe_anchor {
+        return Ok(Some(CatalogAnchorAcceptanceRelation::ProvablyLater));
+    }
+    Ok(None)
 }
 
 fn read_i64(bytes: &[u8], start: usize) -> Result<i64, LifecycleClockFailure> {
@@ -1378,6 +1417,61 @@ mod clock_safety_tests {
         assert_eq!(
             validate_catalog_anchor_singleton(&v2, &mut seen),
             Err(LifecycleClockFailure::OutOfRange)
+        );
+    }
+
+    #[test]
+    fn acceptance_receipt_accepts_only_exact_history_or_a_strictly_later_anchor() {
+        let historical = LifecycleClockSafety {
+            anchor: UnixNanoseconds::new(1_000),
+            anchor_elapsed: 0,
+            state: LifecycleClockState::Certain,
+            last_wall_clock: Some(UnixNanoseconds::new(500)),
+            observed_offset_nanoseconds: Some(500),
+            wall_clock_correction_nanoseconds: 500,
+            revision: 0,
+        };
+        let exact = encode_catalog_anchor(historical).expect("historical anchor");
+        assert_eq!(
+            catalog_anchor_acceptance_relation(
+                &exact,
+                UnixNanoseconds::new(1_000),
+                UnixNanoseconds::new(500),
+                500,
+            ),
+            Ok(Some(CatalogAnchorAcceptanceRelation::ExactHistorical))
+        );
+
+        let later_uncertain = encode_catalog_anchor(LifecycleClockSafety {
+            anchor: UnixNanoseconds::new(1_001),
+            state: LifecycleClockState::ClockUncertain,
+            wall_clock_correction_nanoseconds: -250,
+            ..historical
+        })
+        .expect("later anchor");
+        assert_eq!(
+            catalog_anchor_acceptance_relation(
+                &later_uncertain,
+                UnixNanoseconds::new(1_000),
+                UnixNanoseconds::new(500),
+                500,
+            ),
+            Ok(Some(CatalogAnchorAcceptanceRelation::ProvablyLater))
+        );
+
+        let altered_history = encode_catalog_anchor(LifecycleClockSafety {
+            wall_clock_correction_nanoseconds: 499,
+            ..historical
+        })
+        .expect("altered anchor");
+        assert_eq!(
+            catalog_anchor_acceptance_relation(
+                &altered_history,
+                UnixNanoseconds::new(1_000),
+                UnixNanoseconds::new(500),
+                500,
+            ),
+            Ok(None)
         );
     }
 

@@ -6,7 +6,7 @@ use std::fmt::{Display, Formatter};
 use positron_kernel::{
     AuditIntent, Catalog, CatalogCommit, CatalogFailureCode, CatalogObject, CatalogProposal,
     CatalogReadView, CatalogSnapshot, FormatEpoch, PreparedLifecycleClockAcceptance,
-    PreparedTransactionResolution, TransactionId, catalog_anchor_matches_accepted_discontinuity,
+    PreparedTransactionResolution, TransactionId, catalog_anchor_acceptance_relation,
     validate_catalog_anchor_record, validate_catalog_anchor_singleton,
 };
 use sha2::{Digest, Sha256};
@@ -114,13 +114,14 @@ impl LifecycleClockAcceptanceAdministration {
             })? {
                 continue;
             }
-            if !catalog_anchor_matches_accepted_discontinuity(
+            if catalog_anchor_acceptance_relation(
                 bytes,
                 receipt.safe_anchor,
                 receipt.observed_wall_clock,
                 receipt.observed_offset_nanoseconds,
             )
             .map_err(|_| LifecycleClockAcceptanceAdministrationFailure::PersistenceUnavailable)?
+            .is_none()
             {
                 return Err(LifecycleClockAcceptanceAdministrationFailure::PersistenceUnavailable);
             }
