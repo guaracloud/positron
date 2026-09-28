@@ -342,6 +342,13 @@ pub struct ManualRetentionTime(Arc<AtomicU64>);
 
 #[cfg(any(test, fuzzing, feature = "test-support"))]
 impl ManualRetentionTime {
+    /// Returns the deterministic monotonic elapsed time for test and fuzz
+    /// state machines without exposing the authority's internal clock source.
+    #[must_use]
+    pub fn nanoseconds(&self) -> u64 {
+        self.0.load(Ordering::Acquire)
+    }
+
     /// Advances the authority's monotonic elapsed time by nanoseconds.
     pub fn advance(&self, nanoseconds: u64) -> Result<(), LifecycleClockFailure> {
         self.0
@@ -1156,6 +1163,15 @@ mod clock_safety_tests {
                 .map(|instant| *instant)
                 .map_err(|_| LifecycleClockFailure::Unavailable)
         }
+    }
+
+    #[test]
+    fn manual_elapsed_observation_tracks_fuzz_state_advances() {
+        let (_, elapsed) =
+            RetentionTimeAuthority::establish_with_manual_elapsed(UnixNanoseconds::new(1_000));
+        assert_eq!(elapsed.nanoseconds(), 0);
+        elapsed.advance(7).expect("bounded elapsed advance");
+        assert_eq!(elapsed.nanoseconds(), 7);
     }
 
     struct FailingAfterEstablishment(AtomicU8);
