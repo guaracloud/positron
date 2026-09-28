@@ -701,6 +701,41 @@ impl GovernanceAuditEntry {
                 },
             ));
         }
+        if intent.starts_with(&LIFECYCLE_CLOCK_ACCEPTANCE_MAGIC) {
+            let mut cursor = Cursor::new(intent);
+            if cursor.take_array::<8>()? != LIFECYCLE_CLOCK_ACCEPTANCE_MAGIC {
+                return Err(IdentityFailure);
+            }
+            let idempotency_key = AdministrativeIdempotencyKey::new(cursor.take_array()?)
+                .map_err(|_| IdentityFailure)?;
+            let actor =
+                PrincipalId::from_bytes(cursor.take_array()?).map_err(|_| IdentityFailure)?;
+            let expected_catalog = cursor.take_array()?;
+            let safe_anchor = i64::from_be_bytes(cursor.take_array()?);
+            let observed_wall_clock = i64::from_be_bytes(cursor.take_array()?);
+            let observed_offset_nanoseconds = i64::from_be_bytes(cursor.take_array()?);
+            let request_digest = cursor.take_array()?;
+            if idempotency_key.to_bytes() != transaction_id
+                || expected_catalog.iter().all(|byte| *byte == 0)
+                || observed_wall_clock.checked_sub(safe_anchor) != Some(observed_offset_nanoseconds)
+                || request_digest.iter().all(|byte| *byte == 0)
+                || !cursor.is_empty()
+            {
+                return Err(IdentityFailure);
+            }
+            return Ok(Self::LifecycleClockAcceptance(
+                LifecycleClockAcceptanceAuditEntry {
+                    position,
+                    idempotency_key,
+                    actor,
+                    expected_catalog,
+                    safe_anchor,
+                    observed_wall_clock,
+                    observed_offset_nanoseconds,
+                    request_digest,
+                },
+            ));
+        }
         if intent.starts_with(&TENANT_ALIAS_MAGIC) {
             let mut cursor = Cursor::new(intent);
             if cursor.take_array::<8>()? != TENANT_ALIAS_MAGIC {

@@ -207,6 +207,7 @@ impl TenantRetentionImpactPreview {
 mod administration_inspection;
 mod administration_keys;
 mod administration_lifecycle;
+mod administration_lifecycle_clock;
 mod administration_retention;
 mod administration_serving;
 mod administration_tenants;

@@ -272,6 +272,7 @@ struct MigratedReceipt {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum TerminalReceiptKind {
     SystemAuditRetention,
+    LifecycleClockAcceptance,
     TenantCreation,
     TenantDisplayName,
     CatalogFormatMigration,
@@ -285,8 +286,9 @@ enum TerminalReceiptKind {
 }
 
 impl TerminalReceiptKind {
-    const ALL: [Self; 11] = [
+    const ALL: [Self; 12] = [
         Self::SystemAuditRetention,
+        Self::LifecycleClockAcceptance,
         Self::TenantCreation,
         Self::TenantDisplayName,
         Self::CatalogFormatMigration,
@@ -306,6 +308,9 @@ impl TerminalReceiptKind {
         let key = match self {
             Self::SystemAuditRetention => {
                 crate::audit::terminal_receipt_key(bytes, &[(RECEIPT_MAGIC, RECEIPT_BYTES, 8)])
+            },
+            Self::LifecycleClockAcceptance => {
+                crate::lifecycle_clock_administration::retention_terminal_key(bytes)
             },
             Self::TenantCreation => crate::tenant_administration::retention_terminal_key(bytes),
             Self::TenantDisplayName => {
@@ -394,6 +399,12 @@ fn receipt_for_pruned_entry(
         | GovernanceAuditEntry::DurableOperation(_)
         | GovernanceAuditEntry::Configuration(_)
         | GovernanceAuditEntry::TlsMaterialReload(_) => return Ok(None),
+        GovernanceAuditEntry::LifecycleClockAcceptance(entry) => (
+            crate::lifecycle_clock_administration::legacy_receipt_object(entry)
+                .map_err(|_| SystemAuditRetentionAdministrationFailure::PersistenceUnavailable)?,
+            TerminalReceiptKind::LifecycleClockAcceptance,
+            entry.idempotency_key().to_bytes(),
+        ),
         GovernanceAuditEntry::TenantCreation(entry) => (
             crate::tenant_administration::legacy_receipt_object(entry)
                 .map_err(|_| SystemAuditRetentionAdministrationFailure::PersistenceUnavailable)?,

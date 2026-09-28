@@ -135,7 +135,10 @@ pub use retention_time::RetentionTimeAuthority;
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub use retention_time::fuzz_retention_time_stateful;
-pub use retention_time::{LifecycleClockPolicy, LifecycleClockState, LifecycleClockStatus};
+pub use retention_time::{
+    LifecycleClockAcceptanceFailure, LifecycleClockPolicy, LifecycleClockState,
+    LifecycleClockStatus, PreparedLifecycleClockAcceptance, validate_catalog_anchor_record,
+};
 
 pub use resource_governor::{
     AdmissionCompletionState, AdmissionFailure, AdmissionFailureCode, AdmissionRetry,

@@ -1,21 +1,22 @@
 use std::collections::BTreeMap;
 #[cfg(any(test, fuzzing, feature = "test-support"))]
 use std::sync::Arc;
-use std::sync::Mutex;
 #[cfg(any(test, fuzzing, feature = "test-support"))]
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use std::time::Instant;
 
 use positron_domain::time::UnixNanoseconds;
 
 use crate::{
-    CatalogSnapshot, IngestTime, LifecycleClockFailure, LifecycleClockSource, SegmentScope,
-    SystemLifecycleClockSource,
+    CatalogCommit, CatalogSnapshot, IngestTime, LifecycleClockFailure, LifecycleClockSource,
+    SegmentScope, SystemLifecycleClockSource,
 };
 
 const CLOCK_ANCHOR_MAGIC: &[u8; 8] = b"PLIFCLK1";
-const CLOCK_ANCHOR_VERSION: u8 = 1;
-const CLOCK_ANCHOR_BYTES: usize = 8 + 1 + 1 + 8 + 1 + 8 + 1 + 8;
+const CLOCK_ANCHOR_VERSION: u8 = 2;
+const CLOCK_ANCHOR_V1_BYTES: usize = 8 + 1 + 1 + 8 + 1 + 8 + 1 + 8;
+const CLOCK_ANCHOR_BYTES: usize = CLOCK_ANCHOR_V1_BYTES + 8;
 
 /// Process-monotonic time authority for the conservative Release 1 retention frontier.
 ///
@@ -28,6 +29,7 @@ pub struct RetentionTimeAuthority {
     destructive_retention: bool,
     source: Option<Box<dyn LifecycleClockSource>>,
     policy: LifecycleClockPolicy,
+    acceptance: Mutex<()>,
     safety: Mutex<LifecycleClockSafety>,
     scopes: Mutex<BTreeMap<SegmentScope, ScopeBaseline>>,
 }
@@ -73,6 +75,16 @@ pub enum LifecycleClockState {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LifecycleClockAcceptanceFailure {
+    Unavailable,
+    NotUncertain,
+    StaleAnchor,
+    MissingDiscontinuity,
+    PersistenceMismatch,
+    OutOfRange,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LifecycleClockStatus {
     state: LifecycleClockState,
     safe_anchor: UnixNanoseconds,
@@ -106,6 +118,7 @@ pub(crate) struct LifecycleClockSafety {
     state: LifecycleClockState,
     last_wall_clock: Option<UnixNanoseconds>,
     observed_offset_nanoseconds: Option<i64>,
+    wall_clock_correction_nanoseconds: i64,
     revision: u64,
 }
 
@@ -123,6 +136,77 @@ pub(crate) struct StagedCatalogAnchor<'authority> {
     candidate_revision: Option<u64>,
     candidate_anchor: Option<UnixNanoseconds>,
     committed: bool,
+}
+
+/// One kernel-derived candidate for a system-administrator discontinuity
+/// acceptance. The lifetime-held gate prevents a later source observation
+/// from changing the authenticated discontinuity during Catalog publication.
+pub struct PreparedLifecycleClockAcceptance<'authority> {
+    authority: &'authority RetentionTimeAuthority,
+    _acceptance: MutexGuard<'authority, ()>,
+    revision: u64,
+    anchor: UnixNanoseconds,
+    observed_wall_clock: UnixNanoseconds,
+    observed_offset_nanoseconds: i64,
+    accepted_record: Vec<u8>,
+}
+
+impl PreparedLifecycleClockAcceptance<'_> {
+    #[must_use]
+    pub const fn safe_anchor(&self) -> UnixNanoseconds {
+        self.anchor
+    }
+
+    #[must_use]
+    pub const fn observed_wall_clock(&self) -> UnixNanoseconds {
+        self.observed_wall_clock
+    }
+
+    #[must_use]
+    pub const fn observed_offset_nanoseconds(&self) -> i64 {
+        self.observed_offset_nanoseconds
+    }
+
+    #[must_use]
+    pub fn accepted_catalog_anchor(&self) -> &[u8] {
+        &self.accepted_record
+    }
+
+    pub fn commit_after_catalog(
+        self,
+        commit: &CatalogCommit,
+    ) -> Result<(), LifecycleClockAcceptanceFailure> {
+        if commit.governance_audit_record().is_none()
+            || !commit
+                .snapshot()
+                .plaintext_objects()
+                .any(|record| record == self.accepted_record)
+        {
+            return Err(LifecycleClockAcceptanceFailure::PersistenceMismatch);
+        }
+        let mut safety = self
+            .authority
+            .safety
+            .lock()
+            .map_err(|_| LifecycleClockAcceptanceFailure::Unavailable)?;
+        if safety.revision != self.revision || safety.anchor != self.anchor {
+            return Err(LifecycleClockAcceptanceFailure::StaleAnchor);
+        }
+        if safety.state != LifecycleClockState::ClockUncertain {
+            return Err(LifecycleClockAcceptanceFailure::NotUncertain);
+        }
+        safety.state = LifecycleClockState::Certain;
+        safety.wall_clock_correction_nanoseconds = self
+            .anchor
+            .value()
+            .checked_sub(self.observed_wall_clock.value())
+            .ok_or(LifecycleClockAcceptanceFailure::OutOfRange)?;
+        safety.revision = safety
+            .revision
+            .checked_add(1)
+            .ok_or(LifecycleClockAcceptanceFailure::OutOfRange)?;
+        Ok(())
+    }
 }
 
 impl StagedCatalogAnchor<'_> {
@@ -333,12 +417,14 @@ impl RetentionTimeAuthority {
             destructive_retention,
             source,
             policy,
+            acceptance: Mutex::new(()),
             safety: Mutex::new(LifecycleClockSafety {
                 anchor: epoch,
                 anchor_elapsed: 0,
                 state: LifecycleClockState::Certain,
                 last_wall_clock: Some(epoch),
                 observed_offset_nanoseconds: Some(0),
+                wall_clock_correction_nanoseconds: 0,
                 revision: 0,
             }),
             scopes: Mutex::new(BTreeMap::new()),
@@ -372,6 +458,61 @@ impl RetentionTimeAuthority {
         self.destructive_retention
     }
 
+    /// Derives the only Catalog anchor that can accept the currently observed
+    /// discontinuity. Callers supply the previously observed safe anchor as a
+    /// compare-and-swap precondition; they cannot choose a replacement time or
+    /// audit payload.
+    pub fn prepare_discontinuity_acceptance(
+        &self,
+        expected_safe_anchor: UnixNanoseconds,
+    ) -> Result<PreparedLifecycleClockAcceptance<'_>, LifecycleClockAcceptanceFailure> {
+        let acceptance = self
+            .acceptance
+            .lock()
+            .map_err(|_| LifecycleClockAcceptanceFailure::Unavailable)?;
+        let safety = self
+            .safety
+            .lock()
+            .map_err(|_| LifecycleClockAcceptanceFailure::Unavailable)?;
+        if safety.state != LifecycleClockState::ClockUncertain {
+            return Err(LifecycleClockAcceptanceFailure::NotUncertain);
+        }
+        if safety.anchor != expected_safe_anchor {
+            return Err(LifecycleClockAcceptanceFailure::StaleAnchor);
+        }
+        let observed_wall_clock = safety
+            .last_wall_clock
+            .ok_or(LifecycleClockAcceptanceFailure::MissingDiscontinuity)?;
+        let observed_offset_nanoseconds = safety
+            .observed_offset_nanoseconds
+            .ok_or(LifecycleClockAcceptanceFailure::MissingDiscontinuity)?;
+        if observed_offset_nanoseconds.unsigned_abs()
+            <= self.policy.maximum_reconciliation_offset_nanoseconds
+        {
+            return Err(LifecycleClockAcceptanceFailure::MissingDiscontinuity);
+        }
+        let wall_clock_correction_nanoseconds = safety
+            .anchor
+            .value()
+            .checked_sub(observed_wall_clock.value())
+            .ok_or(LifecycleClockAcceptanceFailure::OutOfRange)?;
+        let accepted_record = encode_catalog_anchor(LifecycleClockSafety {
+            state: LifecycleClockState::Certain,
+            wall_clock_correction_nanoseconds,
+            ..*safety
+        })
+        .map_err(|_| LifecycleClockAcceptanceFailure::OutOfRange)?;
+        Ok(PreparedLifecycleClockAcceptance {
+            authority: self,
+            _acceptance: acceptance,
+            revision: safety.revision,
+            anchor: safety.anchor,
+            observed_wall_clock,
+            observed_offset_nanoseconds,
+            accepted_record,
+        })
+    }
+
     /// Reconciles this process authority with the one authenticated,
     /// instance-level Catalog anchor before a scope can mint time.
     pub(crate) fn recover_catalog_anchor(
@@ -390,6 +531,14 @@ impl RetentionTimeAuthority {
         let Some(record) = record else {
             return Ok(());
         };
+        // Recovery changes the same anchor/revision pair as acceptance. Hold
+        // the acceptance gate across both the durable-record install and its
+        // source reconciliation so a concurrent Catalog publication cannot
+        // observe a stale in-memory candidate after it has succeeded.
+        let _acceptance = self
+            .acceptance
+            .lock()
+            .map_err(|_| LifecycleClockFailure::Unavailable)?;
         let elapsed = self.elapsed.nanoseconds()?;
         let mut safety = self
             .safety
@@ -402,13 +551,14 @@ impl RetentionTimeAuthority {
         safety.anchor_elapsed = elapsed;
         safety.last_wall_clock = record.last_wall_clock;
         safety.observed_offset_nanoseconds = record.observed_offset_nanoseconds;
+        safety.wall_clock_correction_nanoseconds = record.wall_clock_correction_nanoseconds;
         safety.state = record.state;
         safety.revision = safety
             .revision
             .checked_add(1)
             .ok_or(LifecycleClockFailure::OutOfRange)?;
         drop(safety);
-        self.reconcile(record.anchor, elapsed)
+        self.reconcile_while_acceptance_held(record.anchor, elapsed)
     }
 
     pub(crate) fn catalog_anchor_record(
@@ -445,6 +595,9 @@ impl RetentionTimeAuthority {
         checkpoint: LifecycleAnchorCheckpoint,
         candidate_revision: Option<u64>,
     ) {
+        let Ok(_acceptance) = self.acceptance.lock() else {
+            return;
+        };
         let Ok(mut safety) = self.safety.lock() else {
             return;
         };
@@ -628,6 +781,18 @@ impl RetentionTimeAuthority {
         durable_or_expected: UnixNanoseconds,
         elapsed: u64,
     ) -> Result<(), LifecycleClockFailure> {
+        let _acceptance = self
+            .acceptance
+            .lock()
+            .map_err(|_| LifecycleClockFailure::Unavailable)?;
+        self.reconcile_while_acceptance_held(durable_or_expected, elapsed)
+    }
+
+    fn reconcile_while_acceptance_held(
+        &self,
+        durable_or_expected: UnixNanoseconds,
+        elapsed: u64,
+    ) -> Result<(), LifecycleClockFailure> {
         let mut safety = self
             .safety
             .lock()
@@ -647,9 +812,13 @@ impl RetentionTimeAuthority {
             .value()
             .checked_sub(expected.value())
             .ok_or(LifecycleClockFailure::OutOfRange)?;
+        let adjusted_wall = wall
+            .value()
+            .checked_add(safety.wall_clock_correction_nanoseconds)
+            .ok_or(LifecycleClockFailure::OutOfRange)?;
         safety.last_wall_clock = Some(wall);
         safety.observed_offset_nanoseconds = Some(offset);
-        safety.state = if wall.value().abs_diff(expected.value())
+        safety.state = if adjusted_wall.abs_diff(expected.value())
             > self.policy.maximum_reconciliation_offset_nanoseconds
         {
             LifecycleClockState::ClockUncertain
@@ -704,6 +873,7 @@ fn encode_catalog_anchor(safety: LifecycleClockSafety) -> Result<Vec<u8>, Lifecy
             bytes.extend_from_slice(&0_i64.to_be_bytes());
         },
     }
+    bytes.extend_from_slice(&safety.wall_clock_correction_nanoseconds.to_be_bytes());
     Ok(bytes)
 }
 
@@ -713,7 +883,14 @@ fn decode_catalog_anchor(
     if !bytes.starts_with(CLOCK_ANCHOR_MAGIC) {
         return Ok(None);
     }
-    if bytes.len() != CLOCK_ANCHOR_BYTES || bytes.get(8).copied() != Some(CLOCK_ANCHOR_VERSION) {
+    let version = bytes
+        .get(8)
+        .copied()
+        .ok_or(LifecycleClockFailure::OutOfRange)?;
+    if !matches!(
+        (version, bytes.len()),
+        (1, CLOCK_ANCHOR_V1_BYTES) | (CLOCK_ANCHOR_VERSION, CLOCK_ANCHOR_BYTES)
+    ) {
         return Err(LifecycleClockFailure::OutOfRange);
     }
     let state = match bytes.get(9).copied() {
@@ -732,14 +909,27 @@ fn decode_catalog_anchor(
         Some(1) => Some(read_i64(bytes, 28)?),
         _ => return Err(LifecycleClockFailure::OutOfRange),
     };
+    let wall_clock_correction_nanoseconds = if version == 1 {
+        0
+    } else {
+        read_i64(bytes, CLOCK_ANCHOR_V1_BYTES)?
+    };
     Ok(Some(LifecycleClockSafety {
         anchor,
         anchor_elapsed: 0,
         state,
         last_wall_clock,
         observed_offset_nanoseconds,
+        wall_clock_correction_nanoseconds,
         revision: 0,
     }))
+}
+
+/// Verifies one untrusted Catalog object is either not a lifecycle anchor or
+/// is an exactly encoded supported lifecycle anchor. Callers replacing the
+/// singleton anchor must reject malformed records rather than dropping them.
+pub fn validate_catalog_anchor_record(bytes: &[u8]) -> Result<bool, LifecycleClockFailure> {
+    decode_catalog_anchor(bytes).map(|record| record.is_some())
 }
 
 pub(crate) fn is_catalog_anchor(bytes: &[u8]) -> bool {
@@ -1073,6 +1263,74 @@ mod clock_safety_tests {
 
         assert_eq!(clock.status().safe_anchor(), UnixNanoseconds::new(1_010));
         assert_eq!(clock.status().state(), LifecycleClockState::ClockUncertain);
+    }
+
+    #[test]
+    fn authenticated_v1_anchor_remains_readable_with_zero_correction() {
+        let safety = LifecycleClockSafety {
+            anchor: UnixNanoseconds::new(42),
+            anchor_elapsed: 0,
+            state: LifecycleClockState::Certain,
+            last_wall_clock: Some(UnixNanoseconds::new(42)),
+            observed_offset_nanoseconds: Some(0),
+            wall_clock_correction_nanoseconds: 7,
+            revision: 0,
+        };
+        let mut v1 = encode_catalog_anchor(safety).expect("v2 record");
+        v1[8] = 1;
+        v1.truncate(CLOCK_ANCHOR_V1_BYTES);
+        let decoded = decode_catalog_anchor(&v1)
+            .expect("v1 valid")
+            .expect("anchor");
+        assert_eq!(decoded.wall_clock_correction_nanoseconds, 0);
+        assert!(validate_catalog_anchor_record(&v1).expect("v1 classification"));
+    }
+
+    #[test]
+    fn malformed_lifecycle_anchor_record_is_never_classified_as_replaceable() {
+        let mut malformed = CLOCK_ANCHOR_MAGIC.to_vec();
+        malformed.extend_from_slice(&[2, 0]);
+        assert_eq!(
+            validate_catalog_anchor_record(&malformed),
+            Err(LifecycleClockFailure::OutOfRange)
+        );
+    }
+
+    #[test]
+    fn prepared_acceptance_persists_a_backward_step_correction_and_releases_on_failure() {
+        let wall = Arc::new(Mutex::new(UnixNanoseconds::new(1_000)));
+        let (clock, elapsed) = RetentionTimeAuthority::establish_with_source_and_manual_elapsed(
+            MutableWallClock(Arc::clone(&wall)),
+            LifecycleClockPolicy::new(10).expect("bounded policy"),
+        )
+        .expect("clock establishes");
+        let scope = SegmentScope::new(
+            positron_domain::identity::TenantId::from_bytes([9; 16]).expect("tenant"),
+            positron_domain::routing::SignalKind::Logs,
+            positron_domain::routing::VirtualShardId::new(9).expect("shard"),
+        );
+        elapsed.advance(1).expect("elapsed");
+        *wall.lock().expect("wall lock") = UnixNanoseconds::new(500);
+        clock.ingest_time(scope, None).expect("safe ingest");
+        let expected = clock.status().safe_anchor();
+        assert_eq!(clock.status().state(), LifecycleClockState::ClockUncertain);
+
+        let prepared = clock
+            .prepare_discontinuity_acceptance(expected)
+            .expect("observed discontinuity can be prepared");
+        let record = decode_catalog_anchor(prepared.accepted_catalog_anchor())
+            .expect("record decodes")
+            .expect("clock record");
+        assert_eq!(record.state, LifecycleClockState::Certain);
+        assert_eq!(record.wall_clock_correction_nanoseconds, 501);
+        drop(prepared);
+
+        // Abandoning a failed Catalog attempt does not clear the safety fence.
+        assert_eq!(clock.status().state(), LifecycleClockState::ClockUncertain);
+        assert!(matches!(
+            clock.prepare_discontinuity_acceptance(UnixNanoseconds::new(999)),
+            Err(LifecycleClockAcceptanceFailure::StaleAnchor)
+        ));
     }
 
     #[test]

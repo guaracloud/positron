@@ -112,6 +112,39 @@ pub(super) fn map_tenant_retention_failure(
     BootstrapFailure::new(code)
 }
 
+pub(super) fn map_lifecycle_clock_acceptance_failure(
+    failure: positron_kernel::LifecycleClockAcceptanceFailure,
+) -> BootstrapFailure {
+    use positron_kernel::LifecycleClockAcceptanceFailure as Failure;
+    let code = match failure {
+        Failure::Unavailable | Failure::PersistenceMismatch => {
+            BootstrapFailureCode::CatalogUnavailable
+        },
+        Failure::NotUncertain
+        | Failure::StaleAnchor
+        | Failure::MissingDiscontinuity
+        | Failure::OutOfRange => BootstrapFailureCode::LifecycleClockAcceptanceInvalidDiscontinuity,
+    };
+    BootstrapFailure::new(code)
+}
+
+pub(super) fn map_lifecycle_clock_acceptance_administration_failure(
+    failure: positron_governance::LifecycleClockAcceptanceAdministrationFailure,
+) -> BootstrapFailure {
+    use positron_governance::LifecycleClockAcceptanceAdministrationFailure as Failure;
+    let code = match failure {
+        Failure::Unauthorized => BootstrapFailureCode::LifecycleClockAcceptanceUnauthorized,
+        Failure::StaleCatalog => BootstrapFailureCode::LifecycleClockAcceptanceStaleCatalog,
+        Failure::IdempotencyConflict => {
+            BootstrapFailureCode::LifecycleClockAcceptanceIdempotencyConflict
+        },
+        Failure::PersistenceUnavailable | Failure::CapacityExceeded => {
+            BootstrapFailureCode::CatalogUnavailable
+        },
+    };
+    BootstrapFailure::new(code)
+}
+
 pub(super) fn map_system_audit_retention_failure(
     failure: positron_governance::SystemAuditRetentionAdministrationFailure,
 ) -> BootstrapFailure {
