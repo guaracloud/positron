@@ -58,7 +58,8 @@ pub(crate) fn map_trace_store_failure(
         | Trace::ConcurrentWriter
         | Trace::IdempotencyConflict
         | Trace::StaleGeneration
-        | Trace::ClockUnavailable => QueryFailure::new(QueryFailureCode::StoreUnavailable),
+        | Trace::ClockUnavailable
+        | Trace::ClockUncertain => QueryFailure::new(QueryFailureCode::StoreUnavailable),
         Trace::SnapshotExpired => QueryFailure::new(QueryFailureCode::SnapshotExpired),
         Trace::StaleResumeMarker => QueryFailure::new(QueryFailureCode::InvalidCursor),
         Trace::StorageExhausted | Trace::ResourceExhausted => {
@@ -81,7 +82,8 @@ const fn map_store_failure_code(code: positron_signals::LogStoreFailureCode) -> 
         | Store::ConcurrentWriter
         | Store::IdempotencyConflict
         | Store::StaleGeneration
-        | Store::ClockUnavailable => QueryFailureCode::StoreUnavailable,
+        | Store::ClockUnavailable
+        | Store::ClockUncertain => QueryFailureCode::StoreUnavailable,
         Store::IntegrityCorruption
         | Store::AuthenticationFailed
         | Store::UnsupportedFormat

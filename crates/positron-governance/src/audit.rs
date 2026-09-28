@@ -7,6 +7,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use positron_domain::identity::{ExternalTenantAlias, PrincipalId, Scope, TenantId, TenantSlug};
 use positron_domain::lifecycle::TenantLifecycleState;
+use positron_domain::time::UnixNanoseconds;
 use positron_kernel::GovernanceAuditRecord;
 use sha2::{Digest, Sha256};
 
@@ -42,6 +43,7 @@ const FORMAT_MIGRATION_MAGIC: [u8; 8] = *b"POSFMT01";
 const TENANT_ALIAS_MAGIC: [u8; 8] = *b"POSALI01";
 const TENANT_RETENTION_MAGIC: [u8; 8] = *b"POSTRT01";
 const SYSTEM_AUDIT_RETENTION_MAGIC: [u8; 8] = *b"POSAR001";
+const LIFECYCLE_CLOCK_ACCEPTANCE_MAGIC: [u8; 8] = *b"POSLCA01";
 const DURABLE_OPERATION_AUDIT_MAGIC: [u8; 8] = *b"POSOPA02";
 const DURABLE_OPERATION_AUDIT_MAGIC_V3: [u8; 8] = *b"POSOPA03";
 const DURABLE_OPERATION_AUDIT_MAGIC_V4: [u8; 8] = *b"POSOPA04";
@@ -130,6 +132,7 @@ pub enum GovernanceAuditEntry {
     TenantAliasBinding(TenantAliasBindingAuditEntry),
     TenantRetentionUpdate(TenantRetentionUpdateAuditEntry),
     SystemAuditRetentionUpdate(SystemAuditRetentionUpdateAuditEntry),
+    LifecycleClockAcceptance(LifecycleClockAcceptanceAuditEntry),
     DurableOperation(DurableOperationAuditEntry),
     Configuration(ConfigurationAuditEntry),
     TlsMaterialReload(TlsMaterialReloadAuditEntry),
@@ -761,6 +764,46 @@ impl SystemAuditRetentionAuditIntent {
         intent.extend_from_slice(&self.expected_generation.get().to_be_bytes());
         intent.extend_from_slice(&self.generation.get().to_be_bytes());
         intent.extend_from_slice(&self.retained_record_limit.to_be_bytes());
+        intent.extend_from_slice(&self.request_digest);
+        intent
+    }
+}
+
+/// Redacted receipt for accepting one source-observed lifecycle-clock
+/// discontinuity. The anchor and observed wall values are durable evidence,
+/// never caller-selected replacement time.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LifecycleClockAcceptanceAuditEntry {
+    position: u64,
+    idempotency_key: AdministrativeIdempotencyKey,
+    actor: PrincipalId,
+    expected_catalog: [u8; 32],
+    safe_anchor: i64,
+    observed_wall_clock: i64,
+    observed_offset_nanoseconds: i64,
+    request_digest: [u8; 32],
+}
+
+pub(crate) struct LifecycleClockAcceptanceAuditIntent {
+    pub(crate) idempotency_key: AdministrativeIdempotencyKey,
+    pub(crate) actor: PrincipalId,
+    pub(crate) expected_catalog: [u8; 32],
+    pub(crate) safe_anchor: UnixNanoseconds,
+    pub(crate) observed_wall_clock: UnixNanoseconds,
+    pub(crate) observed_offset_nanoseconds: i64,
+    pub(crate) request_digest: [u8; 32],
+}
+
+impl LifecycleClockAcceptanceAuditIntent {
+    pub(crate) fn encode(self) -> Vec<u8> {
+        let mut intent = Vec::with_capacity(128);
+        intent.extend_from_slice(&LIFECYCLE_CLOCK_ACCEPTANCE_MAGIC);
+        intent.extend_from_slice(&self.idempotency_key.to_bytes());
+        intent.extend_from_slice(&self.actor.to_bytes());
+        intent.extend_from_slice(&self.expected_catalog);
+        intent.extend_from_slice(&self.safe_anchor.value().to_be_bytes());
+        intent.extend_from_slice(&self.observed_wall_clock.value().to_be_bytes());
+        intent.extend_from_slice(&self.observed_offset_nanoseconds.to_be_bytes());
         intent.extend_from_slice(&self.request_digest);
         intent
     }
@@ -1746,6 +1789,7 @@ impl GovernanceAuditEntry {
             Self::TenantAliasBinding(entry) => entry.position,
             Self::TenantRetentionUpdate(entry) => entry.position,
             Self::SystemAuditRetentionUpdate(entry) => entry.position,
+            Self::LifecycleClockAcceptance(entry) => entry.position,
             Self::DurableOperation(entry) => entry.position,
             Self::Configuration(entry) => entry.position(),
             Self::TlsMaterialReload(entry) => entry.position(),
@@ -1771,7 +1815,7 @@ impl GovernanceAuditEntry {
             Self::CatalogFormatMigration(_) => None,
             Self::TenantAliasBinding(entry) => Some(entry.tenant),
             Self::TenantRetentionUpdate(entry) => Some(entry.tenant),
-            Self::SystemAuditRetentionUpdate(_) => None,
+            Self::SystemAuditRetentionUpdate(_) | Self::LifecycleClockAcceptance(_) => None,
             Self::DurableOperation(entry) => entry.applicable_tenant(),
             Self::Configuration(entry) => entry.applicable_tenant(),
             Self::TlsMaterialReload(_) => None,
@@ -1799,6 +1843,7 @@ impl GovernanceAuditEntry {
             Self::TenantAliasBinding(_) => "tenant.alias.bind",
             Self::TenantRetentionUpdate(_) => "tenant.retention.update",
             Self::SystemAuditRetentionUpdate(_) => "system.audit-retention.update",
+            Self::LifecycleClockAcceptance(_) => "lifecycle-clock.discontinuity.accept",
             Self::DurableOperation(_) => "durable-operation.transition",
             Self::Configuration(_) => "configuration.reload",
             Self::TlsMaterialReload(entry) => entry.action(),
@@ -1821,7 +1866,7 @@ impl GovernanceAuditEntry {
             Self::CatalogFormatMigration(_) => "succeeded",
             Self::TenantAliasBinding(_) => "succeeded",
             Self::TenantRetentionUpdate(_) => "succeeded",
-            Self::SystemAuditRetentionUpdate(_) => "succeeded",
+            Self::SystemAuditRetentionUpdate(_) | Self::LifecycleClockAcceptance(_) => "succeeded",
             Self::DurableOperation(entry) => match entry.outcome {
                 DurableOperationStatus::Failed => "failed",
                 DurableOperationStatus::Cancelled => "cancelled",
@@ -1857,6 +1902,7 @@ impl GovernanceAuditEntry {
             | Self::TenantAliasBinding(_)
             | Self::TenantRetentionUpdate(_)
             | Self::SystemAuditRetentionUpdate(_)
+            | Self::LifecycleClockAcceptance(_)
             | Self::DurableOperation(_) => None,
             Self::Configuration(_) | Self::TlsMaterialReload(_) => None,
         }
@@ -1879,6 +1925,7 @@ impl GovernanceAuditEntry {
             | Self::TenantAliasBinding(_)
             | Self::TenantRetentionUpdate(_)
             | Self::SystemAuditRetentionUpdate(_)
+            | Self::LifecycleClockAcceptance(_)
             | Self::DurableOperation(_) => None,
             Self::Configuration(_) | Self::TlsMaterialReload(_) => None,
         }
@@ -1901,6 +1948,7 @@ impl GovernanceAuditEntry {
             | Self::TenantAliasBinding(_)
             | Self::TenantRetentionUpdate(_)
             | Self::SystemAuditRetentionUpdate(_)
+            | Self::LifecycleClockAcceptance(_)
             | Self::DurableOperation(_) => None,
             Self::Configuration(_) | Self::TlsMaterialReload(_) => None,
         }
@@ -1923,6 +1971,7 @@ impl GovernanceAuditEntry {
             | Self::TenantAliasBinding(_)
             | Self::TenantRetentionUpdate(_)
             | Self::SystemAuditRetentionUpdate(_)
+            | Self::LifecycleClockAcceptance(_)
             | Self::DurableOperation(_) => None,
             Self::Configuration(_) | Self::TlsMaterialReload(_) => None,
         }
@@ -1945,6 +1994,7 @@ impl GovernanceAuditEntry {
             | Self::TenantAliasBinding(_)
             | Self::TenantRetentionUpdate(_)
             | Self::SystemAuditRetentionUpdate(_)
+            | Self::LifecycleClockAcceptance(_)
             | Self::DurableOperation(_) => None,
             Self::Configuration(_) | Self::TlsMaterialReload(_) => None,
         }
@@ -1967,6 +2017,7 @@ impl GovernanceAuditEntry {
             | Self::TenantAliasBinding(_)
             | Self::TenantRetentionUpdate(_)
             | Self::SystemAuditRetentionUpdate(_)
+            | Self::LifecycleClockAcceptance(_)
             | Self::DurableOperation(_) => None,
             Self::Configuration(_) | Self::TlsMaterialReload(_) => None,
         }
@@ -1989,6 +2040,7 @@ impl GovernanceAuditEntry {
             | Self::TenantAliasBinding(_)
             | Self::TenantRetentionUpdate(_)
             | Self::SystemAuditRetentionUpdate(_)
+            | Self::LifecycleClockAcceptance(_)
             | Self::DurableOperation(_) => None,
             Self::Configuration(_) | Self::TlsMaterialReload(_) => None,
         }
@@ -2013,6 +2065,7 @@ impl GovernanceAuditEntry {
             | Self::TenantAliasBinding(_)
             | Self::TenantRetentionUpdate(_)
             | Self::SystemAuditRetentionUpdate(_)
+            | Self::LifecycleClockAcceptance(_)
             | Self::DurableOperation(_) => None,
             Self::Configuration(_) | Self::TlsMaterialReload(_) => None,
         }
@@ -2035,6 +2088,7 @@ impl GovernanceAuditEntry {
             | Self::CatalogFormatMigration(_)
             | Self::TenantAliasBinding(_) => None,
             Self::SystemAuditRetentionUpdate(_)
+            | Self::LifecycleClockAcceptance(_)
             | Self::DurableOperation(_)
             | Self::Configuration(_)
             | Self::TlsMaterialReload(_) => None,
@@ -2047,6 +2101,16 @@ impl GovernanceAuditEntry {
     ) -> Option<&SystemAuditRetentionUpdateAuditEntry> {
         match self {
             Self::SystemAuditRetentionUpdate(entry) => Some(entry),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_lifecycle_clock_acceptance(
+        &self,
+    ) -> Option<&LifecycleClockAcceptanceAuditEntry> {
+        match self {
+            Self::LifecycleClockAcceptance(entry) => Some(entry),
             _ => None,
         }
     }
@@ -2065,6 +2129,41 @@ impl GovernanceAuditEntry {
             Self::TlsMaterialReload(entry) => Some(entry),
             _ => None,
         }
+    }
+}
+
+impl LifecycleClockAcceptanceAuditEntry {
+    #[must_use]
+    pub const fn position(&self) -> u64 {
+        self.position
+    }
+    #[must_use]
+    pub const fn idempotency_key(&self) -> AdministrativeIdempotencyKey {
+        self.idempotency_key
+    }
+    #[must_use]
+    pub const fn actor_id(&self) -> PrincipalId {
+        self.actor
+    }
+    #[must_use]
+    pub const fn expected_catalog(&self) -> [u8; 32] {
+        self.expected_catalog
+    }
+    #[must_use]
+    pub const fn safe_anchor(&self) -> UnixNanoseconds {
+        UnixNanoseconds::new(self.safe_anchor)
+    }
+    #[must_use]
+    pub const fn observed_wall_clock(&self) -> UnixNanoseconds {
+        UnixNanoseconds::new(self.observed_wall_clock)
+    }
+    #[must_use]
+    pub const fn observed_offset_nanoseconds(&self) -> i64 {
+        self.observed_offset_nanoseconds
+    }
+    #[must_use]
+    pub const fn request_digest(&self) -> [u8; 32] {
+        self.request_digest
     }
 }
 

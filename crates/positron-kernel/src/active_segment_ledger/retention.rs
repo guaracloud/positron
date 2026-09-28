@@ -90,6 +90,7 @@ pub(super) fn commit(
         ledger.catalog,
         &basis,
         &ledger.storage,
+        &evaluation.clock_anchor,
         ledger.scope,
         &metadata,
         evaluation.frontier,
@@ -102,6 +103,7 @@ pub(super) fn commit(
             return Err(failure);
         },
     };
+    evaluation.clock_anchor.commit();
     let latest_metadata = ledger
         .storage
         .catalog_segments(&latest, ledger.scope)

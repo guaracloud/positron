@@ -31,17 +31,32 @@ pub(super) fn recover(
 pub(super) fn publish(
     catalog: &Catalog<'_>,
     basis: &CatalogSnapshot,
+    lifecycle_clock: &crate::retention_time::StagedCatalogAnchor<'_>,
     scope: SegmentScope,
     frontier: IngestTime,
 ) -> Result<(), LedgerFailure> {
     let mut objects = Vec::new();
     objects
-        .try_reserve_exact(basis.plaintext_object_count().saturating_add(1))
+        .try_reserve_exact(basis.plaintext_object_count().saturating_add(2))
         .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+    let mut lifecycle_anchor_seen = false;
     for bytes in basis.plaintext_objects() {
+        if crate::retention_time::validate_catalog_anchor_singleton(
+            bytes,
+            &mut lifecycle_anchor_seen,
+        )
+        .map_err(|_| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?
+        {
+            continue;
+        }
         objects.push(CatalogObject::new(bytes.to_vec())?);
     }
     objects.push(CatalogObject::new(encode(scope, frontier))?);
+    objects.push(CatalogObject::new(
+        lifecycle_clock
+            .catalog_anchor_record(frontier)
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::StorageUnavailable))?,
+    )?);
     let random = DataProtection::random_identifier().map_err(map_frame_failure)?;
     let mut transaction = [0_u8; 16];
     transaction.copy_from_slice(
@@ -71,7 +86,10 @@ pub(super) fn publish(
             let latest = catalog.pin().map_err(ambiguous_catalog)?;
             let recovered = recover(&latest, scope)
                 .map_err(|recovery| LedgerFailure::ambiguous(recovery.code()))?;
-            if recovered.is_some_and(|durable| durable >= frontier) {
+            let anchor_subsumed = lifecycle_clock
+                .catalog_anchor_subsumed(&latest)
+                .map_err(|_| LedgerFailure::ambiguous(LedgerFailureCode::StorageUnavailable))?;
+            if recovered.is_some_and(|durable| durable >= frontier) && anchor_subsumed {
                 Ok(())
             } else if latest.identity() == basis.identity() {
                 Err(failure.into())

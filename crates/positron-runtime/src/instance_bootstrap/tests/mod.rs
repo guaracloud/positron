@@ -6,6 +6,7 @@ mod faults;
 mod format_migration;
 mod identity;
 mod initialization;
+mod lifecycle_clock_acceptance;
 mod prepared_recovery;
 mod secondary_lifecycle;
 mod support;

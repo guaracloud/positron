@@ -33,16 +33,13 @@ pub(super) fn open_initial_ledgers(
         let protection = key
             .segment_key_from_tenant_envelope(record.instance, scope, envelope)
             .map_err(key_failure)?;
-        let ledger = match signal {
-            SignalKind::Logs => ActiveSegmentLedger::open_with_retention_time(
-                authority,
-                retention_time,
-                catalog,
-                scope,
-                protection,
-            ),
-            SignalKind::Traces => ActiveSegmentLedger::open(authority, catalog, scope, protection),
-        }
+        let ledger = ActiveSegmentLedger::open_with_retention_time(
+            authority,
+            retention_time,
+            catalog,
+            scope,
+            protection,
+        )
         .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::LedgerUnavailable))?;
         drop(ledger);
     }

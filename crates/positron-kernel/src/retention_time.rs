@@ -1,17 +1,22 @@
 use std::collections::BTreeMap;
 #[cfg(any(test, fuzzing, feature = "test-support"))]
 use std::sync::Arc;
-use std::sync::Mutex;
 #[cfg(any(test, fuzzing, feature = "test-support"))]
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use std::time::Instant;
 
 use positron_domain::time::UnixNanoseconds;
 
 use crate::{
-    IngestTime, LifecycleClockFailure, LifecycleClockSource, SegmentScope,
-    SystemLifecycleClockSource,
+    CatalogCommit, CatalogSnapshot, IngestTime, LifecycleClockFailure, LifecycleClockSource,
+    SegmentScope, SystemLifecycleClockSource,
 };
+
+const CLOCK_ANCHOR_MAGIC: &[u8; 8] = b"PLIFCLK1";
+const CLOCK_ANCHOR_VERSION: u8 = 2;
+const CLOCK_ANCHOR_V1_BYTES: usize = 8 + 1 + 1 + 8 + 1 + 8 + 1 + 8;
+const CLOCK_ANCHOR_BYTES: usize = CLOCK_ANCHOR_V1_BYTES + 8;
 
 /// Process-monotonic time authority for the conservative Release 1 retention frontier.
 ///
@@ -22,7 +27,276 @@ pub struct RetentionTimeAuthority {
     epoch: UnixNanoseconds,
     elapsed: ElapsedSource,
     destructive_retention: bool,
+    source: Option<Box<dyn LifecycleClockSource>>,
+    policy: LifecycleClockPolicy,
+    acceptance: Mutex<()>,
+    safety: Mutex<LifecycleClockSafety>,
     scopes: Mutex<BTreeMap<SegmentScope, ScopeBaseline>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LifecycleClockPolicy {
+    maximum_reconciliation_offset_nanoseconds: u64,
+}
+
+impl LifecycleClockPolicy {
+    pub const DEFAULT_MAXIMUM_RECONCILIATION_OFFSET_NANOSECONDS: u64 = 300_000_000_000;
+
+    pub const fn new(
+        maximum_reconciliation_offset_nanoseconds: u64,
+    ) -> Result<Self, LifecycleClockFailure> {
+        if maximum_reconciliation_offset_nanoseconds == 0 {
+            return Err(LifecycleClockFailure::OutOfRange);
+        }
+        Ok(Self {
+            maximum_reconciliation_offset_nanoseconds,
+        })
+    }
+
+    #[must_use]
+    pub const fn maximum_reconciliation_offset_nanoseconds(self) -> u64 {
+        self.maximum_reconciliation_offset_nanoseconds
+    }
+}
+
+impl Default for LifecycleClockPolicy {
+    fn default() -> Self {
+        Self {
+            maximum_reconciliation_offset_nanoseconds:
+                Self::DEFAULT_MAXIMUM_RECONCILIATION_OFFSET_NANOSECONDS,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LifecycleClockState {
+    Certain,
+    ClockUncertain,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LifecycleClockAcceptanceFailure {
+    Unavailable,
+    NotUncertain,
+    StaleAnchor,
+    MissingDiscontinuity,
+    PersistenceMismatch,
+    OutOfRange,
+}
+
+/// Relationship between the current authenticated Catalog anchor and one
+/// durable discontinuity-acceptance receipt.
+///
+/// A receipt may be replayed after ordinary lifecycle work has advanced the
+/// global anchor. Equal anchors remain valid only when they preserve the
+/// exact accepted correction; a successor must be strictly later so a replay
+/// can never certify altered provenance at the historical instant.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CatalogAnchorAcceptanceRelation {
+    ExactHistorical,
+    ProvablyLater,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LifecycleClockStatus {
+    state: LifecycleClockState,
+    safe_anchor: UnixNanoseconds,
+    last_wall_clock: Option<UnixNanoseconds>,
+    observed_offset_nanoseconds: Option<i64>,
+}
+
+impl LifecycleClockStatus {
+    #[must_use]
+    pub const fn state(self) -> LifecycleClockState {
+        self.state
+    }
+    #[must_use]
+    pub const fn safe_anchor(self) -> UnixNanoseconds {
+        self.safe_anchor
+    }
+    #[must_use]
+    pub const fn last_wall_clock(self) -> Option<UnixNanoseconds> {
+        self.last_wall_clock
+    }
+    #[must_use]
+    pub const fn observed_offset_nanoseconds(self) -> Option<i64> {
+        self.observed_offset_nanoseconds
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct LifecycleClockSafety {
+    anchor: UnixNanoseconds,
+    anchor_elapsed: u64,
+    state: LifecycleClockState,
+    last_wall_clock: Option<UnixNanoseconds>,
+    observed_offset_nanoseconds: Option<i64>,
+    wall_clock_correction_nanoseconds: i64,
+    revision: u64,
+}
+
+#[derive(Clone, Copy)]
+struct LifecycleAnchorCheckpoint(LifecycleClockSafety);
+
+/// A candidate lifecycle observation which becomes authoritative only with
+/// the Catalog generation that carries its anchor.  Dropping an unpublished
+/// candidate restores its predecessor when no later local observation has
+/// intervened; otherwise it fences destructive work rather than rolling a
+/// concurrent observation backwards.
+pub(crate) struct StagedCatalogAnchor<'authority> {
+    authority: &'authority RetentionTimeAuthority,
+    checkpoint: LifecycleAnchorCheckpoint,
+    candidate_revision: Option<u64>,
+    candidate_anchor: Option<UnixNanoseconds>,
+    committed: bool,
+}
+
+/// One kernel-derived candidate for a system-administrator discontinuity
+/// acceptance. The lifetime-held gate prevents a later source observation
+/// from changing the authenticated discontinuity during Catalog publication.
+pub struct PreparedLifecycleClockAcceptance<'authority> {
+    authority: &'authority RetentionTimeAuthority,
+    _acceptance: MutexGuard<'authority, ()>,
+    revision: u64,
+    anchor: UnixNanoseconds,
+    observed_wall_clock: UnixNanoseconds,
+    observed_offset_nanoseconds: i64,
+    accepted_record: Vec<u8>,
+}
+
+impl PreparedLifecycleClockAcceptance<'_> {
+    #[must_use]
+    pub const fn safe_anchor(&self) -> UnixNanoseconds {
+        self.anchor
+    }
+
+    #[must_use]
+    pub const fn observed_wall_clock(&self) -> UnixNanoseconds {
+        self.observed_wall_clock
+    }
+
+    #[must_use]
+    pub const fn observed_offset_nanoseconds(&self) -> i64 {
+        self.observed_offset_nanoseconds
+    }
+
+    #[must_use]
+    pub fn accepted_catalog_anchor(&self) -> &[u8] {
+        &self.accepted_record
+    }
+
+    pub fn commit_after_catalog(
+        self,
+        commit: &CatalogCommit,
+    ) -> Result<(), LifecycleClockAcceptanceFailure> {
+        if commit.governance_audit_record().is_none()
+            || !commit
+                .snapshot()
+                .plaintext_objects()
+                .any(|record| record == self.accepted_record)
+        {
+            return Err(LifecycleClockAcceptanceFailure::PersistenceMismatch);
+        }
+        let mut safety = self
+            .authority
+            .safety
+            .lock()
+            .map_err(|_| LifecycleClockAcceptanceFailure::Unavailable)?;
+        if safety.revision != self.revision || safety.anchor != self.anchor {
+            return Err(LifecycleClockAcceptanceFailure::StaleAnchor);
+        }
+        if safety.state != LifecycleClockState::ClockUncertain {
+            return Err(LifecycleClockAcceptanceFailure::NotUncertain);
+        }
+        safety.state = LifecycleClockState::Certain;
+        safety.wall_clock_correction_nanoseconds = self
+            .anchor
+            .value()
+            .checked_sub(self.observed_wall_clock.value())
+            .ok_or(LifecycleClockAcceptanceFailure::OutOfRange)?;
+        safety.revision = safety
+            .revision
+            .checked_add(1)
+            .ok_or(LifecycleClockAcceptanceFailure::OutOfRange)?;
+        Ok(())
+    }
+}
+
+impl StagedCatalogAnchor<'_> {
+    pub(crate) fn ingest_time(
+        &mut self,
+        scope: SegmentScope,
+        durable: Option<IngestTime>,
+    ) -> Result<IngestTime, LifecycleClockFailure> {
+        self.observe_candidate(|authority| authority.ingest_time(scope, durable))
+    }
+
+    pub(crate) fn destructive_ingest_time(
+        &mut self,
+        scope: SegmentScope,
+        durable: Option<IngestTime>,
+    ) -> Result<IngestTime, LifecycleClockFailure> {
+        self.observe_candidate(|authority| authority.destructive_ingest_time(scope, durable))
+    }
+
+    pub(crate) fn catalog_anchor_record(
+        &self,
+        observed: IngestTime,
+    ) -> Result<Vec<u8>, LifecycleClockFailure> {
+        self.authority.catalog_anchor_record(observed)
+    }
+
+    pub(crate) fn catalog_anchor_subsumed(
+        &self,
+        snapshot: &CatalogSnapshot,
+    ) -> Result<bool, LifecycleClockFailure> {
+        let Some(candidate_anchor) = self.candidate_anchor else {
+            return Ok(false);
+        };
+        let mut durable = None;
+        for bytes in snapshot.plaintext_objects() {
+            let Some(record) = decode_catalog_anchor(bytes)? else {
+                continue;
+            };
+            if durable.replace(record).is_some() {
+                return Err(LifecycleClockFailure::OutOfRange);
+            }
+        }
+        Ok(durable.is_some_and(|record| record.anchor >= candidate_anchor))
+    }
+
+    pub(crate) fn commit(mut self) {
+        self.committed = true;
+    }
+
+    fn observe_candidate<T>(
+        &mut self,
+        operation: impl FnOnce(&RetentionTimeAuthority) -> Result<T, LifecycleClockFailure>,
+    ) -> Result<T, LifecycleClockFailure> {
+        let before = self.authority.safety_revision()?;
+        let result = operation(self.authority);
+        match self.authority.safety_revision() {
+            Ok(after) if after != before => self.candidate_revision = Some(after),
+            Ok(_) => {},
+            // A poisoned or unavailable safety state already fences callers;
+            // make Drop take the same conservative path if it regains the
+            // lock after this operation returns.
+            Err(_) => self.candidate_revision = Some(u64::MAX),
+        }
+        if self.candidate_revision.is_some() {
+            self.candidate_anchor = Some(self.authority.status().safe_anchor());
+        }
+        result
+    }
+}
+
+impl Drop for StagedCatalogAnchor<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.authority
+                .abandon_catalog_anchor(self.checkpoint, self.candidate_revision);
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -68,6 +342,13 @@ pub struct ManualRetentionTime(Arc<AtomicU64>);
 
 #[cfg(any(test, fuzzing, feature = "test-support"))]
 impl ManualRetentionTime {
+    /// Returns the deterministic monotonic elapsed time for test and fuzz
+    /// state machines without exposing the authority's internal clock source.
+    #[must_use]
+    pub fn nanoseconds(&self) -> u64 {
+        self.0.load(Ordering::Acquire)
+    }
+
     /// Advances the authority's monotonic elapsed time by nanoseconds.
     pub fn advance(&self, nanoseconds: u64) -> Result<(), LifecycleClockFailure> {
         self.0
@@ -77,22 +358,25 @@ impl ManualRetentionTime {
             .map(|_| ())
             .map_err(|_| LifecycleClockFailure::OutOfRange)
     }
-
-    #[cfg(fuzzing)]
-    pub(crate) fn nanoseconds(&self) -> u64 {
-        self.0.load(Ordering::Acquire)
-    }
 }
 
 impl RetentionTimeAuthority {
     pub fn establish() -> Result<Self, LifecycleClockFailure> {
-        let epoch = SystemLifecycleClockSource.read()?;
-        Ok(Self {
+        Self::establish_with_source(SystemLifecycleClockSource, LifecycleClockPolicy::default())
+    }
+
+    pub fn establish_with_source<S: LifecycleClockSource + 'static>(
+        source: S,
+        policy: LifecycleClockPolicy,
+    ) -> Result<Self, LifecycleClockFailure> {
+        let epoch = source.read()?;
+        Ok(Self::with_parts(
             epoch,
-            elapsed: ElapsedSource::System(Instant::now()),
-            destructive_retention: true,
-            scopes: Mutex::new(BTreeMap::new()),
-        })
+            ElapsedSource::System(Instant::now()),
+            true,
+            Some(Box::new(source)),
+            policy,
+        ))
     }
 
     #[cfg(any(test, fuzzing, feature = "test-support"))]
@@ -100,27 +384,29 @@ impl RetentionTimeAuthority {
     pub fn establish_with_manual_elapsed(epoch: UnixNanoseconds) -> (Self, ManualRetentionTime) {
         let elapsed = Arc::new(AtomicU64::new(0));
         (
-            Self {
+            Self::with_parts(
                 epoch,
-                elapsed: ElapsedSource::Manual(Arc::clone(&elapsed)),
-                destructive_retention: true,
-                scopes: Mutex::new(BTreeMap::new()),
-            },
+                ElapsedSource::Manual(Arc::clone(&elapsed)),
+                true,
+                None,
+                LifecycleClockPolicy::default(),
+            ),
             ManualRetentionTime(elapsed),
         )
     }
 
     #[cfg(test)]
     pub(crate) fn establish_with_stepping_elapsed(epoch: UnixNanoseconds, step: u64) -> Self {
-        Self {
+        Self::with_parts(
             epoch,
-            elapsed: ElapsedSource::Stepping {
+            ElapsedSource::Stepping {
                 elapsed: AtomicU64::new(0),
                 step,
             },
-            destructive_retention: true,
-            scopes: Mutex::new(BTreeMap::new()),
-        }
+            true,
+            None,
+            LifecycleClockPolicy::default(),
+        )
     }
 
     /// Constructs deterministic Ingest Time authority for cross-crate tests.
@@ -129,16 +415,266 @@ impl RetentionTimeAuthority {
     #[cfg(feature = "test-support")]
     pub fn for_test_ingest_time(epoch: UnixNanoseconds) -> Self {
         let elapsed = Arc::new(AtomicU64::new(0));
+        Self::with_parts(
+            epoch,
+            ElapsedSource::Manual(elapsed),
+            false,
+            None,
+            LifecycleClockPolicy::default(),
+        )
+    }
+
+    fn with_parts(
+        epoch: UnixNanoseconds,
+        elapsed: ElapsedSource,
+        destructive_retention: bool,
+        source: Option<Box<dyn LifecycleClockSource>>,
+        policy: LifecycleClockPolicy,
+    ) -> Self {
         Self {
             epoch,
-            elapsed: ElapsedSource::Manual(elapsed),
-            destructive_retention: false,
+            elapsed,
+            destructive_retention,
+            source,
+            policy,
+            acceptance: Mutex::new(()),
+            safety: Mutex::new(LifecycleClockSafety {
+                anchor: epoch,
+                anchor_elapsed: 0,
+                state: LifecycleClockState::Certain,
+                last_wall_clock: Some(epoch),
+                observed_offset_nanoseconds: Some(0),
+                wall_clock_correction_nanoseconds: 0,
+                revision: 0,
+            }),
             scopes: Mutex::new(BTreeMap::new()),
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn establish_with_source_and_manual_elapsed<S: LifecycleClockSource + 'static>(
+        source: S,
+        policy: LifecycleClockPolicy,
+    ) -> Result<(Self, ManualRetentionTime), LifecycleClockFailure> {
+        let epoch = source.read()?;
+        let elapsed = Arc::new(AtomicU64::new(0));
+        Ok((
+            Self::with_parts(
+                epoch,
+                ElapsedSource::Manual(Arc::clone(&elapsed)),
+                true,
+                Some(Box::new(source)),
+                policy,
+            ),
+            ManualRetentionTime(elapsed),
+        ))
+    }
+
     pub(crate) fn authorizes_destructive_retention(&self) -> bool {
+        self.destructive_retention && self.status().state == LifecycleClockState::Certain
+    }
+
+    pub(crate) const fn is_destructive_authority(&self) -> bool {
         self.destructive_retention
+    }
+
+    /// Derives the only Catalog anchor that can accept the currently observed
+    /// discontinuity. Callers supply the previously observed safe anchor as a
+    /// compare-and-swap precondition; they cannot choose a replacement time or
+    /// audit payload.
+    pub fn prepare_discontinuity_acceptance(
+        &self,
+        expected_safe_anchor: UnixNanoseconds,
+    ) -> Result<PreparedLifecycleClockAcceptance<'_>, LifecycleClockAcceptanceFailure> {
+        let acceptance = self
+            .acceptance
+            .lock()
+            .map_err(|_| LifecycleClockAcceptanceFailure::Unavailable)?;
+        let safety = self
+            .safety
+            .lock()
+            .map_err(|_| LifecycleClockAcceptanceFailure::Unavailable)?;
+        if safety.state != LifecycleClockState::ClockUncertain {
+            return Err(LifecycleClockAcceptanceFailure::NotUncertain);
+        }
+        if safety.anchor != expected_safe_anchor {
+            return Err(LifecycleClockAcceptanceFailure::StaleAnchor);
+        }
+        let observed_wall_clock = safety
+            .last_wall_clock
+            .ok_or(LifecycleClockAcceptanceFailure::MissingDiscontinuity)?;
+        let observed_offset_nanoseconds = safety
+            .observed_offset_nanoseconds
+            .ok_or(LifecycleClockAcceptanceFailure::MissingDiscontinuity)?;
+        if observed_offset_nanoseconds.unsigned_abs()
+            <= self.policy.maximum_reconciliation_offset_nanoseconds
+        {
+            return Err(LifecycleClockAcceptanceFailure::MissingDiscontinuity);
+        }
+        let wall_clock_correction_nanoseconds = safety
+            .anchor
+            .value()
+            .checked_sub(observed_wall_clock.value())
+            .ok_or(LifecycleClockAcceptanceFailure::OutOfRange)?;
+        let accepted_record = encode_catalog_anchor(LifecycleClockSafety {
+            state: LifecycleClockState::Certain,
+            wall_clock_correction_nanoseconds,
+            ..*safety
+        })
+        .map_err(|_| LifecycleClockAcceptanceFailure::OutOfRange)?;
+        Ok(PreparedLifecycleClockAcceptance {
+            authority: self,
+            _acceptance: acceptance,
+            revision: safety.revision,
+            anchor: safety.anchor,
+            observed_wall_clock,
+            observed_offset_nanoseconds,
+            accepted_record,
+        })
+    }
+
+    /// Reconciles this process authority with the one authenticated,
+    /// instance-level Catalog anchor before a scope can mint time.
+    pub fn recover_catalog_anchor(
+        &self,
+        snapshot: &CatalogSnapshot,
+    ) -> Result<(), LifecycleClockFailure> {
+        let mut record = None;
+        for bytes in snapshot.plaintext_objects() {
+            let Some(candidate) = decode_catalog_anchor(bytes)? else {
+                continue;
+            };
+            if record.replace(candidate).is_some() {
+                return Err(LifecycleClockFailure::OutOfRange);
+            }
+        }
+        let Some(record) = record else {
+            return Ok(());
+        };
+        // Recovery changes the same anchor/revision pair as acceptance. Hold
+        // the acceptance gate across both the durable-record install and its
+        // source reconciliation so a concurrent Catalog publication cannot
+        // observe a stale in-memory candidate after it has succeeded.
+        let _acceptance = self
+            .acceptance
+            .lock()
+            .map_err(|_| LifecycleClockFailure::Unavailable)?;
+        let elapsed = self.elapsed.nanoseconds()?;
+        let mut safety = self
+            .safety
+            .lock()
+            .map_err(|_| LifecycleClockFailure::Unavailable)?;
+        // The durable anchor is the comparison baseline. A newly observed wall
+        // value must never replace it before reconciliation: doing so would
+        // turn a restart-time forward jump into a zero offset.
+        safety.anchor = record.anchor;
+        safety.anchor_elapsed = elapsed;
+        safety.last_wall_clock = record.last_wall_clock;
+        safety.observed_offset_nanoseconds = record.observed_offset_nanoseconds;
+        safety.wall_clock_correction_nanoseconds = record.wall_clock_correction_nanoseconds;
+        safety.state = record.state;
+        safety.revision = safety
+            .revision
+            .checked_add(1)
+            .ok_or(LifecycleClockFailure::OutOfRange)?;
+        drop(safety);
+        self.reconcile_while_acceptance_held(record.anchor, elapsed)
+    }
+
+    pub(crate) fn catalog_anchor_record(
+        &self,
+        observed: IngestTime,
+    ) -> Result<Vec<u8>, LifecycleClockFailure> {
+        let safety = self
+            .safety
+            .lock()
+            .map_err(|_| LifecycleClockFailure::Unavailable)?;
+        encode_catalog_anchor(LifecycleClockSafety {
+            anchor: safety.anchor.max(observed.instant()),
+            ..*safety
+        })
+    }
+
+    pub(crate) fn stage_catalog_anchor(
+        &self,
+    ) -> Result<StagedCatalogAnchor<'_>, LifecycleClockFailure> {
+        self.safety
+            .lock()
+            .map(|safety| StagedCatalogAnchor {
+                authority: self,
+                checkpoint: LifecycleAnchorCheckpoint(*safety),
+                candidate_revision: None,
+                candidate_anchor: None,
+                committed: false,
+            })
+            .map_err(|_| LifecycleClockFailure::Unavailable)
+    }
+
+    fn abandon_catalog_anchor(
+        &self,
+        checkpoint: LifecycleAnchorCheckpoint,
+        candidate_revision: Option<u64>,
+    ) {
+        let Ok(_acceptance) = self.acceptance.lock() else {
+            return;
+        };
+        let Ok(mut safety) = self.safety.lock() else {
+            return;
+        };
+        let Some(candidate_revision) = candidate_revision else {
+            return;
+        };
+        if safety.revision == candidate_revision {
+            let sampled_uncertainty = safety.state == LifecycleClockState::ClockUncertain;
+            *safety = checkpoint.0;
+            if sampled_uncertainty {
+                safety.state = LifecycleClockState::ClockUncertain;
+            }
+        } else {
+            // Another observation may already be on its way to a committed
+            // anchor.  Restoring our predecessor could erase it, so fence
+            // irreversible lifecycle work until a durable recovery occurs.
+            safety.state = LifecycleClockState::ClockUncertain;
+            safety.revision = safety.revision.saturating_add(1);
+        }
+    }
+
+    fn safety_revision(&self) -> Result<u64, LifecycleClockFailure> {
+        self.safety
+            .lock()
+            .map(|safety| safety.revision)
+            .map_err(|_| LifecycleClockFailure::Unavailable)
+    }
+
+    pub(crate) fn destructive_ingest_time(
+        &self,
+        scope: SegmentScope,
+        durable: Option<IngestTime>,
+    ) -> Result<IngestTime, LifecycleClockFailure> {
+        let ingest = self.ingest_time(scope, durable)?;
+        if self.authorizes_destructive_retention() {
+            Ok(ingest)
+        } else {
+            Err(LifecycleClockFailure::ClockUncertain)
+        }
+    }
+
+    #[must_use]
+    pub fn status(&self) -> LifecycleClockStatus {
+        self.safety.lock().map_or(
+            LifecycleClockStatus {
+                state: LifecycleClockState::ClockUncertain,
+                safe_anchor: self.epoch,
+                last_wall_clock: None,
+                observed_offset_nanoseconds: None,
+            },
+            |safety| LifecycleClockStatus {
+                state: safety.state,
+                safe_anchor: safety.anchor,
+                last_wall_clock: safety.last_wall_clock,
+                observed_offset_nanoseconds: safety.observed_offset_nanoseconds,
+            },
+        )
     }
 
     pub(crate) fn recover_scope(
@@ -147,6 +683,7 @@ impl RetentionTimeAuthority {
         durable: IngestTime,
     ) -> Result<(), LifecycleClockFailure> {
         let elapsed = self.elapsed.nanoseconds()?;
+        self.reconcile(durable.instant(), elapsed)?;
         let mut scopes = self
             .scopes
             .lock()
@@ -179,6 +716,7 @@ impl RetentionTimeAuthority {
         durable: Option<IngestTime>,
     ) -> Result<IngestTime, LifecycleClockFailure> {
         let elapsed = self.elapsed.nanoseconds()?;
+        self.reconcile_current(elapsed)?;
         let mut scopes = self
             .scopes
             .lock()
@@ -236,15 +774,282 @@ impl RetentionTimeAuthority {
     /// Returns process-monotonic trusted time when a retention preview has no
     /// tenant scopes from which to recover a durable lifecycle frontier.
     pub fn governance_now_seconds(&self) -> Result<u64, LifecycleClockFailure> {
-        let elapsed = i64::try_from(self.elapsed.nanoseconds()?)
-            .map_err(|_| LifecycleClockFailure::OutOfRange)?;
-        self.epoch
+        let elapsed = self.elapsed.nanoseconds()?;
+        self.reconcile_current(elapsed)?;
+        let safety = self
+            .safety
+            .lock()
+            .map_err(|_| LifecycleClockFailure::Unavailable)?;
+        advance_global(*safety, elapsed)?
             .value()
-            .checked_add(elapsed)
-            .and_then(|value| value.checked_div(1_000_000_000))
+            .checked_div(1_000_000_000)
             .and_then(|value| u64::try_from(value).ok())
             .ok_or(LifecycleClockFailure::OutOfRange)
     }
+
+    /// Reads the trusted security clock used for credential expiry. A sampled
+    /// discontinuity makes this authority unavailable so an API credential
+    /// cannot be extended by an uncertain wall-clock observation.
+    pub fn security_time_seconds(&self) -> Result<u64, LifecycleClockFailure> {
+        let state = self
+            .safety
+            .lock()
+            .map_err(|_| LifecycleClockFailure::Unavailable)?
+            .state;
+        if state != LifecycleClockState::Certain {
+            return Err(LifecycleClockFailure::ClockUncertain);
+        }
+        let elapsed = self.elapsed.nanoseconds()?;
+        self.reconcile_current(elapsed)?;
+        let safety = self
+            .safety
+            .lock()
+            .map_err(|_| LifecycleClockFailure::Unavailable)?;
+        if safety.state != LifecycleClockState::Certain {
+            return Err(LifecycleClockFailure::ClockUncertain);
+        }
+        safety
+            .last_wall_clock
+            .ok_or(LifecycleClockFailure::Unavailable)?
+            .value()
+            .checked_div(1_000_000_000)
+            .and_then(|value| u64::try_from(value).ok())
+            .ok_or(LifecycleClockFailure::OutOfRange)
+    }
+
+    fn reconcile_current(&self, elapsed: u64) -> Result<(), LifecycleClockFailure> {
+        let expected = self
+            .safety
+            .lock()
+            .map_err(|_| LifecycleClockFailure::Unavailable)
+            .and_then(|safety| advance_global(*safety, elapsed))?;
+        self.reconcile(expected, elapsed)
+    }
+
+    fn reconcile(
+        &self,
+        durable_or_expected: UnixNanoseconds,
+        elapsed: u64,
+    ) -> Result<(), LifecycleClockFailure> {
+        let _acceptance = self
+            .acceptance
+            .lock()
+            .map_err(|_| LifecycleClockFailure::Unavailable)?;
+        self.reconcile_while_acceptance_held(durable_or_expected, elapsed)
+    }
+
+    fn reconcile_while_acceptance_held(
+        &self,
+        durable_or_expected: UnixNanoseconds,
+        elapsed: u64,
+    ) -> Result<(), LifecycleClockFailure> {
+        let mut safety = self
+            .safety
+            .lock()
+            .map_err(|_| LifecycleClockFailure::Unavailable)?;
+        let expected = advance_global(*safety, elapsed)?.max(durable_or_expected);
+        safety.anchor = expected;
+        safety.anchor_elapsed = elapsed;
+        safety.revision = safety
+            .revision
+            .checked_add(1)
+            .ok_or(LifecycleClockFailure::OutOfRange)?;
+        let Some(source) = &self.source else {
+            return Ok(());
+        };
+        let wall = source.read()?;
+        let offset = wall
+            .value()
+            .checked_sub(expected.value())
+            .ok_or(LifecycleClockFailure::OutOfRange)?;
+        let adjusted_wall = wall
+            .value()
+            .checked_add(safety.wall_clock_correction_nanoseconds)
+            .ok_or(LifecycleClockFailure::OutOfRange)?;
+        safety.last_wall_clock = Some(wall);
+        safety.observed_offset_nanoseconds = Some(offset);
+        safety.state = if adjusted_wall.abs_diff(expected.value())
+            > self.policy.maximum_reconciliation_offset_nanoseconds
+        {
+            LifecycleClockState::ClockUncertain
+        } else {
+            LifecycleClockState::Certain
+        };
+        Ok(())
+    }
+}
+
+fn advance_global(
+    safety: LifecycleClockSafety,
+    elapsed: u64,
+) -> Result<UnixNanoseconds, LifecycleClockFailure> {
+    elapsed
+        .checked_sub(safety.anchor_elapsed)
+        .and_then(|delta| i64::try_from(delta).ok())
+        .and_then(|delta| safety.anchor.value().checked_add(delta))
+        .map(UnixNanoseconds::new)
+        .ok_or(LifecycleClockFailure::OutOfRange)
+}
+
+fn encode_catalog_anchor(safety: LifecycleClockSafety) -> Result<Vec<u8>, LifecycleClockFailure> {
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(CLOCK_ANCHOR_BYTES)
+        .map_err(|_| LifecycleClockFailure::OutOfRange)?;
+    bytes.extend_from_slice(CLOCK_ANCHOR_MAGIC);
+    bytes.push(CLOCK_ANCHOR_VERSION);
+    bytes.push(match safety.state {
+        LifecycleClockState::Certain => 0,
+        LifecycleClockState::ClockUncertain => 1,
+    });
+    bytes.extend_from_slice(&safety.anchor.value().to_be_bytes());
+    match safety.last_wall_clock {
+        Some(wall) => {
+            bytes.push(1);
+            bytes.extend_from_slice(&wall.value().to_be_bytes());
+        },
+        None => {
+            bytes.push(0);
+            bytes.extend_from_slice(&0_i64.to_be_bytes());
+        },
+    }
+    match safety.observed_offset_nanoseconds {
+        Some(offset) => {
+            bytes.push(1);
+            bytes.extend_from_slice(&offset.to_be_bytes());
+        },
+        None => {
+            bytes.push(0);
+            bytes.extend_from_slice(&0_i64.to_be_bytes());
+        },
+    }
+    bytes.extend_from_slice(&safety.wall_clock_correction_nanoseconds.to_be_bytes());
+    Ok(bytes)
+}
+
+fn decode_catalog_anchor(
+    bytes: &[u8],
+) -> Result<Option<LifecycleClockSafety>, LifecycleClockFailure> {
+    if !bytes.starts_with(CLOCK_ANCHOR_MAGIC) {
+        return Ok(None);
+    }
+    let version = bytes
+        .get(8)
+        .copied()
+        .ok_or(LifecycleClockFailure::OutOfRange)?;
+    if !matches!(
+        (version, bytes.len()),
+        (1, CLOCK_ANCHOR_V1_BYTES) | (CLOCK_ANCHOR_VERSION, CLOCK_ANCHOR_BYTES)
+    ) {
+        return Err(LifecycleClockFailure::OutOfRange);
+    }
+    let state = match bytes.get(9).copied() {
+        Some(0) => LifecycleClockState::Certain,
+        Some(1) => LifecycleClockState::ClockUncertain,
+        _ => return Err(LifecycleClockFailure::OutOfRange),
+    };
+    let anchor = UnixNanoseconds::new(read_i64(bytes, 10)?);
+    let last_wall_clock = match bytes.get(18).copied() {
+        Some(0) => None,
+        Some(1) => Some(UnixNanoseconds::new(read_i64(bytes, 19)?)),
+        _ => return Err(LifecycleClockFailure::OutOfRange),
+    };
+    let observed_offset_nanoseconds = match bytes.get(27).copied() {
+        Some(0) => None,
+        Some(1) => Some(read_i64(bytes, 28)?),
+        _ => return Err(LifecycleClockFailure::OutOfRange),
+    };
+    let wall_clock_correction_nanoseconds = if version == 1 {
+        0
+    } else {
+        read_i64(bytes, CLOCK_ANCHOR_V1_BYTES)?
+    };
+    Ok(Some(LifecycleClockSafety {
+        anchor,
+        anchor_elapsed: 0,
+        state,
+        last_wall_clock,
+        observed_offset_nanoseconds,
+        wall_clock_correction_nanoseconds,
+        revision: 0,
+    }))
+}
+
+/// Verifies one untrusted Catalog object is either not a lifecycle anchor or
+/// is an exactly encoded supported lifecycle anchor. Callers replacing the
+/// singleton anchor must reject malformed records rather than dropping them.
+pub fn validate_catalog_anchor_record(bytes: &[u8]) -> Result<bool, LifecycleClockFailure> {
+    decode_catalog_anchor(bytes).map(|record| record.is_some())
+}
+
+/// Classifies one Catalog object while a caller replaces the singleton
+/// lifecycle anchor. Malformed prefixed records and duplicate valid anchors
+/// are integrity failures; neither may be silently replaced by a new anchor.
+pub fn validate_catalog_anchor_singleton(
+    bytes: &[u8],
+    anchor_seen: &mut bool,
+) -> Result<bool, LifecycleClockFailure> {
+    let is_anchor = validate_catalog_anchor_record(bytes)?;
+    if is_anchor && std::mem::replace(anchor_seen, true) {
+        return Err(LifecycleClockFailure::OutOfRange);
+    }
+    Ok(is_anchor)
+}
+
+/// Verifies that a durable anchor is the exact correction described by a
+/// lifecycle-clock acceptance receipt.
+pub fn catalog_anchor_matches_accepted_discontinuity(
+    bytes: &[u8],
+    safe_anchor: UnixNanoseconds,
+    observed_wall_clock: UnixNanoseconds,
+    observed_offset_nanoseconds: i64,
+) -> Result<bool, LifecycleClockFailure> {
+    Ok(matches!(
+        catalog_anchor_acceptance_relation(
+            bytes,
+            safe_anchor,
+            observed_wall_clock,
+            observed_offset_nanoseconds,
+        )?,
+        Some(CatalogAnchorAcceptanceRelation::ExactHistorical)
+    ))
+}
+
+/// Classifies an authenticated lifecycle anchor against an acceptance receipt.
+/// A newer anchor preserves replay safety without restoring historical state.
+pub fn catalog_anchor_acceptance_relation(
+    bytes: &[u8],
+    safe_anchor: UnixNanoseconds,
+    observed_wall_clock: UnixNanoseconds,
+    observed_offset_nanoseconds: i64,
+) -> Result<Option<CatalogAnchorAcceptanceRelation>, LifecycleClockFailure> {
+    let Some(record) = decode_catalog_anchor(bytes)? else {
+        return Ok(None);
+    };
+    let correction = safe_anchor
+        .value()
+        .checked_sub(observed_wall_clock.value())
+        .ok_or(LifecycleClockFailure::OutOfRange)?;
+    if record.state == LifecycleClockState::Certain
+        && record.anchor == safe_anchor
+        && record.last_wall_clock == Some(observed_wall_clock)
+        && record.observed_offset_nanoseconds == Some(observed_offset_nanoseconds)
+        && record.wall_clock_correction_nanoseconds == correction
+    {
+        return Ok(Some(CatalogAnchorAcceptanceRelation::ExactHistorical));
+    }
+    if record.anchor > safe_anchor {
+        return Ok(Some(CatalogAnchorAcceptanceRelation::ProvablyLater));
+    }
+    Ok(None)
+}
+
+fn read_i64(bytes: &[u8], start: usize) -> Result<i64, LifecycleClockFailure> {
+    bytes
+        .get(start..start.saturating_add(8))
+        .and_then(|value| value.try_into().ok())
+        .map(i64::from_be_bytes)
+        .ok_or(LifecycleClockFailure::OutOfRange)
 }
 
 fn advance(
@@ -262,5 +1067,487 @@ fn advance(
 impl std::fmt::Debug for RetentionTimeAuthority {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("RetentionTimeAuthority { <monotonic> }")
+    }
+}
+
+#[cfg(feature = "test-support")]
+/// Exercises the lifecycle-clock state machine and its untrusted durable
+/// anchor decoder without a storage fixture.  The public fuzz target supplies
+/// arbitrary wall movement, elapsed time, and encoded-anchor bytes.
+pub fn fuzz_retention_time_stateful(data: &[u8]) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    struct MutableSource(Arc<AtomicI64>);
+
+    impl LifecycleClockSource for MutableSource {
+        fn read(&self) -> Result<UnixNanoseconds, LifecycleClockFailure> {
+            Ok(UnixNanoseconds::new(self.0.load(Ordering::Acquire)))
+        }
+    }
+
+    let initial = data
+        .get(..8)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(i64::from_be_bytes)
+        .unwrap_or(1_000);
+    let wall = Arc::new(AtomicI64::new(initial));
+    let Ok(policy) = LifecycleClockPolicy::new(10) else {
+        return;
+    };
+    let Ok((clock, elapsed)) = RetentionTimeAuthority::establish_with_source_and_manual_elapsed(
+        MutableSource(Arc::clone(&wall)),
+        policy,
+    ) else {
+        return;
+    };
+    let Ok(tenant) = positron_domain::identity::TenantId::from_bytes([0x71; 16]) else {
+        return;
+    };
+    let Ok(shard) = positron_domain::routing::VirtualShardId::new(71) else {
+        return;
+    };
+    let scope = crate::SegmentScope::new(tenant, positron_domain::routing::SignalKind::Logs, shard);
+    let mut cursor = 8_usize;
+    while let Some(operation) = data.get(cursor).copied() {
+        cursor = cursor.saturating_add(1);
+        match operation % 5 {
+            0 => {
+                if let Some(bytes) = data.get(cursor..cursor.saturating_add(8))
+                    && let Ok(bytes) = <[u8; 8]>::try_from(bytes)
+                {
+                    wall.store(i64::from_be_bytes(bytes), Ordering::Release);
+                    cursor = cursor.saturating_add(8);
+                }
+            },
+            1 => {
+                if let Some(bytes) = data.get(cursor..cursor.saturating_add(8))
+                    && let Ok(bytes) = <[u8; 8]>::try_from(bytes)
+                {
+                    let _ = elapsed.advance(u64::from_be_bytes(bytes));
+                    cursor = cursor.saturating_add(8);
+                }
+            },
+            2 => {
+                let _ = clock.ingest_time(scope, None);
+            },
+            3 => {
+                let _ = clock.destructive_ingest_time(scope, None);
+            },
+            _ => {
+                if let Ok(mut staged) = clock.stage_catalog_anchor() {
+                    let _ = staged.ingest_time(scope, None);
+                }
+            },
+        }
+    }
+    let _ = clock.catalog_anchor_record(IngestTime::from_authenticated_durable(
+        clock.status().safe_anchor(),
+    ));
+    let _ = decode_catalog_anchor(data);
+}
+
+#[cfg(test)]
+mod clock_safety_tests {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+
+    struct MutableWallClock(Arc<Mutex<UnixNanoseconds>>);
+
+    impl LifecycleClockSource for MutableWallClock {
+        fn read(&self) -> Result<UnixNanoseconds, LifecycleClockFailure> {
+            self.0
+                .lock()
+                .map(|instant| *instant)
+                .map_err(|_| LifecycleClockFailure::Unavailable)
+        }
+    }
+
+    #[test]
+    fn manual_elapsed_observation_tracks_fuzz_state_advances() {
+        let (_, elapsed) =
+            RetentionTimeAuthority::establish_with_manual_elapsed(UnixNanoseconds::new(1_000));
+        assert_eq!(elapsed.nanoseconds(), 0);
+        elapsed.advance(7).expect("bounded elapsed advance");
+        assert_eq!(elapsed.nanoseconds(), 7);
+    }
+
+    struct FailingAfterEstablishment(AtomicU8);
+
+    impl LifecycleClockSource for FailingAfterEstablishment {
+        fn read(&self) -> Result<UnixNanoseconds, LifecycleClockFailure> {
+            if self.0.fetch_add(1, Ordering::AcqRel) == 0 {
+                Ok(UnixNanoseconds::new(1_000))
+            } else {
+                Err(LifecycleClockFailure::Unavailable)
+            }
+        }
+    }
+
+    #[test]
+    fn a_wall_clock_step_pauses_destructive_lifecycle_work_but_not_ingest() {
+        let wall = Arc::new(Mutex::new(UnixNanoseconds::new(1_000)));
+        let source = MutableWallClock(Arc::clone(&wall));
+        let (clock, elapsed) = RetentionTimeAuthority::establish_with_source_and_manual_elapsed(
+            source,
+            LifecycleClockPolicy::new(10).expect("bounded policy"),
+        )
+        .expect("clock establishes");
+        let scope = SegmentScope::new(
+            positron_domain::identity::TenantId::from_bytes([1; 16]).expect("tenant"),
+            positron_domain::routing::SignalKind::Logs,
+            positron_domain::routing::VirtualShardId::new(1).expect("shard"),
+        );
+
+        elapsed.advance(1).expect("monotonic elapsed");
+        assert!(clock.ingest_time(scope, None).is_ok());
+        *wall.lock().expect("wall lock") = UnixNanoseconds::new(2_000);
+        assert!(clock.ingest_time(scope, None).is_ok());
+        assert_eq!(clock.status().state(), LifecycleClockState::ClockUncertain);
+        assert!(!clock.authorizes_destructive_retention());
+    }
+
+    #[test]
+    fn a_live_backward_wall_clock_step_pauses_destructive_work_but_keeps_ingest_monotonic() {
+        let wall = Arc::new(Mutex::new(UnixNanoseconds::new(1_000)));
+        let (clock, elapsed) = RetentionTimeAuthority::establish_with_source_and_manual_elapsed(
+            MutableWallClock(Arc::clone(&wall)),
+            LifecycleClockPolicy::new(10).expect("bounded policy"),
+        )
+        .expect("clock establishes");
+        let scope = SegmentScope::new(
+            positron_domain::identity::TenantId::from_bytes([6; 16]).expect("tenant"),
+            positron_domain::routing::SignalKind::Logs,
+            positron_domain::routing::VirtualShardId::new(6).expect("shard"),
+        );
+
+        elapsed.advance(1).expect("monotonic elapsed");
+        assert_eq!(
+            clock
+                .ingest_time(scope, None)
+                .expect("initial ingest")
+                .instant(),
+            UnixNanoseconds::new(1_001)
+        );
+        *wall.lock().expect("wall lock") = UnixNanoseconds::new(500);
+
+        assert_eq!(
+            clock
+                .ingest_time(scope, None)
+                .expect("ingest remains available")
+                .instant(),
+            UnixNanoseconds::new(1_001)
+        );
+        assert_eq!(clock.status().state(), LifecycleClockState::ClockUncertain);
+        assert_eq!(
+            clock.destructive_ingest_time(scope, None),
+            Err(LifecycleClockFailure::ClockUncertain)
+        );
+    }
+
+    #[test]
+    fn bounded_slew_and_in_bound_source_recovery_restore_clock_certainty() {
+        let wall = Arc::new(Mutex::new(UnixNanoseconds::new(1_000)));
+        let (clock, elapsed) = RetentionTimeAuthority::establish_with_source_and_manual_elapsed(
+            MutableWallClock(Arc::clone(&wall)),
+            LifecycleClockPolicy::new(10).expect("bounded policy"),
+        )
+        .expect("clock establishes");
+        let scope = SegmentScope::new(
+            positron_domain::identity::TenantId::from_bytes([7; 16]).expect("tenant"),
+            positron_domain::routing::SignalKind::Logs,
+            positron_domain::routing::VirtualShardId::new(7).expect("shard"),
+        );
+
+        elapsed.advance(1).expect("monotonic elapsed");
+        *wall.lock().expect("wall lock") = UnixNanoseconds::new(1_008);
+        assert!(clock.ingest_time(scope, None).is_ok());
+        assert_eq!(clock.status().state(), LifecycleClockState::Certain);
+
+        *wall.lock().expect("wall lock") = UnixNanoseconds::new(2_000);
+        assert!(clock.ingest_time(scope, None).is_ok());
+        assert_eq!(clock.status().state(), LifecycleClockState::ClockUncertain);
+
+        *wall.lock().expect("wall lock") = UnixNanoseconds::new(1_005);
+        assert!(clock.ingest_time(scope, None).is_ok());
+        assert_eq!(clock.status().state(), LifecycleClockState::Certain);
+        assert!(clock.authorizes_destructive_retention());
+    }
+
+    #[test]
+    fn retention_time_uses_unix_epochs_without_timezone_or_dst_conversion() {
+        let epoch = UnixNanoseconds::new(1_730_614_400_000_000_000);
+        let wall = Arc::new(Mutex::new(epoch));
+        let (clock, elapsed) = RetentionTimeAuthority::establish_with_source_and_manual_elapsed(
+            MutableWallClock(Arc::clone(&wall)),
+            LifecycleClockPolicy::new(10).expect("bounded policy"),
+        )
+        .expect("clock establishes");
+        let scope = SegmentScope::new(
+            positron_domain::identity::TenantId::from_bytes([8; 16]).expect("tenant"),
+            positron_domain::routing::SignalKind::Logs,
+            positron_domain::routing::VirtualShardId::new(8).expect("shard"),
+        );
+
+        elapsed.advance(123).expect("monotonic elapsed");
+        assert_eq!(
+            clock
+                .ingest_time(scope, None)
+                .expect("ingest time")
+                .instant(),
+            UnixNanoseconds::new(1_730_614_400_000_000_123)
+        );
+        assert_eq!(
+            clock.governance_now_seconds().expect("governance time"),
+            1_730_614_400
+        );
+    }
+
+    #[test]
+    fn restart_forward_jump_compares_wall_clock_with_the_durable_anchor() {
+        let wall = Arc::new(Mutex::new(UnixNanoseconds::new(2_000)));
+        let (clock, _) = RetentionTimeAuthority::establish_with_source_and_manual_elapsed(
+            MutableWallClock(Arc::clone(&wall)),
+            LifecycleClockPolicy::new(10).expect("bounded policy"),
+        )
+        .expect("clock establishes");
+        {
+            let mut safety = clock.safety.lock().expect("safety lock");
+            safety.anchor = UnixNanoseconds::new(1_000);
+            safety.anchor_elapsed = 0;
+        }
+
+        clock
+            .reconcile(UnixNanoseconds::new(1_000), 0)
+            .expect("restart observation");
+
+        assert_eq!(clock.status().state(), LifecycleClockState::ClockUncertain);
+        assert_eq!(clock.status().safe_anchor(), UnixNanoseconds::new(1_000));
+    }
+
+    #[test]
+    fn rejected_catalog_candidate_restores_its_unpublished_anchor() {
+        let wall = Arc::new(Mutex::new(UnixNanoseconds::new(1_000)));
+        let (clock, elapsed) = RetentionTimeAuthority::establish_with_source_and_manual_elapsed(
+            MutableWallClock(Arc::clone(&wall)),
+            LifecycleClockPolicy::new(10).expect("bounded policy"),
+        )
+        .expect("clock establishes");
+        let mut checkpoint = clock.stage_catalog_anchor().expect("checkpoint");
+        elapsed.advance(5).expect("elapsed");
+        checkpoint
+            .ingest_time(
+                SegmentScope::new(
+                    positron_domain::identity::TenantId::from_bytes([2; 16]).expect("tenant"),
+                    positron_domain::routing::SignalKind::Logs,
+                    positron_domain::routing::VirtualShardId::new(2).expect("shard"),
+                ),
+                None,
+            )
+            .expect("candidate observation");
+        assert_eq!(clock.status().safe_anchor(), UnixNanoseconds::new(1_005));
+        drop(checkpoint);
+        assert_eq!(clock.status().safe_anchor(), UnixNanoseconds::new(1_000));
+    }
+
+    #[test]
+    fn rejected_candidate_never_rolls_back_a_later_observation() {
+        let wall = Arc::new(Mutex::new(UnixNanoseconds::new(1_000)));
+        let (clock, elapsed) = RetentionTimeAuthority::establish_with_source_and_manual_elapsed(
+            MutableWallClock(Arc::clone(&wall)),
+            LifecycleClockPolicy::new(10).expect("bounded policy"),
+        )
+        .expect("clock establishes");
+        let first = SegmentScope::new(
+            positron_domain::identity::TenantId::from_bytes([3; 16]).expect("tenant"),
+            positron_domain::routing::SignalKind::Logs,
+            positron_domain::routing::VirtualShardId::new(3).expect("shard"),
+        );
+        let second = SegmentScope::new(
+            positron_domain::identity::TenantId::from_bytes([4; 16]).expect("tenant"),
+            positron_domain::routing::SignalKind::Logs,
+            positron_domain::routing::VirtualShardId::new(4).expect("shard"),
+        );
+        let mut candidate = clock.stage_catalog_anchor().expect("candidate");
+        elapsed.advance(5).expect("elapsed");
+        candidate.ingest_time(first, None).expect("candidate time");
+        elapsed.advance(5).expect("elapsed");
+        clock.ingest_time(second, None).expect("later observation");
+
+        drop(candidate);
+
+        assert_eq!(clock.status().safe_anchor(), UnixNanoseconds::new(1_010));
+        assert_eq!(clock.status().state(), LifecycleClockState::ClockUncertain);
+    }
+
+    #[test]
+    fn authenticated_v1_anchor_remains_readable_with_zero_correction() {
+        let safety = LifecycleClockSafety {
+            anchor: UnixNanoseconds::new(42),
+            anchor_elapsed: 0,
+            state: LifecycleClockState::Certain,
+            last_wall_clock: Some(UnixNanoseconds::new(42)),
+            observed_offset_nanoseconds: Some(0),
+            wall_clock_correction_nanoseconds: 7,
+            revision: 0,
+        };
+        let mut v1 = encode_catalog_anchor(safety).expect("v2 record");
+        v1[8] = 1;
+        v1.truncate(CLOCK_ANCHOR_V1_BYTES);
+        let decoded = decode_catalog_anchor(&v1)
+            .expect("v1 valid")
+            .expect("anchor");
+        assert_eq!(decoded.wall_clock_correction_nanoseconds, 0);
+        assert!(validate_catalog_anchor_record(&v1).expect("v1 classification"));
+    }
+
+    #[test]
+    fn malformed_lifecycle_anchor_record_is_never_classified_as_replaceable() {
+        let mut malformed = CLOCK_ANCHOR_MAGIC.to_vec();
+        malformed.extend_from_slice(&[2, 0]);
+        assert_eq!(
+            validate_catalog_anchor_record(&malformed),
+            Err(LifecycleClockFailure::OutOfRange)
+        );
+    }
+
+    #[test]
+    fn singleton_replacement_rejects_duplicate_valid_v1_and_v2_anchors() {
+        let safety = LifecycleClockSafety {
+            anchor: UnixNanoseconds::new(100),
+            anchor_elapsed: 0,
+            state: LifecycleClockState::Certain,
+            last_wall_clock: Some(UnixNanoseconds::new(100)),
+            observed_offset_nanoseconds: Some(0),
+            wall_clock_correction_nanoseconds: 0,
+            revision: 0,
+        };
+        let v2 = encode_catalog_anchor(safety).expect("v2 anchor");
+        let mut v1 = v2.clone();
+        v1[8] = 1;
+        v1.truncate(CLOCK_ANCHOR_V1_BYTES);
+        let mut seen = false;
+        assert!(validate_catalog_anchor_singleton(&v1, &mut seen).expect("v1 anchor"));
+        assert_eq!(
+            validate_catalog_anchor_singleton(&v2, &mut seen),
+            Err(LifecycleClockFailure::OutOfRange)
+        );
+    }
+
+    #[test]
+    fn acceptance_receipt_accepts_only_exact_history_or_a_strictly_later_anchor() {
+        let historical = LifecycleClockSafety {
+            anchor: UnixNanoseconds::new(1_000),
+            anchor_elapsed: 0,
+            state: LifecycleClockState::Certain,
+            last_wall_clock: Some(UnixNanoseconds::new(500)),
+            observed_offset_nanoseconds: Some(500),
+            wall_clock_correction_nanoseconds: 500,
+            revision: 0,
+        };
+        let exact = encode_catalog_anchor(historical).expect("historical anchor");
+        assert_eq!(
+            catalog_anchor_acceptance_relation(
+                &exact,
+                UnixNanoseconds::new(1_000),
+                UnixNanoseconds::new(500),
+                500,
+            ),
+            Ok(Some(CatalogAnchorAcceptanceRelation::ExactHistorical))
+        );
+
+        let later_uncertain = encode_catalog_anchor(LifecycleClockSafety {
+            anchor: UnixNanoseconds::new(1_001),
+            state: LifecycleClockState::ClockUncertain,
+            wall_clock_correction_nanoseconds: -250,
+            ..historical
+        })
+        .expect("later anchor");
+        assert_eq!(
+            catalog_anchor_acceptance_relation(
+                &later_uncertain,
+                UnixNanoseconds::new(1_000),
+                UnixNanoseconds::new(500),
+                500,
+            ),
+            Ok(Some(CatalogAnchorAcceptanceRelation::ProvablyLater))
+        );
+
+        let altered_history = encode_catalog_anchor(LifecycleClockSafety {
+            wall_clock_correction_nanoseconds: 499,
+            ..historical
+        })
+        .expect("altered anchor");
+        assert_eq!(
+            catalog_anchor_acceptance_relation(
+                &altered_history,
+                UnixNanoseconds::new(1_000),
+                UnixNanoseconds::new(500),
+                500,
+            ),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn prepared_acceptance_persists_a_backward_step_correction_and_releases_on_failure() {
+        let wall = Arc::new(Mutex::new(UnixNanoseconds::new(1_000)));
+        let (clock, elapsed) = RetentionTimeAuthority::establish_with_source_and_manual_elapsed(
+            MutableWallClock(Arc::clone(&wall)),
+            LifecycleClockPolicy::new(10).expect("bounded policy"),
+        )
+        .expect("clock establishes");
+        let scope = SegmentScope::new(
+            positron_domain::identity::TenantId::from_bytes([9; 16]).expect("tenant"),
+            positron_domain::routing::SignalKind::Logs,
+            positron_domain::routing::VirtualShardId::new(9).expect("shard"),
+        );
+        elapsed.advance(1).expect("elapsed");
+        *wall.lock().expect("wall lock") = UnixNanoseconds::new(500);
+        clock.ingest_time(scope, None).expect("safe ingest");
+        let expected = clock.status().safe_anchor();
+        assert_eq!(clock.status().state(), LifecycleClockState::ClockUncertain);
+
+        let prepared = clock
+            .prepare_discontinuity_acceptance(expected)
+            .expect("observed discontinuity can be prepared");
+        let record = decode_catalog_anchor(prepared.accepted_catalog_anchor())
+            .expect("record decodes")
+            .expect("clock record");
+        assert_eq!(record.state, LifecycleClockState::Certain);
+        assert_eq!(record.wall_clock_correction_nanoseconds, 501);
+        drop(prepared);
+
+        // Abandoning a failed Catalog attempt does not clear the safety fence.
+        assert_eq!(clock.status().state(), LifecycleClockState::ClockUncertain);
+        assert!(matches!(
+            clock.prepare_discontinuity_acceptance(UnixNanoseconds::new(999)),
+            Err(LifecycleClockAcceptanceFailure::StaleAnchor)
+        ));
+    }
+
+    #[test]
+    fn source_failure_after_candidate_mutation_restores_the_durable_anchor() {
+        let (clock, elapsed) = RetentionTimeAuthority::establish_with_source_and_manual_elapsed(
+            FailingAfterEstablishment(AtomicU8::new(0)),
+            LifecycleClockPolicy::new(10).expect("bounded policy"),
+        )
+        .expect("clock establishes");
+        let scope = SegmentScope::new(
+            positron_domain::identity::TenantId::from_bytes([5; 16]).expect("tenant"),
+            positron_domain::routing::SignalKind::Logs,
+            positron_domain::routing::VirtualShardId::new(5).expect("shard"),
+        );
+        let mut candidate = clock.stage_catalog_anchor().expect("candidate");
+        elapsed.advance(5).expect("elapsed");
+        assert_eq!(
+            candidate.ingest_time(scope, None),
+            Err(LifecycleClockFailure::Unavailable)
+        );
+        drop(candidate);
+        assert_eq!(clock.status().safe_anchor(), UnixNanoseconds::new(1_000));
+        assert_eq!(clock.status().state(), LifecycleClockState::Certain);
     }
 }

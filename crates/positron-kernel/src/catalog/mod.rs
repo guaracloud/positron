@@ -593,6 +593,39 @@ impl<'authority> Catalog<'authority> {
         }
     }
 
+    /// Resolves a transaction already visible in the authenticated Catalog.
+    /// This is intentionally read-only with respect to proposal generation and
+    /// lets an administrative caller recover an acknowledgement-lost commit.
+    pub fn committed_transaction(
+        &self,
+        transaction: TransactionId,
+    ) -> Result<Option<CatalogCommit>, CatalogFailure> {
+        let _operation = self
+            .operation
+            .lock()
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
+        let secret = self
+            .secret
+            .lock()
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
+        let recovered = recover(&self.storage, &secret, self.instance)?;
+        if recovered.current.number() > state.current.number() {
+            *state = recovered;
+        }
+        let Some(outcome) = state.transactions.get(&transaction) else {
+            return Ok(None);
+        };
+        let snapshot = load_snapshot(&self.storage, &secret, self.instance, &outcome.record)?;
+        Ok(Some(CatalogCommit {
+            snapshot,
+            audit: outcome.audit.clone(),
+        }))
+    }
+
     /// Inspects one exact unpublished proposal without making it visible.
     ///
     /// The request digest, predecessor, audit frontier, every staged object,

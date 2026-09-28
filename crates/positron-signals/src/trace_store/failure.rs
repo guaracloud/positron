@@ -24,6 +24,7 @@ pub enum TraceStoreFailureCode {
     StaleResumeMarker,
     ResourceExhausted,
     ClockUnavailable,
+    ClockUncertain,
     ResourceAdmissionRefused,
     Cancelled,
     BudgetExhausted,
@@ -215,6 +216,7 @@ pub(super) const fn classify_kernel_failure_code(code: Kernel) -> TraceStoreFail
         Kernel::Cancelled => TraceStoreFailureCode::Cancelled,
         Kernel::SnapshotExpired => TraceStoreFailureCode::SnapshotExpired,
         Kernel::StaleResumeMarker => TraceStoreFailureCode::StaleResumeMarker,
+        Kernel::ClockUncertain => TraceStoreFailureCode::ClockUncertain,
     }
 }
 

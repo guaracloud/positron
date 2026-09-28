@@ -204,6 +204,7 @@ pub struct RetentionEvaluation<'ledger, 'kernel, 'catalog> {
     frontier: crate::IngestTime,
     cutoff: positron_domain::time::UnixNanoseconds,
     blocks: Vec<CommittedBlock>,
+    clock_anchor: crate::retention_time::StagedCatalogAnchor<'ledger>,
 }
 
 impl<'ledger, 'kernel, 'catalog> RetentionEvaluation<'ledger, 'kernel, 'catalog> {
@@ -221,6 +222,7 @@ fn map_retention_time_failure(failure: crate::LifecycleClockFailure) -> LedgerFa
     let code = match failure {
         crate::LifecycleClockFailure::Unavailable => LedgerFailureCode::StorageUnavailable,
         crate::LifecycleClockFailure::OutOfRange => LedgerFailureCode::LimitExceeded,
+        crate::LifecycleClockFailure::ClockUncertain => LedgerFailureCode::ClockUncertain,
     };
     LedgerFailure::new(code)
 }
@@ -402,6 +404,11 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::StorageUnavailable))?;
         let mut storage = LedgerStorage::open(volume)?;
         let snapshot = catalog.pin()?;
+        if let Some(retention_time) = retention_time {
+            retention_time
+                .recover_catalog_anchor(&snapshot)
+                .map_err(map_retention_time_failure)?;
+        }
         let retention_frontier = retention_frontier::recover(&snapshot, scope)?;
         let recovery_metadata = storage.catalog_segments(&snapshot, scope)?;
         let reconstruction = reconstruct(
@@ -547,18 +554,25 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         let retention_time = self
             .retention_time
             .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::UnsupportedFormat))?;
-        if !retention_time.authorizes_destructive_retention() {
+        if !retention_time.is_destructive_authority() {
             return Err(LedgerFailure::new(LedgerFailureCode::UnsupportedFormat));
         }
-        let ingest_time = retention_time
+        let mut clock_anchor = retention_time
+            .stage_catalog_anchor()
+            .map_err(map_retention_time_failure)?;
+        let ingest_time = clock_anchor
             .ingest_time(self.scope, state.retention_frontier)
             .map_err(map_retention_time_failure)?;
         if state.retention_readiness == RetentionReadiness::EmptyUninitialized {
             self.catalog.refresh_state()?;
             let basis = self.catalog.pin()?;
-            if let Err(failure) =
-                retention_frontier::publish(self.catalog, &basis, self.scope, ingest_time)
-            {
+            if let Err(failure) = retention_frontier::publish(
+                self.catalog,
+                &basis,
+                &clock_anchor,
+                self.scope,
+                ingest_time,
+            ) {
                 if failure.completion_state() != LedgerCompletionState::RejectedBeforeMutation {
                     state.poisoned = true;
                 }
@@ -566,6 +580,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             }
             state.retention_frontier = Some(ingest_time);
             state.retention_readiness = RetentionReadiness::TrustedPersisted;
+            clock_anchor.commit();
         }
         Ok(StoreBlockPreparation {
             scope: self.scope,
@@ -625,9 +640,12 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         let retention_time = self
             .retention_time
             .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::UnsupportedFormat))?;
-        if !retention_time.authorizes_destructive_retention() {
+        if !retention_time.is_destructive_authority() {
             return Err(LedgerFailure::new(LedgerFailureCode::UnsupportedFormat));
         }
+        let mut clock_anchor = retention_time
+            .stage_catalog_anchor()
+            .map_err(map_retention_time_failure)?;
         self.catalog.refresh_state()?;
         let basis = self.catalog.pin()?;
         let state = self
@@ -672,8 +690,8 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         {
             return Err(LedgerFailure::new(LedgerFailureCode::PhysicalScopeMismatch));
         }
-        let frontier = retention_time
-            .ingest_time(self.scope, state.retention_frontier)
+        let frontier = clock_anchor
+            .destructive_ingest_time(self.scope, state.retention_frontier)
             .map_err(map_retention_time_failure)?;
         let duration_nanos = policy
             .retention_seconds()
@@ -697,6 +715,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             frontier,
             cutoff,
             blocks,
+            clock_anchor,
         })
     }
 

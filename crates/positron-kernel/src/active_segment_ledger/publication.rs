@@ -12,6 +12,12 @@ use super::{
     FORMAT_EPOCH, LedgerFailure, LedgerFailureCode, SegmentId, SegmentScope, map_frame_failure,
 };
 
+struct PublicationOptions<'clock> {
+    frontier: Option<IngestTime>,
+    lifecycle_clock: Option<&'clock crate::retention_time::StagedCatalogAnchor<'clock>>,
+    exact_scope: bool,
+}
+
 pub(super) fn fresh_metadata(
     scope: SegmentScope,
     base_position: CommitPosition,
@@ -38,7 +44,18 @@ pub(super) fn publish_segments(
     scope: SegmentScope,
     metadata: &[SegmentMetadata],
 ) -> Result<crate::CatalogSnapshot, LedgerFailure> {
-    publish_scope(catalog, basis, storage, scope, metadata, None, false)
+    publish_scope(
+        catalog,
+        basis,
+        storage,
+        scope,
+        metadata,
+        PublicationOptions {
+            frontier: None,
+            lifecycle_clock: None,
+            exact_scope: false,
+        },
+    )
 }
 
 pub(super) fn publish_exact_scope_segments(
@@ -48,13 +65,25 @@ pub(super) fn publish_exact_scope_segments(
     scope: SegmentScope,
     metadata: &[SegmentMetadata],
 ) -> Result<crate::CatalogSnapshot, LedgerFailure> {
-    publish_scope(catalog, basis, storage, scope, metadata, None, true)
+    publish_scope(
+        catalog,
+        basis,
+        storage,
+        scope,
+        metadata,
+        PublicationOptions {
+            frontier: None,
+            lifecycle_clock: None,
+            exact_scope: true,
+        },
+    )
 }
 
 pub(super) fn publish_segments_with_frontier(
     catalog: &Catalog<'_>,
     basis: &crate::CatalogSnapshot,
     storage: &LedgerStorage,
+    lifecycle_clock: &crate::retention_time::StagedCatalogAnchor<'_>,
     scope: SegmentScope,
     metadata: &[SegmentMetadata],
     frontier: IngestTime,
@@ -65,8 +94,11 @@ pub(super) fn publish_segments_with_frontier(
         storage,
         scope,
         metadata,
-        Some(frontier),
-        false,
+        PublicationOptions {
+            frontier: Some(frontier),
+            lifecycle_clock: Some(lifecycle_clock),
+            exact_scope: false,
+        },
     )
 }
 
@@ -76,27 +108,37 @@ fn publish_scope(
     storage: &LedgerStorage,
     scope: SegmentScope,
     metadata: &[SegmentMetadata],
-    frontier: Option<IngestTime>,
-    exact_scope: bool,
+    options: PublicationOptions<'_>,
 ) -> Result<crate::CatalogSnapshot, LedgerFailure> {
     let mut objects = Vec::new();
-    let frontier_objects = usize::from(frontier.is_some());
+    let frontier_objects = usize::from(options.frontier.is_some());
+    let clock_objects = usize::from(options.lifecycle_clock.is_some());
     let object_capacity = basis
         .plaintext_object_count()
         .checked_add(metadata.len())
         .and_then(|count| count.checked_add(frontier_objects))
+        .and_then(|count| count.checked_add(clock_objects))
         .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
     objects
         .try_reserve_exact(object_capacity)
         .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
+    let mut lifecycle_anchor_seen = false;
     for bytes in basis.plaintext_objects() {
         if storage.is_scope_metadata(bytes, scope) {
             continue;
         }
-        if frontier.is_some()
+        if options.frontier.is_some()
             && super::retention_frontier::decode(bytes)?
                 .is_some_and(|(candidate, _)| candidate == scope)
         {
+            continue;
+        }
+        let lifecycle_anchor = crate::retention_time::validate_catalog_anchor_singleton(
+            bytes,
+            &mut lifecycle_anchor_seen,
+        )
+        .map_err(|_| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?;
+        if options.lifecycle_clock.is_some() && lifecycle_anchor {
             continue;
         }
         let mut retained = Vec::new();
@@ -109,10 +151,17 @@ fn publish_scope(
     for segment in metadata {
         objects.push(CatalogObject::new(storage.metadata_object(*segment))?);
     }
-    if let Some(frontier) = frontier {
+    if let Some(frontier) = options.frontier {
         objects.push(CatalogObject::new(super::retention_frontier::encode(
             scope, frontier,
         ))?);
+    }
+    if let (Some(clock), Some(frontier)) = (options.lifecycle_clock, options.frontier) {
+        objects.push(CatalogObject::new(
+            clock
+                .catalog_anchor_record(frontier)
+                .map_err(|_| LedgerFailure::new(LedgerFailureCode::StorageUnavailable))?,
+        )?);
     }
     let random = DataProtection::random_identifier().map_err(map_frame_failure)?;
     let mut transaction = [0_u8; 16];
@@ -153,13 +202,22 @@ fn publish_scope(
             }
             let segments = storage.catalog_segments(&snapshot, scope)?;
             let segments_subsume = metadata.iter().all(|expected| segments.contains(expected))
-                && (!exact_scope || segments.len() == metadata.len());
-            let frontier_subsumed = match frontier {
+                && (!options.exact_scope || segments.len() == metadata.len());
+            let frontier_subsumed = match options.frontier {
                 Some(expected) => super::retention_frontier::recover(&snapshot, scope)?
                     .is_some_and(|published| published >= expected),
                 None => true,
             };
-            if snapshot.number() > basis.number() && segments_subsume && frontier_subsumed {
+            let anchor_subsumed = options.lifecycle_clock.map_or(Ok(true), |clock| {
+                clock
+                    .catalog_anchor_subsumed(&snapshot)
+                    .map_err(|_| LedgerFailure::ambiguous(LedgerFailureCode::StorageUnavailable))
+            })?;
+            if snapshot.number() > basis.number()
+                && segments_subsume
+                && frontier_subsumed
+                && anchor_subsumed
+            {
                 Ok(snapshot)
             } else {
                 Err(LedgerFailure::ambiguous(LedgerFailureCode::StaleGeneration))

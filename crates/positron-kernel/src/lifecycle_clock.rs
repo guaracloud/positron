@@ -146,6 +146,7 @@ impl<S: LifecycleClockSource> LifecycleClock<S> {
 pub enum LifecycleClockFailure {
     Unavailable,
     OutOfRange,
+    ClockUncertain,
 }
 
 impl Display for LifecycleClockFailure {
@@ -153,6 +154,7 @@ impl Display for LifecycleClockFailure {
         formatter.write_str(match self {
             Self::Unavailable => "lifecycle clock unavailable",
             Self::OutOfRange => "lifecycle clock value is out of range",
+            Self::ClockUncertain => "lifecycle clock is uncertain",
         })
     }
 }

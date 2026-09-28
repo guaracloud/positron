@@ -123,21 +123,13 @@ impl InitializedInstance {
         // Never expose the boot-cached identity as a data-plane authority.
         // Rebuild the immutable view from the current durable Catalog
         // generation for every attribution request.
-        let scope =
-            positron_kernel::SegmentScope::new(self.tenant, SignalKind::Logs, self.logs_shard);
-        let lifecycle_seconds = self
-            .retention_time
-            .governance_time_seconds(scope)
-            .map_err(|_| positron_governance::AttributionFailure)?;
         self.durable_identity()
             .map_err(|_| positron_governance::AttributionFailure)?
-            .attribute_at(
-                &self.key,
-                credential,
-                intent,
-                hints,
-                Some(lifecycle_seconds),
-            )
+            .attribute_with_expiry_time(&self.key, credential, intent, hints, || {
+                self.retention_time
+                    .security_time_seconds()
+                    .map_err(|_| positron_governance::AttributionFailure)
+            })
     }
 
     /// Records the active explicit plaintext listener transport selection through

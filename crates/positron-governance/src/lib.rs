@@ -16,6 +16,7 @@ mod audit;
 mod durable_operation_administration;
 mod format_migration_administration;
 mod identity;
+mod lifecycle_clock_administration;
 mod listener_transport_administration;
 mod policy_administration;
 mod quota_administration;
@@ -58,6 +59,10 @@ pub use format_migration_administration::{
 pub use identity::{
     AttributionFailure, AuthorizedContext, CompatibilityHints, GovernanceAuditInspection,
     GovernanceInspection, Identity, IdentityFailure, PresentedCredential, RequestedIntent,
+};
+pub use lifecycle_clock_administration::{
+    LifecycleClockAcceptanceAdministration, LifecycleClockAcceptanceAdministrationFailure,
+    LifecycleClockAcceptanceRequest, LifecycleClockAcceptanceUpdate,
 };
 pub use listener_transport_administration::{
     ListenerTransportActivation, ListenerTransportAdministration,
