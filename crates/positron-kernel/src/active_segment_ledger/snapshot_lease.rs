@@ -242,7 +242,8 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             .governor()
             .reserve(claim)
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
-        let mut expiry_cancellations = Vec::new();
+        let mut expiry_cancellations: Vec<crate::maintenance::SnapshotLeaseExpiryCancellation> =
+            Vec::new();
         if let Some(coordinator) = coordinator {
             for expired_identity in &expired {
                 let expired_record = all_records
@@ -264,7 +265,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
                 let Some(descriptor) = descriptor else {
                     continue;
                 };
-                if let Some(cancellation) = coordinator
+                let cancellation = coordinator
                     .prepare_snapshot_lease_expiry_cancellation(
                         *expired_identity,
                         MaintenanceScope::segment(
@@ -277,8 +278,17 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
                         expired_record.expiry,
                         descriptor,
                     )
-                    .map_err(|_| LedgerFailure::new(LedgerFailureCode::StaleGeneration))?
-                {
+                    .map_err(|_| LedgerFailure::new(LedgerFailureCode::StaleGeneration));
+                let cancellation = match cancellation {
+                    Ok(cancellation) => cancellation,
+                    Err(failure) => {
+                        for cancellation in &expiry_cancellations {
+                            cancellation.discard(coordinator);
+                        }
+                        return Err(failure);
+                    },
+                };
+                if let Some(cancellation) = cancellation {
                     expiry_cancellations.push(cancellation);
                 }
             }
@@ -303,7 +313,18 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
                     )
                     .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))
             })
-            .transpose()?;
+            .transpose();
+        let expiry_submission = match expiry_submission {
+            Ok(submission) => submission,
+            Err(failure) => {
+                if let Some(coordinator) = coordinator {
+                    for cancellation in &expiry_cancellations {
+                        cancellation.discard(coordinator);
+                    }
+                }
+                return Err(failure);
+            },
+        };
         let state = &mut *state;
         let (reservations, pending) = (
             &mut state.lease_reservations,
@@ -349,6 +370,11 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
                         LedgerFailure::new(LedgerFailureCode::IntegrityCorruption)
                     })?,
                 );
+            }
+            if let Some(coordinator) = coordinator {
+                for cancellation in &expiry_cancellations {
+                    cancellation.discard(coordinator);
+                }
             }
             if failure.completion_state() != LedgerCompletionState::CommitAmbiguous {
                 state.lease_reservations.remove(&identity);
@@ -687,15 +713,24 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             state.pending_lease_releases.register(identity)?;
             return self.retry_pending_releases(&mut state);
         };
-        publish_lease_release_with_task_replacement(
+        let cancellation_object = match cancellation.catalog_object() {
+            Ok(object) => object,
+            Err(_) => {
+                cancellation.discard(coordinator);
+                return Err(LedgerFailure::new(LedgerFailureCode::StaleGeneration));
+            },
+        };
+        let publication = publish_lease_release_with_task_replacement(
             self.catalog,
             &basis,
             identity,
             task,
-            cancellation
-                .catalog_object()
-                .map_err(|_| LedgerFailure::new(LedgerFailureCode::StaleGeneration))?,
-        )?;
+            cancellation_object,
+        );
+        if let Err(failure) = publication {
+            cancellation.discard(coordinator);
+            return Err(failure);
+        }
         cancellation
             .install(coordinator)
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::StaleGeneration))?;

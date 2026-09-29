@@ -52,6 +52,7 @@ pub(super) fn eligible_task_ids(
             .any(|active| tasks_conflict(&task.task, active));
         if task.phase == MaintenanceTaskPhase::Queued
             && task.task.not_before <= now
+            && !state.pending_cancellations.contains(identity)
             && !clock_blocks
             && !window_blocks
             && !conflicts
@@ -74,6 +75,9 @@ pub(super) fn dispatch_task(
     identity: MaintenanceTaskId,
     now: u64,
 ) -> Result<MaintenanceDispatch, MaintenanceFailure> {
+    if state.pending_cancellations.contains(&identity) {
+        return Err(MaintenanceFailure::PreconditionFailed);
+    }
     let (dispatch, fairness_key, next_fairness) = {
         let task = state
             .tasks
@@ -213,13 +217,14 @@ pub(super) fn reclaim_terminal_slot(
     let candidate = state
         .tasks
         .iter()
-        .filter(|(_, task)| {
-            matches!(
-                task.phase,
-                MaintenanceTaskPhase::Cancelled
-                    | MaintenanceTaskPhase::Succeeded
-                    | MaintenanceTaskPhase::Failed
-            )
+        .filter(|(identity, task)| {
+            !state.pending_terminal_reclamations.contains(*identity)
+                && matches!(
+                    task.phase,
+                    MaintenanceTaskPhase::Cancelled
+                        | MaintenanceTaskPhase::Succeeded
+                        | MaintenanceTaskPhase::Failed
+                )
         })
         .min_by_key(|(identity, task)| {
             (

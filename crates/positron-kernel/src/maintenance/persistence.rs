@@ -49,12 +49,27 @@ impl SnapshotLeaseExpiryCancellation {
             .state
             .lock()
             .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
-        if state.tasks.get(&self.before.task.identity) != Some(&self.before) {
+        if !state
+            .pending_cancellations
+            .contains(&self.before.task.identity)
+            || state.tasks.get(&self.before.task.identity) != Some(&self.before)
+        {
             return Err(MaintenanceFailure::PreconditionFailed);
         }
+        state
+            .pending_cancellations
+            .remove(&self.before.task.identity);
         state.tasks.insert(self.after.task.identity, self.after);
         state.next_terminal_order = state.next_terminal_order.max(self.next_terminal_order);
         Ok(())
+    }
+
+    pub(crate) fn discard(&self, coordinator: &MaintenanceCoordinator) {
+        if let Ok(mut state) = coordinator.state.lock() {
+            state
+                .pending_cancellations
+                .remove(&self.before.task.identity);
+        }
     }
 }
 
@@ -137,7 +152,11 @@ impl MaintenanceCoordinator {
                         || state.tasks.get(identity) != Some(expected)
                 })
             || cancellations.iter().any(|cancellation| {
-                state.tasks.get(&cancellation.before.task.identity) != Some(&cancellation.before)
+                !state
+                    .pending_cancellations
+                    .contains(&cancellation.before.task.identity)
+                    || state.tasks.get(&cancellation.before.task.identity)
+                        != Some(&cancellation.before)
             })
         {
             return Err(MaintenanceFailure::PreconditionFailed);
@@ -150,6 +169,9 @@ impl MaintenanceCoordinator {
             super::scheduling::remove_task_and_clear_empty_scope(&mut state, identity)?;
         }
         for cancellation in cancellations {
+            state
+                .pending_cancellations
+                .remove(&cancellation.before.task.identity);
             state
                 .tasks
                 .insert(cancellation.after.task.identity, cancellation.after);
@@ -177,7 +199,10 @@ impl MaintenanceCoordinator {
             .state
             .lock()
             .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
-        if state.tasks.get(&cancellation.before.task.identity) != Some(&cancellation.before)
+        if !state
+            .pending_cancellations
+            .contains(&cancellation.before.task.identity)
+            || state.tasks.get(&cancellation.before.task.identity) != Some(&cancellation.before)
             || !state
                 .pending_submissions
                 .contains(&submission_state.task.identity)
@@ -194,6 +219,9 @@ impl MaintenanceCoordinator {
         state
             .pending_submissions
             .remove(&submission_state.task.identity);
+        state
+            .pending_cancellations
+            .remove(&cancellation.before.task.identity);
         if let Some((identity, _)) = reclaimed_terminal {
             state.pending_terminal_reclamations.remove(&identity);
             super::scheduling::remove_task_and_clear_empty_scope(&mut state, identity)?;
@@ -221,7 +249,7 @@ impl MaintenanceCoordinator {
     ) -> Result<Option<SnapshotLeaseExpiryCancellation>, MaintenanceFailure> {
         let identity = MaintenanceTaskId::new(identity.to_bytes())?;
         let expected_input = MaintenanceObjectId::new(lease_object.to_bytes())?;
-        let state = self
+        let mut state = self
             .state
             .lock()
             .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
@@ -253,6 +281,9 @@ impl MaintenanceCoordinator {
         if before.phase != MaintenanceTaskPhase::Queued {
             return Err(MaintenanceFailure::InvalidTransition);
         }
+        if state.pending_cancellations.contains(&identity) {
+            return Err(MaintenanceFailure::PreconditionFailed);
+        }
         let mut next = state.clone();
         let after = next
             .tasks
@@ -267,6 +298,7 @@ impl MaintenanceCoordinator {
             .cloned()
             .ok_or(MaintenanceFailure::UnknownTask)?;
         let record = encode_record(&after)?;
+        state.pending_cancellations.insert(identity);
         Ok(Some(SnapshotLeaseExpiryCancellation {
             before,
             after,
@@ -308,13 +340,9 @@ impl MaintenanceCoordinator {
             .tasks
             .len()
             .checked_add(state.pending_submissions.len())
-            .and_then(|count| count.checked_sub(state.pending_terminal_reclamations.len()))
             .ok_or(MaintenanceFailure::CapacityExceeded)?;
         let reclaimed_terminal = if occupied >= MAX_MAINTENANCE_TASKS {
             let mut prospective = state.clone();
-            for identity in &state.pending_terminal_reclamations {
-                prospective.tasks.remove(identity);
-            }
             let identity = reclaim_terminal_slot(&mut prospective)?
                 .ok_or(MaintenanceFailure::CapacityExceeded)?;
             let terminal = state

@@ -17,6 +17,7 @@ use crate::{
 mod persistence;
 mod record;
 
+pub(crate) use persistence::SnapshotLeaseExpiryCancellation;
 use record::{decode_record, encode_record};
 
 pub(crate) fn durable_task_record_identity(
@@ -60,6 +61,7 @@ struct CoordinatorState {
     tasks: BTreeMap<MaintenanceTaskId, TaskState>,
     pending_submissions: BTreeSet<MaintenanceTaskId>,
     pending_terminal_reclamations: BTreeSet<MaintenanceTaskId>,
+    pending_cancellations: BTreeSet<MaintenanceTaskId>,
     window: Option<MaintenanceWindow>,
     fairness: BTreeMap<(MaintenancePriority, MaintenanceScope), u64>,
     next_terminal_order: u64,
@@ -280,6 +282,7 @@ impl MaintenanceCoordinator {
                 tasks: BTreeMap::new(),
                 pending_submissions: BTreeSet::new(),
                 pending_terminal_reclamations: BTreeSet::new(),
+                pending_cancellations: BTreeSet::new(),
                 window: None,
                 fairness: BTreeMap::new(),
                 next_terminal_order: 1,

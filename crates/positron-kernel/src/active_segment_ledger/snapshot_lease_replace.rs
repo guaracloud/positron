@@ -196,7 +196,7 @@ impl<'lease, 'kernel, 'catalog> SnapshotLeaseReplacement<'lease, 'kernel, 'catal
             )
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::StaleGeneration))?
             .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::StaleGeneration))?;
-        let submission = coordinator
+        let submission = match coordinator
             .prepare_snapshot_lease_expiry(
                 self.new_identity,
                 MaintenanceScope::segment(
@@ -208,29 +208,58 @@ impl<'lease, 'kernel, 'catalog> SnapshotLeaseReplacement<'lease, 'kernel, 'catal
                 basis.number(),
                 self.expiry,
             )
-            .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))
+        {
+            Ok(submission) => submission,
+            Err(failure) => {
+                cancellation.discard(coordinator);
+                return Err(failure);
+            },
+        };
         let amounts = lease_claim(self.encoded.len())?;
         let transaction = LeaseReservationTransaction::begin(&mut state, self.old_identity)?;
         if let Err(failure) = transaction.resize(&mut state, amounts) {
             transaction.cancel(&mut state);
             submission.discard(coordinator);
+            cancellation.discard(coordinator);
             return Err(failure);
         }
+        let cancellation_object = match cancellation.catalog_object() {
+            Ok(object) => object,
+            Err(_) => {
+                submission.discard(coordinator);
+                cancellation.discard(coordinator);
+                return Err(rollback_after_replacement_failure(
+                    &mut state,
+                    transaction,
+                    LedgerFailure::new(LedgerFailureCode::IntegrityCorruption),
+                ));
+            },
+        };
+        let submission_object = match submission.catalog_object() {
+            Ok(object) => object,
+            Err(_) => {
+                submission.discard(coordinator);
+                cancellation.discard(coordinator);
+                return Err(rollback_after_replacement_failure(
+                    &mut state,
+                    transaction,
+                    LedgerFailure::new(LedgerFailureCode::IntegrityCorruption),
+                ));
+            },
+        };
         let publication = publish_lease_replacement_with_task_replacements(
             self.ledger.catalog,
             &basis,
             self.old_identity,
             self.encoded.clone(),
             old_task,
-            cancellation
-                .catalog_object()
-                .map_err(|_| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?,
-            submission
-                .catalog_object()
-                .map_err(|_| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?,
+            cancellation_object,
+            submission_object,
         );
         if let Err(failure) = publication {
             submission.discard(coordinator);
+            cancellation.discard(coordinator);
             return Err(rollback_after_replacement_failure(
                 &mut state,
                 transaction,
