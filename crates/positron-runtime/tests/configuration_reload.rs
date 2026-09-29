@@ -1,14 +1,15 @@
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use positron_config::{
     CommandLineOverrides, ConfigurationDiff, ConfigurationDriftDisposition, ConfigurationInputs,
     EnvironmentOverrides, LogLevel, resolve,
 };
 use positron_governance::{
-    CompatibilityHints, ConfigurationAuditOutcome, PresentedCredential, RequestedIntent,
+    AdministrativeIdempotencyKey, CompatibilityHints, ConfigurationAuditOutcome,
+    PresentedCredential, RequestedIntent, ResourceGeneration,
 };
 use positron_runtime::{
     ApplicationRuntime, ConfigurationPublication, ConfigurationPublicationDisposition,
@@ -495,6 +496,132 @@ fn same_endpoint_reload_drains_accepted_old_work_before_the_successor_serves()
 }
 
 #[test]
+fn listener_reload_releases_catalog_ownership_before_draining_an_accepted_request()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write;
+
+    let roots = TestRoots::new("configuration-listener-catalog-drain")?;
+    let operations_port = available_loopback_port()?;
+    let control_path = std::env::temp_dir().join(format!(
+        "p81-listener-catalog-drain-{}-{operations_port}.sock",
+        std::process::id()
+    ));
+    let initial = configuration(Some(&listener_configuration(
+        control_path.clone(),
+        operations_port,
+    )))?;
+    let paths = roots.bootstrap_paths()?;
+    drop(InstanceBootstrap::initialize(
+        &paths,
+        positron_runtime::InitializationPlan::non_interactive(),
+    )?);
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let initialized = InstanceBootstrap::reopen(&paths)?;
+    let system = initialized.attribute(
+        PresentedCredential::parse(claim.secret())?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let administrator_secret = initialized
+        .create_api_key_for_tenant(
+            system,
+            initialized.default_tenant_id(),
+            positron_domain::identity::Scope::TenantAdministration,
+            None,
+            ResourceGeneration::new(1)?,
+            AdministrativeIdempotencyKey::new([0x81; 16])?,
+        )?
+        .secret()
+        .ok_or("provisioned tenant-administration credential missing")?
+        .to_owned();
+    drop(initialized);
+    let host = NativeHost::new(NativeBindings::from_effective(&initial)?);
+    let process = ApplicationRuntime::start(
+        ServeConfiguration::new(paths, InitializationMode::ExistingOnly)
+            .with_effective_configuration(Arc::clone(&initial)),
+        HostInputs::new(&host, &host),
+    )?;
+    let runtime = process
+        .configuration()
+        .ok_or("configuration runtime missing")?;
+    let before = runtime.observed()?.generation();
+    let api = process
+        .bound_endpoints()
+        .into_iter()
+        .find(|endpoint| endpoint.role() == ListenerRole::Api)
+        .and_then(|endpoint| endpoint.socket_address())
+        .ok_or("API endpoint missing")?;
+    let body = br#"{"policy_json":"{\"generation\":2,\"rules\":[{\"id\":\"reload-drain\",\"predicates\":[{\"receiver\":\"otlp_http_json\"}],\"action\":\"reject\"}]}","expected_generation":1,"idempotency_key":"82828282-8282-8282-8282-828282828282"}"#;
+    let mut old = std::net::TcpStream::connect(api)?;
+    old.set_read_timeout(Some(Duration::from_secs(2)))?;
+    let request_head = format!(
+        "POST /v1/policies:activate HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {administrator_secret}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    old.write_all(request_head.as_bytes())?;
+    let candidate = configuration(Some(&format!(
+        "{}\n[listener.operations]\ntrusted_proxy_cidrs = [\"127.0.0.1/32\"]\nforwarded_hops = 1\n",
+        listener_configuration(control_path, operations_port)
+    )))?;
+    let observed = Arc::clone(&runtime);
+    let released_request = std::thread::spawn(move || -> Result<(), String> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while observed
+            .observed()
+            .map_err(|error| error.to_string())?
+            .generation()
+            == before
+        {
+            if Instant::now() >= deadline {
+                return Err(
+                    "reload did not publish before draining the accepted request".to_owned(),
+                );
+            }
+            std::thread::yield_now();
+        }
+        old.write_all(body).map_err(|error| error.to_string())?;
+        let response = read_terminal_response(&mut old).map_err(|error| error.to_string())?;
+        let response_head_end = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .ok_or_else(|| "policy activation response head missing".to_owned())?;
+        let response_head = std::str::from_utf8(&response[..response_head_end])
+            .map_err(|error| error.to_string())?;
+        assert!(
+            response_head.starts_with("HTTP/1.1 200 "),
+            "accepted policy activation did not complete successfully: {:?}",
+            String::from_utf8_lossy(&response)
+        );
+        assert!(
+            response[(response_head_end + 4)..]
+                .windows(b"\"resource_generation\":2".len())
+                .any(|window| window == b"\"resource_generation\":2"),
+            "accepted policy activation did not publish its resource generation"
+        );
+        assert!(
+            response[(response_head_end + 4)..]
+                .windows(b"\"audit_position\":".len())
+                .any(|window| window == b"\"audit_position\":"),
+            "accepted policy activation did not publish an audit receipt"
+        );
+        Ok(())
+    });
+    assert!(matches!(
+        process.reload_configuration(candidate)?,
+        ConfigurationReloadOutcome::PublishedLive { .. }
+    ));
+    released_request
+        .join()
+        .map_err(|_| "accepted request releaser panicked")?
+        .map_err(|error| format!("accepted request releaser failed: {error}"))?;
+    assert!(matches!(
+        process.shutdown(ShutdownTrigger::FirstSignal),
+        positron_runtime::ExitOutcome::Graceful
+    ));
+    Ok(())
+}
+
+#[test]
 fn control_path_reload_binds_the_candidate_socket_and_releases_the_predecessor()
 -> Result<(), Box<dyn std::error::Error>> {
     let roots = TestRoots::new("configuration-control-path-reload")?;
@@ -733,6 +860,21 @@ fn same_endpoint_proxy_policy_reload_keeps_the_serving_endpoints_stable()
 fn available_loopback_port() -> Result<u16, std::io::Error> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     listener.local_addr().map(|address| address.port())
+}
+
+fn read_terminal_response(stream: &mut std::net::TcpStream) -> Result<Vec<u8>, std::io::Error> {
+    let mut response = Vec::new();
+    let mut buffer = [0_u8; 1_024];
+    loop {
+        match std::io::Read::read(stream, &mut buffer) {
+            Ok(0) => return Ok(response),
+            Ok(read) => response.extend_from_slice(&buffer[..read]),
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {
+                return Ok(response);
+            },
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn listener_configuration(control_path: std::path::PathBuf, operations_port: u16) -> String {
