@@ -12,9 +12,10 @@ use positron_domain::time::UnixNanoseconds;
 use positron_governance::GovernanceAuditEntry;
 use positron_ingest::load_schema_checkpoint;
 use positron_kernel::{
-    ActiveSegmentLedger, AuditIntent, Catalog, CatalogObject, CatalogProposal, FormatEpoch,
-    MaintenanceTask, MaintenanceTaskClass, MaintenanceTaskId, MaintenanceTaskPhase,
-    MountQualification, RetentionTimeAuthority, SegmentScope, TransactionId, WorkClass,
+    ActiveSegmentLedger, AuditIntent, Catalog, CatalogObject, CatalogProposal,
+    CatalogPublicationFault, FormatEpoch, MaintenanceTask, MaintenanceTaskClass, MaintenanceTaskId,
+    MaintenanceTaskPhase, MountQualification, RetentionTimeAuthority, SegmentScope, TransactionId,
+    WorkClass, with_catalog_publication_fault_after,
 };
 use positron_query::QueryBudget;
 use prost::Message;
@@ -402,6 +403,80 @@ fn runtime_worker_wakes_for_a_poststart_future_lease_expiry() -> Result<(), Box<
         Ok(())
     );
     Ok(())
+}
+
+#[test]
+fn runtime_worker_retries_a_running_expiry_after_terminal_publication_outage()
+-> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let (mut initialized, _, _) = fixture.initialized()?;
+    let (retention_time, elapsed) =
+        RetentionTimeAuthority::establish_with_manual_elapsed(UnixNanoseconds::new(10_000_000_000));
+    Arc::get_mut(&mut initialized)
+        .ok_or("sole initialized instance")?
+        .install_retention_time_for_test(retention_time)?;
+    let services = ServiceHandle::new(Arc::clone(&initialized))?;
+    let scope = SegmentScope::new(
+        initialized.tenant,
+        positron_domain::routing::SignalKind::Logs,
+        initialized.logs_shard,
+    );
+    let catalog_operation = services.catalog_operation()?;
+    let catalog = open_catalog(&initialized)?;
+    let identity = positron_governance::Identity::open(&catalog.pin()?)?;
+    let protection = super::super::tenant_segment_key(&initialized, &identity, scope)?;
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
+        &initialized._authority,
+        &initialized.retention_time,
+        &catalog,
+        scope,
+        protection,
+    )?;
+    let coordinator = initialized
+        .maintenance_coordinator()
+        .lock()
+        .map_err(|_| "maintenance lock")?;
+    let lease = ledger.create_snapshot_lease_for_at_catalog_with_expiry_task(
+        &coordinator,
+        0,
+        std::num::NonZeroU64::new(1).ok_or("nonzero ttl")?,
+        catalog.pin()?.identity(),
+    )?;
+    let task = MaintenanceTaskId::new(lease.identity().to_bytes()).expect("lease task id");
+    drop(lease);
+    drop(coordinator);
+    drop(ledger);
+    drop(catalog);
+    drop(catalog_operation);
+    elapsed.advance(1_000_000_000)?;
+    let cancellation = crate::TaskCancellation::new();
+    let worker_services = services.clone();
+    let worker_cancellation = cancellation.clone();
+    with_catalog_publication_fault_after(CatalogPublicationFault::SynchronizeCommit, 1, || {
+        let worker = std::thread::spawn(move || {
+            worker_services.run_maintenance_worker(&worker_cancellation)
+        });
+        services.notify_maintenance_worker();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while initialized
+            .maintenance_coordinator()
+            .lock()
+            .map_err(|_| "maintenance lock")?
+            .status(task)
+            .map_err(|_| "maintenance task status")?
+            .phase()
+            != MaintenanceTaskPhase::Succeeded
+        {
+            if Instant::now() >= deadline {
+                cancellation.cancel();
+                return Err("worker did not retry running expiry".into());
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        cancellation.cancel();
+        worker.join().map_err(|_| "maintenance worker panicked")??;
+        Ok(())
+    })
 }
 
 #[test]

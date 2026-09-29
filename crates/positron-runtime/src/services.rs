@@ -128,6 +128,7 @@ impl ServiceHandle {
         maintenance::wake_snapshot_lease_expiry(self, None)
     }
 
+    #[cfg(test)]
     pub(crate) fn wake_maintenance_worker_with_cancellation(
         &self,
         cancellation: &crate::TaskCancellation,
@@ -139,9 +140,7 @@ impl ServiceHandle {
         &self,
         cancellation: &crate::TaskCancellation,
     ) -> Result<(), ServiceFailure> {
-        maintenance::run_snapshot_lease_expiry_worker(cancellation, &self.maintenance_wake, || {
-            self.wake_maintenance_worker_with_cancellation(cancellation)
-        })
+        maintenance::run_snapshot_lease_expiry_worker(self, cancellation, &self.maintenance_wake)
     }
 
     pub(crate) fn catalog_operation(&self) -> Result<MutexGuard<'_, ()>, ServiceFailure> {

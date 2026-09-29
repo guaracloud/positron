@@ -6,8 +6,8 @@ use std::{
 };
 
 use positron_kernel::{
-    ActiveSegmentLedger, Catalog, MaintenanceCoordinator, MaintenanceFailure, MaintenanceScope,
-    MaintenanceTaskClass, SegmentScope, SnapshotLeaseId,
+    ActiveSegmentLedger, Catalog, MaintenanceCoordinator, MaintenanceExecution, MaintenanceFailure,
+    MaintenanceScope, MaintenanceTaskClass, SegmentScope, SnapshotLeaseId,
 };
 
 use super::{ServiceFailure, classify_catalog_failure_code};
@@ -83,10 +83,27 @@ pub(super) fn restore(instance: &crate::InitializedInstance) -> Result<(), Servi
 /// Performs one bounded coordinator dispatch for the only maintenance handler
 /// installed by this runtime slice. Unsupported durable classes remain queued
 /// for their own future handlers.
+#[cfg(test)]
 pub(super) fn wake_snapshot_lease_expiry(
     services: &super::ServiceHandle,
     cancellation: Option<&crate::TaskCancellation>,
 ) -> Result<bool, ServiceFailure> {
+    let Some(execution) = start_snapshot_lease_expiry(services, cancellation)? else {
+        return Ok(false);
+    };
+    complete_snapshot_lease_expiry(services, cancellation, &execution)
+}
+
+struct SnapshotLeaseExpiryExecution<'authority> {
+    execution: MaintenanceExecution<'authority>,
+    scope: SegmentScope,
+    identity: SnapshotLeaseId,
+}
+
+fn start_snapshot_lease_expiry<'authority>(
+    services: &'authority super::ServiceHandle,
+    cancellation: Option<&crate::TaskCancellation>,
+) -> Result<Option<SnapshotLeaseExpiryExecution<'authority>>, ServiceFailure> {
     if cancellation.is_some_and(crate::TaskCancellation::is_cancelled) {
         return Err(ServiceFailure::Cancelled);
     }
@@ -122,7 +139,7 @@ pub(super) fn wake_snapshot_lease_expiry(
         )
         .map_err(map_failure)?
     else {
-        return Ok(false);
+        return Ok(None);
     };
     // The task is now durably Running. Drain cancellation remains effective
     // until the handler enters its atomic ledger-and-Catalog publication.
@@ -133,30 +150,66 @@ pub(super) fn wake_snapshot_lease_expiry(
     let scope = scope_for_snapshot_lease_expiry(execution.task().scope(), instance.tenant)?;
     let identity = SnapshotLeaseId::new(execution.task().identity().to_bytes())
         .map_err(|_| ServiceFailure::Internal)?;
+    Ok(Some(SnapshotLeaseExpiryExecution {
+        execution,
+        scope,
+        identity,
+    }))
+}
+
+fn complete_snapshot_lease_expiry(
+    services: &super::ServiceHandle,
+    cancellation: Option<&crate::TaskCancellation>,
+    execution: &SnapshotLeaseExpiryExecution<'_>,
+) -> Result<bool, ServiceFailure> {
+    if cancellation.is_some_and(crate::TaskCancellation::is_cancelled) {
+        return Err(ServiceFailure::Cancelled);
+    }
+    let Some(_catalog_operation) = services.try_catalog_operation()? else {
+        return Err(ServiceFailure::CatalogUnavailable);
+    };
+    let instance = &services.instance;
+    let catalog = Catalog::open(
+        &instance._authority,
+        instance.instance,
+        instance
+            .key
+            .catalog_secret(instance.instance)
+            .map_err(|_| ServiceFailure::KeyUnavailable)?,
+    )
+    .map_err(|failure| classify_catalog_failure_code(failure.code()))?;
+    let coordinator = instance
+        .maintenance_coordinator()
+        .lock()
+        .map_err(|_| ServiceFailure::Internal)?;
     let snapshot = catalog
         .pin()
         .map_err(|failure| classify_catalog_failure_code(failure.code()))?;
     let durable_identity =
         positron_governance::Identity::open(&snapshot).map_err(|_| ServiceFailure::CorruptState)?;
-    let key = super::tenant_segment_key(instance, &durable_identity, scope)?;
+    let key = super::tenant_segment_key(instance, &durable_identity, execution.scope)?;
     let ledger = ActiveSegmentLedger::open_with_retention_time(
         &instance._authority,
         &instance.retention_time,
         &catalog,
-        scope,
+        execution.scope,
         key,
     )
     .map_err(|failure| super::classify_ledger_failure_code(failure.code()))?;
     ledger
-        .complete_running_snapshot_lease_expiry_task(&coordinator, &execution, identity)
+        .complete_running_snapshot_lease_expiry_task(
+            &coordinator,
+            &execution.execution,
+            execution.identity,
+        )
         .map_err(|failure| super::classify_ledger_failure_code(failure.code()))?;
     Ok(true)
 }
 
 pub(super) fn run_snapshot_lease_expiry_worker(
+    services: &super::ServiceHandle,
     cancellation: &crate::TaskCancellation,
     wake_signal: &MaintenanceWake,
-    mut wake: impl FnMut() -> Result<bool, ServiceFailure>,
 ) -> Result<(), ServiceFailure> {
     const WORK_YIELD: Duration = Duration::from_millis(10);
     const INITIAL_TRANSIENT_BACKOFF: Duration = Duration::from_millis(50);
@@ -164,9 +217,23 @@ pub(super) fn run_snapshot_lease_expiry_worker(
 
     let mut observed = wake_signal.generation();
     let mut retry_delay = INITIAL_TRANSIENT_BACKOFF;
+    let mut in_flight = None;
     while !cancellation.is_cancelled() {
-        let delay = match wake() {
+        let result = match in_flight.as_ref() {
+            Some(execution) => {
+                complete_snapshot_lease_expiry(services, Some(cancellation), execution)
+            },
+            None => match start_snapshot_lease_expiry(services, Some(cancellation))? {
+                Some(execution) => {
+                    in_flight = Some(execution);
+                    continue;
+                },
+                None => Ok(false),
+            },
+        };
+        let delay = match result {
             Ok(true) => {
+                in_flight = None;
                 retry_delay = INITIAL_TRANSIENT_BACKOFF;
                 WORK_YIELD
             },
@@ -217,37 +284,5 @@ fn map_failure(failure: MaintenanceFailure) -> ServiceFailure {
         | MaintenanceFailure::InvalidTransition
         | MaintenanceFailure::PreconditionFailed
         | MaintenanceFailure::Paused => ServiceFailure::Internal,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use super::{MaintenanceWake, ServiceFailure, run_snapshot_lease_expiry_worker};
-
-    #[test]
-    fn recoverable_catalog_failures_keep_the_maintenance_role_alive() {
-        let cancellation = crate::TaskCancellation::new();
-        let wake = MaintenanceWake::for_instance(
-            positron_kernel::InstanceId::new([0x42; 16]).expect("valid instance"),
-        );
-        let attempts = AtomicUsize::new(0);
-
-        let result = run_snapshot_lease_expiry_worker(&cancellation, &wake, || {
-            let attempt = attempts.fetch_add(1, Ordering::AcqRel);
-            if attempt < 3 {
-                return Err(ServiceFailure::CatalogUnavailable);
-            }
-            cancellation.cancel();
-            Ok(false)
-        });
-
-        assert_eq!(result, Ok(()));
-        assert_eq!(
-            attempts.load(Ordering::Acquire),
-            4,
-            "bounded retries must survive multiple recoverable catalog outages"
-        );
     }
 }
