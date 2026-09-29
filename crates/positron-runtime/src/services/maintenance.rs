@@ -223,12 +223,14 @@ pub(super) fn run_snapshot_lease_expiry_worker(
             Some(execution) => {
                 complete_snapshot_lease_expiry(services, Some(cancellation), execution)
             },
-            None => match start_snapshot_lease_expiry(services, Some(cancellation))? {
-                Some(execution) => {
+            None => match start_snapshot_lease_expiry(services, Some(cancellation)) {
+                Ok(Some(execution)) => {
                     in_flight = Some(execution);
                     continue;
                 },
-                None => Ok(false),
+                Ok(None) => Ok(false),
+                Err(ServiceFailure::Cancelled) => break,
+                Err(failure) => return Err(failure),
             },
         };
         let delay = match result {

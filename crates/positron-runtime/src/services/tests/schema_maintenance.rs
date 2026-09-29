@@ -331,6 +331,21 @@ fn cancellation_after_maintenance_dispatch_preserves_the_lease_for_recovery()
 }
 
 #[test]
+fn maintenance_worker_treats_cancellation_before_dispatch_as_a_normal_exit()
+-> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let (initialized, _, _) = fixture.initialized()?;
+    let services = ServiceHandle::new(initialized)?;
+    let cancellation = crate::TaskCancellation::new();
+    // Poll one is the outer worker-loop check; poll two is the scheduler
+    // admission boundary immediately before a task can become Running.
+    cancellation.cancel_after_polls(2);
+
+    assert_eq!(services.run_maintenance_worker(&cancellation), Ok(()));
+    Ok(())
+}
+
+#[test]
 fn runtime_worker_wakes_for_a_poststart_future_lease_expiry() -> Result<(), Box<dyn Error>> {
     let fixture = Fixture::new()?;
     let (mut initialized, _, _) = fixture.initialized()?;
