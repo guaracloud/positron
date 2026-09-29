@@ -1,6 +1,8 @@
 use std::error::Error;
+use std::sync::Mutex;
 
 use positron_governance::{CompatibilityHints, PresentedCredential, RequestedIntent};
+use positron_kernel::MaintenanceCoordinator;
 use positron_query::{
     QueryBudget, QueryBudgetDimension, QueryEvent, QueryFailureCode, QueryService, QueryTerminal,
 };
@@ -414,6 +416,49 @@ fn runtime_observations_cover_scan_output_and_pre_delivery_boundaries() -> Resul
                     && incomplete.stats().output_bytes() == 0
                     && incomplete.stats().result_digest() == [0; 32]
         ));
+        Ok(())
+    })
+}
+
+#[test]
+fn failed_query_with_maintenance_cancels_its_coupled_expiry_task() -> Result<(), Box<dyn Error>> {
+    QueryFixture::scoped("failed-query-coupled-cleanup", |fixture| {
+        fixture.kernel.append_log("failure", 20, 1)?;
+        let coordinator = Mutex::new(MaintenanceCoordinator::new());
+        let service = QueryService::with_runtime(
+            fixture.kernel.authority.governor(),
+            fixture.kernel.ledger()?,
+            1,
+            TestClock::shared(100),
+            std::sync::Arc::new(FailingStageWorkMeter(
+                positron_query::QueryWorkStage::ScanDecode,
+            )),
+        )
+        .with_maintenance_coordinator(&coordinator);
+        let planned = service.plan_pipeline(
+            fixture.context,
+            "logs | range query_time -100 100 | limit 1",
+            QueryBudget::new(1_048_576, 16, 16, 1_048_576, 1_048_576, 60)?,
+        )?;
+        let events = service.execute(planned)?.collect::<Vec<_>>();
+        assert!(matches!(
+            events.last(),
+            Some(QueryEvent::Terminal(QueryTerminal::Incomplete(failure)))
+                if failure.code() == QueryFailureCode::Internal
+        ));
+        let coordinator = coordinator.lock().map_err(|_| "maintenance lock")?;
+        assert!(
+            coordinator
+                .start_next_with_reservation_and_persist(
+                    fixture.kernel.catalog_for_test(),
+                    fixture.kernel.authority,
+                    1_000,
+                    false,
+                )
+                .map_err(|_| "maintenance scheduler")?
+                .is_none(),
+            "a failed query must leave no queued or running expiry work; bounded Cancelled history may remain durable"
+        );
         Ok(())
     })
 }

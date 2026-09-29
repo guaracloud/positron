@@ -81,7 +81,13 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         let ledger = self.ledger;
         let mut resources = resources;
         if let Err(failure) = resources.persist_usage(ledger, self.trace_ledger, state) {
-            return Err(resources.fail_before_stream(ledger, self.trace_ledger, state, failure));
+            return Err(resources.fail_before_stream(
+                ledger,
+                self.trace_ledger,
+                self.maintenance,
+                state,
+                failure,
+            ));
         }
         let resources = resources.validate_lease_identity(
             ledger,
@@ -139,7 +145,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
     }
 }
 
-fn release_lease(
+pub(super) fn release_lease(
     ledger: &positron_kernel::ActiveSegmentLedger<'_, '_>,
     maintenance: Option<&std::sync::Mutex<positron_kernel::MaintenanceCoordinator>>,
     identity: positron_kernel::SnapshotLeaseId,

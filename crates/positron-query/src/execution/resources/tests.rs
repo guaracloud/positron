@@ -109,6 +109,7 @@ fn failed_usage_reconciliation_retains_the_durable_lease_for_retry() -> Result<(
     let failure = resources.fail_before_stream(
         &ledger,
         None,
+        None,
         &state,
         crate::QueryFailure::new(QueryFailureCode::Internal),
     );
