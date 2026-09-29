@@ -606,6 +606,7 @@ impl MaintenanceCoordinator {
             .state
             .lock()
             .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
+        require_unreserved_task_transition(&state, identity)?;
         let task = state
             .tasks
             .get_mut(&identity)
@@ -636,6 +637,7 @@ impl MaintenanceCoordinator {
             .state
             .lock()
             .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
+        require_unreserved_task_transition(&state, identity)?;
         {
             let task = state
                 .tasks

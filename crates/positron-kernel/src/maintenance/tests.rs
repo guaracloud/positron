@@ -288,6 +288,21 @@ fn prepared_running_lease_expiry_completion_blocks_cancellation_before_publicati
         MaintenanceTaskPhase::Running
     );
     assert_eq!(
+        coordinator
+            .checkpoint(
+                identity,
+                MaintenanceCheckpoint::new(1, 0, vec![1]).expect("checkpoint"),
+            )
+            .expect_err("prepared completion fences direct test-model checkpoints"),
+        MaintenanceFailure::PreconditionFailed
+    );
+    assert_eq!(
+        coordinator
+            .complete(identity, true)
+            .expect_err("prepared completion fences direct test-model terminalization"),
+        MaintenanceFailure::PreconditionFailed
+    );
+    assert_eq!(
         execution
             .checkpoint_and_persist(
                 &coordinator,
