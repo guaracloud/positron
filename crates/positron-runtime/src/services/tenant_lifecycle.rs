@@ -24,6 +24,9 @@ impl ServiceHandle {
         bearer: &str,
         body: &[u8],
     ) -> Result<TenantLifecycleTransitionResponse, TenantLifecycleHttpFailure> {
+        let _catalog_operation = self
+            .catalog_operation()
+            .map_err(|_| TenantLifecycleHttpFailure::Code(503, "administration_unavailable"))?;
         let actor = self
             .instance
             .attribute(

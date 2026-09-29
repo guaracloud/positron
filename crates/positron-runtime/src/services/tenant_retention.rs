@@ -34,6 +34,9 @@ impl ServiceHandle {
         bearer: &str,
         body: &[u8],
     ) -> Result<TenantRetentionPreviewResponse, TenantRetentionHttpFailure> {
+        let _catalog_operation = self
+            .catalog_operation()
+            .map_err(|_| TenantRetentionHttpFailure::Code(503, "administration_unavailable"))?;
         let actor = actor(self, bearer)?;
         let request = TenantRetentionPreviewRequest::decode(body)
             .map_err(|_| TenantRetentionHttpFailure::Code(400, "invalid_request"))?;
@@ -61,6 +64,9 @@ impl ServiceHandle {
         bearer: &str,
         body: &[u8],
     ) -> Result<TenantRetentionUpdateResponse, TenantRetentionHttpFailure> {
+        let _catalog_operation = self
+            .catalog_operation()
+            .map_err(|_| TenantRetentionHttpFailure::Code(503, "administration_unavailable"))?;
         let actor = actor(self, bearer)?;
         let request = TenantRetentionUpdateRequest::decode(body)
             .map_err(|_| TenantRetentionHttpFailure::Code(400, "invalid_request"))?;

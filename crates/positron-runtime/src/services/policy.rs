@@ -28,6 +28,9 @@ impl ServiceHandle {
         bearer: &str,
         body: &[u8],
     ) -> Result<positron_api::policy::PolicyActivateResponse, PolicyActivateHttpFailure> {
+        let _catalog_operation = self
+            .catalog_operation()
+            .map_err(|_| PolicyActivateHttpFailure::Code(503, "administration_unavailable"))?;
         let context = self
             .instance
             .attribute(
@@ -50,7 +53,7 @@ impl ServiceHandle {
             .map_err(|_| PolicyActivateHttpFailure::Code(400, "invalid_request"))?
             .into_ingest_policy();
         let activation = self
-            .activate_ingest_policy_durable(context, expected, key, candidate)
+            .activate_ingest_policy_with_catalog_operation(context, expected, key, candidate)
             .map_err(map_policy_activation_durable_failure)?;
         Ok(positron_api::policy::PolicyActivateResponse {
             resource_generation: activation.resource_generation().get(),
@@ -64,6 +67,9 @@ impl ServiceHandle {
         bearer: &str,
         body: &[u8],
     ) -> Result<positron_api::policy::PolicyExplainResponse, (u16, &'static str)> {
+        let _catalog_operation = self
+            .catalog_operation()
+            .map_err(|_| (503, "administration_unavailable"))?;
         self.instance
             .attribute(
                 positron_governance::PresentedCredential::parse(bearer)
@@ -103,6 +109,9 @@ impl ServiceHandle {
         bearer: &str,
         body: &[u8],
     ) -> Result<positron_api::policy::PolicyDiffResponse, (u16, &'static str)> {
+        let _catalog_operation = self
+            .catalog_operation()
+            .map_err(|_| (503, "administration_unavailable"))?;
         self.instance
             .attribute(
                 positron_governance::PresentedCredential::parse(bearer)
@@ -142,6 +151,9 @@ impl ServiceHandle {
         bearer: &str,
         body: &[u8],
     ) -> Result<positron_api::policy::PolicyTestResponse, (u16, &'static str)> {
+        let _catalog_operation = self
+            .catalog_operation()
+            .map_err(|_| (503, "administration_unavailable"))?;
         self.instance
             .attribute(
                 positron_governance::PresentedCredential::parse(bearer)
@@ -179,6 +191,9 @@ impl ServiceHandle {
         bearer: &str,
         body: &[u8],
     ) -> Result<positron_api::policy::PolicyValidateResponse, (u16, &'static str)> {
+        let _catalog_operation = self
+            .catalog_operation()
+            .map_err(|_| (503, "administration_unavailable"))?;
         self.instance
             .attribute(
                 positron_governance::PresentedCredential::parse(bearer)
@@ -237,20 +252,18 @@ impl ServiceHandle {
         key: AdministrativeIdempotencyKey,
         candidate: IngestPolicy,
     ) -> Result<IngestPolicyActivation, ServiceFailure> {
-        self.activate_ingest_policy_durable(context, expected, key, candidate)
+        let _catalog_operation = self.catalog_operation()?;
+        self.activate_ingest_policy_with_catalog_operation(context, expected, key, candidate)
             .map_err(map_policy_activation_service_failure)
     }
 
-    fn activate_ingest_policy_durable(
+    fn activate_ingest_policy_with_catalog_operation(
         &self,
         context: AuthorizedContext,
         expected: ResourceGeneration,
         key: AdministrativeIdempotencyKey,
         candidate: IngestPolicy,
     ) -> Result<IngestPolicyActivation, PolicyActivationDurableFailure> {
-        let _catalog_operation = self
-            .catalog_operation()
-            .map_err(|_| PolicyActivationDurableFailure::Unavailable)?;
         let instance = &self.instance;
         let tenant = context
             .tenant_attribution()

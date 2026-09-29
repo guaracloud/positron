@@ -312,6 +312,7 @@ impl ServiceHandle {
         bearer: &str,
         hints: CompatibilityHints,
     ) -> Result<AuthorizedContext, ServiceFailure> {
+        let _catalog_operation = self.catalog_operation()?;
         let instance = &self.instance;
         let identity = instance
             .durable_identity()
@@ -536,6 +537,7 @@ impl ServiceHandle {
         &self,
         context: AuthorizedContext,
     ) -> Result<(), ServiceFailure> {
+        let _catalog_operation = self.catalog_operation()?;
         let identity = self
             .instance
             .durable_identity()
