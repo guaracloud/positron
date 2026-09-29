@@ -2,14 +2,17 @@ use std::error::Error;
 
 use positron_domain::identity::TenantId;
 use positron_domain::routing::{SignalKind, VirtualShardId};
+use positron_domain::time::UnixNanoseconds;
 
 use super::super::support::{TemporaryRoot, establish_authority};
 use crate::catalog::{CatalogFileEvent, with_catalog_fault};
 use crate::{
     ActiveSegmentLedger, Catalog, CatalogSecret, InstanceId, MaintenanceCoordinator,
-    MaintenanceTaskId, MaintenanceTaskPhase, MountQualification, SegmentProtectionKey,
-    SegmentScope, SnapshotLeaseId,
+    MaintenanceTaskId, MaintenanceTaskPhase, MountQualification, RetentionTimeAuthority,
+    SegmentProtectionKey, SegmentScope, SnapshotLeaseId,
 };
+#[cfg(feature = "test-support")]
+use crate::{CatalogPublicationFault, with_catalog_publication_fault_sequence_after};
 
 #[test]
 fn dispatched_lease_expiry_removes_the_lease_and_succeeds_its_exact_task_atomically()
@@ -18,6 +21,9 @@ fn dispatched_lease_expiry_removes_the_lease_and_succeeds_its_exact_task_atomica
     let volume = crate::PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)
         .expect("primary volume");
     let authority = establish_authority(volume).expect("kernel authority");
+    let (retention_time, elapsed) = RetentionTimeAuthority::establish_with_manual_elapsed(
+        UnixNanoseconds::new(100_000_000_000),
+    );
     let catalog = Catalog::open(
         &authority,
         InstanceId::new([0xa1; 16]).expect("instance id"),
@@ -29,8 +35,9 @@ fn dispatched_lease_expiry_removes_the_lease_and_succeeds_its_exact_task_atomica
         SignalKind::Logs,
         VirtualShardId::new(1).expect("shard id"),
     );
-    let ledger = ActiveSegmentLedger::open(
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
         &authority,
+        &retention_time,
         &catalog,
         scope,
         SegmentProtectionKey::from_owned(Box::new([0xa5; 32])),
@@ -53,6 +60,15 @@ fn dispatched_lease_expiry_removes_the_lease_and_succeeds_its_exact_task_atomica
         .start_next_with_reservation_and_persist(&catalog, &authority, 150, false)
         .expect("scheduler dispatch")
         .expect("expiry task is due");
+    let early = ledger
+        .complete_running_snapshot_lease_expiry_task(&coordinator, &execution, identity)
+        .expect_err("the handler rechecks the authoritative destructive clock");
+    assert_eq!(early.code(), crate::LedgerFailureCode::ClockUncertain);
+    assert_eq!(
+        coordinator.status(task).expect("retained task").phase(),
+        MaintenanceTaskPhase::Running
+    );
+    elapsed.advance(50_000_000_000)?;
 
     ledger
         .complete_running_snapshot_lease_expiry_task(&coordinator, &execution, identity)
@@ -95,6 +111,9 @@ fn running_expiry_execution_rejects_a_foreign_lease_without_terminalizing_its_ta
     let root = TemporaryRoot::new()?;
     let volume = crate::PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
     let authority = establish_authority(volume)?;
+    let (retention_time, elapsed) = RetentionTimeAuthority::establish_with_manual_elapsed(
+        UnixNanoseconds::new(100_000_000_000),
+    );
     let catalog = Catalog::open(
         &authority,
         InstanceId::new([0xb1; 16])?,
@@ -105,8 +124,9 @@ fn running_expiry_execution_rejects_a_foreign_lease_without_terminalizing_its_ta
         SignalKind::Logs,
         VirtualShardId::new(1)?,
     );
-    let ledger = ActiveSegmentLedger::open(
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
         &authority,
+        &retention_time,
         &catalog,
         scope,
         SegmentProtectionKey::from_owned(Box::new([0xb4; 32])),
@@ -123,12 +143,13 @@ fn running_expiry_execution_rejects_a_foreign_lease_without_terminalizing_its_ta
         .start_next_with_reservation_and_persist(&catalog, &authority, 150, false)
         .expect("dispatch")
         .expect("due expiry");
+    elapsed.advance(50_000_000_000)?;
     let foreign = SnapshotLeaseId::new([0xfe; 16])?;
 
     let failure = ledger
         .complete_running_snapshot_lease_expiry_task(&coordinator, &execution, foreign)
         .expect_err("a dispatch cannot terminalize another lease");
-    assert_eq!(failure.code(), crate::LedgerFailureCode::StaleGeneration);
+    assert_eq!(failure.code(), crate::LedgerFailureCode::RecoveryRequired);
     assert_eq!(
         coordinator.status(task).expect("running task").phase(),
         MaintenanceTaskPhase::Running
@@ -147,6 +168,9 @@ fn failed_running_expiry_publication_keeps_its_execution_for_the_exact_retry()
     let root = TemporaryRoot::new()?;
     let volume = crate::PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
     let authority = establish_authority(volume)?;
+    let (retention_time, elapsed) = RetentionTimeAuthority::establish_with_manual_elapsed(
+        UnixNanoseconds::new(100_000_000_000),
+    );
     let catalog = Catalog::open(
         &authority,
         InstanceId::new([0xc1; 16])?,
@@ -157,8 +181,9 @@ fn failed_running_expiry_publication_keeps_its_execution_for_the_exact_retry()
         SignalKind::Logs,
         VirtualShardId::new(1)?,
     );
-    let ledger = ActiveSegmentLedger::open(
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
         &authority,
+        &retention_time,
         &catalog,
         scope,
         SegmentProtectionKey::from_owned(Box::new([0xc4; 32])),
@@ -176,6 +201,7 @@ fn failed_running_expiry_publication_keeps_its_execution_for_the_exact_retry()
         .start_next_with_reservation_and_persist(&catalog, &authority, 150, false)
         .expect("dispatch")
         .expect("due expiry");
+    elapsed.advance(50_000_000_000)?;
 
     let failure = with_catalog_fault(CatalogFileEvent::WriteObject, || {
         ledger.complete_running_snapshot_lease_expiry_task(&coordinator, &execution, identity)
@@ -194,6 +220,139 @@ fn failed_running_expiry_publication_keeps_its_execution_for_the_exact_retry()
     );
 
     ledger.complete_running_snapshot_lease_expiry_task(&coordinator, &execution, identity)?;
+    assert_eq!(
+        coordinator.status(task).expect("terminal task").phase(),
+        MaintenanceTaskPhase::Succeeded
+    );
+    Ok(())
+}
+
+#[test]
+fn cancelled_running_expiry_terminalizes_cancelled_and_retains_its_lease()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = crate::PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_authority(volume)?;
+    let (retention_time, elapsed) = RetentionTimeAuthority::establish_with_manual_elapsed(
+        UnixNanoseconds::new(100_000_000_000),
+    );
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0xd1; 16])?,
+        CatalogSecret::from_owned(Box::new([0xd2; 32]), Box::new([0xd3; 32])),
+    )?;
+    let scope = SegmentScope::new(
+        TenantId::from_bytes([0x64; 16])?,
+        SignalKind::Logs,
+        VirtualShardId::new(1)?,
+    );
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        SegmentProtectionKey::from_owned(Box::new([0xd4; 32])),
+    )?;
+    let coordinator = MaintenanceCoordinator::new();
+    let lease = ledger.create_snapshot_lease_for_at_catalog_with_expiry_task(
+        &coordinator,
+        0,
+        std::num::NonZeroU64::new(50).ok_or("nonzero ttl")?,
+        catalog.pin()?.identity(),
+    )?;
+    let identity = lease.identity();
+    let task = MaintenanceTaskId::new(identity.to_bytes()).expect("lease task id");
+    let execution = coordinator
+        .start_next_with_reservation_and_persist(&catalog, &authority, 150, false)
+        .expect("dispatch")
+        .expect("due expiry");
+    elapsed.advance(50_000_000_000)?;
+    coordinator
+        .cancel_and_persist(&catalog, task)
+        .expect("durable cancellation request");
+
+    let cancelled = ledger
+        .complete_running_snapshot_lease_expiry_task(&coordinator, &execution, identity)
+        .expect_err("the handler must honor the running cancellation request");
+    assert_eq!(cancelled.code(), crate::LedgerFailureCode::Cancelled);
+    assert_eq!(
+        coordinator.status(task).expect("terminal task").phase(),
+        MaintenanceTaskPhase::Cancelled
+    );
+    assert!(
+        super::super::super::snapshot_lease::records(&catalog.pin()?)?
+            .iter()
+            .any(|record| record.identity == identity),
+        "cancellation cannot remove the live snapshot lease"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn ambiguous_expiry_completion_retries_the_visible_exact_terminal_pair()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = crate::PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_authority(volume)?;
+    let (retention_time, elapsed) = RetentionTimeAuthority::establish_with_manual_elapsed(
+        UnixNanoseconds::new(100_000_000_000),
+    );
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0xe1; 16])?,
+        CatalogSecret::from_owned(Box::new([0xe2; 32]), Box::new([0xe3; 32])),
+    )?;
+    let scope = SegmentScope::new(
+        TenantId::from_bytes([0x64; 16])?,
+        SignalKind::Logs,
+        VirtualShardId::new(1)?,
+    );
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        SegmentProtectionKey::from_owned(Box::new([0xe4; 32])),
+    )?;
+    let coordinator = MaintenanceCoordinator::new();
+    let lease = ledger.create_snapshot_lease_for_at_catalog_with_expiry_task(
+        &coordinator,
+        0,
+        std::num::NonZeroU64::new(50).ok_or("nonzero ttl")?,
+        catalog.pin()?.identity(),
+    )?;
+    let identity = lease.identity();
+    let task = MaintenanceTaskId::new(identity.to_bytes()).expect("lease task id");
+    let execution = coordinator
+        .start_next_with_reservation_and_persist(&catalog, &authority, 150, false)
+        .expect("dispatch")
+        .expect("due expiry");
+    elapsed.advance(50_000_000_000)?;
+
+    let first = with_catalog_publication_fault_sequence_after(
+        &[
+            (CatalogPublicationFault::SynchronizeGenerationDirectory, 0),
+            (CatalogPublicationFault::ReadGenerationDirectory, 0),
+        ],
+        || ledger.complete_running_snapshot_lease_expiry_task(&coordinator, &execution, identity),
+    )
+    .expect_err("lost acknowledgement plus failed reconciliation is ambiguous");
+    assert_eq!(
+        first.completion_state(),
+        crate::LedgerCompletionState::CommitAmbiguous
+    );
+    assert_eq!(
+        coordinator
+            .status(task)
+            .expect("retained execution")
+            .phase(),
+        MaintenanceTaskPhase::Running
+    );
+
+    ledger
+        .complete_running_snapshot_lease_expiry_task(&coordinator, &execution, identity)
+        .expect("the visible exact terminal pair reconciles on retry");
     assert_eq!(
         coordinator.status(task).expect("terminal task").phase(),
         MaintenanceTaskPhase::Succeeded

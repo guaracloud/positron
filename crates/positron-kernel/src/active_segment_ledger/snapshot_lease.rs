@@ -761,12 +761,18 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             .lock()
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
         state.require_healthy()?;
+        if coordinator
+            .status(execution.task().identity())
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::StaleGeneration))?
+            .cancellation_requested()
+        {
+            execution
+                .complete_and_persist(coordinator, self.catalog, true)
+                .map_err(|_| LedgerFailure::new(LedgerFailureCode::RecoveryRequired))?;
+            return Err(LedgerFailure::new(LedgerFailureCode::Cancelled));
+        }
         self.catalog.refresh_state()?;
         let basis = self.catalog.pin()?;
-        let record = records(&basis)?
-            .into_iter()
-            .find(|record| record.identity == identity && record.scope == self.scope)
-            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::StaleGeneration))?;
         let task = MaintenanceTaskId::new(identity.to_bytes())
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?;
         let mut descriptor = None;
@@ -780,7 +786,37 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             }
         }
         let descriptor =
-            descriptor.ok_or_else(|| LedgerFailure::new(LedgerFailureCode::StaleGeneration))?;
+            descriptor.ok_or_else(|| LedgerFailure::new(LedgerFailureCode::RecoveryRequired))?;
+        let record = records(&basis)?
+            .into_iter()
+            .find(|record| record.identity == identity && record.scope == self.scope);
+        let Some(record) = record else {
+            let terminal = execution
+                .reconcile_running_snapshot_lease_expiry_completion(coordinator, descriptor)
+                .map_err(|_| LedgerFailure::new(LedgerFailureCode::RecoveryRequired))?;
+            terminal
+                .install_reconciled_running_completion(coordinator)
+                .map_err(|_| LedgerFailure::new(LedgerFailureCode::RecoveryRequired))?;
+            state.lease_reservations.remove(&identity);
+            state.lease_reservation_baselines.remove(&identity);
+            state.lease_resume_markers.remove(&identity);
+            state.pending_lease_releases.remove(identity);
+            return Ok(());
+        };
+        let retention_time = self
+            .retention_time
+            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::ClockUncertain))?;
+        let now = retention_time
+            .destructive_ingest_time(self.scope, None)
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::ClockUncertain))?
+            .instant()
+            .value()
+            .checked_div(1_000_000_000)
+            .and_then(|seconds| u64::try_from(seconds).ok())
+            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::ClockUncertain))?;
+        if now < record.expiry {
+            return Err(LedgerFailure::new(LedgerFailureCode::ClockUncertain));
+        }
         let terminal = execution
             .prepare_running_snapshot_lease_expiry_completion(
                 coordinator,
@@ -798,16 +834,23 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
                 ),
             )
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::StaleGeneration))?;
-        let terminal_object = terminal
-            .catalog_object()
-            .map_err(|_| LedgerFailure::new(LedgerFailureCode::StaleGeneration))?;
-        publish_lease_release_with_task_replacement(
+        let terminal_object = match terminal.catalog_object() {
+            Ok(object) => object,
+            Err(_) => {
+                terminal.discard(coordinator);
+                return Err(LedgerFailure::new(LedgerFailureCode::StaleGeneration));
+            },
+        };
+        if let Err(failure) = publish_lease_release_with_task_replacement(
             self.catalog,
             &basis,
             identity,
             task,
             terminal_object,
-        )?;
+        ) {
+            terminal.discard(coordinator);
+            return Err(failure);
+        }
         terminal
             .install_running_completion(coordinator)
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::RecoveryRequired))?;

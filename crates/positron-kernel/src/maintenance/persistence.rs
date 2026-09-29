@@ -50,14 +50,14 @@ impl SnapshotLeaseExpiryTaskReplacement {
             .lock()
             .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
         if !state
-            .pending_cancellations
+            .pending_task_transitions
             .contains(&self.before.task.identity)
             || state.tasks.get(&self.before.task.identity) != Some(&self.before)
         {
             return Err(MaintenanceFailure::PreconditionFailed);
         }
         state
-            .pending_cancellations
+            .pending_task_transitions
             .remove(&self.before.task.identity);
         state.tasks.insert(self.after.task.identity, self.after);
         state.next_terminal_order = state.next_terminal_order.max(self.next_terminal_order);
@@ -67,12 +67,35 @@ impl SnapshotLeaseExpiryTaskReplacement {
     pub(crate) fn discard(&self, coordinator: &MaintenanceCoordinator) {
         if let Ok(mut state) = coordinator.state.lock() {
             state
-                .pending_cancellations
+                .pending_task_transitions
                 .remove(&self.before.task.identity);
         }
     }
 
     pub(crate) fn install_running_completion(
+        self,
+        coordinator: &MaintenanceCoordinator,
+    ) -> Result<(), MaintenanceFailure> {
+        let mut state = coordinator
+            .state
+            .lock()
+            .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
+        if !state
+            .pending_task_transitions
+            .contains(&self.before.task.identity)
+            || state.tasks.get(&self.before.task.identity) != Some(&self.before)
+        {
+            return Err(MaintenanceFailure::PreconditionFailed);
+        }
+        state
+            .pending_task_transitions
+            .remove(&self.before.task.identity);
+        state.tasks.insert(self.after.task.identity, self.after);
+        state.next_terminal_order = state.next_terminal_order.max(self.next_terminal_order);
+        Ok(())
+    }
+
+    pub(crate) fn install_reconciled_running_completion(
         self,
         coordinator: &MaintenanceCoordinator,
     ) -> Result<(), MaintenanceFailure> {
@@ -143,6 +166,52 @@ impl QueuedMaintenanceSubmission {
 }
 
 impl MaintenanceCoordinator {
+    pub(super) fn reconcile_running_snapshot_lease_expiry_completion(
+        &self,
+        dispatch: MaintenanceDispatch,
+        durable_record: &[u8],
+    ) -> Result<SnapshotLeaseExpiryTaskReplacement, MaintenanceFailure> {
+        let identity = dispatch.identity;
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
+        let before = state
+            .tasks
+            .get(&identity)
+            .cloned()
+            .ok_or(MaintenanceFailure::UnknownTask)?;
+        if before.task.class != MaintenanceTaskClass::SnapshotLeaseExpiry
+            || before.phase != MaintenanceTaskPhase::Running
+            || before.active_dispatch != Some(dispatch)
+            || before.cancellation_requested
+        {
+            return Err(MaintenanceFailure::PreconditionFailed);
+        }
+        let mut next = state.clone();
+        let after = next
+            .tasks
+            .get_mut(&identity)
+            .ok_or(MaintenanceFailure::UnknownTask)?;
+        after.phase = MaintenanceTaskPhase::Succeeded;
+        after.active_dispatch = None;
+        assign_terminal_order(&mut next, identity)?;
+        let after = next
+            .tasks
+            .get(&identity)
+            .cloned()
+            .ok_or(MaintenanceFailure::UnknownTask)?;
+        let record = encode_record(&after)?;
+        if record.as_bytes() != durable_record {
+            return Err(MaintenanceFailure::PreconditionFailed);
+        }
+        Ok(SnapshotLeaseExpiryTaskReplacement {
+            before,
+            after,
+            next_terminal_order: next.next_terminal_order,
+            record,
+        })
+    }
     pub(super) fn prepare_running_snapshot_lease_expiry_completion(
         &self,
         dispatch: MaintenanceDispatch,
@@ -153,7 +222,7 @@ impl MaintenanceCoordinator {
         }
         let identity = MaintenanceTaskId::new(binding.identity.to_bytes())?;
         let expected_input = MaintenanceObjectId::new(binding.lease_object.to_bytes())?;
-        let state = self
+        let mut state = self
             .state
             .lock()
             .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
@@ -173,6 +242,8 @@ impl MaintenanceCoordinator {
             || encode_record(&before)?.as_bytes() != binding.durable_record
             || before.phase != MaintenanceTaskPhase::Running
             || before.active_dispatch != Some(dispatch)
+            || before.cancellation_requested
+            || state.pending_task_transitions.contains(&identity)
         {
             return Err(MaintenanceFailure::PreconditionFailed);
         }
@@ -191,6 +262,7 @@ impl MaintenanceCoordinator {
             .cloned()
             .ok_or(MaintenanceFailure::UnknownTask)?;
         let record = encode_record(&after)?;
+        state.pending_task_transitions.insert(identity);
         Ok(SnapshotLeaseExpiryTaskReplacement {
             before,
             after,
@@ -225,7 +297,7 @@ impl MaintenanceCoordinator {
                 })
             || cancellations.iter().any(|cancellation| {
                 !state
-                    .pending_cancellations
+                    .pending_task_transitions
                     .contains(&cancellation.before.task.identity)
                     || state.tasks.get(&cancellation.before.task.identity)
                         != Some(&cancellation.before)
@@ -242,7 +314,7 @@ impl MaintenanceCoordinator {
         }
         for cancellation in cancellations {
             state
-                .pending_cancellations
+                .pending_task_transitions
                 .remove(&cancellation.before.task.identity);
             state
                 .tasks
@@ -272,7 +344,7 @@ impl MaintenanceCoordinator {
             .lock()
             .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
         if !state
-            .pending_cancellations
+            .pending_task_transitions
             .contains(&cancellation.before.task.identity)
             || state.tasks.get(&cancellation.before.task.identity) != Some(&cancellation.before)
             || !state
@@ -292,7 +364,7 @@ impl MaintenanceCoordinator {
             .pending_submissions
             .remove(&submission_state.task.identity);
         state
-            .pending_cancellations
+            .pending_task_transitions
             .remove(&cancellation.before.task.identity);
         if let Some((identity, _)) = reclaimed_terminal {
             state.pending_terminal_reclamations.remove(&identity);
@@ -353,7 +425,7 @@ impl MaintenanceCoordinator {
         if before.phase != MaintenanceTaskPhase::Queued {
             return Err(MaintenanceFailure::InvalidTransition);
         }
-        if state.pending_cancellations.contains(&identity) {
+        if state.pending_task_transitions.contains(&identity) {
             return Err(MaintenanceFailure::PreconditionFailed);
         }
         let mut next = state.clone();
@@ -370,7 +442,7 @@ impl MaintenanceCoordinator {
             .cloned()
             .ok_or(MaintenanceFailure::UnknownTask)?;
         let record = encode_record(&after)?;
-        state.pending_cancellations.insert(identity);
+        state.pending_task_transitions.insert(identity);
         Ok(Some(SnapshotLeaseExpiryTaskReplacement {
             before,
             after,
@@ -807,6 +879,14 @@ impl MaintenanceCoordinator {
 }
 
 impl MaintenanceExecution<'_> {
+    pub(crate) fn reconcile_running_snapshot_lease_expiry_completion(
+        &self,
+        coordinator: &MaintenanceCoordinator,
+        durable_record: &[u8],
+    ) -> Result<SnapshotLeaseExpiryTaskReplacement, MaintenanceFailure> {
+        coordinator
+            .reconcile_running_snapshot_lease_expiry_completion(self.dispatch, durable_record)
+    }
     pub(crate) fn prepare_running_snapshot_lease_expiry_completion(
         &self,
         coordinator: &MaintenanceCoordinator,

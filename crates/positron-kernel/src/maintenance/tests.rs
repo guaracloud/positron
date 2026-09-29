@@ -229,6 +229,78 @@ fn prepared_lease_expiry_cancellation_blocks_dispatch_before_its_install()
 }
 
 #[test]
+fn prepared_running_lease_expiry_completion_blocks_cancellation_before_publication()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = CatalogRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
+    let authority = crate::catalog::tests::support::establish_catalog_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new(nonzero_id(74))?,
+        CatalogSecret::from_owned(Box::new([0x75; 32]), Box::new([0x76; 32])),
+    )?;
+    let initial = CatalogProposal::new(
+        TransactionId::new(nonzero_id(75))?,
+        FormatEpoch::CATALOG_V1,
+        vec![CatalogObject::new(
+            b"running completion dispatch basis".to_vec(),
+        )?],
+    )?;
+    catalog.commit(catalog.pin()?.identity(), initial, None)?;
+    let coordinator = MaintenanceCoordinator::new();
+    let lease = crate::SnapshotLeaseId::new([77; 16])?;
+    let scope = MaintenanceScope::segment(
+        TenantId::from_bytes([0x43; 16])?,
+        SignalKind::Logs,
+        VirtualShardId::new(1)?,
+    );
+    let lease_object = CatalogObject::new(b"running immutable lease binding".to_vec())?.identity();
+    let task = snapshot_lease_expiry_task(lease, scope, lease_object);
+    let identity = task.identity();
+    coordinator
+        .submit_and_persist(&catalog, task, 1)
+        .expect("expiry task persists");
+    let execution = coordinator
+        .start_next_with_reservation_and_persist(&catalog, &authority, 10, false)
+        .expect("dispatch")
+        .expect("due expiry execution");
+    let durable = coordinator
+        .durable_records()
+        .expect("durable records")
+        .into_iter()
+        .next()
+        .ok_or("running durable expiry task")?;
+    let completion = execution
+        .prepare_running_snapshot_lease_expiry_completion(
+            &coordinator,
+            SnapshotLeaseExpiryBinding::new(lease, scope, lease_object, 7, 10, durable.as_bytes()),
+        )
+        .expect("running completion preparation");
+
+    assert_eq!(
+        coordinator
+            .cancel_and_persist(&catalog, identity)
+            .expect_err("prepared completion owns the Running transition"),
+        MaintenanceFailure::PreconditionFailed
+    );
+    assert_eq!(
+        coordinator.status(identity).expect("running task").phase(),
+        MaintenanceTaskPhase::Running
+    );
+    completion.discard(&coordinator);
+    coordinator
+        .cancel_and_persist(&catalog, identity)
+        .expect("cancellation after discarded completion");
+    assert!(
+        coordinator
+            .status(identity)
+            .expect("running cancellation")
+            .cancellation_requested()
+    );
+    Ok(())
+}
+
+#[test]
 fn ordinary_submissions_never_evict_a_terminal_reserved_for_lease_publication()
 -> Result<(), Box<dyn std::error::Error>> {
     let coordinator = MaintenanceCoordinator::new();

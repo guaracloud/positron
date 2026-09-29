@@ -61,7 +61,7 @@ struct CoordinatorState {
     tasks: BTreeMap<MaintenanceTaskId, TaskState>,
     pending_submissions: BTreeSet<MaintenanceTaskId>,
     pending_terminal_reclamations: BTreeSet<MaintenanceTaskId>,
-    pending_cancellations: BTreeSet<MaintenanceTaskId>,
+    pending_task_transitions: BTreeSet<MaintenanceTaskId>,
     window: Option<MaintenanceWindow>,
     fairness: BTreeMap<(MaintenancePriority, MaintenanceScope), u64>,
     next_terminal_order: u64,
@@ -71,7 +71,7 @@ fn require_unreserved_task_transition(
     state: &CoordinatorState,
     identity: MaintenanceTaskId,
 ) -> Result<(), MaintenanceFailure> {
-    if state.pending_cancellations.contains(&identity) {
+    if state.pending_task_transitions.contains(&identity) {
         return Err(MaintenanceFailure::PreconditionFailed);
     }
     Ok(())
@@ -324,7 +324,7 @@ impl MaintenanceCoordinator {
                 tasks: BTreeMap::new(),
                 pending_submissions: BTreeSet::new(),
                 pending_terminal_reclamations: BTreeSet::new(),
-                pending_cancellations: BTreeSet::new(),
+                pending_task_transitions: BTreeSet::new(),
                 window: None,
                 fairness: BTreeMap::new(),
                 next_terminal_order: 1,

@@ -850,6 +850,7 @@ impl CatalogStorage {
         let mut authentication_failures = 0_usize;
         let mut entry_count = 0_usize;
         let mut name_bytes = 0_usize;
+        emit_event(CatalogFileEvent::ReadGenerationDirectory)?;
         let mut directory = Dir::read_from(&self.generations)
             .map_err(|_| CatalogFailure::new(CatalogFailureCode::StorageUnavailable))?;
         while let Some(entry) = directory.read() {

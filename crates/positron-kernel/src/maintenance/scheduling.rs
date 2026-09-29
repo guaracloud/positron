@@ -52,7 +52,7 @@ pub(super) fn eligible_task_ids(
             .any(|active| tasks_conflict(&task.task, active));
         if task.phase == MaintenanceTaskPhase::Queued
             && task.task.not_before <= now
-            && !state.pending_cancellations.contains(identity)
+            && !state.pending_task_transitions.contains(identity)
             && !clock_blocks
             && !window_blocks
             && !conflicts
