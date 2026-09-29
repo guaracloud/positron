@@ -17,7 +17,7 @@ use crate::{
 mod persistence;
 mod record;
 
-pub(crate) use persistence::SnapshotLeaseExpiryCancellation;
+pub(crate) use persistence::SnapshotLeaseExpiryTaskReplacement;
 use record::{decode_record, encode_record};
 
 pub(crate) fn durable_task_record_identity(
@@ -101,6 +101,38 @@ struct MaintenanceDispatch {
     coordinator_id: u64,
     identity: MaintenanceTaskId,
     attempt: u64,
+}
+
+/// Immutable durable binding that ties a running Snapshot Lease expiry task to
+/// the one lease record it may remove.
+pub(crate) struct SnapshotLeaseExpiryBinding<'record> {
+    identity: crate::SnapshotLeaseId,
+    scope: MaintenanceScope,
+    lease_object: crate::CatalogObjectId,
+    predecessor_generation: u64,
+    not_before: u64,
+    durable_record: &'record [u8],
+}
+
+impl<'record> SnapshotLeaseExpiryBinding<'record> {
+    #[must_use]
+    pub(crate) const fn new(
+        identity: crate::SnapshotLeaseId,
+        scope: MaintenanceScope,
+        lease_object: crate::CatalogObjectId,
+        predecessor_generation: u64,
+        not_before: u64,
+        durable_record: &'record [u8],
+    ) -> Self {
+        Self {
+            identity,
+            scope,
+            lease_object,
+            predecessor_generation,
+            not_before,
+            durable_record,
+        }
+    }
 }
 
 /// Read-only task status. It exposes no unbounded object identifiers in telemetry.

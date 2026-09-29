@@ -9,7 +9,10 @@ use super::snapshot_lease_record::{
     LeaseBlock, LeaseRecord, LeaseWindow, SnapshotLeaseId, SnapshotLeaseUsage,
     immutable_binding_object_id, resume_marker_for, valid_lease_interval, validate_active_lease,
 };
-use crate::{MaintenanceCoordinator, MaintenanceScope, MaintenanceTaskId, WorkClaim, WorkKind};
+use crate::{
+    MaintenanceCoordinator, MaintenanceExecution, MaintenanceScope, MaintenanceTaskId, WorkClaim,
+    WorkKind,
+};
 use std::collections::BTreeSet;
 #[path = "snapshot_lease_lifecycle.rs"]
 mod snapshot_lease_lifecycle;
@@ -242,7 +245,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             .governor()
             .reserve(claim)
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
-        let mut expiry_cancellations: Vec<crate::maintenance::SnapshotLeaseExpiryCancellation> =
+        let mut expiry_cancellations: Vec<crate::maintenance::SnapshotLeaseExpiryTaskReplacement> =
             Vec::new();
         if let Some(coordinator) = coordinator {
             for expired_identity in &expired {
@@ -733,6 +736,80 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         }
         cancellation
             .install(coordinator)
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::RecoveryRequired))?;
+        state.lease_reservations.remove(&identity);
+        state.lease_reservation_baselines.remove(&identity);
+        state.lease_resume_markers.remove(&identity);
+        state.pending_lease_releases.remove(identity);
+        Ok(())
+    }
+
+    /// Completes a dispatched Snapshot Lease expiry by removing the lease and
+    /// replacing its exact durable task record in one Catalog proposal.
+    ///
+    /// The execution is the only authority that may terminalize a Running
+    /// task. A failed publication leaves both durable records and the Running
+    /// dispatch unchanged so that same execution can retry.
+    pub fn complete_running_snapshot_lease_expiry_task(
+        &self,
+        coordinator: &MaintenanceCoordinator,
+        execution: &MaintenanceExecution<'_>,
+        identity: SnapshotLeaseId,
+    ) -> Result<(), LedgerFailure> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
+        state.require_healthy()?;
+        self.catalog.refresh_state()?;
+        let basis = self.catalog.pin()?;
+        let record = records(&basis)?
+            .into_iter()
+            .find(|record| record.identity == identity && record.scope == self.scope)
+            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::StaleGeneration))?;
+        let task = MaintenanceTaskId::new(identity.to_bytes())
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?;
+        let mut descriptor = None;
+        for bytes in basis.plaintext_objects() {
+            if crate::maintenance::durable_task_record_identity(bytes)
+                .map_err(|_| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?
+                == Some(task)
+                && descriptor.replace(bytes).is_some()
+            {
+                return Err(LedgerFailure::new(LedgerFailureCode::StaleGeneration));
+            }
+        }
+        let descriptor =
+            descriptor.ok_or_else(|| LedgerFailure::new(LedgerFailureCode::StaleGeneration))?;
+        let terminal = execution
+            .prepare_running_snapshot_lease_expiry_completion(
+                coordinator,
+                crate::maintenance::SnapshotLeaseExpiryBinding::new(
+                    identity,
+                    MaintenanceScope::segment(
+                        self.scope.tenant_id(),
+                        self.scope.signal_kind(),
+                        self.scope.shard_id(),
+                    ),
+                    immutable_binding_object_id(&record)?,
+                    record.catalog_generation,
+                    record.expiry,
+                    descriptor,
+                ),
+            )
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::StaleGeneration))?;
+        let terminal_object = terminal
+            .catalog_object()
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::StaleGeneration))?;
+        publish_lease_release_with_task_replacement(
+            self.catalog,
+            &basis,
+            identity,
+            task,
+            terminal_object,
+        )?;
+        terminal
+            .install_running_completion(coordinator)
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::RecoveryRequired))?;
         state.lease_reservations.remove(&identity);
         state.lease_reservation_baselines.remove(&identity);

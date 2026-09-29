@@ -24,14 +24,14 @@ pub(crate) struct QueuedMaintenanceSubmission {
 /// A terminal replacement for the exact expiry record attached to a released
 /// Snapshot Lease. Like a queued submission, it stays opaque until the
 /// caller-owned Catalog proposal has committed.
-pub(crate) struct SnapshotLeaseExpiryCancellation {
+pub(crate) struct SnapshotLeaseExpiryTaskReplacement {
     before: TaskState,
     after: TaskState,
     next_terminal_order: u64,
     record: MaintenanceTaskRecord,
 }
 
-impl SnapshotLeaseExpiryCancellation {
+impl SnapshotLeaseExpiryTaskReplacement {
     #[must_use]
     pub(crate) const fn task_identity(&self) -> MaintenanceTaskId {
         self.before.task.identity
@@ -70,6 +70,22 @@ impl SnapshotLeaseExpiryCancellation {
                 .pending_cancellations
                 .remove(&self.before.task.identity);
         }
+    }
+
+    pub(crate) fn install_running_completion(
+        self,
+        coordinator: &MaintenanceCoordinator,
+    ) -> Result<(), MaintenanceFailure> {
+        let mut state = coordinator
+            .state
+            .lock()
+            .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
+        if state.tasks.get(&self.before.task.identity) != Some(&self.before) {
+            return Err(MaintenanceFailure::PreconditionFailed);
+        }
+        state.tasks.insert(self.after.task.identity, self.after);
+        state.next_terminal_order = state.next_terminal_order.max(self.next_terminal_order);
+        Ok(())
     }
 }
 
@@ -127,9 +143,65 @@ impl QueuedMaintenanceSubmission {
 }
 
 impl MaintenanceCoordinator {
+    pub(super) fn prepare_running_snapshot_lease_expiry_completion(
+        &self,
+        dispatch: MaintenanceDispatch,
+        binding: SnapshotLeaseExpiryBinding<'_>,
+    ) -> Result<SnapshotLeaseExpiryTaskReplacement, MaintenanceFailure> {
+        if dispatch.coordinator_id != self.coordinator_id {
+            return Err(MaintenanceFailure::InvalidTransition);
+        }
+        let identity = MaintenanceTaskId::new(binding.identity.to_bytes())?;
+        let expected_input = MaintenanceObjectId::new(binding.lease_object.to_bytes())?;
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
+        let before = state
+            .tasks
+            .get(&identity)
+            .cloned()
+            .ok_or(MaintenanceFailure::UnknownTask)?;
+        if before.task.class != MaintenanceTaskClass::SnapshotLeaseExpiry
+            || before.task.scope != binding.scope
+            || before.task.trigger != MaintenanceTrigger::Scheduled
+            || before.task.preconditions.catalog_generation != binding.predecessor_generation
+            || before.task.preconditions.resource_generation != 1
+            || before.task.inputs.as_slice() != [expected_input]
+            || !before.task.outputs.is_empty()
+            || before.task.not_before != binding.not_before
+            || encode_record(&before)?.as_bytes() != binding.durable_record
+            || before.phase != MaintenanceTaskPhase::Running
+            || before.active_dispatch != Some(dispatch)
+        {
+            return Err(MaintenanceFailure::PreconditionFailed);
+        }
+        let mut next = state.clone();
+        let after = next
+            .tasks
+            .get_mut(&identity)
+            .ok_or(MaintenanceFailure::UnknownTask)?;
+        after.phase = MaintenanceTaskPhase::Succeeded;
+        after.cancellation_requested = false;
+        after.active_dispatch = None;
+        assign_terminal_order(&mut next, identity)?;
+        let after = next
+            .tasks
+            .get(&identity)
+            .cloned()
+            .ok_or(MaintenanceFailure::UnknownTask)?;
+        let record = encode_record(&after)?;
+        Ok(SnapshotLeaseExpiryTaskReplacement {
+            before,
+            after,
+            next_terminal_order: next.next_terminal_order,
+            record,
+        })
+    }
+
     pub(crate) fn install_snapshot_lease_expiry_cancellations(
         &self,
-        cancellations: Vec<SnapshotLeaseExpiryCancellation>,
+        cancellations: Vec<SnapshotLeaseExpiryTaskReplacement>,
         submission: QueuedMaintenanceSubmission,
     ) -> Result<(), MaintenanceFailure> {
         let QueuedMaintenanceSubmission {
@@ -187,7 +259,7 @@ impl MaintenanceCoordinator {
 
     pub(crate) fn install_snapshot_lease_expiry_replacement(
         &self,
-        cancellation: SnapshotLeaseExpiryCancellation,
+        cancellation: SnapshotLeaseExpiryTaskReplacement,
         submission: QueuedMaintenanceSubmission,
     ) -> Result<(), MaintenanceFailure> {
         let QueuedMaintenanceSubmission {
@@ -246,7 +318,7 @@ impl MaintenanceCoordinator {
         predecessor_generation: u64,
         not_before: u64,
         durable_record: &[u8],
-    ) -> Result<Option<SnapshotLeaseExpiryCancellation>, MaintenanceFailure> {
+    ) -> Result<Option<SnapshotLeaseExpiryTaskReplacement>, MaintenanceFailure> {
         let identity = MaintenanceTaskId::new(identity.to_bytes())?;
         let expected_input = MaintenanceObjectId::new(lease_object.to_bytes())?;
         let mut state = self
@@ -299,7 +371,7 @@ impl MaintenanceCoordinator {
             .ok_or(MaintenanceFailure::UnknownTask)?;
         let record = encode_record(&after)?;
         state.pending_cancellations.insert(identity);
-        Ok(Some(SnapshotLeaseExpiryCancellation {
+        Ok(Some(SnapshotLeaseExpiryTaskReplacement {
             before,
             after,
             next_terminal_order: next.next_terminal_order,
@@ -735,6 +807,14 @@ impl MaintenanceCoordinator {
 }
 
 impl MaintenanceExecution<'_> {
+    pub(crate) fn prepare_running_snapshot_lease_expiry_completion(
+        &self,
+        coordinator: &MaintenanceCoordinator,
+        binding: SnapshotLeaseExpiryBinding<'_>,
+    ) -> Result<SnapshotLeaseExpiryTaskReplacement, MaintenanceFailure> {
+        coordinator.prepare_running_snapshot_lease_expiry_completion(self.dispatch, binding)
+    }
+
     /// Durably advances a handler checkpoint through the sole Catalog Writer.
     /// A failed or ambiguous publication leaves the in-memory state unchanged
     /// until the exact retry resolves against the Catalog record.
