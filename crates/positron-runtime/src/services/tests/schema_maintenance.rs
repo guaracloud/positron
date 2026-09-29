@@ -1,7 +1,9 @@
 use std::error::Error;
 use std::fs;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, any_value};
@@ -18,7 +20,10 @@ use positron_query::QueryBudget;
 use prost::Message;
 
 use super::super::{ServiceFailure, ServiceHandle, schema_maintenance};
-use crate::{BootstrapPaths, InitializationPlan, InstanceBootstrap};
+use crate::{
+    ApplicationRuntime, BootstrapPaths, HostInputs, InitializationMode, InitializationPlan,
+    InstanceBootstrap, NativeBindings, NativeHost, ServeConfiguration, ShutdownTrigger,
+};
 
 type InitializedCredentials = (Arc<crate::InitializedInstance>, String, String, String);
 
@@ -170,7 +175,7 @@ fn production_query_publishes_a_durable_snapshot_lease_expiry_task() -> Result<(
 }
 
 #[test]
-fn runtime_maintenance_wake_dispatches_and_completes_a_due_snapshot_lease_expiry()
+fn runtime_maintenance_worker_wake_dispatches_and_completes_a_due_snapshot_lease_expiry()
 -> Result<(), Box<dyn Error>> {
     let fixture = Fixture::new()?;
     let (mut initialized, _, _) = fixture.initialized()?;
@@ -213,7 +218,7 @@ fn runtime_maintenance_wake_dispatches_and_completes_a_due_snapshot_lease_expiry
     drop(catalog);
     elapsed.advance(1_000_000_000)?;
 
-    assert!(services.run_snapshot_lease_expiry_once()?);
+    assert!(services.wake_maintenance_worker()?);
 
     let catalog = open_catalog(&initialized)?;
     let identity = positron_governance::Identity::open(&catalog.pin()?)?;
@@ -242,6 +247,114 @@ fn runtime_maintenance_wake_dispatches_and_completes_a_due_snapshot_lease_expiry
             .expect("terminal task")
             .phase(),
         MaintenanceTaskPhase::Succeeded
+    );
+    Ok(())
+}
+
+#[test]
+fn native_runtime_worker_expires_a_durable_lease_and_joins_before_reopen()
+-> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let (mut initialized, _, _) = fixture.initialized()?;
+    let (retention_time, elapsed) =
+        RetentionTimeAuthority::establish_with_manual_elapsed(UnixNanoseconds::new(10_000_000_000));
+    Arc::get_mut(&mut initialized)
+        .ok_or("sole initialized instance")?
+        .install_retention_time_for_test(retention_time)?;
+    let scope = SegmentScope::new(
+        initialized.tenant,
+        positron_domain::routing::SignalKind::Logs,
+        initialized.logs_shard,
+    );
+    let catalog = open_catalog(&initialized)?;
+    let identity = positron_governance::Identity::open(&catalog.pin()?)?;
+    let protection = super::super::tenant_segment_key(&initialized, &identity, scope)?;
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
+        &initialized._authority,
+        &initialized.retention_time,
+        &catalog,
+        scope,
+        protection,
+    )?;
+    let coordinator = initialized
+        .maintenance_coordinator()
+        .lock()
+        .map_err(|_| "maintenance lock")?;
+    let lease = ledger.create_snapshot_lease_for_at_catalog_with_expiry_task(
+        &coordinator,
+        0,
+        std::num::NonZeroU64::new(1).ok_or("nonzero ttl")?,
+        catalog.pin()?.identity(),
+    )?;
+    let task = MaintenanceTaskId::new(lease.identity().to_bytes()).expect("lease task id");
+    drop(lease);
+    drop(coordinator);
+    drop(ledger);
+    drop(catalog);
+    elapsed.advance(1_000_000_000)?;
+    drop(initialized);
+
+    let [operations, api, otlp_grpc, otlp_http, loki_push] = reserve_native_addresses()?;
+    static NEXT_NATIVE_CONTROL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let control = std::env::temp_dir().join(format!(
+        "positron-maintenance-worker-{}-{}.sock",
+        std::process::id(),
+        NEXT_NATIVE_CONTROL.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    match fs::remove_file(&control) {
+        Ok(()) => {},
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+        Err(error) => return Err(error.into()),
+    }
+    let host = NativeHost::new(NativeBindings::new(
+        control, operations, api, otlp_grpc, otlp_http, loki_push,
+    )?);
+    let paths = BootstrapPaths::new(
+        &fixture.root.join("data"),
+        &fixture.root.join("secrets"),
+        MountQualification::LocalHost,
+    )?;
+    let process = ApplicationRuntime::start(
+        ServeConfiguration::new(paths, InitializationMode::ExistingOnly),
+        HostInputs::new(&host, &host),
+    )?;
+    let services = process.services().ok_or("serving services")?;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while services
+        .instance
+        .maintenance_coordinator()
+        .lock()
+        .map_err(|_| "maintenance lock")?
+        .status(task)
+        .map_err(|_| "maintenance task status")?
+        .phase()
+        != MaintenanceTaskPhase::Succeeded
+    {
+        if Instant::now() >= deadline {
+            return Err("native maintenance worker did not complete the due lease expiry".into());
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    drop(services);
+    assert_eq!(
+        process.shutdown(ShutdownTrigger::FirstSignal),
+        crate::ExitOutcome::Graceful,
+        "shutdown joins the internal maintenance worker"
+    );
+
+    let reopened = fixture.reopen()?;
+    let restored = ServiceHandle::new(reopened)?;
+    assert_eq!(
+        restored
+            .instance
+            .maintenance_coordinator()
+            .lock()
+            .map_err(|_| "maintenance lock")?
+            .status(task)
+            .map_err(|_| "maintenance task status")?
+            .phase(),
+        MaintenanceTaskPhase::Succeeded,
+        "the worker-published terminal result survives reopen"
     );
     Ok(())
 }
@@ -530,6 +643,21 @@ pub(super) fn request(body: &str) -> ExportLogsServiceRequest {
             ..ResourceLogs::default()
         }],
     }
+}
+
+fn reserve_native_addresses() -> Result<[SocketAddr; 5], Box<dyn Error>> {
+    let mut listeners = Vec::with_capacity(5);
+    let mut addresses = Vec::with_capacity(5);
+    for _ in 0..5 {
+        let listener =
+            TcpListener::bind(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))?;
+        addresses.push(listener.local_addr()?);
+        listeners.push(listener);
+    }
+    drop(listeners);
+    addresses
+        .try_into()
+        .map_err(|_| "five native listener addresses".into())
 }
 
 pub(super) struct Fixture {

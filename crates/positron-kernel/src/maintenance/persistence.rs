@@ -531,6 +531,26 @@ impl MaintenanceCoordinator {
         now: u64,
         clock_uncertain: bool,
     ) -> Result<Option<MaintenanceExecution<'authority>>, MaintenanceFailure> {
+        self.start_next_with_reservation_and_persist_for_class(
+            catalog,
+            authority,
+            now,
+            clock_uncertain,
+            None,
+        )
+    }
+
+    /// Selects only work owned by one installed runtime handler. Unsupported
+    /// task classes remain queued for their own handler instead of being
+    /// dispatched into a worker that cannot truthfully terminalize them.
+    pub fn start_next_with_reservation_and_persist_for_class<'authority>(
+        &self,
+        catalog: &Catalog<'_>,
+        authority: &'authority StorageKernelResourceAuthority,
+        now: u64,
+        clock_uncertain: bool,
+        class: Option<MaintenanceTaskClass>,
+    ) -> Result<Option<MaintenanceExecution<'authority>>, MaintenanceFailure> {
         let mut state = self
             .state
             .lock()
@@ -546,6 +566,9 @@ impl MaintenanceCoordinator {
                 .get(&identity)
                 .map(|stored| stored.task.clone())
                 .ok_or(MaintenanceFailure::UnknownTask)?;
+            if class.is_some_and(|expected| task.class() != expected) {
+                continue;
+            }
             let reservation = match reserve_task(authority, &task) {
                 Ok(reservation) => reservation,
                 Err(()) => continue,

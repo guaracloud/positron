@@ -42,6 +42,7 @@ fn partial_task_spawn_failure_aborts_started_tasks_and_releases_ownership()
             .cloned()
             .collect::<Vec<_>>(),
         [
+            TaskEvent::Aborted(TaskRole::Maintenance, ProcessPhase::Recovering, true),
             TaskEvent::Aborted(TaskRole::Operations, ProcessPhase::Recovering, true),
             TaskEvent::Aborted(TaskRole::Control, ProcessPhase::Recovering, true),
         ]
@@ -92,6 +93,7 @@ fn partial_spawn_with_failed_rollback_reports_internal_cleanup_failure()
             .cloned()
             .collect::<Vec<_>>(),
         [
+            TaskEvent::Aborted(TaskRole::Maintenance, ProcessPhase::Recovering, true),
             TaskEvent::Aborted(TaskRole::Operations, ProcessPhase::Recovering, true),
             TaskEvent::Aborted(TaskRole::Control, ProcessPhase::Recovering, true),
             TaskEvent::Aborted(TaskRole::Operations, ProcessPhase::Recovering, true),

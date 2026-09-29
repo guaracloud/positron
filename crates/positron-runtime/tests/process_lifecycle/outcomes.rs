@@ -234,7 +234,7 @@ fn second_signal_cleanup_overflow_is_bounded_and_deterministic()
     else {
         panic!("cleanup overflow must remain typed");
     };
-    assert_eq!(cleanup.task_failures(), 6);
+    assert_eq!(cleanup.task_failures(), 7);
     assert_eq!(cleanup.listener_failures(), 1);
     assert!(cleanup.overflowed());
     assert_eq!(
@@ -312,6 +312,7 @@ fn deadline_aborts_every_task_and_never_reports_graceful_completion()
             TaskEvent::Aborted(TaskRole::OtlpHttp, ProcessPhase::Stopping, true),
             TaskEvent::Aborted(TaskRole::OtlpGrpc, ProcessPhase::Stopping, true),
             TaskEvent::Aborted(TaskRole::Api, ProcessPhase::Stopping, true),
+            TaskEvent::Aborted(TaskRole::Maintenance, ProcessPhase::Stopping, true),
             TaskEvent::Aborted(TaskRole::Operations, ProcessPhase::Stopping, true),
             TaskEvent::Aborted(TaskRole::Control, ProcessPhase::Stopping, true),
         ]
@@ -432,7 +433,7 @@ fn first_signal_closes_admission_joins_registered_tasks_and_releases_ownership_l
     assert_eq!(health.readiness(), Readiness::NotReady);
     assert!(roots.acquire_volume_again().is_ok());
     let events = tasks.events.borrow();
-    assert_eq!(events.len(), 18);
+    assert_eq!(events.len(), 21);
     assert!(matches!(
         events.last(),
         Some(TaskEvent::Joined(TaskRole::LokiPush, ..))

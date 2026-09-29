@@ -315,6 +315,7 @@ fn register_tasks(registrar: &dyn TaskRegistrar) -> Result<RegisteredTasks, Exit
     [
         TaskRole::Control,
         TaskRole::Operations,
+        TaskRole::Maintenance,
         TaskRole::Api,
         TaskRole::OtlpGrpc,
         TaskRole::OtlpHttp,

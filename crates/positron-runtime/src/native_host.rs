@@ -1246,7 +1246,24 @@ impl RegisteredTask for NativeRegisteredTask {
         health: HealthState,
         services: Option<ServiceHandle>,
     ) -> Result<Box<dyn RunningTask>, TaskFailure> {
-        let listener_role = listener_role(self.role);
+        if self.role == TaskRole::Maintenance {
+            let services = services.ok_or(TaskFailure::SpawnUnavailable)?;
+            let task_cancellation = cancellation.clone();
+            let handle = std::thread::Builder::new()
+                .name("positron-maintenance".to_owned())
+                .spawn(move || {
+                    services
+                        .run_maintenance_worker(&task_cancellation)
+                        .map_err(|_| TaskFailure::JoinUnavailable)
+                })
+                .map_err(|_| TaskFailure::SpawnUnavailable)?;
+            return Ok(Box::new(NativeRunningTask {
+                cancellation,
+                force: TaskCancellation::new(),
+                handle: Some(handle),
+            }));
+        }
+        let listener_role = listener_role(self.role)?;
         let task_cancellation = cancellation.clone();
         let force = TaskCancellation::new();
         let force_cancellation = force.clone();
@@ -1295,14 +1312,15 @@ const fn task_role(role: ListenerRole) -> TaskRole {
     }
 }
 
-const fn listener_role(role: TaskRole) -> ListenerRole {
+const fn listener_role(role: TaskRole) -> Result<ListenerRole, TaskFailure> {
     match role {
-        TaskRole::Control => ListenerRole::Control,
-        TaskRole::Operations => ListenerRole::Operations,
-        TaskRole::Api => ListenerRole::Api,
-        TaskRole::OtlpGrpc => ListenerRole::OtlpGrpc,
-        TaskRole::OtlpHttp => ListenerRole::OtlpHttp,
-        TaskRole::LokiPush => ListenerRole::LokiPush,
+        TaskRole::Control => Ok(ListenerRole::Control),
+        TaskRole::Operations => Ok(ListenerRole::Operations),
+        TaskRole::Maintenance => Err(TaskFailure::SpawnUnavailable),
+        TaskRole::Api => Ok(ListenerRole::Api),
+        TaskRole::OtlpGrpc => Ok(ListenerRole::OtlpGrpc),
+        TaskRole::OtlpHttp => Ok(ListenerRole::OtlpHttp),
+        TaskRole::LokiPush => Ok(ListenerRole::LokiPush),
     }
 }
 
