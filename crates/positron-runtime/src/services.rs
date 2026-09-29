@@ -118,6 +118,10 @@ impl std::fmt::Debug for ServiceHandle {
 }
 
 impl ServiceHandle {
+    #[cfg(test)]
+    pub(crate) fn run_snapshot_lease_expiry_once(&self) -> Result<bool, ServiceFailure> {
+        maintenance::run_snapshot_lease_expiry_once(&self.instance)
+    }
     #[allow(dead_code)]
     pub(crate) fn new(instance: Arc<InitializedInstance>) -> Result<Self, ServiceFailure> {
         Self::new_with_cancellation(instance, None)

@@ -192,6 +192,7 @@ impl MaintenanceExecution<'_> {
             .state
             .lock()
             .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
+        require_unreserved_task_transition(&state, self.dispatch.identity)?;
         let task = state
             .tasks
             .get_mut(&self.dispatch.identity)
@@ -235,6 +236,7 @@ impl MaintenanceExecution<'_> {
             .state
             .lock()
             .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
+        require_unreserved_task_transition(&state, self.dispatch.identity)?;
         {
             let task = state
                 .tasks
@@ -679,6 +681,9 @@ impl MaintenanceCoordinator {
         for identity in terminal {
             assign_terminal_order(&mut state, identity)?;
         }
+        state.pending_submissions.clear();
+        state.pending_terminal_reclamations.clear();
+        state.pending_task_transitions.clear();
         Ok(())
     }
 

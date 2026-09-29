@@ -6,11 +6,13 @@ use std::sync::Arc;
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, any_value};
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+use positron_domain::time::UnixNanoseconds;
 use positron_governance::GovernanceAuditEntry;
 use positron_ingest::load_schema_checkpoint;
 use positron_kernel::{
-    AuditIntent, Catalog, CatalogObject, CatalogProposal, FormatEpoch, MaintenanceTask,
-    MaintenanceTaskClass, MaintenanceTaskId, MountQualification, TransactionId, WorkClass,
+    ActiveSegmentLedger, AuditIntent, Catalog, CatalogObject, CatalogProposal, FormatEpoch,
+    MaintenanceTask, MaintenanceTaskClass, MaintenanceTaskId, MaintenanceTaskPhase,
+    MountQualification, RetentionTimeAuthority, SegmentScope, TransactionId, WorkClass,
 };
 use positron_query::QueryBudget;
 use prost::Message;
@@ -163,6 +165,83 @@ fn production_query_publishes_a_durable_snapshot_lease_expiry_task() -> Result<(
             .expect("released query expiry task is terminal")
             .is_none(),
         "collecting the ordinary query releases its lease and cancels its paired expiry task"
+    );
+    Ok(())
+}
+
+#[test]
+fn runtime_maintenance_wake_dispatches_and_completes_a_due_snapshot_lease_expiry()
+-> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let (mut initialized, _, _) = fixture.initialized()?;
+    let (retention_time, elapsed) =
+        RetentionTimeAuthority::establish_with_manual_elapsed(UnixNanoseconds::new(10_000_000_000));
+    Arc::get_mut(&mut initialized)
+        .ok_or("sole initialized instance")?
+        .install_retention_time_for_test(retention_time)?;
+    let services = ServiceHandle::new(Arc::clone(&initialized))?;
+    let scope = SegmentScope::new(
+        initialized.tenant,
+        positron_domain::routing::SignalKind::Logs,
+        initialized.logs_shard,
+    );
+    let catalog = open_catalog(&initialized)?;
+    let identity = positron_governance::Identity::open(&catalog.pin()?)?;
+    let protection = super::super::tenant_segment_key(&initialized, &identity, scope)?;
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
+        &initialized._authority,
+        &initialized.retention_time,
+        &catalog,
+        scope,
+        protection,
+    )?;
+    let coordinator = initialized
+        .maintenance_coordinator()
+        .lock()
+        .map_err(|_| "maintenance lock")?;
+    let lease = ledger.create_snapshot_lease_for_at_catalog_with_expiry_task(
+        &coordinator,
+        0,
+        std::num::NonZeroU64::new(1).ok_or("nonzero ttl")?,
+        catalog.pin()?.identity(),
+    )?;
+    let lease_id = lease.identity();
+    let task = MaintenanceTaskId::new(lease_id.to_bytes()).expect("lease task id");
+    drop(lease);
+    drop(coordinator);
+    drop(ledger);
+    drop(catalog);
+    elapsed.advance(1_000_000_000)?;
+
+    assert!(services.run_snapshot_lease_expiry_once()?);
+
+    let catalog = open_catalog(&initialized)?;
+    let identity = positron_governance::Identity::open(&catalog.pin()?)?;
+    let protection = super::super::tenant_segment_key(&initialized, &identity, scope)?;
+    let reopened = ActiveSegmentLedger::open_with_retention_time(
+        &initialized._authority,
+        &initialized.retention_time,
+        &catalog,
+        scope,
+        protection,
+    )?;
+    assert!(
+        reopened
+            .resume_snapshot_lease(lease_id, 11)
+            .expect_err("the runtime handler removed the expired lease")
+            .code()
+            == positron_kernel::LedgerFailureCode::SnapshotExpired,
+        "the runtime handler removes the expired lease"
+    );
+    assert_eq!(
+        initialized
+            .maintenance_coordinator()
+            .lock()
+            .map_err(|_| "maintenance lock")?
+            .status(task)
+            .expect("terminal task")
+            .phase(),
+        MaintenanceTaskPhase::Succeeded
     );
     Ok(())
 }

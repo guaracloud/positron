@@ -287,6 +287,30 @@ fn prepared_running_lease_expiry_completion_blocks_cancellation_before_publicati
         coordinator.status(identity).expect("running task").phase(),
         MaintenanceTaskPhase::Running
     );
+    assert_eq!(
+        execution
+            .checkpoint_and_persist(
+                &coordinator,
+                &catalog,
+                MaintenanceCheckpoint::new(1, 0, vec![1]).expect("checkpoint"),
+            )
+            .expect_err("prepared completion fences handler checkpoints"),
+        MaintenanceFailure::PreconditionFailed
+    );
+    assert_eq!(
+        execution
+            .complete_and_persist(&coordinator, &catalog, true)
+            .expect_err("prepared completion fences generic terminalization"),
+        MaintenanceFailure::PreconditionFailed
+    );
+    coordinator.recover_after_crash().expect("crash recovery");
+    assert!(
+        coordinator
+            .start_next(10, false)
+            .expect("recovered scheduling")
+            .is_some(),
+        "crash recovery drops the prepared transition reservation"
+    );
     completion.discard(&coordinator);
     coordinator
         .cancel_and_persist(&catalog, identity)
