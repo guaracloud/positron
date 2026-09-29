@@ -118,14 +118,29 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         };
         // PlannedQuery still owns its admitted CPU reservation while the
         // separately scoped immutable source snapshots are constructed.
-        let lease = self
-            .ledger
-            .create_snapshot_lease_for_at_catalog(
-                now,
-                remaining_ttl(now, expiry)?,
-                catalog_identity,
-            )
-            .map_err(map_ledger_failure)?;
+        let lease = match self.maintenance {
+            Some(maintenance) => {
+                let coordinator = maintenance
+                    .lock()
+                    .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
+                self.ledger
+                    .create_snapshot_lease_for_at_catalog_with_expiry_task(
+                        &coordinator,
+                        now,
+                        remaining_ttl(now, expiry)?,
+                        catalog_identity,
+                    )
+                    .map_err(map_ledger_failure)?
+            },
+            None => self
+                .ledger
+                .create_snapshot_lease_for_at_catalog(
+                    now,
+                    remaining_ttl(now, expiry)?,
+                    catalog_identity,
+                )
+                .map_err(map_ledger_failure)?,
+        };
         let trace_lease = match trace_ledger {
             Some(trace_ledger) => {
                 let (reauthorized_tenant, trace_catalog_identity, _) =
@@ -139,11 +154,25 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                     let failure = QueryFailure::new(QueryFailureCode::AuthorizationChanged);
                     return Err(self.fail_after_source_lease(lease.identity(), failure));
                 }
-                match trace_ledger.create_snapshot_lease_for_at_catalog(
-                    now,
-                    remaining_ttl(now, expiry)?,
-                    trace_catalog_identity,
-                ) {
+                let trace_result = match self.maintenance {
+                    Some(maintenance) => {
+                        let coordinator = maintenance
+                            .lock()
+                            .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
+                        trace_ledger.create_snapshot_lease_for_at_catalog_with_expiry_task(
+                            &coordinator,
+                            now,
+                            remaining_ttl(now, expiry)?,
+                            trace_catalog_identity,
+                        )
+                    },
+                    None => trace_ledger.create_snapshot_lease_for_at_catalog(
+                        now,
+                        remaining_ttl(now, expiry)?,
+                        trace_catalog_identity,
+                    ),
+                };
+                match trace_result {
                     Ok(lease) => Some(lease),
                     Err(failure) => {
                         let primary = map_ledger_failure(failure);

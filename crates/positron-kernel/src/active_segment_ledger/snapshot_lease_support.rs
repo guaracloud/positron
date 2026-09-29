@@ -385,6 +385,28 @@ pub(crate) fn publish_many(
     publish_many_with_expected_catalog(catalog, basis, basis.identity(), remove, add)
 }
 
+/// Publishes lease records and one already-encoded coordinator record through
+/// the same Catalog transaction. The caller retains the coordinator draft and
+/// installs it only after this returns success.
+pub(crate) fn publish_many_with_catalog_objects(
+    catalog: &crate::Catalog<'_>,
+    basis: &crate::CatalogSnapshot,
+    remove: &BTreeSet<SnapshotLeaseId>,
+    add: Vec<Vec<u8>>,
+    additional: Vec<CatalogObject>,
+) -> Result<(), LedgerFailure> {
+    publish_many_with_expected_catalog_inner(
+        catalog,
+        basis,
+        basis.identity(),
+        remove,
+        add,
+        additional,
+        true,
+    )
+    .map(|_| ())
+}
+
 pub(crate) fn publish_many_with_expected_catalog(
     catalog: &crate::Catalog<'_>,
     basis: &crate::CatalogSnapshot,
@@ -392,8 +414,16 @@ pub(crate) fn publish_many_with_expected_catalog(
     remove: &BTreeSet<SnapshotLeaseId>,
     add: Vec<Vec<u8>>,
 ) -> Result<(), LedgerFailure> {
-    publish_many_with_expected_catalog_inner(catalog, basis, expected_catalog, remove, add, true)
-        .map(|_| ())
+    publish_many_with_expected_catalog_inner(
+        catalog,
+        basis,
+        expected_catalog,
+        remove,
+        add,
+        Vec::new(),
+        true,
+    )
+    .map(|_| ())
 }
 
 pub(crate) fn publish_many_with_expected_catalog_snapshot(
@@ -408,6 +438,7 @@ pub(crate) fn publish_many_with_expected_catalog_snapshot(
         expected_catalog,
         remove,
         Vec::new(),
+        Vec::new(),
         false,
     )
 }
@@ -418,12 +449,14 @@ fn publish_many_with_expected_catalog_inner(
     expected_catalog: crate::CatalogGenerationId,
     remove: &BTreeSet<SnapshotLeaseId>,
     add: Vec<Vec<u8>>,
+    additional: Vec<CatalogObject>,
     reconcile_visible: bool,
 ) -> Result<crate::CatalogSnapshot, LedgerFailure> {
     let capacity = basis
         .plaintext_objects()
         .count()
         .checked_add(add.len())
+        .and_then(|count| count.checked_add(additional.len()))
         .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
     let mut objects = Vec::new();
     objects
@@ -437,6 +470,7 @@ fn publish_many_with_expected_catalog_inner(
     for encoded in &add {
         objects.push(CatalogObject::new(encoded.clone())?);
     }
+    objects.extend(additional);
     let transaction = TransactionId::new(fresh_identity()?.to_bytes())?;
     match catalog.commit(
         expected_catalog,

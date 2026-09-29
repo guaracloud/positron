@@ -9,7 +9,7 @@ use super::snapshot_lease_record::{
     LeaseBlock, LeaseRecord, LeaseWindow, SnapshotLeaseId, SnapshotLeaseUsage, resume_marker_for,
     valid_lease_interval, validate_active_lease,
 };
-use crate::{WorkClaim, WorkKind};
+use crate::{MaintenanceCoordinator, MaintenanceScope, WorkClaim, WorkKind};
 use std::collections::BTreeSet;
 #[path = "snapshot_lease_lifecycle.rs"]
 mod snapshot_lease_lifecycle;
@@ -20,7 +20,7 @@ use crate::CatalogGenerationId;
 pub(super) use snapshot_lease_support::map_catalog_failure;
 pub(super) use snapshot_lease_support::{
     LeaseReservationTransaction, active_segments, expired_in_scope, publish_many,
-    reclamation_lease_expiry, records,
+    publish_many_with_catalog_objects, reclamation_lease_expiry, records,
 };
 use snapshot_lease_support::{
     fresh_identity, publish, reject_time_regression, remove_reservations, snapshot_from_record,
@@ -54,6 +54,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
                 expiry,
             },
             None,
+            None,
         )
     }
 
@@ -64,7 +65,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         fallback_now: u64,
         ttl: std::num::NonZeroU64,
     ) -> Result<SnapshotLeaseGrant<'kernel>, LedgerFailure> {
-        self.create_snapshot_lease_for_internal(fallback_now, ttl, None)
+        self.create_snapshot_lease_for_internal(fallback_now, ttl, None, None)
     }
 
     /// Creates a lease only if the durable Catalog is still the generation
@@ -88,6 +89,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
                 expiry,
             },
             Some(expected_catalog),
+            None,
         )
     }
 
@@ -99,7 +101,25 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         ttl: std::num::NonZeroU64,
         expected_catalog: CatalogGenerationId,
     ) -> Result<SnapshotLeaseGrant<'kernel>, LedgerFailure> {
-        self.create_snapshot_lease_for_internal(fallback_now, ttl, Some(expected_catalog))
+        self.create_snapshot_lease_for_internal(fallback_now, ttl, Some(expected_catalog), None)
+    }
+
+    /// Creates a Snapshot Lease and its due expiry task in one Catalog
+    /// transaction. The ledger owns the composition so query callers cannot
+    /// expose a lease before its maintenance work is durable.
+    pub fn create_snapshot_lease_for_at_catalog_with_expiry_task(
+        &self,
+        coordinator: &MaintenanceCoordinator,
+        fallback_now: u64,
+        ttl: std::num::NonZeroU64,
+        expected_catalog: CatalogGenerationId,
+    ) -> Result<SnapshotLeaseGrant<'kernel>, LedgerFailure> {
+        self.create_snapshot_lease_for_internal(
+            fallback_now,
+            ttl,
+            Some(expected_catalog),
+            Some(coordinator),
+        )
     }
 
     fn create_snapshot_lease_for_internal(
@@ -107,6 +127,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         fallback_now: u64,
         ttl: std::num::NonZeroU64,
         expected_catalog: Option<CatalogGenerationId>,
+        coordinator: Option<&MaintenanceCoordinator>,
     ) -> Result<SnapshotLeaseGrant<'kernel>, LedgerFailure> {
         let now = self
             .retention_time
@@ -124,6 +145,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
                 expiry,
             },
             expected_catalog,
+            coordinator,
         )
     }
 
@@ -131,6 +153,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         &self,
         window: LeaseWindow,
         expected_catalog: Option<CatalogGenerationId>,
+        coordinator: Option<&MaintenanceCoordinator>,
     ) -> Result<SnapshotLeaseGrant<'kernel>, LedgerFailure> {
         let mut now = window.observed;
         let expiry = window.expiry;
@@ -188,6 +211,24 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         // leaving a catalog lease that no caller can release.
         let snapshot = snapshot_from_record(self, &state, &record)?;
         let encoded = encode(&record)?;
+        let expiry_submission = coordinator
+            .map(|coordinator| {
+                let lease_object = crate::CatalogObject::new(encoded.clone())?;
+                coordinator
+                    .prepare_snapshot_lease_expiry(
+                        identity,
+                        MaintenanceScope::segment(
+                            self.scope.tenant_id(),
+                            self.scope.signal_kind(),
+                            self.scope.shard_id(),
+                        ),
+                        lease_object.identity(),
+                        basis.number(),
+                        expiry,
+                    )
+                    .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))
+            })
+            .transpose()?;
         let claim = WorkClaim::tenant(
             self.scope.tenant,
             WorkKind::InteractiveQueryTail,
@@ -206,7 +247,18 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         );
         register_lease_reservation(reservations, pending, identity, retained, &expired)?;
         let publication = (|| {
-            publish(self.catalog, &basis, &expired, Some(encoded))?;
+            match expiry_submission.as_ref() {
+                Some(submission) => publish_many_with_catalog_objects(
+                    self.catalog,
+                    &basis,
+                    &expired,
+                    vec![encoded],
+                    vec![submission.catalog_object().map_err(|_| {
+                        LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused)
+                    })?],
+                )?,
+                None => publish(self.catalog, &basis, &expired, Some(encoded))?,
+            }
             #[cfg(any(test, fuzzing, feature = "test-support"))]
             super::fault::emit_event(
                 super::fault::LedgerFileEvent::BeforeLeaseCreationReconciliation,
@@ -214,6 +266,13 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             Ok::<(), LedgerFailure>(())
         })();
         if let Err(failure) = publication {
+            if let Some(submission) = expiry_submission {
+                submission.discard(
+                    coordinator.ok_or_else(|| {
+                        LedgerFailure::new(LedgerFailureCode::IntegrityCorruption)
+                    })?,
+                );
+            }
             if failure.completion_state() != LedgerCompletionState::CommitAmbiguous {
                 state.lease_reservations.remove(&identity);
                 state.pending_lease_releases.remove(identity);
@@ -224,6 +283,15 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         remove_reservations(state, &expired);
         state.pending_lease_releases.remove(identity);
         state.last_snapshot_lease_time = now;
+        if let Some(submission) = expiry_submission {
+            submission
+                .install(
+                    coordinator.ok_or_else(|| {
+                        LedgerFailure::new(LedgerFailureCode::IntegrityCorruption)
+                    })?,
+                )
+                .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
+        }
         Ok(SnapshotLeaseGrant {
             identity,
             expiry,

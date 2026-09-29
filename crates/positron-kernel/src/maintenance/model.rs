@@ -283,6 +283,7 @@ pub struct MaintenanceTask {
     pub(super) inputs: Vec<MaintenanceObjectId>,
     pub(super) outputs: Vec<MaintenanceObjectId>,
     pub(super) reservations: ResourceAmounts,
+    pub(super) not_before: u64,
 }
 
 impl MaintenanceTask {
@@ -304,6 +305,7 @@ impl MaintenanceTask {
             inputs: Vec::new(),
             outputs: Vec::new(),
             reservations: ResourceAmounts::new([1, 1, 1, 0, 1, 0, 1, 1, 1, 1, 0]),
+            not_before: 0,
         }
     }
 
@@ -314,9 +316,34 @@ impl MaintenanceTask {
         scope: MaintenanceScope,
         trigger: MaintenanceTrigger,
         preconditions: MaintenancePreconditions,
+        inputs: Vec<MaintenanceObjectId>,
+        outputs: Vec<MaintenanceObjectId>,
+        reservations: ResourceAmounts,
+    ) -> Result<Self, MaintenanceFailure> {
+        Self::with_contract_not_before(
+            identity,
+            class,
+            scope,
+            trigger,
+            preconditions,
+            inputs,
+            outputs,
+            reservations,
+            0,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn with_contract_not_before(
+        identity: MaintenanceTaskId,
+        class: MaintenanceTaskClass,
+        scope: MaintenanceScope,
+        trigger: MaintenanceTrigger,
+        preconditions: MaintenancePreconditions,
         mut inputs: Vec<MaintenanceObjectId>,
         mut outputs: Vec<MaintenanceObjectId>,
         reservations: ResourceAmounts,
+        not_before: u64,
     ) -> Result<Self, MaintenanceFailure> {
         if inputs.len() > MAX_TASK_OBJECTS
             || outputs.len() > MAX_TASK_OBJECTS
@@ -343,6 +370,7 @@ impl MaintenanceTask {
             inputs,
             outputs,
             reservations,
+            not_before,
         })
     }
 
@@ -383,5 +411,9 @@ impl MaintenanceTask {
     #[must_use]
     pub const fn reservations(&self) -> ResourceAmounts {
         self.reservations
+    }
+    #[must_use]
+    pub const fn not_before(&self) -> u64 {
+        self.not_before
     }
 }

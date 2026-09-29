@@ -1,6 +1,7 @@
 use super::*;
 
-const RECORD_MAGIC: &[u8; 8] = b"PMTC0002";
+const RECORD_MAGIC: &[u8; 8] = b"PMTC0003";
+const PREVIOUS_RECORD_MAGIC: &[u8; 8] = b"PMTC0002";
 
 pub(super) fn encode_record(
     state: &TaskState,
@@ -17,7 +18,7 @@ pub(super) fn encode_record(
         .ok_or(MaintenanceFailure::CapacityExceeded)?;
     let capacity = RECORD_MAGIC
         .len()
-        .checked_add(16 + 3 + 16 + 6 + 16 + 1 + 1 + 1 + 8 + 1 + 8)
+        .checked_add(16 + 3 + 16 + 6 + 16 + 1 + 1 + 1 + 8 + 8 + 1 + 8)
         .and_then(|size| size.checked_add(objects.checked_mul(32)?))
         .and_then(|size| {
             size.checked_add(11 * 8 + 1 + 8 + 1 + 1 + 8 + 1 + 8 + 4 + 4 + checkpoint_bytes)
@@ -36,6 +37,7 @@ pub(super) fn encode_record(
     bytes.push(priority_code(task.priority()));
     push_u64(&mut bytes, task.preconditions.catalog_generation);
     push_u64(&mut bytes, task.preconditions.resource_generation);
+    push_u64(&mut bytes, task.not_before);
     bytes.push(u8::try_from(task.inputs.len()).map_err(|_| MaintenanceFailure::CapacityExceeded)?);
     for input in &task.inputs {
         bytes.extend_from_slice(&input.to_bytes());
@@ -69,9 +71,14 @@ pub(super) fn encode_record(
 
 pub(super) fn decode_record(bytes: &[u8]) -> Result<TaskState, MaintenanceFailure> {
     let mut cursor = RecordCursor::new(bytes);
-    if cursor.take_exact(RECORD_MAGIC.len())? != RECORD_MAGIC {
+    let magic = cursor.take_exact(RECORD_MAGIC.len())?;
+    let includes_not_before = if magic == RECORD_MAGIC {
+        true
+    } else if magic == PREVIOUS_RECORD_MAGIC {
+        false
+    } else {
         return Err(MaintenanceFailure::InvalidInput);
-    }
+    };
     let identity = MaintenanceTaskId::new(cursor.array_16()?)?;
     let class = class_from_code(cursor.byte()?)?;
     let scope = decode_scope(&mut cursor)?;
@@ -85,13 +92,18 @@ pub(super) fn decode_record(bytes: &[u8]) -> Result<TaskState, MaintenanceFailur
     };
     let priority = priority_from_code(cursor.byte()?)?;
     let preconditions = MaintenancePreconditions::new(cursor.u64()?, cursor.u64()?)?;
+    let not_before = if includes_not_before {
+        cursor.u64()?
+    } else {
+        0
+    };
     let inputs = decode_objects(&mut cursor)?;
     let outputs = decode_objects(&mut cursor)?;
     let mut amounts = [0_u64; 11];
     for slot in &mut amounts {
         *slot = cursor.u64()?;
     }
-    let mut task = MaintenanceTask::with_contract(
+    let mut task = MaintenanceTask::with_contract_not_before(
         identity,
         class,
         scope,
@@ -100,6 +112,7 @@ pub(super) fn decode_record(bytes: &[u8]) -> Result<TaskState, MaintenanceFailur
         inputs,
         outputs,
         ResourceAmounts::new(amounts),
+        not_before,
     )?;
     task.emergency_compaction = emergency_compaction;
     if priority != task.priority() {
@@ -319,6 +332,7 @@ struct RecordCursor<'a> {
     bytes: &'a [u8],
     position: usize,
 }
+
 impl<'a> RecordCursor<'a> {
     const fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, position: 0 }
@@ -373,7 +387,7 @@ impl<'a> RecordCursor<'a> {
 pub(super) fn record_identity(
     bytes: &[u8],
 ) -> Result<Option<MaintenanceTaskId>, MaintenanceFailure> {
-    if !bytes.starts_with(RECORD_MAGIC) {
+    if !bytes.starts_with(RECORD_MAGIC) && !bytes.starts_with(PREVIOUS_RECORD_MAGIC) {
         return Ok(None);
     }
     decode_record(bytes).map(|state| Some(state.task.identity))
@@ -429,4 +443,46 @@ pub(super) fn window_record(bytes: &[u8]) -> Result<Option<MaintenanceWindow>, M
         return Err(MaintenanceFailure::InvalidInput);
     }
     Ok(Some(MaintenanceWindow { deferred, until }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn v2_task_record_decodes_with_an_immediately_eligible_schedule() {
+        let state = TaskState {
+            task: MaintenanceTask::with_contract_not_before(
+                MaintenanceTaskId::new([7; 16]).expect("identity"),
+                MaintenanceTaskClass::SnapshotLeaseExpiry,
+                MaintenanceScope::system(),
+                MaintenanceTrigger::Scheduled,
+                MaintenancePreconditions::new(3, 1).expect("preconditions"),
+                Vec::new(),
+                Vec::new(),
+                ResourceAmounts::new([1; 11]),
+                99,
+            )
+            .expect("task"),
+            phase: MaintenanceTaskPhase::Queued,
+            submitted_at: 7,
+            checkpoint: None,
+            pause_until: None,
+            cancellation_requested: false,
+            dispatches: 0,
+            terminal_order: None,
+            active_dispatch: None,
+        };
+        let mut legacy = encode_record(&state).expect("v3 encoding").0;
+        legacy[..RECORD_MAGIC.len()].copy_from_slice(PREVIOUS_RECORD_MAGIC);
+        // Magic, identity, class, system scope, trigger, emergency, priority,
+        // then the two precondition generations precede the v3 due-time field.
+        legacy.drain(45..53);
+        let decoded = decode_record(&legacy).expect("v2 decoding");
+        assert_eq!(decoded.task.not_before(), 0);
+        assert_eq!(
+            decoded.task.class(),
+            MaintenanceTaskClass::SnapshotLeaseExpiry
+        );
+    }
 }

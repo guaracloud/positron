@@ -195,7 +195,8 @@ pub(super) fn query_log_bodies(
         protection,
     )
     .map_err(|failure| classify_ledger_failure_code(failure.code()))?;
-    let service = QueryService::new(instance._authority.governor(), &ledger, 100);
+    let service = QueryService::new(instance._authority.governor(), &ledger, 100)
+        .with_maintenance_coordinator(instance.maintenance_coordinator());
     let service = match &services.export_destination_resolver {
         Some(resolver) => service.with_export_destination_resolver(Arc::clone(resolver)),
         None => service,

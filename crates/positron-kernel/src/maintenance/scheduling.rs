@@ -51,6 +51,7 @@ pub(super) fn eligible_task_ids(
             .iter()
             .any(|active| tasks_conflict(&task.task, active));
         if task.phase == MaintenanceTaskPhase::Queued
+            && task.task.not_before <= now
             && !clock_blocks
             && !window_blocks
             && !conflicts

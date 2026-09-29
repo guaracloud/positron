@@ -2,13 +2,15 @@ use std::error::Error;
 
 use positron_domain::identity::TenantId;
 use positron_domain::routing::{SignalKind, VirtualShardId};
+use positron_domain::time::UnixNanoseconds;
 
 use super::support::{TemporaryRoot, establish_authority};
 use crate::active_segment_ledger::fault::{LedgerFileEvent, with_ledger_errno, with_ledger_fault};
 use crate::catalog::{CatalogFileEvent, with_catalog_fault, with_catalog_fault_hook_after};
 use crate::{
     ActiveSegmentLedger, Catalog, CatalogObject, CatalogProposal, CatalogSecret, FormatEpoch,
-    InstanceId, LedgerCompletionState, LedgerFailureCode, MountQualification, PreparedStoreBlock,
+    InstanceId, LedgerCompletionState, LedgerFailureCode, MaintenanceCoordinator,
+    MaintenanceTaskId, MaintenanceTaskPhase, MountQualification, PreparedStoreBlock,
     PrimaryDataVolume, SegmentProtectionKey, SegmentScope, StoreBlockIdentity, TransactionId,
     WorkClaim, WorkKind,
 };
@@ -17,6 +19,234 @@ mod admission_faults;
 mod sealing_faults;
 mod snapshot_lease_capacity;
 mod snapshot_leases;
+
+#[test]
+fn lease_expiry_task_is_published_with_its_lease_and_waits_for_its_due_time()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x31; 16])?,
+        CatalogSecret::from_owned(Box::new([0x32; 32]), Box::new([0x33; 32])),
+    )?;
+    let scope = SegmentScope::new(
+        TenantId::from_bytes([0x64; 16])?,
+        SignalKind::Logs,
+        VirtualShardId::new(1)?,
+    );
+    let ledger = ActiveSegmentLedger::open(
+        &authority,
+        &catalog,
+        scope,
+        SegmentProtectionKey::from_owned(Box::new([0x34; 32])),
+    )?;
+    let coordinator = MaintenanceCoordinator::new();
+    let basis = catalog.pin()?;
+    let lease = ledger.create_snapshot_lease_for_at_catalog_with_expiry_task(
+        &coordinator,
+        100,
+        std::num::NonZeroU64::new(50).ok_or("nonzero ttl")?,
+        basis.identity(),
+    )?;
+    let task =
+        MaintenanceTaskId::new(lease.identity().to_bytes()).expect("lease identity is valid");
+    assert_eq!(
+        coordinator.status(task).expect("task is installed").phase(),
+        MaintenanceTaskPhase::Queued,
+        "the in-memory coordinator installs only after the coupled Catalog commit"
+    );
+    assert_eq!(
+        catalog
+            .pin()?
+            .plaintext_objects()
+            .filter(|bytes| bytes.starts_with(b"PMTC"))
+            .count(),
+        1,
+        "the immutable lease and exactly one expiry descriptor are co-present"
+    );
+    assert!(
+        coordinator
+            .start_next_with_reservation_and_persist(&catalog, &authority, 149, false)
+            .expect("scheduler checks due time")
+            .is_none()
+    );
+    assert!(
+        coordinator
+            .start_next_with_reservation_and_persist(&catalog, &authority, 150, true)
+            .expect("uncertain clock blocks scheduled expiry")
+            .is_none()
+    );
+    let execution = coordinator
+        .start_next_with_reservation_and_persist(&catalog, &authority, 150, false)
+        .expect("scheduler admits due work")
+        .ok_or("due expiry task must dispatch")?;
+    assert_eq!(execution.task().identity(), task);
+    Ok(())
+}
+
+#[test]
+fn lease_expiry_publication_fault_never_leaves_only_a_lease_or_only_a_task()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x41; 16])?,
+        CatalogSecret::from_owned(Box::new([0x42; 32]), Box::new([0x43; 32])),
+    )?;
+    let scope = SegmentScope::new(
+        TenantId::from_bytes([0x64; 16])?,
+        SignalKind::Logs,
+        VirtualShardId::new(1)?,
+    );
+    let protection = || SegmentProtectionKey::from_owned(Box::new([0x44; 32]));
+    let ledger = ActiveSegmentLedger::open(&authority, &catalog, scope, protection())?;
+    let coordinator = MaintenanceCoordinator::new();
+    let basis = catalog.pin()?;
+    let failure = with_catalog_fault(CatalogFileEvent::WriteObject, || {
+        ledger.create_snapshot_lease_for_at_catalog_with_expiry_task(
+            &coordinator,
+            100,
+            std::num::NonZeroU64::new(50).expect("nonzero ttl"),
+            basis.identity(),
+        )
+    })
+    .expect_err("faulted transaction must not publish either member");
+    assert_eq!(failure.code(), LedgerFailureCode::StorageUnavailable);
+    assert_eq!(
+        catalog
+            .pin()?
+            .plaintext_objects()
+            .filter(|bytes| bytes.starts_with(b"PMTC"))
+            .count(),
+        0
+    );
+    assert!(super::super::snapshot_lease::records(&catalog.pin()?)?.is_empty());
+
+    let lease = ledger.create_snapshot_lease_for_at_catalog_with_expiry_task(
+        &coordinator,
+        100,
+        std::num::NonZeroU64::new(50).ok_or("nonzero ttl")?,
+        catalog.pin()?.identity(),
+    )?;
+    let identity = lease.identity();
+    drop(lease);
+    drop(ledger);
+    drop(coordinator);
+    let reopened = ActiveSegmentLedger::open_with_clock(
+        &authority,
+        &catalog,
+        scope,
+        protection(),
+        &crate::LifecycleClock::new(crate::FixedLifecycleClockSource::new(UnixNanoseconds::new(
+            101_000_000_000,
+        ))),
+    )?;
+    let restored = MaintenanceCoordinator::restore_from_catalog(&catalog)
+        .expect("the co-published task must survive reopen");
+    assert_eq!(
+        restored
+            .status(MaintenanceTaskId::new(identity.to_bytes()).expect("valid identity"))
+            .expect("co-published task")
+            .phase(),
+        MaintenanceTaskPhase::Queued
+    );
+    drop(reopened.resume_snapshot_lease(identity, 101)?);
+    assert_eq!(
+        catalog
+            .pin()?
+            .plaintext_objects()
+            .filter(|bytes| bytes.starts_with(b"PMTC"))
+            .count(),
+        1,
+        "retry creates exactly one coupled task"
+    );
+    Ok(())
+}
+
+#[test]
+fn lease_expiry_marker_acknowledgement_ambiguity_reconciles_the_coupled_generation()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new([0x51; 16])?,
+        CatalogSecret::from_owned(Box::new([0x52; 32]), Box::new([0x53; 32])),
+    )?;
+    let unrelated = CatalogObject::new(b"unrelated lease basis".to_vec())?;
+    let unrelated_id = unrelated.identity();
+    catalog.commit(
+        catalog.pin()?.identity(),
+        CatalogProposal::new(
+            TransactionId::new([0x54; 16])?,
+            FormatEpoch::CATALOG_V1,
+            vec![unrelated],
+        )?,
+        None,
+    )?;
+    let scope = SegmentScope::new(
+        TenantId::from_bytes([0x64; 16])?,
+        SignalKind::Logs,
+        VirtualShardId::new(1)?,
+    );
+    let protection = || SegmentProtectionKey::from_owned(Box::new([0x55; 32]));
+    let ledger = ActiveSegmentLedger::open(&authority, &catalog, scope, protection())?;
+    let coordinator = MaintenanceCoordinator::new();
+    let basis = catalog.pin()?;
+    let lease = with_catalog_fault(CatalogFileEvent::SynchronizeGenerationDirectory, || {
+        ledger.create_snapshot_lease_for_at_catalog_with_expiry_task(
+            &coordinator,
+            100,
+            std::num::NonZeroU64::new(50).expect("nonzero ttl"),
+            basis.identity(),
+        )
+    })
+    .expect("the publisher reconciles a visible generation after acknowledgement ambiguity");
+    let task = MaintenanceTaskId::new(lease.identity().to_bytes()).expect("valid task identity");
+    assert_eq!(
+        coordinator
+            .status(task)
+            .expect("post-commit install")
+            .phase(),
+        MaintenanceTaskPhase::Queued
+    );
+    let snapshot = catalog.pin()?;
+    assert_eq!(
+        snapshot.object(unrelated_id)?,
+        Some(b"unrelated lease basis".as_slice())
+    );
+    assert_eq!(
+        snapshot
+            .plaintext_objects()
+            .filter(|bytes| bytes.starts_with(b"PMTC"))
+            .count(),
+        1
+    );
+    assert_eq!(super::super::snapshot_lease::records(&snapshot)?.len(), 1);
+    drop((lease, ledger, coordinator));
+    let reopened = ActiveSegmentLedger::open_with_clock(
+        &authority,
+        &catalog,
+        scope,
+        protection(),
+        &crate::LifecycleClock::new(crate::FixedLifecycleClockSource::new(UnixNanoseconds::new(
+            101_000_000_000,
+        ))),
+    )?;
+    let restored = MaintenanceCoordinator::restore_from_catalog(&catalog)
+        .expect("reopen restores the co-published task");
+    assert_eq!(
+        restored.status(task).expect("durable task").phase(),
+        MaintenanceTaskPhase::Queued
+    );
+    drop(reopened);
+    Ok(())
+}
 
 fn prepared(
     scope: SegmentScope,

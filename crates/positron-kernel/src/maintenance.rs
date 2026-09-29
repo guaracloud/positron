@@ -52,6 +52,7 @@ pub struct MaintenanceCoordinator {
 #[derive(Clone)]
 struct CoordinatorState {
     tasks: BTreeMap<MaintenanceTaskId, TaskState>,
+    pending_submissions: BTreeSet<MaintenanceTaskId>,
     window: Option<MaintenanceWindow>,
     fairness: BTreeMap<(MaintenancePriority, MaintenanceScope), u64>,
     next_terminal_order: u64,
@@ -270,6 +271,7 @@ impl MaintenanceCoordinator {
         Self {
             state: Mutex::new(CoordinatorState {
                 tasks: BTreeMap::new(),
+                pending_submissions: BTreeSet::new(),
                 window: None,
                 fairness: BTreeMap::new(),
                 next_terminal_order: 1,
@@ -325,7 +327,12 @@ impl MaintenanceCoordinator {
             }
             return Ok(existing.task.clone());
         }
-        if state.tasks.len() >= MAX_MAINTENANCE_TASKS
+        if state
+            .tasks
+            .len()
+            .checked_add(state.pending_submissions.len())
+            .ok_or(MaintenanceFailure::CapacityExceeded)?
+            >= MAX_MAINTENANCE_TASKS
             && reclaim_terminal_slot(&mut state)?.is_none()
         {
             return Err(MaintenanceFailure::CapacityExceeded);

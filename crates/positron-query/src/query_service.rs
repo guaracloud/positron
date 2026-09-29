@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use positron_domain::identity::{PrincipalId, Scope, TenantId};
 use positron_governance::{AuthorizedContext, Identity};
@@ -32,6 +32,7 @@ pub struct QueryService<'kernel, 'catalog, 'ledger> {
     pub(crate) governor: ResourceGovernor<'kernel>,
     pub(crate) ledger: &'ledger ActiveSegmentLedger<'kernel, 'catalog>,
     pub(crate) trace_ledger: Option<&'ledger ActiveSegmentLedger<'kernel, 'catalog>>,
+    pub(crate) maintenance: Option<&'ledger Mutex<positron_kernel::MaintenanceCoordinator>>,
     pub(crate) batch_limit: u16,
     pub(crate) clock: Arc<dyn crate::QueryClock>,
     pub(crate) work_meter: Arc<dyn crate::QueryWorkMeter>,
@@ -90,11 +91,23 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             governor,
             ledger,
             trace_ledger: None,
+            maintenance: None,
             batch_limit,
             clock,
             work_meter,
             export_destination_resolver: None,
         }
+    }
+
+    /// Supplies the runtime-owned coordinator to the Storage Kernel lease
+    /// publisher. Query never submits maintenance work itself.
+    #[must_use]
+    pub fn with_maintenance_coordinator(
+        mut self,
+        maintenance: &'ledger Mutex<positron_kernel::MaintenanceCoordinator>,
+    ) -> Self {
+        self.maintenance = Some(maintenance);
+        self
     }
 
     /// Adds the runtime's immutable configured-destination authority.

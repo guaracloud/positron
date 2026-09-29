@@ -11,7 +11,99 @@ use std::collections::BTreeSet;
 use super::*;
 use crate::{Catalog, CatalogObject, CatalogProposal, TransactionId};
 
+/// A not-yet-visible task record prepared by the coordinator for inclusion in
+/// a caller-owned Catalog transaction. The ledger uses this only to couple a
+/// newly created Snapshot Lease to its expiry work; it cannot inspect or
+/// mutate coordinator state directly.
+pub(crate) struct QueuedMaintenanceSubmission {
+    state: TaskState,
+    record: MaintenanceTaskRecord,
+}
+
+impl QueuedMaintenanceSubmission {
+    pub(crate) fn catalog_object(&self) -> Result<CatalogObject, MaintenanceFailure> {
+        self.record.catalog_object()
+    }
+
+    pub(crate) fn install(
+        self,
+        coordinator: &MaintenanceCoordinator,
+    ) -> Result<(), MaintenanceFailure> {
+        let mut state = coordinator
+            .state
+            .lock()
+            .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
+        if !state.pending_submissions.remove(&self.state.task.identity)
+            || state.tasks.contains_key(&self.state.task.identity)
+        {
+            return Err(MaintenanceFailure::PreconditionFailed);
+        }
+        state.tasks.insert(self.state.task.identity, self.state);
+        Ok(())
+    }
+
+    pub(crate) fn discard(self, coordinator: &MaintenanceCoordinator) {
+        if let Ok(mut state) = coordinator.state.lock() {
+            state.pending_submissions.remove(&self.state.task.identity);
+        }
+    }
+}
+
 impl MaintenanceCoordinator {
+    /// Prepares the one expiry task that must become reachable in the same
+    /// Catalog generation as its Snapshot Lease. It deliberately makes no
+    /// in-memory state visible until the lease publisher reports that commit.
+    pub(crate) fn prepare_snapshot_lease_expiry(
+        &self,
+        identity: crate::SnapshotLeaseId,
+        scope: MaintenanceScope,
+        lease_object: crate::CatalogObjectId,
+        predecessor_generation: u64,
+        not_before: u64,
+    ) -> Result<QueuedMaintenanceSubmission, MaintenanceFailure> {
+        let task = MaintenanceTask::with_contract_not_before(
+            MaintenanceTaskId::new(identity.to_bytes())?,
+            MaintenanceTaskClass::SnapshotLeaseExpiry,
+            scope,
+            MaintenanceTrigger::Scheduled,
+            MaintenancePreconditions::new(predecessor_generation, 1)?,
+            vec![MaintenanceObjectId::new(lease_object.to_bytes())?],
+            Vec::new(),
+            ResourceAmounts::new([1, 1, 1, 0, 1, 0, 1, 1, 1, 1, 0]),
+            not_before,
+        )?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
+        if state.tasks.contains_key(&task.identity) {
+            return Err(MaintenanceFailure::PreconditionFailed);
+        }
+        if state
+            .tasks
+            .len()
+            .checked_add(state.pending_submissions.len())
+            .ok_or(MaintenanceFailure::CapacityExceeded)?
+            >= MAX_MAINTENANCE_TASKS
+        {
+            return Err(MaintenanceFailure::CapacityExceeded);
+        }
+        state.pending_submissions.insert(task.identity);
+        drop(state);
+        let state = TaskState {
+            task,
+            phase: MaintenanceTaskPhase::Queued,
+            submitted_at: not_before,
+            checkpoint: None,
+            pause_until: None,
+            cancellation_requested: false,
+            dispatches: 0,
+            terminal_order: None,
+            active_dispatch: None,
+        };
+        let record = encode_record(&state)?;
+        Ok(QueuedMaintenanceSubmission { state, record })
+    }
     /// Selects, reserves, and durably marks one task Running before handing its
     /// execution to a handler. A failed publication drops the fresh reservation
     /// and leaves the task queued for the same stable retry.
@@ -83,7 +175,12 @@ impl MaintenanceCoordinator {
         }
 
         let mut next = state.clone();
-        let removed = if next.tasks.len() >= MAX_MAINTENANCE_TASKS {
+        let occupied = next
+            .tasks
+            .len()
+            .checked_add(next.pending_submissions.len())
+            .ok_or(MaintenanceFailure::CapacityExceeded)?;
+        let removed = if occupied >= MAX_MAINTENANCE_TASKS {
             Some(reclaim_terminal_slot(&mut next)?.ok_or(MaintenanceFailure::CapacityExceeded)?)
         } else {
             None

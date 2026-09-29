@@ -123,6 +123,35 @@ fn serving_updates_live_schema_without_catalog_publication() -> Result<(), Box<d
 }
 
 #[test]
+fn production_query_publishes_a_durable_snapshot_lease_expiry_task() -> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let (initialized, ingest, query) = fixture.initialized()?;
+    let services = ServiceHandle::new(Arc::clone(&initialized))?;
+    services.ingest_otlp_logs(&ingest, request("lease-task").encode_to_vec())?;
+    assert_eq!(
+        services.query_log_bodies(
+            &query,
+            "logs | range query_time 0 100 | limit 16",
+            QueryBudget::new(1_000_000, 100, 100, 1_000_000, 1_000_000, 10)?
+                .with_cpu_work_units(15)?,
+        )?,
+        ["lease-task"]
+    );
+    assert_eq!(
+        initialized
+            .maintenance_coordinator()
+            .lock()
+            .map_err(|_| "maintenance lock")?
+            .durable_records()
+            .expect("query expiry task is coordinator-owned")
+            .len(),
+        1,
+        "the runtime query path asks the kernel lease publisher to atomically create expiry work"
+    );
+    Ok(())
+}
+
+#[test]
 fn crash_without_publication_rebuilds_from_committed_blocks() -> Result<(), Box<dyn Error>> {
     let fixture = Fixture::new()?;
     let (initialized, ingest, query) = fixture.initialized()?;
