@@ -505,18 +505,6 @@ impl RunningProcess {
         candidate: Arc<EffectiveConfiguration>,
     ) -> Result<ConfigurationReloadOutcome, ConfigurationRuntimeFailure> {
         let _reload = self.reload_lock();
-        // Catalog-backed configuration publication shares the service
-        // operation authority with foreground work and the internal
-        // maintenance role. Without this gate a just-started maintenance
-        // worker can acquire the Kernel's sole Catalog writer lease between
-        // listener staging and publication, turning a valid reload into a
-        // spurious availability failure.
-        let _catalog_operation = self
-            .services
-            .as_ref()
-            .map(|services| services.catalog_operation())
-            .transpose()
-            .map_err(|_| ConfigurationRuntimeFailure::Unavailable)?;
         let runtime = self
             .configuration
             .as_ref()
@@ -532,26 +520,30 @@ impl RunningProcess {
             plan,
             ConfigurationDiffPlan::DrainThenPublish | ConfigurationDiffPlan::NoChange
         ) {
-            return runtime.reload_with(candidate, publication);
+            return self.with_catalog_operation(|| runtime.reload_with(candidate, publication));
         }
         let Some(factory) = self.listener_generation_factory.as_ref() else {
-            return runtime.reload_with(candidate, publication);
+            return self.with_catalog_operation(|| runtime.reload_with(candidate, publication));
         };
         let staged = match factory.stage(&candidate, self.health(), self.services()) {
             Ok(staged) => staged,
             Err(_) => {
                 if plan != ConfigurationDiffPlan::NoChange {
-                    publication
-                        .record_rejected_listener_staging(observed.effective(), &candidate)?;
+                    self.with_catalog_operation(|| {
+                        publication
+                            .record_rejected_listener_staging(observed.effective(), &candidate)
+                    })?;
                 } else if let Some(listener_set) = tls_material_listener_set {
                     let listener_set_identity =
                         crate::configuration_catalog::configuration_digest(&candidate);
-                    publication.record_tls_material_reload(
-                        listener_set,
-                        positron_governance::TlsMaterialReloadOutcome::Rejected,
-                        listener_set_identity,
-                        Self::rejected_tls_attempt_identity(listener_set_identity),
-                    )?;
+                    self.with_catalog_operation(|| {
+                        publication.record_tls_material_reload(
+                            listener_set,
+                            positron_governance::TlsMaterialReloadOutcome::Rejected,
+                            listener_set_identity,
+                            Self::rejected_tls_attempt_identity(listener_set_identity),
+                        )
+                    })?;
                 }
                 return Err(ConfigurationRuntimeFailure::ListenerUnavailable);
             },
@@ -562,16 +554,20 @@ impl RunningProcess {
                 .discard()
                 .map_err(|_| ConfigurationRuntimeFailure::ListenerUnavailable)?;
             if plan != ConfigurationDiffPlan::NoChange {
-                publication.record_rejected_listener_staging(observed.effective(), &candidate)?;
+                self.with_catalog_operation(|| {
+                    publication.record_rejected_listener_staging(observed.effective(), &candidate)
+                })?;
             } else if let (Some(listener_set), Some(material_identity)) =
                 (tls_material_listener_set, material_identity)
             {
-                publication.record_tls_material_reload(
-                    listener_set,
-                    positron_governance::TlsMaterialReloadOutcome::Rejected,
-                    crate::configuration_catalog::configuration_digest(&candidate),
-                    material_identity,
-                )?;
+                self.with_catalog_operation(|| {
+                    publication.record_tls_material_reload(
+                        listener_set,
+                        positron_governance::TlsMaterialReloadOutcome::Rejected,
+                        crate::configuration_catalog::configuration_digest(&candidate),
+                        material_identity,
+                    )
+                })?;
             }
             return Err(ConfigurationRuntimeFailure::ListenerUnavailable);
         }
@@ -581,22 +577,26 @@ impl RunningProcess {
             let material_identity = staged
                 .material_identity()
                 .ok_or(ConfigurationRuntimeFailure::ListenerUnavailable)?;
-            publication.record_tls_material_reload(
-                listener_set,
-                positron_governance::TlsMaterialReloadOutcome::Applied,
-                crate::configuration_catalog::configuration_digest(&candidate),
-                material_identity,
-            )?;
+            self.with_catalog_operation(|| {
+                publication.record_tls_material_reload(
+                    listener_set,
+                    positron_governance::TlsMaterialReloadOutcome::Applied,
+                    crate::configuration_catalog::configuration_digest(&candidate),
+                    material_identity,
+                )
+            })?;
         }
-        let outcome = match if plan == ConfigurationDiffPlan::NoChange {
-            runtime.reload_with(Arc::clone(&candidate), publication)
-        } else {
-            runtime.publish_staged_listener_reload(
-                Arc::clone(&candidate),
-                publication,
-                &plaintext_listener_audit_requests(&candidate),
-            )
-        } {
+        let outcome = match self.with_catalog_operation(|| {
+            if plan == ConfigurationDiffPlan::NoChange {
+                runtime.reload_with(Arc::clone(&candidate), publication)
+            } else {
+                runtime.publish_staged_listener_reload(
+                    Arc::clone(&candidate),
+                    publication,
+                    &plaintext_listener_audit_requests(&candidate),
+                )
+            }
+        }) {
             Ok(outcome) => {
                 self.state
                     .set_plaintext_listener_warnings(&plaintext_listener_intents_for(&candidate));
@@ -684,6 +684,23 @@ impl RunningProcess {
         hasher.finalize().into()
     }
 
+    fn with_catalog_operation<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, ConfigurationRuntimeFailure>,
+    ) -> Result<T, ConfigurationRuntimeFailure> {
+        // Publication owns the Catalog writer lease only for its durable
+        // transaction. Listener retirement may wait for accepted foreground
+        // work, which can itself need this gate, so it must run after the
+        // guard has been dropped.
+        let _catalog_operation = self
+            .services
+            .as_ref()
+            .map(|services| services.catalog_operation())
+            .transpose()
+            .map_err(|_| ConfigurationRuntimeFailure::Unavailable)?;
+        operation()
+    }
+
     /// Records a rejected source document while retaining the current complete
     /// runtime configuration.
     pub fn record_invalid_configuration_reload(&self) -> Result<(), ConfigurationRuntimeFailure> {
@@ -692,10 +709,11 @@ impl RunningProcess {
             .as_ref()
             .ok_or(ConfigurationRuntimeFailure::Unavailable)?;
         let active = runtime.observed()?;
-        self.configuration_publication
+        let publication = self
+            .configuration_publication
             .as_ref()
-            .ok_or(ConfigurationRuntimeFailure::Unavailable)?
-            .record_invalid(active.effective())
+            .ok_or(ConfigurationRuntimeFailure::Unavailable)?;
+        self.with_catalog_operation(|| publication.record_invalid(active.effective()))
     }
 
     /// Reconciles ordinary desired-state drift through the durable reload
@@ -720,12 +738,13 @@ impl RunningProcess {
                 Ok(drift)
             },
             ConfigurationDriftDisposition::Fence => {
-                let drift = runtime.record_fenced_drift_with(
-                    Arc::clone(&desired),
-                    self.configuration_publication
-                        .as_ref()
-                        .ok_or(ConfigurationRuntimeFailure::Unavailable)?,
-                )?;
+                let publication = self
+                    .configuration_publication
+                    .as_ref()
+                    .ok_or(ConfigurationRuntimeFailure::Unavailable)?;
+                let drift = self.with_catalog_operation(|| {
+                    runtime.record_fenced_drift_with(Arc::clone(&desired), publication)
+                })?;
                 self.state.transition(ProcessPhase::Fenced);
                 Ok(drift)
             },
