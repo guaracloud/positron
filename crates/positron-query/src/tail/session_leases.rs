@@ -150,12 +150,19 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
             .try_reserve_exact(secondary.len())
             .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
         let mut primary_grant = if let Some(replacement) = primary.as_mut() {
-            Some(
-                replacement
-                    .replacement
-                    .commit()
-                    .map_err(crate::execution_support::map_ledger_failure)?,
-            )
+            let grant = match self.service.maintenance {
+                Some(maintenance) => {
+                    let coordinator = maintenance
+                        .lock()
+                        .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
+                    replacement
+                        .replacement
+                        .commit_with_expiry_task(&coordinator)
+                },
+                None => replacement.replacement.commit(),
+            }
+            .map_err(crate::execution_support::map_ledger_failure)?;
+            Some(grant)
         } else {
             None
         };
@@ -163,7 +170,18 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
             let replacement = secondary
                 .get_mut(index)
                 .ok_or_else(super::super::internal)?;
-            match replacement.replacement.commit() {
+            let committed = match self.service.maintenance {
+                Some(maintenance) => {
+                    let coordinator = maintenance
+                        .lock()
+                        .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
+                    replacement
+                        .replacement
+                        .commit_with_expiry_task(&coordinator)
+                },
+                None => replacement.replacement.commit(),
+            };
+            match committed {
                 Ok(grant) => {
                     secondary_grants.push(Some(grant));
                     committed_secondary.push(index);
@@ -184,8 +202,11 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
                             if let Some(grant) =
                                 secondary_grants.get_mut(index).and_then(Option::take)
                             {
-                                let owner =
-                                    TailLeaseOwner::new(replacement.authority, grant.identity());
+                                let owner = TailLeaseOwner::new(
+                                    replacement.authority,
+                                    grant.identity(),
+                                    self.service.maintenance,
+                                );
                                 match self
                                     .source_lease_owners
                                     .replace(replacement.old_identity, owner)
@@ -211,8 +232,11 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
                             crate::execution_support::map_ledger_failure(failure),
                         );
                         if let Some(grant) = primary_grant.take() {
-                            let owner =
-                                TailLeaseOwner::new(replacement.authority, grant.identity());
+                            let owner = TailLeaseOwner::new(
+                                replacement.authority,
+                                grant.identity(),
+                                self.service.maintenance,
+                            );
                             let old = std::mem::replace(&mut self.lease_owner, owner);
                             drop(old);
                         } else {
@@ -227,7 +251,11 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
             }
         }
         if let (Some(replacement), Some(grant)) = (primary, primary_grant.take()) {
-            let owner = TailLeaseOwner::new(replacement.authority, grant.identity());
+            let owner = TailLeaseOwner::new(
+                replacement.authority,
+                grant.identity(),
+                self.service.maintenance,
+            );
             let old = std::mem::replace(&mut self.lease_owner, owner);
             self._lease = Some(grant);
             drop(old);
@@ -236,7 +264,11 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
             .into_iter()
             .zip(secondary_grants.into_iter().flatten())
         {
-            let owner = TailLeaseOwner::new(replacement.authority, grant.identity());
+            let owner = TailLeaseOwner::new(
+                replacement.authority,
+                grant.identity(),
+                self.service.maintenance,
+            );
             let old = self
                 .source_lease_owners
                 .replace(replacement.old_identity, owner)?;

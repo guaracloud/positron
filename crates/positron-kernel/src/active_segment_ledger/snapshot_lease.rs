@@ -6,10 +6,10 @@ use super::snapshot_lease_pending::{
     cleanup_expired_on_resume_failure, register_all, register_lease_reservation, remove_all,
 };
 use super::snapshot_lease_record::{
-    LeaseBlock, LeaseRecord, LeaseWindow, SnapshotLeaseId, SnapshotLeaseUsage, resume_marker_for,
-    valid_lease_interval, validate_active_lease,
+    LeaseBlock, LeaseRecord, LeaseWindow, SnapshotLeaseId, SnapshotLeaseUsage,
+    immutable_binding_object_id, resume_marker_for, valid_lease_interval, validate_active_lease,
 };
-use crate::{MaintenanceCoordinator, MaintenanceScope, WorkClaim, WorkKind};
+use crate::{MaintenanceCoordinator, MaintenanceScope, MaintenanceTaskId, WorkClaim, WorkKind};
 use std::collections::BTreeSet;
 #[path = "snapshot_lease_lifecycle.rs"]
 mod snapshot_lease_lifecycle;
@@ -19,8 +19,9 @@ use super::{ActiveSegmentLedger, LedgerCompletionState, LedgerFailure, LedgerFai
 use crate::CatalogGenerationId;
 pub(super) use snapshot_lease_support::map_catalog_failure;
 pub(super) use snapshot_lease_support::{
-    LeaseReservationTransaction, active_segments, expired_in_scope, publish_many,
-    publish_many_with_catalog_objects, reclamation_lease_expiry, records,
+    LeaseReservationTransaction, active_segments, expired_in_scope,
+    publish_lease_release_with_task_replacement, publish_many, publish_many_with_catalog_objects,
+    reclamation_lease_expiry, records,
 };
 use snapshot_lease_support::{
     fresh_identity, publish, reject_time_regression, remove_reservations, snapshot_from_record,
@@ -33,6 +34,16 @@ pub(super) const MAX_SNAPSHOT_LEASES: usize = 64;
 #[path = "snapshot_lease_tests.rs"]
 mod tests;
 impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
+    /// Returns the latest durable Catalog generation for an admission that
+    /// follows another coupled publication in the same query.
+    pub fn current_catalog_generation(&self) -> Result<CatalogGenerationId, LedgerFailure> {
+        self.catalog.refresh_state()?;
+        self.catalog
+            .pin()
+            .map(|snapshot| snapshot.identity())
+            .map_err(|failure| LedgerFailure::new(map_catalog_failure(failure.code())))
+    }
+
     /// Creates a durable lease for an already-admitted query task. The caller's
     /// query reservation covers construction CPU; the returned grant retains
     /// only resources that remain live with its immutable snapshot.
@@ -165,6 +176,12 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         if !valid_lease_interval(now, expiry) {
             return Err(LedgerFailure::new(LedgerFailureCode::InvalidInput));
         }
+        if let Some(expected_catalog) = expected_catalog {
+            self.catalog.refresh_state()?;
+            if self.catalog.pin()?.identity() != expected_catalog {
+                return Err(LedgerFailure::new(LedgerFailureCode::StaleGeneration));
+            }
+        }
         self.retry_pending_releases(&mut state)?;
         now = state.last_snapshot_lease_time.max(now);
         if !valid_lease_interval(now, expiry) {
@@ -172,9 +189,6 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         }
         self.catalog.refresh_state()?;
         let basis = self.catalog.pin()?;
-        if expected_catalog.is_some_and(|expected| expected != basis.identity()) {
-            return Err(LedgerFailure::new(LedgerFailureCode::StaleGeneration));
-        }
         let all_records = records(&basis)?;
         let expired = expired_in_scope(&all_records, self.scope, now);
         for record in all_records
@@ -211,24 +225,6 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         // leaving a catalog lease that no caller can release.
         let snapshot = snapshot_from_record(self, &state, &record)?;
         let encoded = encode(&record)?;
-        let expiry_submission = coordinator
-            .map(|coordinator| {
-                let lease_object = crate::CatalogObject::new(encoded.clone())?;
-                coordinator
-                    .prepare_snapshot_lease_expiry(
-                        identity,
-                        MaintenanceScope::segment(
-                            self.scope.tenant_id(),
-                            self.scope.signal_kind(),
-                            self.scope.shard_id(),
-                        ),
-                        lease_object.identity(),
-                        basis.number(),
-                        expiry,
-                    )
-                    .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))
-            })
-            .transpose()?;
         let claim = WorkClaim::tenant(
             self.scope.tenant,
             WorkKind::InteractiveQueryTail,
@@ -240,6 +236,27 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             .governor()
             .reserve(claim)
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
+        // Preparing a coordinator draft reserves bounded coordinator state.
+        // Do it only after the lease's own retained reservation has succeeded,
+        // so an admission refusal cannot strand an invisible descriptor slot.
+        let expiry_submission = coordinator
+            .map(|coordinator| {
+                let lease_object = immutable_binding_object_id(&record)?;
+                coordinator
+                    .prepare_snapshot_lease_expiry(
+                        identity,
+                        MaintenanceScope::segment(
+                            self.scope.tenant_id(),
+                            self.scope.signal_kind(),
+                            self.scope.shard_id(),
+                        ),
+                        lease_object,
+                        basis.number(),
+                        expiry,
+                    )
+                    .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))
+            })
+            .transpose()?;
         let state = &mut *state;
         let (reservations, pending) = (
             &mut state.lease_reservations,
@@ -550,5 +567,54 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         state.require_healthy()?;
         state.pending_lease_releases.register(identity)?;
         self.retry_pending_releases(&mut state)
+    }
+
+    /// Releases a coupled query lease and terminalizes exactly its durable
+    /// expiry descriptor in the same Catalog generation.
+    pub fn release_snapshot_lease_with_expiry_task(
+        &self,
+        coordinator: &MaintenanceCoordinator,
+        identity: SnapshotLeaseId,
+    ) -> Result<(), LedgerFailure> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
+        state.require_healthy()?;
+        self.catalog.refresh_state()?;
+        let basis = self.catalog.pin()?;
+        let record = records(&basis)?
+            .into_iter()
+            .find(|record| record.identity == identity && record.scope == self.scope);
+        let Some(record) = record else {
+            state.pending_lease_releases.register(identity)?;
+            return self.retry_pending_releases(&mut state);
+        };
+        let lease_object = immutable_binding_object_id(&record)?;
+        let cancellation = coordinator
+            .prepare_snapshot_lease_expiry_cancellation(identity, lease_object)
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::StaleGeneration))?;
+        let Some(cancellation) = cancellation else {
+            state.pending_lease_releases.register(identity)?;
+            return self.retry_pending_releases(&mut state);
+        };
+        publish_lease_release_with_task_replacement(
+            self.catalog,
+            &basis,
+            identity,
+            MaintenanceTaskId::new(identity.to_bytes())
+                .map_err(|_| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?,
+            cancellation
+                .catalog_object()
+                .map_err(|_| LedgerFailure::new(LedgerFailureCode::StaleGeneration))?,
+        )?;
+        cancellation
+            .install(coordinator)
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::StaleGeneration))?;
+        state.lease_reservations.remove(&identity);
+        state.lease_reservation_baselines.remove(&identity);
+        state.lease_resume_markers.remove(&identity);
+        state.pending_lease_releases.remove(identity);
+        Ok(())
     }
 }

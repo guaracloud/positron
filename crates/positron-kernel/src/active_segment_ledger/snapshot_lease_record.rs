@@ -196,6 +196,47 @@ pub(super) struct LeaseBlock {
     pub(super) segment: SegmentId,
 }
 
+/// Stable identity for work that acts on a Snapshot Lease. Mutable usage and
+/// delivery markers deliberately do not participate, so accounting updates
+/// cannot detach an already-published expiry descriptor from its lease.
+pub(super) fn immutable_binding_object_id(
+    record: &LeaseRecord,
+) -> Result<crate::CatalogObjectId, LedgerFailure> {
+    let capacity = 8_usize
+        .checked_add(16 + 16 + 1 + 4 + 32 + 8 + 8 + 8 + 1)
+        .and_then(|size| size.checked_add(record.blocks.len().checked_mul(40)?))
+        .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(capacity)
+        .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+    bytes.extend_from_slice(b"PMLB0001");
+    bytes.extend_from_slice(&record.identity.to_bytes());
+    bytes.extend_from_slice(&record.scope.tenant_id().to_bytes());
+    bytes.push(match record.scope.signal_kind() {
+        positron_domain::routing::SignalKind::Logs => 1,
+        positron_domain::routing::SignalKind::Traces => 2,
+    });
+    bytes.extend_from_slice(&record.scope.shard_id().value().to_be_bytes());
+    bytes.extend_from_slice(&record.catalog_identity.to_bytes());
+    bytes.extend_from_slice(&record.catalog_generation.to_be_bytes());
+    bytes.extend_from_slice(&record.frontier.value().to_be_bytes());
+    bytes.extend_from_slice(&record.observed_at.to_be_bytes());
+    bytes.extend_from_slice(&record.expiry.to_be_bytes());
+    bytes.push(
+        u8::try_from(record.blocks.len())
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?,
+    );
+    for block in &record.blocks {
+        bytes.extend_from_slice(&block.identity.to_bytes());
+        bytes.extend_from_slice(&block.position.value().to_be_bytes());
+        bytes.extend_from_slice(&block.segment.to_bytes());
+    }
+    crate::CatalogObject::new(bytes)
+        .map(|object| object.identity())
+        .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))
+}
+
 pub(super) fn valid_lease_interval(observed_at: u64, expiry: u64) -> bool {
     expiry
         .checked_sub(observed_at)
@@ -310,5 +351,21 @@ mod tests {
         assert_eq!(merged.memory_peak_bytes(), 9);
         assert_eq!(merged.scanned_bytes(), 8);
         assert_eq!(merged.wall_seconds(), 14);
+    }
+
+    #[test]
+    fn immutable_binding_excludes_usage_but_rejects_expiry_mutation() {
+        let mut lease = record(100, 200);
+        let binding = super::immutable_binding_object_id(&lease).expect("binding");
+        lease.usage = SnapshotLeaseUsage::new(1, 2, 3, 4, 5, 6, 7);
+        assert_eq!(
+            super::immutable_binding_object_id(&lease).expect("usage-stable binding"),
+            binding
+        );
+        lease.expiry = 201;
+        assert_ne!(
+            super::immutable_binding_object_id(&lease).expect("changed expiry binding"),
+            binding
+        );
     }
 }

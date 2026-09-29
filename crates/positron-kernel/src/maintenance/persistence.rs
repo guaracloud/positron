@@ -20,6 +20,38 @@ pub(crate) struct QueuedMaintenanceSubmission {
     record: MaintenanceTaskRecord,
 }
 
+/// A terminal replacement for the exact expiry record attached to a released
+/// Snapshot Lease. Like a queued submission, it stays opaque until the
+/// caller-owned Catalog proposal has committed.
+pub(crate) struct SnapshotLeaseExpiryCancellation {
+    before: TaskState,
+    after: TaskState,
+    next_terminal_order: u64,
+    record: MaintenanceTaskRecord,
+}
+
+impl SnapshotLeaseExpiryCancellation {
+    pub(crate) fn catalog_object(&self) -> Result<CatalogObject, MaintenanceFailure> {
+        self.record.catalog_object()
+    }
+
+    pub(crate) fn install(
+        self,
+        coordinator: &MaintenanceCoordinator,
+    ) -> Result<(), MaintenanceFailure> {
+        let mut state = coordinator
+            .state
+            .lock()
+            .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
+        if state.tasks.get(&self.before.task.identity) != Some(&self.before) {
+            return Err(MaintenanceFailure::PreconditionFailed);
+        }
+        state.tasks.insert(self.after.task.identity, self.after);
+        state.next_terminal_order = state.next_terminal_order.max(self.next_terminal_order);
+        Ok(())
+    }
+}
+
 impl QueuedMaintenanceSubmission {
     pub(crate) fn catalog_object(&self) -> Result<CatalogObject, MaintenanceFailure> {
         self.record.catalog_object()
@@ -50,6 +82,89 @@ impl QueuedMaintenanceSubmission {
 }
 
 impl MaintenanceCoordinator {
+    pub(crate) fn install_snapshot_lease_expiry_replacement(
+        &self,
+        cancellation: SnapshotLeaseExpiryCancellation,
+        submission: QueuedMaintenanceSubmission,
+    ) -> Result<(), MaintenanceFailure> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
+        if state.tasks.get(&cancellation.before.task.identity) != Some(&cancellation.before)
+            || !state
+                .pending_submissions
+                .remove(&submission.state.task.identity)
+            || state.tasks.contains_key(&submission.state.task.identity)
+        {
+            return Err(MaintenanceFailure::PreconditionFailed);
+        }
+        state
+            .tasks
+            .insert(cancellation.after.task.identity, cancellation.after);
+        state
+            .tasks
+            .insert(submission.state.task.identity, submission.state);
+        state.next_terminal_order = state
+            .next_terminal_order
+            .max(cancellation.next_terminal_order);
+        Ok(())
+    }
+
+    pub(crate) fn prepare_snapshot_lease_expiry_cancellation(
+        &self,
+        identity: crate::SnapshotLeaseId,
+        lease_object: crate::CatalogObjectId,
+    ) -> Result<Option<SnapshotLeaseExpiryCancellation>, MaintenanceFailure> {
+        let identity = MaintenanceTaskId::new(identity.to_bytes())?;
+        let expected_input = MaintenanceObjectId::new(lease_object.to_bytes())?;
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
+        let before = state
+            .tasks
+            .get(&identity)
+            .cloned()
+            .ok_or(MaintenanceFailure::UnknownTask)?;
+        if before.task.class != MaintenanceTaskClass::SnapshotLeaseExpiry
+            || before.task.inputs.as_slice() != [expected_input]
+        {
+            return Err(MaintenanceFailure::PreconditionFailed);
+        }
+        if matches!(
+            before.phase,
+            MaintenanceTaskPhase::Cancelled
+                | MaintenanceTaskPhase::Succeeded
+                | MaintenanceTaskPhase::Failed
+        ) {
+            return Ok(None);
+        }
+        if before.phase != MaintenanceTaskPhase::Queued {
+            return Err(MaintenanceFailure::InvalidTransition);
+        }
+        let mut next = state.clone();
+        let after = next
+            .tasks
+            .get_mut(&identity)
+            .ok_or(MaintenanceFailure::UnknownTask)?;
+        after.phase = MaintenanceTaskPhase::Cancelled;
+        after.cancellation_requested = false;
+        assign_terminal_order(&mut next, identity)?;
+        let after = next
+            .tasks
+            .get(&identity)
+            .cloned()
+            .ok_or(MaintenanceFailure::UnknownTask)?;
+        let record = encode_record(&after)?;
+        Ok(Some(SnapshotLeaseExpiryCancellation {
+            before,
+            after,
+            next_terminal_order: next.next_terminal_order,
+            record,
+        }))
+    }
+
     /// Prepares the one expiry task that must become reachable in the same
     /// Catalog generation as its Snapshot Lease. It deliberately makes no
     /// in-memory state visible until the lease publisher reports that commit.

@@ -407,6 +407,163 @@ pub(crate) fn publish_many_with_catalog_objects(
     .map(|_| ())
 }
 
+/// Atomically removes a lease and replaces only its matching maintenance
+/// descriptor. The Catalog remains the sole writer for both records.
+pub(crate) fn publish_lease_release_with_task_replacement(
+    catalog: &crate::Catalog<'_>,
+    basis: &crate::CatalogSnapshot,
+    lease: SnapshotLeaseId,
+    task: crate::MaintenanceTaskId,
+    replacement: CatalogObject,
+) -> Result<(), LedgerFailure> {
+    let mut objects = Vec::new();
+    objects
+        .try_reserve_exact(basis.object_count())
+        .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+    for bytes in basis.plaintext_objects() {
+        if decode(bytes)?.is_some_and(|record| record.identity == lease) {
+            continue;
+        }
+        if crate::maintenance::durable_task_record_identity(bytes)
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?
+            .is_some_and(|identity| identity == task)
+        {
+            continue;
+        }
+        objects.push(CatalogObject::new(bytes.to_vec())?);
+    }
+    objects.push(replacement);
+    let transaction = TransactionId::new(fresh_identity()?.to_bytes())?;
+    catalog
+        .commit(
+            basis.identity(),
+            CatalogProposal::new(
+                transaction,
+                basis
+                    .format_epoch()
+                    .unwrap_or(FormatEpoch::new(FORMAT_EPOCH)?),
+                objects,
+            )?,
+            None,
+        )
+        .map_err(|failure| LedgerFailure::new(map_catalog_failure(failure.code())))?;
+    Ok(())
+}
+
+pub(crate) fn publish_lease_replacement_with_task_replacements(
+    catalog: &crate::Catalog<'_>,
+    basis: &crate::CatalogSnapshot,
+    old_lease: SnapshotLeaseId,
+    new_lease: Vec<u8>,
+    old_task: crate::MaintenanceTaskId,
+    cancelled_task: CatalogObject,
+    new_task: CatalogObject,
+) -> Result<(), LedgerFailure> {
+    let cancelled_task_identity = cancelled_task.identity();
+    let new_task_identity = new_task.identity();
+    let mut objects = Vec::new();
+    objects
+        .try_reserve_exact(
+            basis
+                .object_count()
+                .checked_add(3)
+                .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?,
+        )
+        .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+    for bytes in basis.plaintext_objects() {
+        if decode(bytes)?.is_some_and(|record| record.identity == old_lease)
+            || crate::maintenance::durable_task_record_identity(bytes)
+                .map_err(|_| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?
+                .is_some_and(|identity| identity == old_task)
+        {
+            continue;
+        }
+        objects.push(CatalogObject::new(bytes.to_vec())?);
+    }
+    objects.push(CatalogObject::new(new_lease.clone())?);
+    objects.push(cancelled_task);
+    objects.push(new_task);
+    let transaction = TransactionId::new(fresh_identity()?.to_bytes())?;
+    match catalog.commit(
+        basis.identity(),
+        CatalogProposal::new(
+            transaction,
+            basis
+                .format_epoch()
+                .unwrap_or(FormatEpoch::new(FORMAT_EPOCH)?),
+            objects,
+        )?,
+        None,
+    ) {
+        Ok(_) => Ok(()),
+        Err(failure) => {
+            let code = map_catalog_failure(failure.code());
+            if code != LedgerFailureCode::StorageUnavailable {
+                return Err(LedgerFailure::new(code));
+            }
+            catalog
+                .refresh_state()
+                .map_err(|_| LedgerFailure::ambiguous(code))?;
+            let current = catalog.pin().map_err(|_| LedgerFailure::ambiguous(code))?;
+            let old_lease_removed = !records(&current)?
+                .iter()
+                .any(|record| record.identity == old_lease);
+            let new_lease_visible = current
+                .plaintext_objects()
+                .any(|bytes| bytes == new_lease.as_slice());
+            let cancellation_visible = current.object(cancelled_task_identity)?.is_some();
+            let submission_visible = current.object(new_task_identity)?.is_some();
+            if old_lease_removed && new_lease_visible && cancellation_visible && submission_visible
+            {
+                Ok(())
+            } else {
+                Err(LedgerFailure::new(code))
+            }
+        },
+    }
+}
+
+pub(crate) fn publish_lease_and_task_removals(
+    catalog: &crate::Catalog<'_>,
+    basis: &crate::CatalogSnapshot,
+    leases: &BTreeSet<SnapshotLeaseId>,
+) -> Result<(), LedgerFailure> {
+    let task_ids = leases
+        .iter()
+        .map(|identity| crate::MaintenanceTaskId::new(identity.to_bytes()))
+        .collect::<Result<BTreeSet<_>, _>>()
+        .map_err(|_| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?;
+    let mut objects = Vec::new();
+    objects
+        .try_reserve_exact(basis.object_count())
+        .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+    for bytes in basis.plaintext_objects() {
+        if decode(bytes)?.is_some_and(|record| leases.contains(&record.identity))
+            || crate::maintenance::durable_task_record_identity(bytes)
+                .map_err(|_| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?
+                .is_some_and(|identity| task_ids.contains(&identity))
+        {
+            continue;
+        }
+        objects.push(CatalogObject::new(bytes.to_vec())?);
+    }
+    let transaction = TransactionId::new(fresh_identity()?.to_bytes())?;
+    catalog
+        .commit(
+            basis.identity(),
+            CatalogProposal::new(
+                transaction,
+                basis
+                    .format_epoch()
+                    .unwrap_or(FormatEpoch::new(FORMAT_EPOCH)?),
+                objects,
+            )?,
+            None,
+        )
+        .map_err(|failure| LedgerFailure::new(map_catalog_failure(failure.code())))?;
+    Ok(())
+}
+
 pub(crate) fn publish_many_with_expected_catalog(
     catalog: &crate::Catalog<'_>,
     basis: &crate::CatalogSnapshot,

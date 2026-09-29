@@ -1,11 +1,11 @@
 use std::error::Error;
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Mutex};
 
 use positron_domain::routing::{SignalKind, VirtualShardId};
 use positron_domain::value::AttributeValueKind;
 use positron_kernel::{
-    ActiveSegmentLedger, CatalogPublicationFault, CommittedLedgerReader, PrincipalQuota,
-    ResourceAmounts, SegmentProtectionKey, SnapshotLeaseId, WorkClass,
+    ActiveSegmentLedger, CatalogPublicationFault, CommittedLedgerReader, MaintenanceCoordinator,
+    PrincipalQuota, ResourceAmounts, SegmentProtectionKey, SnapshotLeaseId, WorkClass,
     with_catalog_publication_fault_after, with_catalog_publication_fault_sequence_after,
 };
 use positron_query::{
@@ -30,6 +30,136 @@ impl positron_query::QueryWorkMeter for OperatorOverflowWorkMeter {
     ) -> Result<u64, positron_query::QueryWorkFailure> {
         Ok(u64::from(stage == positron_query::QueryWorkStage::Operators) * u64::MAX)
     }
+}
+
+#[test]
+fn tail_publishes_an_expiry_task_for_every_new_source_lease() -> Result<(), Box<dyn Error>> {
+    QueryFixture::scoped("tail-coupled-expiry-tasks", |fixture| {
+        let second = ActiveSegmentLedger::open(
+            fixture.kernel.authority,
+            fixture.kernel.catalog_for_test(),
+            positron_kernel::SegmentScope::new(
+                fixture
+                    .context
+                    .tenant_attribution()
+                    .ok_or("tenant")?
+                    .tenant_id(),
+                SignalKind::Logs,
+                VirtualShardId::new(2)?,
+            ),
+            SegmentProtectionKey::from_owned(Box::new([0x3a; 32])),
+        )?;
+        let sources =
+            TailSourceSet::new(vec![fixture.kernel.ledger()?.reader()?, second.reader()?])?;
+        let coordinator = Mutex::new(MaintenanceCoordinator::new());
+        fixture.kernel.append_log("initial", 1, 1)?;
+        let service = zero_work_clock_service(
+            fixture.kernel.authority.governor(),
+            fixture.kernel.ledger()?,
+            16,
+            TestClock::shared(100),
+        )
+        .with_maintenance_coordinator(&coordinator);
+        let query = service.plan_pipeline(
+            fixture.context,
+            "pipeline:v1 logs | range query_time -100 100 | limit all",
+            QueryBudget::new(1_048_576, 16, 4, 1_048_576, 1_048_576, 60)?,
+        )?;
+        let _tail = service.tail_with_sources(query, TailStart::Now, sources)?;
+        let coordinator = coordinator.lock().map_err(|_| "maintenance lock")?;
+        assert_eq!(
+            coordinator
+                .durable_records()
+                .expect("tail expiry tasks persist")
+                .len(),
+            2
+        );
+        Ok(())
+    })
+}
+
+#[test]
+fn released_tail_lease_cancels_its_expiry_task_before_the_due_time() -> Result<(), Box<dyn Error>> {
+    QueryFixture::scoped("tail-release-coupled-expiry", |fixture| {
+        let coordinator = Mutex::new(MaintenanceCoordinator::new());
+        let service = zero_work_clock_service(
+            fixture.kernel.authority.governor(),
+            fixture.kernel.ledger()?,
+            16,
+            TestClock::shared(100),
+        )
+        .with_maintenance_coordinator(&coordinator);
+        let query = service.plan_pipeline(
+            fixture.context,
+            "pipeline:v1 logs | range query_time -100 100 | limit all",
+            QueryBudget::new(1_048_576, 16, 4, 1_048_576, 1_048_576, 60)?,
+        )?;
+        let tail = service.tail(query, TailStart::Now)?;
+        drop(tail);
+        assert!(
+            coordinator
+                .lock()
+                .map_err(|_| "maintenance lock")?
+                .start_next_with_reservation_and_persist(
+                    fixture.kernel.catalog_for_test(),
+                    fixture.kernel.authority,
+                    160,
+                    false,
+                )
+                .expect("maintenance dispatch")
+                .is_none(),
+            "a released lease has no due expiry work to dispatch"
+        );
+        Ok(())
+    })
+}
+
+#[test]
+fn live_tail_lease_roll_replaces_its_expiry_descriptor() -> Result<(), Box<dyn Error>> {
+    QueryFixture::scoped("tail-roll-coupled-expiry", |fixture| {
+        let coordinator = Mutex::new(MaintenanceCoordinator::new());
+        fixture.kernel.append_log("initial", 1, 1)?;
+        let service = zero_work_clock_service(
+            fixture.kernel.authority.governor(),
+            fixture.kernel.ledger()?,
+            16,
+            TestClock::shared(100),
+        )
+        .with_maintenance_coordinator(&coordinator);
+        let query = service.plan_pipeline(
+            fixture.context,
+            "pipeline:v1 logs | range query_time -100 100 | limit all",
+            QueryBudget::new(1_048_576, 16, 4, 1_048_576, 1_048_576, 60)?,
+        )?;
+        let mut tail = service.tail(query, TailStart::Historical { max_rows: 4 })?;
+        assert!(matches!(tail.poll(), Some(TailEvent::Header(_))));
+        let Some(TailEvent::Batch(initial)) = tail.poll() else {
+            return Err("initial tail batch missing".into());
+        };
+        tail.acknowledge(initial.sequence(), initial.digest())?;
+        let idle = tail.poll();
+        if !matches!(idle, Some(TailEvent::Idle)) {
+            return Err(
+                format!("tail did not settle after its acknowledged history: {idle:?}").into(),
+            );
+        }
+        fixture.kernel.append_log("rolled", 2, 2)?;
+        let event = tail.poll();
+        if !matches!(event, Some(TailEvent::Batch(_))) {
+            return Err(format!("rolled tail batch missing: {event:?}").into());
+        }
+        assert_eq!(
+            coordinator
+                .lock()
+                .map_err(|_| "maintenance lock")?
+                .durable_records()
+                .expect("durable expiry records")
+                .len(),
+            2,
+            "the old lease has terminal evidence and the replacement has queued expiry work"
+        );
+        Ok(())
+    })
 }
 
 #[test]

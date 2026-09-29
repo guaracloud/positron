@@ -3,7 +3,9 @@ use std::collections::BTreeSet;
 use super::super::capacity::lease_claim;
 use super::super::snapshot_lease_codec::encode;
 use super::super::snapshot_lease_record::LeaseRecord;
-use super::snapshot_lease_support::{map_catalog_failure, publish, publish_many, records};
+use super::snapshot_lease_support::{
+    map_catalog_failure, publish_lease_and_task_removals, publish_many, records,
+};
 use super::{ActiveSegmentLedger, LedgerFailure, LedgerFailureCode};
 use crate::{WorkClaim, WorkKind};
 
@@ -29,7 +31,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             .map(|record| record.identity)
             .collect::<BTreeSet<_>>();
         if !remove.is_empty() {
-            publish(self.catalog, &basis, &remove, None)?;
+            publish_lease_and_task_removals(self.catalog, &basis, &remove)?;
         }
         for identity in pending {
             state.lease_reservations.remove(&identity);

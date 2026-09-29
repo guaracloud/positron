@@ -108,14 +108,30 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 now,
                 Some((catalog_identity, generation)),
             )?;
-            let owner = TailLeaseOwner::new(self.ledger, lease.identity());
+            let owner = TailLeaseOwner::new(self.ledger, lease.identity(), self.maintenance);
             (lease, owner)
         } else {
-            let lease = self
-                .ledger
-                .create_snapshot_lease_for_at_catalog(now, lease_ttl, catalog_identity)
-                .map_err(crate::execution_support::map_ledger_failure)?;
-            let owner = TailLeaseOwner::new(self.ledger, lease.identity());
+            let lease = match self.maintenance {
+                Some(maintenance) => {
+                    let coordinator = maintenance
+                        .lock()
+                        .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
+                    self.ledger
+                        .create_snapshot_lease_for_at_catalog_with_expiry_task(
+                            &coordinator,
+                            now,
+                            lease_ttl,
+                            catalog_identity,
+                        )
+                },
+                None => self.ledger.create_snapshot_lease_for_at_catalog(
+                    now,
+                    lease_ttl,
+                    catalog_identity,
+                ),
+            }
+            .map_err(crate::execution_support::map_ledger_failure)?;
+            let owner = TailLeaseOwner::new(self.ledger, lease.identity(), self.maintenance);
             (lease, owner)
         };
         let lease_usage_before = lease.usage();
@@ -137,9 +153,23 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 let authority = reader
                     .lease_authority()
                     .ok_or_else(|| QueryFailure::new(QueryFailureCode::StoreUnavailable))?;
-                let source_lease = authority
-                    .create_snapshot_lease_for(now, lease_ttl)
-                    .map_err(crate::execution_support::map_ledger_failure)?;
+                let source_lease = match self.maintenance {
+                    Some(maintenance) => {
+                        let coordinator = maintenance
+                            .lock()
+                            .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
+                        authority.create_snapshot_lease_for_at_catalog_with_expiry_task(
+                            &coordinator,
+                            now,
+                            lease_ttl,
+                            authority
+                                .current_catalog_generation()
+                                .map_err(crate::execution_support::map_ledger_failure)?,
+                        )
+                    },
+                    None => authority.create_snapshot_lease_for(now, lease_ttl),
+                }
+                .map_err(crate::execution_support::map_ledger_failure)?;
                 (authority, Some(source_lease))
             };
             let lease_id = source_lease
@@ -151,7 +181,11 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             );
             bindings.push(TailSourceBinding::new(shard, lease_id, frontier));
             if let Some(source_lease) = source_lease {
-                source_lease_owners.push(TailLeaseOwner::new(authority, source_lease.identity()));
+                source_lease_owners.push(TailLeaseOwner::new(
+                    authority,
+                    source_lease.identity(),
+                    self.maintenance,
+                ));
                 source_lease_grants.push(source_lease);
             }
         }

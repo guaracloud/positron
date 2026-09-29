@@ -19,6 +19,12 @@ mod record;
 
 use record::{decode_record, encode_record};
 
+pub(crate) fn durable_task_record_identity(
+    bytes: &[u8],
+) -> Result<Option<MaintenanceTaskId>, MaintenanceFailure> {
+    record::record_identity(bytes)
+}
+
 const MAX_MAINTENANCE_TASKS: usize = 128;
 const MAX_TASK_OBJECTS: usize = 16;
 const MAX_CHECKPOINT_BYTES: usize = 4_096;
@@ -64,7 +70,7 @@ struct MaintenanceWindow {
     until: u64,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Eq, PartialEq)]
 struct TaskState {
     task: MaintenanceTask,
     phase: MaintenanceTaskPhase,

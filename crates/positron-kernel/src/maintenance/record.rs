@@ -454,7 +454,7 @@ mod tests {
         let state = TaskState {
             task: MaintenanceTask::with_contract_not_before(
                 MaintenanceTaskId::new([7; 16]).expect("identity"),
-                MaintenanceTaskClass::SnapshotLeaseExpiry,
+                MaintenanceTaskClass::SchemaPromotion,
                 MaintenanceScope::system(),
                 MaintenanceTrigger::Scheduled,
                 MaintenancePreconditions::new(3, 1).expect("preconditions"),
@@ -480,9 +480,45 @@ mod tests {
         legacy.drain(45..53);
         let decoded = decode_record(&legacy).expect("v2 decoding");
         assert_eq!(decoded.task.not_before(), 0);
-        assert_eq!(
-            decoded.task.class(),
-            MaintenanceTaskClass::SnapshotLeaseExpiry
+        assert_eq!(decoded.task.class(), MaintenanceTaskClass::SchemaPromotion);
+    }
+
+    #[test]
+    fn snapshot_lease_expiry_rejects_noncanonical_durable_contracts() {
+        let identity = MaintenanceTaskId::new([7; 16]).expect("identity");
+        let preconditions = MaintenancePreconditions::new(3, 1).expect("preconditions");
+        let reservation = ResourceAmounts::new([1, 1, 1, 0, 1, 0, 1, 1, 1, 1, 0]);
+        assert!(
+            MaintenanceTask::with_contract_not_before(
+                identity,
+                MaintenanceTaskClass::SnapshotLeaseExpiry,
+                MaintenanceScope::system(),
+                MaintenanceTrigger::Scheduled,
+                preconditions,
+                vec![MaintenanceObjectId::new([8; 32]).expect("object")],
+                Vec::new(),
+                reservation,
+                9,
+            )
+            .is_err()
+        );
+        assert!(
+            MaintenanceTask::with_contract_not_before(
+                identity,
+                MaintenanceTaskClass::SnapshotLeaseExpiry,
+                MaintenanceScope::segment(
+                    positron_domain::identity::TenantId::from_bytes([9; 16]).expect("tenant"),
+                    positron_domain::routing::SignalKind::Logs,
+                    positron_domain::routing::VirtualShardId::new(1).expect("shard"),
+                ),
+                MaintenanceTrigger::Scheduled,
+                preconditions,
+                vec![MaintenanceObjectId::new([8; 32]).expect("object")],
+                Vec::new(),
+                reservation,
+                9,
+            )
+            .is_ok()
         );
     }
 }

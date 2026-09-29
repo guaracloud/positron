@@ -360,6 +360,17 @@ impl MaintenanceTask {
         {
             return Err(MaintenanceFailure::InvalidInput);
         }
+        if class == MaintenanceTaskClass::SnapshotLeaseExpiry
+            && (!matches!(scope, MaintenanceScope::Segment { .. })
+                || trigger != MaintenanceTrigger::Scheduled
+                || preconditions.resource_generation != 1
+                || inputs.len() != 1
+                || !outputs.is_empty()
+                || reservations != ResourceAmounts::new([1, 1, 1, 0, 1, 0, 1, 1, 1, 1, 0])
+                || not_before == 0)
+        {
+            return Err(MaintenanceFailure::InvalidInput);
+        }
         Ok(Self {
             identity,
             class,

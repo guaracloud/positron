@@ -148,6 +148,22 @@ fn production_query_publishes_a_durable_snapshot_lease_expiry_task() -> Result<(
         1,
         "the runtime query path asks the kernel lease publisher to atomically create expiry work"
     );
+    let catalog = open_catalog(&initialized)?;
+    assert!(
+        initialized
+            .maintenance_coordinator()
+            .lock()
+            .map_err(|_| "maintenance lock")?
+            .start_next_with_reservation_and_persist(
+                &catalog,
+                &initialized._authority,
+                u64::MAX,
+                false,
+            )
+            .expect("released query expiry task is terminal")
+            .is_none(),
+        "collecting the ordinary query releases its lease and cancels its paired expiry task"
+    );
     Ok(())
 }
 

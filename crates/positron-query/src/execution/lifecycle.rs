@@ -92,27 +92,30 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         let (admission, identity, target_identity) = resources.into_stream();
         let cancellation = state.cancellation.clone();
         let target_ledger = self.trace_ledger;
+        let maintenance = self.maintenance;
         let mut source_identity = Some(identity);
         let mut target_identity = target_identity;
         let release = Box::new(move || {
             let target_failure = match (target_identity, target_ledger) {
-                (Some(identity), Some(ledger)) => match ledger.release_snapshot_lease(identity) {
-                    Ok(()) => {
-                        target_identity = None;
-                        None
-                    },
-                    Err(failure) => Some(map_ledger_failure(failure)),
+                (Some(identity), Some(ledger)) => {
+                    match release_lease(ledger, maintenance, identity) {
+                        Ok(()) => {
+                            target_identity = None;
+                            None
+                        },
+                        Err(failure) => Some(failure),
+                    }
                 },
                 (Some(_), None) => Some(QueryFailure::new(crate::QueryFailureCode::Internal)),
                 (None, _) => None,
             };
             let source_failure = match source_identity {
-                Some(identity) => match ledger.release_snapshot_lease(identity) {
+                Some(identity) => match release_lease(ledger, maintenance, identity) {
                     Ok(()) => {
                         source_identity = None;
                         None
                     },
-                    Err(failure) => Some(map_ledger_failure(failure)),
+                    Err(failure) => Some(failure),
                 },
                 None => None,
             };
@@ -133,5 +136,25 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             cancellation,
             Some(admission),
         ))
+    }
+}
+
+fn release_lease(
+    ledger: &positron_kernel::ActiveSegmentLedger<'_, '_>,
+    maintenance: Option<&std::sync::Mutex<positron_kernel::MaintenanceCoordinator>>,
+    identity: positron_kernel::SnapshotLeaseId,
+) -> Result<(), QueryFailure> {
+    match maintenance {
+        Some(maintenance) => {
+            let coordinator = maintenance
+                .lock()
+                .map_err(|_| QueryFailure::new(crate::QueryFailureCode::Internal))?;
+            ledger
+                .release_snapshot_lease_with_expiry_task(&coordinator, identity)
+                .map_err(map_ledger_failure)
+        },
+        None => ledger
+            .release_snapshot_lease(identity)
+            .map_err(map_ledger_failure),
     }
 }

@@ -2,16 +2,18 @@ use std::collections::BTreeSet;
 
 use super::capacity::lease_claim;
 use super::snapshot_lease::snapshot_lease_support::{
-    LeaseReservationTransaction, fresh_identity, publish_many_with_expected_catalog, records,
-    snapshot_from_record,
+    LeaseReservationTransaction, fresh_identity, publish_lease_replacement_with_task_replacements,
+    publish_many_with_expected_catalog, records, snapshot_from_record,
 };
 use super::snapshot_lease_codec::decode;
 use super::snapshot_lease_codec::encode;
 use super::snapshot_lease_grant::SnapshotLeaseGrant;
 use super::snapshot_lease_record::{
     LeaseBlock, LeaseRecord, LeaseWindow, SnapshotLeaseId, SnapshotLeaseUsage,
+    immutable_binding_object_id,
 };
 use super::{ActiveSegmentLedger, LedgerFailure, LedgerFailureCode};
+use crate::{MaintenanceCoordinator, MaintenanceScope, MaintenanceTaskId};
 
 /// A prepared replacement keeps the old durable lease authoritative until the
 /// caller has authenticated the candidate cursor. Dropping it releases only
@@ -118,6 +120,115 @@ impl<'lease, 'kernel, 'catalog> SnapshotLeaseReplacement<'lease, 'kernel, 'catal
             .insert(self.new_identity, reservation);
         state.lease_resume_markers.remove(&self.old_identity);
         state.last_snapshot_lease_time = state.last_snapshot_lease_time.max(self.observed_at);
+        self.committed = true;
+        self.grant
+            .take()
+            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))
+    }
+
+    /// Commits a live lease roll together with the old lease's terminal
+    /// descriptor and the new lease's queued descriptor.
+    pub fn commit_with_expiry_task(
+        &mut self,
+        coordinator: &MaintenanceCoordinator,
+    ) -> Result<SnapshotLeaseGrant<'kernel>, LedgerFailure> {
+        if self.committed || self.grant.is_none() {
+            return Err(LedgerFailure::new(LedgerFailureCode::InvalidInput));
+        }
+        let mut state = self
+            .ledger
+            .state
+            .lock()
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
+        state.require_healthy()?;
+        if self.expiry <= state.last_snapshot_lease_time
+            || self.observed_at < state.last_snapshot_lease_time
+        {
+            return Err(LedgerFailure::new(LedgerFailureCode::SnapshotExpired));
+        }
+        self.ledger.retry_pending_releases(&mut state)?;
+        if state.lease_reservations.contains_key(&self.new_identity) {
+            return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
+        }
+        self.ledger.catalog.refresh_state()?;
+        let basis = self.ledger.catalog.pin()?;
+        let old_record = records(&basis)?
+            .into_iter()
+            .find(|record| {
+                record.identity == self.old_identity && record.scope == self.ledger.scope
+            })
+            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::SnapshotExpired))?;
+        if !basis
+            .plaintext_objects()
+            .any(|bytes| bytes == self.old_encoded.as_slice())
+            || !state.lease_reservations.contains_key(&self.old_identity)
+        {
+            return Err(LedgerFailure::new(LedgerFailureCode::ConcurrentWriter));
+        }
+        let new_record = decode(&self.encoded)?
+            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?;
+        let cancellation = coordinator
+            .prepare_snapshot_lease_expiry_cancellation(
+                self.old_identity,
+                immutable_binding_object_id(&old_record)?,
+            )
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::StaleGeneration))?
+            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::StaleGeneration))?;
+        let submission = coordinator
+            .prepare_snapshot_lease_expiry(
+                self.new_identity,
+                MaintenanceScope::segment(
+                    self.ledger.scope.tenant_id(),
+                    self.ledger.scope.signal_kind(),
+                    self.ledger.scope.shard_id(),
+                ),
+                immutable_binding_object_id(&new_record)?,
+                basis.number(),
+                self.expiry,
+            )
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
+        let amounts = lease_claim(self.encoded.len())?;
+        let transaction = LeaseReservationTransaction::begin(&mut state, self.old_identity)?;
+        if let Err(failure) = transaction.resize(&mut state, amounts) {
+            transaction.cancel(&mut state);
+            submission.discard(coordinator);
+            return Err(failure);
+        }
+        let publication = publish_lease_replacement_with_task_replacements(
+            self.ledger.catalog,
+            &basis,
+            self.old_identity,
+            self.encoded.clone(),
+            MaintenanceTaskId::new(self.old_identity.to_bytes())
+                .map_err(|_| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?,
+            cancellation
+                .catalog_object()
+                .map_err(|_| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?,
+            submission
+                .catalog_object()
+                .map_err(|_| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?,
+        );
+        if let Err(failure) = publication {
+            submission.discard(coordinator);
+            return Err(rollback_after_replacement_failure(
+                &mut state,
+                transaction,
+                failure,
+            ));
+        }
+        let reservation = state
+            .lease_reservations
+            .remove(&self.old_identity)
+            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?;
+        transaction.commit(&mut state);
+        state
+            .lease_reservations
+            .insert(self.new_identity, reservation);
+        state.lease_resume_markers.remove(&self.old_identity);
+        state.last_snapshot_lease_time = state.last_snapshot_lease_time.max(self.observed_at);
+        coordinator
+            .install_snapshot_lease_expiry_replacement(cancellation, submission)
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::RecoveryRequired))?;
         self.committed = true;
         self.grant
             .take()
@@ -297,8 +408,8 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         let record = LeaseRecord {
             identity: new_identity,
             scope: self.scope,
-            catalog_identity: old_record.catalog_identity,
-            catalog_generation: old_record.catalog_generation,
+            catalog_identity: basis.identity(),
+            catalog_generation: basis.number(),
             frontier: state.frontier,
             observed_at: now,
             expiry,
