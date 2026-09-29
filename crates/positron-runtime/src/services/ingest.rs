@@ -73,6 +73,7 @@ pub(super) fn ingest_native_batch(
     // Catalog writer only after planning and keep it through the final ledger
     // publications, so a lifecycle transition cannot pass the final identity
     // check and interleave with append while unrelated planning is blocked.
+    let _catalog_operation = services.catalog_operation()?;
     let catalog = open_catalog(instance)?;
     let snapshot = catalog
         .pin()
@@ -161,6 +162,7 @@ fn ingest_native_trace_batch(
             .with_additional_rejections(request_rejections)
             .with_limit_rejections(limit_rejections));
     }
+    let _catalog_operation = services.catalog_operation()?;
     let catalog = open_catalog(instance)?;
     let snapshot = catalog
         .pin()

@@ -208,6 +208,7 @@ impl ServiceHandle {
         &self,
         tenant: positron_domain::identity::TenantId,
     ) -> Result<IngestPolicyServingSnapshot, ServiceFailure> {
+        let _catalog_operation = self.catalog_operation()?;
         let instance = &self.instance;
         let catalog = Catalog::open(
             &instance._authority,
@@ -247,6 +248,9 @@ impl ServiceHandle {
         key: AdministrativeIdempotencyKey,
         candidate: IngestPolicy,
     ) -> Result<IngestPolicyActivation, PolicyActivationDurableFailure> {
+        let _catalog_operation = self
+            .catalog_operation()
+            .map_err(|_| PolicyActivationDurableFailure::Unavailable)?;
         let instance = &self.instance;
         let tenant = context
             .tenant_attribution()

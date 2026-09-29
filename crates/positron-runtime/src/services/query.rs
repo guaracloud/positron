@@ -43,6 +43,7 @@ pub(super) fn query_events_for_test(
     budget: QueryBudget,
     page_limit: Option<u16>,
 ) -> Result<QueryTestOutcome, ServiceFailure> {
+    let _catalog_operation = services.catalog_operation()?;
     let instance = &services.instance;
     let catalog = Catalog::open(
         &instance._authority,
@@ -107,6 +108,7 @@ pub(super) fn resume_query_events_for_test(
     shard: positron_domain::routing::VirtualShardId,
     batch_limit: u16,
 ) -> Result<QueryTestOutcome, ServiceFailure> {
+    let _catalog_operation = services.catalog_operation()?;
     let instance = &services.instance;
     let catalog = Catalog::open(
         &instance._authority,
@@ -154,6 +156,7 @@ pub(super) fn query_log_bodies(
     source: &str,
     budget: QueryBudget,
 ) -> Result<Vec<String>, ServiceFailure> {
+    let _catalog_operation = services.catalog_operation()?;
     let instance = &services.instance;
     let initial_identity = instance
         .durable_identity()
@@ -201,6 +204,7 @@ pub(super) fn query_log_bodies(
         Some(resolver) => service.with_export_destination_resolver(Arc::clone(resolver)),
         None => service,
     };
+    services.notify_maintenance_worker();
     let query = service
         .plan_pipeline(context, source, budget)
         .map_err(|failure| map_query_failure(&failure))?;

@@ -252,6 +252,159 @@ fn runtime_maintenance_worker_wake_dispatches_and_completes_a_due_snapshot_lease
 }
 
 #[test]
+fn cancellation_after_maintenance_dispatch_preserves_the_lease_for_recovery()
+-> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let (mut initialized, _, _) = fixture.initialized()?;
+    let (retention_time, elapsed) =
+        RetentionTimeAuthority::establish_with_manual_elapsed(UnixNanoseconds::new(10_000_000_000));
+    Arc::get_mut(&mut initialized)
+        .ok_or("sole initialized instance")?
+        .install_retention_time_for_test(retention_time)?;
+    let services = ServiceHandle::new(Arc::clone(&initialized))?;
+    let scope = SegmentScope::new(
+        initialized.tenant,
+        positron_domain::routing::SignalKind::Logs,
+        initialized.logs_shard,
+    );
+    let catalog = open_catalog(&initialized)?;
+    let identity = positron_governance::Identity::open(&catalog.pin()?)?;
+    let protection = super::super::tenant_segment_key(&initialized, &identity, scope)?;
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
+        &initialized._authority,
+        &initialized.retention_time,
+        &catalog,
+        scope,
+        protection,
+    )?;
+    let coordinator = initialized
+        .maintenance_coordinator()
+        .lock()
+        .map_err(|_| "maintenance lock")?;
+    let lease = ledger.create_snapshot_lease_for_at_catalog_with_expiry_task(
+        &coordinator,
+        0,
+        std::num::NonZeroU64::new(1).ok_or("nonzero ttl")?,
+        catalog.pin()?.identity(),
+    )?;
+    let lease_id = lease.identity();
+    let task = MaintenanceTaskId::new(lease_id.to_bytes()).expect("lease task id");
+    drop(lease);
+    drop(coordinator);
+    drop(ledger);
+    drop(catalog);
+    elapsed.advance(1_000_000_000)?;
+
+    let cancellation = crate::TaskCancellation::new();
+    cancellation.cancel_after_polls(2);
+    assert!(matches!(
+        services.wake_maintenance_worker_with_cancellation(&cancellation),
+        Err(ServiceFailure::Cancelled)
+    ));
+
+    assert_eq!(
+        initialized
+            .maintenance_coordinator()
+            .lock()
+            .map_err(|_| "maintenance lock")?
+            .status(task)
+            .expect("running task")
+            .phase(),
+        MaintenanceTaskPhase::Running
+    );
+    drop(services);
+
+    let recovered = ServiceHandle::new(Arc::clone(&initialized))?;
+    assert_eq!(
+        initialized
+            .maintenance_coordinator()
+            .lock()
+            .map_err(|_| "maintenance lock")?
+            .status(task)
+            .expect("recovered task")
+            .phase(),
+        MaintenanceTaskPhase::Queued
+    );
+    drop(recovered);
+    Ok(())
+}
+
+#[test]
+fn runtime_worker_wakes_for_a_poststart_future_lease_expiry() -> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let (mut initialized, _, _) = fixture.initialized()?;
+    let (retention_time, elapsed) =
+        RetentionTimeAuthority::establish_with_manual_elapsed(UnixNanoseconds::new(10_000_000_000));
+    Arc::get_mut(&mut initialized)
+        .ok_or("sole initialized instance")?
+        .install_retention_time_for_test(retention_time)?;
+    let services = ServiceHandle::new(Arc::clone(&initialized))?;
+    let cancellation = crate::TaskCancellation::new();
+    let worker_services = services.clone();
+    let worker_cancellation = cancellation.clone();
+    let worker =
+        std::thread::spawn(move || worker_services.run_maintenance_worker(&worker_cancellation));
+
+    let scope = SegmentScope::new(
+        initialized.tenant,
+        positron_domain::routing::SignalKind::Logs,
+        initialized.logs_shard,
+    );
+    let catalog_operation = services.catalog_operation()?;
+    let catalog = open_catalog(&initialized)?;
+    let identity = positron_governance::Identity::open(&catalog.pin()?)?;
+    let protection = super::super::tenant_segment_key(&initialized, &identity, scope)?;
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
+        &initialized._authority,
+        &initialized.retention_time,
+        &catalog,
+        scope,
+        protection,
+    )?;
+    let coordinator = initialized
+        .maintenance_coordinator()
+        .lock()
+        .map_err(|_| "maintenance lock")?;
+    let lease = ledger.create_snapshot_lease_for_at_catalog_with_expiry_task(
+        &coordinator,
+        0,
+        std::num::NonZeroU64::new(1).ok_or("nonzero ttl")?,
+        catalog.pin()?.identity(),
+    )?;
+    let task = MaintenanceTaskId::new(lease.identity().to_bytes()).expect("lease task id");
+    drop(lease);
+    drop(coordinator);
+    drop(ledger);
+    drop(catalog);
+    drop(catalog_operation);
+
+    elapsed.advance(1_000_000_000)?;
+    services.notify_maintenance_worker();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while initialized
+        .maintenance_coordinator()
+        .lock()
+        .map_err(|_| "maintenance lock")?
+        .status(task)
+        .map_err(|_| "maintenance task status")?
+        .phase()
+        != MaintenanceTaskPhase::Succeeded
+    {
+        if Instant::now() >= deadline {
+            cancellation.cancel();
+            return Err("runtime maintenance worker did not wake for poststart expiry work".into());
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    cancellation.cancel();
+    assert_eq!(
+        worker.join().map_err(|_| "maintenance worker panicked")?,
+        Ok(())
+    );
+    Ok(())
+}
+
+#[test]
 fn native_runtime_worker_expires_a_durable_lease_and_joins_before_reopen()
 -> Result<(), Box<dyn Error>> {
     let fixture = Fixture::new()?;

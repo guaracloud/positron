@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 use positron_governance::{
     AuthorizedContext, CompatibilityHints, Identity, PresentedCredential, RequestedIntent,
@@ -68,6 +68,11 @@ mod tests;
 pub struct ServiceHandle {
     schema_sessions: TenantSchemaRegistry,
     shutdown_schema_capacity: Arc<Mutex<Option<TransferredResourceReservation>>>,
+    // Catalog::open deliberately owns the Kernel's sole writer lease. Runtime
+    // entrypoints share this gate so foreground work and maintenance wait
+    // cooperatively instead of racing the lease and surfacing false outages.
+    catalog_operation: Arc<Mutex<()>>,
+    maintenance_wake: maintenance::MaintenanceWake,
     export_destination_resolver: Option<Arc<dyn positron_query::ExportDestinationResolver>>,
     #[cfg(test)]
     receiver_test_backend: Arc<Mutex<Option<Arc<dyn ReceiverTestBackend>>>>,
@@ -118,17 +123,45 @@ impl std::fmt::Debug for ServiceHandle {
 }
 
 impl ServiceHandle {
+    #[cfg(test)]
     pub(crate) fn wake_maintenance_worker(&self) -> Result<bool, ServiceFailure> {
-        maintenance::wake_snapshot_lease_expiry(&self.instance)
+        maintenance::wake_snapshot_lease_expiry(self, None)
+    }
+
+    pub(crate) fn wake_maintenance_worker_with_cancellation(
+        &self,
+        cancellation: &crate::TaskCancellation,
+    ) -> Result<bool, ServiceFailure> {
+        maintenance::wake_snapshot_lease_expiry(self, Some(cancellation))
     }
 
     pub(crate) fn run_maintenance_worker(
         &self,
         cancellation: &crate::TaskCancellation,
     ) -> Result<(), ServiceFailure> {
-        maintenance::run_snapshot_lease_expiry_worker(cancellation, || {
-            self.wake_maintenance_worker()
+        maintenance::run_snapshot_lease_expiry_worker(cancellation, &self.maintenance_wake, || {
+            self.wake_maintenance_worker_with_cancellation(cancellation)
         })
+    }
+
+    pub(crate) fn catalog_operation(&self) -> Result<MutexGuard<'_, ()>, ServiceFailure> {
+        self.catalog_operation
+            .lock()
+            .map_err(|_| ServiceFailure::Internal)
+    }
+
+    pub(crate) fn try_catalog_operation(
+        &self,
+    ) -> Result<Option<MutexGuard<'_, ()>>, ServiceFailure> {
+        match self.catalog_operation.try_lock() {
+            Ok(operation) => Ok(Some(operation)),
+            Err(TryLockError::WouldBlock) => Ok(None),
+            Err(TryLockError::Poisoned(_)) => Err(ServiceFailure::Internal),
+        }
+    }
+
+    pub(crate) fn notify_maintenance_worker(&self) {
+        self.maintenance_wake.notify();
     }
     #[allow(dead_code)]
     pub(crate) fn new(instance: Arc<InitializedInstance>) -> Result<Self, ServiceFailure> {
@@ -163,6 +196,8 @@ impl ServiceHandle {
         Ok(Self {
             schema_sessions: recovered.registry,
             shutdown_schema_capacity: Arc::new(Mutex::new(None)),
+            catalog_operation: Arc::new(Mutex::new(())),
+            maintenance_wake: maintenance::MaintenanceWake::for_instance(instance.instance),
             export_destination_resolver,
             #[cfg(test)]
             receiver_test_backend: Arc::new(Mutex::new(None)),
@@ -178,6 +213,7 @@ impl ServiceHandle {
         if self.schema_session_with_checkpoint_changes()?.is_none() {
             return Ok(());
         }
+        let _catalog_operation = self.catalog_operation()?;
         let capacity = schema_maintenance::reserve_shutdown_capacity(&self.instance)?;
         *self
             .shutdown_schema_capacity
@@ -190,6 +226,7 @@ impl ServiceHandle {
         let Some(session) = self.schema_session_with_checkpoint_changes()? else {
             return Ok(());
         };
+        let _catalog_operation = self.catalog_operation()?;
         let capacity = self
             .shutdown_schema_capacity
             .lock()
