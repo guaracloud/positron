@@ -18,6 +18,7 @@ use crate::{Catalog, CatalogObject, CatalogProposal, TransactionId};
 pub(crate) struct QueuedMaintenanceSubmission {
     state: TaskState,
     record: MaintenanceTaskRecord,
+    reclaimed_terminal: Option<(MaintenanceTaskId, TaskState)>,
 }
 
 /// A terminal replacement for the exact expiry record attached to a released
@@ -31,6 +32,11 @@ pub(crate) struct SnapshotLeaseExpiryCancellation {
 }
 
 impl SnapshotLeaseExpiryCancellation {
+    #[must_use]
+    pub(crate) const fn task_identity(&self) -> MaintenanceTaskId {
+        self.before.task.identity
+    }
+
     pub(crate) fn catalog_object(&self) -> Result<CatalogObject, MaintenanceFailure> {
         self.record.catalog_object()
     }
@@ -57,6 +63,13 @@ impl QueuedMaintenanceSubmission {
         self.record.catalog_object()
     }
 
+    #[must_use]
+    pub(crate) fn reclaimed_task_identity(&self) -> Option<MaintenanceTaskId> {
+        self.reclaimed_terminal
+            .as_ref()
+            .map(|(identity, _)| *identity)
+    }
+
     pub(crate) fn install(
         self,
         coordinator: &MaintenanceCoordinator,
@@ -65,10 +78,24 @@ impl QueuedMaintenanceSubmission {
             .state
             .lock()
             .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
-        if !state.pending_submissions.remove(&self.state.task.identity)
+        if !state
+            .pending_submissions
+            .contains(&self.state.task.identity)
             || state.tasks.contains_key(&self.state.task.identity)
+            || self
+                .reclaimed_terminal
+                .as_ref()
+                .is_some_and(|(identity, expected)| {
+                    !state.pending_terminal_reclamations.contains(identity)
+                        || state.tasks.get(identity) != Some(expected)
+                })
         {
             return Err(MaintenanceFailure::PreconditionFailed);
+        }
+        state.pending_submissions.remove(&self.state.task.identity);
+        if let Some((identity, _)) = self.reclaimed_terminal {
+            state.pending_terminal_reclamations.remove(&identity);
+            super::scheduling::remove_task_and_clear_empty_scope(&mut state, identity)?;
         }
         state.tasks.insert(self.state.task.identity, self.state);
         Ok(())
@@ -77,16 +104,75 @@ impl QueuedMaintenanceSubmission {
     pub(crate) fn discard(self, coordinator: &MaintenanceCoordinator) {
         if let Ok(mut state) = coordinator.state.lock() {
             state.pending_submissions.remove(&self.state.task.identity);
+            if let Some((identity, _)) = self.reclaimed_terminal {
+                state.pending_terminal_reclamations.remove(&identity);
+            }
         }
     }
 }
 
 impl MaintenanceCoordinator {
+    pub(crate) fn install_snapshot_lease_expiry_cancellations(
+        &self,
+        cancellations: Vec<SnapshotLeaseExpiryCancellation>,
+        submission: QueuedMaintenanceSubmission,
+    ) -> Result<(), MaintenanceFailure> {
+        let QueuedMaintenanceSubmission {
+            state: submission_state,
+            reclaimed_terminal,
+            ..
+        } = submission;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
+        if !state
+            .pending_submissions
+            .contains(&submission_state.task.identity)
+            || state.tasks.contains_key(&submission_state.task.identity)
+            || reclaimed_terminal
+                .as_ref()
+                .is_some_and(|(identity, expected)| {
+                    !state.pending_terminal_reclamations.contains(identity)
+                        || state.tasks.get(identity) != Some(expected)
+                })
+            || cancellations.iter().any(|cancellation| {
+                state.tasks.get(&cancellation.before.task.identity) != Some(&cancellation.before)
+            })
+        {
+            return Err(MaintenanceFailure::PreconditionFailed);
+        }
+        state
+            .pending_submissions
+            .remove(&submission_state.task.identity);
+        if let Some((identity, _)) = reclaimed_terminal {
+            state.pending_terminal_reclamations.remove(&identity);
+            super::scheduling::remove_task_and_clear_empty_scope(&mut state, identity)?;
+        }
+        for cancellation in cancellations {
+            state
+                .tasks
+                .insert(cancellation.after.task.identity, cancellation.after);
+            state.next_terminal_order = state
+                .next_terminal_order
+                .max(cancellation.next_terminal_order);
+        }
+        state
+            .tasks
+            .insert(submission_state.task.identity, submission_state);
+        Ok(())
+    }
+
     pub(crate) fn install_snapshot_lease_expiry_replacement(
         &self,
         cancellation: SnapshotLeaseExpiryCancellation,
         submission: QueuedMaintenanceSubmission,
     ) -> Result<(), MaintenanceFailure> {
+        let QueuedMaintenanceSubmission {
+            state: submission_state,
+            reclaimed_terminal,
+            ..
+        } = submission;
         let mut state = self
             .state
             .lock()
@@ -94,17 +180,30 @@ impl MaintenanceCoordinator {
         if state.tasks.get(&cancellation.before.task.identity) != Some(&cancellation.before)
             || !state
                 .pending_submissions
-                .remove(&submission.state.task.identity)
-            || state.tasks.contains_key(&submission.state.task.identity)
+                .contains(&submission_state.task.identity)
+            || state.tasks.contains_key(&submission_state.task.identity)
+            || reclaimed_terminal
+                .as_ref()
+                .is_some_and(|(identity, expected)| {
+                    !state.pending_terminal_reclamations.contains(identity)
+                        || state.tasks.get(identity) != Some(expected)
+                })
         {
             return Err(MaintenanceFailure::PreconditionFailed);
+        }
+        state
+            .pending_submissions
+            .remove(&submission_state.task.identity);
+        if let Some((identity, _)) = reclaimed_terminal {
+            state.pending_terminal_reclamations.remove(&identity);
+            super::scheduling::remove_task_and_clear_empty_scope(&mut state, identity)?;
         }
         state
             .tasks
             .insert(cancellation.after.task.identity, cancellation.after);
         state
             .tasks
-            .insert(submission.state.task.identity, submission.state);
+            .insert(submission_state.task.identity, submission_state);
         state.next_terminal_order = state
             .next_terminal_order
             .max(cancellation.next_terminal_order);
@@ -114,7 +213,11 @@ impl MaintenanceCoordinator {
     pub(crate) fn prepare_snapshot_lease_expiry_cancellation(
         &self,
         identity: crate::SnapshotLeaseId,
+        scope: MaintenanceScope,
         lease_object: crate::CatalogObjectId,
+        predecessor_generation: u64,
+        not_before: u64,
+        durable_record: &[u8],
     ) -> Result<Option<SnapshotLeaseExpiryCancellation>, MaintenanceFailure> {
         let identity = MaintenanceTaskId::new(identity.to_bytes())?;
         let expected_input = MaintenanceObjectId::new(lease_object.to_bytes())?;
@@ -128,7 +231,14 @@ impl MaintenanceCoordinator {
             .cloned()
             .ok_or(MaintenanceFailure::UnknownTask)?;
         if before.task.class != MaintenanceTaskClass::SnapshotLeaseExpiry
+            || before.task.scope != scope
+            || before.task.trigger != MaintenanceTrigger::Scheduled
+            || before.task.preconditions.catalog_generation != predecessor_generation
+            || before.task.preconditions.resource_generation != 1
             || before.task.inputs.as_slice() != [expected_input]
+            || !before.task.outputs.is_empty()
+            || before.task.not_before != not_before
+            || encode_record(&before)?.as_bytes() != durable_record
         {
             return Err(MaintenanceFailure::PreconditionFailed);
         }
@@ -194,16 +304,32 @@ impl MaintenanceCoordinator {
         if state.tasks.contains_key(&task.identity) {
             return Err(MaintenanceFailure::PreconditionFailed);
         }
-        if state
+        let occupied = state
             .tasks
             .len()
             .checked_add(state.pending_submissions.len())
-            .ok_or(MaintenanceFailure::CapacityExceeded)?
-            >= MAX_MAINTENANCE_TASKS
-        {
-            return Err(MaintenanceFailure::CapacityExceeded);
-        }
+            .and_then(|count| count.checked_sub(state.pending_terminal_reclamations.len()))
+            .ok_or(MaintenanceFailure::CapacityExceeded)?;
+        let reclaimed_terminal = if occupied >= MAX_MAINTENANCE_TASKS {
+            let mut prospective = state.clone();
+            for identity in &state.pending_terminal_reclamations {
+                prospective.tasks.remove(identity);
+            }
+            let identity = reclaim_terminal_slot(&mut prospective)?
+                .ok_or(MaintenanceFailure::CapacityExceeded)?;
+            let terminal = state
+                .tasks
+                .get(&identity)
+                .cloned()
+                .ok_or(MaintenanceFailure::UnknownTask)?;
+            Some((identity, terminal))
+        } else {
+            None
+        };
         state.pending_submissions.insert(task.identity);
+        if let Some((identity, _)) = &reclaimed_terminal {
+            state.pending_terminal_reclamations.insert(*identity);
+        }
         drop(state);
         let state = TaskState {
             task,
@@ -217,7 +343,11 @@ impl MaintenanceCoordinator {
             active_dispatch: None,
         };
         let record = encode_record(&state)?;
-        Ok(QueuedMaintenanceSubmission { state, record })
+        Ok(QueuedMaintenanceSubmission {
+            state,
+            record,
+            reclaimed_terminal,
+        })
     }
     /// Selects, reserves, and durably marks one task Running before handing its
     /// execution to a handler. A failed publication drops the fresh reservation

@@ -232,6 +232,14 @@ pub(super) fn reclaim_terminal_slot(
     let Some(identity) = candidate else {
         return Ok(None);
     };
+    remove_task_and_clear_empty_scope(state, identity)?;
+    Ok(Some(identity))
+}
+
+pub(super) fn remove_task_and_clear_empty_scope(
+    state: &mut CoordinatorState,
+    identity: MaintenanceTaskId,
+) -> Result<(), MaintenanceFailure> {
     let removed = state
         .tasks
         .remove(&identity)
@@ -245,7 +253,7 @@ pub(super) fn reclaim_terminal_slot(
             .fairness
             .retain(|(_, scope), _| *scope != removed.task.scope);
     }
-    Ok(Some(identity))
+    Ok(())
 }
 
 fn tasks_conflict(left: &MaintenanceTask, right: &MaintenanceTask) -> bool {

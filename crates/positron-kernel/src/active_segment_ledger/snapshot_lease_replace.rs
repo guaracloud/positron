@@ -167,10 +167,32 @@ impl<'lease, 'kernel, 'catalog> SnapshotLeaseReplacement<'lease, 'kernel, 'catal
         }
         let new_record = decode(&self.encoded)?
             .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?;
+        let old_task = MaintenanceTaskId::new(self.old_identity.to_bytes())
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?;
+        let mut old_descriptor = None;
+        for bytes in basis.plaintext_objects() {
+            if crate::maintenance::durable_task_record_identity(bytes)
+                .map_err(|_| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?
+                == Some(old_task)
+                && old_descriptor.replace(bytes).is_some()
+            {
+                return Err(LedgerFailure::new(LedgerFailureCode::StaleGeneration));
+            }
+        }
+        let old_descriptor =
+            old_descriptor.ok_or_else(|| LedgerFailure::new(LedgerFailureCode::StaleGeneration))?;
         let cancellation = coordinator
             .prepare_snapshot_lease_expiry_cancellation(
                 self.old_identity,
+                MaintenanceScope::segment(
+                    self.ledger.scope.tenant_id(),
+                    self.ledger.scope.signal_kind(),
+                    self.ledger.scope.shard_id(),
+                ),
                 immutable_binding_object_id(&old_record)?,
+                old_record.catalog_generation,
+                old_record.expiry,
+                old_descriptor,
             )
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::StaleGeneration))?
             .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::StaleGeneration))?;
@@ -199,8 +221,7 @@ impl<'lease, 'kernel, 'catalog> SnapshotLeaseReplacement<'lease, 'kernel, 'catal
             &basis,
             self.old_identity,
             self.encoded.clone(),
-            MaintenanceTaskId::new(self.old_identity.to_bytes())
-                .map_err(|_| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?,
+            old_task,
             cancellation
                 .catalog_object()
                 .map_err(|_| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?,

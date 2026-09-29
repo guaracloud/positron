@@ -183,6 +183,12 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             }
         }
         self.retry_pending_releases(&mut state)?;
+        if let Some(expected_catalog) = expected_catalog {
+            self.catalog.refresh_state()?;
+            if self.catalog.pin()?.identity() != expected_catalog {
+                return Err(LedgerFailure::new(LedgerFailureCode::StaleGeneration));
+            }
+        }
         now = state.last_snapshot_lease_time.max(now);
         if !valid_lease_interval(now, expiry) {
             return Err(LedgerFailure::new(LedgerFailureCode::InvalidInput));
@@ -236,6 +242,47 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             .governor()
             .reserve(claim)
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
+        let mut expiry_cancellations = Vec::new();
+        if let Some(coordinator) = coordinator {
+            for expired_identity in &expired {
+                let expired_record = all_records
+                    .iter()
+                    .find(|record| record.identity == *expired_identity)
+                    .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?;
+                let task = MaintenanceTaskId::new(expired_identity.to_bytes())
+                    .map_err(|_| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?;
+                let mut descriptor = None;
+                for bytes in basis.plaintext_objects() {
+                    if crate::maintenance::durable_task_record_identity(bytes)
+                        .map_err(|_| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?
+                        == Some(task)
+                        && descriptor.replace(bytes).is_some()
+                    {
+                        return Err(LedgerFailure::new(LedgerFailureCode::StaleGeneration));
+                    }
+                }
+                let Some(descriptor) = descriptor else {
+                    continue;
+                };
+                if let Some(cancellation) = coordinator
+                    .prepare_snapshot_lease_expiry_cancellation(
+                        *expired_identity,
+                        MaintenanceScope::segment(
+                            self.scope.tenant_id(),
+                            self.scope.signal_kind(),
+                            self.scope.shard_id(),
+                        ),
+                        immutable_binding_object_id(expired_record)?,
+                        expired_record.catalog_generation,
+                        expired_record.expiry,
+                        descriptor,
+                    )
+                    .map_err(|_| LedgerFailure::new(LedgerFailureCode::StaleGeneration))?
+                {
+                    expiry_cancellations.push(cancellation);
+                }
+            }
+        }
         // Preparing a coordinator draft reserves bounded coordinator state.
         // Do it only after the lease's own retained reservation has succeeded,
         // so an admission refusal cannot strand an invisible descriptor slot.
@@ -270,9 +317,22 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
                     &basis,
                     &expired,
                     vec![encoded],
-                    vec![submission.catalog_object().map_err(|_| {
-                        LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused)
-                    })?],
+                    expiry_cancellations
+                        .iter()
+                        .map(|cancellation| {
+                            cancellation
+                                .catalog_object()
+                                .map_err(|_| LedgerFailure::new(LedgerFailureCode::StaleGeneration))
+                        })
+                        .chain(std::iter::once(submission.catalog_object().map_err(|_| {
+                            LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused)
+                        })))
+                        .collect::<Result<Vec<_>, _>>()?,
+                    &expiry_cancellations
+                        .iter()
+                        .map(|cancellation| cancellation.task_identity())
+                        .collect(),
+                    submission.reclaimed_task_identity(),
                 )?,
                 None => publish(self.catalog, &basis, &expired, Some(encoded))?,
             }
@@ -301,13 +361,17 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         state.pending_lease_releases.remove(identity);
         state.last_snapshot_lease_time = now;
         if let Some(submission) = expiry_submission {
-            submission
-                .install(
-                    coordinator.ok_or_else(|| {
-                        LedgerFailure::new(LedgerFailureCode::IntegrityCorruption)
-                    })?,
-                )
-                .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
+            let coordinator = coordinator
+                .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?;
+            if expiry_cancellations.is_empty() {
+                submission
+                    .install(coordinator)
+                    .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
+            } else {
+                coordinator
+                    .install_snapshot_lease_expiry_cancellations(expiry_cancellations, submission)
+                    .map_err(|_| LedgerFailure::new(LedgerFailureCode::RecoveryRequired))?;
+            }
         }
         Ok(SnapshotLeaseGrant {
             identity,
@@ -590,9 +654,34 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             state.pending_lease_releases.register(identity)?;
             return self.retry_pending_releases(&mut state);
         };
+        let task = MaintenanceTaskId::new(identity.to_bytes())
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?;
+        let mut descriptor = None;
+        for bytes in basis.plaintext_objects() {
+            if crate::maintenance::durable_task_record_identity(bytes)
+                .map_err(|_| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?
+                == Some(task)
+                && descriptor.replace(bytes).is_some()
+            {
+                return Err(LedgerFailure::new(LedgerFailureCode::StaleGeneration));
+            }
+        }
+        let descriptor =
+            descriptor.ok_or_else(|| LedgerFailure::new(LedgerFailureCode::StaleGeneration))?;
         let lease_object = immutable_binding_object_id(&record)?;
         let cancellation = coordinator
-            .prepare_snapshot_lease_expiry_cancellation(identity, lease_object)
+            .prepare_snapshot_lease_expiry_cancellation(
+                identity,
+                MaintenanceScope::segment(
+                    self.scope.tenant_id(),
+                    self.scope.signal_kind(),
+                    self.scope.shard_id(),
+                ),
+                lease_object,
+                record.catalog_generation,
+                record.expiry,
+                descriptor,
+            )
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::StaleGeneration))?;
         let Some(cancellation) = cancellation else {
             state.pending_lease_releases.register(identity)?;
@@ -602,8 +691,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             self.catalog,
             &basis,
             identity,
-            MaintenanceTaskId::new(identity.to_bytes())
-                .map_err(|_| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?,
+            task,
             cancellation
                 .catalog_object()
                 .map_err(|_| LedgerFailure::new(LedgerFailureCode::StaleGeneration))?,
