@@ -505,6 +505,18 @@ impl RunningProcess {
         candidate: Arc<EffectiveConfiguration>,
     ) -> Result<ConfigurationReloadOutcome, ConfigurationRuntimeFailure> {
         let _reload = self.reload_lock();
+        // Catalog-backed configuration publication shares the service
+        // operation authority with foreground work and the internal
+        // maintenance role. Without this gate a just-started maintenance
+        // worker can acquire the Kernel's sole Catalog writer lease between
+        // listener staging and publication, turning a valid reload into a
+        // spurious availability failure.
+        let _catalog_operation = self
+            .services
+            .as_ref()
+            .map(|services| services.catalog_operation())
+            .transpose()
+            .map_err(|_| ConfigurationRuntimeFailure::Unavailable)?;
         let runtime = self
             .configuration
             .as_ref()
@@ -601,10 +613,19 @@ impl RunningProcess {
             let mut active = self.listeners();
             std::mem::take(&mut *active)
         };
-        let mut retired_tasks = {
+        let retired_tasks = {
             let mut active = self.tasks();
             std::mem::take(&mut *active)
         };
+        // The maintenance role is process-owned: it has no listener and is
+        // not controlled by a listener-generation cancellation capability.
+        // Keep it active while listener roles are replaced; shutdown still
+        // owns and joins it through `self.tasks`.
+        let (mut retired_tasks, retained_tasks) = split_listener_tasks(retired_tasks);
+        {
+            let mut active = self.tasks();
+            *active = retained_tasks;
+        }
         let retired_cancellations = {
             let mut active = match self.listener_task_cancellations.lock() {
                 Ok(cancellations) => cancellations,
@@ -623,14 +644,14 @@ impl RunningProcess {
             return Err(ConfigurationRuntimeFailure::ListenerUnavailable);
         }
         staged.open_admission();
-        let (successor, successor_tasks, successor_cancellation) = staged.into_active();
+        let (successor, mut successor_tasks, successor_cancellation) = staged.into_active();
         {
             let mut active = self.listeners();
             *active = successor;
         }
         {
             let mut active = self.tasks();
-            *active = successor_tasks;
+            active.append(&mut successor_tasks);
         }
         if let Some(cancellation) = successor_cancellation {
             let mut active = match self.listener_task_cancellations.lock() {
@@ -754,6 +775,12 @@ impl RunningProcess {
         self.cancel_listener_tasks();
         DrainingProcess(self)
     }
+}
+
+fn split_listener_tasks(tasks: RunningTasks) -> (RunningTasks, RunningTasks) {
+    tasks
+        .into_iter()
+        .partition(|(role, _)| *role != TaskRole::Maintenance)
 }
 
 fn close_listeners(listeners: &mut [Box<dyn BoundListener>]) -> Result<(), ()> {
