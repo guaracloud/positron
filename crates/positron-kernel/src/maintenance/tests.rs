@@ -192,6 +192,17 @@ fn prepared_lease_expiry_cancellation_blocks_dispatch_before_its_install()
         .expect("cancellation preparation")
         .expect("queued expiry task prepares cancellation");
 
+    assert_eq!(
+        coordinator
+            .cancel_and_persist(&catalog, identity)
+            .expect_err("a prepared cancellation owns the task transition"),
+        MaintenanceFailure::PreconditionFailed
+    );
+    assert_eq!(
+        coordinator.status(identity).expect("queued task").phase(),
+        MaintenanceTaskPhase::Queued
+    );
+
     assert!(
         coordinator
             .start_next(10, false)

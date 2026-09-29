@@ -550,6 +550,7 @@ impl MaintenanceCoordinator {
             .state
             .lock()
             .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
+        super::require_unreserved_task_transition(&state, identity)?;
         let mut next = state.clone();
         let terminal = {
             let task = next

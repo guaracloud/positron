@@ -75,9 +75,7 @@ pub(super) fn dispatch_task(
     identity: MaintenanceTaskId,
     now: u64,
 ) -> Result<MaintenanceDispatch, MaintenanceFailure> {
-    if state.pending_cancellations.contains(&identity) {
-        return Err(MaintenanceFailure::PreconditionFailed);
-    }
+    require_unreserved_task_transition(state, identity)?;
     let (dispatch, fairness_key, next_fairness) = {
         let task = state
             .tasks

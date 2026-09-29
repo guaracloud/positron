@@ -392,7 +392,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             if expiry_cancellations.is_empty() {
                 submission
                     .install(coordinator)
-                    .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
+                    .map_err(|_| LedgerFailure::new(LedgerFailureCode::RecoveryRequired))?;
             } else {
                 coordinator
                     .install_snapshot_lease_expiry_cancellations(expiry_cancellations, submission)
@@ -733,7 +733,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         }
         cancellation
             .install(coordinator)
-            .map_err(|_| LedgerFailure::new(LedgerFailureCode::StaleGeneration))?;
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::RecoveryRequired))?;
         state.lease_reservations.remove(&identity);
         state.lease_reservation_baselines.remove(&identity);
         state.lease_resume_markers.remove(&identity);

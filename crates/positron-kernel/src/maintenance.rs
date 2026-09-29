@@ -67,6 +67,16 @@ struct CoordinatorState {
     next_terminal_order: u64,
 }
 
+fn require_unreserved_task_transition(
+    state: &CoordinatorState,
+    identity: MaintenanceTaskId,
+) -> Result<(), MaintenanceFailure> {
+    if state.pending_cancellations.contains(&identity) {
+        return Err(MaintenanceFailure::PreconditionFailed);
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 struct MaintenanceWindow {
     deferred: BTreeSet<MaintenanceTaskClass>,
@@ -457,6 +467,7 @@ impl MaintenanceCoordinator {
             .state
             .lock()
             .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
+        require_unreserved_task_transition(&state, identity)?;
         let terminal = {
             let task = state
                 .tasks
