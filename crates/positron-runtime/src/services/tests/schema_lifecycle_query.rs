@@ -207,3 +207,52 @@ fn admitted_active_ingest_is_revalidated_before_append_after_lifecycle_transitio
     }
     Ok(())
 }
+
+#[test]
+fn query_wakes_maintenance_only_after_its_durable_expiry_task_publication()
+-> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let (initialized, ingest, query_secret) = fixture.initialized()?;
+    let services = ServiceHandle::new(Arc::clone(&initialized))?;
+    assert_eq!(
+        services
+            .ingest_otlp_logs(&ingest, request("maintenance-wake-order").encode_to_vec())?
+            .accepted_records(),
+        1
+    );
+    let before = services.maintenance_wake_generation();
+    let (progress_tx, progress_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    services.install_query_execution_test_hook(Arc::new(BlockingQueryExecution {
+        progress: progress_tx,
+        release: Mutex::new(release_rx),
+    }))?;
+    let querying_services = services.clone();
+    let query = std::thread::spawn(move || {
+        querying_services.query_log_bodies(
+            &query_secret,
+            "logs | range query_time 0 100 | limit 2",
+            QueryBudget::new(1_000_000, 100, 100, 1_000_000, 1_000_000, 60)
+                .expect("fixed query budget")
+                .with_cpu_work_units(16)
+                .expect("fixed query work"),
+        )
+    });
+    assert_eq!(progress_rx.recv()?, "admitted");
+    assert_eq!(
+        services.maintenance_wake_generation(),
+        before,
+        "query admission precedes durable lease/task publication and must not wake maintenance"
+    );
+    release_tx.send(())?;
+    assert_eq!(
+        query.join().map_err(|_| "query thread panicked")??,
+        ["maintenance-wake-order"]
+    );
+    assert_eq!(
+        services.maintenance_wake_generation(),
+        before.saturating_add(1),
+        "successful durable lease/task publication must notify the registered maintenance worker"
+    );
+    Ok(())
+}

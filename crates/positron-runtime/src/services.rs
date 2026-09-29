@@ -162,6 +162,11 @@ impl ServiceHandle {
     pub(crate) fn notify_maintenance_worker(&self) {
         self.maintenance_wake.notify();
     }
+
+    #[cfg(test)]
+    pub(crate) fn maintenance_wake_generation(&self) -> u64 {
+        self.maintenance_wake.generation()
+    }
     #[allow(dead_code)]
     pub(crate) fn new(instance: Arc<InitializedInstance>) -> Result<Self, ServiceFailure> {
         Self::new_with_cancellation(instance, None)

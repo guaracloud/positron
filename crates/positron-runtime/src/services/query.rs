@@ -204,7 +204,6 @@ pub(super) fn query_log_bodies(
         Some(resolver) => service.with_export_destination_resolver(Arc::clone(resolver)),
         None => service,
     };
-    services.notify_maintenance_worker();
     let query = service
         .plan_pipeline(context, source, budget)
         .map_err(|failure| map_query_failure(&failure))?;
@@ -223,5 +222,9 @@ pub(super) fn query_log_bodies(
         })
         .map_err(schema_bootstrap::classify_replay_failure)?
         .map_err(|failure| map_query_failure(&failure))?;
+    // QueryService publishes the source lease and its expiry task atomically
+    // before yielding this stream. Wake only after that durable transition so
+    // the registered worker cannot consume a pre-publication signal.
+    services.notify_maintenance_worker();
     collect_query_bodies(events)
 }

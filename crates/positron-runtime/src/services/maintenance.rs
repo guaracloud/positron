@@ -37,7 +37,7 @@ impl MaintenanceWake {
         }
     }
 
-    fn generation(&self) -> u64 {
+    pub(super) fn generation(&self) -> u64 {
         self.state.0.lock().map_or(0, |generation| *generation)
     }
 
@@ -230,7 +230,7 @@ pub(super) fn run_snapshot_lease_expiry_worker(
                 },
                 Ok(None) => Ok(false),
                 Err(ServiceFailure::Cancelled) => break,
-                Err(failure) => return Err(failure),
+                Err(failure) => Err(failure),
             },
         };
         let delay = match result {

@@ -7,19 +7,19 @@ use positron_domain::identity::{PrincipalId, TenantId};
 use positron_domain::routing::{SignalKind, VirtualShardId};
 use positron_kernel::{
     ActiveSegmentLedger, Catalog, CatalogSecret, DiskPressureThresholds, GovernorPolicy,
-    InstanceId, InventoryCardinalityLimits, MountQualification, ObservedResourceEnvironment,
-    OperatorLimits, OrdinaryPoolPolicy, OwnedPrimaryDataVolume, PrimaryDataVolume,
-    RecoveryPoolCapacities, RecoveryReserve, RegisteredResourceBounds, ResourceAmounts,
-    ResourceDimension, ResourceGovernorConfiguration, ResourceInventory, SegmentProtectionKey,
-    SegmentScope, SnapshotLeaseId, SnapshotLeaseUsage, StorageKernelResourceAuthority, TenantQuota,
-    WorkClaim, WorkKind,
+    InstanceId, InventoryCardinalityLimits, MaintenanceCoordinator, MountQualification,
+    ObservedResourceEnvironment, OperatorLimits, OrdinaryPoolPolicy, OwnedPrimaryDataVolume,
+    PrimaryDataVolume, RecoveryPoolCapacities, RecoveryReserve, RegisteredResourceBounds,
+    ResourceAmounts, ResourceDimension, ResourceGovernorConfiguration, ResourceInventory,
+    SegmentProtectionKey, SegmentScope, SnapshotLeaseId, SnapshotLeaseUsage,
+    StorageKernelResourceAuthority, TenantQuota, WorkClaim, WorkKind,
 };
 
 use super::ExecutionResources;
 use crate::QueryFailureCode;
 use crate::cursor::CursorState;
 use crate::{LogicalPlan, QueryBudget, QueryCancellation, TemporalAxis, TemporalRange};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
 
@@ -41,6 +41,7 @@ fn lease_identity_mismatch_releases_every_pre_stream_resource() -> Result<(), Bo
         SegmentProtectionKey::from_owned(Box::new([0x34; 32])),
     )?;
     let baseline = authority.governor().inspect()?;
+    let coordinator = Mutex::new(MaintenanceCoordinator::new());
 
     for iteration in 0..65 {
         let admission = authority.governor().reserve(WorkClaim::tenant(
@@ -48,18 +49,30 @@ fn lease_identity_mismatch_releases_every_pre_stream_resource() -> Result<(), Bo
             WorkKind::InteractiveQueryTail,
             ResourceAmounts::new([1, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0]),
         )?)?;
-        let lease = ledger.create_snapshot_lease(100 + iteration, 200 + iteration)?;
+        let coordinator_guard = coordinator.lock().map_err(|_| "maintenance lock")?;
+        let lease = ledger.create_snapshot_lease_for_at_catalog_with_expiry_task(
+            &coordinator_guard,
+            100 + iteration,
+            std::num::NonZeroU64::new(100).ok_or("nonzero ttl")?,
+            catalog.pin()?.identity(),
+        )?;
+        drop(coordinator_guard);
         let identity = lease.identity();
         drop(lease);
         let resources = ExecutionResources::new(admission, identity, SnapshotLeaseUsage::default());
         let expected = SnapshotLeaseId::new([0x99; 16])?;
 
         let state = test_cursor_state(identity.to_bytes());
-        let failure =
-            match resources.validate_lease_identity(&ledger, None, &state, expected.to_bytes()) {
-                Ok(_) => return Err("mismatched stream identity was accepted".into()),
-                Err(failure) => failure,
-            };
+        let failure = match resources.validate_lease_identity(
+            &ledger,
+            None,
+            Some(&coordinator),
+            &state,
+            expected.to_bytes(),
+        ) {
+            Ok(_) => return Err("mismatched stream identity was accepted".into()),
+            Err(failure) => failure,
+        };
         assert_eq!(failure.code(), QueryFailureCode::Internal);
         assert_eq!(
             ledger
@@ -67,6 +80,15 @@ fn lease_identity_mismatch_releases_every_pre_stream_resource() -> Result<(), Bo
                 .expect_err("mismatched lease is released")
                 .code(),
             positron_kernel::LedgerFailureCode::SnapshotExpired
+        );
+        assert!(
+            coordinator
+                .lock()
+                .map_err(|_| "maintenance lock")?
+                .start_next_with_reservation_and_persist(&catalog, &authority, 10_000, false)
+                .map_err(|_| "maintenance scheduler")?
+                .is_none(),
+            "identity mismatch cleanup terminalizes its coupled expiry task"
         );
         let after = authority.governor().inspect()?;
         assert_eq!(after.outstanding_total(), baseline.outstanding_total());

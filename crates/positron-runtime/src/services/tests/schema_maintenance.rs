@@ -377,13 +377,14 @@ fn runtime_worker_wakes_for_a_poststart_future_lease_expiry() -> Result<(), Box<
         scope,
         protection,
     )?;
+    let now = initialized.retention_time.governance_now_seconds()?;
     let coordinator = initialized
         .maintenance_coordinator()
         .lock()
         .map_err(|_| "maintenance lock")?;
     let lease = ledger.create_snapshot_lease_for_at_catalog_with_expiry_task(
         &coordinator,
-        0,
+        now,
         std::num::NonZeroU64::new(1).ok_or("nonzero ttl")?,
         catalog.pin()?.identity(),
     )?;
@@ -394,7 +395,7 @@ fn runtime_worker_wakes_for_a_poststart_future_lease_expiry() -> Result<(), Box<
     drop(catalog);
     drop(catalog_operation);
 
-    elapsed.advance(1_000_000_000)?;
+    elapsed.advance(2_000_000_000)?;
     services.notify_maintenance_worker();
     let deadline = Instant::now() + Duration::from_secs(2);
     while initialized
@@ -611,6 +612,114 @@ fn native_runtime_worker_expires_a_durable_lease_and_joins_before_reopen()
             .phase(),
         MaintenanceTaskPhase::Succeeded,
         "the worker-published terminal result survives reopen"
+    );
+    Ok(())
+}
+
+#[test]
+fn native_runtime_worker_periodically_expires_a_poststart_future_lease_and_persists_completion()
+-> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let (initialized, _, _) = fixture.initialized()?;
+    drop(initialized);
+
+    let [operations, api, otlp_grpc, otlp_http, loki_push] = reserve_native_addresses()?;
+    static NEXT_POSTSTART_NATIVE_CONTROL: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    let control = std::env::temp_dir().join(format!(
+        "positron-poststart-maintenance-worker-{}-{}.sock",
+        std::process::id(),
+        NEXT_POSTSTART_NATIVE_CONTROL.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    match fs::remove_file(&control) {
+        Ok(()) => {},
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+        Err(error) => return Err(error.into()),
+    }
+    let host = NativeHost::new(NativeBindings::new(
+        control, operations, api, otlp_grpc, otlp_http, loki_push,
+    )?);
+    let paths = BootstrapPaths::new(
+        &fixture.root.join("data"),
+        &fixture.root.join("secrets"),
+        MountQualification::LocalHost,
+    )?;
+    let process = ApplicationRuntime::start(
+        ServeConfiguration::new(paths, InitializationMode::ExistingOnly),
+        HostInputs::new(&host, &host),
+    )?;
+    let services = process.services().ok_or("serving services")?;
+    let scope = SegmentScope::new(
+        services.instance.tenant,
+        positron_domain::routing::SignalKind::Logs,
+        services.instance.logs_shard,
+    );
+    let _catalog_operation = services.catalog_operation()?;
+    let catalog = open_catalog(&services.instance)?;
+    let identity = positron_governance::Identity::open(&catalog.pin()?)?;
+    let protection = super::super::tenant_segment_key(&services.instance, &identity, scope)?;
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
+        &services.instance._authority,
+        &services.instance.retention_time,
+        &catalog,
+        scope,
+        protection,
+    )?;
+    let now = services.instance.retention_time.governance_now_seconds()?;
+    let coordinator = services
+        .instance
+        .maintenance_coordinator()
+        .lock()
+        .map_err(|_| "maintenance lock")?;
+    let lease = ledger.create_snapshot_lease_for_at_catalog_with_expiry_task(
+        &coordinator,
+        now,
+        std::num::NonZeroU64::new(1).ok_or("nonzero ttl")?,
+        catalog.pin()?.identity(),
+    )?;
+    let task = MaintenanceTaskId::new(lease.identity().to_bytes()).expect("lease task id");
+    drop(lease);
+    drop(coordinator);
+    drop(ledger);
+    drop(catalog);
+    drop(_catalog_operation);
+
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while services
+        .instance
+        .maintenance_coordinator()
+        .lock()
+        .map_err(|_| "maintenance lock")?
+        .status(task)
+        .map_err(|_| "maintenance task status")?
+        .phase()
+        != MaintenanceTaskPhase::Succeeded
+    {
+        if Instant::now() >= deadline {
+            return Err(
+                "native maintenance role did not complete poststart future expiry work".into(),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    drop(services);
+    assert_eq!(
+        process.shutdown(ShutdownTrigger::FirstSignal),
+        crate::ExitOutcome::Graceful,
+        "shutdown joins the native maintenance role after poststart expiry work"
+    );
+    let reopened = ServiceHandle::new(fixture.reopen()?)?;
+    assert_eq!(
+        reopened
+            .instance
+            .maintenance_coordinator()
+            .lock()
+            .map_err(|_| "maintenance lock")?
+            .status(task)
+            .map_err(|_| "restored maintenance task status")?
+            .phase(),
+        MaintenanceTaskPhase::Succeeded,
+        "the poststart worker completion survives reopen"
     );
     Ok(())
 }

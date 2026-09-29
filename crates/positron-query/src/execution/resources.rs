@@ -185,6 +185,7 @@ impl ExecutionResources {
         self,
         ledger: &ActiveSegmentLedger<'_, '_>,
         target_ledger: Option<&ActiveSegmentLedger<'_, '_>>,
+        maintenance: Option<&std::sync::Mutex<positron_kernel::MaintenanceCoordinator>>,
         state: &crate::cursor::CursorState,
         expected: [u8; 16],
     ) -> Result<Self, QueryFailure> {
@@ -194,7 +195,7 @@ impl ExecutionResources {
         Err(self.fail_before_stream(
             ledger,
             target_ledger,
-            None,
+            maintenance,
             state,
             QueryFailure::new(crate::QueryFailureCode::Internal),
         ))

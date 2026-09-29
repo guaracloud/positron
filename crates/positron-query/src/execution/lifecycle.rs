@@ -92,6 +92,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         let resources = resources.validate_lease_identity(
             ledger,
             self.trace_ledger,
+            self.maintenance,
             state,
             state.lease_identity,
         )?;
