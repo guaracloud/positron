@@ -60,6 +60,7 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
             .map_err(|_| QueryFailure::new(QueryFailureCode::ResourceExhausted))?;
         bindings.extend_from_slice(existing_bindings);
         let mut rotation = LeaseRotation::empty();
+        let mut primary_catalog = None;
         rotation
             .secondary
             .try_reserve_exact(self.sources.readers().len())
@@ -98,20 +99,22 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
             {
                 return Err(QueryFailure::new(QueryFailureCode::StoreUnavailable));
             }
+            let snapshot = replacement
+                .snapshot()
+                .ok_or_else(|| QueryFailure::new(QueryFailureCode::StoreUnavailable))?;
+            let new_binding =
+                TailSourceBinding::new(shard, replacement.identity(), snapshot.frontier());
+            if reader.scope() == self.service.ledger.scope() {
+                primary_catalog = Some((
+                    snapshot.catalog_identity().to_bytes(),
+                    snapshot.catalog_generation(),
+                ));
+            }
             let replacement = SourceLeaseReplacement {
                 old_identity: binding.lease(),
                 authority,
                 replacement,
             };
-            let new_binding = TailSourceBinding::new(
-                shard,
-                replacement.replacement.identity(),
-                replacement
-                    .replacement
-                    .snapshot()
-                    .ok_or_else(|| QueryFailure::new(QueryFailureCode::StoreUnavailable))?
-                    .frontier(),
-            );
             if let Some(existing) = bindings
                 .iter_mut()
                 .find(|candidate| candidate.shard() == shard)
@@ -124,11 +127,9 @@ impl<'service, 'kernel, 'catalog, 'ledger> TailSession<'service, 'kernel, 'catal
                 rotation.secondary.push(replacement);
             }
         }
-        state.set_source_bindings(
-            state.snapshot_identity(),
-            state.snapshot_generation(),
-            bindings,
-        )?;
+        let (snapshot_identity, snapshot_generation) =
+            primary_catalog.unwrap_or((state.snapshot_identity(), state.snapshot_generation()));
+        state.set_source_bindings(snapshot_identity, snapshot_generation, bindings)?;
         Ok(rotation)
     }
 
