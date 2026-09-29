@@ -467,31 +467,44 @@ fn runtime_worker_retries_a_running_expiry_after_terminal_publication_outage()
     let cancellation = crate::TaskCancellation::new();
     let worker_services = services.clone();
     let worker_cancellation = cancellation.clone();
-    with_catalog_publication_fault_after(CatalogPublicationFault::SynchronizeCommit, 1, || {
-        let worker = std::thread::spawn(move || {
+    let worker = std::thread::spawn(move || {
+        with_catalog_publication_fault_after(CatalogPublicationFault::SynchronizeCommit, 1, || {
             worker_services.run_maintenance_worker(&worker_cancellation)
-        });
-        services.notify_maintenance_worker();
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while initialized
+        })
+    });
+    services.notify_maintenance_worker();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut saw_running = false;
+    while initialized
+        .maintenance_coordinator()
+        .lock()
+        .map_err(|_| "maintenance lock")?
+        .status(task)
+        .map_err(|_| "maintenance task status")?
+        .phase()
+        != MaintenanceTaskPhase::Succeeded
+    {
+        let phase = initialized
             .maintenance_coordinator()
             .lock()
             .map_err(|_| "maintenance lock")?
             .status(task)
             .map_err(|_| "maintenance task status")?
-            .phase()
-            != MaintenanceTaskPhase::Succeeded
-        {
-            if Instant::now() >= deadline {
-                cancellation.cancel();
-                return Err("worker did not retry running expiry".into());
-            }
-            std::thread::sleep(Duration::from_millis(5));
+            .phase();
+        saw_running |= phase == MaintenanceTaskPhase::Running;
+        if Instant::now() >= deadline {
+            cancellation.cancel();
+            return Err("worker did not retry running expiry".into());
         }
-        cancellation.cancel();
-        worker.join().map_err(|_| "maintenance worker panicked")??;
-        Ok(())
-    })
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        saw_running,
+        "terminal-publication fault retains the same Running execution before retry"
+    );
+    cancellation.cancel();
+    worker.join().map_err(|_| "maintenance worker panicked")??;
+    Ok(())
 }
 
 #[test]
