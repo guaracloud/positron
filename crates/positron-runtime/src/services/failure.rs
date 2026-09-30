@@ -132,6 +132,9 @@ pub(super) const fn classify_bootstrap_failure_code(
         | crate::BootstrapFailureCode::DurableOperationCancellationUnavailable => {
             ServiceFailure::InvalidRequest
         },
+        crate::BootstrapFailureCode::GovernanceAuditCheckpointInProgress => {
+            ServiceFailure::CatalogUnavailable
+        },
         crate::BootstrapFailureCode::KeyCustodyUnavailable => ServiceFailure::KeyUnavailable,
         crate::BootstrapFailureCode::ResourceUnavailable => ServiceFailure::CapacityUnavailable,
         crate::BootstrapFailureCode::CorruptState

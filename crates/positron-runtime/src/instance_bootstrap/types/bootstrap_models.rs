@@ -61,6 +61,9 @@ pub enum BootstrapFailureCode {
     DurableOperationLookupExpired,
     DurableOperationUnknown,
     DurableOperationCancellationUnavailable,
+    /// The exact authenticated governance-audit task is running; retry the
+    /// same request using [`BootstrapFailure::maintenance_task`].
+    GovernanceAuditCheckpointInProgress,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -70,6 +73,7 @@ pub struct BootstrapFailure {
     quota_generation_conflict: Option<positron_governance::TenantQuotaGenerationConflict>,
     display_generation_conflict: Option<TenantDisplayGenerationConflict>,
     retention_generation_conflict: Option<positron_governance::TenantRetentionGenerationConflict>,
+    maintenance_task: Option<MaintenanceTaskId>,
 }
 
 impl BootstrapFailure {
@@ -80,6 +84,7 @@ impl BootstrapFailure {
             quota_generation_conflict: None,
             display_generation_conflict: None,
             retention_generation_conflict: None,
+            maintenance_task: None,
         }
     }
 
@@ -92,6 +97,7 @@ impl BootstrapFailure {
             quota_generation_conflict: None,
             display_generation_conflict: None,
             retention_generation_conflict: None,
+            maintenance_task: None,
         }
     }
 
@@ -104,6 +110,7 @@ impl BootstrapFailure {
             quota_generation_conflict: Some(conflict),
             display_generation_conflict: None,
             retention_generation_conflict: None,
+            maintenance_task: None,
         }
     }
 
@@ -116,6 +123,7 @@ impl BootstrapFailure {
             quota_generation_conflict: None,
             display_generation_conflict: Some(conflict),
             retention_generation_conflict: None,
+            maintenance_task: None,
         }
     }
 
@@ -128,6 +136,20 @@ impl BootstrapFailure {
             quota_generation_conflict: None,
             display_generation_conflict: None,
             retention_generation_conflict: Some(conflict),
+            maintenance_task: None,
+        }
+    }
+
+    pub(super) const fn governance_audit_checkpoint_in_progress(
+        maintenance_task: MaintenanceTaskId,
+    ) -> Self {
+        Self {
+            code: BootstrapFailureCode::GovernanceAuditCheckpointInProgress,
+            lifecycle_generation_conflict: None,
+            quota_generation_conflict: None,
+            display_generation_conflict: None,
+            retention_generation_conflict: None,
+            maintenance_task: Some(maintenance_task),
         }
     }
 
@@ -169,10 +191,28 @@ impl BootstrapFailure {
     ) -> Option<positron_governance::TenantRetentionGenerationConflict> {
         self.retention_generation_conflict
     }
+
+    /// Returns the stable maintenance identity for a retryable in-progress
+    /// governance audit checkpoint request.
+    #[must_use]
+    pub const fn maintenance_task(&self) -> Option<MaintenanceTaskId> {
+        self.maintenance_task
+    }
 }
 
 impl Display for BootstrapFailure {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        if self.code == BootstrapFailureCode::GovernanceAuditCheckpointInProgress
+            && let Some(maintenance_task) = self.maintenance_task
+        {
+            formatter.write_str(
+                "governance audit checkpoint is in progress; retry the same request with maintenance task ",
+            )?;
+            for byte in maintenance_task.to_bytes() {
+                write!(formatter, "{byte:02x}")?;
+            }
+            return Ok(());
+        }
         formatter.write_str("instance bootstrap failed")
     }
 }

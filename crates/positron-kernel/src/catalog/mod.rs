@@ -1050,7 +1050,13 @@ impl<'authority> Catalog<'authority> {
         let checkpoint = GovernanceAuditCheckpoint::create(signer, self.instance, frontier)?;
         self.storage
             .publish_audit_checkpoint(&secret, self.instance, &checkpoint)?;
-        state.audit_checkpoint = Some(checkpoint.clone());
+        if state
+            .audit_checkpoint
+            .as_ref()
+            .is_none_or(|current| checkpoint.position() > current.position())
+        {
+            state.audit_checkpoint = Some(checkpoint.clone());
+        }
         Ok(checkpoint)
     }
 

@@ -131,6 +131,65 @@ fn system_administrator_publishes_and_verifies_a_bootstrap_bound_audit_checkpoin
 }
 
 #[test]
+fn delayed_audit_checkpoint_keeps_the_newer_live_and_recovered_frontier()
+-> Result<(), Box<dyn Error>> {
+    let roots = Roots::new()?;
+    let paths = roots.paths().map_err(|code| format!("paths: {code:?}"))?;
+    drop(InstanceBootstrap::initialize(
+        &paths,
+        InitializationPlan::non_interactive(),
+    )?);
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    let administrator = || {
+        instance.attribute(
+            PresentedCredential::parse(claim.secret()).expect("claim syntax"),
+            RequestedIntent::SystemAdministration,
+            CompatibilityHints::none(),
+        )
+    };
+
+    let older_task = instance.queue_governance_audit_checkpoint_for_test()?;
+    instance.update_tenant_display_name(
+        administrator()?,
+        instance.default_tenant_id(),
+        ResourceGeneration::new(1)?,
+        "Checkpoint frontier successor",
+        AdministrativeIdempotencyKey::new([0x73; 16])?,
+    )?;
+    let newer_task = instance.queue_governance_audit_checkpoint_for_test()?;
+
+    let newer = instance.complete_queued_governance_audit_checkpoint_for_test(newer_task)?;
+    let (older, live_latest) =
+        instance.complete_queued_governance_audit_checkpoint_and_read_live_for_test(older_task)?;
+    assert!(older.position() < newer.position());
+    assert_eq!(
+        instance.governance_audit_checkpoint_phase_for_test(older_task)?,
+        MaintenanceTaskPhase::Succeeded,
+        "the delayed task still terminalizes after publishing its exact frontier"
+    );
+    assert_eq!(
+        instance.governance_audit_checkpoint_phase_for_test(newer_task)?,
+        MaintenanceTaskPhase::Succeeded
+    );
+
+    assert_eq!(
+        live_latest,
+        Some(newer.clone()),
+        "the live cache keeps the greatest persisted checkpoint frontier"
+    );
+    drop(instance);
+
+    let reopened = InstanceBootstrap::reopen(&paths)?;
+    assert_eq!(
+        reopened.latest_governance_audit_checkpoint_for_test()?,
+        Some(newer),
+        "recovery and the live Catalog agree on the greatest persisted checkpoint frontier"
+    );
+    Ok(())
+}
+
+#[test]
 fn non_administrator_cannot_create_audit_checkpoint_artifact_or_task() -> Result<(), Box<dyn Error>>
 {
     let roots = Roots::new()?;

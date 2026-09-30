@@ -668,6 +668,139 @@ fn runtime_worker_retries_a_running_expiry_after_terminal_publication_outage()
 }
 
 #[test]
+fn public_audit_checkpoint_reports_the_worker_task_before_artifact_publication()
+-> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let (initialized, _, _, administrator_secret) = fixture.initialized_with_admin()?;
+    let task = initialized.queue_governance_audit_checkpoint_for_test()?;
+    let services = ServiceHandle::new(Arc::clone(&initialized))?;
+    let cancellation = crate::TaskCancellation::new();
+    // The runtime worker checks cancellation once before scheduling and once
+    // after durably transitioning the selected task to Running, before any
+    // handler can publish its checkpoint artifact.
+    cancellation.cancel_after_polls(2);
+    assert_eq!(
+        services.wake_maintenance_worker_with_cancellation(&cancellation),
+        Err(ServiceFailure::Cancelled)
+    );
+    assert_eq!(
+        initialized
+            .maintenance_coordinator()
+            .lock()
+            .map_err(|_| "maintenance lock")?
+            .status(task)
+            .map_err(|_| "audit task status")?
+            .phase(),
+        MaintenanceTaskPhase::Running
+    );
+    assert_eq!(
+        initialized.latest_governance_audit_checkpoint_for_test()?,
+        None,
+        "the public caller arrives before the worker handler can publish an artifact"
+    );
+
+    let actor = initialized.attribute(
+        PresentedCredential::parse(&administrator_secret)?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let attached = initialized
+        .publish_governance_audit_checkpoint(actor)
+        .expect_err(
+            "the public caller must not claim storage is unavailable for a worker-owned task",
+        );
+    assert_eq!(
+        attached.code(),
+        crate::BootstrapFailureCode::GovernanceAuditCheckpointInProgress
+    );
+    assert_eq!(
+        attached.maintenance_task(),
+        Some(task),
+        "the retryable result exposes the exact stable worker identity"
+    );
+    assert!(
+        attached.to_string().ends_with(
+            &task
+                .to_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        ),
+        "the retryable public message provides the stable task identity without credential material"
+    );
+    assert_eq!(
+        initialized.governance_audit_checkpoint_state_for_test()?,
+        (false, 1),
+        "the public request neither redispatches nor duplicates the worker-owned task"
+    );
+    drop(services);
+
+    let recovered = ServiceHandle::new(Arc::clone(&initialized))?;
+    assert_eq!(
+        initialized
+            .maintenance_coordinator()
+            .lock()
+            .map_err(|_| "maintenance lock")?
+            .status(task)
+            .map_err(|_| "recovered audit task status")?
+            .phase(),
+        MaintenanceTaskPhase::Queued,
+        "restart recovery returns the interrupted worker task to its durable queue"
+    );
+    let actor = initialized.attribute(
+        PresentedCredential::parse(&administrator_secret)?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let checkpoint = initialized.publish_governance_audit_checkpoint(actor)?;
+    assert_eq!(checkpoint.position(), 1);
+    assert_eq!(
+        initialized.governance_audit_checkpoint_state_for_test()?,
+        (true, 1),
+        "retry completes the recovered worker task instead of granting a duplicate"
+    );
+    drop(recovered);
+    Ok(())
+}
+
+#[test]
+fn public_audit_checkpoint_returns_a_running_worker_artifact_without_redispatch()
+-> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let (initialized, _, _, administrator_secret) = fixture.initialized_with_admin()?;
+    let task = initialized.queue_governance_audit_checkpoint_for_test()?;
+    let worker_checkpoint =
+        initialized.publish_running_governance_audit_checkpoint_for_test(task)?;
+    assert_eq!(
+        initialized.governance_audit_checkpoint_phase_for_test(task)?,
+        MaintenanceTaskPhase::Running,
+        "the handler published before terminalization"
+    );
+
+    let actor = initialized.attribute(
+        PresentedCredential::parse(&administrator_secret)?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    assert_eq!(
+        initialized.publish_governance_audit_checkpoint(actor)?,
+        worker_checkpoint,
+        "the authenticated public call reads the worker-owned signed artifact"
+    );
+    assert_eq!(
+        initialized.governance_audit_checkpoint_phase_for_test(task)?,
+        MaintenanceTaskPhase::Running,
+        "reading the artifact does not redispatch or terminalize the worker task"
+    );
+    assert_eq!(
+        initialized.governance_audit_checkpoint_state_for_test()?,
+        (true, 1),
+        "attachment retains one durable artifact and one stable task"
+    );
+    Ok(())
+}
+
+#[test]
 fn native_runtime_worker_expires_a_durable_lease_and_joins_before_reopen()
 -> Result<(), Box<dyn Error>> {
     let fixture = Fixture::new()?;

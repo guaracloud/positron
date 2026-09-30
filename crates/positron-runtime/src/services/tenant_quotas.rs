@@ -129,7 +129,8 @@ fn map_failure(failure: crate::BootstrapFailure) -> TenantQuotaHttpFailure {
         },
         BootstrapFailureCode::DurableOperationLookupExpired
         | BootstrapFailureCode::DurableOperationUnknown
-        | BootstrapFailureCode::DurableOperationCancellationUnavailable => {
+        | BootstrapFailureCode::DurableOperationCancellationUnavailable
+        | BootstrapFailureCode::GovernanceAuditCheckpointInProgress => {
             TenantQuotaHttpFailure::Code(503, "administration_unavailable")
         },
     }

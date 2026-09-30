@@ -130,6 +130,21 @@ impl InitializedInstance {
         &self,
         identity: MaintenanceTaskId,
     ) -> Result<positron_kernel::GovernanceAuditCheckpoint, BootstrapFailure> {
+        self.complete_queued_governance_audit_checkpoint_and_read_live_for_test(identity)
+            .map(|(checkpoint, _)| checkpoint)
+    }
+
+    #[doc(hidden)]
+    pub fn complete_queued_governance_audit_checkpoint_and_read_live_for_test(
+        &self,
+        identity: MaintenanceTaskId,
+    ) -> Result<
+        (
+            positron_kernel::GovernanceAuditCheckpoint,
+            Option<positron_kernel::GovernanceAuditCheckpoint>,
+        ),
+        BootstrapFailure,
+    > {
         let secret = self
             .key
             .catalog_secret(self.instance)
@@ -154,11 +169,63 @@ impl InitializedInstance {
             )
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?
             .ok_or_else(|| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
-        self.complete_governance_audit_checkpoint_execution_with_coordinator(
+        let checkpoint = self.complete_governance_audit_checkpoint_execution_with_coordinator(
             &catalog,
             &execution,
             &coordinator,
-        )
+        )?;
+        let live = catalog
+            .latest_audit_checkpoint()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        Ok((checkpoint, live))
+    }
+
+    #[doc(hidden)]
+    pub fn publish_running_governance_audit_checkpoint_for_test(
+        &self,
+        identity: MaintenanceTaskId,
+    ) -> Result<positron_kernel::GovernanceAuditCheckpoint, BootstrapFailure> {
+        let secret = self
+            .key
+            .catalog_secret(self.instance)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
+        let catalog = Catalog::open(&self._authority, self.instance, secret)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        let snapshot = catalog
+            .pin()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        let (_, governance) = snapshot
+            .governance_object()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
+        let signer = self
+            .key
+            .audit_checkpoint_signer(self.instance, governance.protected_integrity_key())
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
+        let now = self
+            .retention_time
+            .governance_now_seconds()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        let coordinator = self
+            .maintenance_coordinator()
+            .lock()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        let execution = coordinator
+            .start_task_with_reservation_and_persist(
+                &catalog,
+                &self._authority,
+                now,
+                false,
+                identity,
+            )
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?
+            .ok_or_else(|| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        catalog
+            .publish_admitted_audit_checkpoint(
+                &execution,
+                &signer,
+                governance.integrity_key_fingerprint(),
+            )
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))
     }
 
     #[doc(hidden)]
@@ -196,6 +263,20 @@ impl InitializedInstance {
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?
             .len();
         Ok((published, tasks))
+    }
+
+    #[doc(hidden)]
+    pub fn latest_governance_audit_checkpoint_for_test(
+        &self,
+    ) -> Result<Option<positron_kernel::GovernanceAuditCheckpoint>, BootstrapFailure> {
+        let secret = self
+            .key
+            .catalog_secret(self.instance)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
+        Catalog::read_current_view(&self._authority, self.instance, secret)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?
+            .latest_audit_checkpoint()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))
     }
 
     /// Opens the narrow Instance Integrity signing capability used by a

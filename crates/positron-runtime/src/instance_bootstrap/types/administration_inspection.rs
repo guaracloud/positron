@@ -36,33 +36,42 @@ impl InitializedInstance {
 
     /// Publishes a signed checkpoint for the complete currently visible
     /// Governance Audit chain. Only the authenticated system administrator may
-    /// request this system-governance maintenance action.
+    /// request this system-governance maintenance action. When an equivalent
+    /// worker-owned task is running before its signed artifact is durable, the
+    /// authenticated request returns `GovernanceAuditCheckpointInProgress`
+    /// with that task's stable identity; retrying the same request returns the
+    /// exact artifact once it is durable.
     pub fn publish_governance_audit_checkpoint(
         &self,
         actor: positron_governance::AuthorizedContext,
     ) -> Result<positron_kernel::GovernanceAuditCheckpoint, BootstrapFailure> {
-        // This public synchronous operation owns the coordinator before it
-        // acquires the Catalog writer. Concurrent callers therefore attach to
-        // its durable result instead of racing for a second writer lease.
-        let coordinator = self
-            .maintenance_coordinator()
-            .lock()
-            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
         let secret = self
             .key
             .catalog_secret(self.instance)
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
-        let catalog = Catalog::open(&self._authority, self.instance, secret)
+        // The coordinator serializes public requests from their read-only
+        // attachment decision through execution. This prevents a concurrent
+        // reader from racing the selected caller's Catalog writer. A worker
+        // has released the coordinator before its handler, so a worker-owned
+        // request below returns immediately rather than waiting on it.
+        let coordinator = self
+            .maintenance_coordinator()
+            .lock()
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
-        let snapshot = catalog
-            .pin()
+        // A worker's live durability reservation intentionally prevents a
+        // second Catalog Writer from attaching to its task. Inspect the
+        // authenticated read view first so an equivalent public request can
+        // return the worker's exact durable signed artifact without waiting
+        // under the coordinator or competing for that reservation.
+        let view = Catalog::read_current_view(&self._authority, self.instance, secret)
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
-        let identity = positron_governance::Identity::open(&snapshot)
+        let identity = positron_governance::Identity::open(view.snapshot())
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
         identity
             .inspect(actor, &[])
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::ApiKeyUnauthorized))?;
-        let (_, governance) = snapshot
+        let (_, governance) = view
+            .snapshot()
             .governance_object()
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
         if governance.integrity_key_fingerprint() != self.integrity_key_fingerprint {
@@ -79,11 +88,11 @@ impl InitializedInstance {
                 BootstrapFailureCode::IdentityMismatch,
             ));
         }
-        let frontier = catalog
+        let frontier = view
             .governance_audit_records()
-            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?
-            .into_iter()
-            .last()
+            .iter()
+            .next_back()
+            .cloned()
             .ok_or_else(|| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
         let (task, binding) = Catalog::governance_audit_checkpoint_task(
             &frontier,
@@ -91,15 +100,58 @@ impl InitializedInstance {
         )
         .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
         let requested = task.identity();
+        if let Some(checkpoint) = view
+            .latest_audit_checkpoint()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?
+            && checkpoint.instance() == self.instance
+            && checkpoint.position() == frontier.position()
+            && checkpoint.record_hash() == frontier.record_hash()
+        {
+            checkpoint
+                .verify(signer.public_key())
+                .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+            return Ok(checkpoint);
+        }
+        drop(view);
+        match coordinator.status(requested) {
+            Ok(status) if status.phase() == MaintenanceTaskPhase::Running => {
+                return Err(BootstrapFailure::governance_audit_checkpoint_in_progress(
+                    requested,
+                ));
+            },
+            Ok(_) | Err(MaintenanceFailure::UnknownTask) => {},
+            Err(_) => {
+                return Err(BootstrapFailure::new(
+                    BootstrapFailureCode::CatalogUnavailable,
+                ));
+            },
+        }
         let now = self
             .retention_time
             .governance_now_seconds()
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
-        drop(snapshot);
-        // Keep duplicate public requests attached to this one coordinator
-        // transition until its signed result is durable. The worker uses the
-        // same coordinator state, so an already-running task remains visible
-        // rather than being silently redispatched.
+        let secret = self
+            .key
+            .catalog_secret(self.instance)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
+        let catalog = match Catalog::open(&self._authority, self.instance, secret) {
+            Ok(catalog) => catalog,
+            Err(_) => {
+                if coordinator
+                    .status(requested)
+                    .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?
+                    .phase()
+                    == MaintenanceTaskPhase::Running
+                {
+                    return Err(BootstrapFailure::governance_audit_checkpoint_in_progress(
+                        requested,
+                    ));
+                }
+                return Err(BootstrapFailure::new(
+                    BootstrapFailureCode::CatalogUnavailable,
+                ));
+            },
+        };
         coordinator
             .submit_governance_audit_checkpoint_and_persist(&catalog, task, binding, now)
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
@@ -114,14 +166,7 @@ impl InitializedInstance {
             checkpoint
                 .verify(signer.public_key())
                 .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
-            if coordinator
-                .status(requested)
-                .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?
-                .phase()
-                == positron_kernel::MaintenanceTaskPhase::Succeeded
-            {
-                return Ok(checkpoint);
-            }
+            return Ok(checkpoint);
         }
         let execution = coordinator
             .start_task_with_reservation_and_persist(
@@ -131,8 +176,25 @@ impl InitializedInstance {
                 false,
                 requested,
             )
-            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?
-            .ok_or_else(|| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        let execution = match execution {
+            Some(execution) => execution,
+            None if coordinator
+                .status(requested)
+                .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?
+                .phase()
+                == MaintenanceTaskPhase::Running =>
+            {
+                return Err(BootstrapFailure::governance_audit_checkpoint_in_progress(
+                    requested,
+                ));
+            },
+            None => {
+                return Err(BootstrapFailure::new(
+                    BootstrapFailureCode::CatalogUnavailable,
+                ));
+            },
+        };
         self.complete_governance_audit_checkpoint_execution_with_coordinator(
             &catalog,
             &execution,
