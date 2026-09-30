@@ -8,7 +8,7 @@ use std::num::NonZeroU64;
 use positron_domain::identity::PrincipalId;
 use positron_kernel::{
     AuditCheckpointSigner, AuditIntent, Catalog, CatalogFailureCode, CatalogObject,
-    CatalogSnapshot, SystemAuditRetentionPolicy, TransactionId,
+    CatalogSnapshot, SystemAuditRetentionPolicy, SystemAuditRetentionPublication, TransactionId,
 };
 use sha2::{Digest, Sha256};
 
@@ -100,6 +100,7 @@ impl SystemAuditRetentionAdministration {
         instance: positron_kernel::InstanceId,
         identity: &Identity,
         signer: &AuditCheckpointSigner,
+        coordinator: &positron_kernel::MaintenanceCoordinator,
         request: SystemAuditRetentionRequest,
     ) -> Result<SystemAuditRetentionUpdate, SystemAuditRetentionAdministrationFailure> {
         let actor = identity
@@ -115,11 +116,9 @@ impl SystemAuditRetentionAdministration {
             {
                 return Err(SystemAuditRetentionAdministrationFailure::IdempotencyConflict);
             }
-            if receipt.reclamation_required {
-                catalog
-                    .complete_audit_retention_reclamation()
-                    .map_err(map_catalog)?;
-            }
+            coordinator
+                .reconcile_from_catalog(catalog)
+                .map_err(|_| SystemAuditRetentionAdministrationFailure::PersistenceUnavailable)?;
             return Ok(receipt.update());
         }
         let current_generation = catalog
@@ -183,18 +182,22 @@ impl SystemAuditRetentionAdministration {
             .publish_system_audit_retention_policy_with_receipt(
                 TransactionId::new(request.idempotency_key.to_bytes()).map_err(map_catalog)?,
                 signer,
-                SystemAuditRetentionPolicy::new(
-                    instance,
-                    generation.get(),
-                    request.retained_record_limit.get(),
-                )
-                .map_err(map_catalog)?,
-                last_removed,
-                AuditIntent::new(audit).map_err(map_catalog)?,
-                {
-                    let mut receipts = migrated_receipts;
-                    receipts.push(receipt.object(request.idempotency_key)?);
-                    receipts
+                SystemAuditRetentionPublication {
+                    policy: SystemAuditRetentionPolicy::new(
+                        instance,
+                        generation.get(),
+                        request.retained_record_limit.get(),
+                    )
+                    .map_err(map_catalog)?,
+                    last_removed,
+                    audit: AuditIntent::new(audit).map_err(map_catalog)?,
+                    receipts: {
+                        let mut receipts = migrated_receipts;
+                        receipts.push(receipt.object(request.idempotency_key)?);
+                        receipts
+                    },
+                    coordinator,
+                    submitted_at: request.audit_ingest_time_unix_seconds,
                 },
             )
             .map_err(map_catalog)?;

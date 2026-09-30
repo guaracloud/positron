@@ -14,6 +14,7 @@ use positron_domain::lifecycle::TenantLifecycleState;
 use positron_domain::time::UnixNanoseconds;
 use positron_governance::{AdministrativeIdempotencyKey, ResourceGeneration};
 use positron_governance::{CompatibilityHints, PresentedCredential, RequestedIntent};
+#[cfg(feature = "test-support")]
 use positron_kernel::MaintenanceTaskPhase;
 #[cfg(feature = "test-support")]
 use positron_kernel::RetentionTimeAuthority;
@@ -130,6 +131,7 @@ fn system_administrator_publishes_and_verifies_a_bootstrap_bound_audit_checkpoin
     Ok(())
 }
 
+#[cfg(feature = "test-support")]
 #[test]
 fn delayed_audit_checkpoint_keeps_the_newer_live_and_recovered_frontier()
 -> Result<(), Box<dyn Error>> {
@@ -189,6 +191,7 @@ fn delayed_audit_checkpoint_keeps_the_newer_live_and_recovered_frontier()
     Ok(())
 }
 
+#[cfg(feature = "test-support")]
 #[test]
 fn non_administrator_cannot_create_audit_checkpoint_artifact_or_task() -> Result<(), Box<dyn Error>>
 {
@@ -367,6 +370,7 @@ fn audit_checkpoint_reopens_and_reconciles_after_artifact_and_terminal_faults()
     Ok(())
 }
 
+#[cfg(feature = "test-support")]
 #[test]
 fn queued_audit_checkpoint_key_change_fails_durably_and_new_binding_progresses()
 -> Result<(), Box<dyn Error>> {

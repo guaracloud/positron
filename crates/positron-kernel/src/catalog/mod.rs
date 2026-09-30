@@ -38,10 +38,11 @@ use storage::{CatalogStorage, PreparedLookup};
 use crate::data_protection::ControlTokenProtector;
 use crate::resource_governor::CatalogWriterLease;
 use crate::{
-    GovernanceAuditCheckpointBinding, MaintenanceExecution, MaintenanceObjectId,
-    MaintenancePreconditions, MaintenanceScope, MaintenanceTask, MaintenanceTaskClass,
-    MaintenanceTaskId, MaintenanceTrigger, RecoveryWorkClaim, RecoveryWorkKind, ResourceAmounts,
-    ResourceDimension, StorageKernelResourceAuthority, WorkClaim, WorkKind,
+    GovernanceAuditCheckpointBinding, MaintenanceCoordinator, MaintenanceExecution,
+    MaintenanceObjectId, MaintenancePreconditions, MaintenanceScope, MaintenanceTask,
+    MaintenanceTaskClass, MaintenanceTaskId, MaintenanceTrigger, RecoveryWorkClaim,
+    RecoveryWorkKind, ResourceAmounts, ResourceDimension, StorageKernelResourceAuthority,
+    WorkClaim, WorkKind,
 };
 
 pub use audit_checkpoint::{
@@ -140,6 +141,17 @@ pub struct Catalog<'authority> {
     operation: Mutex<()>,
     pub(crate) export_output_operation: Mutex<()>,
     state: Mutex<CatalogState>,
+}
+
+/// The caller-owned inputs that must reach one joint system audit-retention
+/// Catalog publication, including its coordinator-owned reclamation draft.
+pub struct SystemAuditRetentionPublication<'a> {
+    pub policy: SystemAuditRetentionPolicy,
+    pub last_removed: Option<&'a GovernanceAuditRecord>,
+    pub audit: AuditIntent,
+    pub receipts: Vec<CatalogObject>,
+    pub coordinator: &'a MaintenanceCoordinator,
+    pub submitted_at: u64,
 }
 
 struct CatalogState {
@@ -1197,13 +1209,18 @@ impl<'authority> Catalog<'authority> {
         last_removed: &GovernanceAuditRecord,
         audit: AuditIntent,
     ) -> Result<AuditRetentionAnchor, CatalogFailure> {
+        let coordinator = MaintenanceCoordinator::new();
         self.publish_system_audit_retention_policy_with_receipt(
             transaction,
             signer,
-            policy,
-            Some(last_removed),
-            audit,
-            Vec::new(),
+            SystemAuditRetentionPublication {
+                policy,
+                last_removed: Some(last_removed),
+                audit,
+                receipts: Vec::new(),
+                coordinator: &coordinator,
+                submitted_at: 0,
+            },
         )?
         .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::IntegrityCorruption))
     }
@@ -1217,15 +1234,16 @@ impl<'authority> Catalog<'authority> {
         &self,
         transaction: TransactionId,
         signer: &AuditCheckpointSigner,
-        policy: SystemAuditRetentionPolicy,
-        last_removed: Option<&GovernanceAuditRecord>,
-        audit: AuditIntent,
-        receipts: Vec<CatalogObject>,
+        publication: SystemAuditRetentionPublication<'_>,
     ) -> Result<Option<AuditRetentionAnchor>, CatalogFailure> {
         let basis = self.pin()?;
-        let trust = audit_checkpoint::retention_trust_for_policy(&basis, self.instance, policy)?;
+        let trust = audit_checkpoint::retention_trust_for_policy(
+            &basis,
+            self.instance,
+            publication.policy,
+        )?;
         let records = self.governance_audit_records()?;
-        let anchor = match last_removed {
+        let anchor = match publication.last_removed {
             Some(record) => {
                 if !records.iter().any(|candidate| {
                     candidate.position == record.position && candidate.hash == record.hash
@@ -1239,10 +1257,21 @@ impl<'authority> Catalog<'authority> {
                 .map(|previous| previous.rebind(signer, trust))
                 .transpose()?,
         };
+        let queued_reclamation = anchor
+            .as_ref()
+            .map(|anchor| {
+                Self::audit_retention_reclamation_task(anchor).and_then(|task| {
+                    publication
+                        .coordinator
+                        .prepare_catalog_reclamation(task, publication.submitted_at)
+                        .map_err(|_| CatalogFailure::new(CatalogFailureCode::LimitExceeded))
+                })
+            })
+            .transpose()?;
         let capacity = basis
             .plaintext_object_count()
-            .checked_add(3)
-            .and_then(|value| value.checked_add(receipts.len()))
+            .checked_add(4)
+            .and_then(|value| value.checked_add(publication.receipts.len()))
             .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?;
         let mut objects = Vec::new();
         objects
@@ -1260,14 +1289,21 @@ impl<'authority> Catalog<'authority> {
             }
             objects.push(CatalogObject::new(object.to_vec())?);
         }
-        objects.push(policy.into_catalog_object()?);
+        objects.push(publication.policy.into_catalog_object()?);
         if let Some(anchor) = &anchor {
             objects.push(CatalogObject::new(anchor.encode())?);
             objects.push(CatalogObject::new(
                 audit_checkpoint::AuditRetentionReclamationReceipt::new(anchor).encode(),
             )?);
         }
-        for receipt in receipts {
+        if let Some(queued) = &queued_reclamation {
+            objects.push(
+                queued
+                    .catalog_object()
+                    .map_err(|_| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?,
+            );
+        }
+        for receipt in publication.receipts {
             objects.push(receipt);
         }
         let format_epoch = basis
@@ -1276,7 +1312,7 @@ impl<'authority> Catalog<'authority> {
         let proposal = CatalogProposal::new(transaction, format_epoch, objects)?;
         let durability_claim = RecoveryWorkClaim::system(
             RecoveryWorkKind::DurabilityCompletion,
-            commit_resource_claim(&proposal, Some(&audit))?,
+            commit_resource_claim(&proposal, Some(&publication.audit))?,
         )
         .map_err(|_| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?;
         let reservation = self
@@ -1289,7 +1325,7 @@ impl<'authority> Catalog<'authority> {
                 .operation
                 .lock()
                 .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
-            self.commit_unreserved(basis.identity(), proposal, Some(audit), None)
+            self.commit_unreserved(basis.identity(), proposal, Some(publication.audit), None)
         };
         drop(reservation);
         #[cfg(any(test, feature = "test-support"))]
@@ -1299,11 +1335,55 @@ impl<'authority> Catalog<'authority> {
         {
             storage::after_ambiguous_publication(self);
         }
-        result?;
-        if anchor.is_some() {
-            self.complete_audit_retention_reclamation()?;
+        if let Err(failure) = result {
+            if let Some(queued) = queued_reclamation {
+                queued.discard(publication.coordinator);
+            }
+            return Err(failure);
+        }
+        if let Some(queued) = queued_reclamation {
+            queued
+                .install(publication.coordinator)
+                .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
         }
         Ok(anchor)
+    }
+
+    fn audit_retention_reclamation_task(
+        anchor: &AuditRetentionAnchor,
+    ) -> Result<MaintenanceTask, CatalogFailure> {
+        let anchor_object = CatalogObject::new(anchor.encode())?;
+        let receipt_object = CatalogObject::new(
+            audit_checkpoint::AuditRetentionReclamationReceipt::new(anchor).encode(),
+        )?;
+        let mut digest = Sha256::new();
+        digest.update(b"positron.audit-retention-reclamation-task.v1\0");
+        digest.update(anchor_object.identity().to_bytes());
+        digest.update(receipt_object.identity().to_bytes());
+        let bytes: [u8; 16] = digest
+            .finalize()
+            .get(..16)
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?;
+        MaintenanceTask::with_contract(
+            MaintenanceTaskId::new(bytes)
+                .map_err(|_| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?,
+            MaintenanceTaskClass::CatalogReclamation,
+            MaintenanceScope::System,
+            MaintenanceTrigger::Event,
+            MaintenancePreconditions::new(anchor.system_policy_generation(), 1)
+                .map_err(|_| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?,
+            vec![
+                MaintenanceObjectId::new(anchor_object.identity().to_bytes())
+                    .map_err(|_| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?,
+            ],
+            vec![
+                MaintenanceObjectId::new(receipt_object.identity().to_bytes())
+                    .map_err(|_| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?,
+            ],
+            ResourceAmounts::new([1, 1, 1, 0, 1, 0, 1, 1, 1, 1, 0]),
+        )
+        .map_err(|_| CatalogFailure::new(CatalogFailureCode::LimitExceeded))
     }
 
     /// Completes an already-published, receipt-bound Governance Audit

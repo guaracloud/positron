@@ -521,7 +521,7 @@ fn system_audit_retention_rejects_tenant_data_plane_and_revoked_tenant_contexts(
 }
 
 #[test]
-fn committed_system_audit_retention_replay_finishes_interrupted_reclamation_after_reopen()
+fn committed_system_audit_retention_queues_reclamation_before_physical_mutation()
 -> Result<(), Box<dyn Error>> {
     let fixture = Fixture::new()?;
     let (initialized, _, _, administrator_secret) = fixture.initialized_with_admin()?;
@@ -539,28 +539,18 @@ fn committed_system_audit_retention_replay_finishes_interrupted_reclamation_afte
     let key = AdministrativeIdempotencyKey::new([0xd9; 16])?;
     let retained_record_limit = NonZeroU64::new(1).ok_or("nonzero retained audit-record limit")?;
     let expected = ResourceGeneration::new(2)?;
-    let interrupted =
+    let audit_before = initialized.governance_audit_for_test()?.len();
+    let update =
         with_catalog_publication_fault_after(CatalogPublicationFault::ReclaimAudit, 0, || {
             initialized.update_system_audit_retention(actor, retained_record_limit, expected, key)
         })
-        .expect_err("the durable receipt must survive an interrupted post-commit reclaim");
-    assert_eq!(interrupted.code(), BootstrapFailureCode::CatalogUnavailable);
-    drop(initialized);
-
-    let reopened = fixture.reopen()?;
-    let actor = reopened.attribute(
-        PresentedCredential::parse(&administrator_secret)?,
-        RequestedIntent::SystemAdministration,
-        CompatibilityHints::none(),
-    )?;
-    let replay = reopened.update_system_audit_retention(
-        actor,
-        NonZeroU64::new(1).ok_or("nonzero retained audit-record limit")?,
-        ResourceGeneration::new(2)?,
-        key,
-    )?;
-    assert_eq!(replay.policy_generation(), ResourceGeneration::new(3)?);
-    assert_eq!(reopened.governance_audit_for_test()?.len(), 1);
+        .expect("the policy receipt and bounded maintenance request commit before unlinking");
+    assert_eq!(update.policy_generation(), ResourceGeneration::new(3)?);
+    assert_eq!(
+        initialized.governance_audit_for_test()?.len(),
+        audit_before + 1,
+        "a policy update only makes physical audit reclamation eligible; its worker has not run"
+    );
     Ok(())
 }
 

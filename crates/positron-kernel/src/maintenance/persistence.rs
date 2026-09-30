@@ -340,6 +340,23 @@ impl QueuedMaintenanceSubmission {
 }
 
 impl MaintenanceCoordinator {
+    /// Reconciles the in-memory coordinator registry from the sole durable
+    /// source after a caller observes a previously committed transaction.
+    /// This is used by idempotent administration replay when an acknowledgement
+    /// was lost after the joint policy-and-task publication.
+    pub fn reconcile_from_catalog(&self, catalog: &Catalog<'_>) -> Result<(), MaintenanceFailure> {
+        let restored = Self::restore_from_catalog(catalog)?;
+        let recovered = restored
+            .state
+            .into_inner()
+            .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
+        *state = recovered;
+        Ok(())
+    }
     pub(super) fn prepare_running_retention_reclamation_completion(
         &self,
         dispatch: MaintenanceDispatch,
@@ -892,6 +909,74 @@ impl MaintenanceCoordinator {
             task,
             phase: MaintenanceTaskPhase::Queued,
             submitted_at: not_before,
+            checkpoint: None,
+            pause_until: None,
+            cancellation_requested: false,
+            dispatches: 0,
+            terminal_order: None,
+            active_dispatch: None,
+        };
+        let record = encode_record(&state)?;
+        Ok(QueuedMaintenanceSubmission {
+            state,
+            record,
+            reclaimed_terminal,
+        })
+    }
+
+    /// Reserves one system-scoped Catalog reclamation descriptor for a
+    /// caller-owned Catalog proposal.  The descriptor is invisible until its
+    /// companion proposal commits, exactly like the coupled lease-expiry
+    /// descriptor above.
+    pub(crate) fn prepare_catalog_reclamation(
+        &self,
+        task: MaintenanceTask,
+        submitted_at: u64,
+    ) -> Result<QueuedMaintenanceSubmission, MaintenanceFailure> {
+        if task.class != MaintenanceTaskClass::CatalogReclamation
+            || task.scope != MaintenanceScope::System
+            || task.trigger != MaintenanceTrigger::Event
+        {
+            return Err(MaintenanceFailure::InvalidInput);
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
+        if state.tasks.contains_key(&task.identity)
+            || state.pending_submissions.contains(&task.identity)
+        {
+            return Err(MaintenanceFailure::PreconditionFailed);
+        }
+        let occupied = state
+            .tasks
+            .len()
+            .checked_add(state.pending_submissions.len())
+            .ok_or(MaintenanceFailure::CapacityExceeded)?;
+        let reclaimed_terminal = if occupied >= MAX_MAINTENANCE_TASKS {
+            let mut prospective = state.clone();
+            let identity = reclaim_terminal_slot(&mut prospective)?
+                .ok_or(MaintenanceFailure::CapacityExceeded)?;
+            Some((
+                identity,
+                state
+                    .tasks
+                    .get(&identity)
+                    .cloned()
+                    .ok_or(MaintenanceFailure::UnknownTask)?,
+            ))
+        } else {
+            None
+        };
+        state.pending_submissions.insert(task.identity);
+        if let Some((identity, _)) = &reclaimed_terminal {
+            state.pending_terminal_reclamations.insert(*identity);
+        }
+        drop(state);
+        let state = TaskState {
+            task,
+            phase: MaintenanceTaskPhase::Queued,
+            submitted_at,
             checkpoint: None,
             pause_until: None,
             cancellation_requested: false,
