@@ -78,7 +78,8 @@ async fn success_and_decode_failure_release_capacity_without_governor_drift()
         Duration::from_secs(2),
         LogsServiceClient::connect(format!("http://{}", harness.endpoint())),
     )
-    .await??;
+    .await
+    .map_err(|_| "resource-governance client connection timed out")??;
 
     for sequence in 0..8 {
         let request = harness.authorize(tonic::Request::new(otlp_request(&format!(
@@ -86,7 +87,7 @@ async fn success_and_decode_failure_release_capacity_without_governor_drift()
         ))))?;
         let response = tokio::time::timeout(Duration::from_secs(2), client.export(request))
             .await
-            .map_err(|_| "resource-governance successful export timed out")??;
+            .map_err(|_| format!("resource-governance successful export {sequence} timed out"))??;
         assert!(response.into_inner().partial_success.is_none());
     }
 
