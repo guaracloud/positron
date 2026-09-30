@@ -1248,6 +1248,7 @@ impl RegisteredTask for NativeRegisteredTask {
     ) -> Result<Box<dyn RunningTask>, TaskFailure> {
         if self.role == TaskRole::Maintenance {
             let services = services.ok_or(TaskFailure::SpawnUnavailable)?;
+            let wake_services = services.clone();
             let task_cancellation = cancellation.clone();
             let handle = std::thread::Builder::new()
                 .name("positron-maintenance".to_owned())
@@ -1260,6 +1261,7 @@ impl RegisteredTask for NativeRegisteredTask {
             return Ok(Box::new(NativeRunningTask {
                 cancellation,
                 force: TaskCancellation::new(),
+                maintenance_wake: Some(wake_services),
                 handle: Some(handle),
             }));
         }
@@ -1296,6 +1298,7 @@ impl RegisteredTask for NativeRegisteredTask {
         Ok(Box::new(NativeRunningTask {
             cancellation,
             force,
+            maintenance_wake: None,
             handle: Some(handle),
         }))
     }
@@ -1433,6 +1436,7 @@ fn latest_admission(
 struct NativeRunningTask {
     cancellation: TaskCancellation,
     force: TaskCancellation,
+    maintenance_wake: Option<ServiceHandle>,
     handle: Option<JoinHandle<Result<(), TaskFailure>>>,
 }
 
@@ -1456,6 +1460,9 @@ impl RunningTask for NativeRunningTask {
 
     fn abort(&mut self) -> Result<(), TaskFailure> {
         self.cancellation.cancel();
+        if let Some(services) = self.maintenance_wake.as_ref() {
+            services.notify_maintenance_worker();
+        }
         self.force.cancel();
         if join_thread_within(&mut self.handle, Duration::from_millis(250))? {
             Ok(())
