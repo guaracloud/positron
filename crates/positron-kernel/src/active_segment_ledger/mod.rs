@@ -349,6 +349,29 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             scope,
             protection,
             None,
+            false,
+        )
+    }
+
+    /// Reopens a scope for a durable maintenance task without rolling its
+    /// existing active segment into a new sealed segment. The writer and
+    /// recovery reservations remain held, so the caller retains the same
+    /// serialization and repair guarantees as ordinary ingestion.
+    pub fn open_for_maintenance_with_retention_time(
+        authority: &'kernel StorageKernelResourceAuthority,
+        retention_time: &'kernel crate::RetentionTimeAuthority,
+        catalog: &'catalog Catalog<'kernel>,
+        scope: SegmentScope,
+        protection: SegmentProtectionKey,
+    ) -> Result<Self, LedgerFailure> {
+        Self::open_at(
+            authority,
+            Some(retention_time),
+            catalog,
+            scope,
+            protection,
+            None,
+            true,
         )
     }
 
@@ -367,7 +390,15 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             .checked_div(1_000_000_000)
             .and_then(|value| u64::try_from(value).ok())
             .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::StorageUnavailable))?;
-        Self::open_at(authority, None, catalog, scope, protection, Some(now))
+        Self::open_at(
+            authority,
+            None,
+            catalog,
+            scope,
+            protection,
+            Some(now),
+            false,
+        )
     }
 
     fn open_at(
@@ -377,6 +408,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         scope: SegmentScope,
         protection: SegmentProtectionKey,
         lifecycle_now: Option<u64>,
+        preserve_active: bool,
     ) -> Result<Self, LedgerFailure> {
         let writer = authority
             .acquire_active_segment_ledger(scope.lease_key())
@@ -469,22 +501,36 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         retained_capacity
             .try_resize_preserving_capacity(retained_claim(retained_bytes, blocks.len())?)
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
-        let successor = fresh_metadata(scope, frontier)?;
-        let key = storage.create_active(successor, &protection, catalog.instance())?;
-        if let Some((predecessor, _recovered_key)) = recovered_active {
-            storage
-                .seal(predecessor)
+        let (key, current, publish_scope) = if preserve_active {
+            if let Some((active, key)) = recovered_active {
+                (key, active, false)
+            } else {
+                let successor = fresh_metadata(scope, frontier)?;
+                let key = storage.create_active(successor, &protection, catalog.instance())?;
+                metadata.push(successor);
+                (key, successor, true)
+            }
+        } else {
+            let successor = fresh_metadata(scope, frontier)?;
+            let key = storage.create_active(successor, &protection, catalog.instance())?;
+            if let Some((predecessor, _recovered_key)) = recovered_active {
+                storage
+                    .seal(predecessor)
+                    .map_err(|failure| LedgerFailure::post_mutation(failure.code()))?;
+                metadata.retain(|candidate| candidate.id != predecessor.id);
+                metadata.push(SegmentMetadata {
+                    state: SegmentState::Sealed,
+                    ..predecessor
+                });
+            }
+            metadata.push(successor);
+            (key, successor, true)
+        };
+        if publish_scope {
+            publish_segments(catalog, &snapshot, &storage, scope, &metadata)
                 .map_err(|failure| LedgerFailure::post_mutation(failure.code()))?;
-            metadata.retain(|candidate| candidate.id != predecessor.id);
-            metadata.push(SegmentMetadata {
-                state: SegmentState::Sealed,
-                ..predecessor
-            });
         }
-        metadata.push(successor);
-        publish_segments(catalog, &snapshot, &storage, scope, &metadata)
-            .map_err(|failure| LedgerFailure::post_mutation(failure.code()))?;
-        storage.set_current(successor);
+        storage.set_current(current);
         Ok(Self {
             _writer: writer,
             authority,

@@ -125,7 +125,7 @@ impl std::fmt::Debug for ServiceHandle {
 impl ServiceHandle {
     #[cfg(test)]
     pub(crate) fn wake_maintenance_worker(&self) -> Result<bool, ServiceFailure> {
-        maintenance::wake_snapshot_lease_expiry(self, None)
+        maintenance::wake_runtime_maintenance(self, None)
     }
 
     #[cfg(test)]
@@ -133,14 +133,14 @@ impl ServiceHandle {
         &self,
         cancellation: &crate::TaskCancellation,
     ) -> Result<bool, ServiceFailure> {
-        maintenance::wake_snapshot_lease_expiry(self, Some(cancellation))
+        maintenance::wake_runtime_maintenance(self, Some(cancellation))
     }
 
     pub(crate) fn run_maintenance_worker(
         &self,
         cancellation: &crate::TaskCancellation,
     ) -> Result<(), ServiceFailure> {
-        maintenance::run_snapshot_lease_expiry_worker(self, cancellation, &self.maintenance_wake)
+        maintenance::run_runtime_maintenance_worker(self, cancellation, &self.maintenance_wake)
     }
 
     pub(crate) fn catalog_operation(&self) -> Result<MutexGuard<'_, ()>, ServiceFailure> {

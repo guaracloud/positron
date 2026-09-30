@@ -842,6 +842,34 @@ impl MaintenanceCoordinator {
         state.tasks.values().map(encode_record).collect()
     }
 
+    /// Reports whether a nonterminal retention task already owns a segment
+    /// scope. Runtime discovery uses this bounded coordinator view to avoid
+    /// preparing a second descriptor while the durable first attempt or its
+    /// Reclamation successor remains authoritative.
+    pub fn has_nonterminal_retention_task_for_scope(
+        &self,
+        scope: MaintenanceScope,
+    ) -> Result<bool, MaintenanceFailure> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
+        Ok(state.tasks.values().any(|task| {
+            task.task.scope == scope
+                && matches!(
+                    task.task.class,
+                    MaintenanceTaskClass::RetentionPublication
+                        | MaintenanceTaskClass::RetentionReclamation
+                )
+                && !matches!(
+                    task.phase,
+                    MaintenanceTaskPhase::Cancelled
+                        | MaintenanceTaskPhase::Succeeded
+                        | MaintenanceTaskPhase::Failed
+                )
+        }))
+    }
+
     pub fn restore(
         records: impl IntoIterator<Item = MaintenanceTaskRecord>,
     ) -> Result<Self, MaintenanceFailure> {

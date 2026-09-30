@@ -6,10 +6,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, any_value};
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
+use positron_domain::routing::SignalKind;
 use positron_domain::time::UnixNanoseconds;
-use positron_governance::GovernanceAuditEntry;
+use positron_governance::{
+    AdministrativeIdempotencyKey, CompatibilityHints, GovernanceAuditEntry, PresentedCredential,
+    RequestedIntent, ResourceGeneration,
+};
 use positron_ingest::load_schema_checkpoint;
 use positron_kernel::{
     ActiveSegmentLedger, AuditIntent, Catalog, CatalogObject, CatalogProposal,
@@ -249,6 +255,159 @@ fn runtime_maintenance_worker_wake_dispatches_and_completes_a_due_snapshot_lease
             .phase(),
         MaintenanceTaskPhase::Succeeded
     );
+    Ok(())
+}
+
+#[test]
+fn runtime_maintenance_worker_discovers_and_completes_expired_log_and_trace_retention()
+-> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let (mut initialized, ingest, _, administrator_secret) = fixture.initialized_with_admin()?;
+    let (retention_time, elapsed) =
+        RetentionTimeAuthority::establish_with_manual_elapsed(UnixNanoseconds::new(10_000_000_000));
+    Arc::get_mut(&mut initialized)
+        .ok_or("sole initialized instance")?
+        .install_retention_time_for_test(retention_time)?;
+    let tenant = initialized.default_tenant_id();
+    let system = initialized.attribute(
+        PresentedCredential::parse(&administrator_secret)?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let retention = std::num::NonZeroU64::new(1).ok_or("one second retention")?;
+    let preview = initialized.inspect_tenant_retention_impact(system, tenant, retention)?;
+    initialized.update_tenant_retention(
+        system,
+        tenant,
+        retention,
+        ResourceGeneration::new(1)?,
+        Some(&preview),
+        AdministrativeIdempotencyKey::new([0x83; 16])?,
+    )?;
+    let services = ServiceHandle::new(Arc::clone(&initialized))?;
+    assert_eq!(
+        services
+            .ingest_otlp_logs(&ingest, request("runtime-retention-log").encode_to_vec())?
+            .accepted_records(),
+        1
+    );
+    assert_eq!(
+        services
+            .ingest_otlp_traces(
+                &ingest,
+                ExportTraceServiceRequest {
+                    resource_spans: vec![ResourceSpans {
+                        scope_spans: vec![ScopeSpans {
+                            spans: vec![Span {
+                                trace_id: vec![0x83; 16],
+                                span_id: vec![0x84; 8],
+                                name: "runtime-retention-trace".to_owned(),
+                                start_time_unix_nano: 41,
+                                end_time_unix_nano: 42,
+                                ..Span::default()
+                            }],
+                            ..ScopeSpans::default()
+                        }],
+                        ..ResourceSpans::default()
+                    }],
+                }
+                .encode_to_vec(),
+            )?
+            .accepted_records(),
+        1
+    );
+
+    let catalog = open_catalog(&initialized)?;
+    let snapshot = catalog.pin()?;
+    let scopes = [SignalKind::Logs, SignalKind::Traces]
+        .into_iter()
+        .map(|signal| snapshot.reachable_ledger_scopes(tenant, signal))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        scopes.len(),
+        2,
+        "one canonical scope for each stored signal"
+    );
+    drop((snapshot, catalog));
+    for scope in &scopes {
+        let catalog = open_catalog(&initialized)?;
+        let identity = positron_governance::Identity::open(&catalog.pin()?)?;
+        let protection = super::super::tenant_segment_key(&initialized, &identity, *scope)?;
+        ActiveSegmentLedger::open_with_retention_time(
+            &initialized._authority,
+            &initialized.retention_time,
+            &catalog,
+            *scope,
+            protection,
+        )?
+        .seal()?;
+    }
+    elapsed.advance(2_000_000_000)?;
+
+    assert!(
+        services.wake_maintenance_worker()?,
+        "the sole runtime worker discovers and begins due retention work"
+    );
+    for _ in 0..3 {
+        assert!(services.wake_maintenance_worker()?);
+    }
+    let catalog = open_catalog(&initialized)?;
+    let idle_generation = catalog.pin()?.number();
+    let idle_task_count = initialized
+        .maintenance_coordinator()
+        .lock()
+        .map_err(|_| "maintenance lock")?
+        .durable_records()
+        .map_err(|_| "durable maintenance records")?
+        .len();
+    drop(catalog);
+    for _ in 0..4 {
+        assert!(
+            !services.wake_maintenance_worker()?,
+            "an idle maintenance pass must not roll an empty active segment"
+        );
+    }
+    let catalog = open_catalog(&initialized)?;
+    assert_eq!(
+        catalog.pin()?.number(),
+        idle_generation,
+        "idle discovery does not publish a Catalog generation"
+    );
+    assert_eq!(
+        initialized
+            .maintenance_coordinator()
+            .lock()
+            .map_err(|_| "maintenance lock")?
+            .durable_records()
+            .map_err(|_| "durable maintenance records")?
+            .len(),
+        idle_task_count,
+        "idle discovery does not create a new durable task"
+    );
+    drop(catalog);
+
+    for scope in scopes {
+        let catalog = open_catalog(&initialized)?;
+        let identity = positron_governance::Identity::open(&catalog.pin()?)?;
+        let protection = super::super::tenant_segment_key(&initialized, &identity, scope)?;
+        let ledger = ActiveSegmentLedger::open_for_maintenance_with_retention_time(
+            &initialized._authority,
+            &initialized.retention_time,
+            &catalog,
+            scope,
+            protection,
+        )?;
+        assert_eq!(
+            ledger
+                .prepare_retention_publication()
+                .expect_err("the runtime worker has consumed this expired scope")
+                .code(),
+            positron_kernel::LedgerFailureCode::InvalidInput
+        );
+    }
     Ok(())
 }
 

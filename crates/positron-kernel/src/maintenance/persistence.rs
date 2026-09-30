@@ -936,6 +936,27 @@ impl MaintenanceCoordinator {
         clock_uncertain: bool,
         class: Option<MaintenanceTaskClass>,
     ) -> Result<Option<MaintenanceExecution<'authority>>, MaintenanceFailure> {
+        let classes = class.as_slice();
+        self.start_next_with_reservation_and_persist_for_classes(
+            catalog,
+            authority,
+            now,
+            clock_uncertain,
+            classes,
+        )
+    }
+
+    /// Selects only work owned by the installed runtime handler set. Candidate
+    /// ordering remains the coordinator's ordinary priority and fairness order;
+    /// an unsupported class stays Queued for a future handler.
+    pub fn start_next_with_reservation_and_persist_for_classes<'authority>(
+        &self,
+        catalog: &Catalog<'_>,
+        authority: &'authority StorageKernelResourceAuthority,
+        now: u64,
+        clock_uncertain: bool,
+        classes: &[MaintenanceTaskClass],
+    ) -> Result<Option<MaintenanceExecution<'authority>>, MaintenanceFailure> {
         let mut state = self
             .state
             .lock()
@@ -951,7 +972,7 @@ impl MaintenanceCoordinator {
                 .get(&identity)
                 .map(|stored| stored.task.clone())
                 .ok_or(MaintenanceFailure::UnknownTask)?;
-            if class.is_some_and(|expected| task.class() != expected) {
+            if !classes.is_empty() && !classes.contains(&task.class()) {
                 continue;
             }
             let reservation = match reserve_task(authority, &task) {

@@ -95,6 +95,81 @@ fn retention_publication_retires_an_empty_sealed_segment_and_queues_reclamation(
 }
 
 #[test]
+fn maintenance_reopen_preserves_a_prepared_retention_publication_binding()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_authority(volume)?;
+    let instance = InstanceId::new([0xd1; 16])?;
+    let catalog = Catalog::open(
+        &authority,
+        instance,
+        CatalogSecret::from_owned(Box::new([0xd2; 32]), Box::new([0xd3; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x64; 16])?;
+    install_governance_policy(&catalog, instance, tenant, 1, 0xd4)?;
+    let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(92)?);
+    let (retention_time, elapsed) =
+        RetentionTimeAuthority::establish_with_manual_elapsed(UnixNanoseconds::new(10_000_000_000));
+    let key = || SegmentProtectionKey::from_owned(Box::new([0xd5; 32]));
+    ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?
+    .seal()?;
+    elapsed.advance(2_000_000_000)?;
+
+    let coordinator = MaintenanceCoordinator::new();
+    let discovery = ActiveSegmentLedger::open_for_maintenance_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    let active_id = discovery.active_segment_id()?;
+    discovery
+        .prepare_retention_publication()?
+        .submit_and_persist(&coordinator, &catalog, 12)?;
+    drop(discovery);
+    let execution = coordinator
+        .start_next_with_reservation_and_persist(&catalog, &authority, 12, false)
+        .map_err(|_| "maintenance dispatch")?
+        .expect("the durable publication is dispatched");
+    let maintenance_generation = catalog.pin()?.number();
+
+    let maintenance = ActiveSegmentLedger::open_for_maintenance_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    assert_eq!(
+        maintenance.active_segment_id()?,
+        active_id,
+        "maintenance reopening keeps the authenticated active segment live"
+    );
+    assert_eq!(
+        catalog.pin()?.number(),
+        maintenance_generation,
+        "maintenance reopening does not publish an unrelated Catalog generation"
+    );
+    maintenance.complete_running_retention_publication_task(&coordinator, &execution)?;
+    assert_eq!(
+        coordinator
+            .status(execution.task().identity())
+            .expect("publication is terminal")
+            .phase(),
+        MaintenanceTaskPhase::Succeeded
+    );
+    Ok(())
+}
+
+#[test]
 fn retention_publication_uses_canonical_multi_segment_bindings() -> Result<(), Box<dyn Error>> {
     let root = TemporaryRoot::new()?;
     let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;

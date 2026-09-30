@@ -80,30 +80,53 @@ pub(super) fn restore(instance: &crate::InitializedInstance) -> Result<(), Servi
     Ok(())
 }
 
-/// Performs one bounded coordinator dispatch for the only maintenance handler
-/// installed by this runtime slice. Unsupported durable classes remain queued
-/// for their own future handlers.
+const INSTALLED_TASK_CLASSES: &[MaintenanceTaskClass] = &[
+    MaintenanceTaskClass::SnapshotLeaseExpiry,
+    MaintenanceTaskClass::RetentionPublication,
+    MaintenanceTaskClass::RetentionReclamation,
+];
+
+/// Performs one bounded coordinator dispatch for the runtime's installed
+/// maintenance handlers. Unsupported durable classes remain queued for their
+/// own future handlers.
 #[cfg(test)]
-pub(super) fn wake_snapshot_lease_expiry(
+pub(super) fn wake_runtime_maintenance(
     services: &super::ServiceHandle,
     cancellation: Option<&crate::TaskCancellation>,
 ) -> Result<bool, ServiceFailure> {
-    let Some(execution) = start_snapshot_lease_expiry(services, cancellation)? else {
-        return Ok(false);
+    let execution = match start_installed_maintenance(services, cancellation)? {
+        Some(execution) => execution,
+        None => {
+            let discovered = discover_retention_publications(services, cancellation)?;
+            let Some(execution) = start_installed_maintenance(services, cancellation)? else {
+                return Ok(discovered);
+            };
+            execution
+        },
     };
-    complete_snapshot_lease_expiry(services, cancellation, &execution)
+    complete_installed_maintenance(services, cancellation, &execution)
 }
 
-struct SnapshotLeaseExpiryExecution<'authority> {
-    execution: MaintenanceExecution<'authority>,
-    scope: SegmentScope,
-    identity: SnapshotLeaseId,
+enum InstalledMaintenanceExecution<'authority> {
+    SnapshotLeaseExpiry {
+        execution: MaintenanceExecution<'authority>,
+        scope: SegmentScope,
+        identity: SnapshotLeaseId,
+    },
+    RetentionPublication {
+        execution: MaintenanceExecution<'authority>,
+        scope: SegmentScope,
+    },
+    RetentionReclamation {
+        execution: MaintenanceExecution<'authority>,
+        scope: SegmentScope,
+    },
 }
 
-fn start_snapshot_lease_expiry<'authority>(
+fn start_installed_maintenance<'authority>(
     services: &'authority super::ServiceHandle,
     cancellation: Option<&crate::TaskCancellation>,
-) -> Result<Option<SnapshotLeaseExpiryExecution<'authority>>, ServiceFailure> {
+) -> Result<Option<InstalledMaintenanceExecution<'authority>>, ServiceFailure> {
     if cancellation.is_some_and(crate::TaskCancellation::is_cancelled) {
         return Err(ServiceFailure::Cancelled);
     }
@@ -128,17 +151,18 @@ fn start_snapshot_lease_expiry<'authority>(
         .maintenance_coordinator()
         .lock()
         .map_err(|_| ServiceFailure::Internal)?;
-    let Some(execution) = coordinator
-        .start_next_with_reservation_and_persist_for_class(
-            &catalog,
-            &instance._authority,
-            now,
-            instance.retention_time.status().state()
-                == positron_kernel::LifecycleClockState::ClockUncertain,
-            Some(MaintenanceTaskClass::SnapshotLeaseExpiry),
-        )
-        .map_err(map_failure)?
-    else {
+    let selected = coordinator.start_next_with_reservation_and_persist_for_classes(
+        &catalog,
+        &instance._authority,
+        now,
+        instance.retention_time.status().state()
+            == positron_kernel::LifecycleClockState::ClockUncertain,
+        INSTALLED_TASK_CLASSES,
+    );
+    let Some(execution) = (match selected {
+        Ok(execution) => execution,
+        Err(failure) => return Err(map_failure(failure)),
+    }) else {
         return Ok(None);
     };
     // The task is now durably Running. Drain cancellation remains effective
@@ -147,20 +171,32 @@ fn start_snapshot_lease_expiry<'authority>(
     if cancellation.is_some_and(crate::TaskCancellation::is_cancelled) {
         return Err(ServiceFailure::Cancelled);
     }
-    let scope = scope_for_snapshot_lease_expiry(execution.task().scope(), instance.tenant)?;
-    let identity = SnapshotLeaseId::new(execution.task().identity().to_bytes())
-        .map_err(|_| ServiceFailure::Internal)?;
-    Ok(Some(SnapshotLeaseExpiryExecution {
-        execution,
-        scope,
-        identity,
-    }))
+    let scope = scope_for_segment_task(execution.task().scope())?;
+    let execution = match execution.task().class() {
+        MaintenanceTaskClass::SnapshotLeaseExpiry => {
+            let identity = SnapshotLeaseId::new(execution.task().identity().to_bytes())
+                .map_err(|_| ServiceFailure::Internal)?;
+            InstalledMaintenanceExecution::SnapshotLeaseExpiry {
+                execution,
+                scope,
+                identity,
+            }
+        },
+        MaintenanceTaskClass::RetentionPublication => {
+            InstalledMaintenanceExecution::RetentionPublication { execution, scope }
+        },
+        MaintenanceTaskClass::RetentionReclamation => {
+            InstalledMaintenanceExecution::RetentionReclamation { execution, scope }
+        },
+        _ => return Err(ServiceFailure::Internal),
+    };
+    Ok(Some(execution))
 }
 
-fn complete_snapshot_lease_expiry(
+fn complete_installed_maintenance(
     services: &super::ServiceHandle,
     cancellation: Option<&crate::TaskCancellation>,
-    execution: &SnapshotLeaseExpiryExecution<'_>,
+    execution: &InstalledMaintenanceExecution<'_>,
 ) -> Result<bool, ServiceFailure> {
     if cancellation.is_some_and(crate::TaskCancellation::is_cancelled) {
         return Err(ServiceFailure::Cancelled);
@@ -182,31 +218,154 @@ fn complete_snapshot_lease_expiry(
         .maintenance_coordinator()
         .lock()
         .map_err(|_| ServiceFailure::Internal)?;
+    let scope = match execution {
+        InstalledMaintenanceExecution::SnapshotLeaseExpiry { scope, .. }
+        | InstalledMaintenanceExecution::RetentionPublication { scope, .. }
+        | InstalledMaintenanceExecution::RetentionReclamation { scope, .. } => *scope,
+    };
     let snapshot = catalog
         .pin()
         .map_err(|failure| classify_catalog_failure_code(failure.code()))?;
     let durable_identity =
         positron_governance::Identity::open(&snapshot).map_err(|_| ServiceFailure::CorruptState)?;
-    let key = super::tenant_segment_key(instance, &durable_identity, execution.scope)?;
-    let ledger = ActiveSegmentLedger::open_with_retention_time(
-        &instance._authority,
-        &instance.retention_time,
-        &catalog,
-        execution.scope,
-        key,
-    )
+    let key = super::tenant_segment_key(instance, &durable_identity, scope)?;
+    let ledger = match execution {
+        InstalledMaintenanceExecution::SnapshotLeaseExpiry { .. } => {
+            ActiveSegmentLedger::open_with_retention_time(
+                &instance._authority,
+                &instance.retention_time,
+                &catalog,
+                scope,
+                key,
+            )
+        },
+        InstalledMaintenanceExecution::RetentionPublication { .. }
+        | InstalledMaintenanceExecution::RetentionReclamation { .. } => {
+            ActiveSegmentLedger::open_for_maintenance_with_retention_time(
+                &instance._authority,
+                &instance.retention_time,
+                &catalog,
+                scope,
+                key,
+            )
+        },
+    }
     .map_err(|failure| super::classify_ledger_failure_code(failure.code()))?;
-    ledger
-        .complete_running_snapshot_lease_expiry_task(
-            &coordinator,
-            &execution.execution,
-            execution.identity,
-        )
-        .map_err(|failure| super::classify_ledger_failure_code(failure.code()))?;
+    let completed = match execution {
+        InstalledMaintenanceExecution::SnapshotLeaseExpiry {
+            execution,
+            identity,
+            ..
+        } => ledger.complete_running_snapshot_lease_expiry_task(&coordinator, execution, *identity),
+        InstalledMaintenanceExecution::RetentionPublication { execution, .. } => ledger
+            .complete_running_retention_publication_task(&coordinator, execution)
+            .map(|_| ()),
+        InstalledMaintenanceExecution::RetentionReclamation { execution, .. } => {
+            ledger.complete_running_retention_reclamation_task(&coordinator, execution)
+        },
+    };
+    if let Err(failure) = completed {
+        return Err(super::classify_ledger_failure_code(failure.code()));
+    }
     Ok(true)
 }
 
-pub(super) fn run_snapshot_lease_expiry_worker(
+fn discover_retention_publications(
+    services: &super::ServiceHandle,
+    cancellation: Option<&crate::TaskCancellation>,
+) -> Result<bool, ServiceFailure> {
+    if cancellation.is_some_and(crate::TaskCancellation::is_cancelled) {
+        return Err(ServiceFailure::Cancelled);
+    }
+    let instance = &services.instance;
+    if instance.retention_time.status().state() != positron_kernel::LifecycleClockState::Certain {
+        return Ok(false);
+    }
+    let Some(_catalog_operation) = services.try_catalog_operation()? else {
+        return Err(ServiceFailure::CatalogUnavailable);
+    };
+    let catalog = Catalog::open(
+        &instance._authority,
+        instance.instance,
+        instance
+            .key
+            .catalog_secret(instance.instance)
+            .map_err(|_| ServiceFailure::KeyUnavailable)?,
+    )
+    .map_err(|failure| classify_catalog_failure_code(failure.code()))?;
+    let snapshot = catalog
+        .pin()
+        .map_err(|failure| classify_catalog_failure_code(failure.code()))?;
+    let identity =
+        positron_governance::Identity::open(&snapshot).map_err(|_| ServiceFailure::CorruptState)?;
+    let tenants = positron_governance::TenantAdministration::registered_tenant_ids(&snapshot)
+        .map_err(|_| ServiceFailure::CorruptState)?;
+    let mut scopes = Vec::new();
+    for tenant in tenants {
+        for signal in [
+            positron_domain::routing::SignalKind::Logs,
+            positron_domain::routing::SignalKind::Traces,
+        ] {
+            let found = snapshot
+                .reachable_ledger_scopes(tenant, signal)
+                .map_err(|failure| super::classify_ledger_failure_code(failure.code()))?;
+            scopes
+                .try_reserve(found.len())
+                .map_err(|_| ServiceFailure::CapacityUnavailable)?;
+            scopes.extend(found);
+        }
+    }
+    drop(snapshot);
+    let now = instance
+        .retention_time
+        .governance_now_seconds()
+        .map_err(|_| ServiceFailure::StorageUnavailable)?;
+    let coordinator = instance
+        .maintenance_coordinator()
+        .lock()
+        .map_err(|_| ServiceFailure::Internal)?;
+    let mut submitted = false;
+    for scope in scopes {
+        if cancellation.is_some_and(crate::TaskCancellation::is_cancelled) {
+            return Err(ServiceFailure::Cancelled);
+        }
+        let maintenance_scope =
+            MaintenanceScope::segment(scope.tenant_id(), scope.signal_kind(), scope.shard_id());
+        if coordinator
+            .has_nonterminal_retention_task_for_scope(maintenance_scope)
+            .map_err(map_failure)?
+        {
+            continue;
+        }
+        let key = super::tenant_segment_key(instance, &identity, scope)?;
+        let ledger = ActiveSegmentLedger::open_for_maintenance_with_retention_time(
+            &instance._authority,
+            &instance.retention_time,
+            &catalog,
+            scope,
+            key,
+        )
+        .map_err(|failure| super::classify_ledger_failure_code(failure.code()))?;
+        match ledger.prepare_retention_publication() {
+            Ok(preparation) => {
+                preparation
+                    .submit_and_persist(&coordinator, &catalog, now)
+                    .map_err(|failure| super::classify_ledger_failure_code(failure.code()))?;
+                submitted = true;
+            },
+            Err(failure)
+                if matches!(
+                    failure.code(),
+                    positron_kernel::LedgerFailureCode::InvalidInput
+                        | positron_kernel::LedgerFailureCode::ClockUncertain
+                ) => {},
+            Err(failure) => return Err(super::classify_ledger_failure_code(failure.code())),
+        }
+    }
+    Ok(submitted)
+}
+
+pub(super) fn run_runtime_maintenance_worker(
     services: &super::ServiceHandle,
     cancellation: &crate::TaskCancellation,
     wake_signal: &MaintenanceWake,
@@ -221,14 +380,28 @@ pub(super) fn run_snapshot_lease_expiry_worker(
     while !cancellation.is_cancelled() {
         let result = match in_flight.as_ref() {
             Some(execution) => {
-                complete_snapshot_lease_expiry(services, Some(cancellation), execution)
+                complete_installed_maintenance(services, Some(cancellation), execution)
             },
-            None => match start_snapshot_lease_expiry(services, Some(cancellation)) {
+            None => match start_installed_maintenance(services, Some(cancellation)) {
                 Ok(Some(execution)) => {
                     in_flight = Some(execution);
                     continue;
                 },
-                Ok(None) => Ok(false),
+                Ok(None) => match discover_retention_publications(services, Some(cancellation)) {
+                    Ok(discovered) => {
+                        match start_installed_maintenance(services, Some(cancellation)) {
+                            Ok(Some(execution)) => {
+                                in_flight = Some(execution);
+                                continue;
+                            },
+                            Ok(None) => Ok(discovered),
+                            Err(ServiceFailure::Cancelled) => break,
+                            Err(failure) => Err(failure),
+                        }
+                    },
+                    Err(ServiceFailure::Cancelled) => break,
+                    Err(failure) => Err(failure),
+                },
                 Err(ServiceFailure::Cancelled) => break,
                 Err(failure) => Err(failure),
             },
@@ -258,19 +431,14 @@ pub(super) fn run_snapshot_lease_expiry_worker(
     Ok(())
 }
 
-fn scope_for_snapshot_lease_expiry(
-    scope: MaintenanceScope,
-    expected_tenant: positron_domain::identity::TenantId,
-) -> Result<SegmentScope, ServiceFailure> {
+fn scope_for_segment_task(scope: MaintenanceScope) -> Result<SegmentScope, ServiceFailure> {
     match scope {
         MaintenanceScope::Segment {
             tenant,
             signal,
             shard,
-        } if tenant == expected_tenant => Ok(SegmentScope::new(tenant, signal, shard)),
-        MaintenanceScope::System
-        | MaintenanceScope::Tenant(_)
-        | MaintenanceScope::Segment { .. } => Err(ServiceFailure::CorruptState),
+        } => Ok(SegmentScope::new(tenant, signal, shard)),
+        MaintenanceScope::System | MaintenanceScope::Tenant(_) => Err(ServiceFailure::CorruptState),
     }
 }
 

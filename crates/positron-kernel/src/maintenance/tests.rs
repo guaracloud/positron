@@ -147,6 +147,68 @@ fn snapshot_lease_expiry_task(
 }
 
 #[test]
+fn installed_class_selection_dispatches_supported_work_and_leaves_other_classes_queued()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = CatalogRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
+    let authority = crate::catalog::tests::support::establish_catalog_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new(nonzero_id(66))?,
+        CatalogSecret::from_owned(Box::new([0x67; 32]), Box::new([0x68; 32])),
+    )?;
+    let initial = CatalogProposal::new(
+        TransactionId::new(nonzero_id(69))?,
+        FormatEpoch::CATALOG_V1,
+        vec![CatalogObject::new(b"class selection basis".to_vec())?],
+    )?;
+    catalog.commit(catalog.pin()?.identity(), initial, None)?;
+
+    let coordinator = MaintenanceCoordinator::new();
+    let unsupported = MaintenanceTask::new(
+        MaintenanceTaskId::new(nonzero_id(70)).expect("unsupported task identity"),
+        MaintenanceTaskClass::SchemaPromotion,
+    );
+    let unsupported_id = unsupported.identity();
+    coordinator
+        .submit_and_persist(&catalog, unsupported, 1)
+        .expect("unsupported task persists");
+    let lease = crate::SnapshotLeaseId::new([71; 16])?;
+    let scope = MaintenanceScope::segment(
+        TenantId::from_bytes([0x43; 16])?,
+        SignalKind::Logs,
+        VirtualShardId::new(1)?,
+    );
+    let lease_object = CatalogObject::new(b"class selection lease binding".to_vec())?.identity();
+    let supported = snapshot_lease_expiry_task(lease, scope, lease_object);
+    let supported_id = supported.identity();
+    coordinator
+        .submit_and_persist(&catalog, supported, 1)
+        .expect("supported task persists");
+
+    let execution = coordinator
+        .start_next_with_reservation_and_persist_for_classes(
+            &catalog,
+            &authority,
+            10,
+            false,
+            &[MaintenanceTaskClass::SnapshotLeaseExpiry],
+        )
+        .expect("installed handler selection")
+        .expect("the installed handler selects its eligible task");
+    assert_eq!(execution.task().identity(), supported_id);
+    assert_eq!(
+        coordinator
+            .status(unsupported_id)
+            .expect("unsupported task")
+            .phase(),
+        MaintenanceTaskPhase::Queued,
+        "the worker must not mark an unsupported class Running"
+    );
+    Ok(())
+}
+
+#[test]
 fn prepared_lease_expiry_cancellation_blocks_dispatch_before_its_install()
 -> Result<(), Box<dyn std::error::Error>> {
     let root = CatalogRoot::new()?;
