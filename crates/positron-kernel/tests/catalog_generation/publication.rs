@@ -281,13 +281,11 @@ fn signed_audit_checkpoint_binds_the_visible_chain_frontier() -> Result<(), Box<
         .into_iter()
         .last()
         .ok_or("visible governed audit record")?;
-    let checkpoint = positron_kernel::GovernanceAuditCheckpoint::create(&signer, instance, &frontier)?;
+    let checkpoint =
+        positron_kernel::GovernanceAuditCheckpoint::create(&signer, instance, &frontier)?;
     assert_eq!(checkpoint.instance(), instance);
     assert_eq!(checkpoint.position(), 1);
-    assert_eq!(
-        checkpoint.record_hash(),
-        frontier.record_hash()
-    );
+    assert_eq!(checkpoint.record_hash(), frontier.record_hash());
     checkpoint.verify(public_key)?;
     Ok(())
 }

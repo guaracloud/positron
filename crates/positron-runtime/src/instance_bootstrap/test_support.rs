@@ -174,6 +174,30 @@ impl InitializedInstance {
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))
     }
 
+    #[doc(hidden)]
+    pub fn governance_audit_checkpoint_state_for_test(
+        &self,
+    ) -> Result<(bool, usize), BootstrapFailure> {
+        let secret = self
+            .key
+            .catalog_secret(self.instance)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
+        let catalog = Catalog::open(&self._authority, self.instance, secret)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        let published = catalog
+            .latest_audit_checkpoint()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?
+            .is_some();
+        let tasks = self
+            .maintenance_coordinator()
+            .lock()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?
+            .durable_records()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?
+            .len();
+        Ok((published, tasks))
+    }
+
     /// Opens the narrow Instance Integrity signing capability used by a
     /// durable Query export integration test. Product entry points obtain the
     /// same capability through their authenticated runtime composition.

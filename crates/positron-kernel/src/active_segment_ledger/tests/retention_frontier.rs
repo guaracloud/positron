@@ -10,9 +10,9 @@ use positron_domain::time::UnixNanoseconds;
 use super::support::{
     TemporaryRoot, establish_authority, establish_authority_with_retention_capacity,
 };
-use crate::active_segment_ledger::fault::{
-    LedgerFileEvent, with_ledger_fault, with_ledger_faults_after,
-};
+#[cfg(feature = "test-support")]
+use crate::active_segment_ledger::fault::with_ledger_faults_after;
+use crate::active_segment_ledger::fault::{LedgerFileEvent, with_ledger_fault};
 use crate::active_segment_ledger::format::decode_header;
 use crate::active_segment_ledger::object_context;
 use crate::data_protection::{DataProtection, FrameLimits, FrameSequence, SegmentFramePurpose};
@@ -20,14 +20,14 @@ use crate::retention_time::RetentionTimeAuthority;
 use crate::{
     ActiveSegmentLedger, Catalog, CatalogObject, CatalogProposal, CatalogSecret, FormatEpoch,
     InstanceId, LedgerCompletionState, LedgerFailureCode, MountQualification, PreparedStoreBlock,
-    PrimaryDataVolume, ResourceAmounts, ResourceDimension, RetentionBucket, SegmentId,
-    SegmentProtectionKey, SegmentScope, SnapshotLeaseUsage, StoreBlockIdentity, TransactionId,
-    WorkClaim, WorkKind,
+    PrimaryDataVolume, RecoveryWorkClaim, RecoveryWorkKind, ResourceAmounts, ResourceDimension,
+    RetentionBucket, SegmentId, SegmentProtectionKey, SegmentScope, SnapshotLeaseUsage,
+    StoreBlockIdentity, TransactionId, WorkClaim, WorkKind,
 };
 #[cfg(feature = "test-support")]
 use crate::{
-    CatalogPublicationFault, RecoveryWorkClaim, RecoveryWorkKind,
-    with_catalog_generation_ambiguity_hook_after, with_catalog_publication_fault_after,
+    CatalogPublicationFault, with_catalog_generation_ambiguity_hook_after,
+    with_catalog_publication_fault_after,
 };
 
 mod admission_commit;
@@ -38,7 +38,9 @@ mod lease_reclamation;
 mod policy_authority;
 mod publication;
 mod publication_capacity;
+#[cfg(feature = "test-support")]
 mod publication_faults;
+#[cfg(feature = "test-support")]
 mod reclamation_faults;
 
 fn preparation_capacity<'kernel>(

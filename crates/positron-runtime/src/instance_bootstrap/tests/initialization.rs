@@ -131,6 +131,57 @@ fn system_administrator_publishes_and_verifies_a_bootstrap_bound_audit_checkpoin
 }
 
 #[test]
+fn non_administrator_cannot_create_audit_checkpoint_artifact_or_task() -> Result<(), Box<dyn Error>>
+{
+    let roots = Roots::new()?;
+    let paths = roots.paths().map_err(|code| format!("paths: {code:?}"))?;
+    drop(InstanceBootstrap::initialize(
+        &paths,
+        InitializationPlan::non_interactive(),
+    )?);
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    let administrator = || {
+        instance.attribute(
+            PresentedCredential::parse(claim.secret()).expect("claim syntax"),
+            RequestedIntent::SystemAdministration,
+            CompatibilityHints::none(),
+        )
+    };
+    let query_secret = instance
+        .create_api_key(
+            administrator()?,
+            Scope::Query,
+            None,
+            ResourceGeneration::new(1)?,
+            AdministrativeIdempotencyKey::new([0xd0; 16])?,
+        )?
+        .secret()
+        .ok_or("query credential")?
+        .to_owned();
+    let query = instance.attribute(
+        PresentedCredential::parse(&query_secret)?,
+        RequestedIntent::Query,
+        CompatibilityHints::none(),
+    )?;
+    let rejected = instance
+        .publish_governance_audit_checkpoint(query)
+        .expect_err("a tenant query principal cannot request system audit maintenance");
+    assert_eq!(rejected.code(), BootstrapFailureCode::ApiKeyUnauthorized);
+    assert_eq!(
+        instance.governance_audit_checkpoint_state_for_test()?,
+        (false, 0)
+    );
+
+    instance.publish_governance_audit_checkpoint(administrator()?)?;
+    assert_eq!(
+        instance.governance_audit_checkpoint_state_for_test()?,
+        (true, 1)
+    );
+    Ok(())
+}
+
+#[test]
 fn concurrent_system_administrators_attach_to_one_audit_checkpoint_result()
 -> Result<(), Box<dyn Error>> {
     let roots = Roots::new()?;

@@ -28,7 +28,7 @@ pub(crate) fn durable_task_record_identity(
     record::record_identity(bytes)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-support"))]
 pub(crate) fn rewrite_durable_task_record_dispatches_for_test(
     bytes: &[u8],
     dispatches: u64,
@@ -38,7 +38,7 @@ pub(crate) fn rewrite_durable_task_record_dispatches_for_test(
     Ok(record::encode_record(&state)?.as_bytes().to_vec())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-support"))]
 pub(crate) fn rewrite_durable_task_record_not_before_for_test(
     bytes: &[u8],
     not_before: u64,
