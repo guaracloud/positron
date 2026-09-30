@@ -84,6 +84,7 @@ const INSTALLED_TASK_CLASSES: &[MaintenanceTaskClass] = &[
     MaintenanceTaskClass::SnapshotLeaseExpiry,
     MaintenanceTaskClass::RetentionPublication,
     MaintenanceTaskClass::RetentionReclamation,
+    MaintenanceTaskClass::GovernanceAuditCheckpoint,
 ];
 
 /// Performs one bounded coordinator dispatch for the runtime's installed
@@ -108,6 +109,9 @@ pub(super) fn wake_runtime_maintenance(
 }
 
 enum InstalledMaintenanceExecution<'authority> {
+    GovernanceAuditCheckpoint {
+        execution: MaintenanceExecution<'authority>,
+    },
     SnapshotLeaseExpiry {
         execution: MaintenanceExecution<'authority>,
         scope: SegmentScope,
@@ -171,9 +175,12 @@ fn start_installed_maintenance<'authority>(
     if cancellation.is_some_and(crate::TaskCancellation::is_cancelled) {
         return Err(ServiceFailure::Cancelled);
     }
-    let scope = scope_for_segment_task(execution.task().scope())?;
     let execution = match execution.task().class() {
+        MaintenanceTaskClass::GovernanceAuditCheckpoint => {
+            InstalledMaintenanceExecution::GovernanceAuditCheckpoint { execution }
+        },
         MaintenanceTaskClass::SnapshotLeaseExpiry => {
+            let scope = scope_for_segment_task(execution.task().scope())?;
             let identity = SnapshotLeaseId::new(execution.task().identity().to_bytes())
                 .map_err(|_| ServiceFailure::Internal)?;
             InstalledMaintenanceExecution::SnapshotLeaseExpiry {
@@ -183,9 +190,11 @@ fn start_installed_maintenance<'authority>(
             }
         },
         MaintenanceTaskClass::RetentionPublication => {
+            let scope = scope_for_segment_task(execution.task().scope())?;
             InstalledMaintenanceExecution::RetentionPublication { execution, scope }
         },
         MaintenanceTaskClass::RetentionReclamation => {
+            let scope = scope_for_segment_task(execution.task().scope())?;
             InstalledMaintenanceExecution::RetentionReclamation { execution, scope }
         },
         _ => return Err(ServiceFailure::Internal),
@@ -214,6 +223,13 @@ fn complete_installed_maintenance(
             .map_err(|_| ServiceFailure::KeyUnavailable)?,
     )
     .map_err(|failure| classify_catalog_failure_code(failure.code()))?;
+    if let InstalledMaintenanceExecution::GovernanceAuditCheckpoint { execution } = execution {
+        services
+            .instance
+            .complete_governance_audit_checkpoint_execution(&catalog, execution)
+            .map_err(|_| ServiceFailure::CatalogUnavailable)?;
+        return Ok(true);
+    }
     let coordinator = instance
         .maintenance_coordinator()
         .lock()
@@ -222,6 +238,9 @@ fn complete_installed_maintenance(
         InstalledMaintenanceExecution::SnapshotLeaseExpiry { scope, .. }
         | InstalledMaintenanceExecution::RetentionPublication { scope, .. }
         | InstalledMaintenanceExecution::RetentionReclamation { scope, .. } => *scope,
+        InstalledMaintenanceExecution::GovernanceAuditCheckpoint { .. } => {
+            return Err(ServiceFailure::Internal);
+        },
     };
     let snapshot = catalog
         .pin()
@@ -249,6 +268,9 @@ fn complete_installed_maintenance(
                 key,
             )
         },
+        InstalledMaintenanceExecution::GovernanceAuditCheckpoint { .. } => {
+            return Err(ServiceFailure::Internal);
+        },
     }
     .map_err(|failure| super::classify_ledger_failure_code(failure.code()))?;
     let completed = match execution {
@@ -262,6 +284,9 @@ fn complete_installed_maintenance(
             .map(|_| ()),
         InstalledMaintenanceExecution::RetentionReclamation { execution, .. } => {
             ledger.complete_running_retention_reclamation_task(&coordinator, execution)
+        },
+        InstalledMaintenanceExecution::GovernanceAuditCheckpoint { .. } => {
+            return Err(ServiceFailure::Internal);
         },
     };
     if let Err(failure) = completed {

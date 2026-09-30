@@ -984,17 +984,20 @@ impl MaintenanceCoordinator {
                 .tasks
                 .get(&identity)
                 .ok_or(MaintenanceFailure::UnknownTask)?;
-            if let Err(failure) = persist_task_state(catalog, updated, None) {
-                drop(reservation);
-                return Err(failure);
-            }
+            let pending_execution = MaintenanceExecution {
+                task: task.clone(),
+                checkpoint: updated.checkpoint.clone(),
+                reservation,
+                dispatch,
+            };
+            persist_task_state_admitted(catalog, updated, None, &pending_execution)?;
             let updated = updated.clone();
+            let checkpoint = updated.checkpoint.clone();
             state.tasks.insert(identity, updated);
             state.fairness = prospective.fairness;
             return Ok(Some(MaintenanceExecution {
-                task,
-                reservation,
-                dispatch,
+                checkpoint,
+                ..pending_execution
             }));
         }
         Err(MaintenanceFailure::ResourceAdmissionRefused)
@@ -1030,6 +1033,27 @@ impl MaintenanceCoordinator {
         }
         super::retention_publication_frontier(Some(&checkpoint))?;
         self.submit_task_and_persist(catalog, task, Some(checkpoint), now)
+    }
+
+    /// Persists the immutable binding for one system-scoped Governance Audit
+    /// checkpoint before the coordinator may admit it for signing.
+    pub fn submit_governance_audit_checkpoint_and_persist(
+        &self,
+        catalog: &Catalog<'_>,
+        task: MaintenanceTask,
+        binding: GovernanceAuditCheckpointBinding,
+        now: u64,
+    ) -> Result<MaintenanceTask, MaintenanceFailure> {
+        let record = MaintenanceObjectId::new(binding.record_hash())?;
+        let fingerprint = MaintenanceObjectId::new(binding.integrity_key_fingerprint())?;
+        if task.class != MaintenanceTaskClass::GovernanceAuditCheckpoint
+            || task.scope != MaintenanceScope::System
+            || task.inputs.as_slice() != [record]
+            || task.outputs.as_slice() != [fingerprint]
+        {
+            return Err(MaintenanceFailure::InvalidInput);
+        }
+        self.submit_task_and_persist(catalog, task, Some(binding.checkpoint()?), now)
     }
 
     fn submit_task_and_persist(
@@ -1320,6 +1344,16 @@ impl MaintenanceCoordinator {
         dispatch: MaintenanceDispatch,
         succeeded: bool,
     ) -> Result<(), MaintenanceFailure> {
+        self.complete_and_persist_dispatch_inner(catalog, dispatch, succeeded, None)
+    }
+
+    fn complete_and_persist_dispatch_inner(
+        &self,
+        catalog: &Catalog<'_>,
+        dispatch: MaintenanceDispatch,
+        succeeded: bool,
+        execution: Option<&MaintenanceExecution<'_>>,
+    ) -> Result<(), MaintenanceFailure> {
         if dispatch.coordinator_id != self.coordinator_id {
             return Err(MaintenanceFailure::InvalidTransition);
         }
@@ -1361,9 +1395,22 @@ impl MaintenanceCoordinator {
             .tasks
             .get(&dispatch.identity)
             .ok_or(MaintenanceFailure::UnknownTask)?;
-        persist_task_state(catalog, task, None)?;
+        match execution {
+            Some(execution) => persist_task_state_admitted(catalog, task, None, execution)?,
+            None => persist_task_state(catalog, task, None)?,
+        }
         *state = next;
         Ok(())
+    }
+
+    fn complete_and_persist_admitted_dispatch(
+        &self,
+        catalog: &Catalog<'_>,
+        dispatch: MaintenanceDispatch,
+        succeeded: bool,
+        execution: &MaintenanceExecution<'_>,
+    ) -> Result<(), MaintenanceFailure> {
+        self.complete_and_persist_dispatch_inner(catalog, dispatch, succeeded, Some(execution))
     }
 
     pub(super) fn cancel_running_retention_publication_and_persist_dispatch(
@@ -1543,7 +1590,16 @@ impl MaintenanceExecution<'_> {
         catalog: &Catalog<'_>,
         succeeded: bool,
     ) -> Result<(), MaintenanceFailure> {
-        coordinator.complete_and_persist_dispatch(catalog, self.dispatch, succeeded)
+        if self.task.class == MaintenanceTaskClass::GovernanceAuditCheckpoint {
+            coordinator.complete_and_persist_admitted_dispatch(
+                catalog,
+                self.dispatch,
+                succeeded,
+                self,
+            )
+        } else {
+            coordinator.complete_and_persist_dispatch(catalog, self.dispatch, succeeded)
+        }
     }
 }
 
@@ -1652,6 +1708,24 @@ fn persist_task_state(
     task: &TaskState,
     removed: Option<MaintenanceTaskId>,
 ) -> Result<(), MaintenanceFailure> {
+    persist_task_state_inner(catalog, task, removed, None)
+}
+
+fn persist_task_state_admitted(
+    catalog: &Catalog<'_>,
+    task: &TaskState,
+    removed: Option<MaintenanceTaskId>,
+    execution: &MaintenanceExecution<'_>,
+) -> Result<(), MaintenanceFailure> {
+    persist_task_state_inner(catalog, task, removed, Some(execution))
+}
+
+fn persist_task_state_inner(
+    catalog: &Catalog<'_>,
+    task: &TaskState,
+    removed: Option<MaintenanceTaskId>,
+    execution: Option<&MaintenanceExecution<'_>>,
+) -> Result<(), MaintenanceFailure> {
     let record = encode_record(task)?;
     let snapshot = catalog.pin().map_err(map_catalog_failure)?;
     let mut objects = Vec::new();
@@ -1691,9 +1765,13 @@ fn persist_task_state(
         .ok_or(MaintenanceFailure::CatalogUnavailable)?;
     let proposal =
         CatalogProposal::new(transaction, epoch, objects).map_err(map_catalog_failure)?;
-    catalog
-        .commit(snapshot.identity(), proposal, None)
-        .map_err(map_catalog_failure)?;
+    match execution {
+        Some(execution) => {
+            catalog.commit_admitted_maintenance_task_state(snapshot.identity(), proposal, execution)
+        },
+        None => catalog.commit(snapshot.identity(), proposal, None),
+    }
+    .map_err(map_catalog_failure)?;
     Ok(())
 }
 

@@ -131,10 +131,11 @@ pub use lifecycle_clock::{
     LifecycleClockSource, RetentionCutoffProvenance, SystemLifecycleClockSource,
 };
 pub use maintenance::{
-    MaintenanceCheckpoint, MaintenanceCoordinator, MaintenanceExecution, MaintenanceFailure,
-    MaintenanceObjectId, MaintenancePreconditions, MaintenancePriority, MaintenanceReservation,
-    MaintenanceScope, MaintenanceTask, MaintenanceTaskClass, MaintenanceTaskId,
-    MaintenanceTaskPhase, MaintenanceTaskRecord, MaintenanceTaskStatus, MaintenanceTrigger,
+    GovernanceAuditCheckpointBinding, MaintenanceCheckpoint, MaintenanceCoordinator,
+    MaintenanceExecution, MaintenanceFailure, MaintenanceObjectId, MaintenancePreconditions,
+    MaintenancePriority, MaintenanceReservation, MaintenanceScope, MaintenanceTask,
+    MaintenanceTaskClass, MaintenanceTaskId, MaintenanceTaskPhase, MaintenanceTaskRecord,
+    MaintenanceTaskStatus, MaintenanceTrigger,
 };
 #[cfg(feature = "test-support")]
 pub use retention_time::ManualRetentionTime;

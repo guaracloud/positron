@@ -662,8 +662,9 @@ fn audit_checkpoint_faults_expose_no_partial_anchor_and_remain_retryable()
             Some(AuditIntent::new(b"action=governed-change".to_vec())?),
         )?;
         let signer = AuditCheckpointSigner::from_seed(Box::new([0x85; 32]))?;
-        let failure = with_catalog_fault(event, || catalog.publish_audit_checkpoint(&signer))
-            .expect_err("injected checkpoint persistence failure must fail closed");
+        let failure =
+            with_catalog_fault(event, || catalog.publish_audit_checkpoint_for_test(&signer))
+                .expect_err("injected checkpoint persistence failure must fail closed");
         assert_eq!(
             failure.code(),
             CatalogFailureCode::StorageUnavailable,
@@ -680,7 +681,7 @@ fn audit_checkpoint_faults_expose_no_partial_anchor_and_remain_retryable()
         view.verify_audit_chain(signer.public_key(), recovered.as_ref())?;
 
         let catalog = Catalog::open(&authority, instance, secret())?;
-        let checkpoint = catalog.publish_audit_checkpoint(&signer)?;
+        let checkpoint = catalog.publish_audit_checkpoint_for_test(&signer)?;
         assert_eq!(checkpoint.position(), 1, "{event:?}");
     }
     Ok(())
@@ -699,7 +700,7 @@ fn tampered_audit_checkpoint_fences_recovery() -> Result<(), Box<dyn std::error:
         Some(AuditIntent::new(b"action=governed-change".to_vec())?),
     )?;
     let signer = AuditCheckpointSigner::from_seed(Box::new([0x89; 32]))?;
-    catalog.publish_audit_checkpoint(&signer)?;
+    catalog.publish_audit_checkpoint_for_test(&signer)?;
     drop(catalog);
 
     let checkpoints = root.0.join("catalog/governance-audit-checkpoints");

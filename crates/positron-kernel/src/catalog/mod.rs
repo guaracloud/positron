@@ -20,6 +20,8 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::sync::{Arc, Mutex};
 
+use sha2::{Digest, Sha256};
+
 use budget::{
     audit_checkpoint_resource_claim, commit_resource_claim, recovery_resource_claim,
     reserve_history, retained_artifact_bytes,
@@ -36,8 +38,10 @@ use storage::{CatalogStorage, PreparedLookup};
 use crate::data_protection::ControlTokenProtector;
 use crate::resource_governor::CatalogWriterLease;
 use crate::{
-    RecoveryWorkClaim, RecoveryWorkKind, ResourceAmounts, StorageKernelResourceAuthority,
-    WorkClaim, WorkKind,
+    GovernanceAuditCheckpointBinding, MaintenanceExecution, MaintenanceObjectId,
+    MaintenancePreconditions, MaintenanceScope, MaintenanceTask, MaintenanceTaskClass,
+    MaintenanceTaskId, MaintenanceTrigger, RecoveryWorkClaim, RecoveryWorkKind, ResourceAmounts,
+    ResourceDimension, StorageKernelResourceAuthority, WorkClaim, WorkKind,
 };
 
 pub use audit_checkpoint::{
@@ -253,6 +257,53 @@ impl std::fmt::Debug for Catalog<'_> {
 }
 
 impl<'authority> Catalog<'authority> {
+    /// Builds the sole durable coordinator task contract for a checkpoint of
+    /// one already-visible Governance Audit frontier.
+    pub fn governance_audit_checkpoint_task(
+        catalog_generation: u64,
+        frontier: &GovernanceAuditRecord,
+        integrity_key_fingerprint: [u8; 32],
+    ) -> Result<(MaintenanceTask, GovernanceAuditCheckpointBinding), CatalogFailure> {
+        let binding = GovernanceAuditCheckpointBinding::new(
+            frontier.position(),
+            frontier.record_hash(),
+            integrity_key_fingerprint,
+        )
+        .map_err(|_| CatalogFailure::new(CatalogFailureCode::InvalidInput))?;
+        let mut digest = Sha256::new();
+        digest.update(b"positron-governance-audit-checkpoint-task-v1\\0");
+        digest.update(frontier.position().to_be_bytes());
+        digest.update(frontier.record_hash());
+        digest.update(integrity_key_fingerprint);
+        let digest = digest.finalize();
+        let identity = MaintenanceTaskId::new(
+            digest
+                .get(..16)
+                .and_then(|bytes| bytes.try_into().ok())
+                .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?,
+        )
+        .map_err(|_| CatalogFailure::new(CatalogFailureCode::InvalidInput))?;
+        let task = MaintenanceTask::with_contract(
+            identity,
+            MaintenanceTaskClass::GovernanceAuditCheckpoint,
+            MaintenanceScope::System,
+            MaintenanceTrigger::Event,
+            MaintenancePreconditions::new(catalog_generation, 1)
+                .map_err(|_| CatalogFailure::new(CatalogFailureCode::InvalidInput))?,
+            vec![
+                MaintenanceObjectId::new(frontier.record_hash())
+                    .map_err(|_| CatalogFailure::new(CatalogFailureCode::InvalidInput))?,
+            ],
+            vec![
+                MaintenanceObjectId::new(integrity_key_fingerprint)
+                    .map_err(|_| CatalogFailure::new(CatalogFailureCode::InvalidInput))?,
+            ],
+            audit_checkpoint_resource_claim(),
+        )
+        .map_err(|_| CatalogFailure::new(CatalogFailureCode::InvalidInput))?;
+        Ok((task, binding))
+    }
+
     pub(crate) const fn control_tokens(&self) -> ControlTokenProtector<'_> {
         ControlTokenProtector::new(&self.secret)
     }
@@ -474,6 +525,27 @@ impl<'authority> Catalog<'authority> {
             storage::after_ambiguous_publication(self);
         }
         result
+    }
+
+    pub(crate) fn commit_admitted_maintenance_task_state(
+        &self,
+        expected: CatalogGenerationId,
+        proposal: CatalogProposal,
+        execution: &MaintenanceExecution<'_>,
+    ) -> Result<CatalogCommit, CatalogFailure> {
+        let required = commit_resource_claim(&proposal, None)?;
+        if ResourceDimension::ALL.iter().any(|dimension| {
+            execution.reservation().granted().get(*dimension) < required.get(*dimension)
+        }) {
+            return Err(CatalogFailure::new(
+                CatalogFailureCode::ResourceAdmissionRefused,
+            ));
+        }
+        let _operation = self
+            .operation
+            .lock()
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
+        self.commit_unreserved(expected, proposal, None, None)
     }
 
     /// Publishes an administrative proposal whose retry identity is fixed before
@@ -903,10 +975,74 @@ impl<'authority> Catalog<'authority> {
         audit_checkpoint::retention_policy(&self.pin()?)
     }
 
-    /// Persists a signed anchor for the currently visible Governance Audit
-    /// frontier. It is idempotent for the same frontier and key, and never
-    /// changes Catalog generation visibility.
-    pub fn publish_audit_checkpoint(
+    /// Persists the exact signed Governance Audit frontier admitted by the
+    /// sole Maintenance Coordinator. The execution's reservation is the only
+    /// capacity authority for this write; this Catalog path never self-admits.
+    pub fn publish_admitted_audit_checkpoint(
+        &self,
+        execution: &MaintenanceExecution<'_>,
+        signer: &AuditCheckpointSigner,
+        integrity_key_fingerprint: [u8; 32],
+    ) -> Result<GovernanceAuditCheckpoint, CatalogFailure> {
+        if execution.task().class() != MaintenanceTaskClass::GovernanceAuditCheckpoint {
+            return Err(CatalogFailure::new(CatalogFailureCode::InvalidInput));
+        }
+        let binding =
+            GovernanceAuditCheckpointBinding::from_checkpoint(execution.task_checkpoint())
+                .map_err(|_| CatalogFailure::new(CatalogFailureCode::InvalidInput))?;
+        if execution.task().inputs().len() != 1
+            || execution.task().inputs()[0].to_bytes() != binding.record_hash()
+            || execution.task().outputs().len() != 1
+            || execution.task().outputs()[0].to_bytes() != binding.integrity_key_fingerprint()
+        {
+            return Err(CatalogFailure::new(CatalogFailureCode::InvalidInput));
+        }
+        let snapshot = self.pin()?;
+        let (_, governance) = snapshot.governance_object()?;
+        if binding.integrity_key_fingerprint() != integrity_key_fingerprint
+            || binding.integrity_key_fingerprint() != governance.integrity_key_fingerprint()
+            || signer.public_key() != governance.integrity_public_key()
+        {
+            return Err(CatalogFailure::new(
+                CatalogFailureCode::AuthenticationFailed,
+            ));
+        }
+        let _operation = self
+            .operation
+            .lock()
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
+        let secret = self
+            .secret
+            .lock()
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
+        let frontier = state
+            .audit
+            .iter()
+            .find(|record| {
+                record.position() == binding.position()
+                    && record.record_hash() == binding.record_hash()
+            })
+            .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::InvalidInput))?;
+        if let Some(existing) = state.audit_checkpoint.as_ref()
+            && existing.position() == frontier.position()
+            && existing.record_hash() == frontier.record_hash()
+        {
+            existing.verify(signer.public_key())?;
+            return Ok(existing.clone());
+        }
+        let checkpoint = GovernanceAuditCheckpoint::create(signer, self.instance, frontier)?;
+        self.storage
+            .publish_audit_checkpoint(&secret, self.instance, &checkpoint)?;
+        state.audit_checkpoint = Some(checkpoint.clone());
+        Ok(checkpoint)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publish_audit_checkpoint_for_test(
         &self,
         signer: &AuditCheckpointSigner,
     ) -> Result<GovernanceAuditCheckpoint, CatalogFailure> {

@@ -52,6 +52,8 @@ const MAX_MAINTENANCE_TASKS: usize = 128;
 const MAX_TASK_OBJECTS: usize = 16;
 pub(crate) const MAX_CHECKPOINT_BYTES: usize = 4_096;
 const RETENTION_PUBLICATION_FRONTIER_MAGIC: &[u8; 8] = b"RTPFR001";
+const GOVERNANCE_AUDIT_CHECKPOINT_BINDING_MAGIC: &[u8; 8] = b"GACPB001";
+const GOVERNANCE_AUDIT_CHECKPOINT_BINDING_BYTES: usize = 8 + 8 + 32 + 32;
 
 pub(crate) fn retention_publication_frontier_checkpoint(
     frontier: crate::IngestTime,
@@ -85,6 +87,91 @@ pub(crate) fn retention_publication_frontier(
     Ok(crate::IngestTime::from_authenticated_durable(
         positron_domain::time::UnixNanoseconds::new(i64::from_be_bytes(instant)),
     ))
+}
+
+/// The immutable frontier and integrity-key identity a governance checkpoint
+/// task must sign. Keeping this in the durable task checkpoint prevents a
+/// delayed worker from silently advancing a caller's requested frontier.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GovernanceAuditCheckpointBinding {
+    position: u64,
+    record_hash: [u8; 32],
+    integrity_key_fingerprint: [u8; 32],
+}
+
+impl GovernanceAuditCheckpointBinding {
+    pub fn new(
+        position: u64,
+        record_hash: [u8; 32],
+        integrity_key_fingerprint: [u8; 32],
+    ) -> Result<Self, MaintenanceFailure> {
+        if position == 0
+            || record_hash.iter().all(|byte| *byte == 0)
+            || integrity_key_fingerprint.iter().all(|byte| *byte == 0)
+        {
+            return Err(MaintenanceFailure::InvalidInput);
+        }
+        Ok(Self {
+            position,
+            record_hash,
+            integrity_key_fingerprint,
+        })
+    }
+
+    #[must_use]
+    pub const fn position(self) -> u64 {
+        self.position
+    }
+
+    #[must_use]
+    pub const fn record_hash(self) -> [u8; 32] {
+        self.record_hash
+    }
+
+    #[must_use]
+    pub const fn integrity_key_fingerprint(self) -> [u8; 32] {
+        self.integrity_key_fingerprint
+    }
+
+    pub fn checkpoint(self) -> Result<MaintenanceCheckpoint, MaintenanceFailure> {
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(GOVERNANCE_AUDIT_CHECKPOINT_BINDING_BYTES)
+            .map_err(|_| MaintenanceFailure::CapacityExceeded)?;
+        bytes.extend_from_slice(GOVERNANCE_AUDIT_CHECKPOINT_BINDING_MAGIC);
+        bytes.extend_from_slice(&self.position.to_be_bytes());
+        bytes.extend_from_slice(&self.record_hash);
+        bytes.extend_from_slice(&self.integrity_key_fingerprint);
+        MaintenanceCheckpoint::new(1, 0, bytes)
+    }
+
+    pub fn from_checkpoint(
+        checkpoint: Option<&MaintenanceCheckpoint>,
+    ) -> Result<Self, MaintenanceFailure> {
+        let checkpoint = checkpoint.ok_or(MaintenanceFailure::InvalidInput)?;
+        let bytes = checkpoint.opaque_progress();
+        if checkpoint.sequence() != 1
+            || checkpoint.completed_inputs() != 0
+            || bytes.len() != GOVERNANCE_AUDIT_CHECKPOINT_BINDING_BYTES
+            || !bytes.starts_with(GOVERNANCE_AUDIT_CHECKPOINT_BINDING_MAGIC)
+        {
+            return Err(MaintenanceFailure::InvalidInput);
+        }
+        let position = bytes
+            .get(8..16)
+            .and_then(|value| value.try_into().ok())
+            .map(u64::from_be_bytes)
+            .ok_or(MaintenanceFailure::InvalidInput)?;
+        let record_hash = bytes
+            .get(16..48)
+            .and_then(|value| value.try_into().ok())
+            .ok_or(MaintenanceFailure::InvalidInput)?;
+        let integrity_key_fingerprint = bytes
+            .get(48..80)
+            .and_then(|value| value.try_into().ok())
+            .ok_or(MaintenanceFailure::InvalidInput)?;
+        Self::new(position, record_hash, integrity_key_fingerprint)
+    }
 }
 const MAX_LOWER_CLASS_QUEUE_DELAY: u64 = 60;
 static NEXT_COORDINATOR_ID: AtomicU64 = AtomicU64::new(1);
@@ -156,6 +243,17 @@ struct TaskState {
 fn validate_retention_publication_state(state: &TaskState) -> Result<(), MaintenanceFailure> {
     if state.task.class == MaintenanceTaskClass::RetentionPublication {
         let _ = retention_publication_frontier(state.checkpoint.as_ref())?;
+    }
+    if state.task.class == MaintenanceTaskClass::GovernanceAuditCheckpoint {
+        let binding = GovernanceAuditCheckpointBinding::from_checkpoint(state.checkpoint.as_ref())?;
+        if !matches!(state.task.scope, MaintenanceScope::System)
+            || state.task.inputs.len() != 1
+            || state.task.inputs[0].to_bytes() != binding.record_hash()
+            || state.task.outputs.len() != 1
+            || state.task.outputs[0].to_bytes() != binding.integrity_key_fingerprint()
+        {
+            return Err(MaintenanceFailure::InvalidInput);
+        }
     }
     Ok(())
 }
@@ -287,6 +385,7 @@ impl MaintenanceReservation<'_> {
 /// A task selected by the coordinator after its complete peak reservation was admitted.
 pub struct MaintenanceExecution<'authority> {
     task: MaintenanceTask,
+    checkpoint: Option<MaintenanceCheckpoint>,
     reservation: MaintenanceReservation<'authority>,
     dispatch: MaintenanceDispatch,
 }
@@ -295,6 +394,10 @@ impl MaintenanceExecution<'_> {
     #[must_use]
     pub fn task(&self) -> &MaintenanceTask {
         &self.task
+    }
+    #[must_use]
+    pub fn task_checkpoint(&self) -> Option<&MaintenanceCheckpoint> {
+        self.checkpoint.as_ref()
     }
     #[must_use]
     pub fn reservation(&self) -> &MaintenanceReservation<'_> {
@@ -711,6 +814,10 @@ impl MaintenanceCoordinator {
             let dispatch = dispatch_task(&mut state, self.coordinator_id, identity, now)?;
             return Ok(Some(MaintenanceExecution {
                 task,
+                checkpoint: state
+                    .tasks
+                    .get(&identity)
+                    .and_then(|stored| stored.checkpoint.clone()),
                 reservation,
                 dispatch,
             }));

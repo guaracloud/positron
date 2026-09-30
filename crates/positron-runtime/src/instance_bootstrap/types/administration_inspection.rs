@@ -63,6 +63,81 @@ impl InitializedInstance {
                 BootstrapFailureCode::IdentityMismatch,
             ));
         }
+        let frontier = catalog
+            .governance_audit_records()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?
+            .into_iter()
+            .last()
+            .ok_or_else(|| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
+        let (task, binding) = Catalog::governance_audit_checkpoint_task(
+            snapshot.number(),
+            &frontier,
+            governance.integrity_key_fingerprint(),
+        )
+        .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        let requested = task.identity();
+        let now = self
+            .retention_time
+            .governance_now_seconds()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        {
+            let coordinator = self
+                .maintenance_coordinator()
+                .lock()
+                .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+            coordinator
+                .submit_governance_audit_checkpoint_and_persist(&catalog, task, binding, now)
+                .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        }
+        drop(snapshot);
+
+        // This synchronous administrative seam drives ordinary coordinator
+        // dispatches until its own task completes. It never waits for the
+        // runtime worker while holding the Catalog or coordinator gate.
+        loop {
+            let execution = {
+                let coordinator = self
+                    .maintenance_coordinator()
+                    .lock()
+                    .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+                coordinator
+                    .start_next_with_reservation_and_persist_for_class(
+                        &catalog,
+                        &self._authority,
+                        now,
+                        false,
+                        Some(positron_kernel::MaintenanceTaskClass::GovernanceAuditCheckpoint),
+                    )
+                    .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?
+                    .ok_or_else(|| {
+                        BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable)
+                    })?
+            };
+            let task = execution.task().identity();
+            let checkpoint =
+                self.complete_governance_audit_checkpoint_execution(&catalog, &execution)?;
+            if task == requested {
+                return Ok(checkpoint);
+            }
+        }
+    }
+
+    pub(crate) fn complete_governance_audit_checkpoint_execution(
+        &self,
+        catalog: &Catalog<'_>,
+        execution: &positron_kernel::MaintenanceExecution<'_>,
+    ) -> Result<positron_kernel::GovernanceAuditCheckpoint, BootstrapFailure> {
+        let snapshot = catalog
+            .pin()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        let (_, governance) = snapshot
+            .governance_object()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
+        if governance.integrity_key_fingerprint() != self.integrity_key_fingerprint {
+            return Err(BootstrapFailure::new(
+                BootstrapFailureCode::IdentityMismatch,
+            ));
+        }
         let signer = self
             .key
             .audit_checkpoint_signer(self.instance, governance.protected_integrity_key())
@@ -72,9 +147,21 @@ impl InitializedInstance {
                 BootstrapFailureCode::IdentityMismatch,
             ));
         }
-        catalog
-            .publish_audit_checkpoint(&signer)
-            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))
+        let checkpoint = catalog
+            .publish_admitted_audit_checkpoint(
+                execution,
+                &signer,
+                governance.integrity_key_fingerprint(),
+            )
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        let coordinator = self
+            .maintenance_coordinator()
+            .lock()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        execution
+            .complete_and_persist(&coordinator, catalog, true)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        Ok(checkpoint)
     }
 
     /// Verifies the complete visible Governance Audit chain against the

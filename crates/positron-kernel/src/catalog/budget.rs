@@ -1,7 +1,8 @@
 use super::storage::{FRAME_OVERHEAD_BYTES, MAX_GENERATIONS};
 use super::{
-    AuditIntent, CatalogFailure, CatalogFailureCode, CatalogProposal, MAX_RECOVERY_ITEMS,
-    MAX_RECOVERY_MEMORY_BYTES, MAX_RETAINED_HISTORY_BYTES,
+    AuditIntent, CatalogFailure, CatalogFailureCode, CatalogProposal, MAX_CATALOG_OBJECTS,
+    MAX_CATALOG_TOTAL_BYTES, MAX_RECOVERY_ITEMS, MAX_RECOVERY_MEMORY_BYTES,
+    MAX_RETAINED_HISTORY_BYTES,
 };
 use crate::ResourceAmounts;
 
@@ -45,8 +46,37 @@ pub(super) fn recovery_resource_claim() -> ResourceAmounts {
 
 /// Bounded system-maintenance reservation for one signed audit anchor.
 pub(super) fn audit_checkpoint_resource_claim() -> ResourceAmounts {
+    // A checkpoint task first persists Queued/Running/Succeeded maintenance
+    // records through a complete Catalog replacement, then writes its small
+    // checkpoint artifact. The former can carry the maximum valid Catalog
+    // proposal after the request has queued, so reserve the exact upper bound
+    // of `commit_resource_claim` from the catalog format limits. These phases
+    // are sequential, hence `maximum`; the task's own binding buffers are
+    // already contained in the Catalog proposal/object accounting.
     ResourceAmounts::new([1_048_576, 1, 1, 1_048_576, 4, 0, 1, 1, 1, 4, 16_384])
         .maximum(recovery_resource_claim())
+        .maximum(maximum_catalog_commit_resource_claim())
+}
+
+fn maximum_catalog_commit_resource_claim() -> ResourceAmounts {
+    let objects = MAX_CATALOG_OBJECTS as u64;
+    let object_bytes = MAX_CATALOG_TOTAL_BYTES as u64;
+    let artifacts = objects.saturating_add(2);
+    let durable_bytes = object_bytes.saturating_add(artifacts.saturating_mul(512));
+    let memory = durable_bytes.saturating_mul(2).saturating_add(1_048_576);
+    ResourceAmounts::new([
+        memory,
+        1,
+        1,
+        memory,
+        artifacts,
+        0,
+        1,
+        1,
+        1,
+        8,
+        durable_bytes,
+    ])
 }
 
 pub(super) fn commit_resource_claim(
