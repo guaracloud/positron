@@ -1856,6 +1856,137 @@ fn typed_compaction_task_couples_the_exact_manifest_and_terminal_record()
     Ok(())
 }
 
+#[test]
+fn typed_compaction_ordinary_denial_defers_corrupt_payload_read_until_admission()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_authority(volume)?;
+    let instance = InstanceId::new([0xac; 16])?;
+    let catalog = Catalog::open(
+        &authority,
+        instance,
+        CatalogSecret::from_owned(Box::new([0xad; 32]), Box::new([0xae; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x64; 16])?;
+    super::retention_frontier::install_governance_policy(&catalog, instance, tenant, 60, 0xaf)?;
+    let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(65)?);
+    let retention_time = RetentionTimeAuthority::establish()?;
+    let key = || SegmentProtectionKey::from_owned(Box::new([0xb0; 32]));
+    let source = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    source.append(
+        source
+            .begin_store_block(
+                preparation_capacity(&authority, tenant)?,
+                StoreBlockIdentity::new([0xb1; 16])?,
+            )?
+            .finish(b"ordinary denial must precede payload decoding".to_vec())?,
+    )?;
+    source.seal()?;
+
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    let basis = catalog.pin()?;
+    let source_id = ledger
+        .storage
+        .catalog_segments(&basis, scope)?
+        .into_iter()
+        .find(|metadata| metadata.state == SegmentState::Sealed)
+        .ok_or("sealed source")?
+        .id;
+    let source_path = root
+        .path()
+        .join("segments")
+        .join("sealed")
+        .join(segment_name(source_id));
+    let mut corrupted = fs::read(&source_path)?;
+    let byte = corrupted.last_mut().ok_or("sealed source bytes")?;
+    *byte ^= 0xa5;
+    fs::write(source_path, corrupted)?;
+
+    let bucket = RetentionBucket::for_ingest_time(
+        tenant,
+        SignalKind::Logs,
+        IngestTime::from_authenticated_durable(UnixNanoseconds::new(0)),
+        catalog
+            .pin()?
+            .retention_policy(SignalKind::Logs)?
+            .retention_seconds(),
+    )?;
+    let identity = MaintenanceTaskId::new([0xb2; 16])
+        .map_err(|failure| format!("typed task identity: {failure:?}"))?;
+    let task = ledger.prepare_compaction_task(bucket, identity)?;
+    let claim = task.task().reservations();
+    let coordinator = MaintenanceCoordinator::new();
+    task.submit_and_persist(&coordinator, &catalog, 1)?;
+    let mut blockers = Vec::new();
+    for _ in 0..64 {
+        match authority.governor().reserve(WorkClaim::tenant(
+            tenant,
+            WorkKind::OrdinaryMaintenanceBackup,
+            claim,
+        )?) {
+            Ok(reservation) => blockers.push(reservation),
+            Err(_) => break,
+        }
+    }
+    assert!(
+        !blockers.is_empty(),
+        "ordinary capacity must be exhaustible"
+    );
+    let generation_before_denial = catalog.pin()?.identity();
+    let denial = match coordinator.start_compaction_task_with_reservation_and_persist(
+        &catalog, &authority, 1, false, identity,
+    ) {
+        Ok(_) => return Err("ordinary denial borrowed an emergency reservation".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(denial, crate::MaintenanceFailure::ResourceAdmissionRefused);
+    assert_eq!(catalog.pin()?.identity(), generation_before_denial);
+    assert_eq!(
+        coordinator
+            .status(identity)
+            .map_err(|failure| format!("queued denied task: {failure:?}"))?
+            .phase(),
+        crate::MaintenanceTaskPhase::Queued
+    );
+    let emergency = authority.recovery().reserve(RecoveryWorkClaim::tenant(
+        tenant,
+        RecoveryWorkKind::EmergencyCompaction,
+        ResourceAmounts::only(ResourceDimension::MemoryBytes, 1)?,
+    )?)?;
+    drop(emergency);
+    drop(blockers);
+
+    let execution = coordinator
+        .start_compaction_task_with_reservation_and_persist(
+            &catalog, &authority, 1, false, identity,
+        )
+        .map_err(|failure| format!("admitted ordinary task: {failure:?}"))?
+        .expect("ordinary Compaction dispatches after ordinary capacity is released");
+    ledger.prepare_compaction_for_maintenance(&execution)?;
+    let payload_failure = match ledger.reader()?.snapshot() {
+        Ok(_) => return Err("the sealed payload was not decoded after ordinary admission".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(
+        payload_failure.code(),
+        LedgerFailureCode::IntegrityCorruption
+    );
+    Ok(())
+}
+
 #[cfg(feature = "test-support")]
 #[test]
 fn typed_compaction_recovers_the_exact_output_and_terminal_pair_after_lost_ack()
