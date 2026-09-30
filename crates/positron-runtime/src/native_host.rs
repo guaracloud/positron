@@ -1867,6 +1867,7 @@ fn serve_http(
                     continue;
                 }
                 let Some(lease) = admission.accept_connection(peer.ip()) else {
+                    drop(stream);
                     wait_for_rate_window(&admission, &cancellation);
                     continue;
                 };

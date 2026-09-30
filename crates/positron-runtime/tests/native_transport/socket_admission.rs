@@ -108,9 +108,20 @@ async fn api_preauthentication_rate_refuses_by_peer_and_global_window_then_recov
     )?;
     let api = address(&process.bound_endpoints(), ListenerRole::Api)?;
 
-    assert_status(request_from(Ipv4Addr::LOCALHOST, api).await?, 405);
-    assert_closed(connect_from(Ipv4Addr::LOCALHOST, api).await?).await?;
-    assert_status(request_from(Ipv4Addr::LOCALHOST, api).await?, 405);
+    let first = request_from(Ipv4Addr::LOCALHOST, api)
+        .await
+        .map_err(|error| format!("first admitted request: {error}"))?;
+    assert_status(first, 405);
+    let refused = connect_from(Ipv4Addr::LOCALHOST, api)
+        .await
+        .map_err(|error| format!("rate-limited connection: {error}"))?;
+    assert_closed(refused)
+        .await
+        .map_err(|error| format!("rate-limited connection: {error}"))?;
+    let recovered = request_from(Ipv4Addr::LOCALHOST, api)
+        .await
+        .map_err(|error| format!("recovered request: {error}"))?;
+    assert_status(recovered, 405);
     assert_eq!(
         process.shutdown(ShutdownTrigger::FirstSignal),
         positron_runtime::ExitOutcome::Graceful
