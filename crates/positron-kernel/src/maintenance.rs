@@ -53,7 +53,7 @@ pub(crate) fn rewrite_durable_task_record_not_before_for_test(
 }
 
 const MAX_MAINTENANCE_TASKS: usize = 128;
-const MAX_TASK_OBJECTS: usize = 16;
+pub(crate) const MAX_TASK_OBJECTS: usize = 16;
 pub(crate) const MAX_CHECKPOINT_BYTES: usize = 4_096;
 const RETENTION_PUBLICATION_FRONTIER_MAGIC: &[u8; 8] = b"RTPFR001";
 const GOVERNANCE_AUDIT_CHECKPOINT_BINDING_MAGIC: &[u8; 8] = b"GACPB001";
@@ -382,6 +382,20 @@ impl MaintenanceReservation<'_> {
     pub fn granted(&self) -> ResourceAmounts {
         match self {
             Self::Ordinary(reservation) | Self::Recovery(reservation) => reservation.granted(),
+        }
+    }
+
+    pub(crate) fn authorizes_ordinary_compaction(
+        &self,
+        governor: crate::ResourceGovernor<'_>,
+        tenant: TenantId,
+    ) -> bool {
+        match self {
+            Self::Ordinary(reservation) => {
+                reservation.belongs_to(governor)
+                    && reservation.authorizes_ordinary_compaction(tenant)
+            },
+            Self::Recovery(_) => false,
         }
     }
 }

@@ -1626,11 +1626,14 @@ fn typed_compaction_task_couples_the_exact_manifest_and_terminal_record()
         policy.retention_seconds(),
     )?;
     let generation_before_binding_refusals = catalog.pin()?.number();
-    let mut wrong_scope = blocks.clone();
-    wrong_scope[0].scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(65)?);
+    let foreign_bucket = RetentionBucket::for_ingest_time(
+        TenantId::from_bytes([0x65; 16])?,
+        SignalKind::Logs,
+        blocks[0].ingest_time,
+        policy.retention_seconds(),
+    )?;
     let wrong_scope_failure = match ledger.prepare_compaction_task(
-        &wrong_scope,
-        bucket,
+        foreign_bucket,
         MaintenanceTaskId::new([0xa1; 16]).expect("wrong-scope task identity"),
     ) {
         Ok(_) => return Err("a Compaction descriptor bound a foreign physical scope".into()),
@@ -1638,7 +1641,7 @@ fn typed_compaction_task_couples_the_exact_manifest_and_terminal_record()
     };
     assert_eq!(
         wrong_scope_failure.code(),
-        LedgerFailureCode::StaleGeneration
+        LedgerFailureCode::InvalidInput
     );
     let outside_bucket = RetentionBucket::for_ingest_time(
         tenant,
@@ -1653,30 +1656,20 @@ fn typed_compaction_task_couples_the_exact_manifest_and_terminal_record()
         )),
         policy.retention_seconds(),
     )?;
-    let wrong_bucket_failure = match ledger.prepare_compaction_task(
-        &blocks,
-        outside_bucket,
-        MaintenanceTaskId::new([0xa2; 16]).expect("wrong-bucket task identity"),
-    ) {
-        Ok(_) => {
-            return Err("a Compaction descriptor bound sources outside its fixed bucket".into());
-        },
-        Err(failure) => failure,
-    };
-    assert_eq!(
-        wrong_bucket_failure.code(),
-        LedgerFailureCode::StaleGeneration
-    );
+    let _outside_bucket = outside_bucket;
     assert_eq!(catalog.pin()?.number(), generation_before_binding_refusals);
     let identity = MaintenanceTaskId::new([0xe8; 16]).expect("task identity");
-    let task = ledger.prepare_compaction_task(&blocks, bucket, identity)?;
+    let task = ledger
+        .prepare_compaction_task(bucket, identity)
+        .map_err(|failure| format!("typed task planning: {failure:?}"))?;
     let coordinator = MaintenanceCoordinator::new();
-    task.submit_and_persist(&coordinator, &catalog, 1)?;
+    task.submit_and_persist(&coordinator, &catalog, 1)
+        .map_err(|failure| format!("typed task persistence: {failure:?}"))?;
     let execution = coordinator
         .start_compaction_task_with_reservation_and_persist(
             &catalog, &authority, 1, false, identity,
         )
-        .expect("typed task starts")
+        .map_err(|failure| format!("typed task admission: {failure:?}"))?
         .expect("typed task dispatches");
     let unrelated_bytes = vec![0xa5; 1_048_576];
     let adding_basis = catalog.pin()?;
@@ -1694,17 +1687,11 @@ fn typed_compaction_task_couples_the_exact_manifest_and_terminal_record()
         )?,
         None,
     )?;
-    let growth_refusal_preparation = ledger.prepare_compaction_with_policy(&snapshot, policy)?;
     let generation_before_growth_refusal = catalog.pin()?.number();
-    let growth_refusal = ledger
-        .compact_sealed_with_maintenance(
-            blocks.clone(),
-            growth_refusal_preparation,
-            &coordinator,
-            &execution,
-            || false,
-        )
-        .expect_err("current Catalog growth cannot make an immutable Compaction grant underclaim");
+    let growth_refusal = match ledger.prepare_compaction_for_maintenance(&execution) {
+        Ok(_) => return Err("current Catalog growth made an immutable grant underclaim".into()),
+        Err(failure) => failure,
+    };
     assert_eq!(
         growth_refusal.code(),
         LedgerFailureCode::ResourceAdmissionRefused
@@ -1731,7 +1718,10 @@ fn typed_compaction_task_couples_the_exact_manifest_and_terminal_record()
     )?;
     let mut rewritten_source = blocks.clone();
     rewritten_source[0].source_segment = rewritten_source[1].source_segment;
-    let refusal_preparation = ledger.prepare_compaction_with_policy(&snapshot, policy)?;
+    let refusal_preparation =
+        ledger
+            .prepare_compaction_payload_for_maintenance(&snapshot, &execution)
+            .map_err(|failure| format!("rewritten-source preparation: {failure:?}"))?;
     let generation_before_refusal = catalog.pin()?.number();
     let refusal = ledger
         .compact_sealed_with_maintenance(
@@ -1749,19 +1739,11 @@ fn typed_compaction_task_couples_the_exact_manifest_and_terminal_record()
         crate::MaintenanceTaskPhase::Running
     );
     super::retention_frontier::install_governance_policy(&catalog, instance, tenant, 120, 0xa3)?;
-    let changed_policy = catalog.pin()?.retention_policy(SignalKind::Logs)?;
-    let policy_refusal_preparation =
-        ledger.prepare_compaction_with_policy(&snapshot, changed_policy)?;
     let generation_before_policy_refusal = catalog.pin()?.number();
-    let policy_refusal = ledger
-        .compact_sealed_with_maintenance(
-            blocks.clone(),
-            policy_refusal_preparation,
-            &coordinator,
-            &execution,
-            || false,
-        )
-        .expect_err("a running task cannot substitute a later retention policy object");
+    let policy_refusal = match ledger.prepare_compaction_for_maintenance(&execution) {
+        Ok(_) => return Err("a running task substituted a later retention policy object".into()),
+        Err(failure) => failure,
+    };
     assert_eq!(policy_refusal.code(), LedgerFailureCode::StaleGeneration);
     assert_eq!(catalog.pin()?.number(), generation_before_policy_refusal);
     assert_eq!(
@@ -1770,7 +1752,7 @@ fn typed_compaction_task_couples_the_exact_manifest_and_terminal_record()
     );
     super::retention_frontier::install_governance_policy(&catalog, instance, tenant, 60, 0xa4)?;
     let preparation = ledger
-        .prepare_compaction_with_policy(&snapshot, policy)
+        .prepare_compaction_payload_for_maintenance(&snapshot, &execution)
         .map_err(|failure| format!("execution preparation: {failure:?}"))?;
     let generation = catalog.pin()?.number();
     ledger
@@ -1856,7 +1838,7 @@ fn typed_compaction_recovers_the_exact_output_and_terminal_pair_after_lost_ack()
         policy.retention_seconds(),
     )?;
     let identity = MaintenanceTaskId::new([0xf0; 16]).expect("task identity");
-    let task = ledger.prepare_compaction_task(&blocks, bucket, identity)?;
+    let task = ledger.prepare_compaction_task(bucket, identity)?;
     let coordinator = MaintenanceCoordinator::new();
     task.submit_and_persist(&coordinator, &catalog, 1)?;
     let execution = coordinator
@@ -1865,7 +1847,7 @@ fn typed_compaction_recovers_the_exact_output_and_terminal_pair_after_lost_ack()
         )
         .expect("typed compaction starts")
         .ok_or("typed compaction dispatch")?;
-    let preparation = ledger.prepare_compaction_with_policy(&snapshot, policy)?;
+    let preparation = ledger.prepare_compaction_payload_for_maintenance(&snapshot, &execution)?;
     let generation = catalog.pin()?.number();
     let publication = with_catalog_publication_fault_after(
         CatalogPublicationFault::SynchronizeGenerationDirectory,
@@ -1996,7 +1978,7 @@ fn typed_compaction_reconciles_a_two_fault_lost_ack_with_the_original_execution(
         policy.retention_seconds(),
     )?;
     let identity = MaintenanceTaskId::new([0xf8; 16]).expect("task identity");
-    let task = ledger.prepare_compaction_task(&blocks, bucket, identity)?;
+    let task = ledger.prepare_compaction_task(bucket, identity)?;
     let coordinator = MaintenanceCoordinator::new();
     task.submit_and_persist(&coordinator, &catalog, 1)?;
     let execution = coordinator
@@ -2005,7 +1987,7 @@ fn typed_compaction_reconciles_a_two_fault_lost_ack_with_the_original_execution(
         )
         .expect("typed compaction starts")
         .ok_or("typed compaction dispatch")?;
-    let preparation = ledger.prepare_compaction_with_policy(&snapshot, policy)?;
+    let preparation = ledger.prepare_compaction_payload_for_maintenance(&snapshot, &execution)?;
     let generation = catalog.pin()?.number();
     let first = with_catalog_publication_fault_sequence_after(
         &[
@@ -2133,7 +2115,7 @@ fn typed_compaction_refuses_an_altered_valid_terminal_record_after_lost_ack()
         policy.retention_seconds(),
     )?;
     let identity = MaintenanceTaskId::new([0xff; 16]).expect("task identity");
-    let task = ledger.prepare_compaction_task(&blocks, bucket, identity)?;
+    let task = ledger.prepare_compaction_task(bucket, identity)?;
     let coordinator = MaintenanceCoordinator::new();
     task.submit_and_persist(&coordinator, &catalog, 1)?;
     let execution = coordinator
@@ -2142,7 +2124,7 @@ fn typed_compaction_refuses_an_altered_valid_terminal_record_after_lost_ack()
         )
         .expect("typed compaction starts")
         .ok_or("typed compaction dispatch")?;
-    let preparation = ledger.prepare_compaction_with_policy(&snapshot, policy)?;
+    let preparation = ledger.prepare_compaction_payload_for_maintenance(&snapshot, &execution)?;
     let first = with_catalog_publication_fault_sequence_after(
         &[
             (CatalogPublicationFault::SynchronizeGenerationDirectory, 0),

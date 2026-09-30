@@ -302,7 +302,9 @@ pub struct CompactionBlock {
 /// The reservation is move-only so every successful preparation is either
 /// consumed by the kernel publication or released before the caller returns.
 pub struct CompactionPreparation<'kernel> {
-    pub(super) capacity: ResourceReservation<'kernel>,
+    pub(super) capacity: Option<ResourceReservation<'kernel>>,
+    pub(super) granted: crate::ResourceAmounts,
+    pub(super) coordinator_admitted: bool,
     pub(super) scope: SegmentScope,
     pub(super) catalog_instance: crate::InstanceId,
     pub(super) catalog_identity: crate::CatalogGenerationId,
