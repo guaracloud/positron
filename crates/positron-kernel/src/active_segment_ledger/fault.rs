@@ -40,6 +40,8 @@ pub(super) enum LedgerFileEvent {
     BeforeLeaseCreationReconciliation,
     #[cfg(any(test, fuzzing, feature = "test-support"))]
     BeforeRetentionFrontierReconciliation,
+    #[cfg(any(test, fuzzing, feature = "test-support"))]
+    BeforeReclaimRetiredSegment,
 }
 
 pub(super) fn emit_event(_event: LedgerFileEvent) -> Result<(), LedgerFailure> {

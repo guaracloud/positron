@@ -10,7 +10,9 @@ use positron_domain::time::UnixNanoseconds;
 use super::support::{
     TemporaryRoot, establish_authority, establish_authority_with_retention_capacity,
 };
-use crate::active_segment_ledger::fault::{LedgerFileEvent, with_ledger_fault};
+use crate::active_segment_ledger::fault::{
+    LedgerFileEvent, with_ledger_fault, with_ledger_faults_after,
+};
 use crate::active_segment_ledger::format::decode_header;
 use crate::active_segment_ledger::object_context;
 use crate::data_protection::{DataProtection, FrameLimits, FrameSequence, SegmentFramePurpose};

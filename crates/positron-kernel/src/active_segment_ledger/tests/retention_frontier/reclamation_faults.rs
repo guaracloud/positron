@@ -160,7 +160,7 @@ fn uncertain_clock_reclamation_protects_existing_leases_but_reclaims_after_relea
     drop(publication_execution);
     drop(active);
 
-    let wall = Arc::new(Mutex::new(UnixNanoseconds::new(13_000_000_000)));
+    let wall = Arc::new(Mutex::new(UnixNanoseconds::new(200_000_000_000)));
     let (uncertain_time, _) = RetentionTimeAuthority::establish_with_source_and_manual_elapsed(
         MutableWallClock(Arc::clone(&wall)),
         crate::LifecycleClockPolicy::new(10)?,
@@ -261,26 +261,47 @@ fn reclamation_retries_the_same_descriptor_after_partial_physical_unlink()
     let reclamation_id =
         active.complete_running_retention_publication_task(&coordinator, &publication_execution)?;
     drop(publication_execution);
-    let retired = active
-        .storage
-        .catalog_segments(&catalog.pin()?, scope)?
-        .into_iter()
-        .filter(|metadata| metadata.state == crate::active_segment_ledger::SegmentState::Retired)
-        .collect::<Vec<_>>();
     assert_eq!(
-        retired.len(),
+        active
+            .storage
+            .catalog_segments(&catalog.pin()?, scope)?
+            .into_iter()
+            .filter(|metadata| metadata.state == crate::active_segment_ledger::SegmentState::Retired)
+            .count(),
         2,
         "publication must bind both retired inputs"
     );
-    assert!(
-        active.storage.reclaim_retired(retired[0])?,
-        "the fixture simulates one completed unlink before process recovery"
-    );
-
     let execution = coordinator
         .start_next_with_reservation_and_persist(&catalog, &authority, 12, false)
         .expect("reclamation dispatch admission")
         .ok_or("reclamation dispatch")?;
+    let failure =
+        with_ledger_faults_after(&[(LedgerFileEvent::BeforeReclaimRetiredSegment, 1)], || {
+            active.complete_running_retention_reclamation_task(&coordinator, &execution)
+        })
+        .expect_err("the second physical unlink must report a post-mutation failure");
+    assert_eq!(failure.code(), LedgerFailureCode::StorageUnavailable);
+    assert_eq!(
+        failure.completion_state(),
+        crate::LedgerCompletionState::RecoveryRequired
+    );
+    assert_eq!(
+        coordinator
+            .status(reclamation_id)
+            .expect("running reclamation")
+            .phase(),
+        MaintenanceTaskPhase::Running,
+        "the original durable descriptor must remain running after partial physical mutation"
+    );
+    assert_eq!(
+        MaintenanceCoordinator::restore_from_catalog(&catalog)
+            .expect("reopen after physical failure")
+            .status(reclamation_id)
+            .expect("durable running reclamation")
+            .phase(),
+        MaintenanceTaskPhase::Queued,
+        "the unchanged durable record must make post-crash retry schedulable"
+    );
     active.complete_running_retention_reclamation_task(&coordinator, &execution)?;
     assert_eq!(
         coordinator

@@ -76,9 +76,14 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             return Err(LedgerFailure::new(LedgerFailureCode::RecoveryRequired));
         }
         let _barrier = SnapshotProtection::write_barrier(self.authority.snapshot_barrier())?;
-        let now = self
-            .retention_time
-            .and_then(|authority| authority.lease_time(self.scope).ok());
+        // A forward wall-clock discontinuity may be discovered while sampling
+        // the lease clock.  Check the authority again after that sample: an
+        // uncertain time must retain every durable matching lease rather than
+        // treating a jumped observation as an expiry decision.
+        let now = self.retention_time.and_then(|authority| {
+            let sampled = authority.lease_time(self.scope).ok()?;
+            (authority.status().state() == crate::LifecycleClockState::Certain).then_some(sampled)
+        });
         let leased = super::snapshot_lease::active_segments(&basis, self.scope, now.unwrap_or(0))?;
         let in_process = retired.iter().try_fold(false, |protected, segment| {
             SnapshotProtection::is_protected(&self.authority.snapshot_protection(), segment.id)

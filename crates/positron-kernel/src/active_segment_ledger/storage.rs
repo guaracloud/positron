@@ -393,6 +393,8 @@ impl LedgerStorage {
         {
             return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
         }
+        #[cfg(any(test, fuzzing, feature = "test-support"))]
+        emit_event(LedgerFileEvent::BeforeReclaimRetiredSegment)?;
         let mut changed = false;
         for name in [segment_name(metadata.id), frontier_name(metadata.id)] {
             match unix_fs::unlinkat(&self.sealed, name, AtFlags::empty()) {
