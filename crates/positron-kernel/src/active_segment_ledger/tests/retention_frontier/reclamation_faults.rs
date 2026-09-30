@@ -208,7 +208,7 @@ fn uncertain_clock_reclamation_protects_existing_leases_but_reclaims_after_relea
 }
 
 #[test]
-fn reclamation_retries_the_same_descriptor_after_partial_physical_unlink()
+fn reclamation_restores_the_same_descriptor_after_partial_physical_unlink()
 -> Result<(), Box<dyn Error>> {
     let root = TemporaryRoot::new()?;
     let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
@@ -261,13 +261,14 @@ fn reclamation_retries_the_same_descriptor_after_partial_physical_unlink()
     let reclamation_id =
         active.complete_running_retention_publication_task(&coordinator, &publication_execution)?;
     drop(publication_execution);
+    let retired = active
+        .storage
+        .catalog_segments(&catalog.pin()?, scope)?
+        .into_iter()
+        .filter(|metadata| metadata.state == crate::active_segment_ledger::SegmentState::Retired)
+        .collect::<Vec<_>>();
     assert_eq!(
-        active
-            .storage
-            .catalog_segments(&catalog.pin()?, scope)?
-            .into_iter()
-            .filter(|metadata| metadata.state == crate::active_segment_ledger::SegmentState::Retired)
-            .count(),
+        retired.len(),
         2,
         "publication must bind both retired inputs"
     );
@@ -293,22 +294,59 @@ fn reclamation_retries_the_same_descriptor_after_partial_physical_unlink()
         MaintenanceTaskPhase::Running,
         "the original durable descriptor must remain running after partial physical mutation"
     );
+    assert!(
+        !active.storage.reclaim_retired(retired[0])?,
+        "the first exact retired input must already be physically absent"
+    );
+    drop(execution);
+    drop(coordinator);
+    drop(active);
+
+    let coordinator = MaintenanceCoordinator::restore_from_catalog(&catalog)
+        .expect("reopen after physical failure");
     assert_eq!(
-        MaintenanceCoordinator::restore_from_catalog(&catalog)
-            .expect("reopen after physical failure")
+        coordinator
             .status(reclamation_id)
             .expect("durable running reclamation")
             .phase(),
         MaintenanceTaskPhase::Queued,
         "the unchanged durable record must make post-crash retry schedulable"
     );
-    active.complete_running_retention_reclamation_task(&coordinator, &execution)?;
+    let reopened = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    let restored_execution = coordinator
+        .start_next_with_reservation_and_persist(&catalog, &authority, 12, false)
+        .expect("restored reclamation dispatch admission")
+        .ok_or("restored reclamation dispatch")?;
+    reopened.complete_running_retention_reclamation_task(&coordinator, &restored_execution)?;
     assert_eq!(
         coordinator
             .status(reclamation_id)
             .expect("terminal reclamation")
             .phase(),
         MaintenanceTaskPhase::Succeeded
+    );
+    let terminal_metadata = reopened
+        .storage
+        .catalog_segments(&catalog.pin()?, scope)?
+        .into_iter()
+        .filter(|metadata| metadata.state == crate::active_segment_ledger::SegmentState::Retired)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        terminal_metadata.len(),
+        1,
+        "the terminal Catalog metadata must retain only the exact continuity marker"
+    );
+    assert_eq!(terminal_metadata[0].id, retired[1].id);
+    assert!(
+        !reopened.storage.reclaim_retired(retired[0])?
+            && !reopened.storage.reclaim_retired(retired[1])?,
+        "the restored execution must leave both exact retired payloads physically absent"
     );
     assert_eq!(
         MaintenanceCoordinator::restore_from_catalog(&catalog)

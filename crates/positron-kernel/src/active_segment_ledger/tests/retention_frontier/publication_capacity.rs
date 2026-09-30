@@ -3,6 +3,10 @@ use std::mem::size_of;
 
 use crate::active_segment_ledger::SegmentRetention;
 use crate::active_segment_ledger::retention_publication::retention_publication_claim;
+use crate::{
+    MaintenanceCoordinator, MaintenanceTask, MaintenanceTaskClass, MaintenanceTaskId,
+    MaintenanceTaskPhase,
+};
 
 #[test]
 fn retention_publication_claim_covers_all_live_terminal_pair_buffers() -> Result<(), Box<dyn Error>>
@@ -183,6 +187,147 @@ fn retention_publication_requires_its_exact_recovery_headroom_before_planning()
         .expect_err("one byte below the derived claim must refuse before planning");
     assert_eq!(failure.code(), LedgerFailureCode::ResourceAdmissionRefused);
     Ok(())
+}
+
+#[test]
+fn terminal_publication_eviction_leaves_its_exact_queued_reclamation_recoverable()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_authority(volume)?;
+    let instance = InstanceId::new([0x51; 16])?;
+    let catalog = Catalog::open(
+        &authority,
+        instance,
+        CatalogSecret::from_owned(Box::new([0x52; 32]), Box::new([0x53; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x64; 16])?;
+    install_governance_policy(&catalog, instance, tenant, 1, 0x54)?;
+    let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(107)?);
+    let (retention_time, elapsed) =
+        RetentionTimeAuthority::establish_with_manual_elapsed(UnixNanoseconds::new(10_000_000_000));
+    let key = || SegmentProtectionKey::from_owned(Box::new([0x55; 32]));
+    let sealed = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    let block = sealed.begin_store_block(
+        preparation_capacity(&authority, tenant)?,
+        StoreBlockIdentity::new([0x56; 16])?,
+    )?;
+    sealed.append(block.finish(b"evicted publication reclamation".to_vec())?)?;
+    sealed.seal()?;
+    elapsed.advance(2_000_000_000)?;
+
+    let active = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    let coordinator = MaintenanceCoordinator::new();
+    let preparation = active.prepare_retention_publication()?;
+    let publication_id = preparation.task().identity();
+    let expected_reclamation_inputs = preparation.task().outputs().to_vec();
+    preparation.submit_and_persist(&coordinator, &catalog, 12)?;
+    let publication_execution = coordinator
+        .start_next_with_reservation_and_persist(&catalog, &authority, 12, false)
+        .expect("publication dispatch admission")
+        .ok_or("publication dispatch")?;
+    let reclamation_id =
+        active.complete_running_retention_publication_task(&coordinator, &publication_execution)?;
+    drop(publication_execution);
+    let retired_metadata = active
+        .storage
+        .catalog_segments(&catalog.pin()?, scope)?
+        .into_iter()
+        .find(|metadata| metadata.state == crate::active_segment_ledger::SegmentState::Retired)
+        .ok_or("published retired metadata")?;
+
+    for raw in 1_u8..=126 {
+        coordinator
+            .submit_and_persist(&catalog, filler_task(0xe0, raw), 13)
+            .expect("ordinary filler task persists");
+    }
+    coordinator
+        .submit_and_persist(&catalog, filler_task(0xe1, 1), 13)
+        .expect("bounded admission persists the replacement filler task");
+    assert_eq!(
+        coordinator.status(publication_id),
+        Err(crate::MaintenanceFailure::UnknownTask),
+        "bounded admission must reclaim the completed publication before any queued task"
+    );
+    assert_eq!(
+        coordinator
+            .status(reclamation_id)
+            .expect("queued reclamation survives bounded admission")
+            .phase(),
+        MaintenanceTaskPhase::Queued
+    );
+    drop(active);
+    drop(coordinator);
+
+    let coordinator = MaintenanceCoordinator::restore_from_catalog(&catalog)
+        .expect("bounded registry restores after publication eviction");
+    assert_eq!(
+        coordinator.status(publication_id),
+        Err(crate::MaintenanceFailure::UnknownTask),
+        "terminal publication eviction is durable across restart"
+    );
+    let restored_reclamation = coordinator
+        .status(reclamation_id)
+        .expect("exact reclamation remains durable after publication eviction");
+    assert_eq!(restored_reclamation.phase(), MaintenanceTaskPhase::Queued);
+    assert_eq!(
+        restored_reclamation.task().inputs(),
+        expected_reclamation_inputs,
+        "the standalone reclamation descriptor retains its exact authenticated retired binding"
+    );
+
+    let reopened = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    let reclamation_execution = coordinator
+        .start_next_with_reservation_and_persist_for_class(
+            &catalog,
+            &authority,
+            13,
+            false,
+            Some(MaintenanceTaskClass::RetentionReclamation),
+        )
+        .expect("restored reclamation dispatch admission")
+        .ok_or("restored reclamation dispatch")?;
+    reopened.complete_running_retention_reclamation_task(&coordinator, &reclamation_execution)?;
+    assert_eq!(
+        coordinator
+            .status(reclamation_id)
+            .expect("terminal reclamation")
+            .phase(),
+        MaintenanceTaskPhase::Succeeded
+    );
+    assert!(
+        !reopened.storage.reclaim_retired(retired_metadata)?,
+        "the surviving descriptor must reclaim its exact retired payload after restart"
+    );
+    Ok(())
+}
+
+fn filler_task(first: u8, second: u8) -> MaintenanceTask {
+    let mut identity = [0_u8; 16];
+    identity[0] = first;
+    identity[1] = second;
+    MaintenanceTask::new(
+        MaintenanceTaskId::new(identity).expect("nonzero filler task identity"),
+        MaintenanceTaskClass::Compaction,
+    )
 }
 
 fn recovery_shared_capacity(
