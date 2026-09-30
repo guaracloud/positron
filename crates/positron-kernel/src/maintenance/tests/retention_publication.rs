@@ -147,11 +147,8 @@ fn retention_reclamation_task(identity: u8) -> MaintenanceTask {
     .expect("reclamation task")
 }
 
-#[test]
-fn restore_rejects_a_reclamation_without_the_canonical_successor_identity() {
-    let mut task = retention_reclamation_task(0x80);
-    task.identity = MaintenanceTaskId::new([0x80; 16]).expect("wrong identity");
-    let record = encode_record(&TaskState {
+fn queued_reclamation_state(task: MaintenanceTask) -> TaskState {
+    TaskState {
         task,
         phase: MaintenanceTaskPhase::Queued,
         submitted_at: 1,
@@ -161,11 +158,109 @@ fn restore_rejects_a_reclamation_without_the_canonical_successor_identity() {
         dispatches: 0,
         terminal_order: None,
         active_dispatch: None,
-    })
-    .expect("authenticated malformed fixture");
-    match MaintenanceCoordinator::restore([record]) {
-        Err(error) => assert_eq!(error, MaintenanceFailure::InvalidInput),
-        Ok(_) => panic!("wrong successor identity must fail restore"),
+    }
+}
+
+#[test]
+fn restore_rejects_noncanonical_reclamation_descriptors() {
+    let task = retention_reclamation_task(0x80);
+    let tenant = TenantId::from_bytes([0x74; 16]).expect("tenant");
+    let binding = MaintenanceObjectId::new([0x82; 32]).expect("output binding");
+    let cases = [
+        (
+            "wrong successor identity",
+            TaskState {
+                task: MaintenanceTask {
+                    identity: MaintenanceTaskId::new([0x80; 16]).expect("wrong identity"),
+                    ..task.clone()
+                },
+                ..queued_reclamation_state(task.clone())
+            },
+        ),
+        (
+            "system scope",
+            TaskState {
+                task: MaintenanceTask {
+                    scope: MaintenanceScope::System,
+                    ..task.clone()
+                },
+                ..queued_reclamation_state(task.clone())
+            },
+        ),
+        (
+            "tenant scope",
+            TaskState {
+                task: MaintenanceTask {
+                    scope: MaintenanceScope::Tenant(tenant),
+                    ..task.clone()
+                },
+                ..queued_reclamation_state(task.clone())
+            },
+        ),
+        (
+            "event trigger",
+            TaskState {
+                task: MaintenanceTask {
+                    trigger: MaintenanceTrigger::Event,
+                    ..task.clone()
+                },
+                ..queued_reclamation_state(task.clone())
+            },
+        ),
+        (
+            "no retired input",
+            TaskState {
+                task: MaintenanceTask {
+                    inputs: Vec::new(),
+                    ..task.clone()
+                },
+                ..queued_reclamation_state(task.clone())
+            },
+        ),
+        (
+            "output binding",
+            TaskState {
+                task: MaintenanceTask {
+                    outputs: vec![binding],
+                    ..task.clone()
+                },
+                ..queued_reclamation_state(task.clone())
+            },
+        ),
+        (
+            "scheduled not before",
+            TaskState {
+                task: MaintenanceTask {
+                    not_before: 1,
+                    ..task.clone()
+                },
+                ..queued_reclamation_state(task.clone())
+            },
+        ),
+        (
+            "checkpoint",
+            TaskState {
+                checkpoint: Some(
+                    MaintenanceCheckpoint::new(1, 0, b"forged progress".to_vec())
+                        .expect("checkpoint"),
+                ),
+                ..queued_reclamation_state(task.clone())
+            },
+        ),
+        (
+            "pause",
+            TaskState {
+                pause_until: Some(2),
+                ..queued_reclamation_state(task)
+            },
+        ),
+    ];
+    for (case, state) in cases {
+        let record = encode_record(&state).expect("authenticated malformed fixture");
+        match MaintenanceCoordinator::restore([record]) {
+            Err(error) => assert_eq!(error, MaintenanceFailure::InvalidInput, "{case}"),
+            Ok(_) => panic!("{case} must fail restore"),
+        }
     }
 }
 
@@ -277,6 +372,83 @@ fn generic_completion_cannot_terminalize_a_retention_reclamation()
             .phase(),
         MaintenanceTaskPhase::Queued,
         "generic completion must leave the durable Reclamation record unchanged"
+    );
+    Ok(())
+}
+
+#[test]
+fn generic_checkpoint_cannot_mutate_a_retention_reclamation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = CatalogRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
+    let authority = crate::catalog::tests::support::establish_catalog_authority(volume)?;
+    let tenant = TenantId::from_bytes([0x43; 16])?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new(nonzero_id(0x7d))?,
+        CatalogSecret::from_owned(Box::new([0x7e; 32]), Box::new([0x7f; 32])),
+    )?;
+    let mut task = retention_reclamation_task(0x80);
+    task.scope = MaintenanceScope::segment(tenant, SignalKind::Logs, VirtualShardId::new(3)?);
+    let identity = task.identity();
+    let queued = TaskState {
+        task,
+        phase: MaintenanceTaskPhase::Queued,
+        submitted_at: 1,
+        checkpoint: None,
+        pause_until: None,
+        cancellation_requested: false,
+        dispatches: 0,
+        terminal_order: None,
+        active_dispatch: None,
+    };
+    catalog.commit(
+        catalog.pin()?.identity(),
+        CatalogProposal::new(
+            TransactionId::new(nonzero_id(0x81))?,
+            FormatEpoch::CATALOG_V1,
+            vec![CatalogObject::new(
+                encode_record(&queued)
+                    .expect("durable queued record")
+                    .as_bytes()
+                    .to_vec(),
+            )?],
+        )?,
+        None,
+    )?;
+    let coordinator = MaintenanceCoordinator::restore_from_catalog(&catalog)
+        .expect("queued reclamation restores");
+    let execution = coordinator
+        .start_next_with_reservation_and_persist(&catalog, &authority, 2, false)
+        .expect("reclamation dispatch admission")
+        .ok_or("reclamation dispatch")?;
+
+    assert_eq!(
+        execution
+            .checkpoint_and_persist(
+                &coordinator,
+                &catalog,
+                MaintenanceCheckpoint::new(1, 0, b"forged progress".to_vec()).expect("checkpoint"),
+            )
+            .expect_err("only the metadata-coupled Reclamation handler owns its progress"),
+        MaintenanceFailure::InvalidTransition
+    );
+    assert!(
+        coordinator
+            .status(identity)
+            .expect("running reclamation")
+            .checkpoint()
+            .is_none(),
+        "generic checkpointing must not mutate the typed descriptor"
+    );
+    assert!(
+        MaintenanceCoordinator::restore_from_catalog(&catalog)
+            .expect("durable record restores")
+            .status(identity)
+            .expect("durable running reclamation")
+            .checkpoint()
+            .is_none(),
+        "the durable Running record must remain without generic progress"
     );
     Ok(())
 }
