@@ -326,7 +326,7 @@ fn filler_task(first: u8, second: u8) -> MaintenanceTask {
     identity[1] = second;
     MaintenanceTask::new(
         MaintenanceTaskId::new(identity).expect("nonzero filler task identity"),
-        MaintenanceTaskClass::Compaction,
+        MaintenanceTaskClass::RepositoryVerification,
     )
 }
 
