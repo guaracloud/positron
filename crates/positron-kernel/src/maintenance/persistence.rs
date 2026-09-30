@@ -414,6 +414,32 @@ impl QueuedMaintenanceSubmission {
     }
 }
 
+fn matches_catalog_reclamation_predecessor(
+    durable: &TaskState,
+    durable_record: &[u8],
+    live: &TaskState,
+) -> Result<bool, MaintenanceFailure> {
+    let live_record = encode_record(live)?;
+    if live_record.as_bytes() == durable_record {
+        return Ok(true);
+    }
+    // Recovery alone canonically derives this terminal live state from an
+    // authenticated durable Running cancellation after a pre-physical
+    // terminal-write failure. Keep every persisted field exact while allowing
+    // that one phase derivation; ordinary Running descriptors remain refused.
+    if durable.phase != MaintenanceTaskPhase::Running
+        || !durable.cancellation_requested
+        || live.phase != MaintenanceTaskPhase::Cancelled
+        || !live.cancellation_requested
+        || live.active_dispatch.is_some()
+    {
+        return Ok(false);
+    }
+    let mut recovered = durable.clone();
+    recovered.phase = MaintenanceTaskPhase::Cancelled;
+    Ok(encode_record(&recovered)?.as_bytes() == live_record.as_bytes())
+}
+
 impl MaintenanceCoordinator {
     pub(super) fn reconcile_running_compaction_completion(
         &self,
@@ -1128,27 +1154,56 @@ impl MaintenanceCoordinator {
         {
             return Err(MaintenanceFailure::PreconditionFailed);
         }
-        let replaced_queued = predecessor_record
-            .map(decode_record)
-            .transpose()?
-            .map(|predecessor| {
+        let predecessor = match predecessor_record {
+            Some(record) => {
+                let predecessor = decode_record(record)?;
+                let live = state
+                    .tasks
+                    .get(&predecessor.task.identity)
+                    .ok_or(MaintenanceFailure::PreconditionFailed)?;
                 if predecessor.task.class != MaintenanceTaskClass::CatalogReclamation
                     || predecessor.task.scope != MaintenanceScope::System
-                    || predecessor.phase != MaintenanceTaskPhase::Queued
-                    || state.tasks.get(&predecessor.task.identity) != Some(&predecessor)
+                    || !matches_catalog_reclamation_predecessor(&predecessor, record, live)?
                 {
                     return Err(MaintenanceFailure::PreconditionFailed);
                 }
-                Ok((predecessor.task.identity, predecessor))
-            })
-            .transpose()?;
+                // Terminal eviction order is coordinator-local rather than a
+                // durable task-record field. The authenticated predecessor
+                // record has already matched the live state or the one
+                // recovery-defined cancelled form above.
+                Some(live.clone())
+            },
+            None => None,
+        };
+        let replaced_queued = predecessor.as_ref().and_then(|predecessor| {
+            (predecessor.phase == MaintenanceTaskPhase::Queued)
+                .then(|| (predecessor.task.identity, predecessor.clone()))
+        });
+        let predecessor_terminal = predecessor.as_ref().and_then(|predecessor| {
+            matches!(
+                predecessor.phase,
+                MaintenanceTaskPhase::Cancelled
+                    | MaintenanceTaskPhase::Succeeded
+                    | MaintenanceTaskPhase::Failed
+            )
+            .then(|| (predecessor.task.identity, predecessor.clone()))
+        });
+        if predecessor.is_some() && replaced_queued.is_none() && predecessor_terminal.is_none() {
+            return Err(MaintenanceFailure::PreconditionFailed);
+        }
         let occupied = state
             .tasks
             .len()
             .checked_add(state.pending_submissions.len())
-            .and_then(|value| value.checked_sub(usize::from(replaced_queued.is_some())))
+            .and_then(|value| {
+                value.checked_sub(usize::from(
+                    replaced_queued.is_some() || predecessor_terminal.is_some(),
+                ))
+            })
             .ok_or(MaintenanceFailure::CapacityExceeded)?;
-        let reclaimed_terminal = if occupied >= MAX_MAINTENANCE_TASKS {
+        let reclaimed_terminal = if let Some(terminal) = predecessor_terminal {
+            Some(terminal)
+        } else if occupied >= MAX_MAINTENANCE_TASKS {
             let mut prospective = state.clone();
             let identity = reclaim_terminal_slot(&mut prospective)?
                 .ok_or(MaintenanceFailure::CapacityExceeded)?;

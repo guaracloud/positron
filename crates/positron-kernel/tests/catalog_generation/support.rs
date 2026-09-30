@@ -19,14 +19,37 @@ pub fn catalog_recovery_claim() -> ResourceAmounts {
 pub fn establish_catalog_authority(
     volume: OwnedPrimaryDataVolume,
 ) -> Result<StorageKernelResourceAuthority, Box<dyn Error>> {
+    establish_catalog_authority_with_large(
+        volume,
+        ResourceAmounts::new([
+            70_000_001, 2, 2, 70_000_001, 65_541, 2, 2, 2, 2, 9, 20_000_001,
+        ]),
+    )
+}
+
+pub fn establish_catalog_reclamation_authority(
+    volume: OwnedPrimaryDataVolume,
+) -> Result<StorageKernelResourceAuthority, Box<dyn Error>> {
+    // A running CatalogReclamation holds its physical-frame reservation while
+    // its durable Queued/Running/Succeeded records each use an independent
+    // ordinary Catalog commit reservation.  This fixture therefore needs the
+    // component-wise sum of those two live claims, plus the test's one-unit
+    // headroom, rather than only a maximum Catalog commit.
+    let large = ResourceAmounts::new([
+        70_197_294, 3, 3, 70_000_001, 65_542, 2, 3, 3, 3, 10, 20_000_001,
+    ]);
+    establish_catalog_authority_with_large(volume, large)
+}
+
+fn establish_catalog_authority_with_large(
+    volume: OwnedPrimaryDataVolume,
+    large: ResourceAmounts,
+) -> Result<StorageKernelResourceAuthority, Box<dyn Error>> {
     let cardinality = InventoryCardinalityLimits::new(1, 16)?;
     let observed = ObservedResourceEnvironment::observe(
         &volume,
         RegisteredResourceBounds::new([100, 100, 500_000_000, 500_000, 100, 100, 100])?,
     )?;
-    let large = ResourceAmounts::new([
-        70_000_001, 2, 2, 70_000_001, 65_541, 2, 2, 2, 2, 9, 20_000_001,
-    ]);
     let small = uniform(1);
     let dual = uniform(2);
     let durability = add(add(large, large)?, large)?;

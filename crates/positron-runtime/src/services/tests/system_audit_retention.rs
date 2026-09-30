@@ -10,8 +10,9 @@ use positron_governance::{
 };
 use positron_kernel::{
     CatalogObject, CatalogProposal, CatalogPublicationFault, FormatEpoch, MaintenanceCoordinator,
-    MaintenanceTask, MaintenanceTaskClass, MaintenanceTaskId, MaintenanceTaskPhase, TransactionId,
-    with_catalog_publication_fault_after, with_catalog_publication_fault_sequence_after,
+    MaintenanceFailure, MaintenanceTask, MaintenanceTaskClass, MaintenanceTaskId,
+    MaintenanceTaskPhase, TransactionId, with_catalog_publication_fault_after,
+    with_catalog_publication_fault_sequence_after,
 };
 
 use super::super::ServiceHandle;
@@ -781,21 +782,37 @@ fn audit_reclaimer_recovers_a_prephysical_cancellation_when_its_terminal_write_f
     );
     drop(execution);
     drop(coordinator);
+
+    let successor = initialized.update_system_audit_retention(
+        actor,
+        NonZeroU64::new(1).ok_or("nonzero retained audit-record limit")?,
+        ResourceGeneration::new(3)?,
+        AdministrativeIdempotencyKey::new([0xfd; 16])?,
+    )?;
+    assert_eq!(successor.policy_generation(), ResourceGeneration::new(4)?);
+    assert!(
+        ServiceHandle::new(Arc::clone(&initialized))?.wake_maintenance_worker()?,
+        "a recovered pre-physical cancellation permits the next authorized audit-reclamation receipt"
+    );
+    assert!(
+        initialized.governance_audit_for_test()?.len() < audit_before.len(),
+        "the successor's receipt-bound handler reclaims its authorized prefix"
+    );
     drop(initialized);
 
     let reopened = fixture.reopen()?;
     let reopened_catalog = open_catalog(&reopened)?;
     let recovered = MaintenanceCoordinator::restore_from_catalog(&reopened_catalog)
-        .expect("recover the durable cancellation outcome");
-    let recovered_status = recovered
-        .status(task)
-        .expect("durably cancelled audit-reclaimer status");
+        .expect("recover the successor outcome");
     assert_eq!(
-        recovered_status.phase(),
-        MaintenanceTaskPhase::Cancelled,
-        "restart derives the same terminal cancellation from the durable record"
+        recovered
+            .status(task)
+            .expect_err("the successor removes the recovered cancelled predecessor"),
+        MaintenanceFailure::UnknownTask,
+        "the successor atomically replaces only the recovered cancelled predecessor record"
     );
-    assert!(recovered_status.cancellation_requested());
+    drop(reopened_catalog);
+    assert!(reopened.governance_audit_for_test()?.len() < audit_before.len());
     Ok(())
 }
 
