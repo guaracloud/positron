@@ -68,7 +68,7 @@ fn resource_sizing(max_registered_tenants: u16) -> Result<ResourceSizing, Bootst
             .ok_or_else(|| BootstrapFailure::new(BootstrapFailureCode::ResourceUnavailable))?,
     );
     let durability = at_least(add(add(large, large)?, large)?, dual_scope_recovery);
-    let retention = at_least(small, tenant_recovery);
+    let retention = at_least(large, tenant_recovery);
     let compaction = at_least(uniform(3), dual_scope_recovery);
     let purge = at_least(small, tenant_recovery);
     let repair = at_least(large, dual_scope_recovery);
@@ -312,19 +312,47 @@ mod tests {
         assert_eq!(
             sizing.recovery_capacity,
             ResourceAmounts::new([
-                450_000_012,
-                32,
-                32,
-                450_000_012,
-                350_012,
-                32,
-                32,
-                32,
-                32,
-                92,
-                200_000_012,
+                540_000_010,
+                34,
+                34,
+                540_000_010,
+                420_010,
+                34,
+                34,
+                34,
+                34,
+                106,
+                240_000_010,
             ])
         );
+        Ok(())
+    }
+
+    #[test]
+    fn retention_pool_admits_the_bounded_publication_preparation_claim()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = std::env::temp_dir().join(format!(
+            "positron-retention-resource-sizing-test-{}-{}",
+            std::process::id(),
+            NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root)?;
+        let volume = PrimaryDataVolume::acquire(&root, MountQualification::LocalHost)?;
+        let pool_floor = ResourceAmounts::new([
+            90_000_000, 4, 4, 90_000_000, 70_000, 4, 4, 4, 4, 16, 40_000_000,
+        ]);
+        let sizing = resource_sizing(1)?;
+        let retention = sizing
+            .recovery
+            .get(positron_kernel::RecoveryWorkKind::Retention);
+        for dimension in ResourceDimension::ALL {
+            assert!(
+                retention.get(dimension) >= pool_floor.get(dimension),
+                "retention pool must cover its bounded preparation claim for {dimension:?}"
+            );
+        }
+        drop(volume);
+        fs::remove_dir_all(&root)?;
         Ok(())
     }
 
@@ -370,7 +398,7 @@ mod tests {
         let tenant = TenantId::from_bytes([0x91; 16])?;
         let observed = ObservedResourceEnvironment::observe(
             &volume,
-            RegisteredResourceBounds::new([100, 100, 500_000_000, 500_000, 100, 100, 100])?,
+            RegisteredResourceBounds::new([100, 100, 1_000_000_000, 1_000_000, 100, 100, 100])?,
         )?;
         let configuration = resource_configuration(tenant, resource_sizing(1)?, observed)?;
         let authority = StorageKernelResourceAuthority::establish(volume, configuration)?;

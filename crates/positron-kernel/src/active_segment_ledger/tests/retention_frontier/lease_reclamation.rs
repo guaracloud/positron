@@ -46,7 +46,8 @@ fn retention_publication_atomically_hides_protected_logs_and_queues_reclamation(
     let lease_identity = lease.identity();
     drop(lease);
     let coordinator = MaintenanceCoordinator::new();
-    let publication = active.prepare_retention_publication()?;
+    let preparation = active.prepare_retention_publication()?;
+    let publication = preparation.task().clone();
     let publication_id = publication.identity();
     assert!(
         !publication.inputs().is_empty(),
@@ -56,8 +57,8 @@ fn retention_publication_atomically_hides_protected_logs_and_queues_reclamation(
         !publication.outputs().is_empty(),
         "publication must bind the retired metadata for reclamation"
     );
-    coordinator
-        .submit_and_persist(&catalog, publication.clone(), 12)
+    preparation
+        .submit_and_persist(&coordinator, &catalog, 12)
         .expect("publication task is durable");
     let execution = coordinator
         .start_next_with_reservation_and_persist(&catalog, &authority, 12, false)
@@ -182,10 +183,11 @@ fn rejected_retention_publication_keeps_the_lease_and_running_task_authoritative
     let lease_identity = lease.identity();
     drop(lease);
     let coordinator = MaintenanceCoordinator::new();
-    let publication = active.prepare_retention_publication()?;
+    let preparation = active.prepare_retention_publication()?;
+    let publication = preparation.task().clone();
     let publication_id = publication.identity();
-    coordinator
-        .submit_and_persist(&catalog, publication, 12)
+    preparation
+        .submit_and_persist(&coordinator, &catalog, 12)
         .expect("publication task is durable");
     let execution = coordinator
         .start_next_with_reservation_and_persist(&catalog, &authority, 12, false)

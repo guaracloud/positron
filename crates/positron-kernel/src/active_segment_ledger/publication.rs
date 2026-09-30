@@ -4,7 +4,8 @@ use positron_domain::routing::CommitPosition;
 
 use crate::IngestTime;
 use crate::catalog::{
-    Catalog, CatalogFailureCode, CatalogObject, CatalogProposal, FormatEpoch, TransactionId,
+    Catalog, CatalogFailureCode, CatalogObject, CatalogProposal, FormatEpoch, MAX_CATALOG_OBJECTS,
+    MAX_CATALOG_TOTAL_BYTES, TransactionId,
 };
 use crate::data_protection::DataProtection;
 
@@ -158,16 +159,20 @@ fn publish_scope(
         additional,
         replaced_tasks,
     } = options;
+    let (object_capacity, total_bytes) = publication_preflight(
+        basis,
+        storage,
+        scope,
+        metadata,
+        frontier,
+        lifecycle_clock,
+        &additional,
+        &replaced_tasks,
+    )?;
+    if object_capacity > MAX_CATALOG_OBJECTS || total_bytes > MAX_CATALOG_TOTAL_BYTES {
+        return Err(LedgerFailure::new(LedgerFailureCode::LimitExceeded));
+    }
     let mut objects = Vec::new();
-    let frontier_objects = usize::from(frontier.is_some());
-    let clock_objects = usize::from(lifecycle_clock.is_some());
-    let object_capacity = basis
-        .plaintext_object_count()
-        .checked_add(metadata.len())
-        .and_then(|count| count.checked_add(frontier_objects))
-        .and_then(|count| count.checked_add(clock_objects))
-        .and_then(|count| count.checked_add(additional.len()))
-        .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
     objects
         .try_reserve_exact(object_capacity)
         .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
@@ -288,4 +293,84 @@ fn publish_scope(
             }
         },
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publication_preflight(
+    basis: &crate::CatalogSnapshot,
+    storage: &LedgerStorage,
+    scope: SegmentScope,
+    metadata: &[SegmentMetadata],
+    frontier: Option<IngestTime>,
+    lifecycle_clock: Option<&crate::retention_time::StagedCatalogAnchor<'_>>,
+    additional: &[CatalogObject],
+    replaced_tasks: &BTreeSet<crate::MaintenanceTaskId>,
+) -> Result<(usize, usize), LedgerFailure> {
+    let mut count = 0_usize;
+    let mut total_bytes = 0_usize;
+    let mut lifecycle_anchor_seen = false;
+    for candidate in basis.plaintext_objects() {
+        if storage.is_scope_metadata(candidate, scope) {
+            continue;
+        }
+        if crate::maintenance::durable_task_record_identity(candidate)
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?
+            .is_some_and(|identity| replaced_tasks.contains(&identity))
+        {
+            continue;
+        }
+        if frontier.is_some()
+            && super::retention_frontier::decode(candidate)?
+                .is_some_and(|(candidate_scope, _)| candidate_scope == scope)
+        {
+            continue;
+        }
+        let lifecycle_anchor = crate::retention_time::validate_catalog_anchor_singleton(
+            candidate,
+            &mut lifecycle_anchor_seen,
+        )
+        .map_err(|_| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?;
+        if lifecycle_clock.is_some() && lifecycle_anchor {
+            continue;
+        }
+        count = count
+            .checked_add(1)
+            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+        total_bytes = total_bytes
+            .checked_add(candidate.len())
+            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+    }
+    let metadata_bytes = metadata
+        .len()
+        .checked_mul(super::format::METADATA_BYTES)
+        .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+    count = count
+        .checked_add(metadata.len())
+        .and_then(|value| value.checked_add(usize::from(frontier.is_some())))
+        .and_then(|value| value.checked_add(usize::from(lifecycle_clock.is_some())))
+        .and_then(|value| value.checked_add(additional.len()))
+        .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+    total_bytes = total_bytes
+        .checked_add(metadata_bytes)
+        .and_then(|value| {
+            value.checked_add(if frontier.is_some() {
+                super::retention_frontier::RECORD_BYTES
+            } else {
+                0
+            })
+        })
+        .and_then(|value| {
+            value.checked_add(if lifecycle_clock.is_some() {
+                crate::retention_time::CATALOG_ANCHOR_RECORD_BYTES
+            } else {
+                0
+            })
+        })
+        .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+    for object in additional {
+        total_bytes = total_bytes
+            .checked_add(object.plaintext_len())
+            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+    }
+    Ok((count, total_bytes))
 }

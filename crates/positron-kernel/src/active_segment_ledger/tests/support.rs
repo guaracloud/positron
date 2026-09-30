@@ -6,11 +6,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use positron_domain::identity::TenantId;
 
 use crate::{
-    DiskPressureThresholds, GovernorPolicy, InventoryCardinalityLimits,
+    DiskObservation, DiskPressureThresholds, GovernorPolicy, InventoryCardinalityLimits,
     ObservedResourceEnvironment, OperatorLimits, OrdinaryPoolPolicy, OwnedPrimaryDataVolume,
-    RecoveryPoolCapacities, RecoveryReserve, RegisteredResourceBounds, ResourceAmounts,
-    ResourceDimension, ResourceGovernorConfiguration, ResourceInventory,
-    StorageKernelResourceAuthority, TenantQuota,
+    RecoveryPoolCapacities, RecoveryReserve, ResourceAmounts, ResourceDimension,
+    ResourceGovernorConfiguration, ResourceInventory, StorageKernelResourceAuthority, TenantQuota,
 };
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
@@ -75,21 +74,25 @@ pub(super) fn establish_authority(
     volume: OwnedPrimaryDataVolume,
 ) -> Result<StorageKernelResourceAuthority, Box<dyn Error>> {
     let cardinality = InventoryCardinalityLimits::new(1, 16)?;
-    let observed = ObservedResourceEnvironment::observe(
-        &volume,
-        RegisteredResourceBounds::new([100, 100, 500_000_000, 500_000, 100, 100, 100])?,
-    )?;
     let large = ResourceAmounts::new([
         90_000_000, 4, 4, 90_000_000, 70_000, 4, 4, 4, 4, 16, 40_000_000,
     ]);
     let small = uniform(2);
     let durability = add(add(large, large)?, large)?;
-    let recovery_capacity = add(add(add(durability, large)?, large)?, uniform(12))?;
+    let recovery_capacity = add(
+        add(add(add(durability, large)?, large)?, large)?,
+        uniform(12),
+    )?;
     let tenant_capacity = ResourceAmounts::new([
-        5_000_000, 32, 32, 5_000_000, 2_048, 32, 32, 32, 32, 32, 2_000_000,
+        32_000_000, 32, 32, 5_000_000, 2_048, 32, 32, 32, 32, 32, 2_000_000,
     ]);
     let governed = add(recovery_capacity, tenant_capacity)?;
     let raw = add(governed, cardinality.governor_bootstrap_overhead(1)?)?;
+    let observed = ObservedResourceEnvironment::for_test(
+        &volume,
+        raw,
+        DiskObservation::new(raw.get(ResourceDimension::DiskHeadroomBytes)),
+    )?;
     let disk = observed.initial_disk().usable_bytes();
     let inventory = ResourceInventory::new_observed(
         observed,
@@ -109,7 +112,7 @@ pub(super) fn establish_authority(
         OrdinaryPoolPolicy::new(uniform(8), uniform(6), uniform(4), uniform(2))?,
     )?;
     let recovery =
-        RecoveryPoolCapacities::new(durability, small, small, small, large, small, small)?;
+        RecoveryPoolCapacities::new(durability, large, small, small, large, small, small)?;
     let configuration = ResourceGovernorConfiguration::new(inventory, policy, recovery)?;
     Ok(StorageKernelResourceAuthority::establish(
         volume,

@@ -55,15 +55,16 @@ pub use storage::{
     with_catalog_publication_ambiguity_hook_after, with_catalog_publication_fault_after,
     with_catalog_publication_fault_sequence_after, with_catalog_publication_hook_after,
 };
+use types::AuditFrontier;
 #[cfg(feature = "test-support")]
 pub use types::GovernanceFixtureObject;
-use types::{AuditFrontier, MAX_CATALOG_OBJECTS};
 pub use types::{
     AuditIntent, CatalogCommit, CatalogFailure, CatalogFailureCode, CatalogGenerationId,
     CatalogObject, CatalogObjectId, CatalogProposal, CatalogRotation, CatalogSecret,
     CatalogSnapshot, CatalogWrappingKey, FormatEpoch, GovernanceAuditRecord, InstanceId,
     TransactionId,
 };
+pub(crate) use types::{MAX_CATALOG_OBJECTS, MAX_CATALOG_TOTAL_BYTES};
 
 #[cfg(any(test, fuzzing))]
 pub(crate) use storage::with_catalog_fault;

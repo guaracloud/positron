@@ -10,7 +10,7 @@ use super::{FORMAT_EPOCH, LedgerFailure, LedgerFailureCode, SegmentScope, map_fr
 
 const MAGIC: &[u8; 8] = b"PRETFR01";
 const VERSION: u16 = 1;
-const RECORD_BYTES: usize = 8 + 2 + 16 + 1 + 4 + 8;
+pub(super) const RECORD_BYTES: usize = 8 + 2 + 16 + 1 + 4 + 8;
 
 pub(super) fn recover(
     snapshot: &CatalogSnapshot,

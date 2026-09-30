@@ -16,9 +16,9 @@ pub use failure::{CatalogFailure, CatalogFailureCode};
 pub use snapshot::CatalogSnapshot;
 pub(super) use snapshot::{AuditFrontier, SnapshotData};
 
-pub(super) const MAX_CATALOG_OBJECTS: usize = 1_024;
+pub(crate) const MAX_CATALOG_OBJECTS: usize = 1_024;
 pub(super) const MAX_CATALOG_OBJECT_BYTES: usize = 1_048_576;
-pub(super) const MAX_CATALOG_TOTAL_BYTES: usize = 16_777_216;
+pub(crate) const MAX_CATALOG_TOTAL_BYTES: usize = 16_777_216;
 pub(super) const MAX_AUDIT_INTENT_BYTES: usize = 65_536;
 
 macro_rules! nonzero_id {
@@ -248,6 +248,11 @@ impl CatalogObject {
     #[must_use]
     pub const fn identity(&self) -> CatalogObjectId {
         self.identity
+    }
+
+    #[must_use]
+    pub(crate) const fn plaintext_len(&self) -> usize {
+        self.plaintext.len()
     }
 }
 

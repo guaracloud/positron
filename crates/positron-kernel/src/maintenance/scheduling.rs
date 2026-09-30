@@ -212,7 +212,15 @@ pub(super) fn assign_terminal_order(
 pub(super) fn reclaim_terminal_slot(
     state: &mut CoordinatorState,
 ) -> Result<Option<MaintenanceTaskId>, MaintenanceFailure> {
-    let candidate = state
+    let Some(identity) = reclaimable_terminal_identity(state) else {
+        return Ok(None);
+    };
+    remove_task_and_clear_empty_scope(state, identity)?;
+    Ok(Some(identity))
+}
+
+pub(super) fn reclaimable_terminal_identity(state: &CoordinatorState) -> Option<MaintenanceTaskId> {
+    state
         .tasks
         .iter()
         .filter(|(identity, task)| {
@@ -231,12 +239,7 @@ pub(super) fn reclaim_terminal_slot(
                 **identity,
             )
         })
-        .map(|(identity, _)| *identity);
-    let Some(identity) = candidate else {
-        return Ok(None);
-    };
-    remove_task_and_clear_empty_scope(state, identity)?;
-    Ok(Some(identity))
+        .map(|(identity, _)| *identity)
 }
 
 pub(super) fn remove_task_and_clear_empty_scope(

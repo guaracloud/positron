@@ -11,6 +11,9 @@ use crate::{
     TenantQuota, TransactionId,
 };
 
+#[path = "tests/retention_publication.rs"]
+mod retention_publication;
+
 static NEXT_CATALOG_ROOT: AtomicU64 = AtomicU64::new(0);
 
 struct CatalogRoot(PathBuf);

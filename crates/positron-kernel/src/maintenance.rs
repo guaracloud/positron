@@ -17,7 +17,9 @@ use crate::{
 mod persistence;
 mod record;
 
-pub(crate) use persistence::{SnapshotLeaseExpiryTaskReplacement, queued_task_record_bytes};
+pub(crate) use persistence::{
+    SnapshotLeaseExpiryTaskReplacement, retention_publication_record_bytes_bound,
+};
 use record::{decode_record, encode_record};
 
 pub(crate) fn durable_task_record_identity(

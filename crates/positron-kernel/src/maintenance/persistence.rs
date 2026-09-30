@@ -8,25 +8,12 @@
 
 use std::collections::BTreeSet;
 
+use super::scheduling::{reclaimable_terminal_identity, remove_task_and_clear_empty_scope};
 use super::*;
 use crate::{Catalog, CatalogObject, CatalogProposal, TransactionId};
 
-pub(crate) fn queued_task_record_bytes(
-    task: &MaintenanceTask,
-) -> Result<usize, MaintenanceFailure> {
-    Ok(encode_record(&TaskState {
-        task: task.clone(),
-        phase: MaintenanceTaskPhase::Queued,
-        submitted_at: 0,
-        checkpoint: None,
-        pause_until: None,
-        cancellation_requested: false,
-        dispatches: 0,
-        terminal_order: None,
-        active_dispatch: None,
-    })?
-    .as_bytes()
-    .len())
+pub(crate) fn retention_publication_record_bytes_bound() -> Result<usize, MaintenanceFailure> {
+    record::encoded_record_capacity(MAX_TASK_OBJECTS, MAX_TASK_OBJECTS, MAX_CHECKPOINT_BYTES)
 }
 
 /// A not-yet-visible task record prepared by the coordinator for inclusion in
@@ -285,23 +272,33 @@ impl MaintenanceCoordinator {
             || state
                 .pending_submissions
                 .contains(&binding.reclamation.identity)
+            || binding.reclamation.class != MaintenanceTaskClass::RetentionReclamation
+            || binding.reclamation.scope != before.task.scope
+            || binding.reclamation.trigger != MaintenanceTrigger::AgeDerived
+            || binding.reclamation.preconditions != before.task.preconditions
+            || binding.reclamation.inputs != before.task.outputs
+            || !binding.reclamation.outputs.is_empty()
+            || binding.reclamation.reservations != before.task.reservations
         {
             return Err(MaintenanceFailure::PreconditionFailed);
         }
-        let mut next = state.clone();
-        let publication_after = next
+        let occupied = state
             .tasks
-            .get_mut(&dispatch.identity)
-            .ok_or(MaintenanceFailure::UnknownTask)?;
+            .len()
+            .checked_add(state.pending_submissions.len())
+            .ok_or(MaintenanceFailure::CapacityExceeded)?;
+        if occupied >= MAX_MAINTENANCE_TASKS {
+            return Err(MaintenanceFailure::CapacityExceeded);
+        }
+        let terminal_order = state.next_terminal_order;
+        let next_terminal_order = terminal_order
+            .checked_add(1)
+            .ok_or(MaintenanceFailure::CapacityExceeded)?;
+        let mut publication_after = before.clone();
         publication_after.phase = MaintenanceTaskPhase::Succeeded;
         publication_after.cancellation_requested = false;
         publication_after.active_dispatch = None;
-        assign_terminal_order(&mut next, dispatch.identity)?;
-        let publication_after = next
-            .tasks
-            .get(&dispatch.identity)
-            .cloned()
-            .ok_or(MaintenanceFailure::UnknownTask)?;
+        publication_after.terminal_order = Some(terminal_order);
         let reclamation = TaskState {
             task: binding.reclamation,
             phase: MaintenanceTaskPhase::Queued,
@@ -321,7 +318,7 @@ impl MaintenanceCoordinator {
             publication_before: before,
             publication_after,
             reclamation,
-            next_terminal_order: next.next_terminal_order,
+            next_terminal_order,
             publication_record,
             reclamation_record,
         })
@@ -774,14 +771,16 @@ impl MaintenanceCoordinator {
             return Ok(existing.task.clone());
         }
 
-        let mut next = state.clone();
-        let occupied = next
+        let occupied = state
             .tasks
             .len()
-            .checked_add(next.pending_submissions.len())
+            .checked_add(state.pending_submissions.len())
             .ok_or(MaintenanceFailure::CapacityExceeded)?;
         let removed = if occupied >= MAX_MAINTENANCE_TASKS {
-            Some(reclaim_terminal_slot(&mut next)?.ok_or(MaintenanceFailure::CapacityExceeded)?)
+            Some(
+                reclaimable_terminal_identity(&state)
+                    .ok_or(MaintenanceFailure::CapacityExceeded)?,
+            )
         } else {
             None
         };
@@ -797,8 +796,10 @@ impl MaintenanceCoordinator {
             active_dispatch: None,
         };
         persist_task_state(catalog, &task_state, removed)?;
-        next.tasks.insert(task.identity, task_state);
-        *state = next;
+        if let Some(identity) = removed {
+            remove_task_and_clear_empty_scope(&mut state, identity)?;
+        }
+        state.tasks.insert(task.identity, task_state);
         Ok(task)
     }
 

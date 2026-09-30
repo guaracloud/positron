@@ -194,6 +194,22 @@ impl<'authority> ResourceReservation<'authority> {
             )
     }
 
+    /// Confirms that this live grant owns the tenant-scoped Retention
+    /// preparation capability before the ledger decodes publication metadata.
+    pub(crate) fn authorizes_retention_publication(
+        &self,
+        tenant: positron_domain::identity::TenantId,
+    ) -> bool {
+        self.active
+            && matches!(
+                self.identity,
+                ReservationIdentity::Recovery {
+                    scope: super::RecoveryScope::Tenant(reserved_tenant),
+                    kind: super::RecoveryWorkKind::Retention,
+                } if reserved_tenant == tenant
+            )
+    }
+
     fn release(&mut self) {
         if self.active {
             self.governor.mark_drop_pending(self.slot);

@@ -11,19 +11,8 @@ pub(super) fn encode_record(
         .checkpoint
         .as_ref()
         .map_or(0, |checkpoint| checkpoint.opaque_progress.len());
-    let objects = task
-        .inputs
-        .len()
-        .checked_add(task.outputs.len())
-        .ok_or(MaintenanceFailure::CapacityExceeded)?;
-    let capacity = RECORD_MAGIC
-        .len()
-        .checked_add(16 + 3 + 16 + 6 + 16 + 1 + 1 + 1 + 8 + 8 + 1 + 8)
-        .and_then(|size| size.checked_add(objects.checked_mul(32)?))
-        .and_then(|size| {
-            size.checked_add(11 * 8 + 1 + 8 + 1 + 1 + 8 + 1 + 8 + 4 + 4 + checkpoint_bytes)
-        })
-        .ok_or(MaintenanceFailure::CapacityExceeded)?;
+    let capacity =
+        encoded_record_capacity(task.inputs.len(), task.outputs.len(), checkpoint_bytes)?;
     let mut bytes = Vec::new();
     bytes
         .try_reserve_exact(capacity)
@@ -67,6 +56,24 @@ pub(super) fn encode_record(
         bytes.extend_from_slice(&checkpoint.opaque_progress);
     }
     Ok(MaintenanceTaskRecord(bytes))
+}
+
+pub(super) fn encoded_record_capacity(
+    inputs: usize,
+    outputs: usize,
+    checkpoint_bytes: usize,
+) -> Result<usize, MaintenanceFailure> {
+    let objects = inputs
+        .checked_add(outputs)
+        .ok_or(MaintenanceFailure::CapacityExceeded)?;
+    RECORD_MAGIC
+        .len()
+        .checked_add(16 + 3 + 16 + 6 + 16 + 1 + 1 + 1 + 8 + 8 + 1 + 8)
+        .and_then(|size| size.checked_add(objects.checked_mul(32)?))
+        .and_then(|size| {
+            size.checked_add(11 * 8 + 1 + 8 + 1 + 1 + 8 + 1 + 8 + 4 + 4 + checkpoint_bytes)
+        })
+        .ok_or(MaintenanceFailure::CapacityExceeded)
 }
 
 pub(super) fn decode_record(bytes: &[u8]) -> Result<TaskState, MaintenanceFailure> {

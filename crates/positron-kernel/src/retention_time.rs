@@ -16,7 +16,7 @@ use crate::{
 const CLOCK_ANCHOR_MAGIC: &[u8; 8] = b"PLIFCLK1";
 const CLOCK_ANCHOR_VERSION: u8 = 2;
 const CLOCK_ANCHOR_V1_BYTES: usize = 8 + 1 + 1 + 8 + 1 + 8 + 1 + 8;
-const CLOCK_ANCHOR_BYTES: usize = CLOCK_ANCHOR_V1_BYTES + 8;
+pub(crate) const CATALOG_ANCHOR_RECORD_BYTES: usize = CLOCK_ANCHOR_V1_BYTES + 8;
 
 /// Process-monotonic time authority for the conservative Release 1 retention frontier.
 ///
@@ -894,7 +894,7 @@ fn advance_global(
 fn encode_catalog_anchor(safety: LifecycleClockSafety) -> Result<Vec<u8>, LifecycleClockFailure> {
     let mut bytes = Vec::new();
     bytes
-        .try_reserve_exact(CLOCK_ANCHOR_BYTES)
+        .try_reserve_exact(CATALOG_ANCHOR_RECORD_BYTES)
         .map_err(|_| LifecycleClockFailure::OutOfRange)?;
     bytes.extend_from_slice(CLOCK_ANCHOR_MAGIC);
     bytes.push(CLOCK_ANCHOR_VERSION);
@@ -939,7 +939,7 @@ fn decode_catalog_anchor(
         .ok_or(LifecycleClockFailure::OutOfRange)?;
     if !matches!(
         (version, bytes.len()),
-        (1, CLOCK_ANCHOR_V1_BYTES) | (CLOCK_ANCHOR_VERSION, CLOCK_ANCHOR_BYTES)
+        (1, CLOCK_ANCHOR_V1_BYTES) | (CLOCK_ANCHOR_VERSION, CATALOG_ANCHOR_RECORD_BYTES)
     ) {
         return Err(LifecycleClockFailure::OutOfRange);
     }

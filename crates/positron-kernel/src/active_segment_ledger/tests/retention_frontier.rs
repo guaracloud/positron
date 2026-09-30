@@ -32,6 +32,7 @@ mod frontier_publication;
 mod frontier_recovery;
 mod lease_reclamation;
 mod policy_authority;
+mod publication;
 
 fn preparation_capacity<'kernel>(
     authority: &'kernel crate::StorageKernelResourceAuthority,
