@@ -990,7 +990,11 @@ impl MaintenanceCoordinator {
                 reservation,
                 dispatch,
             };
-            persist_task_state_admitted(catalog, updated, None, &pending_execution)?;
+            if task.class == MaintenanceTaskClass::GovernanceAuditCheckpoint {
+                persist_task_state_admitted(catalog, updated, None, &pending_execution)?;
+            } else {
+                persist_task_state(catalog, updated, None)?;
+            }
             let updated = updated.clone();
             let checkpoint = updated.checkpoint.clone();
             state.tasks.insert(identity, updated);

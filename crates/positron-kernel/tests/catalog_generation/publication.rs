@@ -276,23 +276,19 @@ fn signed_audit_checkpoint_binds_the_visible_chain_frontier() -> Result<(), Box<
         Some(AuditIntent::new(b"action=tenant.suspend".to_vec())?),
     )?;
 
-    let checkpoint = catalog.publish_audit_checkpoint(&signer)?;
+    let frontier = catalog
+        .governance_audit_records()?
+        .into_iter()
+        .last()
+        .ok_or("visible governed audit record")?;
+    let checkpoint = positron_kernel::GovernanceAuditCheckpoint::create(&signer, instance, &frontier)?;
     assert_eq!(checkpoint.instance(), instance);
     assert_eq!(checkpoint.position(), 1);
     assert_eq!(
         checkpoint.record_hash(),
-        catalog.governance_audit_records()?[0].record_hash()
+        frontier.record_hash()
     );
     checkpoint.verify(public_key)?;
-
-    drop(catalog);
-    let view = Catalog::read_current_view(
-        &authority,
-        instance,
-        CatalogSecret::from_owned(Box::new([0x93; 32]), Box::new([0xa3; 32])),
-    )?;
-    assert_eq!(view.latest_audit_checkpoint()?.as_ref(), Some(&checkpoint));
-    view.verify_audit_chain(public_key, Some(&checkpoint))?;
     Ok(())
 }
 

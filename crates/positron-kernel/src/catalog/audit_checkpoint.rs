@@ -83,7 +83,7 @@ pub struct GovernanceAuditCheckpoint {
 }
 
 impl GovernanceAuditCheckpoint {
-    pub(super) fn create(
+    pub fn create(
         signer: &AuditCheckpointSigner,
         instance: InstanceId,
         record: &GovernanceAuditRecord,
