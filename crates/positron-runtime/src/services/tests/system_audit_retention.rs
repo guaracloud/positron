@@ -601,6 +601,205 @@ fn runtime_worker_physically_reclaims_a_receipt_bound_system_audit_prefix()
 }
 
 #[test]
+fn audit_reclaimer_cancellation_before_physical_work_preserves_the_prefix_and_terminalizes()
+-> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let (initialized, _, _, administrator_secret) = fixture.initialized_with_admin()?;
+    let actor = initialized.attribute(
+        PresentedCredential::parse(&administrator_secret)?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    initialized.update_system_audit_retention(
+        actor,
+        NonZeroU64::new(2).ok_or("nonzero retained audit-record limit")?,
+        ResourceGeneration::new(1)?,
+        AdministrativeIdempotencyKey::new([0xf8; 16])?,
+    )?;
+    initialized.update_system_audit_retention(
+        actor,
+        NonZeroU64::new(1).ok_or("nonzero retained audit-record limit")?,
+        ResourceGeneration::new(2)?,
+        AdministrativeIdempotencyKey::new([0xf9; 16])?,
+    )?;
+    let audit_before = initialized.governance_audit_for_test()?;
+    let catalog = open_catalog(&initialized)?;
+    let coordinator = initialized
+        .maintenance_coordinator()
+        .lock()
+        .map_err(|_| "maintenance lock")?;
+    let execution = coordinator
+        .start_next_with_reservation_and_persist_for_class(
+            &catalog,
+            &initialized._authority,
+            1,
+            false,
+            Some(MaintenanceTaskClass::CatalogReclamation),
+        )
+        .expect("start receipt-bound audit reclaimer")
+        .ok_or("queued receipt-bound audit reclaimer")?;
+    let task = execution.task().identity();
+    coordinator
+        .cancel_and_persist(&catalog, task)
+        .expect("durably request cancellation before physical work");
+
+    catalog.complete_running_audit_retention_reclamation(&coordinator, &execution)?;
+    assert_eq!(
+        coordinator
+            .status(task)
+            .expect("cancelled audit-reclaimer status")
+            .phase(),
+        MaintenanceTaskPhase::Cancelled,
+        "the exact dispatched descriptor terminalizes instead of remaining Running"
+    );
+    drop(catalog);
+    assert_eq!(
+        initialized.governance_audit_for_test()?,
+        audit_before,
+        "cancellation before the first unlink preserves every audit frame"
+    );
+    drop(execution);
+    drop(coordinator);
+
+    let subsequent_task = MaintenanceTask::new(
+        MaintenanceTaskId::new([0xfa; 16]).expect("stable later-work identity"),
+        MaintenanceTaskClass::SchemaPromotion,
+    );
+    let subsequent_catalog = open_catalog(&initialized)?;
+    let subsequent_coordinator = initialized
+        .maintenance_coordinator()
+        .lock()
+        .map_err(|_| "maintenance lock")?;
+    subsequent_coordinator
+        .submit_and_persist(&subsequent_catalog, subsequent_task.clone(), 2)
+        .expect("submit later coordinator work");
+    let subsequent_execution = subsequent_coordinator
+        .start_next_with_reservation_and_persist_for_class(
+            &subsequent_catalog,
+            &initialized._authority,
+            2,
+            false,
+            Some(MaintenanceTaskClass::SchemaPromotion),
+        )
+        .expect("start later coordinator work")
+        .ok_or("later queued coordinator work")?;
+    assert_eq!(
+        subsequent_execution.task().identity(),
+        subsequent_task.identity(),
+        "dropping the cancelled execution releases its reservation for later exact work"
+    );
+    drop(subsequent_execution);
+    drop(subsequent_coordinator);
+    drop(subsequent_catalog);
+    drop(initialized);
+
+    let reopened = fixture.reopen()?;
+    let reopened_catalog = open_catalog(&reopened)?;
+    let recovered = MaintenanceCoordinator::restore_from_catalog(&reopened_catalog)
+        .expect("recover the durable cancellation outcome");
+    assert_eq!(
+        recovered
+            .status(task)
+            .expect("durably cancelled audit-reclaimer status")
+            .phase(),
+        MaintenanceTaskPhase::Cancelled,
+        "recovery preserves the exact pre-physical cancellation terminal outcome"
+    );
+    drop(reopened_catalog);
+    assert_eq!(reopened.governance_audit_for_test()?, audit_before);
+    Ok(())
+}
+
+#[test]
+fn audit_reclaimer_recovers_a_prephysical_cancellation_when_its_terminal_write_faults()
+-> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let (initialized, _, _, administrator_secret) = fixture.initialized_with_admin()?;
+    let actor = initialized.attribute(
+        PresentedCredential::parse(&administrator_secret)?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    initialized.update_system_audit_retention(
+        actor,
+        NonZeroU64::new(2).ok_or("nonzero retained audit-record limit")?,
+        ResourceGeneration::new(1)?,
+        AdministrativeIdempotencyKey::new([0xfb; 16])?,
+    )?;
+    initialized.update_system_audit_retention(
+        actor,
+        NonZeroU64::new(1).ok_or("nonzero retained audit-record limit")?,
+        ResourceGeneration::new(2)?,
+        AdministrativeIdempotencyKey::new([0xfc; 16])?,
+    )?;
+    let audit_before = initialized.governance_audit_for_test()?;
+    let catalog = open_catalog(&initialized)?;
+    let coordinator = initialized
+        .maintenance_coordinator()
+        .lock()
+        .map_err(|_| "maintenance lock")?;
+    let execution = coordinator
+        .start_next_with_reservation_and_persist_for_class(
+            &catalog,
+            &initialized._authority,
+            1,
+            false,
+            Some(MaintenanceTaskClass::CatalogReclamation),
+        )
+        .expect("start receipt-bound audit reclaimer")
+        .ok_or("queued receipt-bound audit reclaimer")?;
+    let task = execution.task().identity();
+    coordinator
+        .cancel_and_persist(&catalog, task)
+        .expect("durably request cancellation before physical work");
+
+    let terminal_write =
+        with_catalog_publication_fault_after(CatalogPublicationFault::SynchronizeCommit, 0, || {
+            catalog.complete_running_audit_retention_reclamation(&coordinator, &execution)
+        });
+    assert!(
+        terminal_write.is_err(),
+        "the terminal cancellation write is unavailable or its acknowledgement is lost"
+    );
+    let recovered_live = coordinator
+        .status(task)
+        .expect("recovered cancellation status");
+    assert_eq!(
+        recovered_live.phase(),
+        MaintenanceTaskPhase::Cancelled,
+        "the same process adopts the exact durable cancellation outcome instead of stranding Running"
+    );
+    assert!(
+        recovered_live.cancellation_requested(),
+        "reconciliation preserves the durable cancellation flag rather than making a pre-physical retry eligible"
+    );
+    drop(catalog);
+    assert_eq!(
+        initialized.governance_audit_for_test()?,
+        audit_before,
+        "terminal-write recovery before physical work never reclaims an audit frame"
+    );
+    drop(execution);
+    drop(coordinator);
+    drop(initialized);
+
+    let reopened = fixture.reopen()?;
+    let reopened_catalog = open_catalog(&reopened)?;
+    let recovered = MaintenanceCoordinator::restore_from_catalog(&reopened_catalog)
+        .expect("recover the durable cancellation outcome");
+    let recovered_status = recovered
+        .status(task)
+        .expect("durably cancelled audit-reclaimer status");
+    assert_eq!(
+        recovered_status.phase(),
+        MaintenanceTaskPhase::Cancelled,
+        "restart derives the same terminal cancellation from the durable record"
+    );
+    assert!(recovered_status.cancellation_requested());
+    Ok(())
+}
+
+#[test]
 fn audit_reclaimer_requeues_after_a_post_unlink_fault_and_finishes_on_same_process_retry()
 -> Result<(), Box<dyn Error>> {
     let fixture = Fixture::new()?;

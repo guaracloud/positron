@@ -1473,6 +1473,7 @@ impl<'authority> Catalog<'authority> {
         execution: &MaintenanceExecution<'_>,
     ) -> Result<(), CatalogFailure> {
         let mut physically_started = false;
+        let mut cancelled_before_physical_work = false;
         let reclaimed = (|| {
             let _operation = self
                 .operation
@@ -1512,6 +1513,13 @@ impl<'authority> Catalog<'authority> {
             execution
                 .verify_running_catalog_reclamation(coordinator, durable_record)
                 .map_err(|_| CatalogFailure::new(CatalogFailureCode::InvalidInput))?;
+            if execution
+                .catalog_reclamation_cancellation_requested(coordinator)
+                .map_err(|_| CatalogFailure::new(CatalogFailureCode::StorageUnavailable))?
+            {
+                cancelled_before_physical_work = true;
+                return Ok(());
+            }
 
             for record in state
                 .audit
@@ -1549,6 +1557,21 @@ impl<'authority> Catalog<'authority> {
                     .map_err(|_| CatalogFailure::new(CatalogFailureCode::StorageUnavailable))?;
             }
             return Err(failure);
+        }
+        if cancelled_before_physical_work {
+            if execution
+                .complete_catalog_reclamation_and_persist(coordinator, self)
+                .is_err()
+            {
+                execution
+                    .reconcile_cancelled_catalog_reclamation_after_terminal_failure(
+                        coordinator,
+                        self,
+                    )
+                    .map_err(|_| CatalogFailure::new(CatalogFailureCode::StorageUnavailable))?;
+                return Err(CatalogFailure::new(CatalogFailureCode::StorageUnavailable));
+            }
+            return Ok(());
         }
         if execution
             .catalog_reclamation_cancellation_requested(coordinator)

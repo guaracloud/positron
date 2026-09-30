@@ -1699,6 +1699,51 @@ impl MaintenanceCoordinator {
         Ok(())
     }
 
+    /// Reconciles a pre-physical cancellation after its terminal record write
+    /// is unavailable or acknowledgement-ambiguous. Recovery maps the exact
+    /// durable Running-with-cancellation record to Cancelled, so replacing
+    /// only this live descriptor neither restarts physical work nor disturbs
+    /// another coordinator task.
+    fn restore_cancelled_catalog_reclamation_after_terminal_failure(
+        &self,
+        catalog: &Catalog<'_>,
+        dispatch: MaintenanceDispatch,
+    ) -> Result<(), MaintenanceFailure> {
+        let restored = Self::restore_from_catalog(catalog)?;
+        let recovered = restored
+            .state
+            .into_inner()
+            .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
+        let candidate = recovered
+            .tasks
+            .get(&dispatch.identity)
+            .cloned()
+            .ok_or(MaintenanceFailure::UnknownTask)?;
+        if candidate.task.class != MaintenanceTaskClass::CatalogReclamation
+            || candidate.phase != MaintenanceTaskPhase::Cancelled
+        {
+            return Err(MaintenanceFailure::InvalidTransition);
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
+        let current = state
+            .tasks
+            .get(&dispatch.identity)
+            .ok_or(MaintenanceFailure::UnknownTask)?;
+        if current.task.class != MaintenanceTaskClass::CatalogReclamation
+            || current.phase != MaintenanceTaskPhase::Running
+            || !current.cancellation_requested
+            || current.active_dispatch != Some(dispatch)
+        {
+            return Err(MaintenanceFailure::InvalidTransition);
+        }
+        state.tasks.insert(dispatch.identity, candidate);
+        state.next_terminal_order = state.next_terminal_order.max(recovered.next_terminal_order);
+        Ok(())
+    }
+
     fn verify_running_catalog_reclamation_dispatch(
         &self,
         dispatch: MaintenanceDispatch,
@@ -1715,7 +1760,6 @@ impl MaintenanceCoordinator {
         if task.task.class != MaintenanceTaskClass::CatalogReclamation
             || task.phase != MaintenanceTaskPhase::Running
             || task.active_dispatch != Some(dispatch)
-            || task.cancellation_requested
             || encode_record(task)?.as_bytes() != durable_record
         {
             return Err(MaintenanceFailure::PreconditionFailed);
@@ -1922,6 +1966,18 @@ impl MaintenanceExecution<'_> {
             return Err(MaintenanceFailure::InvalidInput);
         }
         coordinator.requeue_catalog_reclamation_and_persist_dispatch(catalog, self.dispatch)
+    }
+
+    pub(crate) fn reconcile_cancelled_catalog_reclamation_after_terminal_failure(
+        &self,
+        coordinator: &MaintenanceCoordinator,
+        catalog: &Catalog<'_>,
+    ) -> Result<(), MaintenanceFailure> {
+        if self.task.class != MaintenanceTaskClass::CatalogReclamation {
+            return Err(MaintenanceFailure::InvalidInput);
+        }
+        coordinator
+            .restore_cancelled_catalog_reclamation_after_terminal_failure(catalog, self.dispatch)
     }
 
     pub(crate) fn catalog_reclamation_cancellation_requested(
