@@ -160,6 +160,40 @@ fn validate_retention_publication_state(state: &TaskState) -> Result<(), Mainten
     Ok(())
 }
 
+fn validate_retention_reclamation_state(state: &TaskState) -> Result<(), MaintenanceFailure> {
+    let task = &state.task;
+    if task.class != MaintenanceTaskClass::RetentionReclamation {
+        return Ok(());
+    }
+    let MaintenanceScope::Segment { .. } = task.scope else {
+        return Err(MaintenanceFailure::InvalidInput);
+    };
+    let Some(first) = task.inputs.first() else {
+        return Err(MaintenanceFailure::InvalidInput);
+    };
+    if task.trigger != MaintenanceTrigger::AgeDerived
+        || task.inputs.len() > 16
+        || !task.outputs.is_empty()
+        || task.not_before != 0
+        || task.emergency_compaction
+        || state.checkpoint.is_some()
+        || state.pause_until.is_some()
+        || task.inputs.windows(2).any(|pair| pair[0] >= pair[1])
+    {
+        return Err(MaintenanceFailure::InvalidInput);
+    }
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&first.to_bytes()[..16]);
+    bytes[0] ^= 0xa5;
+    if bytes.iter().all(|byte| *byte == 0) {
+        bytes[0] = 1;
+    }
+    if task.identity != MaintenanceTaskId::new(bytes)? {
+        return Err(MaintenanceFailure::InvalidInput);
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct MaintenanceDispatch {
     coordinator_id: u64,
@@ -815,6 +849,7 @@ impl MaintenanceCoordinator {
         for record in records {
             let mut state = decode_record(record.as_bytes())?;
             validate_retention_publication_state(&state)?;
+            validate_retention_reclamation_state(&state)?;
             if state.phase == MaintenanceTaskPhase::Running {
                 state.phase = if state.cancellation_requested {
                     MaintenanceTaskPhase::Cancelled

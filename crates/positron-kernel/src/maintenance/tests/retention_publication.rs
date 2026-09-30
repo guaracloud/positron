@@ -131,8 +131,11 @@ fn retention_publication_checkpoint_bytes(frontier: i64) -> Vec<u8> {
 
 fn retention_reclamation_task(identity: u8) -> MaintenanceTask {
     let publication = retention_publication_task(identity);
+    let mut successor = [0_u8; 16];
+    successor.copy_from_slice(&publication.outputs()[0].to_bytes()[..16]);
+    successor[0] ^= 0xa5;
     MaintenanceTask::with_contract(
-        publication.identity(),
+        MaintenanceTaskId::new(successor).expect("reclamation identity"),
         MaintenanceTaskClass::RetentionReclamation,
         publication.scope(),
         MaintenanceTrigger::AgeDerived,
@@ -142,6 +145,65 @@ fn retention_reclamation_task(identity: u8) -> MaintenanceTask {
         publication.reservations(),
     )
     .expect("reclamation task")
+}
+
+#[test]
+fn restore_rejects_a_reclamation_without_the_canonical_successor_identity() {
+    let mut task = retention_reclamation_task(0x80);
+    task.identity = MaintenanceTaskId::new([0x80; 16]).expect("wrong identity");
+    let record = encode_record(&TaskState {
+        task,
+        phase: MaintenanceTaskPhase::Queued,
+        submitted_at: 1,
+        checkpoint: None,
+        pause_until: None,
+        cancellation_requested: false,
+        dispatches: 0,
+        terminal_order: None,
+        active_dispatch: None,
+    })
+    .expect("authenticated malformed fixture");
+    match MaintenanceCoordinator::restore([record]) {
+        Err(error) => assert_eq!(error, MaintenanceFailure::InvalidInput),
+        Ok(_) => panic!("wrong successor identity must fail restore"),
+    }
+}
+
+#[test]
+fn generic_submission_cannot_persist_a_retention_reclamation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = CatalogRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
+    let authority = crate::catalog::tests::support::establish_catalog_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new(nonzero_id(0x7d))?,
+        CatalogSecret::from_owned(Box::new([0x7e; 32]), Box::new([0x7f; 32])),
+    )?;
+    catalog.commit(
+        catalog.pin()?.identity(),
+        CatalogProposal::new(
+            TransactionId::new(nonzero_id(0x81))?,
+            FormatEpoch::CATALOG_V1,
+            vec![CatalogObject::new(b"reclamation ingress basis".to_vec())?],
+        )?,
+        None,
+    )?;
+    let coordinator = MaintenanceCoordinator::new();
+    let task = retention_reclamation_task(0x80);
+    assert_eq!(
+        coordinator
+            .submit_and_persist(&catalog, task.clone(), 1)
+            .expect_err("only a Publication completion may durably create Reclamation"),
+        MaintenanceFailure::InvalidInput
+    );
+    assert_eq!(
+        coordinator
+            .status(task.identity())
+            .expect_err("no generic state"),
+        MaintenanceFailure::UnknownTask
+    );
+    Ok(())
 }
 
 #[test]

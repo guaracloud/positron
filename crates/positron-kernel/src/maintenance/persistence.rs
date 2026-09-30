@@ -988,7 +988,10 @@ impl MaintenanceCoordinator {
         task: MaintenanceTask,
         now: u64,
     ) -> Result<MaintenanceTask, MaintenanceFailure> {
-        if task.class == MaintenanceTaskClass::RetentionPublication {
+        if matches!(
+            task.class,
+            MaintenanceTaskClass::RetentionPublication | MaintenanceTaskClass::RetentionReclamation
+        ) {
             return Err(MaintenanceFailure::InvalidInput);
         }
         self.submit_task_and_persist(catalog, task, None, now)
@@ -1265,7 +1268,11 @@ impl MaintenanceCoordinator {
             .get(&dispatch.identity)
             .ok_or(MaintenanceFailure::UnknownTask)?;
         if task.phase != MaintenanceTaskPhase::Running
-            || task.task.class == MaintenanceTaskClass::RetentionPublication
+            || matches!(
+                task.task.class,
+                MaintenanceTaskClass::RetentionPublication
+                    | MaintenanceTaskClass::RetentionReclamation
+            )
             || task.active_dispatch != Some(dispatch)
             || checkpoint.completed_inputs as usize > task.task.inputs.len()
             || task
