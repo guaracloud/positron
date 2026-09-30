@@ -114,6 +114,10 @@ fn assert_registration_then_api_spawn(tasks: &ObservingTasks) {
         TaskRole::Maintenance,
     ];
     assert_eq!(
+        &events[..expected.len()],
+        expected.map(TaskEvent::Registered)
+    );
+    assert_eq!(
         events
             .iter()
             .filter_map(|event| match event {

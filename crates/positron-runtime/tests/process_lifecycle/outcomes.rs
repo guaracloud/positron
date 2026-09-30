@@ -444,6 +444,10 @@ fn first_signal_closes_admission_joins_registered_tasks_and_releases_ownership_l
         TaskRole::Maintenance,
     ];
     assert_eq!(
+        &events[..expected.len()],
+        expected.map(TaskEvent::Registered)
+    );
+    assert_eq!(
         events
             .iter()
             .filter_map(|event| match event {
