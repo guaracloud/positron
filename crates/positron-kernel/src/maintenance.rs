@@ -28,6 +28,16 @@ pub(crate) fn durable_task_record_identity(
     record::record_identity(bytes)
 }
 
+#[cfg(test)]
+pub(crate) fn rewrite_durable_task_record_dispatches_for_test(
+    bytes: &[u8],
+    dispatches: u64,
+) -> Result<Vec<u8>, MaintenanceFailure> {
+    let mut state = record::decode_record(bytes)?;
+    state.dispatches = dispatches;
+    Ok(record::encode_record(&state)?.as_bytes().to_vec())
+}
+
 const MAX_MAINTENANCE_TASKS: usize = 128;
 const MAX_TASK_OBJECTS: usize = 16;
 pub(crate) const MAX_CHECKPOINT_BYTES: usize = 4_096;

@@ -169,7 +169,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
                     durable_record,
                     reclamation_record,
                 )
-                .map_err(map_maintenance_failure)?;
+                .map_err(|_| LedgerFailure::new(LedgerFailureCode::RecoveryRequired))?;
             let metadata = self.storage.catalog_segments(&basis, self.scope)?;
             let outputs = expected.outputs().iter().copied().collect::<BTreeSet<_>>();
             let retired = metadata

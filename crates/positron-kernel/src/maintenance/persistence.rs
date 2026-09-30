@@ -1321,7 +1321,11 @@ fn durable_retention_publication_pair_exists(
             Ok(false)
         },
         (Some(publication), Some(reclamation)) => {
-            canonical_retention_publication_pair(before, &publication, &reclamation)
+            if canonical_retention_publication_pair(before, &publication, &reclamation)? {
+                Ok(true)
+            } else {
+                Err(MaintenanceFailure::PreconditionFailed)
+            }
         },
         _ => Err(MaintenanceFailure::CatalogUnavailable),
     }
@@ -1335,7 +1339,6 @@ fn durable_running_publication_matches(before: &TaskState, durable: &TaskState) 
         && durable.pause_until == before.pause_until
         && durable.cancellation_requested == before.cancellation_requested
         && durable.dispatches == before.dispatches
-        && durable.terminal_order == before.terminal_order
 }
 
 fn canonical_retention_publication_pair(
@@ -1345,7 +1348,9 @@ fn canonical_retention_publication_pair(
 ) -> Result<bool, MaintenanceFailure> {
     Ok(publication.task == before.task
         && publication.phase == MaintenanceTaskPhase::Succeeded
-        && publication.active_dispatch.is_none()
+        && publication.submitted_at == before.submitted_at
+        && publication.pause_until == before.pause_until
+        && publication.dispatches == before.dispatches
         && publication.checkpoint == before.checkpoint
         && !publication.cancellation_requested
         && reclamation.task.identity == retention_reclamation_identity(&before.task)?
@@ -1361,8 +1366,6 @@ fn canonical_retention_publication_pair(
         && reclamation.pause_until.is_none()
         && !reclamation.cancellation_requested
         && reclamation.dispatches == 0
-        && reclamation.terminal_order.is_none()
-        && reclamation.active_dispatch.is_none()
         && reclamation.submitted_at == before.submitted_at)
 }
 
