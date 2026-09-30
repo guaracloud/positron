@@ -1,4 +1,5 @@
-use super::storage::{FRAME_OVERHEAD_BYTES, MAX_GENERATIONS};
+use super::codec::MAX_AUDIT_RECORD_BYTES;
+use super::storage::{FRAME_OVERHEAD_BYTES, MAX_AUDIT_FRAME_BYTES, MAX_GENERATIONS};
 use super::{
     AuditIntent, CatalogFailure, CatalogFailureCode, CatalogProposal, MAX_CATALOG_OBJECTS,
     MAX_CATALOG_TOTAL_BYTES, MAX_RECOVERY_ITEMS, MAX_RECOVERY_MEMORY_BYTES,
@@ -56,6 +57,28 @@ pub(super) fn audit_checkpoint_resource_claim() -> ResourceAmounts {
     ResourceAmounts::new([1_048_576, 1, 1, 1_048_576, 4, 0, 1, 1, 1, 4, 16_384])
         .maximum(recovery_resource_claim())
         .maximum(maximum_catalog_commit_resource_claim())
+}
+
+/// Bounded peak for one receipt-authorized audit-frame reclamation.
+///
+/// `read_exact_file` owns the complete encrypted artifact while
+/// `open_artifact` owns the decrypted frame and its returned plaintext copy.
+/// The expected maintenance descriptor retains one input and one output
+/// identity through the frame loop. Anchor and receipt encodings are dropped
+/// before that loop; the storage directory is queried by name and does not
+/// materialize a listing.
+pub(super) fn audit_reclamation_resource_claim() -> Result<ResourceAmounts, CatalogFailure> {
+    let frame_memory = MAX_AUDIT_FRAME_BYTES
+        .checked_add(
+            MAX_AUDIT_RECORD_BYTES
+                .checked_mul(2)
+                .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?,
+        )
+        .and_then(|bytes| bytes.checked_add(2 * 32))
+        .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?;
+    let memory = u64::try_from(frame_memory)
+        .map_err(|_| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?;
+    Ok(ResourceAmounts::new([memory, 1, 1, 0, 1, 0, 1, 1, 1, 1, 0]))
 }
 
 fn maximum_catalog_commit_resource_claim() -> ResourceAmounts {

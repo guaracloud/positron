@@ -23,8 +23,8 @@ use std::sync::{Arc, Mutex};
 use sha2::{Digest, Sha256};
 
 use budget::{
-    audit_checkpoint_resource_claim, commit_resource_claim, recovery_resource_claim,
-    reserve_history, retained_artifact_bytes,
+    audit_checkpoint_resource_claim, audit_reclamation_resource_claim, commit_resource_claim,
+    recovery_resource_claim, reserve_history, retained_artifact_bytes,
 };
 use codec::{
     CommitRecord, encode_commit, generation_identity, object_set_digest, prepare_audit,
@@ -1405,7 +1405,7 @@ impl<'authority> Catalog<'authority> {
                 MaintenanceObjectId::new(receipt_object.identity().to_bytes())
                     .map_err(|_| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?,
             ],
-            ResourceAmounts::new([1, 1, 1, 0, 1, 0, 1, 1, 1, 1, 0]),
+            audit_reclamation_resource_claim()?,
         )
         .map_err(|_| CatalogFailure::new(CatalogFailureCode::LimitExceeded))
     }
@@ -1549,6 +1549,15 @@ impl<'authority> Catalog<'authority> {
                     .map_err(|_| CatalogFailure::new(CatalogFailureCode::StorageUnavailable))?;
             }
             return Err(failure);
+        }
+        if execution
+            .catalog_reclamation_cancellation_requested(coordinator)
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::StorageUnavailable))?
+        {
+            execution
+                .requeue_catalog_reclamation_and_persist(coordinator, self)
+                .map_err(|_| CatalogFailure::new(CatalogFailureCode::StorageUnavailable))?;
+            return Err(CatalogFailure::new(CatalogFailureCode::StorageUnavailable));
         }
         if execution
             .complete_catalog_reclamation_and_persist(coordinator, self)

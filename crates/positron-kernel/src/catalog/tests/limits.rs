@@ -1,6 +1,6 @@
 use super::super::{
     MAX_GENERATIONS, MAX_RETAINED_HISTORY_BYTES, audit_checkpoint_resource_claim,
-    commit_resource_claim, reserve_history,
+    audit_reclamation_resource_claim, commit_resource_claim, reserve_history,
 };
 use crate::{
     AuditIntent, Catalog, CatalogFailureCode, CatalogObject, CatalogProposal, CatalogSecret,
@@ -12,7 +12,7 @@ use crate::{
 
 use super::super::types::MAX_CATALOG_OBJECT_BYTES;
 use super::super::{CatalogFailure, CatalogGenerationId};
-use super::support::establish_catalog_authority;
+use super::support::{establish_catalog_authority, establish_catalog_authority_with_repair_memory};
 
 use std::fs;
 use std::path::PathBuf;
@@ -44,6 +44,101 @@ fn audit_checkpoint_capacity_id(last: u8) -> [u8; 16] {
     let mut bytes = [0; 16];
     bytes[15] = last;
     bytes
+}
+
+#[test]
+fn audit_reclamation_admission_reserves_one_real_frame_before_any_handler_mutation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let claim = audit_reclamation_resource_claim()?;
+    assert_eq!(claim.get(ResourceDimension::MemoryBytes), 197_293);
+    assert_eq!(claim.get(ResourceDimension::IoPermits), 1);
+    assert_eq!(claim.get(ResourceDimension::CpuWorkUnits), 1);
+    assert_eq!(claim.get(ResourceDimension::FileDescriptors), 1);
+
+    let task = |id| {
+        MaintenanceTask::with_contract(
+            MaintenanceTaskId::new([id; 16]).expect("stable task identity"),
+            MaintenanceTaskClass::CatalogReclamation,
+            MaintenanceScope::System,
+            MaintenanceTrigger::Event,
+            MaintenancePreconditions::new(1, 1).expect("task preconditions"),
+            vec![MaintenanceObjectId::new([id.wrapping_add(2); 32]).expect("task input")],
+            vec![MaintenanceObjectId::new([id.wrapping_add(3); 32]).expect("task output")],
+            claim,
+        )
+        .expect("source-derived task contract")
+    };
+    let below = claim
+        .get(ResourceDimension::MemoryBytes)
+        .checked_sub(1)
+        .ok_or("nonzero real audit-frame claim")?;
+    let root = AuditCheckpointCapacityRoot::new()?;
+    let authority = establish_catalog_authority_with_repair_memory(
+        PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?,
+        below,
+    )?;
+    let coordinator = MaintenanceCoordinator::new();
+    let blocker = MaintenanceTask::with_contract(
+        MaintenanceTaskId::new([0xc0; 16]).expect("stable blocker identity"),
+        MaintenanceTaskClass::CatalogReclamation,
+        MaintenanceScope::System,
+        MaintenanceTrigger::Event,
+        MaintenancePreconditions::new(1, 1).expect("blocker preconditions"),
+        Vec::new(),
+        Vec::new(),
+        ResourceAmounts::new([below + 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+    )
+    .expect("shared-capacity blocker contract");
+    let blocker_identity = blocker.identity();
+    coordinator
+        .submit(blocker)
+        .expect("queued shared-capacity blocker");
+    let refused = task(0xc1);
+    let refused_identity = refused.identity();
+    coordinator.submit(refused).expect("queued audit reclaimer");
+    let held = coordinator
+        .start_next_with_reservation(&authority, 2, false)
+        .expect("shared-capacity blocker admission")
+        .ok_or("shared-capacity blocker execution")?;
+    assert_eq!(held.task().identity(), blocker_identity);
+    assert!(matches!(
+        coordinator.start_next_with_reservation(&authority, 2, false),
+        Err(MaintenanceFailure::ResourceAdmissionRefused)
+    ));
+    assert_eq!(
+        coordinator
+            .status(refused_identity)
+            .expect("queued task status")
+            .phase(),
+        MaintenanceTaskPhase::Queued,
+        "refusal leaves the exact audit reclaimer queued before any handler can unlink a frame"
+    );
+    drop(held);
+
+    let root = AuditCheckpointCapacityRoot::new()?;
+    let authority = establish_catalog_authority_with_repair_memory(
+        PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?,
+        claim.get(ResourceDimension::MemoryBytes),
+    )?;
+    let coordinator = MaintenanceCoordinator::new();
+    let admitted = task(0xc2);
+    let identity = admitted.identity();
+    coordinator
+        .submit(admitted)
+        .expect("queued audit reclaimer");
+    let execution = coordinator
+        .start_next_with_reservation(&authority, 2, false)
+        .expect("source-derived claim admission")
+        .ok_or("the source-derived claim admits one audit reclaimer")?;
+    assert_eq!(execution.task().identity(), identity);
+    assert_eq!(
+        coordinator
+            .status(identity)
+            .expect("running task status")
+            .phase(),
+        MaintenanceTaskPhase::Running
+    );
+    Ok(())
 }
 
 #[test]

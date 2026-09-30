@@ -11,7 +11,7 @@ use positron_governance::{
 use positron_kernel::{
     CatalogObject, CatalogProposal, CatalogPublicationFault, FormatEpoch, MaintenanceCoordinator,
     MaintenanceTask, MaintenanceTaskClass, MaintenanceTaskId, MaintenanceTaskPhase, TransactionId,
-    with_catalog_publication_fault_after,
+    with_catalog_publication_fault_after, with_catalog_publication_fault_sequence_after,
 };
 
 use super::super::ServiceHandle;
@@ -597,6 +597,191 @@ fn runtime_worker_physically_reclaims_a_receipt_bound_system_audit_prefix()
         after.len() < before.len(),
         "the receipt-bound handler physically reclaims the authorized audit prefix"
     );
+    Ok(())
+}
+
+#[test]
+fn audit_reclaimer_requeues_after_a_post_unlink_fault_and_finishes_on_same_process_retry()
+-> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let (initialized, _, _, administrator_secret) = fixture.initialized_with_admin()?;
+    let actor = initialized.attribute(
+        PresentedCredential::parse(&administrator_secret)?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    initialized.update_system_audit_retention(
+        actor,
+        NonZeroU64::new(2).ok_or("nonzero retained audit-record limit")?,
+        ResourceGeneration::new(1)?,
+        AdministrativeIdempotencyKey::new([0xf2; 16])?,
+    )?;
+    initialized.update_system_audit_retention(
+        actor,
+        NonZeroU64::new(1).ok_or("nonzero retained audit-record limit")?,
+        ResourceGeneration::new(2)?,
+        AdministrativeIdempotencyKey::new([0xf3; 16])?,
+    )?;
+    let before = initialized.governance_audit_for_test()?;
+    let services = ServiceHandle::new(Arc::clone(&initialized))?;
+
+    let interrupted =
+        with_catalog_publication_fault_after(CatalogPublicationFault::ReclaimAudit, 1, || {
+            services.wake_maintenance_worker()
+        });
+    assert!(
+        interrupted.is_err(),
+        "the second exact unlink faults after one physical deletion"
+    );
+    let after_interruption = initialized.governance_audit_for_test()?;
+    assert!(
+        after_interruption.len() < before.len(),
+        "the fault fixture must observe its claimed post-unlink physical mutation"
+    );
+    assert!(
+        services.wake_maintenance_worker()?,
+        "the same coordinator retries the exact durable descriptor instead of stranding it Running"
+    );
+    assert_eq!(initialized.governance_audit_for_test()?.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn audit_reclaimer_recovers_a_directory_sync_fault_after_unlink_across_restart()
+-> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let (initialized, _, _, administrator_secret) = fixture.initialized_with_admin()?;
+    let actor = initialized.attribute(
+        PresentedCredential::parse(&administrator_secret)?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    initialized.update_system_audit_retention(
+        actor,
+        NonZeroU64::new(2).ok_or("nonzero retained audit-record limit")?,
+        ResourceGeneration::new(1)?,
+        AdministrativeIdempotencyKey::new([0xf4; 16])?,
+    )?;
+    initialized.update_system_audit_retention(
+        actor,
+        NonZeroU64::new(1).ok_or("nonzero retained audit-record limit")?,
+        ResourceGeneration::new(2)?,
+        AdministrativeIdempotencyKey::new([0xf5; 16])?,
+    )?;
+    let before = initialized.governance_audit_for_test()?;
+    let services = ServiceHandle::new(Arc::clone(&initialized))?;
+    let interrupted = with_catalog_publication_fault_after(
+        CatalogPublicationFault::SynchronizeReclaimedAuditDirectory,
+        0,
+        || services.wake_maintenance_worker(),
+    );
+    assert!(
+        interrupted.is_err(),
+        "the directory sync faults after exact frame unlinks"
+    );
+    assert!(
+        initialized.governance_audit_for_test()?.len() < before.len(),
+        "the fixture observes its post-unlink physical mutation"
+    );
+    drop((services, initialized));
+
+    let reopened = fixture.reopen()?;
+    assert!(
+        ServiceHandle::new(Arc::clone(&reopened))?.wake_maintenance_worker()?,
+        "restart restores and completes the exact queued receipt-bound descriptor"
+    );
+    assert_eq!(reopened.governance_audit_for_test()?.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn audit_reclaimer_recovers_same_process_when_terminal_and_requeue_task_records_both_fault_after_unlink()
+-> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let (initialized, _, _, administrator_secret) = fixture.initialized_with_admin()?;
+    let actor = initialized.attribute(
+        PresentedCredential::parse(&administrator_secret)?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    initialized.update_system_audit_retention(
+        actor,
+        NonZeroU64::new(2).ok_or("nonzero retained audit-record limit")?,
+        ResourceGeneration::new(1)?,
+        AdministrativeIdempotencyKey::new([0xf6; 16])?,
+    )?;
+    initialized.update_system_audit_retention(
+        actor,
+        NonZeroU64::new(1).ok_or("nonzero retained audit-record limit")?,
+        ResourceGeneration::new(2)?,
+        AdministrativeIdempotencyKey::new([0xf7; 16])?,
+    )?;
+    let task = {
+        let records = initialized
+            .maintenance_coordinator()
+            .lock()
+            .map_err(|_| "maintenance lock")?
+            .durable_records()
+            .map_err(|_| "durable audit-reclaimer record")?;
+        let record = records
+            .first()
+            .ok_or("queued audit-reclaimer record")?
+            .as_bytes();
+        let bytes: [u8; 16] = record
+            .get(8..24)
+            .ok_or("encoded task identity")?
+            .try_into()
+            .map_err(|_| "task identity length")?;
+        MaintenanceTaskId::new(bytes).expect("encoded audit-reclaimer task identity")
+    };
+    let before = initialized.governance_audit_for_test()?;
+    let services = ServiceHandle::new(Arc::clone(&initialized))?;
+    let interrupted = with_catalog_publication_fault_sequence_after(
+        &[
+            (CatalogPublicationFault::SynchronizeCommit, 1),
+            (CatalogPublicationFault::SynchronizeCommit, 0),
+            (CatalogPublicationFault::SynchronizeCommit, 0),
+        ],
+        || services.wake_maintenance_worker(),
+    );
+    assert!(
+        interrupted.is_err(),
+        "terminal and durable requeue task-record writes both fault"
+    );
+    assert!(
+        initialized.governance_audit_for_test()?.len() < before.len(),
+        "the fixture reaches physical reclamation before terminal-record failure"
+    );
+    assert_eq!(
+        initialized
+            .maintenance_coordinator()
+            .lock()
+            .map_err(|_| "maintenance lock")?
+            .status(task)
+            .map_err(|_| "post-failure task status")?
+            .phase(),
+        MaintenanceTaskPhase::Queued,
+        "the ambiguous terminal and requeue writes reconcile the live descriptor before retry"
+    );
+    assert!(
+        services.wake_maintenance_worker()?,
+        "the same coordinator reconciles the exact queued descriptor instead of leaving it Running"
+    );
+    assert_eq!(initialized.governance_audit_for_test()?.len(), 1);
+    assert_eq!(
+        initialized
+            .maintenance_coordinator()
+            .lock()
+            .map_err(|_| "maintenance lock")?
+            .status(task)
+            .map_err(|_| "same-process terminal task status")?
+            .phase(),
+        MaintenanceTaskPhase::Succeeded
+    );
+    drop((services, initialized));
+
+    let reopened = fixture.reopen()?;
+    assert_eq!(reopened.governance_audit_for_test()?.len(), 1);
     Ok(())
 }
 

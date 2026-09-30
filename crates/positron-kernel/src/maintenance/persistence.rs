@@ -1611,14 +1611,91 @@ impl MaintenanceCoordinator {
         if task.task.class != MaintenanceTaskClass::CatalogReclamation
             || task.phase != MaintenanceTaskPhase::Running
             || task.active_dispatch != Some(dispatch)
-            || task.cancellation_requested
         {
             return Err(MaintenanceFailure::InvalidTransition);
         }
+        // A cancellation observed after a physical unlink cannot terminalize
+        // the still-unfinished prefix. Requeue the exact descriptor and clear
+        // that request so its authenticated retry can finish idempotently.
+        task.cancellation_requested = false;
         task.phase = MaintenanceTaskPhase::Queued;
         task.active_dispatch = None;
-        persist_task_state(catalog, task, None)?;
+        if let Err(failure) = persist_task_state(catalog, task, None) {
+            drop(state);
+            self.restore_catalog_reclamation_after_requeue_failure(catalog, dispatch)?;
+            return Err(failure);
+        }
         *state = next;
+        Ok(())
+    }
+
+    /// Reconciles the sole affected descriptor after a post-physical-unlink
+    /// requeue write is ambiguous. A durable Running record restarts as its
+    /// exact queued retry, so the live worker need not strand it until restart.
+    fn restore_catalog_reclamation_after_requeue_failure(
+        &self,
+        catalog: &Catalog<'_>,
+        dispatch: MaintenanceDispatch,
+    ) -> Result<(), MaintenanceFailure> {
+        let restored = Self::restore_from_catalog(catalog)?;
+        let mut recovered = restored
+            .state
+            .into_inner()
+            .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
+        let mut candidate = recovered
+            .tasks
+            .remove(&dispatch.identity)
+            .ok_or(MaintenanceFailure::UnknownTask)?;
+        if candidate.task.class != MaintenanceTaskClass::CatalogReclamation {
+            return Err(MaintenanceFailure::InvalidTransition);
+        }
+        if candidate.phase == MaintenanceTaskPhase::Cancelled {
+            // This path is reached only after the handler has made physical
+            // progress. Do not turn that partial prefix into a terminal
+            // cancellation merely because the failed requeue left a durable
+            // Running record with a cancellation request.
+            candidate.phase = MaintenanceTaskPhase::Queued;
+            candidate.cancellation_requested = false;
+            candidate.active_dispatch = None;
+        }
+        if !matches!(
+            candidate.phase,
+            MaintenanceTaskPhase::Queued | MaintenanceTaskPhase::Succeeded
+        ) {
+            return Err(MaintenanceFailure::InvalidTransition);
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
+        let current = state
+            .tasks
+            .get(&dispatch.identity)
+            .ok_or(MaintenanceFailure::UnknownTask)?;
+        if current.task.class != MaintenanceTaskClass::CatalogReclamation
+            || current.phase != MaintenanceTaskPhase::Running
+            || current.active_dispatch != Some(dispatch)
+        {
+            return Err(MaintenanceFailure::InvalidTransition);
+        }
+        state.tasks.insert(dispatch.identity, candidate);
+        state.next_terminal_order = state.next_terminal_order.max(recovered.next_terminal_order);
+        let queued = state
+            .tasks
+            .get(&dispatch.identity)
+            .is_some_and(|task| task.phase == MaintenanceTaskPhase::Queued);
+        let recovered = state
+            .tasks
+            .get(&dispatch.identity)
+            .cloned()
+            .ok_or(MaintenanceFailure::UnknownTask)?;
+        drop(state);
+        if queued {
+            // If this confirmation also faults, keep the recovered queued
+            // descriptor live. The next bounded wake reacquires it from the
+            // exact durable Running record; it is never stranded Running.
+            persist_task_state(catalog, &recovered, None)?;
+        }
         Ok(())
     }
 
@@ -1644,6 +1721,30 @@ impl MaintenanceCoordinator {
             return Err(MaintenanceFailure::PreconditionFailed);
         }
         Ok(())
+    }
+
+    fn catalog_reclamation_cancellation_requested_dispatch(
+        &self,
+        dispatch: MaintenanceDispatch,
+    ) -> Result<bool, MaintenanceFailure> {
+        if dispatch.coordinator_id != self.coordinator_id {
+            return Err(MaintenanceFailure::InvalidTransition);
+        }
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
+        let task = state
+            .tasks
+            .get(&dispatch.identity)
+            .ok_or(MaintenanceFailure::UnknownTask)?;
+        if task.task.class != MaintenanceTaskClass::CatalogReclamation
+            || task.phase != MaintenanceTaskPhase::Running
+            || task.active_dispatch != Some(dispatch)
+        {
+            return Err(MaintenanceFailure::InvalidTransition);
+        }
+        Ok(task.cancellation_requested)
     }
 
     fn requeue_admitted_dispatch(
@@ -1821,6 +1922,16 @@ impl MaintenanceExecution<'_> {
             return Err(MaintenanceFailure::InvalidInput);
         }
         coordinator.requeue_catalog_reclamation_and_persist_dispatch(catalog, self.dispatch)
+    }
+
+    pub(crate) fn catalog_reclamation_cancellation_requested(
+        &self,
+        coordinator: &MaintenanceCoordinator,
+    ) -> Result<bool, MaintenanceFailure> {
+        if self.task.class != MaintenanceTaskClass::CatalogReclamation {
+            return Err(MaintenanceFailure::InvalidInput);
+        }
+        coordinator.catalog_reclamation_cancellation_requested_dispatch(self.dispatch)
     }
     pub(crate) fn prepare_running_retention_reclamation_completion(
         &self,
