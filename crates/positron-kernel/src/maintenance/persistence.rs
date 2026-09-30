@@ -24,6 +24,7 @@ pub(crate) struct QueuedMaintenanceSubmission {
     state: TaskState,
     record: MaintenanceTaskRecord,
     reclaimed_terminal: Option<(MaintenanceTaskId, TaskState)>,
+    replaced_queued: Option<(MaintenanceTaskId, TaskState)>,
 }
 
 /// A terminal replacement for the exact expiry record attached to a released
@@ -317,12 +318,19 @@ impl QueuedMaintenanceSubmission {
                     !state.pending_terminal_reclamations.contains(identity)
                         || state.tasks.get(identity) != Some(expected)
                 })
+            || self
+                .replaced_queued
+                .as_ref()
+                .is_some_and(|(identity, expected)| state.tasks.get(identity) != Some(expected))
         {
             return Err(MaintenanceFailure::PreconditionFailed);
         }
         state.pending_submissions.remove(&self.state.task.identity);
         if let Some((identity, _)) = self.reclaimed_terminal {
             state.pending_terminal_reclamations.remove(&identity);
+            super::scheduling::remove_task_and_clear_empty_scope(&mut state, identity)?;
+        }
+        if let Some((identity, _)) = self.replaced_queued {
             super::scheduling::remove_task_and_clear_empty_scope(&mut state, identity)?;
         }
         state.tasks.insert(self.state.task.identity, self.state);
@@ -354,7 +362,23 @@ impl MaintenanceCoordinator {
             .state
             .lock()
             .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
-        *state = recovered;
+        for (identity, candidate) in recovered.tasks {
+            if candidate.task.class != MaintenanceTaskClass::CatalogReclamation
+                || candidate.phase != MaintenanceTaskPhase::Queued
+            {
+                continue;
+            }
+            if let Some(existing) = state.tasks.get(&identity) {
+                if existing != &candidate {
+                    return Err(MaintenanceFailure::PreconditionFailed);
+                }
+                continue;
+            }
+            if state.tasks.len() >= MAX_MAINTENANCE_TASKS {
+                return Err(MaintenanceFailure::CapacityExceeded);
+            }
+            state.tasks.insert(identity, candidate);
+        }
         Ok(())
     }
     pub(super) fn prepare_running_retention_reclamation_completion(
@@ -921,6 +945,7 @@ impl MaintenanceCoordinator {
             state,
             record,
             reclaimed_terminal,
+            replaced_queued: None,
         })
     }
 
@@ -932,6 +957,7 @@ impl MaintenanceCoordinator {
         &self,
         task: MaintenanceTask,
         submitted_at: u64,
+        predecessor_record: Option<&[u8]>,
     ) -> Result<QueuedMaintenanceSubmission, MaintenanceFailure> {
         if task.class != MaintenanceTaskClass::CatalogReclamation
             || task.scope != MaintenanceScope::System
@@ -948,10 +974,25 @@ impl MaintenanceCoordinator {
         {
             return Err(MaintenanceFailure::PreconditionFailed);
         }
+        let replaced_queued = predecessor_record
+            .map(decode_record)
+            .transpose()?
+            .map(|predecessor| {
+                if predecessor.task.class != MaintenanceTaskClass::CatalogReclamation
+                    || predecessor.task.scope != MaintenanceScope::System
+                    || predecessor.phase != MaintenanceTaskPhase::Queued
+                    || state.tasks.get(&predecessor.task.identity) != Some(&predecessor)
+                {
+                    return Err(MaintenanceFailure::PreconditionFailed);
+                }
+                Ok((predecessor.task.identity, predecessor))
+            })
+            .transpose()?;
         let occupied = state
             .tasks
             .len()
             .checked_add(state.pending_submissions.len())
+            .and_then(|value| value.checked_sub(usize::from(replaced_queued.is_some())))
             .ok_or(MaintenanceFailure::CapacityExceeded)?;
         let reclaimed_terminal = if occupied >= MAX_MAINTENANCE_TASKS {
             let mut prospective = state.clone();
@@ -989,6 +1030,7 @@ impl MaintenanceCoordinator {
             state,
             record,
             reclaimed_terminal,
+            replaced_queued,
         })
     }
     /// Selects, reserves, and durably marks one task Running before handing its

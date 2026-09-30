@@ -36,6 +36,7 @@ use recovery::recover;
 use storage::{CatalogStorage, PreparedLookup};
 
 use crate::data_protection::ControlTokenProtector;
+use crate::maintenance::durable_task_record_identity;
 use crate::resource_governor::CatalogWriterLease;
 use crate::{
     GovernanceAuditCheckpointBinding, MaintenanceCoordinator, MaintenanceExecution,
@@ -1257,13 +1258,35 @@ impl<'authority> Catalog<'authority> {
                 .map(|previous| previous.rebind(signer, trust))
                 .transpose()?,
         };
+        let predecessor_identity = audit_checkpoint::retention_anchor(&basis)?
+            .as_ref()
+            .map(Self::audit_retention_reclamation_task)
+            .transpose()?
+            .map(|task| task.identity());
+        let mut predecessor_record = None;
+        for identity in basis.object_identities() {
+            let object = basis
+                .object(identity)?
+                .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::StorageUnavailable))?;
+            if durable_task_record_identity(object)
+                .map_err(|_| CatalogFailure::new(CatalogFailureCode::IntegrityCorruption))?
+                .is_some_and(|identity| Some(identity) == predecessor_identity)
+                && predecessor_record.replace(object).is_some()
+            {
+                return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
+            }
+        }
         let queued_reclamation = anchor
             .as_ref()
             .map(|anchor| {
                 Self::audit_retention_reclamation_task(anchor).and_then(|task| {
                     publication
                         .coordinator
-                        .prepare_catalog_reclamation(task, publication.submitted_at)
+                        .prepare_catalog_reclamation(
+                            task,
+                            publication.submitted_at,
+                            predecessor_record,
+                        )
                         .map_err(|_| CatalogFailure::new(CatalogFailureCode::LimitExceeded))
                 })
             })
@@ -1284,6 +1307,7 @@ impl<'authority> Catalog<'authority> {
             if AuditRetentionAnchor::is_encoded(object)
                 || SystemAuditRetentionPolicy::is_encoded(object)
                 || audit_checkpoint::AuditRetentionReclamationReceipt::is_encoded(object)
+                || predecessor_record.is_some_and(|predecessor| predecessor == object)
             {
                 continue;
             }

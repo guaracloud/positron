@@ -8,7 +8,8 @@ use positron_governance::{
     ListenerTransportRole, PresentedCredential, RequestedIntent, ResourceGeneration,
 };
 use positron_kernel::{
-    CatalogObject, CatalogProposal, CatalogPublicationFault, FormatEpoch, TransactionId,
+    CatalogObject, CatalogProposal, CatalogPublicationFault, FormatEpoch, MaintenanceCoordinator,
+    MaintenanceTask, MaintenanceTaskClass, MaintenanceTaskId, MaintenanceTaskPhase, TransactionId,
     with_catalog_publication_fault_after,
 };
 
@@ -551,6 +552,296 @@ fn committed_system_audit_retention_queues_reclamation_before_physical_mutation(
         audit_before + 1,
         "a policy update only makes physical audit reclamation eligible; its worker has not run"
     );
+    Ok(())
+}
+
+#[test]
+fn system_audit_retention_successor_replaces_the_queued_reclaimer_authority()
+-> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let (initialized, _, _, administrator_secret) = fixture.initialized_with_admin()?;
+    let actor = initialized.attribute(
+        PresentedCredential::parse(&administrator_secret)?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    initialized.update_system_audit_retention(
+        actor,
+        NonZeroU64::new(2).ok_or("nonzero retained audit-record limit")?,
+        ResourceGeneration::new(1)?,
+        AdministrativeIdempotencyKey::new([0xb1; 16])?,
+    )?;
+    initialized.update_system_audit_retention(
+        actor,
+        NonZeroU64::new(1).ok_or("nonzero retained audit-record limit")?,
+        ResourceGeneration::new(2)?,
+        AdministrativeIdempotencyKey::new([0xb2; 16])?,
+    )?;
+    let predecessor = initialized
+        .maintenance_coordinator()
+        .lock()
+        .map_err(|_| "maintenance lock")?
+        .durable_records()
+        .expect("predecessor durable records");
+    assert_eq!(
+        predecessor.len(),
+        1,
+        "one initial audit reclaimer is queued"
+    );
+
+    initialized.update_system_audit_retention(
+        actor,
+        NonZeroU64::new(1).ok_or("nonzero retained audit-record limit")?,
+        ResourceGeneration::new(3)?,
+        AdministrativeIdempotencyKey::new([0xb3; 16])?,
+    )?;
+
+    let successor = initialized
+        .maintenance_coordinator()
+        .lock()
+        .map_err(|_| "maintenance lock")?
+        .durable_records()
+        .expect("successor durable records");
+    assert_eq!(
+        successor.len(),
+        1,
+        "a newer signed anchor owns exactly one queued Catalog-reclamation authority"
+    );
+    assert_ne!(
+        successor, predecessor,
+        "the successor replaces the predecessor PMTC record instead of accumulating it"
+    );
+    Ok(())
+}
+
+#[test]
+fn system_audit_retention_refuses_a_successor_while_its_reclaimer_is_running()
+-> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let (initialized, _, _, administrator_secret) = fixture.initialized_with_admin()?;
+    let actor = initialized.attribute(
+        PresentedCredential::parse(&administrator_secret)?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    initialized.update_system_audit_retention(
+        actor,
+        NonZeroU64::new(2).ok_or("nonzero retained audit-record limit")?,
+        ResourceGeneration::new(1)?,
+        AdministrativeIdempotencyKey::new([0xb4; 16])?,
+    )?;
+    initialized.update_system_audit_retention(
+        actor,
+        NonZeroU64::new(1).ok_or("nonzero retained audit-record limit")?,
+        ResourceGeneration::new(2)?,
+        AdministrativeIdempotencyKey::new([0xb5; 16])?,
+    )?;
+    let catalog = open_catalog(&initialized)?;
+    let coordinator = initialized
+        .maintenance_coordinator()
+        .lock()
+        .map_err(|_| "maintenance lock")?;
+    let execution = coordinator
+        .start_next_with_reservation_and_persist_for_class(
+            &catalog,
+            &initialized._authority,
+            1,
+            false,
+            Some(MaintenanceTaskClass::CatalogReclamation),
+        )
+        .expect("start queued system audit reclaimer")
+        .ok_or("queued system audit reclaimer starts")?;
+    let reclaimer = execution.task().identity();
+    let predecessor_records = coordinator
+        .durable_records()
+        .expect("running predecessor durable record");
+    assert_eq!(
+        coordinator
+            .status(reclaimer)
+            .expect("running reclaimer status")
+            .phase(),
+        MaintenanceTaskPhase::Running
+    );
+    drop(coordinator);
+    drop(catalog);
+    let generation_before = initialized.catalog_generation();
+
+    let failure = initialized
+        .update_system_audit_retention(
+            actor,
+            NonZeroU64::new(1).ok_or("nonzero retained audit-record limit")?,
+            ResourceGeneration::new(3)?,
+            AdministrativeIdempotencyKey::new([0xb6; 16])?,
+        )
+        .expect_err("a running predecessor must reject a policy successor");
+    assert_eq!(failure.code(), BootstrapFailureCode::CatalogUnavailable);
+    assert_eq!(initialized.catalog_generation(), generation_before);
+    let coordinator = initialized
+        .maintenance_coordinator()
+        .lock()
+        .map_err(|_| "maintenance lock")?;
+    assert_eq!(
+        coordinator
+            .status(reclaimer)
+            .expect("preserved reclaimer status")
+            .phase(),
+        MaintenanceTaskPhase::Running,
+        "the refused successor keeps the sole predecessor and its capability live"
+    );
+    assert_eq!(
+        coordinator
+            .durable_records()
+            .expect("preserved predecessor durable record"),
+        predecessor_records,
+        "the unchanged Catalog generation retains the predecessor's exact anchor-bound capability"
+    );
+    drop(execution);
+    Ok(())
+}
+
+#[test]
+fn lost_system_audit_retention_ack_replays_only_its_exact_queued_reclaimer()
+-> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let (initialized, _, _, administrator_secret) = fixture.initialized_with_admin()?;
+    let actor = initialized.attribute(
+        PresentedCredential::parse(&administrator_secret)?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    initialized.update_system_audit_retention(
+        actor,
+        NonZeroU64::new(2).ok_or("nonzero retained audit-record limit")?,
+        ResourceGeneration::new(1)?,
+        AdministrativeIdempotencyKey::new([0xb7; 16])?,
+    )?;
+    let running = MaintenanceTask::new(
+        MaintenanceTaskId::new([0xb8; 16]).expect("stable running identity"),
+        MaintenanceTaskClass::SchemaPromotion,
+    );
+    let paused = MaintenanceTask::new(
+        MaintenanceTaskId::new([0xb9; 16]).expect("stable paused identity"),
+        MaintenanceTaskClass::SchemaPromotion,
+    );
+    let running_id = running.identity();
+    let paused_id = paused.identity();
+    let catalog = open_catalog(&initialized)?;
+    let coordinator = initialized
+        .maintenance_coordinator()
+        .lock()
+        .map_err(|_| "maintenance lock")?;
+    coordinator
+        .submit_and_persist(&catalog, running, 1)
+        .expect("submit unrelated running task");
+    coordinator
+        .submit_and_persist(&catalog, paused, 1)
+        .expect("submit unrelated paused task");
+    coordinator
+        .pause_and_persist(&catalog, paused_id, 1, 100, 1)
+        .expect("pause unrelated task");
+    let running_execution = coordinator
+        .start_next_with_reservation_and_persist_for_class(
+            &catalog,
+            &initialized._authority,
+            1,
+            false,
+            Some(MaintenanceTaskClass::SchemaPromotion),
+        )
+        .expect("start unrelated task")
+        .ok_or("unrelated task starts")?;
+    assert_eq!(running_execution.task().identity(), running_id);
+    coordinator
+        .cancel_and_persist(&catalog, running_id)
+        .expect("request cancellation for the live unrelated task");
+    let running_before = coordinator
+        .status(running_id)
+        .expect("running task status before replay");
+    let paused_before = coordinator
+        .status(paused_id)
+        .expect("paused task status before replay");
+    let records_before = coordinator
+        .durable_records()
+        .expect("durable task records before replay");
+    drop(coordinator);
+    drop(catalog);
+
+    let key = AdministrativeIdempotencyKey::new([0xba; 16])?;
+    let lost_ack = with_catalog_publication_fault_after(
+        CatalogPublicationFault::SynchronizeGenerationDirectory,
+        0,
+        || {
+            initialized.update_system_audit_retention(
+                actor,
+                NonZeroU64::new(1).expect("nonzero retained audit-record limit"),
+                ResourceGeneration::new(2).expect("expected policy generation"),
+                key,
+            )
+        },
+    );
+    assert!(
+        lost_ack.is_err(),
+        "the committed publication acknowledgement is lost"
+    );
+    let catalog = open_catalog(&initialized)?;
+    let durable_reclaimer = MaintenanceCoordinator::restore_from_catalog(&catalog)
+        .expect("recover committed task records")
+        .durable_records()
+        .expect("recovered durable task records")
+        .into_iter()
+        .find(|record| {
+            !records_before
+                .iter()
+                .any(|before| before.as_bytes() == record.as_bytes())
+        })
+        .ok_or("exact committed reclaimer record")?
+        .as_bytes()
+        .to_vec();
+    drop(catalog);
+    let live_records_before_replay = initialized
+        .maintenance_coordinator()
+        .lock()
+        .map_err(|_| "maintenance lock")?
+        .durable_records()
+        .expect("live durable records before replay");
+    assert!(
+        !live_records_before_replay
+            .iter()
+            .any(|record| record.as_bytes() == durable_reclaimer.as_slice()),
+        "the post-commit acknowledgement loss leaves the exact durable reclaimer absent from memory"
+    );
+
+    let replay = initialized.update_system_audit_retention(
+        actor,
+        NonZeroU64::new(1).ok_or("nonzero retained audit-record limit")?,
+        ResourceGeneration::new(2)?,
+        key,
+    )?;
+    assert_eq!(replay.policy_generation(), ResourceGeneration::new(3)?);
+    let coordinator = initialized
+        .maintenance_coordinator()
+        .lock()
+        .map_err(|_| "maintenance lock")?;
+    assert_eq!(
+        coordinator
+            .status(running_id)
+            .expect("running task status after replay"),
+        running_before
+    );
+    assert_eq!(
+        coordinator
+            .status(paused_id)
+            .expect("paused task status after replay"),
+        paused_before
+    );
+    assert!(
+        coordinator
+            .durable_records()
+            .expect("durable records after replay")
+            .iter()
+            .any(|record| record.as_bytes() == durable_reclaimer.as_slice()),
+        "replay attaches the exact durable queued task without replacing the registry"
+    );
+    drop(running_execution);
     Ok(())
 }
 
