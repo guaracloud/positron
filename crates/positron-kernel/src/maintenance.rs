@@ -17,7 +17,7 @@ use crate::{
 mod persistence;
 mod record;
 
-pub(crate) use persistence::SnapshotLeaseExpiryTaskReplacement;
+pub(crate) use persistence::{SnapshotLeaseExpiryTaskReplacement, queued_task_record_bytes};
 use record::{decode_record, encode_record};
 
 pub(crate) fn durable_task_record_identity(
@@ -112,6 +112,30 @@ pub(crate) struct SnapshotLeaseExpiryBinding<'record> {
     predecessor_generation: u64,
     not_before: u64,
     durable_record: &'record [u8],
+}
+
+/// Immutable task records that the ledger must atomically replace when a
+/// Retention Publication becomes visible. The coordinator owns the state
+/// transition; the ledger owns the matching Catalog publication.
+pub(crate) struct RetentionPublicationBinding<'task, 'record> {
+    publication: &'task MaintenanceTask,
+    reclamation: MaintenanceTask,
+    durable_record: &'record [u8],
+}
+
+impl<'task, 'record> RetentionPublicationBinding<'task, 'record> {
+    #[must_use]
+    pub(crate) const fn new(
+        publication: &'task MaintenanceTask,
+        reclamation: MaintenanceTask,
+        durable_record: &'record [u8],
+    ) -> Self {
+        Self {
+            publication,
+            reclamation,
+            durable_record,
+        }
+    }
 }
 
 impl<'record> SnapshotLeaseExpiryBinding<'record> {

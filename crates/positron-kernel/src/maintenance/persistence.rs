@@ -11,6 +11,24 @@ use std::collections::BTreeSet;
 use super::*;
 use crate::{Catalog, CatalogObject, CatalogProposal, TransactionId};
 
+pub(crate) fn queued_task_record_bytes(
+    task: &MaintenanceTask,
+) -> Result<usize, MaintenanceFailure> {
+    Ok(encode_record(&TaskState {
+        task: task.clone(),
+        phase: MaintenanceTaskPhase::Queued,
+        submitted_at: 0,
+        checkpoint: None,
+        pause_until: None,
+        cancellation_requested: false,
+        dispatches: 0,
+        terminal_order: None,
+        active_dispatch: None,
+    })?
+    .as_bytes()
+    .len())
+}
+
 /// A not-yet-visible task record prepared by the coordinator for inclusion in
 /// a caller-owned Catalog transaction. The ledger uses this only to couple a
 /// newly created Snapshot Lease to its expiry work; it cannot inspect or
@@ -29,6 +47,79 @@ pub(crate) struct SnapshotLeaseExpiryTaskReplacement {
     after: TaskState,
     next_terminal_order: u64,
     record: MaintenanceTaskRecord,
+}
+
+/// One terminal Retention Publication and its already-bound queued
+/// Reclamation successor. Neither state becomes visible until the ledger has
+/// committed both records with the corresponding retired metadata.
+pub(crate) struct RetentionPublicationTaskCompletion {
+    publication_before: TaskState,
+    publication_after: TaskState,
+    reclamation: TaskState,
+    next_terminal_order: u64,
+    publication_record: MaintenanceTaskRecord,
+    reclamation_record: MaintenanceTaskRecord,
+}
+
+impl RetentionPublicationTaskCompletion {
+    pub(crate) fn catalog_objects(&self) -> Result<Vec<CatalogObject>, MaintenanceFailure> {
+        Ok(vec![
+            self.publication_record.catalog_object()?,
+            self.reclamation_record.catalog_object()?,
+        ])
+    }
+
+    #[must_use]
+    pub(crate) const fn publication_identity(&self) -> MaintenanceTaskId {
+        self.publication_before.task.identity
+    }
+
+    pub(crate) fn install(
+        self,
+        coordinator: &MaintenanceCoordinator,
+    ) -> Result<(), MaintenanceFailure> {
+        let mut state = coordinator
+            .state
+            .lock()
+            .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
+        if !state
+            .pending_task_transitions
+            .contains(&self.publication_before.task.identity)
+            || state.tasks.get(&self.publication_before.task.identity)
+                != Some(&self.publication_before)
+            || !state
+                .pending_submissions
+                .contains(&self.reclamation.task.identity)
+            || state.tasks.contains_key(&self.reclamation.task.identity)
+        {
+            return Err(MaintenanceFailure::PreconditionFailed);
+        }
+        state
+            .pending_task_transitions
+            .remove(&self.publication_before.task.identity);
+        state
+            .pending_submissions
+            .remove(&self.reclamation.task.identity);
+        state
+            .tasks
+            .insert(self.publication_after.task.identity, self.publication_after);
+        state
+            .tasks
+            .insert(self.reclamation.task.identity, self.reclamation);
+        state.next_terminal_order = state.next_terminal_order.max(self.next_terminal_order);
+        Ok(())
+    }
+
+    pub(crate) fn discard(&self, coordinator: &MaintenanceCoordinator) {
+        if let Ok(mut state) = coordinator.state.lock() {
+            state
+                .pending_task_transitions
+                .remove(&self.publication_before.task.identity);
+            state
+                .pending_submissions
+                .remove(&self.reclamation.task.identity);
+        }
+    }
 }
 
 impl SnapshotLeaseExpiryTaskReplacement {
@@ -166,6 +257,75 @@ impl QueuedMaintenanceSubmission {
 }
 
 impl MaintenanceCoordinator {
+    pub(super) fn prepare_running_retention_publication_completion(
+        &self,
+        dispatch: MaintenanceDispatch,
+        binding: RetentionPublicationBinding<'_, '_>,
+    ) -> Result<RetentionPublicationTaskCompletion, MaintenanceFailure> {
+        if dispatch.coordinator_id != self.coordinator_id {
+            return Err(MaintenanceFailure::InvalidTransition);
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
+        let before = state
+            .tasks
+            .get(&dispatch.identity)
+            .cloned()
+            .ok_or(MaintenanceFailure::UnknownTask)?;
+        if before.task != *binding.publication
+            || before.task.class != MaintenanceTaskClass::RetentionPublication
+            || before.phase != MaintenanceTaskPhase::Running
+            || before.active_dispatch != Some(dispatch)
+            || before.cancellation_requested
+            || encode_record(&before)?.as_bytes() != binding.durable_record
+            || state.pending_task_transitions.contains(&dispatch.identity)
+            || state.tasks.contains_key(&binding.reclamation.identity)
+            || state
+                .pending_submissions
+                .contains(&binding.reclamation.identity)
+        {
+            return Err(MaintenanceFailure::PreconditionFailed);
+        }
+        let mut next = state.clone();
+        let publication_after = next
+            .tasks
+            .get_mut(&dispatch.identity)
+            .ok_or(MaintenanceFailure::UnknownTask)?;
+        publication_after.phase = MaintenanceTaskPhase::Succeeded;
+        publication_after.cancellation_requested = false;
+        publication_after.active_dispatch = None;
+        assign_terminal_order(&mut next, dispatch.identity)?;
+        let publication_after = next
+            .tasks
+            .get(&dispatch.identity)
+            .cloned()
+            .ok_or(MaintenanceFailure::UnknownTask)?;
+        let reclamation = TaskState {
+            task: binding.reclamation,
+            phase: MaintenanceTaskPhase::Queued,
+            submitted_at: before.submitted_at,
+            checkpoint: None,
+            pause_until: None,
+            cancellation_requested: false,
+            dispatches: 0,
+            terminal_order: None,
+            active_dispatch: None,
+        };
+        let publication_record = encode_record(&publication_after)?;
+        let reclamation_record = encode_record(&reclamation)?;
+        state.pending_task_transitions.insert(dispatch.identity);
+        state.pending_submissions.insert(reclamation.task.identity);
+        Ok(RetentionPublicationTaskCompletion {
+            publication_before: before,
+            publication_after,
+            reclamation,
+            next_terminal_order: next.next_terminal_order,
+            publication_record,
+            reclamation_record,
+        })
+    }
     pub(super) fn reconcile_running_snapshot_lease_expiry_completion(
         &self,
         dispatch: MaintenanceDispatch,
@@ -904,6 +1064,14 @@ impl MaintenanceCoordinator {
 }
 
 impl MaintenanceExecution<'_> {
+    pub(crate) fn prepare_running_retention_publication_completion(
+        &self,
+        coordinator: &MaintenanceCoordinator,
+        binding: RetentionPublicationBinding<'_, '_>,
+    ) -> Result<RetentionPublicationTaskCompletion, MaintenanceFailure> {
+        coordinator.prepare_running_retention_publication_completion(self.dispatch, binding)
+    }
+
     pub(crate) fn reconcile_running_snapshot_lease_expiry_completion(
         &self,
         coordinator: &MaintenanceCoordinator,
