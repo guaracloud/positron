@@ -33,6 +33,7 @@ fn partial_task_spawn_failure_aborts_started_tasks_and_releases_ownership()
         positron_runtime::ExitOutcome::TaskUnavailable(TaskRole::Api)
     );
     assert!(roots.acquire_volume_again().is_ok());
+    assert_registration_then_api_spawn(&tasks);
     assert_eq!(
         tasks
             .events
@@ -79,6 +80,7 @@ fn partial_spawn_with_failed_rollback_reports_internal_cleanup_failure()
     assert_eq!(cleanup.task_failures(), 1);
     assert_eq!(cleanup.listener_failures(), 1);
     assert!(roots.acquire_volume_again().is_ok());
+    assert_registration_then_api_spawn(&tasks);
     assert!(tasks.events.borrow().iter().any(|event| matches!(
         event,
         TaskEvent::Aborted(TaskRole::Operations, ProcessPhase::Recovering, true)
@@ -98,6 +100,39 @@ fn partial_spawn_with_failed_rollback_reports_internal_cleanup_failure()
         ]
     );
     Ok(())
+}
+
+fn assert_registration_then_api_spawn(tasks: &ObservingTasks) {
+    let events = tasks.events.borrow();
+    let expected = [
+        TaskRole::Control,
+        TaskRole::Operations,
+        TaskRole::Api,
+        TaskRole::OtlpGrpc,
+        TaskRole::OtlpHttp,
+        TaskRole::LokiPush,
+        TaskRole::Maintenance,
+    ];
+    assert_eq!(
+        events
+            .iter()
+            .filter_map(|event| match event {
+                TaskEvent::Registered(role) => Some(*role),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        expected
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter_map(|event| match event {
+                TaskEvent::Spawned(role) => Some(*role),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        [TaskRole::Control, TaskRole::Operations, TaskRole::Api]
+    );
 }
 
 #[test]

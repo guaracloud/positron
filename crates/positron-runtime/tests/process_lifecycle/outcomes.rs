@@ -434,6 +434,35 @@ fn first_signal_closes_admission_joins_registered_tasks_and_releases_ownership_l
     assert!(roots.acquire_volume_again().is_ok());
     let events = tasks.events.borrow();
     assert_eq!(events.len(), 21);
+    let expected = [
+        TaskRole::Control,
+        TaskRole::Operations,
+        TaskRole::Api,
+        TaskRole::OtlpGrpc,
+        TaskRole::OtlpHttp,
+        TaskRole::LokiPush,
+        TaskRole::Maintenance,
+    ];
+    assert_eq!(
+        events
+            .iter()
+            .filter_map(|event| match event {
+                TaskEvent::Registered(role) => Some(*role),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        expected
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter_map(|event| match event {
+                TaskEvent::Spawned(role) => Some(*role),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        expected
+    );
     assert!(matches!(
         events.last(),
         Some(TaskEvent::Joined(TaskRole::Maintenance, ..))
