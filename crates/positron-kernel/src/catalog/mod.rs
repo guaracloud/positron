@@ -1462,6 +1462,106 @@ impl<'authority> Catalog<'authority> {
         Ok(())
     }
 
+    /// Executes the sole system audit-reclamation capability after the
+    /// coordinator has durably marked its exact descriptor Running.  The
+    /// descriptor's anchor and receipt object identities are checked again
+    /// while holding the Catalog operation lease, before any audit frame can
+    /// be removed.
+    pub fn complete_running_audit_retention_reclamation(
+        &self,
+        coordinator: &MaintenanceCoordinator,
+        execution: &MaintenanceExecution<'_>,
+    ) -> Result<(), CatalogFailure> {
+        let mut physically_started = false;
+        let reclaimed = (|| {
+            let _operation = self
+                .operation
+                .lock()
+                .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
+            let secret = self
+                .secret
+                .lock()
+                .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
+            let anchor = audit_checkpoint::retention_anchor(&state.current)?
+                .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::InvalidInput))?;
+            let trust = audit_checkpoint::retention_trust(&state.current, self.instance)?;
+            anchor.verify(trust)?;
+            if audit_checkpoint::retention_reclamation_receipt(&state.current, &anchor)?.is_none() {
+                return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
+            }
+            let expected = Self::audit_retention_reclamation_task(&anchor)?;
+            if execution.task() != &expected {
+                return Err(CatalogFailure::new(CatalogFailureCode::InvalidInput));
+            }
+            let mut durable_record = None;
+            for object in state.current.plaintext_objects() {
+                if durable_task_record_identity(object)
+                    .map_err(|_| CatalogFailure::new(CatalogFailureCode::IntegrityCorruption))?
+                    == Some(expected.identity())
+                    && durable_record.replace(object).is_some()
+                {
+                    return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
+                }
+            }
+            let durable_record = durable_record
+                .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::IntegrityCorruption))?;
+            execution
+                .verify_running_catalog_reclamation(coordinator, durable_record)
+                .map_err(|_| CatalogFailure::new(CatalogFailureCode::InvalidInput))?;
+
+            for record in state
+                .audit
+                .iter()
+                .filter(|record| record.position() <= anchor.position())
+            {
+                if self
+                    .storage
+                    .audit_exists(record.position(), record.record_hash())?
+                {
+                    let encoded = self.storage.read_audit(
+                        &secret,
+                        self.instance,
+                        record.position(),
+                        record.record_hash(),
+                    )?;
+                    if codec::decode_audit(&encoded)? != *record {
+                        return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
+                    }
+                    physically_started = true;
+                    self.storage
+                        .reclaim_audit(record.position(), record.record_hash())?;
+                }
+            }
+            self.storage.synchronize_reclaimed_audit()?;
+            state
+                .audit
+                .retain(|record| record.position() > anchor.position());
+            Ok(())
+        })();
+        if let Err(failure) = reclaimed {
+            if physically_started {
+                execution
+                    .requeue_catalog_reclamation_and_persist(coordinator, self)
+                    .map_err(|_| CatalogFailure::new(CatalogFailureCode::StorageUnavailable))?;
+            }
+            return Err(failure);
+        }
+        if execution
+            .complete_catalog_reclamation_and_persist(coordinator, self)
+            .is_err()
+        {
+            execution
+                .requeue_catalog_reclamation_and_persist(coordinator, self)
+                .map_err(|_| CatalogFailure::new(CatalogFailureCode::StorageUnavailable))?;
+            return Err(CatalogFailure::new(CatalogFailureCode::StorageUnavailable));
+        }
+        Ok(())
+    }
+
     pub(crate) fn refresh_state(&self) -> Result<(), CatalogFailure> {
         let mut state = self
             .state

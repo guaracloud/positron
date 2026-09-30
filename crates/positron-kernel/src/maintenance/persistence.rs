@@ -1586,6 +1586,66 @@ impl MaintenanceCoordinator {
         self.complete_and_persist_dispatch_inner(catalog, dispatch, succeeded, Some(execution))
     }
 
+    fn complete_catalog_reclamation_and_persist_dispatch(
+        &self,
+        catalog: &Catalog<'_>,
+        dispatch: MaintenanceDispatch,
+    ) -> Result<(), MaintenanceFailure> {
+        self.complete_and_persist_dispatch(catalog, dispatch, true)
+    }
+
+    fn requeue_catalog_reclamation_and_persist_dispatch(
+        &self,
+        catalog: &Catalog<'_>,
+        dispatch: MaintenanceDispatch,
+    ) -> Result<(), MaintenanceFailure> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
+        let mut next = state.clone();
+        let task = next
+            .tasks
+            .get_mut(&dispatch.identity)
+            .ok_or(MaintenanceFailure::UnknownTask)?;
+        if task.task.class != MaintenanceTaskClass::CatalogReclamation
+            || task.phase != MaintenanceTaskPhase::Running
+            || task.active_dispatch != Some(dispatch)
+            || task.cancellation_requested
+        {
+            return Err(MaintenanceFailure::InvalidTransition);
+        }
+        task.phase = MaintenanceTaskPhase::Queued;
+        task.active_dispatch = None;
+        persist_task_state(catalog, task, None)?;
+        *state = next;
+        Ok(())
+    }
+
+    fn verify_running_catalog_reclamation_dispatch(
+        &self,
+        dispatch: MaintenanceDispatch,
+        durable_record: &[u8],
+    ) -> Result<(), MaintenanceFailure> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
+        let task = state
+            .tasks
+            .get(&dispatch.identity)
+            .ok_or(MaintenanceFailure::UnknownTask)?;
+        if task.task.class != MaintenanceTaskClass::CatalogReclamation
+            || task.phase != MaintenanceTaskPhase::Running
+            || task.active_dispatch != Some(dispatch)
+            || task.cancellation_requested
+            || encode_record(task)?.as_bytes() != durable_record
+        {
+            return Err(MaintenanceFailure::PreconditionFailed);
+        }
+        Ok(())
+    }
+
     fn requeue_admitted_dispatch(
         &self,
         catalog: &Catalog<'_>,
@@ -1730,6 +1790,38 @@ impl MaintenanceCoordinator {
 }
 
 impl MaintenanceExecution<'_> {
+    pub(crate) fn verify_running_catalog_reclamation(
+        &self,
+        coordinator: &MaintenanceCoordinator,
+        durable_record: &[u8],
+    ) -> Result<(), MaintenanceFailure> {
+        if self.task.class != MaintenanceTaskClass::CatalogReclamation {
+            return Err(MaintenanceFailure::InvalidInput);
+        }
+        coordinator.verify_running_catalog_reclamation_dispatch(self.dispatch, durable_record)
+    }
+
+    pub(crate) fn complete_catalog_reclamation_and_persist(
+        &self,
+        coordinator: &MaintenanceCoordinator,
+        catalog: &Catalog<'_>,
+    ) -> Result<(), MaintenanceFailure> {
+        if self.task.class != MaintenanceTaskClass::CatalogReclamation {
+            return Err(MaintenanceFailure::InvalidInput);
+        }
+        coordinator.complete_catalog_reclamation_and_persist_dispatch(catalog, self.dispatch)
+    }
+
+    pub(crate) fn requeue_catalog_reclamation_and_persist(
+        &self,
+        coordinator: &MaintenanceCoordinator,
+        catalog: &Catalog<'_>,
+    ) -> Result<(), MaintenanceFailure> {
+        if self.task.class != MaintenanceTaskClass::CatalogReclamation {
+            return Err(MaintenanceFailure::InvalidInput);
+        }
+        coordinator.requeue_catalog_reclamation_and_persist_dispatch(catalog, self.dispatch)
+    }
     pub(crate) fn prepare_running_retention_reclamation_completion(
         &self,
         coordinator: &MaintenanceCoordinator,
@@ -1815,6 +1907,9 @@ impl MaintenanceExecution<'_> {
         catalog: &Catalog<'_>,
         checkpoint: MaintenanceCheckpoint,
     ) -> Result<(), MaintenanceFailure> {
+        if self.task.class == MaintenanceTaskClass::CatalogReclamation {
+            return Err(MaintenanceFailure::InvalidTransition);
+        }
         coordinator.checkpoint_and_persist_dispatch(catalog, self.dispatch, checkpoint)
     }
 
@@ -1826,7 +1921,14 @@ impl MaintenanceExecution<'_> {
         catalog: &Catalog<'_>,
         succeeded: bool,
     ) -> Result<(), MaintenanceFailure> {
-        if self.task.class == MaintenanceTaskClass::GovernanceAuditCheckpoint {
+        if matches!(
+            self.task.class,
+            MaintenanceTaskClass::GovernanceAuditCheckpoint
+                | MaintenanceTaskClass::CatalogReclamation
+        ) {
+            if self.task.class == MaintenanceTaskClass::CatalogReclamation {
+                return Err(MaintenanceFailure::InvalidTransition);
+            }
             coordinator.complete_and_persist_admitted_dispatch(
                 catalog,
                 self.dispatch,

@@ -1,6 +1,7 @@
 use std::error::Error;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::num::NonZeroU64;
+use std::sync::Arc;
 
 use positron_domain::identity::{Scope, TenantId, TenantSlug};
 use positron_governance::{
@@ -13,6 +14,7 @@ use positron_kernel::{
     with_catalog_publication_fault_after,
 };
 
+use super::super::ServiceHandle;
 use super::schema_maintenance::{Fixture, open_catalog};
 use crate::BootstrapFailureCode;
 
@@ -117,6 +119,10 @@ fn system_audit_retention_replays_an_immutable_receipt_after_successor_compactio
         AdministrativeIdempotencyKey::new([0xd2; 16])?,
     )?;
     assert_eq!(successor.policy_generation(), ResourceGeneration::new(3)?);
+    assert!(
+        ServiceHandle::new(Arc::clone(&initialized))?.wake_maintenance_worker()?,
+        "the runtime worker completes the successor's queued audit reclamation"
+    );
     assert_eq!(initialized.governance_audit_for_test()?.len(), 1);
     drop(initialized);
 
@@ -157,6 +163,7 @@ fn retained_governance_audit_history_verifies_after_reopen() -> Result<(), Box<d
         ResourceGeneration::new(1)?,
         AdministrativeIdempotencyKey::new([0xda; 16])?,
     )?;
+    assert!(ServiceHandle::new(Arc::clone(&initialized))?.wake_maintenance_worker()?);
     drop(initialized);
 
     let reopened = fixture.reopen()?;
@@ -201,6 +208,7 @@ fn retained_audit_verifier_accepts_the_prior_trusted_anchor_and_rejects_a_foreig
         ResourceGeneration::new(1)?,
         AdministrativeIdempotencyKey::new([0xde; 16])?,
     )?;
+    assert!(ServiceHandle::new(Arc::clone(&initialized))?.wake_maintenance_worker()?);
     drop(initialized);
     let reopened = fixture.reopen()?;
     let actor = reopened.attribute(
@@ -551,6 +559,43 @@ fn committed_system_audit_retention_queues_reclamation_before_physical_mutation(
         initialized.governance_audit_for_test()?.len(),
         audit_before + 1,
         "a policy update only makes physical audit reclamation eligible; its worker has not run"
+    );
+    Ok(())
+}
+
+#[test]
+fn runtime_worker_physically_reclaims_a_receipt_bound_system_audit_prefix()
+-> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let (initialized, _, _, administrator_secret) = fixture.initialized_with_admin()?;
+    let actor = initialized.attribute(
+        PresentedCredential::parse(&administrator_secret)?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    initialized.update_system_audit_retention(
+        actor,
+        NonZeroU64::new(2).ok_or("nonzero retained audit-record limit")?,
+        ResourceGeneration::new(1)?,
+        AdministrativeIdempotencyKey::new([0xf0; 16])?,
+    )?;
+    initialized.update_system_audit_retention(
+        actor,
+        NonZeroU64::new(1).ok_or("nonzero retained audit-record limit")?,
+        ResourceGeneration::new(2)?,
+        AdministrativeIdempotencyKey::new([0xf1; 16])?,
+    )?;
+    let before = initialized.governance_audit_for_test()?;
+    let services = ServiceHandle::new(Arc::clone(&initialized))?;
+
+    assert!(
+        services.wake_maintenance_worker()?,
+        "the installed coordinator handler dispatches the queued audit reclaimer"
+    );
+    let after = initialized.governance_audit_for_test()?;
+    assert!(
+        after.len() < before.len(),
+        "the receipt-bound handler physically reclaims the authorized audit prefix"
     );
     Ok(())
 }
