@@ -1191,6 +1191,28 @@ fn lost_system_audit_retention_ack_replays_only_its_exact_queued_reclaimer()
     let records_before = coordinator
         .durable_records()
         .expect("durable task records before replay");
+    let record_identities_before = records_before
+        .iter()
+        .map(|record| maintenance_task_record_identity(record.as_bytes()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let running_record_before = records_before
+        .iter()
+        .find(|record| {
+            maintenance_task_record_identity(record.as_bytes())
+                .is_ok_and(|identity| identity == running_id)
+        })
+        .ok_or("durable unrelated running task record")?
+        .as_bytes()
+        .to_vec();
+    let paused_record_before = records_before
+        .iter()
+        .find(|record| {
+            maintenance_task_record_identity(record.as_bytes())
+                .is_ok_and(|identity| identity == paused_id)
+        })
+        .ok_or("durable unrelated paused task record")?
+        .as_bytes()
+        .to_vec();
     drop(coordinator);
     drop(catalog);
 
@@ -1212,19 +1234,32 @@ fn lost_system_audit_retention_ack_replays_only_its_exact_queued_reclaimer()
         "the committed publication acknowledgement is lost"
     );
     let catalog = open_catalog(&initialized)?;
-    let durable_reclaimer = MaintenanceCoordinator::restore_from_catalog(&catalog)
-        .expect("recover committed task records")
+    let recovered_coordinator = MaintenanceCoordinator::restore_from_catalog(&catalog)
+        .expect("typed recovered maintenance state");
+    let recovered = recovered_coordinator
         .durable_records()
-        .expect("recovered durable task records")
-        .into_iter()
-        .find(|record| {
-            !records_before
-                .iter()
-                .any(|before| before.as_bytes() == record.as_bytes())
-        })
-        .ok_or("exact committed reclaimer record")?
-        .as_bytes()
-        .to_vec();
+        .expect("recovered durable task records");
+    let mut committed_reclaimers = Vec::new();
+    for record in recovered {
+        let identity = maintenance_task_record_identity(record.as_bytes())?;
+        let status = recovered_coordinator
+            .status(identity)
+            .expect("typed recovered maintenance task");
+        if !record_identities_before.contains(&identity)
+            && status.task().class() == MaintenanceTaskClass::CatalogReclamation
+            && status.phase() == MaintenanceTaskPhase::Queued
+        {
+            committed_reclaimers.push((identity, status));
+        }
+    }
+    assert_eq!(
+        committed_reclaimers.len(),
+        1,
+        "the acknowledged-lost publication contributes one new queued CatalogReclamation descriptor"
+    );
+    let (reclaimer_id, recovered_reclaimer) = committed_reclaimers
+        .pop()
+        .ok_or("exact committed reclaimer")?;
     drop(catalog);
     let live_records_before_replay = initialized
         .maintenance_coordinator()
@@ -1233,9 +1268,10 @@ fn lost_system_audit_retention_ack_replays_only_its_exact_queued_reclaimer()
         .durable_records()
         .expect("live durable records before replay");
     assert!(
-        !live_records_before_replay
-            .iter()
-            .any(|record| record.as_bytes() == durable_reclaimer.as_slice()),
+        live_records_before_replay.iter().all(|record| {
+            maintenance_task_record_identity(record.as_bytes())
+                .is_ok_and(|identity| identity != reclaimer_id)
+        }),
         "the post-commit acknowledgement loss leaves the exact durable reclaimer absent from memory"
     );
 
@@ -1262,13 +1298,39 @@ fn lost_system_audit_retention_ack_replays_only_its_exact_queued_reclaimer()
             .expect("paused task status after replay"),
         paused_before
     );
-    assert!(
+    assert_eq!(
         coordinator
-            .durable_records()
-            .expect("durable records after replay")
+            .status(reclaimer_id)
+            .expect("replayed CatalogReclamation status"),
+        recovered_reclaimer,
+        "replay attaches the exact durable queued CatalogReclamation descriptor"
+    );
+    let records_after_replay = coordinator
+        .durable_records()
+        .expect("durable records after replay");
+    assert_eq!(
+        records_after_replay
             .iter()
-            .any(|record| record.as_bytes() == durable_reclaimer.as_slice()),
-        "replay attaches the exact durable queued task without replacing the registry"
+            .find(|record| {
+                maintenance_task_record_identity(record.as_bytes())
+                    .is_ok_and(|identity| identity == running_id)
+            })
+            .ok_or("durable unrelated running task after replay")?
+            .as_bytes(),
+        running_record_before,
+        "replay preserves the unrelated running cancellation record byte-for-byte"
+    );
+    assert_eq!(
+        records_after_replay
+            .iter()
+            .find(|record| {
+                maintenance_task_record_identity(record.as_bytes())
+                    .is_ok_and(|identity| identity == paused_id)
+            })
+            .ok_or("durable unrelated paused task after replay")?
+            .as_bytes(),
+        paused_record_before,
+        "replay preserves the unrelated paused record byte-for-byte"
     );
     drop(running_execution);
     Ok(())
@@ -1367,6 +1429,15 @@ fn retention_capacity_refusal_does_not_publish_a_partial_successor() -> Result<(
     assert_eq!(initialized.catalog_generation(), generation_before);
     assert_eq!(initialized.governance_audit_for_test()?, audit_before);
     Ok(())
+}
+
+fn maintenance_task_record_identity(record: &[u8]) -> Result<MaintenanceTaskId, Box<dyn Error>> {
+    let bytes: [u8; 16] = record
+        .get(8..24)
+        .ok_or("encoded maintenance task identity")?
+        .try_into()
+        .map_err(|_| "maintenance task identity length")?;
+    Ok(MaintenanceTaskId::new(bytes).expect("encoded maintenance task identity"))
 }
 
 fn replace_system_retention_receipt_for_test(
