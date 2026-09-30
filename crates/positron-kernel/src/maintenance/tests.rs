@@ -16,6 +16,28 @@ mod retention_publication;
 
 static NEXT_CATALOG_ROOT: AtomicU64 = AtomicU64::new(0);
 
+#[test]
+fn governance_audit_checkpoint_binding_rejects_malformed_checkpoints() {
+    let valid = GovernanceAuditCheckpointBinding::new(1, [1; 32], [2; 32])
+        .expect("nonzero binding")
+        .checkpoint()
+        .expect("bounded checkpoint");
+    assert!(GovernanceAuditCheckpointBinding::from_checkpoint(Some(&valid)).is_ok());
+
+    for checkpoint in [
+        None,
+        Some(MaintenanceCheckpoint::new(2, 0, valid.opaque_progress().to_vec()).expect("shape")),
+        Some(MaintenanceCheckpoint::new(1, 1, valid.opaque_progress().to_vec()).expect("shape")),
+        Some(MaintenanceCheckpoint::new(1, 0, vec![0; 79]).expect("shape")),
+        Some(MaintenanceCheckpoint::new(1, 0, vec![0; 80]).expect("shape")),
+    ] {
+        assert_eq!(
+            GovernanceAuditCheckpointBinding::from_checkpoint(checkpoint.as_ref()),
+            Err(MaintenanceFailure::InvalidInput)
+        );
+    }
+}
+
 struct CatalogRoot(PathBuf);
 
 impl CatalogRoot {
