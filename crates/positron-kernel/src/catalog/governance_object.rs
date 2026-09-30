@@ -713,6 +713,14 @@ pub struct CatalogLogRetentionPolicy {
 }
 
 impl CatalogLogRetentionPolicy {
+    /// The authenticated governance object from which this exact policy was
+    /// derived. A later object with the same duration is still a different
+    /// policy authority for an already-admitted maintenance task.
+    #[must_use]
+    pub const fn object_id(&self) -> CatalogObjectId {
+        self.object
+    }
+
     #[must_use]
     pub const fn instance(&self) -> InstanceId {
         self.instance

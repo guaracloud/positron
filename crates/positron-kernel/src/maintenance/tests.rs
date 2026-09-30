@@ -138,7 +138,7 @@ fn tenant_task(identity: u8, tenant: TenantId, reservations: ResourceAmounts) ->
 fn catalog_task(identity: u8) -> MaintenanceTask {
     MaintenanceTask::with_contract(
         MaintenanceTaskId::new([identity; 16]).expect("stable task identity"),
-        MaintenanceTaskClass::Compaction,
+        MaintenanceTaskClass::RepositoryVerification,
         MaintenanceScope::system(),
         MaintenanceTrigger::Event,
         MaintenancePreconditions::new(4, 9).expect("preconditions"),
@@ -147,6 +147,40 @@ fn catalog_task(identity: u8) -> MaintenanceTask {
         ResourceAmounts::new([1; 11]),
     )
     .expect("bounded task")
+}
+
+#[test]
+fn generic_submission_cannot_persist_a_compaction_without_its_typed_binding()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = CatalogRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
+    let authority = crate::catalog::tests::support::establish_catalog_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new(nonzero_id(0x57))?,
+        CatalogSecret::from_owned(Box::new([0x58; 32]), Box::new([0x59; 32])),
+    )?;
+    let coordinator = MaintenanceCoordinator::new();
+    let task = task(
+        0x5a,
+        MaintenanceTaskClass::Compaction,
+        MaintenanceTrigger::Event,
+        MaintenancePriority::Required,
+        Vec::new(),
+    );
+    assert_eq!(
+        coordinator
+            .submit_and_persist(&catalog, task, 1)
+            .expect_err("generic ingress must not create an unbound compaction"),
+        MaintenanceFailure::InvalidInput
+    );
+    assert!(
+        coordinator
+            .durable_records()
+            .expect("refused ingress has no durable task record")
+            .is_empty()
+    );
+    Ok(())
 }
 
 fn snapshot_lease_expiry_task(
@@ -538,7 +572,7 @@ fn submitted_work_is_visible_to_the_single_scheduler() {
     let coordinator = MaintenanceCoordinator::new();
     let task = MaintenanceTask::new(
         MaintenanceTaskId::new([8; 16]).expect("non-zero stable identity"),
-        MaintenanceTaskClass::Compaction,
+        MaintenanceTaskClass::SchemaStatistics,
     );
     coordinator.submit(task.clone()).expect("task is accepted");
 
@@ -554,7 +588,7 @@ fn conflicting_copy_on_write_work_waits_for_the_running_owner() {
     let input = MaintenanceObjectId::new([3; 32]).expect("object identity");
     let first = task(
         1,
-        MaintenanceTaskClass::Compaction,
+        MaintenanceTaskClass::SchemaStatistics,
         MaintenanceTrigger::Event,
         MaintenancePriority::Ordinary,
         vec![input],
@@ -1304,7 +1338,7 @@ fn catalog_checkpoint_reopen_restores_one_queued_task_with_its_progress()
     let coordinator = MaintenanceCoordinator::new();
     let task = MaintenanceTask::with_contract(
         MaintenanceTaskId::new([42; 16]).expect("stable task identity"),
-        MaintenanceTaskClass::Compaction,
+        MaintenanceTaskClass::SchemaStatistics,
         MaintenanceScope::system(),
         MaintenanceTrigger::Event,
         MaintenancePreconditions::new(4, 9).expect("preconditions"),
@@ -1416,7 +1450,7 @@ fn catalog_submission_fault_leaves_no_in_memory_task_and_exact_retry_publishes_o
     let coordinator = MaintenanceCoordinator::new();
     let task = MaintenanceTask::with_contract(
         MaintenanceTaskId::new([43; 16]).expect("stable task identity"),
-        MaintenanceTaskClass::Compaction,
+        MaintenanceTaskClass::SchemaStatistics,
         MaintenanceScope::system(),
         MaintenanceTrigger::Event,
         MaintenancePreconditions::new(4, 9).expect("preconditions"),
@@ -1567,7 +1601,12 @@ fn catalog_pause_and_finite_window_survive_reopen_without_deferring_past_expiry(
         .resume_and_persist(&catalog, identity)
         .expect("resume must publish");
     coordinator
-        .set_window_and_persist(&catalog, [MaintenanceTaskClass::Compaction], 20, 9)
+        .set_window_and_persist(
+            &catalog,
+            [MaintenanceTaskClass::RepositoryVerification],
+            20,
+            9,
+        )
         .expect("window must publish");
     drop(catalog);
 

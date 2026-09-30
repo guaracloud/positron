@@ -14,8 +14,12 @@ use crate::{
     ResourceDimension, ResourceReservation, StorageKernelResourceAuthority, WorkClaim, WorkKind,
 };
 
+mod compaction;
 mod persistence;
 mod record;
+
+pub use compaction::CompactionBinding;
+pub(crate) use compaction::{compaction_task_record_bytes, compaction_task_record_working_bytes};
 
 pub(crate) use persistence::{
     SnapshotLeaseExpiryTaskReplacement, retention_publication_record_bytes_bound,

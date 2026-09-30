@@ -100,7 +100,7 @@ fn governance_policy(instance: [u8; 16], tenant: TenantId, retention_seconds: u6
     encoded
 }
 
-fn install_governance_policy(
+pub(super) fn install_governance_policy(
     catalog: &Catalog<'_>,
     instance: InstanceId,
     tenant: TenantId,

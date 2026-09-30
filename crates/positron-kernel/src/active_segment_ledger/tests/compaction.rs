@@ -4,6 +4,7 @@ use std::fs;
 
 use positron_domain::identity::TenantId;
 use positron_domain::routing::{SignalKind, VirtualShardId};
+use positron_domain::time::UnixNanoseconds;
 
 use super::support::{TemporaryRoot, establish_authority};
 use crate::active_segment_ledger::SegmentRetention;
@@ -17,13 +18,17 @@ use crate::catalog::{CatalogFileEvent, with_catalog_fault};
 use crate::{
     ActiveSegmentLedger, Catalog, CatalogObject, CatalogProposal, CatalogSecret, CommittedBlock,
     CompactionBlock, FormatEpoch, IngestTime, InstanceId, LedgerCompletionState, LedgerFailureCode,
-    MountQualification, PrimaryDataVolume, RecoveryWorkClaim, RecoveryWorkKind, ResourceAmounts,
-    ResourceDimension, RetentionTimeAuthority, SegmentId, SegmentProtectionKey, SegmentScope,
-    StoreBlockIdentity, TransactionId, WorkClaim, WorkKind,
+    MaintenanceCoordinator, MaintenanceTaskId, MountQualification, PrimaryDataVolume,
+    RecoveryWorkClaim, RecoveryWorkKind, ResourceAmounts, ResourceDimension, RetentionBucket,
+    RetentionTimeAuthority, SegmentId, SegmentProtectionKey, SegmentScope, StoreBlockIdentity,
+    TransactionId, WorkClaim, WorkKind,
 };
 
 #[cfg(feature = "test-support")]
-use crate::{CatalogPublicationFault, with_catalog_publication_ambiguity_hook_after};
+use crate::{
+    CatalogPublicationFault, with_catalog_publication_ambiguity_hook_after,
+    with_catalog_publication_fault_after, with_catalog_publication_fault_sequence_after,
+};
 
 fn preparation_capacity<'authority>(
     authority: &'authority crate::StorageKernelResourceAuthority,
@@ -1497,20 +1502,16 @@ fn successful_compaction_replaces_sealed_sources_and_survives_reopen() -> Result
     let catalog_objects = u64::try_from(catalog_snapshot.plaintext_object_count())?;
     let expected = |dimension| match dimension {
         ResourceDimension::MemoryBytes => {
-            payload_bytes * 5 + 2 * 256 + catalog_bytes * 2 + catalog_objects * 256
+            payload_bytes * 5 + 2 * 256 + catalog_bytes + catalog_objects * 64
         },
         ResourceDimension::QueueSlots | ResourceDimension::TaskSlots => 1,
-        ResourceDimension::BufferCacheBytes => {
-            payload_bytes * 2 + 2 * (384 + 1_024) + catalog_bytes * 2 + catalog_objects * 512
-        },
+        ResourceDimension::BufferCacheBytes => payload_bytes * 2 + 2 * (384 + 1_024),
         ResourceDimension::BatchItems => 9 + catalog_objects,
         ResourceDimension::LeaseSlots => 0,
         ResourceDimension::RetrySlots | ResourceDimension::IoPermits => 1,
-        ResourceDimension::CpuWorkUnits => 9 + catalog_objects,
+        ResourceDimension::CpuWorkUnits => 1,
         ResourceDimension::FileDescriptors => 6,
-        ResourceDimension::DiskHeadroomBytes => {
-            payload_bytes * 2 + 2 * (384 + 1_024) + catalog_bytes * 2 + catalog_objects * 512
-        },
+        ResourceDimension::DiskHeadroomBytes => payload_bytes * 2 + 2 * (384 + 1_024),
     };
     for dimension in ResourceDimension::ALL {
         let before_usage = governor_before
@@ -1563,6 +1564,642 @@ fn successful_compaction_replaces_sealed_sources_and_survives_reopen() -> Result
     assert_eq!(recovered.blocks().len(), 2);
     assert_eq!(recovered.blocks()[0].payload(), b"successful-first");
     assert_eq!(recovered.blocks()[1].payload(), b"successful-second");
+    Ok(())
+}
+
+#[test]
+fn typed_compaction_task_couples_the_exact_manifest_and_terminal_record()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_authority(volume)?;
+    let instance = InstanceId::new([0xe1; 16])?;
+    let catalog = Catalog::open(
+        &authority,
+        instance,
+        CatalogSecret::from_owned(Box::new([0xe2; 32]), Box::new([0xe3; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x64; 16])?;
+    super::retention_frontier::install_governance_policy(&catalog, instance, tenant, 60, 0xe4)?;
+    let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(61)?);
+    let retention_time = RetentionTimeAuthority::establish()?;
+    let key = || SegmentProtectionKey::from_owned(Box::new([0xe5; 32]));
+    for (identity, payload) in [
+        ([0xe6; 16], b"bound-first".as_slice()),
+        ([0xe7; 16], b"bound-second".as_slice()),
+    ] {
+        let source = ActiveSegmentLedger::open_with_retention_time(
+            &authority,
+            &retention_time,
+            &catalog,
+            scope,
+            key(),
+        )?;
+        source.append(
+            source
+                .begin_store_block(
+                    preparation_capacity(&authority, tenant)?,
+                    StoreBlockIdentity::new(identity)?,
+                )?
+                .finish(payload.to_vec())?,
+        )?;
+        source.seal()?;
+    }
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    let snapshot = ledger.snapshot()?;
+    let blocks = snapshot
+        .blocks()
+        .iter()
+        .map(|block| compaction_block(scope, block))
+        .collect::<Result<Vec<_>, _>>()?;
+    let policy = catalog.pin()?.retention_policy(SignalKind::Logs)?;
+    let bucket = RetentionBucket::for_ingest_time(
+        tenant,
+        SignalKind::Logs,
+        blocks[0].ingest_time,
+        policy.retention_seconds(),
+    )?;
+    let generation_before_binding_refusals = catalog.pin()?.number();
+    let mut wrong_scope = blocks.clone();
+    wrong_scope[0].scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(65)?);
+    let wrong_scope_failure = match ledger.prepare_compaction_task(
+        &wrong_scope,
+        bucket,
+        MaintenanceTaskId::new([0xa1; 16]).expect("wrong-scope task identity"),
+    ) {
+        Ok(_) => return Err("a Compaction descriptor bound a foreign physical scope".into()),
+        Err(failure) => failure,
+    };
+    assert_eq!(
+        wrong_scope_failure.code(),
+        LedgerFailureCode::StaleGeneration
+    );
+    let outside_bucket = RetentionBucket::for_ingest_time(
+        tenant,
+        SignalKind::Logs,
+        IngestTime::from_authenticated_durable(UnixNanoseconds::new(
+            blocks[0]
+                .ingest_time
+                .instant()
+                .value()
+                .checked_add(120_000_000_000)
+                .ok_or("bucket fixture overflow")?,
+        )),
+        policy.retention_seconds(),
+    )?;
+    let wrong_bucket_failure = match ledger.prepare_compaction_task(
+        &blocks,
+        outside_bucket,
+        MaintenanceTaskId::new([0xa2; 16]).expect("wrong-bucket task identity"),
+    ) {
+        Ok(_) => {
+            return Err("a Compaction descriptor bound sources outside its fixed bucket".into());
+        },
+        Err(failure) => failure,
+    };
+    assert_eq!(
+        wrong_bucket_failure.code(),
+        LedgerFailureCode::StaleGeneration
+    );
+    assert_eq!(catalog.pin()?.number(), generation_before_binding_refusals);
+    let identity = MaintenanceTaskId::new([0xe8; 16]).expect("task identity");
+    let task = ledger.prepare_compaction_task(&blocks, bucket, identity)?;
+    let coordinator = MaintenanceCoordinator::new();
+    task.submit_and_persist(&coordinator, &catalog, 1)?;
+    let execution = coordinator
+        .start_compaction_task_with_reservation_and_persist(
+            &catalog, &authority, 1, false, identity,
+        )
+        .expect("typed task starts")
+        .expect("typed task dispatches");
+    let unrelated_bytes = vec![0xa5; 1_048_576];
+    let adding_basis = catalog.pin()?;
+    let mut grown_objects = adding_basis
+        .plaintext_objects()
+        .map(|bytes| CatalogObject::new(bytes.to_vec()))
+        .collect::<Result<Vec<_>, _>>()?;
+    grown_objects.push(CatalogObject::new(unrelated_bytes.clone())?);
+    catalog.commit(
+        adding_basis.identity(),
+        CatalogProposal::new(
+            TransactionId::new([0xa5; 16])?,
+            FormatEpoch::CATALOG_V1,
+            grown_objects,
+        )?,
+        None,
+    )?;
+    let growth_refusal_preparation = ledger.prepare_compaction_with_policy(&snapshot, policy)?;
+    let generation_before_growth_refusal = catalog.pin()?.number();
+    let growth_refusal = ledger
+        .compact_sealed_with_maintenance(
+            blocks.clone(),
+            growth_refusal_preparation,
+            &coordinator,
+            &execution,
+            || false,
+        )
+        .expect_err("current Catalog growth cannot make an immutable Compaction grant underclaim");
+    assert_eq!(
+        growth_refusal.code(),
+        LedgerFailureCode::ResourceAdmissionRefused
+    );
+    assert_eq!(catalog.pin()?.number(), generation_before_growth_refusal);
+    assert_eq!(
+        coordinator.status(identity).expect("running task").phase(),
+        crate::MaintenanceTaskPhase::Running
+    );
+    let removing_basis = catalog.pin()?;
+    let restored_objects = removing_basis
+        .plaintext_objects()
+        .filter(|bytes| *bytes != unrelated_bytes.as_slice())
+        .map(|bytes| CatalogObject::new(bytes.to_vec()))
+        .collect::<Result<Vec<_>, _>>()?;
+    catalog.commit(
+        removing_basis.identity(),
+        CatalogProposal::new(
+            TransactionId::new([0xa6; 16])?,
+            FormatEpoch::CATALOG_V1,
+            restored_objects,
+        )?,
+        None,
+    )?;
+    let mut rewritten_source = blocks.clone();
+    rewritten_source[0].source_segment = rewritten_source[1].source_segment;
+    let refusal_preparation = ledger.prepare_compaction_with_policy(&snapshot, policy)?;
+    let generation_before_refusal = catalog.pin()?.number();
+    let refusal = ledger
+        .compact_sealed_with_maintenance(
+            rewritten_source,
+            refusal_preparation,
+            &coordinator,
+            &execution,
+            || false,
+        )
+        .expect_err("a running task cannot rewrite its immutable sealed-source binding");
+    assert_eq!(refusal.code(), LedgerFailureCode::StaleGeneration);
+    assert_eq!(catalog.pin()?.number(), generation_before_refusal);
+    assert_eq!(
+        coordinator.status(identity).expect("running task").phase(),
+        crate::MaintenanceTaskPhase::Running
+    );
+    super::retention_frontier::install_governance_policy(&catalog, instance, tenant, 120, 0xa3)?;
+    let changed_policy = catalog.pin()?.retention_policy(SignalKind::Logs)?;
+    let policy_refusal_preparation =
+        ledger.prepare_compaction_with_policy(&snapshot, changed_policy)?;
+    let generation_before_policy_refusal = catalog.pin()?.number();
+    let policy_refusal = ledger
+        .compact_sealed_with_maintenance(
+            blocks.clone(),
+            policy_refusal_preparation,
+            &coordinator,
+            &execution,
+            || false,
+        )
+        .expect_err("a running task cannot substitute a later retention policy object");
+    assert_eq!(policy_refusal.code(), LedgerFailureCode::StaleGeneration);
+    assert_eq!(catalog.pin()?.number(), generation_before_policy_refusal);
+    assert_eq!(
+        coordinator.status(identity).expect("running task").phase(),
+        crate::MaintenanceTaskPhase::Running
+    );
+    super::retention_frontier::install_governance_policy(&catalog, instance, tenant, 60, 0xa4)?;
+    let preparation = ledger
+        .prepare_compaction_with_policy(&snapshot, policy)
+        .map_err(|failure| format!("execution preparation: {failure:?}"))?;
+    let generation = catalog.pin()?.number();
+    ledger
+        .compact_sealed_with_maintenance(blocks, preparation, &coordinator, &execution, || false)
+        .map_err(|failure| format!("typed execution: {failure:?}"))?;
+    assert_eq!(
+        coordinator.status(identity).expect("terminal task").phase(),
+        crate::MaintenanceTaskPhase::Succeeded
+    );
+    assert_eq!(
+        catalog.pin()?.number(),
+        generation + 1,
+        "output metadata and terminal PMTC share one Catalog generation"
+    );
+    assert_eq!(
+        MaintenanceCoordinator::restore_from_catalog(&catalog)
+            .expect("restore")
+            .status(identity)
+            .expect("restored task")
+            .phase(),
+        crate::MaintenanceTaskPhase::Succeeded
+    );
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn typed_compaction_recovers_the_exact_output_and_terminal_pair_after_lost_ack()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_authority(volume)?;
+    let instance = InstanceId::new([0xe9; 16])?;
+    let catalog = Catalog::open(
+        &authority,
+        instance,
+        CatalogSecret::from_owned(Box::new([0xea; 32]), Box::new([0xeb; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x64; 16])?;
+    super::retention_frontier::install_governance_policy(&catalog, instance, tenant, 60, 0xec)?;
+    let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(62)?);
+    let retention_time = RetentionTimeAuthority::establish()?;
+    let key = || SegmentProtectionKey::from_owned(Box::new([0xed; 32]));
+    for (identity, payload) in [
+        ([0xee; 16], b"lost-ack-first".as_slice()),
+        ([0xef; 16], b"lost-ack-second".as_slice()),
+    ] {
+        let source = ActiveSegmentLedger::open_with_retention_time(
+            &authority,
+            &retention_time,
+            &catalog,
+            scope,
+            key(),
+        )?;
+        source.append(
+            source
+                .begin_store_block(
+                    preparation_capacity(&authority, tenant)?,
+                    StoreBlockIdentity::new(identity)?,
+                )?
+                .finish(payload.to_vec())?,
+        )?;
+        source.seal()?;
+    }
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    let snapshot = ledger.snapshot()?;
+    let blocks = snapshot
+        .blocks()
+        .iter()
+        .map(|block| compaction_block(scope, block))
+        .collect::<Result<Vec<_>, _>>()?;
+    let policy = catalog.pin()?.retention_policy(SignalKind::Logs)?;
+    let bucket = RetentionBucket::for_ingest_time(
+        tenant,
+        SignalKind::Logs,
+        blocks[0].ingest_time,
+        policy.retention_seconds(),
+    )?;
+    let identity = MaintenanceTaskId::new([0xf0; 16]).expect("task identity");
+    let task = ledger.prepare_compaction_task(&blocks, bucket, identity)?;
+    let coordinator = MaintenanceCoordinator::new();
+    task.submit_and_persist(&coordinator, &catalog, 1)?;
+    let execution = coordinator
+        .start_compaction_task_with_reservation_and_persist(
+            &catalog, &authority, 1, false, identity,
+        )
+        .expect("typed compaction starts")
+        .ok_or("typed compaction dispatch")?;
+    let preparation = ledger.prepare_compaction_with_policy(&snapshot, policy)?;
+    let generation = catalog.pin()?.number();
+    let publication = with_catalog_publication_fault_after(
+        CatalogPublicationFault::SynchronizeGenerationDirectory,
+        0,
+        || {
+            ledger.compact_sealed_with_maintenance(
+                blocks.clone(),
+                preparation,
+                &coordinator,
+                &execution,
+                || false,
+            )
+        },
+    )?;
+    assert_eq!(publication.input_segments(), 2);
+    assert_eq!(publication.output_segments(), 1);
+    assert_eq!(
+        coordinator
+            .status(identity)
+            .expect("succeeded task")
+            .phase(),
+        crate::MaintenanceTaskPhase::Succeeded,
+        "the original coordinator installs success only after proving the exact durable pair"
+    );
+    catalog.refresh_state()?;
+    assert_eq!(catalog.pin()?.number(), generation + 1);
+    let output_segments = ledger
+        .snapshot()?
+        .blocks()
+        .iter()
+        .map(CommittedBlock::segment_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        output_segments.len(),
+        1,
+        "one exact output manifest is current"
+    );
+    let recovered = MaintenanceCoordinator::restore_from_catalog(&catalog).expect("restore");
+    assert_eq!(
+        recovered.status(identity).expect("restored task").phase(),
+        crate::MaintenanceTaskPhase::Succeeded,
+        "the one durable terminal PMTC record is restored with the output generation"
+    );
+    drop(snapshot);
+    drop(ledger);
+    let reopened = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    let output = reopened.snapshot()?;
+    assert_eq!(
+        output.blocks().len(),
+        2,
+        "recovery must not duplicate output blocks"
+    );
+    assert_eq!(
+        output
+            .blocks()
+            .iter()
+            .map(CommittedBlock::segment_id)
+            .collect::<std::collections::BTreeSet<_>>(),
+        output_segments,
+        "reopened Catalog reachability is the exact same output manifest"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn typed_compaction_reconciles_a_two_fault_lost_ack_with_the_original_execution()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_authority(volume)?;
+    let instance = InstanceId::new([0xf1; 16])?;
+    let catalog = Catalog::open(
+        &authority,
+        instance,
+        CatalogSecret::from_owned(Box::new([0xf2; 32]), Box::new([0xf3; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x64; 16])?;
+    super::retention_frontier::install_governance_policy(&catalog, instance, tenant, 60, 0xf4)?;
+    let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(63)?);
+    let retention_time = RetentionTimeAuthority::establish()?;
+    let key = || SegmentProtectionKey::from_owned(Box::new([0xf5; 32]));
+    for (identity, payload) in [
+        ([0xf6; 16], b"two-fault-first".as_slice()),
+        ([0xf7; 16], b"two-fault-second".as_slice()),
+    ] {
+        let source = ActiveSegmentLedger::open_with_retention_time(
+            &authority,
+            &retention_time,
+            &catalog,
+            scope,
+            key(),
+        )?;
+        source.append(
+            source
+                .begin_store_block(
+                    preparation_capacity(&authority, tenant)?,
+                    StoreBlockIdentity::new(identity)?,
+                )?
+                .finish(payload.to_vec())?,
+        )?;
+        source.seal()?;
+    }
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    let snapshot = ledger.snapshot()?;
+    let blocks = snapshot
+        .blocks()
+        .iter()
+        .map(|block| compaction_block(scope, block))
+        .collect::<Result<Vec<_>, _>>()?;
+    let policy = catalog.pin()?.retention_policy(SignalKind::Logs)?;
+    let bucket = RetentionBucket::for_ingest_time(
+        tenant,
+        SignalKind::Logs,
+        blocks[0].ingest_time,
+        policy.retention_seconds(),
+    )?;
+    let identity = MaintenanceTaskId::new([0xf8; 16]).expect("task identity");
+    let task = ledger.prepare_compaction_task(&blocks, bucket, identity)?;
+    let coordinator = MaintenanceCoordinator::new();
+    task.submit_and_persist(&coordinator, &catalog, 1)?;
+    let execution = coordinator
+        .start_compaction_task_with_reservation_and_persist(
+            &catalog, &authority, 1, false, identity,
+        )
+        .expect("typed compaction starts")
+        .ok_or("typed compaction dispatch")?;
+    let preparation = ledger.prepare_compaction_with_policy(&snapshot, policy)?;
+    let generation = catalog.pin()?.number();
+    let first = with_catalog_publication_fault_sequence_after(
+        &[
+            (CatalogPublicationFault::SynchronizeGenerationDirectory, 0),
+            (CatalogPublicationFault::ReadGenerationDirectory, 0),
+        ],
+        || {
+            ledger.compact_sealed_with_maintenance(
+                blocks.clone(),
+                preparation,
+                &coordinator,
+                &execution,
+                || false,
+            )
+        },
+    )
+    .expect_err("a missing immediate successor proof leaves the original task running");
+    assert_eq!(first.code(), LedgerFailureCode::StorageUnavailable);
+    assert_eq!(
+        coordinator.status(identity).expect("running task").phase(),
+        crate::MaintenanceTaskPhase::Running
+    );
+    catalog.refresh_state()?;
+    assert_eq!(catalog.pin()?.number(), generation + 1);
+    ledger.reconcile_ambiguous_compaction_completion(&blocks, &coordinator, &execution)?;
+    assert_eq!(
+        coordinator
+            .status(identity)
+            .expect("succeeded task")
+            .phase(),
+        crate::MaintenanceTaskPhase::Succeeded,
+        "one bounded same-dispatch retry installs only the proven terminal pair"
+    );
+    assert_eq!(
+        catalog.pin()?.number(),
+        generation + 1,
+        "reconciliation never republishes output metadata"
+    );
+    let output = ledger.snapshot()?;
+    let manifest = output
+        .blocks()
+        .iter()
+        .map(CommittedBlock::segment_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(manifest.len(), 1);
+    assert_eq!(output.blocks().len(), 2);
+    assert_eq!(output.blocks()[0].payload(), b"two-fault-first");
+    assert_eq!(output.blocks()[1].payload(), b"two-fault-second");
+    drop(output);
+    drop(snapshot);
+    drop(ledger);
+    let reopened = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    let reopened_output = reopened.snapshot()?;
+    assert_eq!(
+        reopened_output
+            .blocks()
+            .iter()
+            .map(CommittedBlock::segment_id)
+            .collect::<std::collections::BTreeSet<_>>(),
+        manifest,
+        "reopen observes the exact durable output manifest"
+    );
+    assert_eq!(reopened_output.blocks().len(), 2);
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn typed_compaction_refuses_an_altered_valid_terminal_record_after_lost_ack()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_authority(volume)?;
+    let instance = InstanceId::new([0xf9; 16])?;
+    let catalog = Catalog::open(
+        &authority,
+        instance,
+        CatalogSecret::from_owned(Box::new([0xfa; 32]), Box::new([0xfb; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x64; 16])?;
+    super::retention_frontier::install_governance_policy(&catalog, instance, tenant, 60, 0xfc)?;
+    let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(64)?);
+    let retention_time = RetentionTimeAuthority::establish()?;
+    let key = || SegmentProtectionKey::from_owned(Box::new([0xfd; 32]));
+    let source = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    source.append(
+        source
+            .begin_store_block(
+                preparation_capacity(&authority, tenant)?,
+                StoreBlockIdentity::new([0xfe; 16])?,
+            )?
+            .finish(b"altered-terminal-source".to_vec())?,
+    )?;
+    source.seal()?;
+    let ledger = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    let snapshot = ledger.snapshot()?;
+    let blocks = snapshot
+        .blocks()
+        .iter()
+        .map(|block| compaction_block(scope, block))
+        .collect::<Result<Vec<_>, _>>()?;
+    let policy = catalog.pin()?.retention_policy(SignalKind::Logs)?;
+    let bucket = RetentionBucket::for_ingest_time(
+        tenant,
+        SignalKind::Logs,
+        blocks[0].ingest_time,
+        policy.retention_seconds(),
+    )?;
+    let identity = MaintenanceTaskId::new([0xff; 16]).expect("task identity");
+    let task = ledger.prepare_compaction_task(&blocks, bucket, identity)?;
+    let coordinator = MaintenanceCoordinator::new();
+    task.submit_and_persist(&coordinator, &catalog, 1)?;
+    let execution = coordinator
+        .start_compaction_task_with_reservation_and_persist(
+            &catalog, &authority, 1, false, identity,
+        )
+        .expect("typed compaction starts")
+        .ok_or("typed compaction dispatch")?;
+    let preparation = ledger.prepare_compaction_with_policy(&snapshot, policy)?;
+    let first = with_catalog_publication_fault_sequence_after(
+        &[
+            (CatalogPublicationFault::SynchronizeGenerationDirectory, 0),
+            (CatalogPublicationFault::ReadGenerationDirectory, 0),
+        ],
+        || {
+            ledger.compact_sealed_with_maintenance(
+                blocks.clone(),
+                preparation,
+                &coordinator,
+                &execution,
+                || false,
+            )
+        },
+    )
+    .expect_err("a durable pair without immediate proof is ambiguous");
+    assert_eq!(first.code(), LedgerFailureCode::StorageUnavailable);
+    catalog.refresh_state()?;
+    let basis = catalog.pin()?;
+    let mut altered = false;
+    let objects = basis
+        .plaintext_objects()
+        .map(|bytes| {
+            let record_identity = crate::maintenance::durable_task_record_identity(bytes)
+                .map_err(|failure| format!("durable task identity: {failure:?}"))?;
+            let replacement = if record_identity == Some(identity) {
+                altered = true;
+                crate::maintenance::rewrite_durable_task_record_dispatches_for_test(bytes, 2)
+                    .map_err(|failure| format!("rewrite durable terminal: {failure:?}"))?
+            } else {
+                bytes.to_vec()
+            };
+            CatalogObject::new(replacement).map_err(Into::into)
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    assert!(
+        altered,
+        "the terminal PMTC must be durable before it can be altered"
+    );
+    catalog.commit(
+        basis.identity(),
+        CatalogProposal::new(
+            TransactionId::new([0xab; 16])?,
+            FormatEpoch::CATALOG_V1,
+            objects,
+        )?,
+        None,
+    )?;
+    let failure = ledger
+        .reconcile_ambiguous_compaction_completion(&blocks, &coordinator, &execution)
+        .expect_err("a same-identity but altered terminal PMTC must fail closed");
+    assert_eq!(failure.code(), LedgerFailureCode::RecoveryRequired);
+    assert_eq!(
+        coordinator.status(identity).expect("live task").phase(),
+        crate::MaintenanceTaskPhase::Running,
+        "the terminal cannot be faked from object identity alone"
+    );
     Ok(())
 }
 

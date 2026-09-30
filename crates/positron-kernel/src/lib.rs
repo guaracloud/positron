@@ -103,11 +103,11 @@ pub use active_segment_ledger::{
     ActiveSegmentLedger, AppendCancellation, CommitReceipt, CommittedBlock, CommittedLedgerReader,
     CompactionBlock, CompactionPreparation, CompactionPublication, LedgerCompletionState,
     LedgerFailure, LedgerFailureCode, LedgerSnapshot, MAX_SNAPSHOT_LEASE_TTL_SECONDS,
-    PreparedStoreBlock, RetentionBucket, RetentionEvaluation, RetentionImpactPreview,
-    RetentionImpactTimeRange, RetentionReclamation, RetentionReclamationEstimate, SealedSegment,
-    SegmentId, SegmentProtectionKey, SegmentScope, SnapshotLeaseAttempt, SnapshotLeaseGrant,
-    SnapshotLeaseId, SnapshotLeaseReplacement, SnapshotLeaseUsage, StoreBlockIdentity,
-    StoreBlockPreparation,
+    PreparedCompactionTask, PreparedStoreBlock, RetentionBucket, RetentionEvaluation,
+    RetentionImpactPreview, RetentionImpactTimeRange, RetentionReclamation,
+    RetentionReclamationEstimate, SealedSegment, SegmentId, SegmentProtectionKey, SegmentScope,
+    SnapshotLeaseAttempt, SnapshotLeaseGrant, SnapshotLeaseId, SnapshotLeaseReplacement,
+    SnapshotLeaseUsage, StoreBlockIdentity, StoreBlockPreparation,
 };
 
 pub use data_protection::{
@@ -132,11 +132,11 @@ pub use lifecycle_clock::{
     LifecycleClockSource, RetentionCutoffProvenance, SystemLifecycleClockSource,
 };
 pub use maintenance::{
-    GovernanceAuditCheckpointBinding, MaintenanceCheckpoint, MaintenanceCoordinator,
-    MaintenanceExecution, MaintenanceFailure, MaintenanceObjectId, MaintenancePreconditions,
-    MaintenancePriority, MaintenanceReservation, MaintenanceScope, MaintenanceTask,
-    MaintenanceTaskClass, MaintenanceTaskId, MaintenanceTaskPhase, MaintenanceTaskRecord,
-    MaintenanceTaskStatus, MaintenanceTrigger,
+    CompactionBinding, GovernanceAuditCheckpointBinding, MaintenanceCheckpoint,
+    MaintenanceCoordinator, MaintenanceExecution, MaintenanceFailure, MaintenanceObjectId,
+    MaintenancePreconditions, MaintenancePriority, MaintenanceReservation, MaintenanceScope,
+    MaintenanceTask, MaintenanceTaskClass, MaintenanceTaskId, MaintenanceTaskPhase,
+    MaintenanceTaskRecord, MaintenanceTaskStatus, MaintenanceTrigger,
 };
 #[cfg(feature = "test-support")]
 pub use retention_time::ManualRetentionTime;

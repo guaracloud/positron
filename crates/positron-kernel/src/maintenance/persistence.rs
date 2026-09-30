@@ -47,6 +47,16 @@ pub(crate) struct RetentionReclamationTaskReplacement {
     record: MaintenanceTaskRecord,
 }
 
+/// One terminal record reserved by a running Compaction dispatch. The ledger
+/// publishes this record in the same Catalog transaction as the replacement
+/// segment manifest, then installs it in the coordinator after that commit.
+pub(crate) struct CompactionTaskReplacement {
+    before: TaskState,
+    after: TaskState,
+    next_terminal_order: u64,
+    record: MaintenanceTaskRecord,
+}
+
 /// One terminal Retention Publication and its already-bound queued
 /// Reclamation successor. Neither state becomes visible until the ledger has
 /// committed both records with the corresponding retired metadata.
@@ -287,6 +297,63 @@ impl RetentionReclamationTaskReplacement {
     }
 }
 
+impl CompactionTaskReplacement {
+    pub(crate) fn catalog_object(&self) -> Result<CatalogObject, MaintenanceFailure> {
+        self.record.catalog_object()
+    }
+
+    pub(crate) fn install(
+        self,
+        coordinator: &MaintenanceCoordinator,
+    ) -> Result<(), MaintenanceFailure> {
+        let mut state = coordinator
+            .state
+            .lock()
+            .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
+        if !state
+            .pending_task_transitions
+            .contains(&self.before.task.identity)
+            || state.tasks.get(&self.before.task.identity) != Some(&self.before)
+        {
+            return Err(MaintenanceFailure::PreconditionFailed);
+        }
+        state
+            .pending_task_transitions
+            .remove(&self.before.task.identity);
+        state.tasks.insert(self.after.task.identity, self.after);
+        state.next_terminal_order = state.next_terminal_order.max(self.next_terminal_order);
+        Ok(())
+    }
+
+    pub(crate) fn install_reconciled(
+        self,
+        coordinator: &MaintenanceCoordinator,
+    ) -> Result<(), MaintenanceFailure> {
+        let mut state = coordinator
+            .state
+            .lock()
+            .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
+        if state.tasks.get(&self.before.task.identity) != Some(&self.before)
+            || state
+                .pending_task_transitions
+                .contains(&self.before.task.identity)
+        {
+            return Err(MaintenanceFailure::PreconditionFailed);
+        }
+        state.tasks.insert(self.after.task.identity, self.after);
+        state.next_terminal_order = state.next_terminal_order.max(self.next_terminal_order);
+        Ok(())
+    }
+
+    pub(crate) fn discard(&self, coordinator: &MaintenanceCoordinator) {
+        if let Ok(mut state) = coordinator.state.lock() {
+            state
+                .pending_task_transitions
+                .remove(&self.before.task.identity);
+        }
+    }
+}
+
 impl QueuedMaintenanceSubmission {
     pub(crate) fn catalog_object(&self) -> Result<CatalogObject, MaintenanceFailure> {
         self.record.catalog_object()
@@ -348,6 +415,93 @@ impl QueuedMaintenanceSubmission {
 }
 
 impl MaintenanceCoordinator {
+    pub(super) fn reconcile_running_compaction_completion(
+        &self,
+        dispatch: MaintenanceDispatch,
+        durable_record: &[u8],
+    ) -> Result<CompactionTaskReplacement, MaintenanceFailure> {
+        if dispatch.coordinator_id != self.coordinator_id {
+            return Err(MaintenanceFailure::InvalidTransition);
+        }
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
+        let before = state
+            .tasks
+            .get(&dispatch.identity)
+            .cloned()
+            .ok_or(MaintenanceFailure::UnknownTask)?;
+        if before.task.class != MaintenanceTaskClass::Compaction
+            || before.phase != MaintenanceTaskPhase::Running
+            || before.active_dispatch != Some(dispatch)
+            || before.cancellation_requested
+            || state.pending_task_transitions.contains(&dispatch.identity)
+        {
+            return Err(MaintenanceFailure::PreconditionFailed);
+        }
+        let terminal_order = state.next_terminal_order;
+        let next_terminal_order = terminal_order
+            .checked_add(1)
+            .ok_or(MaintenanceFailure::CapacityExceeded)?;
+        let mut after = before.clone();
+        after.phase = MaintenanceTaskPhase::Succeeded;
+        after.active_dispatch = None;
+        after.terminal_order = Some(terminal_order);
+        let record = encode_record(&after)?;
+        if record.as_bytes() != durable_record {
+            return Err(MaintenanceFailure::PreconditionFailed);
+        }
+        Ok(CompactionTaskReplacement {
+            before,
+            after,
+            next_terminal_order,
+            record,
+        })
+    }
+    pub(super) fn prepare_running_compaction_completion(
+        &self,
+        dispatch: MaintenanceDispatch,
+        durable_record: &[u8],
+    ) -> Result<CompactionTaskReplacement, MaintenanceFailure> {
+        if dispatch.coordinator_id != self.coordinator_id {
+            return Err(MaintenanceFailure::InvalidTransition);
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
+        let before = state
+            .tasks
+            .get(&dispatch.identity)
+            .cloned()
+            .ok_or(MaintenanceFailure::UnknownTask)?;
+        if before.task.class != MaintenanceTaskClass::Compaction
+            || before.phase != MaintenanceTaskPhase::Running
+            || before.active_dispatch != Some(dispatch)
+            || before.cancellation_requested
+            || encode_record(&before)?.as_bytes() != durable_record
+            || state.pending_task_transitions.contains(&dispatch.identity)
+        {
+            return Err(MaintenanceFailure::PreconditionFailed);
+        }
+        let terminal_order = state.next_terminal_order;
+        let next_terminal_order = terminal_order
+            .checked_add(1)
+            .ok_or(MaintenanceFailure::CapacityExceeded)?;
+        let mut after = before.clone();
+        after.phase = MaintenanceTaskPhase::Succeeded;
+        after.active_dispatch = None;
+        after.terminal_order = Some(terminal_order);
+        let record = encode_record(&after)?;
+        state.pending_task_transitions.insert(dispatch.identity);
+        Ok(CompactionTaskReplacement {
+            before,
+            after,
+            next_terminal_order,
+            record,
+        })
+    }
     /// Reconciles the in-memory coordinator registry from the sole durable
     /// source after a caller observes a previously committed transaction.
     /// This is used by idempotent administration replay when an acknowledgement
@@ -1114,6 +1268,26 @@ impl MaintenanceCoordinator {
         )
     }
 
+    /// Starts one exact durable Compaction descriptor. Other task classes
+    /// cannot enter this handler path.
+    pub fn start_compaction_task_with_reservation_and_persist<'authority>(
+        &self,
+        catalog: &Catalog<'_>,
+        authority: &'authority StorageKernelResourceAuthority,
+        now: u64,
+        clock_uncertain: bool,
+        identity: MaintenanceTaskId,
+    ) -> Result<Option<MaintenanceExecution<'authority>>, MaintenanceFailure> {
+        self.start_next_with_reservation_and_persist_matching(
+            catalog,
+            authority,
+            now,
+            clock_uncertain,
+            &[MaintenanceTaskClass::Compaction],
+            Some(identity),
+        )
+    }
+
     fn start_next_with_reservation_and_persist_matching<'authority>(
         &self,
         catalog: &Catalog<'_>,
@@ -1187,7 +1361,9 @@ impl MaintenanceCoordinator {
     ) -> Result<MaintenanceTask, MaintenanceFailure> {
         if matches!(
             task.class,
-            MaintenanceTaskClass::RetentionPublication | MaintenanceTaskClass::RetentionReclamation
+            MaintenanceTaskClass::Compaction
+                | MaintenanceTaskClass::RetentionPublication
+                | MaintenanceTaskClass::RetentionReclamation
         ) {
             return Err(MaintenanceFailure::InvalidInput);
         }
@@ -1206,6 +1382,26 @@ impl MaintenanceCoordinator {
         }
         super::retention_publication_frontier(Some(&checkpoint))?;
         self.submit_task_and_persist(catalog, task, Some(checkpoint), now)
+    }
+
+    /// Persists Compaction only with its immutable source and policy proof.
+    /// Generic task ingress cannot manufacture or later overwrite this proof.
+    pub fn submit_compaction_and_persist(
+        &self,
+        catalog: &Catalog<'_>,
+        task: MaintenanceTask,
+        binding: crate::CompactionBinding,
+        now: u64,
+    ) -> Result<MaintenanceTask, MaintenanceFailure> {
+        if task.class != MaintenanceTaskClass::Compaction
+            || task.scope != binding.scope()
+            || task.inputs.is_empty()
+            || !task.outputs.is_empty()
+            || task.preconditions.resource_generation != 1
+        {
+            return Err(MaintenanceFailure::InvalidInput);
+        }
+        self.submit_task_and_persist(catalog, task, Some(binding.checkpoint()?), now)
     }
 
     /// Persists the immutable binding for one system-scoped Governance Audit
@@ -2049,6 +2245,22 @@ impl MaintenanceExecution<'_> {
         coordinator.prepare_running_retention_publication_completion(self.dispatch, binding)
     }
 
+    pub(crate) fn prepare_running_compaction_completion(
+        &self,
+        coordinator: &MaintenanceCoordinator,
+        durable_record: &[u8],
+    ) -> Result<CompactionTaskReplacement, MaintenanceFailure> {
+        coordinator.prepare_running_compaction_completion(self.dispatch, durable_record)
+    }
+
+    pub(crate) fn reconcile_running_compaction_completion(
+        &self,
+        coordinator: &MaintenanceCoordinator,
+        durable_record: &[u8],
+    ) -> Result<CompactionTaskReplacement, MaintenanceFailure> {
+        coordinator.reconcile_running_compaction_completion(self.dispatch, durable_record)
+    }
+
     pub(crate) fn reconcile_running_snapshot_lease_expiry_completion(
         &self,
         coordinator: &MaintenanceCoordinator,
@@ -2074,7 +2286,10 @@ impl MaintenanceExecution<'_> {
         catalog: &Catalog<'_>,
         checkpoint: MaintenanceCheckpoint,
     ) -> Result<(), MaintenanceFailure> {
-        if self.task.class == MaintenanceTaskClass::CatalogReclamation {
+        if matches!(
+            self.task.class,
+            MaintenanceTaskClass::Compaction | MaintenanceTaskClass::CatalogReclamation
+        ) {
             return Err(MaintenanceFailure::InvalidTransition);
         }
         coordinator.checkpoint_and_persist_dispatch(catalog, self.dispatch, checkpoint)
@@ -2090,10 +2305,14 @@ impl MaintenanceExecution<'_> {
     ) -> Result<(), MaintenanceFailure> {
         if matches!(
             self.task.class,
-            MaintenanceTaskClass::GovernanceAuditCheckpoint
+            MaintenanceTaskClass::Compaction
+                | MaintenanceTaskClass::GovernanceAuditCheckpoint
                 | MaintenanceTaskClass::CatalogReclamation
         ) {
-            if self.task.class == MaintenanceTaskClass::CatalogReclamation {
+            if matches!(
+                self.task.class,
+                MaintenanceTaskClass::Compaction | MaintenanceTaskClass::CatalogReclamation
+            ) {
                 return Err(MaintenanceFailure::InvalidTransition);
             }
             coordinator.complete_and_persist_admitted_dispatch(

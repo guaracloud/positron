@@ -51,6 +51,7 @@ use crate::{
 };
 
 use capacity::{recovery_claim, retained_claim, snapshot_retained_claim};
+pub use compaction::PreparedCompactionTask;
 use format::{SegmentMetadata, SegmentState};
 use protection::{map_frame_failure, object_context};
 use publication::{fresh_metadata, publish_segments};

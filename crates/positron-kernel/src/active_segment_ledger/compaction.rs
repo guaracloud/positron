@@ -5,8 +5,13 @@ use sha2::{Digest, Sha256};
 use crate::RecoveryWorkKind;
 use crate::data_protection::{DataProtection, FrameLimits, FrameSequence, SegmentFramePurpose};
 
+use super::capacity::retained_claim;
 use super::format::{SegmentMetadata, SegmentState};
-use super::publication::{fresh_metadata, publish_segments};
+use super::publication::{
+    fresh_metadata, publish_exact_scope_segments_with_task_replacement, publish_segments,
+};
+use super::reconstruction::reconstruct;
+use super::recovery::RecoveryMode;
 use super::storage::{AppendFailure, LedgerStorage, NextFrontier};
 use super::{
     ActiveSegmentLedger, CommittedBlock, CompactionBlock, CompactionPreparation,
@@ -16,7 +21,118 @@ use super::{
 const MAX_COMPACTION_BLOCKS: usize = 1_024;
 const MAX_ENCODED_FRAME_BYTES: u32 = super::MAX_ENCODED_FRAME_BYTES;
 
+/// A caller-chosen, kernel-verified fixed-bucket compaction descriptor. The
+/// durable binding is submitted before dispatch; the payload is not copied or
+/// written during this admission step.
+pub struct PreparedCompactionTask {
+    task: crate::MaintenanceTask,
+    binding: crate::CompactionBinding,
+}
+
+impl PreparedCompactionTask {
+    #[must_use]
+    pub const fn task(&self) -> &crate::MaintenanceTask {
+        &self.task
+    }
+
+    pub fn submit_and_persist(
+        self,
+        coordinator: &crate::MaintenanceCoordinator,
+        catalog: &crate::Catalog<'_>,
+        submitted_at: u64,
+    ) -> Result<crate::MaintenanceTask, LedgerFailure> {
+        coordinator
+            .submit_compaction_and_persist(catalog, self.task.clone(), self.binding, submitted_at)
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))
+    }
+}
+
 impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
+    /// Creates the only durable descriptor for caller-selected sealed sources
+    /// in one fixed retention bucket. The task's reservation is derived from
+    /// the kernel's checked copy-on-write claim, never supplied by the caller.
+    pub fn prepare_compaction_task(
+        &self,
+        blocks: &[CompactionBlock],
+        bucket: super::RetentionBucket,
+        identity: crate::MaintenanceTaskId,
+    ) -> Result<PreparedCompactionTask, LedgerFailure> {
+        if blocks.is_empty()
+            || blocks.len() > MAX_COMPACTION_BLOCKS
+            || bucket.tenant() != self.scope.tenant_id()
+            || bucket.signal_kind() != self.scope.signal_kind()
+        {
+            return Err(LedgerFailure::new(LedgerFailureCode::InvalidInput));
+        }
+        self.catalog.refresh_state()?;
+        let basis = self.catalog.pin()?;
+        let policy = basis.retention_policy(self.scope.signal_kind())?;
+        if policy.instance() != self.catalog.instance() || policy.tenant() != self.scope.tenant_id()
+        {
+            return Err(LedgerFailure::new(LedgerFailureCode::PhysicalScopeMismatch));
+        }
+        let mut inputs = Vec::new();
+        inputs
+            .try_reserve_exact(blocks.len())
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
+        let metadata = self.storage.catalog_segments(&basis, self.scope)?;
+        for block in blocks {
+            if block.scope != self.scope || !bucket_contains(bucket, block.ingest_time) {
+                return Err(LedgerFailure::new(LedgerFailureCode::StaleGeneration));
+            }
+            let source = metadata
+                .iter()
+                .find(|candidate| {
+                    candidate.id == block.source_segment && candidate.state == SegmentState::Sealed
+                })
+                .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::StaleGeneration))?;
+            let binding = super::retention_publication::metadata_binding(&self.storage, *source)?;
+            if !inputs.contains(&binding) {
+                inputs.push(binding);
+            }
+        }
+        inputs.sort_unstable();
+        let scope = crate::MaintenanceScope::segment(
+            self.scope.tenant_id(),
+            self.scope.signal_kind(),
+            self.scope.shard_id(),
+        );
+        let binding = crate::CompactionBinding::new(
+            scope,
+            policy,
+            bucket,
+            maintenance_source_digest(self.scope, blocks)?,
+        )
+        .map_err(|_| LedgerFailure::new(LedgerFailureCode::StaleGeneration))?;
+        let task_record_bytes =
+            crate::maintenance::compaction_task_record_bytes(inputs.len(), binding)
+                .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+        let task_record_working_bytes =
+            crate::maintenance::compaction_task_record_working_bytes(inputs.len(), binding)
+                .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+        let snapshot = self.snapshot()?;
+        let preparation = self.prepare_compaction_inner(
+            &snapshot,
+            Some(policy),
+            task_record_bytes,
+            task_record_working_bytes,
+        )?;
+        let reservations = preparation.capacity.granted();
+        drop(preparation);
+        let task = crate::MaintenanceTask::with_contract(
+            identity,
+            crate::MaintenanceTaskClass::Compaction,
+            scope,
+            crate::MaintenanceTrigger::Event,
+            crate::MaintenancePreconditions::new(basis.number(), 1)
+                .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?,
+            inputs,
+            Vec::new(),
+            reservations,
+        )
+        .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+        Ok(PreparedCompactionTask { task, binding })
+    }
     /// Admits the bounded copy-on-write peak while the caller still owns only
     /// an immutable snapshot. No input payload allocation is needed to make
     /// this decision.
@@ -24,7 +140,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         &self,
         snapshot: &super::LedgerSnapshot<'_>,
     ) -> Result<CompactionPreparation<'kernel>, LedgerFailure> {
-        self.prepare_compaction_inner(snapshot, None)
+        self.prepare_compaction_inner(snapshot, None, 0, 0)
     }
 
     /// Admits compaction against one authenticated POSGOV03 retention policy.
@@ -35,13 +151,15 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         snapshot: &super::LedgerSnapshot<'_>,
         policy: crate::CatalogLogRetentionPolicy,
     ) -> Result<CompactionPreparation<'kernel>, LedgerFailure> {
-        self.prepare_compaction_inner(snapshot, Some(policy))
+        self.prepare_compaction_inner(snapshot, Some(policy), 0, 0)
     }
 
     fn prepare_compaction_inner(
         &self,
         snapshot: &super::LedgerSnapshot<'_>,
         expected_policy: Option<crate::CatalogLogRetentionPolicy>,
+        anticipated_catalog_bytes: usize,
+        terminal_record_working_bytes: usize,
     ) -> Result<CompactionPreparation<'kernel>, LedgerFailure> {
         if snapshot.scope() != self.scope {
             return Err(LedgerFailure::new(LedgerFailureCode::PhysicalScopeMismatch));
@@ -69,7 +187,9 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
                 total
                     .checked_add(bytes.len())
                     .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))
-            })?;
+            })?
+            .checked_add(anticipated_catalog_bytes)
+            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
         let maximum_blocks = snapshot.blocks().len();
         let claim = RecoveryWorkClaim::tenant(
             self.scope.tenant_id(),
@@ -78,7 +198,11 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
                 payload_bytes,
                 maximum_blocks,
                 catalog_bytes,
-                basis.plaintext_object_count(),
+                basis
+                    .plaintext_object_count()
+                    .checked_add(usize::from(anticipated_catalog_bytes != 0))
+                    .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?,
+                terminal_record_working_bytes,
             )
             .map_err(|failure| LedgerFailure::new(failure.code()))?,
         )
@@ -122,9 +246,269 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
     /// reported as recovery-required or ambiguous, never as pre-mutation.
     pub fn compact_sealed_with_cancellation<F>(
         &self,
+        blocks: Vec<CompactionBlock>,
+        preparation: CompactionPreparation<'kernel>,
+        is_cancelled: F,
+    ) -> Result<CompactionPublication, LedgerFailure>
+    where
+        F: Fn() -> bool,
+    {
+        self.compact_sealed_with_cancellation_inner(blocks, preparation, is_cancelled, None)
+    }
+
+    /// Executes one already-admitted Compaction task and atomically publishes
+    /// its terminal PMTC record with the replacement manifest.
+    pub fn compact_sealed_with_maintenance<F>(
+        &self,
+        mut blocks: Vec<CompactionBlock>,
+        preparation: CompactionPreparation<'kernel>,
+        coordinator: &crate::MaintenanceCoordinator,
+        execution: &crate::MaintenanceExecution<'_>,
+        is_cancelled: F,
+    ) -> Result<CompactionPublication, LedgerFailure>
+    where
+        F: Fn() -> bool,
+    {
+        if execution.task().class() != crate::MaintenanceTaskClass::Compaction
+            || execution.task().scope()
+                != crate::MaintenanceScope::segment(
+                    self.scope.tenant_id(),
+                    self.scope.signal_kind(),
+                    self.scope.shard_id(),
+                )
+        {
+            return Err(LedgerFailure::new(LedgerFailureCode::StaleGeneration));
+        }
+        blocks.sort_unstable_by_key(|block| block.position);
+        let binding = crate::CompactionBinding::from_checkpoint(execution.task_checkpoint())
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::StaleGeneration))?;
+        if binding.scope()
+            != crate::MaintenanceScope::segment(
+                self.scope.tenant_id(),
+                self.scope.signal_kind(),
+                self.scope.shard_id(),
+            )
+            || maintenance_source_digest(self.scope, &blocks)? != binding.source_digest()
+            || blocks
+                .iter()
+                .any(|block| !binding.contains(block.ingest_time))
+        {
+            return Err(LedgerFailure::new(LedgerFailureCode::StaleGeneration));
+        }
+        self.catalog.refresh_state()?;
+        let basis = self.catalog.pin()?;
+        let policy = basis.retention_policy(self.scope.signal_kind())?;
+        if policy.instance() != self.catalog.instance()
+            || !binding.matches_policy(policy)
+            || preparation.retention_policy != Some(policy)
+        {
+            return Err(LedgerFailure::new(LedgerFailureCode::StaleGeneration));
+        }
+        let terminal_record_working_bytes =
+            crate::maintenance::compaction_task_record_working_bytes(
+                execution.task().inputs().len(),
+                binding,
+            )
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::StaleGeneration))?;
+        let current_payload_bytes = blocks.iter().try_fold(0_usize, |total, block| {
+            total
+                .checked_add(block.payload.len())
+                .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))
+        })?;
+        let current_catalog_bytes =
+            basis
+                .plaintext_objects()
+                .try_fold(0_usize, |total, bytes| {
+                    total
+                        .checked_add(bytes.len())
+                        .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))
+                })?;
+        let current_minimum = super::capacity::compaction_claim(
+            current_payload_bytes,
+            blocks.len(),
+            current_catalog_bytes,
+            basis.plaintext_object_count(),
+            terminal_record_working_bytes,
+        )?;
+        if crate::ResourceDimension::ALL.iter().any(|dimension| {
+            current_minimum.get(*dimension) > execution.reservation().granted().get(*dimension)
+        }) {
+            return Err(LedgerFailure::new(
+                LedgerFailureCode::ResourceAdmissionRefused,
+            ));
+        }
+        let metadata = self.storage.catalog_segments(&basis, self.scope)?;
+        let mut selected = Vec::new();
+        selected
+            .try_reserve_exact(blocks.len())
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
+        for block in &blocks {
+            let metadata = metadata
+                .iter()
+                .find(|metadata| {
+                    metadata.id == block.source_segment && metadata.state == SegmentState::Sealed
+                })
+                .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::StaleGeneration))?;
+            let candidate =
+                super::retention_publication::metadata_binding(&self.storage, *metadata)?;
+            if !selected.contains(&candidate) {
+                selected.push(candidate);
+            }
+        }
+        selected.sort_unstable();
+        if execution.task().inputs() != selected || !execution.task().outputs().is_empty() {
+            return Err(LedgerFailure::new(LedgerFailureCode::StaleGeneration));
+        }
+        let mut record = None;
+        for bytes in basis.plaintext_objects() {
+            if crate::maintenance::durable_task_record_identity(bytes)
+                .map_err(|_| LedgerFailure::new(LedgerFailureCode::RecoveryRequired))?
+                == Some(execution.task().identity())
+                && record.replace(bytes).is_some()
+            {
+                return Err(LedgerFailure::new(LedgerFailureCode::RecoveryRequired));
+            }
+        }
+        let record =
+            record.ok_or_else(|| LedgerFailure::new(LedgerFailureCode::RecoveryRequired))?;
+        let completion = execution
+            .prepare_running_compaction_completion(coordinator, record)
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::StaleGeneration))?;
+        let terminal = completion
+            .catalog_object()
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::StaleGeneration))?;
+        let result = self.compact_sealed_with_cancellation_inner(
+            blocks,
+            preparation,
+            is_cancelled,
+            Some((execution.task().identity(), terminal)),
+        );
+        match result {
+            Ok(publication) => {
+                completion
+                    .install(coordinator)
+                    .map_err(|_| LedgerFailure::new(LedgerFailureCode::RecoveryRequired))?;
+                Ok(publication)
+            },
+            Err(failure) => {
+                completion.discard(coordinator);
+                Err(failure)
+            },
+        }
+    }
+
+    /// Reconciles one same-dispatch Compaction after a post-commit
+    /// acknowledgement failure. The terminal PMTC bytes are reconstructed from
+    /// the still-running dispatch and must exactly match the sole durable
+    /// successor record; no publication is retried here.
+    pub fn reconcile_ambiguous_compaction_completion(
+        &self,
+        blocks: &[CompactionBlock],
+        coordinator: &crate::MaintenanceCoordinator,
+        execution: &crate::MaintenanceExecution<'_>,
+    ) -> Result<(), LedgerFailure> {
+        if execution.task().class() != crate::MaintenanceTaskClass::Compaction {
+            return Err(LedgerFailure::new(LedgerFailureCode::StaleGeneration));
+        }
+        if blocks.is_empty()
+            || blocks.len() > MAX_COMPACTION_BLOCKS
+            || blocks
+                .windows(2)
+                .any(|pair| pair[0].position >= pair[1].position || pair[0].scope != self.scope)
+            || blocks.last().is_some_and(|block| block.scope != self.scope)
+        {
+            return Err(LedgerFailure::new(LedgerFailureCode::StaleGeneration));
+        }
+        let binding = crate::CompactionBinding::from_checkpoint(execution.task_checkpoint())
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::StaleGeneration))?;
+        if binding.scope()
+            != crate::MaintenanceScope::segment(
+                self.scope.tenant_id(),
+                self.scope.signal_kind(),
+                self.scope.shard_id(),
+            )
+            || maintenance_source_digest(self.scope, blocks)? != binding.source_digest()
+            || blocks
+                .iter()
+                .any(|block| !binding.contains(block.ingest_time))
+        {
+            return Err(LedgerFailure::new(LedgerFailureCode::StaleGeneration));
+        }
+        self.catalog.refresh_state()?;
+        let basis = self.catalog.pin()?;
+        let metadata = self.storage.catalog_segments(&basis, self.scope)?;
+        if blocks.iter().any(|block| {
+            metadata.iter().any(|candidate| {
+                candidate.id == block.source_segment && candidate.state != SegmentState::Retired
+            })
+        }) {
+            return Err(LedgerFailure::new(LedgerFailureCode::RecoveryRequired));
+        }
+        let recovered = reconstruct(
+            &self.storage,
+            &metadata,
+            &self.protection,
+            self.catalog.instance(),
+            RecoveryMode::Observe,
+        )?;
+        for expected in blocks {
+            let matches = recovered
+                .blocks
+                .iter()
+                .filter(|candidate| {
+                    candidate.identity() == expected.identity
+                        && candidate.position() == expected.position
+                        && candidate.payload() == expected.payload.as_slice()
+                        && candidate.content_digest().ok() == Some(expected.content_digest)
+                        && candidate
+                            .authenticate_ingest_time(expected.ingest_time.instant())
+                            .is_ok()
+                })
+                .count();
+            if matches != 1 {
+                return Err(LedgerFailure::new(LedgerFailureCode::RecoveryRequired));
+            }
+        }
+        let mut record = None;
+        for bytes in basis.plaintext_objects() {
+            if crate::maintenance::durable_task_record_identity(bytes)
+                .map_err(|_| LedgerFailure::new(LedgerFailureCode::RecoveryRequired))?
+                == Some(execution.task().identity())
+                && record.replace(bytes).is_some()
+            {
+                return Err(LedgerFailure::new(LedgerFailureCode::RecoveryRequired));
+            }
+        }
+        let record =
+            record.ok_or_else(|| LedgerFailure::new(LedgerFailureCode::RecoveryRequired))?;
+        let completion = execution
+            .reconcile_running_compaction_completion(coordinator, record)
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::RecoveryRequired))?;
+        completion
+            .install_reconciled(coordinator)
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::RecoveryRequired))?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
+        let retained_capacity = retained_claim(recovered.retained_bytes, recovered.blocks.len())?;
+        state
+            .retained_capacity
+            .try_resize_preserving_capacity(retained_capacity)
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::RecoveryRequired))?;
+        state.blocks = recovered.blocks;
+        state.retained_bytes = recovered.retained_bytes;
+        state.frontier = recovered.frontier;
+        state.poisoned = false;
+        Ok(())
+    }
+
+    fn compact_sealed_with_cancellation_inner<F>(
+        &self,
         mut blocks: Vec<CompactionBlock>,
         preparation: CompactionPreparation<'kernel>,
         is_cancelled: F,
+        terminal: Option<(crate::MaintenanceTaskId, crate::CatalogObject)>,
     ) -> Result<CompactionPublication, LedgerFailure>
     where
         F: Fn() -> bool,
@@ -340,28 +724,39 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             }
             return Err(LedgerFailure::new(LedgerFailureCode::Cancelled));
         }
-        let published =
-            match publish_segments(self.catalog, &basis, &output_storage, self.scope, &proposal) {
-                Ok(published) => published,
-                Err(failure)
-                    if failure.completion_state()
-                        == super::LedgerCompletionState::RejectedBeforeMutation =>
-                {
-                    if let Err(cleanup_failure) = discard_outputs(&output_storage, &outputs) {
-                        state.poisoned = true;
-                        return Err(LedgerFailure::post_mutation(cleanup_failure.code()));
-                    }
-                    return Err(failure);
-                },
-                Err(failure) => {
-                    // The publication helper has already reconciled any durable
-                    // successor. A remaining ambiguous result must retain every
-                    // output until restart can determine whether that successor
-                    // was visible to a snapshot.
+        let published = match terminal {
+            Some((identity, record)) => publish_exact_scope_segments_with_task_replacement(
+                self.catalog,
+                &basis,
+                &output_storage,
+                self.scope,
+                &proposal,
+                identity,
+                record,
+            ),
+            None => publish_segments(self.catalog, &basis, &output_storage, self.scope, &proposal),
+        };
+        let published = match published {
+            Ok(published) => published,
+            Err(failure)
+                if failure.completion_state()
+                    == super::LedgerCompletionState::RejectedBeforeMutation =>
+            {
+                if let Err(cleanup_failure) = discard_outputs(&output_storage, &outputs) {
                     state.poisoned = true;
-                    return Err(failure);
-                },
-            };
+                    return Err(LedgerFailure::post_mutation(cleanup_failure.code()));
+                }
+                return Err(failure);
+            },
+            Err(failure) => {
+                // The publication helper has already reconciled any durable
+                // successor. A remaining ambiguous result must retain every
+                // output until restart can determine whether that successor
+                // was visible to a snapshot.
+                state.poisoned = true;
+                return Err(failure);
+            },
+        };
         for output in &outputs {
             if is_cancelled() {
                 state.poisoned = true;
@@ -388,6 +783,36 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             output_segments: outputs.len(),
         })
     }
+}
+
+fn maintenance_source_digest(
+    scope: super::SegmentScope,
+    blocks: &[CompactionBlock],
+) -> Result<[u8; 32], LedgerFailure> {
+    if blocks.is_empty() {
+        return Err(LedgerFailure::new(LedgerFailureCode::InvalidInput));
+    }
+    let mut digest = Sha256::new();
+    digest.update(scope.tenant_id().to_bytes());
+    digest.update([match scope.signal_kind() {
+        positron_domain::routing::SignalKind::Logs => 1,
+        positron_domain::routing::SignalKind::Traces => 2,
+    }]);
+    digest.update(scope.shard_id().value().to_be_bytes());
+    for block in blocks {
+        digest.update(block.source_segment.to_bytes());
+        digest.update(block.identity.to_bytes());
+        digest.update(block.position.value().to_be_bytes());
+        digest.update(block.content_digest);
+        digest.update(block.ingest_time.instant().value().to_be_bytes());
+    }
+    Ok(digest.finalize().into())
+}
+
+fn bucket_contains(bucket: super::RetentionBucket, ingest_time: crate::IngestTime) -> bool {
+    ingest_time.retention_authenticated()
+        && ingest_time.instant().value() >= bucket.start().value()
+        && ingest_time.instant().value() < bucket.end_exclusive().value()
 }
 
 fn contiguous_runs(blocks: &[CompactionBlock]) -> Result<Vec<Vec<CompactionBlock>>, LedgerFailure> {
