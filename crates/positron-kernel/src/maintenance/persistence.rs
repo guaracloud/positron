@@ -333,13 +333,12 @@ impl CompactionTaskReplacement {
             .state
             .lock()
             .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
-        if state.tasks.get(&self.before.task.identity) != Some(&self.before)
-            || state
-                .pending_task_transitions
-                .contains(&self.before.task.identity)
-        {
+        if state.tasks.get(&self.before.task.identity) != Some(&self.before) {
             return Err(MaintenanceFailure::PreconditionFailed);
         }
+        state
+            .pending_task_transitions
+            .remove(&self.before.task.identity);
         state.tasks.insert(self.after.task.identity, self.after);
         state.next_terminal_order = state.next_terminal_order.max(self.next_terminal_order);
         Ok(())
@@ -462,7 +461,6 @@ impl MaintenanceCoordinator {
             || before.phase != MaintenanceTaskPhase::Running
             || before.active_dispatch != Some(dispatch)
             || before.cancellation_requested
-            || state.pending_task_transitions.contains(&dispatch.identity)
         {
             return Err(MaintenanceFailure::PreconditionFailed);
         }
@@ -1616,6 +1614,20 @@ impl MaintenanceCoordinator {
         {
             return Err(MaintenanceFailure::PreconditionFailed);
         }
+        let running_compaction = state.tasks.get(&identity).and_then(|task| {
+            (task.task.class == MaintenanceTaskClass::Compaction
+                && task.phase == MaintenanceTaskPhase::Running)
+                .then(|| task.clone())
+        });
+        if let Some(compaction) = running_compaction
+            && durable_compaction_completion_exists(
+                catalog,
+                &compaction,
+                state.next_terminal_order,
+            )?
+        {
+            return Err(MaintenanceFailure::PreconditionFailed);
+        }
         let mut next = state.clone();
         let terminal = {
             let task = next
@@ -2381,6 +2393,20 @@ impl MaintenanceExecution<'_> {
         }
     }
 
+    /// Terminalizes a dispatched Compaction whose authenticated selected bucket
+    /// contains no blocks. This commits only its exact PMTC successor; it must
+    /// not invent a replacement segment or manifest publication.
+    pub(crate) fn complete_empty_compaction_and_persist(
+        &self,
+        coordinator: &MaintenanceCoordinator,
+        catalog: &Catalog<'_>,
+    ) -> Result<(), MaintenanceFailure> {
+        if self.task.class != MaintenanceTaskClass::Compaction {
+            return Err(MaintenanceFailure::InvalidInput);
+        }
+        coordinator.complete_and_persist_dispatch(catalog, self.dispatch, true)
+    }
+
     /// Returns an audit-checkpoint execution to its durable queue while its
     /// existing reservation is still live. This is used only after its signed
     /// artifact has committed but the terminal task record remains unavailable.
@@ -2446,6 +2472,38 @@ fn durable_retention_publication_pair_exists(
         },
         _ => Err(MaintenanceFailure::CatalogUnavailable),
     }
+}
+
+fn durable_compaction_completion_exists(
+    catalog: &Catalog<'_>,
+    before: &TaskState,
+    terminal_order: u64,
+) -> Result<bool, MaintenanceFailure> {
+    let snapshot = catalog.pin().map_err(map_catalog_failure)?;
+    let mut durable = None;
+    for bytes in snapshot.plaintext_objects() {
+        if record::record_identity(bytes)? != Some(before.task.identity) {
+            continue;
+        }
+        if durable.replace(bytes).is_some() {
+            return Err(MaintenanceFailure::CatalogUnavailable);
+        }
+    }
+    let Some(durable) = durable else {
+        return Err(MaintenanceFailure::CatalogUnavailable);
+    };
+    if encode_record(before)?.as_bytes() == durable {
+        return Ok(false);
+    }
+    let mut succeeded = before.clone();
+    succeeded.phase = MaintenanceTaskPhase::Succeeded;
+    succeeded.cancellation_requested = false;
+    succeeded.active_dispatch = None;
+    succeeded.terminal_order = Some(terminal_order);
+    if encode_record(&succeeded)?.as_bytes() == durable {
+        return Ok(true);
+    }
+    Err(MaintenanceFailure::PreconditionFailed)
 }
 
 fn durable_running_publication_matches(before: &TaskState, durable: &TaskState) -> bool {

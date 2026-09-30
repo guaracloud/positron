@@ -17,10 +17,10 @@ use super::io::{
     map_errno, map_io_error, open_existing_directory, open_or_create_directory, open_regular,
     synchronize,
 };
-use super::recovery::{authenticated_frontier_bounds, frontier_temporary_name};
 use super::recovery::{
     RecoveryMode, RecoveryState, frontier_name, publish_frontier, recover_with_mode, segment_name,
 };
+use super::recovery::{authenticated_frontier_bounds, frontier_temporary_name};
 use super::{
     LedgerFailure, LedgerFailureCode, SegmentId, SegmentProtectionKey, SegmentScope,
     map_frame_failure, object_context,
@@ -404,7 +404,8 @@ impl LedgerStorage {
         {
             return Err(LedgerFailure::new(LedgerFailureCode::AuthenticationFailed));
         }
-        let (durable_bytes, blocks) = authenticated_frontier_bounds(&self.sealed, metadata.id, &key)?;
+        let (durable_bytes, blocks) =
+            authenticated_frontier_bounds(&self.sealed, metadata.id, &key)?;
         let file_bytes = file.metadata().map_err(map_io_error)?.len();
         if file_bytes != durable_bytes {
             return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));

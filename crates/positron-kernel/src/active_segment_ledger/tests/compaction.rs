@@ -1639,10 +1639,7 @@ fn typed_compaction_task_couples_the_exact_manifest_and_terminal_record()
         Ok(_) => return Err("a Compaction descriptor bound a foreign physical scope".into()),
         Err(failure) => failure,
     };
-    assert_eq!(
-        wrong_scope_failure.code(),
-        LedgerFailureCode::InvalidInput
-    );
+    assert_eq!(wrong_scope_failure.code(), LedgerFailureCode::InvalidInput);
     let outside_bucket = RetentionBucket::for_ingest_time(
         tenant,
         SignalKind::Logs,
@@ -1656,8 +1653,68 @@ fn typed_compaction_task_couples_the_exact_manifest_and_terminal_record()
         )),
         policy.retention_seconds(),
     )?;
-    let _outside_bucket = outside_bucket;
     assert_eq!(catalog.pin()?.number(), generation_before_binding_refusals);
+    let source_segments = snapshot
+        .blocks()
+        .iter()
+        .map(CommittedBlock::segment_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    let empty_identity = MaintenanceTaskId::new([0xa2; 16]).expect("empty-bucket task identity");
+    let empty_task = ledger.prepare_compaction_task(outside_bucket, empty_identity)?;
+    let empty_coordinator = MaintenanceCoordinator::new();
+    empty_task.submit_and_persist(&empty_coordinator, &catalog, 1)?;
+    let empty_execution = empty_coordinator
+        .start_compaction_task_with_reservation_and_persist(
+            &catalog,
+            &authority,
+            1,
+            false,
+            empty_identity,
+        )
+        .map_err(|failure| format!("empty-bucket task admission: {failure:?}"))?
+        .expect("empty-bucket compaction dispatch");
+    let empty_preparation =
+        ledger.prepare_compaction_payload_for_maintenance(&snapshot, &empty_execution)?;
+    let empty_generation = catalog.pin()?.number();
+    let empty_publication = ledger.compact_sealed_with_maintenance(
+        Vec::new(),
+        empty_preparation,
+        &empty_coordinator,
+        &empty_execution,
+        || false,
+    )?;
+    assert_eq!(empty_publication.input_segments(), 0);
+    assert_eq!(empty_publication.output_segments(), 0);
+    assert_eq!(
+        catalog.pin()?.number(),
+        empty_generation + 1,
+        "an empty bucket terminalizes only its PMTC record"
+    );
+    assert_eq!(
+        empty_coordinator
+            .status(empty_identity)
+            .expect("empty-bucket terminal task")
+            .phase(),
+        crate::MaintenanceTaskPhase::Succeeded
+    );
+    assert_eq!(
+        ledger
+            .snapshot()?
+            .blocks()
+            .iter()
+            .map(CommittedBlock::segment_id)
+            .collect::<std::collections::BTreeSet<_>>(),
+        source_segments,
+        "an empty bucket leaves the source manifest current"
+    );
+    assert_eq!(
+        MaintenanceCoordinator::restore_from_catalog(&catalog)
+            .map_err(|failure| format!("restore empty-bucket task: {failure:?}"))?
+            .status(empty_identity)
+            .expect("restored empty-bucket task")
+            .phase(),
+        crate::MaintenanceTaskPhase::Succeeded
+    );
     let identity = MaintenanceTaskId::new([0xe8; 16]).expect("task identity");
     let task = ledger
         .prepare_compaction_task(bucket, identity)
@@ -1718,10 +1775,9 @@ fn typed_compaction_task_couples_the_exact_manifest_and_terminal_record()
     )?;
     let mut rewritten_source = blocks.clone();
     rewritten_source[0].source_segment = rewritten_source[1].source_segment;
-    let refusal_preparation =
-        ledger
-            .prepare_compaction_payload_for_maintenance(&snapshot, &execution)
-            .map_err(|failure| format!("rewritten-source preparation: {failure:?}"))?;
+    let refusal_preparation = ledger
+        .prepare_compaction_payload_for_maintenance(&snapshot, &execution)
+        .map_err(|failure| format!("rewritten-source preparation: {failure:?}"))?;
     let generation_before_refusal = catalog.pin()?.number();
     let refusal = ledger
         .compact_sealed_with_maintenance(
@@ -1755,8 +1811,16 @@ fn typed_compaction_task_couples_the_exact_manifest_and_terminal_record()
         .prepare_compaction_payload_for_maintenance(&snapshot, &execution)
         .map_err(|failure| format!("execution preparation: {failure:?}"))?;
     let generation = catalog.pin()?.number();
+    let mut reversed_blocks = blocks;
+    reversed_blocks.reverse();
     ledger
-        .compact_sealed_with_maintenance(blocks, preparation, &coordinator, &execution, || false)
+        .compact_sealed_with_maintenance(
+            reversed_blocks,
+            preparation,
+            &coordinator,
+            &execution,
+            || false,
+        )
         .map_err(|failure| format!("typed execution: {failure:?}"))?;
     assert_eq!(
         coordinator.status(identity).expect("terminal task").phase(),
@@ -1774,6 +1838,20 @@ fn typed_compaction_task_couples_the_exact_manifest_and_terminal_record()
             .expect("restored task")
             .phase(),
         crate::MaintenanceTaskPhase::Succeeded
+    );
+    drop(snapshot);
+    drop(ledger);
+    let reopened = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    assert_eq!(
+        reopened.snapshot()?.blocks().len(),
+        2,
+        "reopen observes the one canonical post-compaction source replacement"
     );
     Ok(())
 }
@@ -2012,6 +2090,12 @@ fn typed_compaction_reconciles_a_two_fault_lost_ack_with_the_original_execution(
     );
     catalog.refresh_state()?;
     assert_eq!(catalog.pin()?.number(), generation + 1);
+    assert_eq!(
+        coordinator
+            .cancel_and_persist(&catalog, identity)
+            .expect_err("a durable Compaction terminal must not be overwritten by cancellation"),
+        crate::MaintenanceFailure::PreconditionFailed
+    );
     ledger.reconcile_ambiguous_compaction_completion(&blocks, &coordinator, &execution)?;
     assert_eq!(
         coordinator
