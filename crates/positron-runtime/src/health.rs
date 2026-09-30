@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use positron_governance::{CompatibilityHints, PresentedCredential, RequestedIntent};
 
@@ -35,6 +35,12 @@ pub enum Liveness {
     Dead,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ConfigurationStatusFailure {
+    AuthenticationRejected,
+    Unavailable,
+}
+
 /// A bounded operator-visible security condition that does not affect readiness.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HealthWarning {
@@ -67,6 +73,7 @@ pub struct HealthState {
     plaintext_listener_roles: Arc<AtomicU8>,
     configuration: Arc<OnceLock<Arc<RuntimeConfiguration>>>,
     inspection_authority: Arc<OnceLock<Weak<InitializedInstance>>>,
+    catalog_operation: Arc<OnceLock<Weak<Mutex<()>>>>,
 }
 
 impl std::fmt::Debug for HealthState {
@@ -155,6 +162,24 @@ impl HealthState {
             .map(|_| ())
             .map_err(|_| ())
     }
+
+    pub(crate) fn authorized_configuration_status(
+        &self,
+        bearer: &str,
+    ) -> Result<Option<ConfigurationObservation>, ConfigurationStatusFailure> {
+        let catalog_operation = self
+            .catalog_operation
+            .get()
+            .and_then(Weak::upgrade)
+            .ok_or(ConfigurationStatusFailure::Unavailable)?;
+        let _catalog_operation = catalog_operation
+            .lock()
+            .map_err(|_| ConfigurationStatusFailure::Unavailable)?;
+        self.authorize_configuration_status(bearer)
+            .map_err(|_| ConfigurationStatusFailure::AuthenticationRejected)?;
+        self.configuration_status()
+            .map_err(|_| ConfigurationStatusFailure::Unavailable)
+    }
 }
 
 pub(crate) struct ProcessState {
@@ -169,6 +194,7 @@ impl ProcessState {
                 plaintext_listener_roles: Arc::new(AtomicU8::new(0)),
                 configuration: Arc::new(OnceLock::new()),
                 inspection_authority: Arc::new(OnceLock::new()),
+                catalog_operation: Arc::new(OnceLock::new()),
             },
         }
     }
@@ -210,6 +236,16 @@ impl ProcessState {
         self.health
             .inspection_authority
             .set(Arc::downgrade(&authority))
+            .map_err(|_| ConfigurationRuntimeFailure::Unavailable)
+    }
+
+    pub(crate) fn set_catalog_operation(
+        &self,
+        catalog_operation: Arc<Mutex<()>>,
+    ) -> Result<(), ConfigurationRuntimeFailure> {
+        self.health
+            .catalog_operation
+            .set(Arc::downgrade(&catalog_operation))
             .map_err(|_| ConfigurationRuntimeFailure::Unavailable)
     }
 }

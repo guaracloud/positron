@@ -149,6 +149,10 @@ impl ServiceHandle {
             .map_err(|_| ServiceFailure::Internal)
     }
 
+    pub(crate) fn catalog_operation_gate(&self) -> Arc<Mutex<()>> {
+        Arc::clone(&self.catalog_operation)
+    }
+
     pub(crate) fn try_catalog_operation(
         &self,
     ) -> Result<Option<MutexGuard<'_, ()>>, ServiceFailure> {

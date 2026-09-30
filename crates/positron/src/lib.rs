@@ -521,6 +521,8 @@ mod tests {
             recovery.after_failure(RecoveryAttempt::for_test(1)),
             RecoveryDecision::Retry
         );
+        let mut signals = recovery.into_signals().map_err(|_| "signals unavailable")?;
+        assert_eq!(signals.pending().next(), None);
         Ok(())
     }
 

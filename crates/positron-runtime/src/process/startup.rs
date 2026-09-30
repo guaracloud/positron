@@ -242,6 +242,16 @@ impl ApplicationRuntime {
                 ));
             },
         };
+        state
+            .set_catalog_operation(services.catalog_operation_gate())
+            .map_err(|_| {
+                cleanup_startup(
+                    ExitOutcome::StartupUnavailable(BootstrapFailureCode::CatalogUnavailable),
+                    &cancellation,
+                    &mut listeners,
+                    &mut tasks,
+                )
+            })?;
         for role in [
             ListenerRole::Api,
             ListenerRole::OtlpGrpc,
