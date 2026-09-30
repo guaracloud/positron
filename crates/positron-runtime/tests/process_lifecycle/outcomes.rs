@@ -240,10 +240,10 @@ fn second_signal_cleanup_overflow_is_bounded_and_deterministic()
     assert_eq!(
         cleanup.failed_roles().collect::<Vec<_>>(),
         [
+            positron_runtime::CleanupRole::Task(TaskRole::Maintenance),
             positron_runtime::CleanupRole::Task(TaskRole::LokiPush),
             positron_runtime::CleanupRole::Task(TaskRole::OtlpHttp),
             positron_runtime::CleanupRole::Task(TaskRole::OtlpGrpc),
-            positron_runtime::CleanupRole::Task(TaskRole::Api),
         ]
     );
     assert!(roots.acquire_volume_again().is_ok());
@@ -308,11 +308,11 @@ fn deadline_aborts_every_task_and_never_reports_graceful_completion()
             .cloned()
             .collect::<Vec<_>>(),
         [
+            TaskEvent::Aborted(TaskRole::Maintenance, ProcessPhase::Stopping, true),
             TaskEvent::Aborted(TaskRole::LokiPush, ProcessPhase::Stopping, true),
             TaskEvent::Aborted(TaskRole::OtlpHttp, ProcessPhase::Stopping, true),
             TaskEvent::Aborted(TaskRole::OtlpGrpc, ProcessPhase::Stopping, true),
             TaskEvent::Aborted(TaskRole::Api, ProcessPhase::Stopping, true),
-            TaskEvent::Aborted(TaskRole::Maintenance, ProcessPhase::Stopping, true),
             TaskEvent::Aborted(TaskRole::Operations, ProcessPhase::Stopping, true),
             TaskEvent::Aborted(TaskRole::Control, ProcessPhase::Stopping, true),
         ]
@@ -436,7 +436,7 @@ fn first_signal_closes_admission_joins_registered_tasks_and_releases_ownership_l
     assert_eq!(events.len(), 21);
     assert!(matches!(
         events.last(),
-        Some(TaskEvent::Joined(TaskRole::LokiPush, ..))
+        Some(TaskEvent::Joined(TaskRole::Maintenance, ..))
     ));
     Ok(())
 }
