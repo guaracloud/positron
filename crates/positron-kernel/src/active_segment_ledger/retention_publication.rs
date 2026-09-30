@@ -145,16 +145,6 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             .lock()
             .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
         state.require_healthy()?;
-        if coordinator
-            .status(execution.task().identity())
-            .map_err(|_| LedgerFailure::new(LedgerFailureCode::StaleGeneration))?
-            .cancellation_requested()
-        {
-            execution
-                .complete_and_persist(coordinator, self.catalog, true)
-                .map_err(|_| LedgerFailure::new(LedgerFailureCode::RecoveryRequired))?;
-            return Err(LedgerFailure::new(LedgerFailureCode::Cancelled));
-        }
         self.catalog.refresh_state()?;
         let basis = self.catalog.pin()?;
         let durable_record = durable_task_record(&basis, execution.task().identity())?;
@@ -165,7 +155,12 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             .copied()
             .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::StaleGeneration))
             .and_then(|output| task_identity(output, 0xa5))?;
-        if let Ok(reclamation_record) = durable_task_record(&basis, reclamation_identity) {
+        let reclamation_record = match durable_task_record(&basis, reclamation_identity) {
+            Ok(record) => Some(record),
+            Err(failure) if failure.code() == LedgerFailureCode::RecoveryRequired => None,
+            Err(failure) => return Err(failure),
+        };
+        if let Some(reclamation_record) = reclamation_record {
             let expected_frontier =
                 retention_publication_frontier_bound(coordinator, execution.task().identity())?;
             let completion = execution
@@ -219,6 +214,16 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             state.retention_frontier = recovered_frontier;
             state.retention_readiness = super::state::RetentionReadiness::TrustedPersisted;
             return Ok(reclamation_identity);
+        }
+        if coordinator
+            .status(expected.identity())
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::StaleGeneration))?
+            .cancellation_requested()
+        {
+            execution
+                .cancel_running_retention_publication_and_persist(coordinator, self.catalog)
+                .map_err(|_| LedgerFailure::new(LedgerFailureCode::RecoveryRequired))?;
+            return Err(LedgerFailure::new(LedgerFailureCode::Cancelled));
         }
         let durable_frontier =
             retention_publication_frontier_bound(coordinator, expected.identity())?;

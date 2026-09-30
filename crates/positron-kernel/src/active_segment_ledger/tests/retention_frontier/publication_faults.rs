@@ -66,6 +66,13 @@ fn delayed_retention_publication_proof_retries_the_exact_durable_terminal_pair()
             .phase(),
         MaintenanceTaskPhase::Running
     );
+    catalog.refresh_state()?;
+    assert_eq!(
+        coordinator
+            .cancel_and_persist(&catalog, publication_id)
+            .expect_err("a durable Publication/Reclamation pair cannot be overwritten"),
+        crate::MaintenanceFailure::PreconditionFailed
+    );
     elapsed.advance(1_000_000_000)?;
     let reclamation_id = active
         .complete_running_retention_publication_task(&coordinator, &execution)
@@ -178,6 +185,102 @@ fn retention_publication_uses_its_durable_frontier_after_the_live_clock_advances
         retention_time.status().safe_anchor(),
         UnixNanoseconds::new(13_000_000_000),
         "the live lifecycle authority can advance beyond the durable publication bound"
+    );
+    Ok(())
+}
+
+#[test]
+fn cancelled_running_retention_publication_terminalizes_without_retiring_or_queuing()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_authority(volume)?;
+    let instance = InstanceId::new([0xd6; 16])?;
+    let catalog = Catalog::open(
+        &authority,
+        instance,
+        CatalogSecret::from_owned(Box::new([0xd7; 32]), Box::new([0xd8; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x64; 16])?;
+    install_governance_policy(&catalog, instance, tenant, 1, 0xd9)?;
+    let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(103)?);
+    let (retention_time, elapsed) =
+        RetentionTimeAuthority::establish_with_manual_elapsed(UnixNanoseconds::new(10_000_000_000));
+    let key = || SegmentProtectionKey::from_owned(Box::new([0xda; 32]));
+    let sealed = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    let block = sealed.begin_store_block(
+        preparation_capacity(&authority, tenant)?,
+        StoreBlockIdentity::new([0xdb; 16])?,
+    )?;
+    sealed.append(block.finish(b"cancelled publication".to_vec())?)?;
+    sealed.seal()?;
+    elapsed.advance(2_000_000_000)?;
+    let active = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    let coordinator = MaintenanceCoordinator::new();
+    let preparation = active.prepare_retention_publication()?;
+    let publication_id = preparation.task().identity();
+    preparation.submit_and_persist(&coordinator, &catalog, 12)?;
+    let execution = coordinator
+        .start_next_with_reservation_and_persist(&catalog, &authority, 12, false)
+        .expect("publication dispatch")
+        .expect("publication execution");
+    coordinator
+        .cancel_and_persist(&catalog, publication_id)
+        .expect("durable cancellation request");
+
+    let cancellation = active
+        .complete_running_retention_publication_task(&coordinator, &execution)
+        .expect_err("a cancellation ends this uncommitted publication without a successor");
+    assert_eq!(cancellation.code(), LedgerFailureCode::Cancelled);
+    assert_eq!(
+        coordinator
+            .status(publication_id)
+            .expect("cancelled publication")
+            .phase(),
+        MaintenanceTaskPhase::Cancelled
+    );
+    assert_eq!(
+        active.snapshot()?.blocks().len(),
+        1,
+        "cancellation keeps the sealed segment visible and does not retire it"
+    );
+    drop(execution);
+    assert_eq!(
+        authority.governor().inspect()?.recovery_pool_usage(
+            crate::RecoveryWorkKind::Retention,
+            crate::ResourceDimension::MemoryBytes,
+        ),
+        0,
+        "the cancelled execution releases its dispatch grant"
+    );
+    let restored = MaintenanceCoordinator::restore_from_catalog(&catalog)
+        .expect("cancelled Publication restores");
+    assert_eq!(
+        restored
+            .status(publication_id)
+            .expect("restored publication")
+            .phase(),
+        MaintenanceTaskPhase::Cancelled
+    );
+    assert_eq!(
+        restored
+            .durable_records()
+            .expect("durable task records")
+            .len(),
+        1,
+        "the cancelled Publication does not publish a Reclamation successor"
     );
     Ok(())
 }

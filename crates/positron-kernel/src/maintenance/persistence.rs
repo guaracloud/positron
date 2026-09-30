@@ -301,19 +301,7 @@ impl MaintenanceCoordinator {
         let next_terminal_order = terminal_order
             .checked_add(1)
             .ok_or(MaintenanceFailure::CapacityExceeded)?;
-        if publication_after.task != before.task
-            || publication_after.phase != MaintenanceTaskPhase::Succeeded
-            || publication_after.active_dispatch.is_some()
-            || publication_after.checkpoint != before.checkpoint
-            || reclamation.task.class != MaintenanceTaskClass::RetentionReclamation
-            || reclamation.phase != MaintenanceTaskPhase::Queued
-            || reclamation.task.scope != before.task.scope
-            || reclamation.task.trigger != MaintenanceTrigger::AgeDerived
-            || reclamation.task.preconditions != before.task.preconditions
-            || reclamation.task.inputs != before.task.outputs
-            || !reclamation.task.outputs.is_empty()
-            || reclamation.task.reservations != before.task.reservations
-            || reclamation.checkpoint.is_some()
+        if !canonical_retention_publication_pair(&before, &publication_after, &reclamation)?
             || state.tasks.contains_key(&reclamation.task.identity)
         {
             return Err(MaintenanceFailure::PreconditionFailed);
@@ -990,6 +978,16 @@ impl MaintenanceCoordinator {
             .lock()
             .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
         super::require_unreserved_task_transition(&state, identity)?;
+        let running_publication = state.tasks.get(&identity).and_then(|task| {
+            (task.task.class == MaintenanceTaskClass::RetentionPublication
+                && task.phase == MaintenanceTaskPhase::Running)
+                .then(|| task.clone())
+        });
+        if let Some(publication) = running_publication
+            && durable_retention_publication_pair_exists(catalog, &publication)?
+        {
+            return Err(MaintenanceFailure::PreconditionFailed);
+        }
         let mut next = state.clone();
         let terminal = {
             let task = next
@@ -1181,9 +1179,57 @@ impl MaintenanceCoordinator {
         *state = next;
         Ok(())
     }
+
+    pub(super) fn cancel_running_retention_publication_and_persist_dispatch(
+        &self,
+        catalog: &Catalog<'_>,
+        dispatch: MaintenanceDispatch,
+    ) -> Result<(), MaintenanceFailure> {
+        if dispatch.coordinator_id != self.coordinator_id {
+            return Err(MaintenanceFailure::InvalidTransition);
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
+        super::require_unreserved_task_transition(&state, dispatch.identity)?;
+        let mut next = state.clone();
+        {
+            let task = next
+                .tasks
+                .get_mut(&dispatch.identity)
+                .ok_or(MaintenanceFailure::UnknownTask)?;
+            if task.task.class != MaintenanceTaskClass::RetentionPublication
+                || task.phase != MaintenanceTaskPhase::Running
+                || task.active_dispatch != Some(dispatch)
+                || !task.cancellation_requested
+            {
+                return Err(MaintenanceFailure::InvalidTransition);
+            }
+            task.phase = MaintenanceTaskPhase::Cancelled;
+            task.active_dispatch = None;
+        }
+        assign_terminal_order(&mut next, dispatch.identity)?;
+        let task = next
+            .tasks
+            .get(&dispatch.identity)
+            .ok_or(MaintenanceFailure::UnknownTask)?;
+        persist_task_state(catalog, task, None)?;
+        *state = next;
+        Ok(())
+    }
 }
 
 impl MaintenanceExecution<'_> {
+    pub(crate) fn cancel_running_retention_publication_and_persist(
+        &self,
+        coordinator: &MaintenanceCoordinator,
+        catalog: &Catalog<'_>,
+    ) -> Result<(), MaintenanceFailure> {
+        coordinator
+            .cancel_running_retention_publication_and_persist_dispatch(catalog, self.dispatch)
+    }
+
     pub(crate) fn reconcile_running_retention_publication_completion(
         &self,
         coordinator: &MaintenanceCoordinator,
@@ -1243,6 +1289,102 @@ impl MaintenanceExecution<'_> {
     ) -> Result<(), MaintenanceFailure> {
         coordinator.complete_and_persist_dispatch(catalog, self.dispatch, succeeded)
     }
+}
+
+fn durable_retention_publication_pair_exists(
+    catalog: &Catalog<'_>,
+    before: &TaskState,
+) -> Result<bool, MaintenanceFailure> {
+    let snapshot = catalog.pin().map_err(map_catalog_failure)?;
+    let reclamation_identity = retention_reclamation_identity(&before.task)?;
+    let mut identities = BTreeSet::new();
+    let mut publication = None;
+    let mut reclamation = None;
+    for bytes in snapshot.plaintext_objects() {
+        let Some(identity) = record::record_identity(bytes)? else {
+            continue;
+        };
+        if !identities.insert(identity) {
+            return Err(MaintenanceFailure::CatalogUnavailable);
+        }
+        let candidate = decode_record(bytes)?;
+        if identity == before.task.identity {
+            if publication.replace(candidate).is_some() {
+                return Err(MaintenanceFailure::CatalogUnavailable);
+            }
+        } else if identity == reclamation_identity && reclamation.replace(candidate).is_some() {
+            return Err(MaintenanceFailure::CatalogUnavailable);
+        }
+    }
+    match (publication, reclamation) {
+        (Some(publication), None) if durable_running_publication_matches(before, &publication) => {
+            Ok(false)
+        },
+        (Some(publication), Some(reclamation)) => {
+            canonical_retention_publication_pair(before, &publication, &reclamation)
+        },
+        _ => Err(MaintenanceFailure::CatalogUnavailable),
+    }
+}
+
+fn durable_running_publication_matches(before: &TaskState, durable: &TaskState) -> bool {
+    durable.task == before.task
+        && durable.phase == MaintenanceTaskPhase::Running
+        && durable.submitted_at == before.submitted_at
+        && durable.checkpoint == before.checkpoint
+        && durable.pause_until == before.pause_until
+        && durable.cancellation_requested == before.cancellation_requested
+        && durable.dispatches == before.dispatches
+        && durable.terminal_order == before.terminal_order
+}
+
+fn canonical_retention_publication_pair(
+    before: &TaskState,
+    publication: &TaskState,
+    reclamation: &TaskState,
+) -> Result<bool, MaintenanceFailure> {
+    Ok(publication.task == before.task
+        && publication.phase == MaintenanceTaskPhase::Succeeded
+        && publication.active_dispatch.is_none()
+        && publication.checkpoint == before.checkpoint
+        && !publication.cancellation_requested
+        && reclamation.task.identity == retention_reclamation_identity(&before.task)?
+        && reclamation.task.class == MaintenanceTaskClass::RetentionReclamation
+        && reclamation.phase == MaintenanceTaskPhase::Queued
+        && reclamation.task.scope == before.task.scope
+        && reclamation.task.trigger == MaintenanceTrigger::AgeDerived
+        && reclamation.task.preconditions == before.task.preconditions
+        && reclamation.task.inputs == before.task.outputs
+        && reclamation.task.outputs.is_empty()
+        && reclamation.task.reservations == before.task.reservations
+        && reclamation.checkpoint.is_none()
+        && reclamation.pause_until.is_none()
+        && !reclamation.cancellation_requested
+        && reclamation.dispatches == 0
+        && reclamation.terminal_order.is_none()
+        && reclamation.active_dispatch.is_none()
+        && reclamation.submitted_at == before.submitted_at)
+}
+
+fn retention_reclamation_identity(
+    publication: &MaintenanceTask,
+) -> Result<MaintenanceTaskId, MaintenanceFailure> {
+    let binding = publication
+        .outputs
+        .first()
+        .ok_or(MaintenanceFailure::PreconditionFailed)?;
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(
+        binding
+            .to_bytes()
+            .get(..16)
+            .ok_or(MaintenanceFailure::PreconditionFailed)?,
+    );
+    bytes[0] ^= 0xa5;
+    if bytes.iter().all(|byte| *byte == 0) {
+        bytes[0] = 1;
+    }
+    MaintenanceTaskId::new(bytes)
 }
 
 fn persist_task_state(
