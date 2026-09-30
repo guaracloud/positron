@@ -230,6 +230,118 @@ fn altered_terminal_publication_record_refuses_cancellation_and_reconciliation()
 }
 
 #[test]
+fn altered_reclamation_not_before_refuses_cancellation_and_reconciliation()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_authority(volume)?;
+    let instance = InstanceId::new([0xb8; 16])?;
+    let catalog = Catalog::open(
+        &authority,
+        instance,
+        CatalogSecret::from_owned(Box::new([0xb9; 32]), Box::new([0xba; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x64; 16])?;
+    install_governance_policy(&catalog, instance, tenant, 1, 0xbb)?;
+    let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(105)?);
+    let (retention_time, elapsed) =
+        RetentionTimeAuthority::establish_with_manual_elapsed(UnixNanoseconds::new(10_000_000_000));
+    let key = || SegmentProtectionKey::from_owned(Box::new([0xbc; 32]));
+    let sealed = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    let block = sealed.begin_store_block(
+        preparation_capacity(&authority, tenant)?,
+        StoreBlockIdentity::new([0xbd; 16])?,
+    )?;
+    sealed.append(block.finish(b"altered reclamation schedule".to_vec())?)?;
+    sealed.seal()?;
+    elapsed.advance(2_000_000_000)?;
+    let active = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    let coordinator = MaintenanceCoordinator::new();
+    let preparation = active.prepare_retention_publication()?;
+    let publication_id = preparation.task().identity();
+    preparation.submit_and_persist(&coordinator, &catalog, 12)?;
+    let execution = coordinator
+        .start_next_with_reservation_and_persist(&catalog, &authority, 12, false)
+        .expect("publication dispatch")
+        .expect("publication execution");
+    let first = with_catalog_publication_fault_sequence_after(
+        &[
+            (CatalogPublicationFault::SynchronizeGenerationDirectory, 0),
+            (CatalogPublicationFault::ReadGenerationDirectory, 0),
+        ],
+        || active.complete_running_retention_publication_task(&coordinator, &execution),
+    )
+    .expect_err("durable publication with failed immediate proof is ambiguous");
+    assert_eq!(first.code(), LedgerFailureCode::StorageUnavailable);
+    catalog.refresh_state()?;
+
+    let basis = catalog.pin()?;
+    let mut replaced = false;
+    let objects = basis
+        .plaintext_objects()
+        .map(|bytes| {
+            let identity = crate::maintenance::durable_task_record_identity(bytes)
+                .map_err(|failure| format!("durable task identity: {failure:?}"))?;
+            let bytes = if identity.is_some() && identity != Some(publication_id) {
+                replaced = true;
+                crate::maintenance::rewrite_durable_task_record_not_before_for_test(bytes, 1)
+                    .map_err(|failure| format!("rewrite durable task: {failure:?}"))?
+            } else {
+                bytes.to_vec()
+            };
+            CatalogObject::new(bytes).map_err(Into::into)
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    assert!(replaced, "the authenticated Reclamation must be present");
+    catalog.commit(
+        basis.identity(),
+        CatalogProposal::new(
+            TransactionId::new([0xbe; 16])?,
+            FormatEpoch::CATALOG_V1,
+            objects,
+        )?,
+        None,
+    )?;
+    let altered_identity = catalog.pin()?.identity();
+
+    assert_eq!(
+        coordinator
+            .cancel_and_persist(&catalog, publication_id)
+            .expect_err("a mismatched Reclamation schedule must not be overwritten"),
+        crate::MaintenanceFailure::PreconditionFailed
+    );
+    assert_eq!(
+        catalog.pin()?.identity(),
+        altered_identity,
+        "refusing cancellation must leave the authenticated durable pair untouched"
+    );
+    let failure = active
+        .complete_running_retention_publication_task(&coordinator, &execution)
+        .expect_err("the altered Reclamation cannot reconcile into live coordinator state");
+    assert_eq!(failure.code(), LedgerFailureCode::RecoveryRequired);
+    assert_eq!(
+        coordinator
+            .status(publication_id)
+            .expect("live publication")
+            .phase(),
+        MaintenanceTaskPhase::Running
+    );
+    Ok(())
+}
+
+#[test]
 fn retention_publication_uses_its_durable_frontier_after_the_live_clock_advances()
 -> Result<(), Box<dyn Error>> {
     let root = TemporaryRoot::new()?;

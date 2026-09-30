@@ -1362,6 +1362,7 @@ fn canonical_retention_publication_pair(
         && reclamation.task.inputs == before.task.outputs
         && reclamation.task.outputs.is_empty()
         && reclamation.task.reservations == before.task.reservations
+        && reclamation.task.not_before == 0
         && reclamation.checkpoint.is_none()
         && reclamation.pause_until.is_none()
         && !reclamation.cancellation_requested
