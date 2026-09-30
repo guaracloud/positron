@@ -30,7 +30,7 @@ fn retention_publication_claim_covers_all_live_terminal_pair_buffers() -> Result
         .checked_add(scanned_metadata.max(proposed_catalog))
         .and_then(|bytes| {
             bytes.checked_add(
-                11_usize
+                13_usize
                     .checked_mul(16)
                     .and_then(|count| count.checked_mul(size_of::<crate::MaintenanceObjectId>()))?,
             )

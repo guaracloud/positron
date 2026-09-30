@@ -1,22 +1,21 @@
 use std::collections::BTreeSet;
-use std::mem::size_of;
 
 use super::format::SegmentState;
 use super::publication::{RetentionPublication, publish_retention_with_tasks};
-use super::{ActiveSegmentLedger, LedgerFailure, LedgerFailureCode, SegmentRetention};
-use crate::maintenance::{MaintenanceCheckpoint, RetentionPublicationBinding};
+use super::{ActiveSegmentLedger, LedgerFailure, LedgerFailureCode};
+use crate::maintenance::RetentionPublicationBinding;
 use crate::{
-    CatalogObject, MaintenanceCoordinator, MaintenanceExecution, MaintenanceObjectId,
-    MaintenancePreconditions, MaintenanceScope, MaintenanceTask, MaintenanceTaskClass,
-    MaintenanceTaskId, MaintenanceTrigger, RecoveryWorkClaim, RecoveryWorkKind, ResourceAmounts,
-    ResourceDimension, ResourceReservation,
+    MaintenanceCoordinator, MaintenanceExecution, MaintenancePreconditions, MaintenanceScope,
+    MaintenanceTask, MaintenanceTaskClass, MaintenanceTaskId, MaintenanceTrigger,
+    RecoveryWorkClaim, RecoveryWorkKind, ResourceDimension, ResourceReservation,
 };
 
-const RETENTION_PUBLICATION_BATCH_ITEMS: u64 = 16;
-const MAX_RETENTION_PUBLICATION_SEGMENTS: usize = 16;
-const COMPLETION_RECORD_COPIES: usize = 4;
-const COMPLETION_BINDING_VECTORS: usize = 11;
-const COMPLETION_CHECKPOINT_COPIES: usize = 3;
+mod plan;
+mod proof;
+
+use plan::{metadata_binding, retention_publication_plan, task_bindings, task_identity};
+pub(super) use proof::retention_publication_claim;
+use proof::{durable_task_record, retention_publication_frontier_bound};
 
 /// An admitted retention-publication descriptor. Its preparation reservation
 /// covers metadata planning and the one durable task submission, then drops
@@ -50,7 +49,9 @@ impl RetentionPublicationPreparation<'_> {
                 LedgerFailureCode::ResourceAdmissionRefused,
             ));
         }
-        let checkpoint = retention_publication_frontier_checkpoint(self.frontier)?;
+        let checkpoint =
+            crate::maintenance::retention_publication_frontier_checkpoint(self.frontier)
+                .map_err(map_maintenance_failure)?;
         coordinator
             .submit_retention_publication_and_persist(
                 catalog,
@@ -61,12 +62,6 @@ impl RetentionPublicationPreparation<'_> {
             .map_err(map_maintenance_failure)?;
         Ok(self.task)
     }
-}
-
-struct RetentionPublicationPlan {
-    metadata: Vec<super::format::SegmentMetadata>,
-    retired: Vec<(MaintenanceObjectId, MaintenanceObjectId)>,
-    frontier: crate::IngestTime,
 }
 
 impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
@@ -225,12 +220,17 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             state.retention_readiness = super::state::RetentionReadiness::TrustedPersisted;
             return Ok(reclamation_identity);
         }
+        let durable_frontier =
+            retention_publication_frontier_bound(coordinator, expected.identity())?;
         let mut clock_anchor = retention_time
             .stage_catalog_anchor()
             .map_err(super::map_retention_time_failure)?;
-        let frontier = clock_anchor
+        let observed_frontier = clock_anchor
             .destructive_ingest_time(self.scope, state.retention_frontier)
             .map_err(super::map_retention_time_failure)?;
+        if observed_frontier < durable_frontier {
+            return Err(LedgerFailure::new(LedgerFailureCode::StaleGeneration));
+        }
         let expected_claim = retention_publication_claim()?;
         if !ResourceDimension::ALL.iter().all(|dimension| {
             expected_claim.get(*dimension) <= execution.reservation().granted().get(*dimension)
@@ -239,7 +239,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
                 LedgerFailureCode::ResourceAdmissionRefused,
             ));
         }
-        let plan = retention_publication_plan(self, &basis, &state, frontier)?;
+        let plan = retention_publication_plan(self, &basis, &state, durable_frontier)?;
         if plan.retired.is_empty() {
             return Err(LedgerFailure::new(LedgerFailureCode::StaleGeneration));
         }
@@ -300,6 +300,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
                 scope: self.scope,
                 metadata: &plan.metadata,
                 frontier: plan.frontier,
+                anchor: observed_frontier,
                 additional,
                 replaced_tasks: replaced,
             },
@@ -310,6 +311,11 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
                 return Err(failure);
             },
         };
+        retention_time
+            .recover_catalog_anchor(&latest)
+            .map_err(|failure| {
+                LedgerFailure::post_mutation(super::map_retention_time_failure(failure).code())
+            })?;
         clock_anchor.commit();
         completion
             .install(coordinator)
@@ -360,62 +366,6 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
     }
 }
 
-pub(super) fn retention_publication_claim() -> Result<ResourceAmounts, LedgerFailure> {
-    let scanned_metadata = crate::catalog::MAX_CATALOG_OBJECTS
-        .checked_mul(size_of::<super::format::SegmentMetadata>())
-        .and_then(|bytes| bytes.checked_mul(2));
-    let proposed_catalog = crate::catalog::MAX_CATALOG_OBJECTS
-        .checked_mul(size_of::<CatalogObject>())
-        .and_then(|objects| {
-            crate::catalog::MAX_CATALOG_OBJECTS
-                .checked_mul(size_of::<super::format::SegmentMetadata>())
-                .and_then(|metadata| objects.checked_add(metadata))
-        });
-    // The coordinator keeps the submitted Publication and dispatch owns its
-    // execution copy. Planning owns inputs and outputs; completion then owns
-    // cloned before and after Publication states plus the Reclamation input.
-    // Those eleven bounded object vectors coexist while both encoded records
-    // are cloned into the Catalog proposal. The submitted state and the two
-    // completion states also retain their independent checkpoint vectors. The
-    // records themselves peak at four copies: two encoded records and two
-    // CatalogObject plaintext clones.
-    let bindings = MAX_RETENTION_PUBLICATION_SEGMENTS
-        .checked_mul(size_of::<MaintenanceObjectId>())
-        .and_then(|objects| objects.checked_mul(COMPLETION_BINDING_VECTORS));
-    let record_bytes = crate::maintenance::retention_publication_record_bytes_bound()
-        .map_err(map_maintenance_failure)?;
-    let completion_records = record_bytes
-        .checked_mul(COMPLETION_RECORD_COPIES)
-        .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
-    let completion_checkpoints = crate::maintenance::MAX_CHECKPOINT_BYTES
-        .checked_mul(COMPLETION_CHECKPOINT_COPIES)
-        .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
-    let memory = crate::catalog::MAX_CATALOG_TOTAL_BYTES
-        .checked_add(
-            scanned_metadata
-                .zip(proposed_catalog)
-                .map(|(scan, proposal)| scan.max(proposal))
-                .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?,
-        )
-        .and_then(|bytes| bytes.checked_add(bindings?))
-        .and_then(|bytes| bytes.checked_add(completion_records))
-        .and_then(|bytes| bytes.checked_add(completion_checkpoints))
-        .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
-    Ok(ResourceAmounts::new([
-        u64::try_from(memory).map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?,
-        1,
-        1,
-        0,
-        RETENTION_PUBLICATION_BATCH_ITEMS,
-        0,
-        1,
-        1,
-        1,
-        1,
-        0,
-    ]))
-}
-
 fn map_maintenance_failure(failure: crate::MaintenanceFailure) -> LedgerFailure {
     let code = match failure {
         crate::MaintenanceFailure::CapacityExceeded
@@ -431,196 +381,4 @@ fn map_maintenance_failure(failure: crate::MaintenanceFailure) -> LedgerFailure 
         | crate::MaintenanceFailure::Paused => LedgerFailureCode::StaleGeneration,
     };
     LedgerFailure::new(code)
-}
-
-const RETENTION_PUBLICATION_FRONTIER_MAGIC: &[u8; 8] = b"RTPFR001";
-const RETENTION_PUBLICATION_FRONTIER_CHECKPOINT_BYTES: usize =
-    RETENTION_PUBLICATION_FRONTIER_MAGIC.len() + 8;
-
-fn retention_publication_frontier_checkpoint(
-    frontier: crate::IngestTime,
-) -> Result<MaintenanceCheckpoint, LedgerFailure> {
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(RETENTION_PUBLICATION_FRONTIER_CHECKPOINT_BYTES)
-        .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
-    bytes.extend_from_slice(RETENTION_PUBLICATION_FRONTIER_MAGIC);
-    bytes.extend_from_slice(&frontier.instant().value().to_be_bytes());
-    MaintenanceCheckpoint::new(1, 0, bytes)
-        .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))
-}
-
-fn retention_publication_frontier_bound(
-    coordinator: &MaintenanceCoordinator,
-    identity: MaintenanceTaskId,
-) -> Result<crate::IngestTime, LedgerFailure> {
-    let status = coordinator
-        .status(identity)
-        .map_err(map_maintenance_failure)?;
-    let checkpoint = status
-        .checkpoint()
-        .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::RecoveryRequired))?;
-    if checkpoint.sequence() != 1 || checkpoint.completed_inputs() != 0 {
-        return Err(LedgerFailure::new(LedgerFailureCode::RecoveryRequired));
-    }
-    let bytes = checkpoint.opaque_progress();
-    if bytes.len() != RETENTION_PUBLICATION_FRONTIER_CHECKPOINT_BYTES
-        || !bytes.starts_with(RETENTION_PUBLICATION_FRONTIER_MAGIC)
-    {
-        return Err(LedgerFailure::new(LedgerFailureCode::RecoveryRequired));
-    }
-    let instant = bytes
-        .get(RETENTION_PUBLICATION_FRONTIER_MAGIC.len()..)
-        .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::RecoveryRequired))?
-        .try_into()
-        .map(i64::from_be_bytes)
-        .map_err(|_| LedgerFailure::new(LedgerFailureCode::RecoveryRequired))?;
-    Ok(crate::IngestTime::from_authenticated_durable(
-        positron_domain::time::UnixNanoseconds::new(instant),
-    ))
-}
-
-fn retention_publication_plan(
-    ledger: &ActiveSegmentLedger<'_, '_>,
-    basis: &crate::CatalogSnapshot,
-    state: &super::state::LedgerState<'_>,
-    frontier: crate::IngestTime,
-) -> Result<RetentionPublicationPlan, LedgerFailure> {
-    let policy = basis.retention_policy(ledger.scope.signal)?;
-    if policy.instance() != ledger.catalog.instance()
-        || policy.tenant() != ledger.scope.tenant
-        || policy.signal_kind() != ledger.scope.signal
-    {
-        return Err(LedgerFailure::new(LedgerFailureCode::PhysicalScopeMismatch));
-    }
-    let duration_nanos = policy
-        .retention_seconds()
-        .get()
-        .checked_mul(1_000_000_000)
-        .and_then(|value| i64::try_from(value).ok())
-        .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
-    let cutoff = frontier
-        .instant()
-        .value()
-        .checked_sub(duration_nanos)
-        .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
-    let mut metadata = ledger.storage.catalog_segments(basis, ledger.scope)?;
-    let mut retired = Vec::new();
-    retired
-        .try_reserve_exact(metadata.len().min(MAX_RETENTION_PUBLICATION_SEGMENTS))
-        .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
-    for candidate in metadata
-        .iter_mut()
-        .filter(|candidate| candidate.state == SegmentState::Sealed)
-    {
-        if retired.len() == MAX_RETENTION_PUBLICATION_SEGMENTS {
-            break;
-        }
-        let input = metadata_binding(&ledger.storage, *candidate)?;
-        let mut latest: Option<crate::IngestTime> = None;
-        let mut last_position: Option<positron_domain::routing::CommitPosition> = None;
-        let mut has_blocks = false;
-        for block in state
-            .blocks
-            .iter()
-            .filter(|block| block.segment == candidate.id)
-        {
-            has_blocks = true;
-            match block.block_retention {
-                SegmentRetention::Complete(instant) => {
-                    latest = Some(latest.map_or(instant, |current| current.max(instant)));
-                    last_position = Some(
-                        last_position
-                            .map_or(block.position(), |current| current.max(block.position())),
-                    );
-                },
-                SegmentRetention::Empty | SegmentRetention::Unavailable => {
-                    return Err(LedgerFailure::new(LedgerFailureCode::UnsupportedFormat));
-                },
-            }
-        }
-        if has_blocks && latest.is_none_or(|instant| instant.instant().value() > cutoff) {
-            continue;
-        }
-        if let Some(position) = last_position {
-            candidate.base_position = position;
-        }
-        candidate.state = SegmentState::Retired;
-        let output = metadata_binding(&ledger.storage, *candidate)?;
-        retired.push((input, output));
-    }
-    retired.sort_unstable_by_key(|(input, _)| *input);
-    Ok(RetentionPublicationPlan {
-        metadata,
-        retired,
-        frontier,
-    })
-}
-
-fn task_bindings(
-    retired: &[(MaintenanceObjectId, MaintenanceObjectId)],
-) -> Result<(Vec<MaintenanceObjectId>, Vec<MaintenanceObjectId>), LedgerFailure> {
-    let mut inputs = Vec::new();
-    let mut outputs = Vec::new();
-    inputs
-        .try_reserve_exact(retired.len())
-        .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
-    outputs
-        .try_reserve_exact(retired.len())
-        .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
-    for (input, output) in retired {
-        inputs.push(*input);
-        outputs.push(*output);
-    }
-    inputs.sort_unstable();
-    outputs.sort_unstable();
-    Ok((inputs, outputs))
-}
-
-fn metadata_binding(
-    storage: &super::LedgerStorage,
-    metadata: super::format::SegmentMetadata,
-) -> Result<MaintenanceObjectId, LedgerFailure> {
-    MaintenanceObjectId::new(
-        CatalogObject::new(storage.metadata_object(metadata))?
-            .identity()
-            .to_bytes(),
-    )
-    .map_err(|_| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))
-}
-
-fn task_identity(
-    binding: MaintenanceObjectId,
-    discriminator: u8,
-) -> Result<MaintenanceTaskId, LedgerFailure> {
-    let mut bytes = [0_u8; 16];
-    bytes.copy_from_slice(
-        binding
-            .to_bytes()
-            .get(..16)
-            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?,
-    );
-    bytes[0] ^= discriminator;
-    if bytes.iter().all(|byte| *byte == 0) {
-        bytes[0] = 1;
-    }
-    MaintenanceTaskId::new(bytes)
-        .map_err(|_| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))
-}
-
-fn durable_task_record(
-    basis: &crate::CatalogSnapshot,
-    identity: MaintenanceTaskId,
-) -> Result<&[u8], LedgerFailure> {
-    let mut record = None;
-    for bytes in basis.plaintext_objects() {
-        if crate::maintenance::durable_task_record_identity(bytes)
-            .map_err(|_| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?
-            == Some(identity)
-            && record.replace(bytes).is_some()
-        {
-            return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
-        }
-    }
-    record.ok_or_else(|| LedgerFailure::new(LedgerFailureCode::RecoveryRequired))
 }

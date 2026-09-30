@@ -31,6 +31,41 @@ pub(crate) fn durable_task_record_identity(
 const MAX_MAINTENANCE_TASKS: usize = 128;
 const MAX_TASK_OBJECTS: usize = 16;
 pub(crate) const MAX_CHECKPOINT_BYTES: usize = 4_096;
+const RETENTION_PUBLICATION_FRONTIER_MAGIC: &[u8; 8] = b"RTPFR001";
+
+pub(crate) fn retention_publication_frontier_checkpoint(
+    frontier: crate::IngestTime,
+) -> Result<MaintenanceCheckpoint, MaintenanceFailure> {
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(RETENTION_PUBLICATION_FRONTIER_MAGIC.len() + 8)
+        .map_err(|_| MaintenanceFailure::CapacityExceeded)?;
+    bytes.extend_from_slice(RETENTION_PUBLICATION_FRONTIER_MAGIC);
+    bytes.extend_from_slice(&frontier.instant().value().to_be_bytes());
+    MaintenanceCheckpoint::new(1, 0, bytes)
+}
+
+pub(crate) fn retention_publication_frontier(
+    checkpoint: Option<&MaintenanceCheckpoint>,
+) -> Result<crate::IngestTime, MaintenanceFailure> {
+    let checkpoint = checkpoint.ok_or(MaintenanceFailure::InvalidInput)?;
+    let bytes = checkpoint.opaque_progress();
+    if checkpoint.sequence() != 1
+        || checkpoint.completed_inputs() != 0
+        || bytes.len() != RETENTION_PUBLICATION_FRONTIER_MAGIC.len() + 8
+        || !bytes.starts_with(RETENTION_PUBLICATION_FRONTIER_MAGIC)
+    {
+        return Err(MaintenanceFailure::InvalidInput);
+    }
+    let instant = bytes
+        .get(RETENTION_PUBLICATION_FRONTIER_MAGIC.len()..)
+        .ok_or(MaintenanceFailure::InvalidInput)?
+        .try_into()
+        .map_err(|_| MaintenanceFailure::InvalidInput)?;
+    Ok(crate::IngestTime::from_authenticated_durable(
+        positron_domain::time::UnixNanoseconds::new(i64::from_be_bytes(instant)),
+    ))
+}
 const MAX_LOWER_CLASS_QUEUE_DELAY: u64 = 60;
 static NEXT_COORDINATOR_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -96,6 +131,13 @@ struct TaskState {
     dispatches: u64,
     terminal_order: Option<u64>,
     active_dispatch: Option<MaintenanceDispatch>,
+}
+
+fn validate_retention_publication_state(state: &TaskState) -> Result<(), MaintenanceFailure> {
+    if state.task.class == MaintenanceTaskClass::RetentionPublication {
+        let _ = retention_publication_frontier(state.checkpoint.as_ref())?;
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -752,6 +794,7 @@ impl MaintenanceCoordinator {
         let coordinator = Self::new();
         for record in records {
             let mut state = decode_record(record.as_bytes())?;
+            validate_retention_publication_state(&state)?;
             if state.phase == MaintenanceTaskPhase::Running {
                 state.phase = if state.cancellation_requested {
                     MaintenanceTaskPhase::Cancelled

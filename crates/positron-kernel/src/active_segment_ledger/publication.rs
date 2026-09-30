@@ -17,6 +17,7 @@ use super::{
 
 struct PublicationOptions<'clock> {
     frontier: Option<IngestTime>,
+    anchor: Option<IngestTime>,
     lifecycle_clock: Option<&'clock crate::retention_time::StagedCatalogAnchor<'clock>>,
     exact_scope: bool,
     additional: Vec<CatalogObject>,
@@ -28,6 +29,7 @@ pub(super) struct RetentionPublication<'clock, 'authority, 'metadata> {
     pub(super) scope: SegmentScope,
     pub(super) metadata: &'metadata [SegmentMetadata],
     pub(super) frontier: IngestTime,
+    pub(super) anchor: IngestTime,
     pub(super) additional: Vec<CatalogObject>,
     pub(super) replaced_tasks: BTreeSet<crate::MaintenanceTaskId>,
 }
@@ -66,6 +68,7 @@ pub(super) fn publish_segments(
         metadata,
         PublicationOptions {
             frontier: None,
+            anchor: None,
             lifecycle_clock: None,
             exact_scope: false,
             additional: Vec::new(),
@@ -89,6 +92,7 @@ pub(super) fn publish_exact_scope_segments(
         metadata,
         PublicationOptions {
             frontier: None,
+            anchor: None,
             lifecycle_clock: None,
             exact_scope: true,
             additional: Vec::new(),
@@ -114,6 +118,7 @@ pub(super) fn publish_segments_with_frontier(
         metadata,
         PublicationOptions {
             frontier: Some(frontier),
+            anchor: Some(frontier),
             lifecycle_clock: Some(lifecycle_clock),
             exact_scope: false,
             additional: Vec::new(),
@@ -136,6 +141,7 @@ pub(super) fn publish_retention_with_tasks(
         publication.metadata,
         PublicationOptions {
             frontier: Some(publication.frontier),
+            anchor: Some(publication.anchor),
             lifecycle_clock: Some(publication.lifecycle_clock),
             exact_scope: false,
             additional: publication.additional,
@@ -154,6 +160,7 @@ fn publish_scope(
 ) -> Result<crate::CatalogSnapshot, LedgerFailure> {
     let PublicationOptions {
         frontier,
+        anchor,
         lifecycle_clock,
         exact_scope,
         additional,
@@ -216,10 +223,10 @@ fn publish_scope(
             scope, frontier,
         ))?);
     }
-    if let (Some(clock), Some(frontier)) = (lifecycle_clock, frontier) {
+    if let (Some(clock), Some(anchor)) = (lifecycle_clock, anchor) {
         objects.push(CatalogObject::new(
             clock
-                .catalog_anchor_record(frontier)
+                .catalog_anchor_record(anchor)
                 .map_err(|_| LedgerFailure::new(LedgerFailureCode::StorageUnavailable))?,
         )?);
     }

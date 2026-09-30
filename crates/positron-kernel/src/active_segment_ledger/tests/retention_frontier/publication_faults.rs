@@ -108,6 +108,81 @@ fn delayed_retention_publication_proof_retries_the_exact_durable_terminal_pair()
 }
 
 #[test]
+fn retention_publication_uses_its_durable_frontier_after_the_live_clock_advances()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_authority(volume)?;
+    let instance = InstanceId::new([0xfa; 16])?;
+    let catalog = Catalog::open(
+        &authority,
+        instance,
+        CatalogSecret::from_owned(Box::new([0xfb; 32]), Box::new([0xfc; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x64; 16])?;
+    install_governance_policy(&catalog, instance, tenant, 1, 0xfd)?;
+    let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(102)?);
+    let (retention_time, elapsed) =
+        RetentionTimeAuthority::establish_with_manual_elapsed(UnixNanoseconds::new(10_000_000_000));
+    let key = || SegmentProtectionKey::from_owned(Box::new([0xfe; 32]));
+    let sealed = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    let block = sealed.begin_store_block(
+        preparation_capacity(&authority, tenant)?,
+        StoreBlockIdentity::new([0xff; 16])?,
+    )?;
+    sealed.append(block.finish(b"durable frontier".to_vec())?)?;
+    sealed.seal()?;
+    elapsed.advance(2_000_000_000)?;
+    let active = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    let coordinator = MaintenanceCoordinator::new();
+    let preparation = active.prepare_retention_publication()?;
+    let publication_id = preparation.task().identity();
+    preparation.submit_and_persist(&coordinator, &catalog, 12)?;
+    assert_eq!(
+        crate::maintenance::retention_publication_frontier(
+            coordinator
+                .status(publication_id)
+                .expect("durable publication task")
+                .checkpoint(),
+        )
+        .expect("typed durable frontier"),
+        crate::IngestTime::from_authenticated_durable(UnixNanoseconds::new(12_000_000_000))
+    );
+    let execution = coordinator
+        .start_next_with_reservation_and_persist(&catalog, &authority, 12, false)
+        .expect("publication dispatch")
+        .expect("publication execution");
+    elapsed.advance(1_000_000_000)?;
+    active.complete_running_retention_publication_task(&coordinator, &execution)?;
+
+    assert_eq!(
+        crate::active_segment_ledger::retention_frontier::recover(&catalog.pin()?, scope)?,
+        Some(crate::IngestTime::from_authenticated_durable(
+            UnixNanoseconds::new(12_000_000_000)
+        )),
+        "the published frontier remains the immutable durable task bound"
+    );
+    assert_eq!(
+        retention_time.status().safe_anchor(),
+        UnixNanoseconds::new(13_000_000_000),
+        "the live lifecycle authority can advance beyond the durable publication bound"
+    );
+    Ok(())
+}
+
+#[test]
 fn delayed_retention_publication_proof_refuses_stale_frontier_and_anchor()
 -> Result<(), Box<dyn Error>> {
     let root = TemporaryRoot::new()?;

@@ -844,6 +844,9 @@ impl MaintenanceCoordinator {
         task: MaintenanceTask,
         now: u64,
     ) -> Result<MaintenanceTask, MaintenanceFailure> {
+        if task.class == MaintenanceTaskClass::RetentionPublication {
+            return Err(MaintenanceFailure::InvalidInput);
+        }
         self.submit_task_and_persist(catalog, task, None, now)
     }
 
@@ -854,12 +857,10 @@ impl MaintenanceCoordinator {
         checkpoint: MaintenanceCheckpoint,
         now: u64,
     ) -> Result<MaintenanceTask, MaintenanceFailure> {
-        if task.class != MaintenanceTaskClass::RetentionPublication
-            || checkpoint.sequence != 1
-            || checkpoint.completed_inputs != 0
-        {
+        if task.class != MaintenanceTaskClass::RetentionPublication {
             return Err(MaintenanceFailure::InvalidInput);
         }
+        super::retention_publication_frontier(Some(&checkpoint))?;
         self.submit_task_and_persist(catalog, task, Some(checkpoint), now)
     }
 
@@ -1131,7 +1132,7 @@ impl MaintenanceCoordinator {
         Ok(())
     }
 
-    fn complete_and_persist_dispatch(
+    pub(super) fn complete_and_persist_dispatch(
         &self,
         catalog: &Catalog<'_>,
         dispatch: MaintenanceDispatch,
@@ -1145,6 +1146,13 @@ impl MaintenanceCoordinator {
             .lock()
             .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
         super::require_unreserved_task_transition(&state, dispatch.identity)?;
+        if state
+            .tasks
+            .get(&dispatch.identity)
+            .is_some_and(|task| task.task.class == MaintenanceTaskClass::RetentionPublication)
+        {
+            return Err(MaintenanceFailure::InvalidTransition);
+        }
         let mut next = state.clone();
         {
             let task = next
