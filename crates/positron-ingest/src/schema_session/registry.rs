@@ -39,6 +39,29 @@ impl TenantSchemaRegistry {
         self.session_inner(tenant, None, governor)
     }
 
+    /// Returns the already-admitted session for `tenant` without creating an
+    /// empty session or reserving additional capacity.
+    pub fn session_if_present(
+        &self,
+        tenant: TenantId,
+    ) -> Result<Option<TenantSchemaSession>, SchemaSessionFailure> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| SchemaSessionFailure::StateUnavailable)?;
+        match state
+            .sessions
+            .binary_search_by_key(&tenant, |(known, _)| *known)
+        {
+            Ok(index) => state
+                .sessions
+                .get(index)
+                .map(|(_, session)| Some(session.clone()))
+                .ok_or(SchemaSessionFailure::StateUnavailable),
+            Err(_) => Ok(None),
+        }
+    }
+
     pub fn session_from_checkpoint(
         &self,
         tenant: TenantId,

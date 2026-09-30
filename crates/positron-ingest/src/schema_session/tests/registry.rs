@@ -81,3 +81,43 @@ fn governed_registry_sessions_are_structurally_tenant_isolated() {
         0
     );
 }
+
+#[test]
+fn checkpoint_inspection_of_an_absent_session_does_not_admit_empty_state() {
+    let fixture = crate::tests::support::fixture().expect("fixture");
+    let registry = TenantSchemaRegistry::new(1).expect("registry");
+    let before = fixture.authority.governor().inspect().expect("before");
+
+    assert!(
+        registry
+            .session_if_present(fixture.tenant)
+            .expect("absent session lookup")
+            .is_none()
+    );
+    assert_eq!(
+        fixture
+            .authority
+            .governor()
+            .inspect()
+            .expect("after absent lookup"),
+        before,
+        "checkpoint inspection must not allocate a fresh empty schema session"
+    );
+
+    let created = registry
+        .session(fixture.tenant, fixture.authority.governor())
+        .expect("create session");
+    assert_eq!(
+        registry
+            .session_if_present(fixture.tenant)
+            .expect("existing session lookup")
+            .expect("session must remain discoverable")
+            .checkpoint()
+            .expect("existing checkpoint")
+            .base_charge_bytes(),
+        created
+            .checkpoint()
+            .expect("created checkpoint")
+            .base_charge_bytes()
+    );
+}

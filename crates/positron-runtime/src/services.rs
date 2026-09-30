@@ -251,8 +251,11 @@ impl ServiceHandle {
     ) -> Result<Option<TenantSchemaSession>, ServiceFailure> {
         let session = self
             .schema_sessions
-            .session(self.instance.tenant, self.instance.resource_governor())
+            .session_if_present(self.instance.tenant)
             .map_err(|_| ServiceFailure::CapacityUnavailable)?;
+        let Some(session) = session else {
+            return Ok(None);
+        };
         session
             .has_checkpoint_changes()
             .map(|changed| changed.then_some(session))
