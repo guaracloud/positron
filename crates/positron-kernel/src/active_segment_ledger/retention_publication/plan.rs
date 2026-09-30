@@ -107,7 +107,7 @@ pub(super) fn task_bindings(
     Ok((inputs, outputs))
 }
 
-pub(super) fn metadata_binding(
+pub(in crate::active_segment_ledger) fn metadata_binding(
     storage: &super::super::LedgerStorage,
     metadata: super::super::format::SegmentMetadata,
 ) -> Result<MaintenanceObjectId, LedgerFailure> {

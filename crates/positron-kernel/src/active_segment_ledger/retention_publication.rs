@@ -13,7 +13,8 @@ use crate::{
 mod plan;
 mod proof;
 
-use plan::{metadata_binding, retention_publication_plan, task_bindings, task_identity};
+pub(super) use plan::metadata_binding;
+use plan::{retention_publication_plan, task_bindings, task_identity};
 pub(super) use proof::retention_publication_claim;
 use proof::{durable_task_record, retention_publication_frontier_bound};
 

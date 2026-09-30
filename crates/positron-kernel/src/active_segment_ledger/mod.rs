@@ -18,6 +18,7 @@ mod retention;
 mod retention_frontier;
 mod retention_impact;
 mod retention_publication;
+mod retention_reclamation;
 mod scope_discovery;
 mod snapshot_lease;
 mod snapshot_lease_attempt;

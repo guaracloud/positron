@@ -1,5 +1,5 @@
 use super::*;
-use crate::active_segment_ledger::RetentionReclamationEstimate;
+use crate::active_segment_ledger::{RetentionReclamationEstimate, SegmentState};
 use crate::{MaintenanceCoordinator, MaintenanceTaskClass, MaintenanceTaskPhase};
 
 #[test]
@@ -135,6 +135,92 @@ fn retention_publication_atomically_hides_protected_logs_and_queues_reclamation(
         reclamation.task().inputs(),
         publication.outputs(),
         "the queued reclamation must bind the retired metadata produced by publication"
+    );
+    drop(execution);
+    let reclamation_execution = coordinator
+        .start_next_with_reservation_and_persist(&catalog, &authority, 12, false)
+        .expect("reclamation dispatch admission")
+        .expect("queued reclamation dispatch");
+    active.complete_running_retention_reclamation_task(&coordinator, &reclamation_execution)?;
+    assert_eq!(
+        coordinator
+            .status(reclamation_id)
+            .expect("protected reclamation")
+            .phase(),
+        MaintenanceTaskPhase::Queued,
+        "a durable snapshot lease must requeue its exact protected reclamation"
+    );
+    assert_eq!(
+        MaintenanceCoordinator::restore_from_catalog(&catalog)
+            .expect("protected reclamation restores")
+            .status(reclamation_id)
+            .expect("durable protected reclamation")
+            .phase(),
+        MaintenanceTaskPhase::Queued,
+        "the protected retry must be durable rather than only in-memory"
+    );
+    assert_eq!(
+        active.resume_snapshot_lease(lease_identity, 12)?.identity(),
+        lease_identity,
+        "protected reclamation cannot remove the durable lease payload"
+    );
+    let retired_metadata = active
+        .storage
+        .catalog_segments(&catalog.pin()?, scope)?
+        .into_iter()
+        .find(|metadata| metadata.state == SegmentState::Retired)
+        .ok_or("published retired metadata")?;
+
+    drop(reclamation_execution);
+    active.release_snapshot_lease(lease_identity)?;
+    let in_process_execution = coordinator
+        .start_next_with_reservation_and_persist(&catalog, &authority, 12, false)
+        .expect("in-process protected reclamation dispatch admission")
+        .expect("in-process protected reclamation dispatch");
+    active.complete_running_retention_reclamation_task(&coordinator, &in_process_execution)?;
+    assert_eq!(
+        coordinator
+            .status(reclamation_id)
+            .expect("in-process protected reclamation")
+            .phase(),
+        MaintenanceTaskPhase::Queued,
+        "the still-live snapshot must protect retired bytes after its durable lease is released"
+    );
+    assert!(
+        active.resume_snapshot_lease(lease_identity, 12).is_err(),
+        "the second protection result cannot come from the released durable lease"
+    );
+
+    drop(in_process_execution);
+    drop(resumed);
+    let physical_execution = coordinator
+        .start_next_with_reservation_and_persist(&catalog, &authority, 12, false)
+        .expect("released reclamation dispatch admission")
+        .expect("released reclamation dispatch");
+    active.complete_running_retention_reclamation_task(&coordinator, &physical_execution)?;
+    assert_eq!(
+        coordinator
+            .status(reclamation_id)
+            .expect("physically reclaimed task")
+            .phase(),
+        MaintenanceTaskPhase::Succeeded,
+        "releasing the durable lease must permit physical reclamation"
+    );
+    assert!(
+        active.resume_snapshot_lease(lease_identity, 12).is_err(),
+        "physical reclamation follows durable lease release"
+    );
+    assert!(
+        !active.storage.reclaim_retired(retired_metadata)?,
+        "a second reclaim must find no retained payload files after physical success"
+    );
+    assert_eq!(
+        MaintenanceCoordinator::restore_from_catalog(&catalog)
+            .expect("physical terminal restores")
+            .status(reclamation_id)
+            .expect("restored terminal reclamation")
+            .phase(),
+        MaintenanceTaskPhase::Succeeded
     );
     Ok(())
 }

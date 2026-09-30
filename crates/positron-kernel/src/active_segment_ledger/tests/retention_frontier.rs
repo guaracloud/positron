@@ -37,6 +37,7 @@ mod policy_authority;
 mod publication;
 mod publication_capacity;
 mod publication_faults;
+mod reclamation_faults;
 
 fn preparation_capacity<'kernel>(
     authority: &'kernel crate::StorageKernelResourceAuthority,

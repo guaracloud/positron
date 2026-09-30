@@ -129,6 +129,96 @@ fn retention_publication_checkpoint_bytes(frontier: i64) -> Vec<u8> {
     bytes
 }
 
+fn retention_reclamation_task(identity: u8) -> MaintenanceTask {
+    let publication = retention_publication_task(identity);
+    MaintenanceTask::with_contract(
+        publication.identity(),
+        MaintenanceTaskClass::RetentionReclamation,
+        publication.scope(),
+        MaintenanceTrigger::AgeDerived,
+        publication.preconditions(),
+        publication.outputs().to_vec(),
+        Vec::new(),
+        publication.reservations(),
+    )
+    .expect("reclamation task")
+}
+
+#[test]
+fn generic_completion_cannot_terminalize_a_retention_reclamation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = CatalogRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
+    let authority = crate::catalog::tests::support::establish_catalog_authority(volume)?;
+    let catalog = Catalog::open(
+        &authority,
+        InstanceId::new(nonzero_id(0x7d))?,
+        CatalogSecret::from_owned(Box::new([0x7e; 32]), Box::new([0x7f; 32])),
+    )?;
+    let coordinator = MaintenanceCoordinator::new();
+    let task = retention_reclamation_task(0x80);
+    let dispatch = MaintenanceDispatch {
+        coordinator_id: coordinator.coordinator_id,
+        identity: task.identity(),
+        attempt: 1,
+    };
+    let running = TaskState {
+        task: task.clone(),
+        phase: MaintenanceTaskPhase::Running,
+        submitted_at: 1,
+        checkpoint: None,
+        pause_until: None,
+        cancellation_requested: false,
+        dispatches: 1,
+        terminal_order: None,
+        active_dispatch: Some(dispatch),
+    };
+    catalog.commit(
+        catalog.pin()?.identity(),
+        CatalogProposal::new(
+            TransactionId::new(nonzero_id(0x81))?,
+            FormatEpoch::CATALOG_V1,
+            vec![CatalogObject::new(
+                encode_record(&running)
+                    .expect("durable running record")
+                    .as_bytes()
+                    .to_vec(),
+            )?],
+        )?,
+        None,
+    )?;
+    coordinator
+        .state
+        .lock()
+        .expect("coordinator state")
+        .tasks
+        .insert(task.identity(), running);
+
+    assert_eq!(
+        coordinator
+            .complete_and_persist_dispatch(&catalog, dispatch, true)
+            .expect_err("only the metadata-coupled Reclamation handler may terminalize"),
+        MaintenanceFailure::InvalidTransition
+    );
+    assert_eq!(
+        coordinator
+            .status(task.identity())
+            .expect("running task")
+            .phase(),
+        MaintenanceTaskPhase::Running
+    );
+    assert_eq!(
+        MaintenanceCoordinator::restore_from_catalog(&catalog)
+            .expect("durable running record restores")
+            .status(task.identity())
+            .expect("durable running task")
+            .phase(),
+        MaintenanceTaskPhase::Queued,
+        "generic completion must leave the durable Reclamation record unchanged"
+    );
+    Ok(())
+}
+
 #[test]
 fn generic_completion_cannot_terminalize_a_retention_publication()
 -> Result<(), Box<dyn std::error::Error>> {

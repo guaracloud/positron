@@ -69,6 +69,28 @@ fn retention_publication_retires_an_empty_sealed_segment_and_queues_reclamation(
             .phase(),
         MaintenanceTaskPhase::Queued
     );
+    drop(execution);
+    let reclamation_execution = coordinator
+        .start_next_with_reservation_and_persist(&catalog, &authority, 12, false)
+        .expect("reclamation dispatch admission")
+        .expect("reclamation dispatch");
+    active.complete_running_retention_reclamation_task(&coordinator, &reclamation_execution)?;
+    assert_eq!(
+        coordinator
+            .status(reclamation_id)
+            .expect("terminal reclamation")
+            .phase(),
+        MaintenanceTaskPhase::Succeeded
+    );
+    assert_eq!(
+        MaintenanceCoordinator::restore_from_catalog(&catalog)
+            .expect("reclamation restoration")
+            .status(reclamation_id)
+            .expect("durable terminal reclamation")
+            .phase(),
+        MaintenanceTaskPhase::Succeeded,
+        "physical reclamation and its terminal task record publish atomically"
+    );
     Ok(())
 }
 

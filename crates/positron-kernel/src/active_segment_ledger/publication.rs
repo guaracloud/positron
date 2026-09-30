@@ -101,6 +101,34 @@ pub(super) fn publish_exact_scope_segments(
     )
 }
 
+pub(super) fn publish_exact_scope_segments_with_task_replacement(
+    catalog: &Catalog<'_>,
+    basis: &crate::CatalogSnapshot,
+    storage: &LedgerStorage,
+    scope: SegmentScope,
+    metadata: &[SegmentMetadata],
+    replacement: crate::MaintenanceTaskId,
+    terminal: CatalogObject,
+) -> Result<crate::CatalogSnapshot, LedgerFailure> {
+    let mut replaced_tasks = BTreeSet::new();
+    replaced_tasks.insert(replacement);
+    publish_scope(
+        catalog,
+        basis,
+        storage,
+        scope,
+        metadata,
+        PublicationOptions {
+            frontier: None,
+            anchor: None,
+            lifecycle_clock: None,
+            exact_scope: true,
+            additional: vec![terminal],
+            replaced_tasks,
+        },
+    )
+}
+
 pub(super) fn publish_segments_with_frontier(
     catalog: &Catalog<'_>,
     basis: &crate::CatalogSnapshot,
