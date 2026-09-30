@@ -30,7 +30,7 @@ pub(crate) fn durable_task_record_identity(
 
 const MAX_MAINTENANCE_TASKS: usize = 128;
 const MAX_TASK_OBJECTS: usize = 16;
-const MAX_CHECKPOINT_BYTES: usize = 4_096;
+pub(crate) const MAX_CHECKPOINT_BYTES: usize = 4_096;
 const MAX_LOWER_CLASS_QUEUE_DELAY: u64 = 60;
 static NEXT_COORDINATOR_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -638,6 +638,7 @@ impl MaintenanceCoordinator {
             .get_mut(&identity)
             .ok_or(MaintenanceFailure::UnknownTask)?;
         if task.phase != MaintenanceTaskPhase::Running
+            || task.task.class == MaintenanceTaskClass::RetentionPublication
             || checkpoint.completed_inputs as usize > task.task.inputs.len()
         {
             return Err(MaintenanceFailure::InvalidTransition);

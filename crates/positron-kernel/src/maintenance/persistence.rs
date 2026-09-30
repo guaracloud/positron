@@ -97,6 +97,35 @@ impl RetentionPublicationTaskCompletion {
         Ok(())
     }
 
+    pub(crate) fn install_reconciled(
+        self,
+        coordinator: &MaintenanceCoordinator,
+    ) -> Result<(), MaintenanceFailure> {
+        let mut state = coordinator
+            .state
+            .lock()
+            .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
+        if state.tasks.get(&self.publication_before.task.identity) != Some(&self.publication_before)
+            || state.tasks.contains_key(&self.reclamation.task.identity)
+            || state
+                .pending_task_transitions
+                .contains(&self.publication_before.task.identity)
+            || state
+                .pending_submissions
+                .contains(&self.reclamation.task.identity)
+        {
+            return Err(MaintenanceFailure::PreconditionFailed);
+        }
+        state
+            .tasks
+            .insert(self.publication_after.task.identity, self.publication_after);
+        state
+            .tasks
+            .insert(self.reclamation.task.identity, self.reclamation);
+        state.next_terminal_order = state.next_terminal_order.max(self.next_terminal_order);
+        Ok(())
+    }
+
     pub(crate) fn discard(&self, coordinator: &MaintenanceCoordinator) {
         if let Ok(mut state) = coordinator.state.lock() {
             state
@@ -244,6 +273,61 @@ impl QueuedMaintenanceSubmission {
 }
 
 impl MaintenanceCoordinator {
+    pub(super) fn reconcile_running_retention_publication_completion(
+        &self,
+        dispatch: MaintenanceDispatch,
+        publication_record: &[u8],
+        reclamation_record: &[u8],
+    ) -> Result<RetentionPublicationTaskCompletion, MaintenanceFailure> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
+        let before = state
+            .tasks
+            .get(&dispatch.identity)
+            .cloned()
+            .ok_or(MaintenanceFailure::UnknownTask)?;
+        if before.task.class != MaintenanceTaskClass::RetentionPublication
+            || before.phase != MaintenanceTaskPhase::Running
+            || before.active_dispatch != Some(dispatch)
+            || before.cancellation_requested
+        {
+            return Err(MaintenanceFailure::PreconditionFailed);
+        }
+        let mut publication_after = decode_record(publication_record)?;
+        let reclamation = decode_record(reclamation_record)?;
+        let terminal_order = state.next_terminal_order;
+        let next_terminal_order = terminal_order
+            .checked_add(1)
+            .ok_or(MaintenanceFailure::CapacityExceeded)?;
+        if publication_after.task != before.task
+            || publication_after.phase != MaintenanceTaskPhase::Succeeded
+            || publication_after.active_dispatch.is_some()
+            || publication_after.checkpoint != before.checkpoint
+            || reclamation.task.class != MaintenanceTaskClass::RetentionReclamation
+            || reclamation.phase != MaintenanceTaskPhase::Queued
+            || reclamation.task.scope != before.task.scope
+            || reclamation.task.trigger != MaintenanceTrigger::AgeDerived
+            || reclamation.task.preconditions != before.task.preconditions
+            || reclamation.task.inputs != before.task.outputs
+            || !reclamation.task.outputs.is_empty()
+            || reclamation.task.reservations != before.task.reservations
+            || reclamation.checkpoint.is_some()
+            || state.tasks.contains_key(&reclamation.task.identity)
+        {
+            return Err(MaintenanceFailure::PreconditionFailed);
+        }
+        publication_after.terminal_order = Some(terminal_order);
+        Ok(RetentionPublicationTaskCompletion {
+            publication_before: before,
+            publication_after,
+            reclamation,
+            next_terminal_order,
+            publication_record: MaintenanceTaskRecord(publication_record.to_vec()),
+            reclamation_record: MaintenanceTaskRecord(reclamation_record.to_vec()),
+        })
+    }
     pub(super) fn prepare_running_retention_publication_completion(
         &self,
         dispatch: MaintenanceDispatch,
@@ -760,12 +844,38 @@ impl MaintenanceCoordinator {
         task: MaintenanceTask,
         now: u64,
     ) -> Result<MaintenanceTask, MaintenanceFailure> {
+        self.submit_task_and_persist(catalog, task, None, now)
+    }
+
+    pub(crate) fn submit_retention_publication_and_persist(
+        &self,
+        catalog: &Catalog<'_>,
+        task: MaintenanceTask,
+        checkpoint: MaintenanceCheckpoint,
+        now: u64,
+    ) -> Result<MaintenanceTask, MaintenanceFailure> {
+        if task.class != MaintenanceTaskClass::RetentionPublication
+            || checkpoint.sequence != 1
+            || checkpoint.completed_inputs != 0
+        {
+            return Err(MaintenanceFailure::InvalidInput);
+        }
+        self.submit_task_and_persist(catalog, task, Some(checkpoint), now)
+    }
+
+    fn submit_task_and_persist(
+        &self,
+        catalog: &Catalog<'_>,
+        task: MaintenanceTask,
+        checkpoint: Option<MaintenanceCheckpoint>,
+        now: u64,
+    ) -> Result<MaintenanceTask, MaintenanceFailure> {
         let mut state = self
             .state
             .lock()
             .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
         if let Some(existing) = state.tasks.get(&task.identity) {
-            if existing.task != task {
+            if existing.task != task || existing.checkpoint != checkpoint {
                 return Err(MaintenanceFailure::PreconditionFailed);
             }
             return Ok(existing.task.clone());
@@ -788,7 +898,7 @@ impl MaintenanceCoordinator {
             task: task.clone(),
             phase: MaintenanceTaskPhase::Queued,
             submitted_at: now,
-            checkpoint: None,
+            checkpoint,
             pause_until: None,
             cancellation_requested: false,
             dispatches: 0,
@@ -1000,6 +1110,7 @@ impl MaintenanceCoordinator {
             .get(&dispatch.identity)
             .ok_or(MaintenanceFailure::UnknownTask)?;
         if task.phase != MaintenanceTaskPhase::Running
+            || task.task.class == MaintenanceTaskClass::RetentionPublication
             || task.active_dispatch != Some(dispatch)
             || checkpoint.completed_inputs as usize > task.task.inputs.len()
             || task
@@ -1065,6 +1176,19 @@ impl MaintenanceCoordinator {
 }
 
 impl MaintenanceExecution<'_> {
+    pub(crate) fn reconcile_running_retention_publication_completion(
+        &self,
+        coordinator: &MaintenanceCoordinator,
+        publication_record: &[u8],
+        reclamation_record: &[u8],
+    ) -> Result<RetentionPublicationTaskCompletion, MaintenanceFailure> {
+        coordinator.reconcile_running_retention_publication_completion(
+            self.dispatch,
+            publication_record,
+            reclamation_record,
+        )
+    }
+
     pub(crate) fn prepare_running_retention_publication_completion(
         &self,
         coordinator: &MaintenanceCoordinator,

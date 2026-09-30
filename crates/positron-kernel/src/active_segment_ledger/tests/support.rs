@@ -73,14 +73,28 @@ impl Drop for TemporaryRoot {
 pub(super) fn establish_authority(
     volume: OwnedPrimaryDataVolume,
 ) -> Result<StorageKernelResourceAuthority, Box<dyn Error>> {
+    let large = ResourceAmounts::new([
+        90_000_000, 4, 4, 90_000_000, 70_000, 4, 4, 4, 4, 16, 40_000_000,
+    ]);
+    establish_authority_with_retention_capacity(volume, large)
+}
+
+pub(super) fn establish_authority_with_retention_capacity(
+    volume: OwnedPrimaryDataVolume,
+    retention: ResourceAmounts,
+) -> Result<StorageKernelResourceAuthority, Box<dyn Error>> {
     let cardinality = InventoryCardinalityLimits::new(1, 16)?;
     let large = ResourceAmounts::new([
         90_000_000, 4, 4, 90_000_000, 70_000, 4, 4, 4, 4, 16, 40_000_000,
     ]);
     let small = uniform(2);
     let durability = add(add(large, large)?, large)?;
+    // Recovery pool configuration requires positive capacity in every
+    // dimension. Publication claims deliberately leave uncharged dimensions
+    // at zero, so give only those dimensions a one-unit configuration floor.
+    let retention_pool = positive_capacity(retention);
     let recovery_capacity = add(
-        add(add(add(durability, large)?, large)?, large)?,
+        add(add(add(durability, large)?, large)?, retention_pool)?,
         uniform(12),
     )?;
     let tenant_capacity = ResourceAmounts::new([
@@ -111,8 +125,15 @@ pub(super) fn establish_authority(
         [TenantQuota::new(tenant, 1, tenant_capacity)?],
         OrdinaryPoolPolicy::new(uniform(8), uniform(6), uniform(4), uniform(2))?,
     )?;
-    let recovery =
-        RecoveryPoolCapacities::new(durability, large, small, small, large, small, small)?;
+    let recovery = RecoveryPoolCapacities::new(
+        durability,
+        retention_pool,
+        small,
+        small,
+        large,
+        small,
+        small,
+    )?;
     let configuration = ResourceGovernorConfiguration::new(inventory, policy, recovery)?;
     Ok(StorageKernelResourceAuthority::establish(
         volume,
@@ -122,6 +143,22 @@ pub(super) fn establish_authority(
 
 fn uniform(value: u64) -> ResourceAmounts {
     ResourceAmounts::new([value; 11])
+}
+
+fn positive_capacity(amounts: ResourceAmounts) -> ResourceAmounts {
+    ResourceAmounts::new([
+        amounts.get(ResourceDimension::MemoryBytes).max(1),
+        amounts.get(ResourceDimension::QueueSlots).max(1),
+        amounts.get(ResourceDimension::TaskSlots).max(1),
+        amounts.get(ResourceDimension::BufferCacheBytes).max(1),
+        amounts.get(ResourceDimension::BatchItems).max(1),
+        amounts.get(ResourceDimension::LeaseSlots).max(1),
+        amounts.get(ResourceDimension::RetrySlots).max(1),
+        amounts.get(ResourceDimension::IoPermits).max(1),
+        amounts.get(ResourceDimension::CpuWorkUnits).max(1),
+        amounts.get(ResourceDimension::FileDescriptors).max(1),
+        amounts.get(ResourceDimension::DiskHeadroomBytes).max(1),
+    ])
 }
 
 fn add(left: ResourceAmounts, right: ResourceAmounts) -> Result<ResourceAmounts, Box<dyn Error>> {

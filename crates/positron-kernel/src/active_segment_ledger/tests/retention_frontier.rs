@@ -7,7 +7,9 @@ use positron_domain::identity::TenantId;
 use positron_domain::routing::{CommitPosition, SignalKind, VirtualShardId};
 use positron_domain::time::UnixNanoseconds;
 
-use super::support::{TemporaryRoot, establish_authority};
+use super::support::{
+    TemporaryRoot, establish_authority, establish_authority_with_retention_capacity,
+};
 use crate::active_segment_ledger::fault::{LedgerFileEvent, with_ledger_fault};
 use crate::active_segment_ledger::format::decode_header;
 use crate::active_segment_ledger::object_context;
@@ -33,6 +35,8 @@ mod frontier_recovery;
 mod lease_reclamation;
 mod policy_authority;
 mod publication;
+mod publication_capacity;
+mod publication_faults;
 
 fn preparation_capacity<'kernel>(
     authority: &'kernel crate::StorageKernelResourceAuthority,

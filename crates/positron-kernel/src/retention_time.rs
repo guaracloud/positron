@@ -236,7 +236,15 @@ impl StagedCatalogAnchor<'_> {
         scope: SegmentScope,
         durable: Option<IngestTime>,
     ) -> Result<IngestTime, LifecycleClockFailure> {
-        self.observe_candidate(|authority| authority.destructive_ingest_time(scope, durable))
+        let ingest =
+            self.observe_candidate(|authority| authority.destructive_ingest_time(scope, durable))?;
+        // A publication anchor must subsume the exact authenticated time that
+        // this staged operation used, even when sampling did not revise the
+        // process-wide clock safety record.
+        self.candidate_anchor = Some(self.candidate_anchor.map_or(ingest.instant(), |candidate| {
+            candidate.max(ingest.instant())
+        }));
+        Ok(ingest)
     }
 
     pub(crate) fn catalog_anchor_record(
@@ -608,6 +616,23 @@ impl RetentionTimeAuthority {
                 committed: false,
             })
             .map_err(|_| LifecycleClockFailure::Unavailable)
+    }
+
+    pub(crate) fn catalog_anchor_subsumes_observed(
+        &self,
+        snapshot: &CatalogSnapshot,
+        observed: IngestTime,
+    ) -> Result<bool, LifecycleClockFailure> {
+        let mut durable = None;
+        for bytes in snapshot.plaintext_objects() {
+            let Some(record) = decode_catalog_anchor(bytes)? else {
+                continue;
+            };
+            if durable.replace(record).is_some() {
+                return Err(LifecycleClockFailure::OutOfRange);
+            }
+        }
+        Ok(durable.is_some_and(|record| record.anchor >= observed.instant()))
     }
 
     fn abandon_catalog_anchor(
