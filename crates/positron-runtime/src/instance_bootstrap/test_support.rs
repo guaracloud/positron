@@ -2,7 +2,7 @@ use positron_domain::lifecycle::TenantLifecycleState;
 use positron_domain::routing::SignalKind;
 use positron_kernel::{
     ActiveSegmentLedger, Catalog, GovernanceFixtureObject, GovernanceFixtureTarget,
-    RetentionReclamation, SegmentScope,
+    MaintenanceTaskId, MaintenanceTaskPhase, RetentionReclamation, SegmentScope,
 };
 
 use super::types::{BootstrapFailure, BootstrapFailureCode, InitializedInstance};
@@ -40,6 +40,22 @@ impl GovernanceTestFixture {
         })
     }
 
+    pub fn with_integrity_key_fingerprint(
+        &self,
+        fingerprint: [u8; 32],
+    ) -> Result<Self, BootstrapFailure> {
+        let governance = positron_kernel::CatalogGovernanceObject::decode(self.object.bytes())
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        Ok(Self {
+            object: GovernanceFixtureObject::from_bytes(
+                &governance
+                    .with_fixture_integrity_key_fingerprint(fingerprint)
+                    .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?,
+            )
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?,
+        })
+    }
+
     pub fn replace_into<T: GovernanceFixtureTarget>(
         &self,
         target: &T,
@@ -51,6 +67,113 @@ impl GovernanceTestFixture {
 }
 
 impl InitializedInstance {
+    #[doc(hidden)]
+    pub fn queue_governance_audit_checkpoint_for_test(
+        &self,
+    ) -> Result<MaintenanceTaskId, BootstrapFailure> {
+        let secret = self
+            .key
+            .catalog_secret(self.instance)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
+        let catalog = Catalog::open(&self._authority, self.instance, secret)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        let snapshot = catalog
+            .pin()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        let (_, governance) = snapshot
+            .governance_object()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
+        let frontier = catalog
+            .governance_audit_records()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?
+            .into_iter()
+            .last()
+            .ok_or_else(|| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
+        let (task, binding) = Catalog::governance_audit_checkpoint_task(
+            &frontier,
+            governance.integrity_key_fingerprint(),
+        )
+        .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        let now = self
+            .retention_time
+            .governance_now_seconds()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        self.maintenance_coordinator()
+            .lock()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?
+            .submit_governance_audit_checkpoint_and_persist(&catalog, task.clone(), binding, now)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        Ok(task.identity())
+    }
+
+    #[doc(hidden)]
+    pub fn rotate_governance_audit_fingerprint_for_test(
+        &mut self,
+        fingerprint: [u8; 32],
+    ) -> Result<(), BootstrapFailure> {
+        let fixture = self
+            .governance_fixture_for_test()?
+            .with_integrity_key_fingerprint(fingerprint)?;
+        let secret = self
+            .key
+            .catalog_secret(self.instance)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
+        let catalog = Catalog::open(&self._authority, self.instance, secret)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        fixture.replace_into(&catalog)?;
+        self.integrity_key_fingerprint = fingerprint;
+        Ok(())
+    }
+
+    #[doc(hidden)]
+    pub fn complete_queued_governance_audit_checkpoint_for_test(
+        &self,
+        identity: MaintenanceTaskId,
+    ) -> Result<positron_kernel::GovernanceAuditCheckpoint, BootstrapFailure> {
+        let secret = self
+            .key
+            .catalog_secret(self.instance)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
+        let catalog = Catalog::open(&self._authority, self.instance, secret)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        let now = self
+            .retention_time
+            .governance_now_seconds()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        let coordinator = self
+            .maintenance_coordinator()
+            .lock()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        let execution = coordinator
+            .start_task_with_reservation_and_persist(
+                &catalog,
+                &self._authority,
+                now,
+                false,
+                identity,
+            )
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?
+            .ok_or_else(|| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        self.complete_governance_audit_checkpoint_execution_with_coordinator(
+            &catalog,
+            &execution,
+            &coordinator,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn governance_audit_checkpoint_phase_for_test(
+        &self,
+        identity: MaintenanceTaskId,
+    ) -> Result<MaintenanceTaskPhase, BootstrapFailure> {
+        self.maintenance_coordinator()
+            .lock()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?
+            .status(identity)
+            .map(|status| status.phase())
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))
+    }
+
     /// Opens the narrow Instance Integrity signing capability used by a
     /// durable Query export integration test. Product entry points obtain the
     /// same capability through their authenticated runtime composition.

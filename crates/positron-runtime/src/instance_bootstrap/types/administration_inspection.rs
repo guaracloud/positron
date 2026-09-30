@@ -41,6 +41,13 @@ impl InitializedInstance {
         &self,
         actor: positron_governance::AuthorizedContext,
     ) -> Result<positron_kernel::GovernanceAuditCheckpoint, BootstrapFailure> {
+        // This public synchronous operation owns the coordinator before it
+        // acquires the Catalog writer. Concurrent callers therefore attach to
+        // its durable result instead of racing for a second writer lease.
+        let coordinator = self
+            .maintenance_coordinator()
+            .lock()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
         let secret = self
             .key
             .catalog_secret(self.instance)
@@ -63,81 +70,6 @@ impl InitializedInstance {
                 BootstrapFailureCode::IdentityMismatch,
             ));
         }
-        let frontier = catalog
-            .governance_audit_records()
-            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?
-            .into_iter()
-            .last()
-            .ok_or_else(|| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
-        let (task, binding) = Catalog::governance_audit_checkpoint_task(
-            snapshot.number(),
-            &frontier,
-            governance.integrity_key_fingerprint(),
-        )
-        .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
-        let requested = task.identity();
-        let now = self
-            .retention_time
-            .governance_now_seconds()
-            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
-        {
-            let coordinator = self
-                .maintenance_coordinator()
-                .lock()
-                .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
-            coordinator
-                .submit_governance_audit_checkpoint_and_persist(&catalog, task, binding, now)
-                .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
-        }
-        drop(snapshot);
-
-        // This synchronous administrative seam drives ordinary coordinator
-        // dispatches until its own task completes. It never waits for the
-        // runtime worker while holding the Catalog or coordinator gate.
-        loop {
-            let execution = {
-                let coordinator = self
-                    .maintenance_coordinator()
-                    .lock()
-                    .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
-                coordinator
-                    .start_next_with_reservation_and_persist_for_class(
-                        &catalog,
-                        &self._authority,
-                        now,
-                        false,
-                        Some(positron_kernel::MaintenanceTaskClass::GovernanceAuditCheckpoint),
-                    )
-                    .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?
-                    .ok_or_else(|| {
-                        BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable)
-                    })?
-            };
-            let task = execution.task().identity();
-            let checkpoint =
-                self.complete_governance_audit_checkpoint_execution(&catalog, &execution)?;
-            if task == requested {
-                return Ok(checkpoint);
-            }
-        }
-    }
-
-    pub(crate) fn complete_governance_audit_checkpoint_execution(
-        &self,
-        catalog: &Catalog<'_>,
-        execution: &positron_kernel::MaintenanceExecution<'_>,
-    ) -> Result<positron_kernel::GovernanceAuditCheckpoint, BootstrapFailure> {
-        let snapshot = catalog
-            .pin()
-            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
-        let (_, governance) = snapshot
-            .governance_object()
-            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
-        if governance.integrity_key_fingerprint() != self.integrity_key_fingerprint {
-            return Err(BootstrapFailure::new(
-                BootstrapFailureCode::IdentityMismatch,
-            ));
-        }
         let signer = self
             .key
             .audit_checkpoint_signer(self.instance, governance.protected_integrity_key())
@@ -147,6 +79,127 @@ impl InitializedInstance {
                 BootstrapFailureCode::IdentityMismatch,
             ));
         }
+        let frontier = catalog
+            .governance_audit_records()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?
+            .into_iter()
+            .last()
+            .ok_or_else(|| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
+        let (task, binding) = Catalog::governance_audit_checkpoint_task(
+            &frontier,
+            governance.integrity_key_fingerprint(),
+        )
+        .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        let requested = task.identity();
+        let now = self
+            .retention_time
+            .governance_now_seconds()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        drop(snapshot);
+        // Keep duplicate public requests attached to this one coordinator
+        // transition until its signed result is durable. The worker uses the
+        // same coordinator state, so an already-running task remains visible
+        // rather than being silently redispatched.
+        coordinator
+            .submit_governance_audit_checkpoint_and_persist(&catalog, task, binding, now)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        let existing = catalog
+            .latest_audit_checkpoint()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        if let Some(checkpoint) = existing
+            && checkpoint.instance() == self.instance
+            && checkpoint.position() == frontier.position()
+            && checkpoint.record_hash() == frontier.record_hash()
+        {
+            checkpoint
+                .verify(signer.public_key())
+                .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+            if coordinator
+                .status(requested)
+                .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?
+                .phase()
+                == positron_kernel::MaintenanceTaskPhase::Succeeded
+            {
+                return Ok(checkpoint);
+            }
+        }
+        let execution = coordinator
+            .start_task_with_reservation_and_persist(
+                &catalog,
+                &self._authority,
+                now,
+                false,
+                requested,
+            )
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?
+            .ok_or_else(|| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        self.complete_governance_audit_checkpoint_execution_with_coordinator(
+            &catalog,
+            &execution,
+            &coordinator,
+        )
+    }
+
+    pub(crate) fn complete_governance_audit_checkpoint_execution(
+        &self,
+        catalog: &Catalog<'_>,
+        execution: &positron_kernel::MaintenanceExecution<'_>,
+    ) -> Result<positron_kernel::GovernanceAuditCheckpoint, BootstrapFailure> {
+        let coordinator = self
+            .maintenance_coordinator()
+            .lock()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        self.complete_governance_audit_checkpoint_execution_with_coordinator(
+            catalog,
+            execution,
+            &coordinator,
+        )
+    }
+
+    pub(in crate::instance_bootstrap) fn complete_governance_audit_checkpoint_execution_with_coordinator(
+        &self,
+        catalog: &Catalog<'_>,
+        execution: &positron_kernel::MaintenanceExecution<'_>,
+        coordinator: &positron_kernel::MaintenanceCoordinator,
+    ) -> Result<positron_kernel::GovernanceAuditCheckpoint, BootstrapFailure> {
+        let snapshot = catalog
+            .pin()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        let (_, governance) = snapshot
+            .governance_object()
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
+        if governance.integrity_key_fingerprint() != self.integrity_key_fingerprint {
+            return self.fail_governance_audit_checkpoint_execution(
+                catalog,
+                execution,
+                coordinator,
+                BootstrapFailureCode::IdentityMismatch,
+            );
+        }
+        let binding = positron_kernel::GovernanceAuditCheckpointBinding::from_checkpoint(
+            execution.task_checkpoint(),
+        )
+        .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CorruptState))?;
+        if binding.integrity_key_fingerprint() != governance.integrity_key_fingerprint() {
+            return self.fail_governance_audit_checkpoint_execution(
+                catalog,
+                execution,
+                coordinator,
+                BootstrapFailureCode::IdentityMismatch,
+            );
+        }
+        let signer = self
+            .key
+            .audit_checkpoint_signer(self.instance, governance.protected_integrity_key())
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::KeyCustodyUnavailable))?;
+        if signer.public_key() != governance.integrity_public_key() {
+            return self.fail_governance_audit_checkpoint_execution(
+                catalog,
+                execution,
+                coordinator,
+                BootstrapFailureCode::IdentityMismatch,
+            );
+        }
         let checkpoint = catalog
             .publish_admitted_audit_checkpoint(
                 execution,
@@ -154,14 +207,40 @@ impl InitializedInstance {
                 governance.integrity_key_fingerprint(),
             )
             .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
-        let coordinator = self
-            .maintenance_coordinator()
-            .lock()
-            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
-        execution
-            .complete_and_persist(&coordinator, catalog, true)
-            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        // The signed artifact is idempotent. Retry the exact terminal record
+        // once while its reservation remains live. If storage still refuses
+        // it, put the same binding back in the durable queue before releasing
+        // that reservation; a same-process attach or restart can then resume.
+        if execution
+            .complete_and_persist(coordinator, catalog, true)
+            .is_err()
+            && execution
+                .complete_and_persist(coordinator, catalog, true)
+                .is_err()
+        {
+            if execution.requeue_and_persist(coordinator, catalog).is_err() {
+                execution
+                    .release_for_same_process_recovery(coordinator)
+                    .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+            }
+            return Err(BootstrapFailure::new(
+                BootstrapFailureCode::CatalogUnavailable,
+            ));
+        }
         Ok(checkpoint)
+    }
+
+    fn fail_governance_audit_checkpoint_execution(
+        &self,
+        catalog: &Catalog<'_>,
+        execution: &positron_kernel::MaintenanceExecution<'_>,
+        coordinator: &positron_kernel::MaintenanceCoordinator,
+        failure: BootstrapFailureCode,
+    ) -> Result<positron_kernel::GovernanceAuditCheckpoint, BootstrapFailure> {
+        execution
+            .complete_and_persist(coordinator, catalog, false)
+            .map_err(|_| BootstrapFailure::new(BootstrapFailureCode::CatalogUnavailable))?;
+        Err(BootstrapFailure::new(failure))
     }
 
     /// Verifies the complete visible Governance Audit chain against the

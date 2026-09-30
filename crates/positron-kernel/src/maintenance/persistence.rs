@@ -957,6 +957,45 @@ impl MaintenanceCoordinator {
         clock_uncertain: bool,
         classes: &[MaintenanceTaskClass],
     ) -> Result<Option<MaintenanceExecution<'authority>>, MaintenanceFailure> {
+        self.start_next_with_reservation_and_persist_matching(
+            catalog,
+            authority,
+            now,
+            clock_uncertain,
+            classes,
+            None,
+        )
+    }
+
+    /// Starts one exact admitted task without allowing another task of the
+    /// same class to consume an attach caller's result path.
+    pub fn start_task_with_reservation_and_persist<'authority>(
+        &self,
+        catalog: &Catalog<'_>,
+        authority: &'authority StorageKernelResourceAuthority,
+        now: u64,
+        clock_uncertain: bool,
+        identity: MaintenanceTaskId,
+    ) -> Result<Option<MaintenanceExecution<'authority>>, MaintenanceFailure> {
+        self.start_next_with_reservation_and_persist_matching(
+            catalog,
+            authority,
+            now,
+            clock_uncertain,
+            &[MaintenanceTaskClass::GovernanceAuditCheckpoint],
+            Some(identity),
+        )
+    }
+
+    fn start_next_with_reservation_and_persist_matching<'authority>(
+        &self,
+        catalog: &Catalog<'_>,
+        authority: &'authority StorageKernelResourceAuthority,
+        now: u64,
+        clock_uncertain: bool,
+        classes: &[MaintenanceTaskClass],
+        requested_identity: Option<MaintenanceTaskId>,
+    ) -> Result<Option<MaintenanceExecution<'authority>>, MaintenanceFailure> {
         let mut state = self
             .state
             .lock()
@@ -967,6 +1006,9 @@ impl MaintenanceCoordinator {
             return Ok(None);
         }
         for identity in candidates {
+            if requested_identity.is_some_and(|requested| requested != identity) {
+                continue;
+            }
             let task = prospective
                 .tasks
                 .get(&identity)
@@ -1417,6 +1459,69 @@ impl MaintenanceCoordinator {
         self.complete_and_persist_dispatch_inner(catalog, dispatch, succeeded, Some(execution))
     }
 
+    fn requeue_admitted_dispatch(
+        &self,
+        catalog: &Catalog<'_>,
+        dispatch: MaintenanceDispatch,
+        execution: &MaintenanceExecution<'_>,
+    ) -> Result<(), MaintenanceFailure> {
+        if dispatch.coordinator_id != self.coordinator_id {
+            return Err(MaintenanceFailure::InvalidTransition);
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
+        let mut next = state.clone();
+        let task = next
+            .tasks
+            .get_mut(&dispatch.identity)
+            .ok_or(MaintenanceFailure::UnknownTask)?;
+        if task.task.class != MaintenanceTaskClass::GovernanceAuditCheckpoint
+            || task.phase != MaintenanceTaskPhase::Running
+            || task.active_dispatch != Some(dispatch)
+            || task.cancellation_requested
+        {
+            return Err(MaintenanceFailure::InvalidTransition);
+        }
+        task.phase = MaintenanceTaskPhase::Queued;
+        task.active_dispatch = None;
+        persist_task_state_admitted(catalog, task, None, execution)?;
+        *state = next;
+        Ok(())
+    }
+
+    fn release_admitted_dispatch_for_recovery(
+        &self,
+        dispatch: MaintenanceDispatch,
+    ) -> Result<(), MaintenanceFailure> {
+        if dispatch.coordinator_id != self.coordinator_id {
+            return Err(MaintenanceFailure::InvalidTransition);
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
+        let task = state
+            .tasks
+            .get_mut(&dispatch.identity)
+            .ok_or(MaintenanceFailure::UnknownTask)?;
+        if task.task.class != MaintenanceTaskClass::GovernanceAuditCheckpoint
+            || task.phase != MaintenanceTaskPhase::Running
+            || task.active_dispatch != Some(dispatch)
+        {
+            return Err(MaintenanceFailure::InvalidTransition);
+        }
+        // A terminal write and its durable requeue both failed. The execution
+        // is about to release its reservation, so retain no live owner in this
+        // coordinator. The authenticated Catalog record remains the recovery
+        // authority; the next exact attach republishes Running before it signs
+        // or terminalizes anything.
+        task.phase = MaintenanceTaskPhase::Queued;
+        task.active_dispatch = None;
+        Ok(())
+    }
+
     pub(super) fn cancel_running_retention_publication_and_persist_dispatch(
         &self,
         catalog: &Catalog<'_>,
@@ -1604,6 +1709,32 @@ impl MaintenanceExecution<'_> {
         } else {
             coordinator.complete_and_persist_dispatch(catalog, self.dispatch, succeeded)
         }
+    }
+
+    /// Returns an audit-checkpoint execution to its durable queue while its
+    /// existing reservation is still live. This is used only after its signed
+    /// artifact has committed but the terminal task record remains unavailable.
+    pub fn requeue_and_persist(
+        &self,
+        coordinator: &MaintenanceCoordinator,
+        catalog: &Catalog<'_>,
+    ) -> Result<(), MaintenanceFailure> {
+        if self.task.class != MaintenanceTaskClass::GovernanceAuditCheckpoint {
+            return Err(MaintenanceFailure::InvalidInput);
+        }
+        coordinator.requeue_admitted_dispatch(catalog, self.dispatch, self)
+    }
+
+    /// Releases a failed audit-checkpoint owner for a later exact same-process
+    /// recovery when even its durable requeue publication was unavailable.
+    pub fn release_for_same_process_recovery(
+        &self,
+        coordinator: &MaintenanceCoordinator,
+    ) -> Result<(), MaintenanceFailure> {
+        if self.task.class != MaintenanceTaskClass::GovernanceAuditCheckpoint {
+            return Err(MaintenanceFailure::InvalidInput);
+        }
+        coordinator.release_admitted_dispatch_for_recovery(self.dispatch)
     }
 }
 

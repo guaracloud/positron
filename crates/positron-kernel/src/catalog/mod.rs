@@ -260,7 +260,6 @@ impl<'authority> Catalog<'authority> {
     /// Builds the sole durable coordinator task contract for a checkpoint of
     /// one already-visible Governance Audit frontier.
     pub fn governance_audit_checkpoint_task(
-        catalog_generation: u64,
         frontier: &GovernanceAuditRecord,
         integrity_key_fingerprint: [u8; 32],
     ) -> Result<(MaintenanceTask, GovernanceAuditCheckpointBinding), CatalogFailure> {
@@ -288,7 +287,10 @@ impl<'authority> Catalog<'authority> {
             MaintenanceTaskClass::GovernanceAuditCheckpoint,
             MaintenanceScope::System,
             MaintenanceTrigger::Event,
-            MaintenancePreconditions::new(catalog_generation, 1)
+            // The signed record is the complete durable frontier contract.
+            // An incidental Catalog generation change must not turn a retry of
+            // that same frontier into a conflicting task.
+            MaintenancePreconditions::new(frontier.position(), 1)
                 .map_err(|_| CatalogFailure::new(CatalogFailureCode::InvalidInput))?,
             vec![
                 MaintenanceObjectId::new(frontier.record_hash())
@@ -965,6 +967,17 @@ impl<'authority> Catalog<'authority> {
         self.state
             .lock()
             .map(|state| state.audit.clone())
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))
+    }
+
+    /// Returns the most recent durable signed audit-chain anchor published by
+    /// the system maintenance path.
+    pub fn latest_audit_checkpoint(
+        &self,
+    ) -> Result<Option<GovernanceAuditCheckpoint>, CatalogFailure> {
+        self.state
+            .lock()
+            .map(|state| state.audit_checkpoint.clone())
             .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))
     }
 

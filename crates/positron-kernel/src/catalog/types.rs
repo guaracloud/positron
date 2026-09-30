@@ -287,6 +287,11 @@ impl GovernanceFixtureObject {
         Ok(Self { plaintext })
     }
 
+    #[doc(hidden)]
+    pub fn bytes(&self) -> &[u8] {
+        &self.plaintext
+    }
+
     /// Returns the same opaque fixture with its typed tenant lifecycle changed.
     #[doc(hidden)]
     pub fn with_lifecycle(&self, lifecycle: TenantLifecycleState) -> Result<Self, CatalogFailure> {
