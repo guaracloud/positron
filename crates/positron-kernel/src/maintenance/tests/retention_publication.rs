@@ -164,6 +164,16 @@ fn queued_reclamation_state(task: MaintenanceTask) -> TaskState {
 #[test]
 fn restore_rejects_noncanonical_reclamation_descriptors() {
     let task = retention_reclamation_task(0x80);
+    let restored =
+        MaintenanceCoordinator::restore([
+            encode_record(&queued_reclamation_state(task.clone())).expect("valid queued record")
+        ])
+        .expect("valid Reclamation descriptor restores");
+    let status = restored
+        .status(task.identity())
+        .expect("restored Reclamation");
+    assert_eq!(status.phase(), MaintenanceTaskPhase::Queued);
+    assert!(status.checkpoint().is_none());
     let tenant = TenantId::from_bytes([0x74; 16]).expect("tenant");
     let binding = MaintenanceObjectId::new([0x82; 32]).expect("output binding");
     let cases = [
@@ -441,13 +451,17 @@ fn generic_checkpoint_cannot_mutate_a_retention_reclamation()
             .is_none(),
         "generic checkpointing must not mutate the typed descriptor"
     );
+    let live = coordinator.status(identity).expect("running reclamation");
+    assert_eq!(live.phase(), MaintenanceTaskPhase::Running);
+    assert!(!live.cancellation_requested());
+    let recovered = MaintenanceCoordinator::restore_from_catalog(&catalog)
+        .expect("durable record restores")
+        .status(identity)
+        .expect("durable running reclamation");
+    assert_eq!(recovered.phase(), MaintenanceTaskPhase::Queued);
+    assert!(!recovered.cancellation_requested());
     assert!(
-        MaintenanceCoordinator::restore_from_catalog(&catalog)
-            .expect("durable record restores")
-            .status(identity)
-            .expect("durable running reclamation")
-            .checkpoint()
-            .is_none(),
+        recovered.checkpoint().is_none(),
         "the durable Running record must remain without generic progress"
     );
     Ok(())
