@@ -114,10 +114,10 @@ async fn api_preauthentication_rate_refuses_by_peer_and_global_window_then_recov
     assert_status(first, 405);
     let refused = connect_from(Ipv4Addr::LOCALHOST, api)
         .await
-        .map_err(|error| format!("rate-limited connection: {error}"))?;
+        .map_err(|error| format!("rate-limited connection establishment: {error}"))?;
     assert_closed(refused)
         .await
-        .map_err(|error| format!("rate-limited connection: {error}"))?;
+        .map_err(|error| format!("rate-limited connection close: {error}"))?;
     let recovered = request_from(Ipv4Addr::LOCALHOST, api)
         .await
         .map_err(|error| format!("recovered request: {error}"))?;
