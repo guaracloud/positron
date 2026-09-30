@@ -30,7 +30,8 @@ async fn saturated_authenticated_stream_rejects_before_payload_decode_and_releas
         Duration::from_secs(2),
         LogsServiceClient::connect(format!("http://{endpoint}")),
     )
-    .await??;
+    .await
+    .map_err(|_| "resource-governance client connection timed out")??;
     let competing = harness.authorize(tonic::Request::new(otlp_request("must-not-decode")))?;
     let competing_result =
         tokio::time::timeout(Duration::from_secs(2), client.export(competing)).await;
@@ -83,8 +84,9 @@ async fn success_and_decode_failure_release_capacity_without_governor_drift()
         let request = harness.authorize(tonic::Request::new(otlp_request(&format!(
             "release-{sequence}"
         ))))?;
-        let response =
-            tokio::time::timeout(Duration::from_secs(2), client.export(request)).await??;
+        let response = tokio::time::timeout(Duration::from_secs(2), client.export(request))
+            .await
+            .map_err(|_| "resource-governance successful export timed out")??;
         assert!(response.into_inner().partial_success.is_none());
     }
 
@@ -98,7 +100,8 @@ async fn success_and_decode_failure_release_capacity_without_governor_drift()
         .time_unix_nano = u64::MAX;
     let malformed = harness.authorize(tonic::Request::new(malformed_payload))?;
     let malformed = tokio::time::timeout(Duration::from_secs(2), client.export(malformed))
-        .await?
+        .await
+        .map_err(|_| "resource-governance malformed export timed out")?
         .expect_err("out-of-range timestamp must be rejected");
     assert_eq!(malformed.code(), Code::InvalidArgument);
 
@@ -107,7 +110,8 @@ async fn success_and_decode_failure_release_capacity_without_governor_drift()
     )))?;
     assert!(
         tokio::time::timeout(Duration::from_secs(2), client.export(after_failure))
-            .await??
+            .await
+            .map_err(|_| "resource-governance post-failure export timed out")??
             .into_inner()
             .partial_success
             .is_none()

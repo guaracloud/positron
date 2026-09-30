@@ -105,7 +105,8 @@ async fn independent_groups_commit_and_report_permanent_rejection_without_rollba
         Duration::from_secs(2),
         LogsServiceClient::connect(format!("http://{}", harness.endpoint())),
     )
-    .await??;
+    .await
+    .map_err(|_| "admission-groups client connection timed out")??;
 
     for _ in 0..2 {
         let mut payload = otlp_request("group-one");
@@ -125,7 +126,8 @@ async fn independent_groups_commit_and_report_permanent_rejection_without_rollba
             .push(rejected);
         let request = harness.authorize(tonic::Request::new(payload))?;
         let partial = tokio::time::timeout(Duration::from_secs(2), client.export(request))
-            .await??
+            .await
+            .map_err(|_| "admission-groups export timed out")??
             .into_inner()
             .partial_success
             .ok_or("two-group mixed outcome omitted OTLP partial success")?;

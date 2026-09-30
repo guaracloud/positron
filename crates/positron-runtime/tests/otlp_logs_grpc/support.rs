@@ -72,7 +72,9 @@ impl ForcedGrpcHarness {
             };
             let _ = outcome_sender.send(process.shutdown(trigger));
         });
-        let endpoint = endpoint_receiver.recv_timeout(std::time::Duration::from_secs(2))?;
+        let endpoint = endpoint_receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .map_err(|error| format!("forced runtime did not report its OTLP endpoint: {error}"))?;
         Ok(Self {
             roots,
             endpoint,

@@ -325,11 +325,14 @@ fn register_tasks(registrar: &dyn TaskRegistrar) -> Result<RegisteredTasks, Exit
     [
         TaskRole::Control,
         TaskRole::Operations,
-        TaskRole::Maintenance,
         TaskRole::Api,
         TaskRole::OtlpGrpc,
         TaskRole::OtlpHttp,
         TaskRole::LokiPush,
+        // The maintenance worker may immediately probe the Catalog. Bind all
+        // public listener roles first so their startup does not wait behind
+        // that idle probe; the worker is still registered before Serving.
+        TaskRole::Maintenance,
     ]
     .into_iter()
     .map(|role| {
