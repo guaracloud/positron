@@ -63,11 +63,18 @@ const TENANT_ALIAS_METHODS: &[MethodSpec] = &[MethodSpec {
     input: ".positron.v1.TenantAliasBindRequest",
     output: ".positron.v1.TenantAliasBindResponse",
 }];
-const MAINTENANCE_METHODS: &[MethodSpec] = &[MethodSpec {
-    name: "Status",
-    input: ".positron.v1.MaintenanceStatusRequest",
-    output: ".positron.v1.MaintenanceStatusResponse",
-}];
+const MAINTENANCE_METHODS: &[MethodSpec] = &[
+    MethodSpec {
+        name: "Status",
+        input: ".positron.v1.MaintenanceStatusRequest",
+        output: ".positron.v1.MaintenanceStatusResponse",
+    },
+    MethodSpec {
+        name: "Explain",
+        input: ".positron.v1.MaintenanceExplainRequest",
+        output: ".positron.v1.MaintenanceExplainResponse",
+    },
+];
 const POLICY_METHODS: &[MethodSpec] = &[
     MethodSpec {
         name: "Validate",

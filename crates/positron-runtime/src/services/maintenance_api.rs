@@ -1,7 +1,8 @@
 use std::fmt::Write;
 
 use positron_api::maintenance::{
-    MaintenanceStatusRequest, MaintenanceStatusResponse, MaintenanceTaskStatus,
+    MaintenanceExplainRequest, MaintenanceExplainResponse, MaintenanceStatusRequest,
+    MaintenanceStatusResponse, MaintenanceTaskStatus,
 };
 use positron_governance::{CompatibilityHints, PresentedCredential, RequestedIntent};
 use positron_kernel::{MaintenanceScope, MaintenanceTaskClass, MaintenanceTaskPhase};
@@ -40,7 +41,6 @@ impl ServiceHandle {
             terminal: 0,
         };
         for status in statuses {
-            let phase = phase_name(status.phase());
             match status.phase() {
                 MaintenanceTaskPhase::Queued => response.queued += 1,
                 MaintenanceTaskPhase::Running => response.running += 1,
@@ -49,21 +49,71 @@ impl ServiceHandle {
                 | MaintenanceTaskPhase::Succeeded
                 | MaintenanceTaskPhase::Failed => response.terminal += 1,
             }
-            response.tasks.push(MaintenanceTaskStatus {
-                identity: hex(status.task().identity().to_bytes()),
-                class: class_name(status.task().class()).to_owned(),
-                scope: scope_name(status.task().scope()),
-                phase: phase.to_owned(),
-                submitted_at_unix_seconds: status.submitted_at(),
-                checkpoint_sequence: status.checkpoint().map(|checkpoint| checkpoint.sequence()),
-                pause_until_unix_seconds: status.pause_until(),
-                cancellation_requested: status.cancellation_requested(),
-            });
+            response.tasks.push(task_status(status));
         }
         response
             .validate()
             .map_err(|_| (503, "administration_unavailable"))?;
         Ok(response)
+    }
+
+    pub(crate) fn explain_maintenance_task(
+        &self,
+        bearer: &str,
+        body: &[u8],
+    ) -> Result<MaintenanceExplainResponse, (u16, &'static str)> {
+        self.instance
+            .attribute(
+                PresentedCredential::parse(bearer).map_err(|_| (401, "authentication_rejected"))?,
+                RequestedIntent::SystemAdministration,
+                CompatibilityHints::none(),
+            )
+            .map_err(|_| (401, "authentication_rejected"))?;
+        let request =
+            MaintenanceExplainRequest::decode(body).map_err(|_| (400, "invalid_request"))?;
+        let identity = task_identity(&request.identity).ok_or((400, "invalid_request"))?;
+        let status = self
+            .instance
+            .maintenance_coordinator()
+            .lock()
+            .map_err(|_| (503, "administration_unavailable"))?
+            .status(identity)
+            .map_err(|_| (404, "task_unavailable"))?;
+        Ok(MaintenanceExplainResponse {
+            task: task_status(status),
+        })
+    }
+}
+
+fn task_status(status: positron_kernel::MaintenanceTaskStatus) -> MaintenanceTaskStatus {
+    MaintenanceTaskStatus {
+        identity: hex(status.task().identity().to_bytes()),
+        class: class_name(status.task().class()).to_owned(),
+        scope: scope_name(status.task().scope()),
+        phase: phase_name(status.phase()).to_owned(),
+        submitted_at_unix_seconds: status.submitted_at(),
+        checkpoint_sequence: status.checkpoint().map(|checkpoint| checkpoint.sequence()),
+        pause_until_unix_seconds: status.pause_until(),
+        cancellation_requested: status.cancellation_requested(),
+    }
+}
+
+fn task_identity(value: &str) -> Option<positron_kernel::MaintenanceTaskId> {
+    let mut bytes = [0_u8; 16];
+    for (slot, pair) in bytes.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
+        let high = hex_value(*pair.first()?)?;
+        let low = hex_value(*pair.get(1)?)?;
+        *slot = (high << 4) | low;
+    }
+    positron_kernel::MaintenanceTaskId::new(bytes).ok()
+}
+
+const fn hex_value(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
     }
 }
 

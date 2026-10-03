@@ -48,6 +48,7 @@ service TenantRetentionService {
 // Maintenance Coordinator. Task control remains in the coordinator.
 service MaintenanceService {
   rpc Status(MaintenanceStatusRequest) returns (MaintenanceStatusResponse);
+  rpc Explain(MaintenanceExplainRequest) returns (MaintenanceExplainResponse);
 }
 
 // Authenticated system administration for explicit tenant registry entries.
@@ -378,6 +379,14 @@ message MaintenanceStatusResponse {
   uint32 running = 3;
   uint32 deferred = 4;
   uint32 terminal = 5;
+}
+
+message MaintenanceExplainRequest {
+  string identity = 1;
+}
+
+message MaintenanceExplainResponse {
+  MaintenanceTaskStatus task = 1;
 }
 
 message CapabilityResponse {

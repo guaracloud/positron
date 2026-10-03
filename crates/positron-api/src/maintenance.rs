@@ -10,6 +10,7 @@ mod client {
 pub use client::{MaintenanceServiceClient, MaintenanceServiceClientFailure};
 
 pub const STATUS_HTTP_PATH: &str = "/v1/maintenance:status";
+pub const EXPLAIN_HTTP_PATH: &str = "/v1/maintenance:explain";
 pub const MAX_REQUEST_BYTES: usize = 128;
 pub const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 pub const MAX_TASKS: usize = 128;
@@ -24,6 +25,30 @@ impl MaintenanceStatusRequest {
             return Err(MaintenanceWireFailure);
         }
         serde_json::from_slice(body).map_err(|_| MaintenanceWireFailure)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaintenanceExplainRequest {
+    pub identity: String,
+}
+
+impl MaintenanceExplainRequest {
+    pub fn decode(body: &[u8]) -> Result<Self, MaintenanceWireFailure> {
+        if body.len() > MAX_REQUEST_BYTES {
+            return Err(MaintenanceWireFailure);
+        }
+        let request: Self = serde_json::from_slice(body).map_err(|_| MaintenanceWireFailure)?;
+        if request.identity.len() != 32
+            || !request
+                .identity
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(MaintenanceWireFailure);
+        }
+        Ok(request)
     }
 }
 
@@ -50,6 +75,29 @@ pub struct MaintenanceStatusResponse {
     pub running: u32,
     pub deferred: u32,
     pub terminal: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaintenanceExplainResponse {
+    pub task: MaintenanceTaskStatus,
+}
+
+impl MaintenanceExplainResponse {
+    pub fn encode(&self) -> Result<Vec<u8>, MaintenanceWireFailure> {
+        let response = MaintenanceStatusResponse {
+            tasks: vec![self.task.clone()],
+            queued: u32::from(self.task.phase == "queued"),
+            running: u32::from(self.task.phase == "running"),
+            deferred: u32::from(self.task.phase == "deferred"),
+            terminal: u32::from(matches!(
+                self.task.phase.as_str(),
+                "cancelled" | "succeeded" | "failed"
+            )),
+        };
+        response.validate()?;
+        serde_json::to_vec(self).map_err(|_| MaintenanceWireFailure)
+    }
 }
 
 impl MaintenanceStatusResponse {

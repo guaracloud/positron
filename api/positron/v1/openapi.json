@@ -3,7 +3,7 @@
   "info": {
     "title": "Positron API",
     "version": "v1",
-    "x-positron-schema-digest": "be0a2a47aa3ecf9a44398003a7dfcb3f9013089b274e4d1c4d833f5460d9b2ec"
+    "x-positron-schema-digest": "3c08950f5f2d6ce8ec40a794baa0a817ac1a6bf848b6c327031885e7a9cdda7e"
   },
   "paths": {
     "/v1/capabilities:negotiate": {
@@ -424,6 +424,22 @@
           "200": {"description": "Bounded redacted Maintenance Coordinator task status.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MaintenanceStatusResponse"}}}},
           "400": {"description": "Invalid bounded maintenance status request."},
           "401": {"description": "System-administration authentication failed before request decoding."},
+          "503": {"description": "Maintenance administration is unavailable."}
+        }
+      }
+    },
+    "/v1/maintenance:explain": {
+      "post": {
+        "operationId": "ExplainMaintenance",
+        "security": [{"apiKeyBearer": []}],
+        "x-positron-availability": "available",
+        "x-positron-max-request-bytes": 128,
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MaintenanceExplainRequest"}}}},
+        "responses": {
+          "200": {"description": "One bounded redacted Maintenance Coordinator task.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MaintenanceExplainResponse"}}}},
+          "400": {"description": "Invalid bounded maintenance task identity."},
+          "401": {"description": "System-administration authentication failed before request decoding."},
+          "404": {"description": "The task is unavailable."},
           "503": {"description": "Maintenance administration is unavailable."}
         }
       }
@@ -1240,6 +1256,16 @@
           "deferred": {"type": "integer", "minimum": 0},
           "terminal": {"type": "integer", "minimum": 0}
         }
+      },
+      "MaintenanceExplainRequest": {
+        "type": "object", "additionalProperties": false,
+        "required": ["identity"],
+        "properties": {"identity": {"type": "string", "pattern": "^[0-9a-fA-F]{32}$", "minLength": 32, "maxLength": 32}}
+      },
+      "MaintenanceExplainResponse": {
+        "type": "object", "additionalProperties": false,
+        "required": ["task"],
+        "properties": {"task": {"$ref": "#/components/schemas/MaintenanceTaskStatus"}}
       },
       "TenantRetentionPreviewRequest": {
         "type": "object",
