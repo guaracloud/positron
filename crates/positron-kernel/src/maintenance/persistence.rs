@@ -147,15 +147,21 @@ impl RetentionPublicationTaskCompletion {
         Ok(())
     }
 
-    pub(crate) fn discard(&self, coordinator: &MaintenanceCoordinator) {
-        if let Ok(mut state) = coordinator.state.lock() {
-            state
-                .pending_task_transitions
-                .remove(&self.publication_before.task.identity);
-            state
-                .pending_submissions
-                .remove(&self.reclamation.task.identity);
-        }
+    pub(crate) fn discard(
+        &self,
+        coordinator: &MaintenanceCoordinator,
+    ) -> Result<(), MaintenanceFailure> {
+        let mut state = coordinator
+            .state
+            .lock()
+            .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
+        state
+            .pending_task_transitions
+            .remove(&self.publication_before.task.identity);
+        state
+            .pending_submissions
+            .remove(&self.reclamation.task.identity);
+        Ok(())
     }
 }
 
@@ -192,12 +198,18 @@ impl SnapshotLeaseExpiryTaskReplacement {
         Ok(())
     }
 
-    pub(crate) fn discard(&self, coordinator: &MaintenanceCoordinator) {
-        if let Ok(mut state) = coordinator.state.lock() {
-            state
-                .pending_task_transitions
-                .remove(&self.before.task.identity);
-        }
+    pub(crate) fn discard(
+        &self,
+        coordinator: &MaintenanceCoordinator,
+    ) -> Result<(), MaintenanceFailure> {
+        let mut state = coordinator
+            .state
+            .lock()
+            .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
+        state
+            .pending_task_transitions
+            .remove(&self.before.task.identity);
+        Ok(())
     }
 
     pub(crate) fn install_running_completion(
@@ -288,12 +300,18 @@ impl RetentionReclamationTaskReplacement {
         Ok(())
     }
 
-    pub(crate) fn discard(&self, coordinator: &MaintenanceCoordinator) {
-        if let Ok(mut state) = coordinator.state.lock() {
-            state
-                .pending_task_transitions
-                .remove(&self.before.task.identity);
-        }
+    pub(crate) fn discard(
+        &self,
+        coordinator: &MaintenanceCoordinator,
+    ) -> Result<(), MaintenanceFailure> {
+        let mut state = coordinator
+            .state
+            .lock()
+            .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
+        state
+            .pending_task_transitions
+            .remove(&self.before.task.identity);
+        Ok(())
     }
 }
 
@@ -344,12 +362,18 @@ impl CompactionTaskReplacement {
         Ok(())
     }
 
-    pub(crate) fn discard(&self, coordinator: &MaintenanceCoordinator) {
-        if let Ok(mut state) = coordinator.state.lock() {
-            state
-                .pending_task_transitions
-                .remove(&self.before.task.identity);
-        }
+    pub(crate) fn discard(
+        &self,
+        coordinator: &MaintenanceCoordinator,
+    ) -> Result<(), MaintenanceFailure> {
+        let mut state = coordinator
+            .state
+            .lock()
+            .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
+        state
+            .pending_task_transitions
+            .remove(&self.before.task.identity);
+        Ok(())
     }
 }
 
@@ -403,13 +427,19 @@ impl QueuedMaintenanceSubmission {
         Ok(())
     }
 
-    pub(crate) fn discard(self, coordinator: &MaintenanceCoordinator) {
-        if let Ok(mut state) = coordinator.state.lock() {
-            state.pending_submissions.remove(&self.state.task.identity);
-            if let Some((identity, _)) = self.reclaimed_terminal {
-                state.pending_terminal_reclamations.remove(&identity);
-            }
+    pub(crate) fn discard(
+        self,
+        coordinator: &MaintenanceCoordinator,
+    ) -> Result<(), MaintenanceFailure> {
+        let mut state = coordinator
+            .state
+            .lock()
+            .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
+        state.pending_submissions.remove(&self.state.task.identity);
+        if let Some((identity, _)) = self.reclaimed_terminal {
+            state.pending_terminal_reclamations.remove(&identity);
         }
+        Ok(())
     }
 }
 
@@ -721,7 +751,7 @@ impl MaintenanceCoordinator {
                 .contains(&binding.reclamation.identity)
             || binding.reclamation.class != MaintenanceTaskClass::RetentionReclamation
             || binding.reclamation.scope != before.task.scope
-            || binding.reclamation.trigger != MaintenanceTrigger::AgeDerived
+            || binding.reclamation.trigger != MaintenanceTrigger::Event
             || binding.reclamation.preconditions != before.task.preconditions
             || binding.reclamation.inputs != before.task.outputs
             || !binding.reclamation.outputs.is_empty()
@@ -1693,6 +1723,46 @@ impl MaintenanceCoordinator {
             .state
             .lock()
             .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
+        let verified_legacy = state
+            .tasks
+            .values()
+            .filter(|reclamation| {
+                reclamation.task.class == MaintenanceTaskClass::RetentionReclamation
+                    && reclamation.task.trigger == MaintenanceTrigger::AgeDerived
+                    && reclamation.phase == MaintenanceTaskPhase::Queued
+            })
+            .filter_map(|reclamation| {
+                state
+                    .tasks
+                    .values()
+                    .find(|publication| {
+                        publication.task.class == MaintenanceTaskClass::RetentionPublication
+                            && canonical_retention_publication_pair(
+                                publication,
+                                publication,
+                                reclamation,
+                            )
+                            .unwrap_or(false)
+                    })
+                    .map(|publication| (publication, reclamation))
+            })
+            .try_fold(
+                BTreeSet::new(),
+                |mut verified, (publication, reclamation)| {
+                    if crate::active_segment_ledger::reclamation_eligibility_is_durably_established(
+                        &snapshot,
+                        &publication.task,
+                        &reclamation.task,
+                        publication.checkpoint.as_ref(),
+                    )
+                    .map_err(|_| MaintenanceFailure::CatalogUnavailable)?
+                    {
+                        verified.insert(reclamation.task.identity);
+                    }
+                    Ok::<_, MaintenanceFailure>(verified)
+                },
+            )?;
+        state.clock_uncertain_durable_eligibility = verified_legacy;
         state.window = window;
         drop(state);
         Ok(coordinator)
@@ -2532,7 +2602,10 @@ fn canonical_retention_publication_pair(
         && reclamation.task.class == MaintenanceTaskClass::RetentionReclamation
         && reclamation.phase == MaintenanceTaskPhase::Queued
         && reclamation.task.scope == before.task.scope
-        && reclamation.task.trigger == MaintenanceTrigger::AgeDerived
+        && matches!(
+            reclamation.task.trigger,
+            MaintenanceTrigger::Event | MaintenanceTrigger::AgeDerived
+        )
         && reclamation.task.preconditions == before.task.preconditions
         && reclamation.task.inputs == before.task.outputs
         && reclamation.task.outputs.is_empty()

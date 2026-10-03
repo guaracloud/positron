@@ -105,7 +105,9 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         let terminal = match completion.catalog_object() {
             Ok(object) => object,
             Err(_) => {
-                completion.discard(coordinator);
+                completion
+                    .discard(coordinator)
+                    .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
                 return Err(LedgerFailure::new(LedgerFailureCode::RecoveryRequired));
             },
         };
@@ -114,7 +116,9 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             match self.storage.reclaim_retired(*candidate) {
                 Ok(changed) => physically_mutated |= changed,
                 Err(failure) => {
-                    completion.discard(coordinator);
+                    completion
+                        .discard(coordinator)
+                        .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
                     return Err(if physically_mutated {
                         LedgerFailure::post_mutation(failure.code())
                     } else {
@@ -145,7 +149,9 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             expected.identity(),
             terminal,
         ) {
-            completion.discard(coordinator);
+            completion
+                .discard(coordinator)
+                .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
             return Err(if physically_mutated {
                 LedgerFailure::post_mutation(failure.code())
             } else {

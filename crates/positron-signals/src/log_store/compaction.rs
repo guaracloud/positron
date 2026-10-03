@@ -61,6 +61,46 @@ pub(super) fn compact<'kernel, 'catalog>(
     cancellation: &dyn ScanCancellation,
     observer: &dyn ScanObserver,
 ) -> Result<LogCompactionOutcome, LogStoreFailure> {
+    compact_inner(ledger, tenant, policy, bucket, cancellation, observer, None)
+}
+
+pub(super) fn compact_with_maintenance<'kernel, 'catalog>(
+    ledger: &ActiveSegmentLedger<'kernel, 'catalog>,
+    tenant: TenantId,
+    policy: LogRetentionPolicy,
+    execution: &crate::MaintenanceCompactionExecution<'_, 'kernel>,
+) -> Result<LogCompactionOutcome, LogStoreFailure> {
+    let binding =
+        positron_kernel::CompactionBinding::from_checkpoint(execution.task().task_checkpoint())
+            .map_err(|_| LogStoreFailure::corrupt_policy())?;
+    let bucket = LogRetentionBucket::from_kernel(
+        binding
+            .bucket()
+            .map_err(|_| LogStoreFailure::corrupt_policy())?,
+    );
+    compact_inner(
+        ledger,
+        tenant,
+        policy,
+        bucket,
+        execution.cancellation(),
+        execution.observer(),
+        Some((execution.coordinator(), execution.task())),
+    )
+}
+
+fn compact_inner<'kernel, 'catalog>(
+    ledger: &ActiveSegmentLedger<'kernel, 'catalog>,
+    tenant: TenantId,
+    policy: LogRetentionPolicy,
+    bucket: LogRetentionBucket,
+    cancellation: &dyn ScanCancellation,
+    observer: &dyn ScanObserver,
+    maintenance: Option<(
+        &positron_kernel::MaintenanceCoordinator,
+        &positron_kernel::MaintenanceExecution<'_>,
+    )>,
+) -> Result<LogCompactionOutcome, LogStoreFailure> {
     if ledger.scope().tenant_id() != tenant
         || ledger.scope().signal_kind() != positron_domain::routing::SignalKind::Logs
         || bucket.tenant() != tenant
@@ -76,9 +116,13 @@ pub(super) fn compact<'kernel, 'catalog>(
     let snapshot = ledger.snapshot().map_err(LogStoreFailure::kernel)?;
     // Admit the kernel's complete copy-on-write peak while only the immutable
     // snapshot exists. This is intentionally before any payload is cloned.
-    let preparation = ledger
-        .prepare_compaction_with_policy(&snapshot, policy.kernel_policy())
-        .map_err(LogStoreFailure::kernel)?;
+    let preparation = match maintenance {
+        Some((_, execution)) => {
+            ledger.prepare_compaction_payload_for_maintenance(&snapshot, execution)
+        },
+        None => ledger.prepare_compaction_with_policy(&snapshot, policy.kernel_policy()),
+    }
+    .map_err(LogStoreFailure::kernel)?;
     policy.verify_current(ledger)?;
     let mut inputs = Vec::new();
     inputs
@@ -189,9 +233,18 @@ pub(super) fn compact<'kernel, 'catalog>(
         });
     }
     let input_blocks = inputs.len();
-    let publication = ledger
-        .compact_sealed_with_cancellation(inputs, preparation, || cancellation.is_cancelled())
-        .map_err(LogStoreFailure::kernel)?;
+    let publication = match maintenance {
+        Some((coordinator, execution)) => ledger.compact_sealed_with_maintenance(
+            inputs,
+            preparation,
+            coordinator,
+            execution,
+            || cancellation.is_cancelled(),
+        ),
+        None => ledger
+            .compact_sealed_with_cancellation(inputs, preparation, || cancellation.is_cancelled()),
+    }
+    .map_err(LogStoreFailure::kernel)?;
     Ok(LogCompactionOutcome {
         bucket,
         input_segments: publication.input_segments(),

@@ -1361,7 +1361,9 @@ impl<'authority> Catalog<'authority> {
         }
         if let Err(failure) = result {
             if let Some(queued) = queued_reclamation {
-                queued.discard(publication.coordinator);
+                queued
+                    .discard(publication.coordinator)
+                    .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
             }
             return Err(failure);
         }

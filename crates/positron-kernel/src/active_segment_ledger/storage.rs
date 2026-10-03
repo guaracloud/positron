@@ -364,7 +364,7 @@ impl LedgerStorage {
         metadata: SegmentMetadata,
         protection: &SegmentProtectionKey,
         instance: InstanceId,
-    ) -> Result<(usize, usize), LedgerFailure> {
+    ) -> Result<Option<(usize, usize)>, LedgerFailure> {
         if metadata.state != SegmentState::Sealed {
             return Err(LedgerFailure::new(LedgerFailureCode::InvalidInput));
         }
@@ -404,9 +404,18 @@ impl LedgerStorage {
         {
             return Err(LedgerFailure::new(LedgerFailureCode::AuthenticationFailed));
         }
+        let file_bytes = file.metadata().map_err(map_io_error)?.len();
+        if !entry_exists(&self.sealed, &frontier_name(metadata.id))? {
+            let header_bytes = u64::try_from(decoded.encoded_bytes)
+                .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+            return if file_bytes == header_bytes {
+                Ok(None)
+            } else {
+                Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))
+            };
+        }
         let (durable_bytes, blocks) =
             authenticated_frontier_bounds(&self.sealed, metadata.id, &key)?;
-        let file_bytes = file.metadata().map_err(map_io_error)?.len();
         if file_bytes != durable_bytes {
             return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
         }
@@ -426,7 +435,7 @@ impl LedgerStorage {
                     .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?,
             )
             .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
-        Ok((total, blocks))
+        Ok(Some((total, blocks)))
     }
 
     pub(super) fn is_scope_metadata(&self, bytes: &[u8], scope: SegmentScope) -> bool {

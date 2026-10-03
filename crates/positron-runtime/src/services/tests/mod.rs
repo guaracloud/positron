@@ -8,6 +8,7 @@ use super::{
 };
 
 mod format_migration_compatibility;
+mod maintenance_compaction;
 mod schema_lifecycle_admission;
 mod schema_lifecycle_concurrency;
 mod schema_lifecycle_query;

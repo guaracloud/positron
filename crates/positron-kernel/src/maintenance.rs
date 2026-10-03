@@ -52,6 +52,16 @@ pub(crate) fn rewrite_durable_task_record_not_before_for_test(
     Ok(record::encode_record(&state)?.as_bytes().to_vec())
 }
 
+#[cfg(all(test, feature = "test-support"))]
+pub(crate) fn rewrite_durable_task_record_trigger_for_test(
+    bytes: &[u8],
+    trigger: MaintenanceTrigger,
+) -> Result<Vec<u8>, MaintenanceFailure> {
+    let mut state = record::decode_record(bytes)?;
+    state.task.trigger = trigger;
+    Ok(record::encode_record(&state)?.as_bytes().to_vec())
+}
+
 const MAX_MAINTENANCE_TASKS: usize = 128;
 pub(crate) const MAX_TASK_OBJECTS: usize = 16;
 pub(crate) const MAX_CHECKPOINT_BYTES: usize = 4_096;
@@ -211,6 +221,7 @@ struct CoordinatorState {
     pending_terminal_reclamations: BTreeSet<MaintenanceTaskId>,
     pending_task_transitions: BTreeSet<MaintenanceTaskId>,
     window: Option<MaintenanceWindow>,
+    clock_uncertain_durable_eligibility: BTreeSet<MaintenanceTaskId>,
     fairness: BTreeMap<(MaintenancePriority, MaintenanceScope), u64>,
     next_terminal_order: u64,
 }
@@ -273,8 +284,10 @@ fn validate_retention_reclamation_state(state: &TaskState) -> Result<(), Mainten
     let Some(first) = task.inputs.first() else {
         return Err(MaintenanceFailure::InvalidInput);
     };
-    if task.trigger != MaintenanceTrigger::AgeDerived
-        || task.inputs.len() > 16
+    if !matches!(
+        task.trigger,
+        MaintenanceTrigger::Event | MaintenanceTrigger::AgeDerived
+    ) || task.inputs.len() > 16
         || !task.outputs.is_empty()
         || task.not_before != 0
         || task.emergency_compaction
@@ -571,6 +584,7 @@ impl MaintenanceCoordinator {
                 pending_terminal_reclamations: BTreeSet::new(),
                 pending_task_transitions: BTreeSet::new(),
                 window: None,
+                clock_uncertain_durable_eligibility: BTreeSet::new(),
                 fairness: BTreeMap::new(),
                 next_terminal_order: 1,
             }),

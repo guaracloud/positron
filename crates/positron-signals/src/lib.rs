@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 mod log_store;
+mod maintenance;
 mod trace_store;
 
 pub use log_store::{
@@ -19,6 +20,7 @@ pub use log_store::{
     SchemaQuery, SchemaQueryResult, SchemaQueryUpdate, SchemaRepresentation, SchemaSessionStore,
     SchemaTraversalFailure, SchemaValue, StoredLogAttribute, StoredLogRecord, TextSearchCandidate,
 };
+pub use maintenance::MaintenanceCompactionExecution;
 pub use trace_store::{
     EvaluatedSpanObservationInput, LogicalSpan, LogicalTraceScanResult, PreparedTraceBlock,
     SamplingDecision, ScannedSpanObservation, SpanAttributeSet, SpanEvent, SpanKind, SpanLink,

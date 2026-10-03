@@ -11,6 +11,10 @@ use crate::{
     TenantQuota, TransactionId,
 };
 
+#[path = "tests/conflicts.rs"]
+mod conflicts;
+#[path = "tests/poison.rs"]
+mod poison;
 #[path = "tests/retention_publication.rs"]
 mod retention_publication;
 
@@ -447,7 +451,9 @@ fn prepared_running_lease_expiry_completion_blocks_cancellation_before_publicati
             .is_some(),
         "crash recovery drops the prepared transition reservation"
     );
-    completion.discard(&coordinator);
+    completion
+        .discard(&coordinator)
+        .expect("discard prepared completion");
     coordinator
         .cancel_and_persist(&catalog, identity)
         .expect("cancellation after discarded completion");
@@ -542,7 +548,9 @@ fn ordinary_submissions_never_evict_a_terminal_reserved_for_lease_publication()
         "persistent submission also preserves the lease draft's terminal"
     );
     assert!(coordinator.status(persisted.identity()).is_ok());
-    submission.discard(&coordinator);
+    submission
+        .discard(&coordinator)
+        .expect("discard lease submission");
     Ok(())
 }
 
@@ -579,51 +587,6 @@ fn submitted_work_is_visible_to_the_single_scheduler() {
     assert_eq!(
         coordinator.start_next(0, false).expect("scheduler runs"),
         Some(task)
-    );
-}
-
-#[test]
-fn conflicting_copy_on_write_work_waits_for_the_running_owner() {
-    let coordinator = MaintenanceCoordinator::new();
-    let input = MaintenanceObjectId::new([3; 32]).expect("object identity");
-    let first = task(
-        1,
-        MaintenanceTaskClass::SchemaStatistics,
-        MaintenanceTrigger::Event,
-        MaintenancePriority::Ordinary,
-        vec![input],
-    );
-    let second = task(
-        2,
-        MaintenanceTaskClass::RetentionPublication,
-        MaintenanceTrigger::Event,
-        MaintenancePriority::Required,
-        vec![input],
-    );
-    coordinator
-        .submit_at(first.clone(), 1)
-        .expect("first accepted");
-    coordinator
-        .submit_at(second.clone(), 2)
-        .expect("second accepted");
-
-    assert_eq!(
-        coordinator.start_next(3, false).expect("first starts"),
-        Some(second)
-    );
-    assert_eq!(
-        coordinator.start_next(4, false).expect("conflict waits"),
-        None
-    );
-    coordinator
-        .complete(
-            MaintenanceTaskId::new([2; 16]).expect("task identity"),
-            true,
-        )
-        .expect("complete");
-    assert_eq!(
-        coordinator.start_next(5, false).expect("unblocked"),
-        Some(first)
     );
 }
 

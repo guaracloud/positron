@@ -2,11 +2,13 @@ use std::collections::BTreeSet;
 
 use super::format::SegmentState;
 use super::publication::{RetentionPublication, publish_retention_with_tasks};
-use super::{ActiveSegmentLedger, LedgerFailure, LedgerFailureCode};
+use super::{
+    ActiveSegmentLedger, LedgerFailure, LedgerFailureCode, SegmentScope, retention_frontier,
+};
 use crate::maintenance::RetentionPublicationBinding;
 use crate::{
-    MaintenanceCoordinator, MaintenanceExecution, MaintenancePreconditions, MaintenanceScope,
-    MaintenanceTask, MaintenanceTaskClass, MaintenanceTaskId, MaintenanceTrigger,
+    CatalogSnapshot, MaintenanceCoordinator, MaintenanceExecution, MaintenancePreconditions,
+    MaintenanceScope, MaintenanceTask, MaintenanceTaskClass, MaintenanceTaskId, MaintenanceTrigger,
     RecoveryWorkClaim, RecoveryWorkKind, ResourceDimension, ResourceReservation,
 };
 
@@ -14,9 +16,67 @@ mod plan;
 mod proof;
 
 pub(super) use plan::metadata_binding;
+use plan::metadata_binding_from_metadata;
 use plan::{retention_publication_plan, task_bindings, task_identity};
 pub(super) use proof::retention_publication_claim;
 use proof::{durable_task_record, retention_publication_frontier_bound};
+
+/// Verifies that a legacy age-derived reclamation task is the exact successor
+/// of a completed Publication and that the same authenticated Catalog
+/// snapshot carries its retired metadata, retention frontier, and lifecycle
+/// anchor. The caller retains this as in-memory scheduling provenance only;
+/// it is not another durable task authority.
+pub(crate) fn reclamation_eligibility_is_durably_established(
+    snapshot: &CatalogSnapshot,
+    publication: &MaintenanceTask,
+    reclamation: &MaintenanceTask,
+    publication_checkpoint: Option<&crate::MaintenanceCheckpoint>,
+) -> Result<bool, LedgerFailure> {
+    if publication.class() != MaintenanceTaskClass::RetentionPublication
+        || reclamation.class() != MaintenanceTaskClass::RetentionReclamation
+        || publication.scope() != reclamation.scope()
+        || reclamation.inputs() != publication.outputs()
+    {
+        return Ok(false);
+    }
+    let scope = match publication.scope() {
+        MaintenanceScope::Segment {
+            tenant,
+            signal,
+            shard,
+        } => SegmentScope::new(tenant, signal, shard),
+        MaintenanceScope::System | MaintenanceScope::Tenant(_) => return Ok(false),
+    };
+    let expected_frontier =
+        crate::maintenance::retention_publication_frontier(publication_checkpoint)
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?;
+    if retention_frontier::recover(snapshot, scope)?
+        .is_none_or(|frontier| frontier < expected_frontier)
+    {
+        return Ok(false);
+    }
+    let mut anchor_seen = false;
+    let mut retired = BTreeSet::new();
+    for bytes in snapshot.plaintext_objects() {
+        if crate::retention_time::validate_catalog_anchor_singleton(bytes, &mut anchor_seen)
+            .is_err()
+        {
+            return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
+        }
+        let Some(metadata) = super::format::decode_metadata(bytes)? else {
+            continue;
+        };
+        if metadata.scope == scope && metadata.state == SegmentState::Retired {
+            retired.insert(metadata_binding_from_metadata(metadata)?);
+        }
+    }
+    let expected = reclamation
+        .inputs()
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    Ok(anchor_seen && !expected.is_empty() && retired == expected)
+}
 
 /// An admitted retention-publication descriptor. Its preparation reservation
 /// covers metadata planning and the one durable task submission, then drops
@@ -275,7 +335,7 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             reclamation_identity,
             MaintenanceTaskClass::RetentionReclamation,
             expected.scope(),
-            MaintenanceTrigger::AgeDerived,
+            MaintenanceTrigger::Event,
             expected.preconditions(),
             outputs.clone(),
             Vec::new(),
@@ -291,7 +351,9 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         let additional = match completion.catalog_objects() {
             Ok(objects) => objects,
             Err(_) => {
-                completion.discard(coordinator);
+                completion
+                    .discard(coordinator)
+                    .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
                 return Err(LedgerFailure::new(LedgerFailureCode::StaleGeneration));
             },
         };
@@ -313,7 +375,9 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         ) {
             Ok(snapshot) => snapshot,
             Err(failure) => {
-                completion.discard(coordinator);
+                completion
+                    .discard(coordinator)
+                    .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
                 return Err(failure);
             },
         };

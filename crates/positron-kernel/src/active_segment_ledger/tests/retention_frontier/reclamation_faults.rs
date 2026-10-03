@@ -158,7 +158,34 @@ fn uncertain_clock_reclamation_protects_existing_leases_but_reclaims_after_relea
     let reclamation_id =
         active.complete_running_retention_publication_task(&coordinator, &publication_execution)?;
     drop(publication_execution);
+    let basis = catalog.pin()?;
+    let mut records = Vec::new();
+    for bytes in basis.plaintext_objects() {
+        let identity = crate::maintenance::durable_task_record_identity(bytes)
+            .map_err(|failure| format!("durable record identity: {failure:?}"))?;
+        let bytes = if identity == Some(reclamation_id) {
+            crate::maintenance::rewrite_durable_task_record_trigger_for_test(
+                bytes,
+                crate::MaintenanceTrigger::AgeDerived,
+            )
+            .map_err(|failure| format!("rewrite legacy trigger: {failure:?}"))?
+        } else {
+            bytes.to_vec()
+        };
+        records.push(crate::CatalogObject::new(bytes)?);
+    }
+    catalog.commit(
+        basis.identity(),
+        crate::CatalogProposal::new(
+            crate::TransactionId::new([0xe7; 16])?,
+            crate::FormatEpoch::CATALOG_V1,
+            records,
+        )?,
+        None,
+    )?;
     drop(active);
+    let coordinator = MaintenanceCoordinator::restore_from_catalog(&catalog)
+        .map_err(|failure| format!("restore coordinator: {failure:?}"))?;
 
     let wall = Arc::new(Mutex::new(UnixNanoseconds::new(200_000_000_000)));
     let (uncertain_time, _) = RetentionTimeAuthority::establish_with_source_and_manual_elapsed(
@@ -177,9 +204,9 @@ fn uncertain_clock_reclamation_protects_existing_leases_but_reclaims_after_relea
         crate::LifecycleClockState::ClockUncertain
     );
     let protected_execution = coordinator
-        .start_next_with_reservation_and_persist(&catalog, &authority, 12, false)
-        .expect("protected dispatch admission")
-        .ok_or("protected dispatch")?;
+        .start_next_with_reservation_and_persist(&catalog, &authority, 12, true)
+        .expect("legacy durable dispatch admission")
+        .ok_or("a durably established legacy reclamation remains eligible")?;
     uncertain.complete_running_retention_reclamation_task(&coordinator, &protected_execution)?;
     assert_eq!(
         coordinator
@@ -192,7 +219,7 @@ fn uncertain_clock_reclamation_protects_existing_leases_but_reclaims_after_relea
     drop(protected_execution);
     uncertain.release_snapshot_lease(lease_identity)?;
     let eligible_execution = coordinator
-        .start_next_with_reservation_and_persist(&catalog, &authority, 12, false)
+        .start_next_with_reservation_and_persist(&catalog, &authority, 12, true)
         .expect("eligible dispatch admission")
         .ok_or("eligible dispatch")?;
     uncertain.complete_running_retention_reclamation_task(&coordinator, &eligible_execution)?;

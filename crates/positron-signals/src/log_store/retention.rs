@@ -62,6 +62,10 @@ impl LogRetentionPolicy {
 pub struct LogRetentionBucket(positron_kernel::RetentionBucket);
 
 impl LogRetentionBucket {
+    pub(super) const fn from_kernel(bucket: positron_kernel::RetentionBucket) -> Self {
+        Self(bucket)
+    }
+
     #[must_use]
     pub const fn tenant(self) -> TenantId {
         self.0.tenant()

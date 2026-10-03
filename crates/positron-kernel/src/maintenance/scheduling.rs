@@ -39,7 +39,8 @@ pub(super) fn eligible_task_ids(
             && matches!(
                 task.task.trigger,
                 MaintenanceTrigger::AgeDerived | MaintenanceTrigger::Scheduled
-            );
+            )
+            && !state.clock_uncertain_durable_eligibility.contains(identity);
         let window_blocks = state.window.as_ref().is_some_and(|window| {
             window.deferred.contains(&task.task.class)
                 && task
@@ -263,15 +264,15 @@ pub(super) fn remove_task_and_clear_empty_scope(
 }
 
 fn tasks_conflict(left: &MaintenanceTask, right: &MaintenanceTask) -> bool {
-    if !scopes_overlap(left.scope, right.scope) {
-        return false;
-    }
-    left.inputs.iter().any(|object| {
+    let object_conflict = left.inputs.iter().any(|object| {
         right.inputs.binary_search(object).is_ok() || right.outputs.binary_search(object).is_ok()
     }) || left.outputs.iter().any(|object| {
         right.inputs.binary_search(object).is_ok() || right.outputs.binary_search(object).is_ok()
-    }) || matches!(left.class, MaintenanceTaskClass::TenantPurge)
-        || matches!(right.class, MaintenanceTaskClass::TenantPurge)
+    });
+    object_conflict
+        || (scopes_overlap(left.scope, right.scope)
+            && (matches!(left.class, MaintenanceTaskClass::TenantPurge)
+                || matches!(right.class, MaintenanceTaskClass::TenantPurge)))
 }
 
 fn scopes_overlap(left: MaintenanceScope, right: MaintenanceScope) -> bool {

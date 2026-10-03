@@ -71,38 +71,13 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         {
             return Err(LedgerFailure::new(LedgerFailureCode::PhysicalScopeMismatch));
         }
-        let mut inputs = Vec::new();
-        inputs
-            .try_reserve_exact(crate::maintenance::MAX_TASK_OBJECTS)
-            .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
         let metadata = self.storage.catalog_segments(&basis, self.scope)?;
-        let mut source_bytes = 0_usize;
-        let mut source_blocks = 0_usize;
-        for source in metadata
-            .iter()
-            .filter(|candidate| candidate.state == SegmentState::Sealed)
-        {
-            inputs.push(super::retention_publication::metadata_binding(
-                &self.storage,
-                *source,
-            )?);
-            let (bytes, blocks) = self.storage.sealed_compaction_source_bound(
-                *source,
-                &self.protection,
-                self.catalog.instance(),
-            )?;
-            source_bytes = source_bytes
-                .checked_add(bytes)
-                .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
-            source_blocks = source_blocks
-                .checked_add(blocks)
-                .filter(|count| *count <= MAX_COMPACTION_BLOCKS)
-                .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
-        }
-        inputs.sort_unstable();
-        if inputs.is_empty() || inputs.len() > crate::maintenance::MAX_TASK_OBJECTS {
-            return Err(LedgerFailure::new(LedgerFailureCode::LimitExceeded));
-        }
+        let (inputs, source_bytes, source_blocks) = compaction_source_manifest_and_bounds(
+            &self.storage,
+            &metadata,
+            &self.protection,
+            self.catalog.instance(),
+        )?;
         let scope = crate::MaintenanceScope::segment(
             self.scope.tenant_id(),
             self.scope.signal_kind(),
@@ -177,7 +152,12 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         let basis = self.catalog.pin()?;
         let policy = basis.retention_policy(self.scope.signal_kind())?;
         let metadata = self.storage.catalog_segments(&basis, self.scope)?;
-        let inputs = compaction_source_manifest(&self.storage, &metadata)?;
+        let (inputs, source_bytes, source_blocks) = compaction_source_manifest_and_bounds(
+            &self.storage,
+            &metadata,
+            &self.protection,
+            self.catalog.instance(),
+        )?;
         if binding.scope()
             != crate::MaintenanceScope::segment(
                 self.scope.tenant_id(),
@@ -190,25 +170,6 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         {
             return Err(LedgerFailure::new(LedgerFailureCode::StaleGeneration));
         }
-        let (source_bytes, source_blocks) = metadata
-            .iter()
-            .filter(|source| source.state == SegmentState::Sealed)
-            .try_fold((0_usize, 0_usize), |(bytes, blocks), source| {
-                let (next_bytes, next_blocks) = self.storage.sealed_compaction_source_bound(
-                    *source,
-                    &self.protection,
-                    self.catalog.instance(),
-                )?;
-                Ok::<_, LedgerFailure>((
-                    bytes
-                        .checked_add(next_bytes)
-                        .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?,
-                    blocks
-                        .checked_add(next_blocks)
-                        .filter(|count| *count <= MAX_COMPACTION_BLOCKS)
-                        .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?,
-                ))
-            })?;
         let task_record_working_bytes =
             crate::maintenance::compaction_task_record_working_bytes(inputs.len(), binding)
                 .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
@@ -538,7 +499,12 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             ));
         }
         let metadata = self.storage.catalog_segments(&basis, self.scope)?;
-        let manifest = compaction_source_manifest(&self.storage, &metadata)?;
+        let (manifest, _, _) = compaction_source_manifest_and_bounds(
+            &self.storage,
+            &metadata,
+            &self.protection,
+            self.catalog.instance(),
+        )?;
         if execution.task().inputs() != manifest
             || binding.source_digest() != maintenance_source_manifest_digest(self.scope, &manifest)?
         {
@@ -635,7 +601,9 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
                 if failure.completion_state()
                     == super::LedgerCompletionState::RejectedBeforeMutation
                 {
-                    completion.discard(coordinator);
+                    completion
+                        .discard(coordinator)
+                        .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
                 }
                 Err(failure)
             },
@@ -1055,27 +1023,43 @@ fn maintenance_source_manifest_digest(
     Ok(digest.finalize().into())
 }
 
-fn compaction_source_manifest(
+fn compaction_source_manifest_and_bounds(
     storage: &super::LedgerStorage,
     metadata: &[SegmentMetadata],
-) -> Result<Vec<crate::MaintenanceObjectId>, LedgerFailure> {
+    protection: &super::SegmentProtectionKey,
+    instance: crate::InstanceId,
+) -> Result<(Vec<crate::MaintenanceObjectId>, usize, usize), LedgerFailure> {
     let mut inputs = Vec::new();
     inputs
         .try_reserve_exact(crate::maintenance::MAX_TASK_OBJECTS)
         .map_err(|_| LedgerFailure::new(LedgerFailureCode::ResourceAdmissionRefused))?;
+    let mut source_bytes = 0_usize;
+    let mut source_blocks = 0_usize;
     for source in metadata
         .iter()
         .filter(|candidate| candidate.state == SegmentState::Sealed)
     {
+        let Some((bytes, blocks)) =
+            storage.sealed_compaction_source_bound(*source, protection, instance)?
+        else {
+            continue;
+        };
         inputs.push(super::retention_publication::metadata_binding(
             storage, *source,
         )?);
+        source_bytes = source_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+        source_blocks = source_blocks
+            .checked_add(blocks)
+            .filter(|count| *count <= MAX_COMPACTION_BLOCKS)
+            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
     }
     inputs.sort_unstable();
     if inputs.is_empty() || inputs.len() > crate::maintenance::MAX_TASK_OBJECTS {
         return Err(LedgerFailure::new(LedgerFailureCode::LimitExceeded));
     }
-    Ok(inputs)
+    Ok((inputs, source_bytes, source_blocks))
 }
 
 fn contiguous_runs(blocks: &[CompactionBlock]) -> Result<Vec<Vec<CompactionBlock>>, LedgerFailure> {

@@ -39,6 +39,46 @@ pub(super) fn compact<'kernel, 'catalog>(
     cancellation: &dyn crate::ScanCancellation,
     observer: &dyn crate::ScanObserver,
 ) -> Result<TraceCompactionOutcome, TraceStoreFailure> {
+    compact_inner(ledger, tenant, policy, bucket, cancellation, observer, None)
+}
+
+pub(super) fn compact_with_maintenance<'kernel, 'catalog>(
+    ledger: &ActiveSegmentLedger<'kernel, 'catalog>,
+    tenant: TenantId,
+    policy: TraceRetentionPolicy,
+    execution: &crate::MaintenanceCompactionExecution<'_, 'kernel>,
+) -> Result<TraceCompactionOutcome, TraceStoreFailure> {
+    let binding =
+        positron_kernel::CompactionBinding::from_checkpoint(execution.task().task_checkpoint())
+            .map_err(|_| TraceStoreFailure::stale_generation())?;
+    let bucket = TraceRetentionBucket::from_kernel(
+        binding
+            .bucket()
+            .map_err(|_| TraceStoreFailure::stale_generation())?,
+    );
+    compact_inner(
+        ledger,
+        tenant,
+        policy,
+        bucket,
+        execution.cancellation(),
+        execution.observer(),
+        Some((execution.coordinator(), execution.task())),
+    )
+}
+
+fn compact_inner<'kernel, 'catalog>(
+    ledger: &ActiveSegmentLedger<'kernel, 'catalog>,
+    tenant: TenantId,
+    policy: TraceRetentionPolicy,
+    bucket: TraceRetentionBucket,
+    cancellation: &dyn crate::ScanCancellation,
+    observer: &dyn crate::ScanObserver,
+    maintenance: Option<(
+        &positron_kernel::MaintenanceCoordinator,
+        &positron_kernel::MaintenanceExecution<'_>,
+    )>,
+) -> Result<TraceCompactionOutcome, TraceStoreFailure> {
     if ledger.scope().tenant_id() != tenant
         || ledger.scope().signal_kind() != SignalKind::Traces
         || bucket.tenant() != tenant
@@ -61,9 +101,13 @@ pub(super) fn compact<'kernel, 'catalog>(
         .active_segment_id()
         .map_err(TraceStoreFailure::kernel)?;
     let snapshot = ledger.snapshot().map_err(TraceStoreFailure::kernel)?;
-    let preparation = ledger
-        .prepare_compaction_with_policy(&snapshot, policy.kernel_policy())
-        .map_err(TraceStoreFailure::kernel)?;
+    let preparation = match maintenance {
+        Some((_, execution)) => {
+            ledger.prepare_compaction_payload_for_maintenance(&snapshot, execution)
+        },
+        None => ledger.prepare_compaction_with_policy(&snapshot, policy.kernel_policy()),
+    }
+    .map_err(TraceStoreFailure::kernel)?;
     let mut inputs = Vec::new();
     inputs
         .try_reserve_exact(snapshot.blocks().len())
@@ -150,9 +194,18 @@ pub(super) fn compact<'kernel, 'catalog>(
         });
     }
     let input_blocks = inputs.len();
-    let published = ledger
-        .compact_sealed_with_cancellation(inputs, preparation, || cancellation.is_cancelled())
-        .map_err(TraceStoreFailure::kernel)?;
+    let published = match maintenance {
+        Some((coordinator, execution)) => ledger.compact_sealed_with_maintenance(
+            inputs,
+            preparation,
+            coordinator,
+            execution,
+            || cancellation.is_cancelled(),
+        ),
+        None => ledger
+            .compact_sealed_with_cancellation(inputs, preparation, || cancellation.is_cancelled()),
+    }
+    .map_err(TraceStoreFailure::kernel)?;
     Ok(TraceCompactionOutcome {
         bucket,
         input_segments: published.input_segments(),

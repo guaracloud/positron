@@ -2,6 +2,7 @@
 
 use positron_domain::identity::TenantId;
 use positron_domain::routing::{SignalKind, VirtualShardId};
+use positron_domain::time::UnixNanoseconds;
 
 use super::{MaintenanceCheckpoint, MaintenanceFailure, MaintenanceScope};
 use crate::CatalogLogRetentionPolicy;
@@ -107,6 +108,21 @@ impl CompactionBinding {
         ingest_time.retention_authenticated()
             && ingest_time.instant().value() >= self.bucket_start
             && ingest_time.instant().value() < self.bucket_end_exclusive
+    }
+
+    pub fn bucket(self) -> Result<crate::RetentionBucket, MaintenanceFailure> {
+        let MaintenanceScope::Segment { tenant, signal, .. } = self.scope else {
+            return Err(MaintenanceFailure::InvalidInput);
+        };
+        crate::RetentionBucket::from_bounds(
+            tenant,
+            signal,
+            UnixNanoseconds::new(self.bucket_start),
+            UnixNanoseconds::new(self.bucket_end_exclusive),
+            std::num::NonZeroU64::new(self.retention_seconds)
+                .ok_or(MaintenanceFailure::InvalidInput)?,
+        )
+        .map_err(|_| MaintenanceFailure::InvalidInput)
     }
 
     pub fn checkpoint(self) -> Result<MaintenanceCheckpoint, MaintenanceFailure> {

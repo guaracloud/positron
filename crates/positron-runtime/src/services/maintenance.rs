@@ -1,13 +1,18 @@
 //! Runtime composition of the Catalog-backed maintenance coordinator.
 
 use std::{
-    sync::{Arc, Condvar, Mutex},
+    sync::{Arc, Condvar, Mutex, MutexGuard},
     time::Duration,
 };
 
 use positron_kernel::{
     ActiveSegmentLedger, Catalog, MaintenanceCoordinator, MaintenanceExecution, MaintenanceFailure,
     MaintenanceScope, MaintenanceTaskClass, SegmentScope, SnapshotLeaseId,
+};
+use positron_signals::{
+    LogRetentionPolicy, LogStore, LogStoreFailureCode, MaintenanceCompactionExecution,
+    ScanObservationFailureCode, ScanObserver, TraceRetentionPolicy, TraceStore,
+    TraceStoreFailureCode,
 };
 
 use super::{ServiceFailure, classify_catalog_failure_code};
@@ -30,33 +35,39 @@ impl MaintenanceWake {
     }
 
     pub(super) fn notify(&self) {
-        let (generation, signal) = &*self.state;
-        if let Ok(mut generation) = generation.lock() {
-            *generation = generation.saturating_add(1);
-            signal.notify_one();
-        }
+        let (_, signal) = &*self.state;
+        let mut generation = self.lock_generation();
+        *generation = generation.saturating_add(1);
+        signal.notify_one();
     }
 
     pub(super) fn generation(&self) -> u64 {
-        self.state.0.lock().map_or(0, |generation| *generation)
+        *self.lock_generation()
     }
 
     fn wait(&self, observed: &mut u64, delay: Duration) {
-        let (generation, signal) = &*self.state;
-        let Ok(current) = generation.lock() else {
-            return;
-        };
+        let (_, signal) = &*self.state;
+        let current = self.lock_generation();
         if *current != *observed {
             *observed = *current;
             return;
         }
-        if let Ok((current, _)) = signal.wait_timeout(current, delay) {
-            *observed = *current;
-        }
+        let (current, _) = match signal.wait_timeout(current, delay) {
+            Ok(result) => result,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *observed = *current;
     }
 
     fn idle_delay(&self) -> Duration {
         self.idle_delay
+    }
+
+    fn lock_generation(&self) -> MutexGuard<'_, u64> {
+        match self.state.0.lock() {
+            Ok(generation) => generation,
+            Err(poisoned) => poisoned.into_inner(),
+        }
     }
 }
 
@@ -81,6 +92,7 @@ pub(super) fn restore(instance: &crate::InitializedInstance) -> Result<(), Servi
 }
 
 const INSTALLED_TASK_CLASSES: &[MaintenanceTaskClass] = &[
+    MaintenanceTaskClass::Compaction,
     MaintenanceTaskClass::SnapshotLeaseExpiry,
     MaintenanceTaskClass::RetentionPublication,
     MaintenanceTaskClass::RetentionReclamation,
@@ -110,6 +122,10 @@ pub(super) fn wake_runtime_maintenance(
 }
 
 enum InstalledMaintenanceExecution<'authority> {
+    Compaction {
+        execution: MaintenanceExecution<'authority>,
+        scope: SegmentScope,
+    },
     GovernanceAuditCheckpoint {
         execution: MaintenanceExecution<'authority>,
     },
@@ -180,6 +196,10 @@ fn start_installed_maintenance<'authority>(
         return Err(ServiceFailure::Cancelled);
     }
     let execution = match execution.task().class() {
+        MaintenanceTaskClass::Compaction => {
+            let scope = scope_for_segment_task(execution.task().scope())?;
+            InstalledMaintenanceExecution::Compaction { execution, scope }
+        },
         MaintenanceTaskClass::GovernanceAuditCheckpoint => {
             InstalledMaintenanceExecution::GovernanceAuditCheckpoint { execution }
         },
@@ -255,7 +275,8 @@ fn complete_installed_maintenance(
         .lock()
         .map_err(|_| ServiceFailure::Internal)?;
     let scope = match execution {
-        InstalledMaintenanceExecution::SnapshotLeaseExpiry { scope, .. }
+        InstalledMaintenanceExecution::Compaction { scope, .. }
+        | InstalledMaintenanceExecution::SnapshotLeaseExpiry { scope, .. }
         | InstalledMaintenanceExecution::RetentionPublication { scope, .. }
         | InstalledMaintenanceExecution::RetentionReclamation { scope, .. } => *scope,
         InstalledMaintenanceExecution::GovernanceAuditCheckpoint { .. }
@@ -279,7 +300,8 @@ fn complete_installed_maintenance(
                 key,
             )
         },
-        InstalledMaintenanceExecution::RetentionPublication { .. }
+        InstalledMaintenanceExecution::Compaction { .. }
+        | InstalledMaintenanceExecution::RetentionPublication { .. }
         | InstalledMaintenanceExecution::RetentionReclamation { .. } => {
             ActiveSegmentLedger::open_for_maintenance_with_retention_time(
                 &instance._authority,
@@ -297,7 +319,36 @@ fn complete_installed_maintenance(
         },
     }
     .map_err(|failure| super::classify_ledger_failure_code(failure.code()))?;
+    if let InstalledMaintenanceExecution::Compaction { execution, scope } = execution {
+        let observer = MaintenanceScanObserver;
+        let uncancelled = UncancelledMaintenance;
+        let cancellation: &dyn positron_signals::ScanCancellation = cancellation
+            .map(|current| current as &dyn positron_signals::ScanCancellation)
+            .unwrap_or(&uncancelled);
+        let maintenance =
+            MaintenanceCompactionExecution::new(&coordinator, execution, cancellation, &observer);
+        match scope.signal_kind() {
+            positron_domain::routing::SignalKind::Logs => {
+                let policy = LogRetentionPolicy::from_catalog(&snapshot)
+                    .map_err(map_log_compaction_failure)?;
+                LogStore::new()
+                    .compact_with_maintenance(&ledger, scope.tenant_id(), policy, &maintenance)
+                    .map(|_| ())
+                    .map_err(map_log_compaction_failure)
+            },
+            positron_domain::routing::SignalKind::Traces => {
+                let policy = TraceRetentionPolicy::from_catalog(&snapshot)
+                    .map_err(map_trace_compaction_failure)?;
+                TraceStore::new()
+                    .compact_with_maintenance(&ledger, scope.tenant_id(), policy, &maintenance)
+                    .map(|_| ())
+                    .map_err(map_trace_compaction_failure)
+            },
+        }?;
+        return Ok(true);
+    }
     let completed = match execution {
+        InstalledMaintenanceExecution::Compaction { .. } => return Err(ServiceFailure::Internal),
         InstalledMaintenanceExecution::SnapshotLeaseExpiry {
             execution,
             identity,
@@ -320,6 +371,76 @@ fn complete_installed_maintenance(
         return Err(super::classify_ledger_failure_code(failure.code()));
     }
     Ok(true)
+}
+
+struct UncancelledMaintenance;
+
+impl positron_signals::ScanCancellation for UncancelledMaintenance {
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+}
+
+struct MaintenanceScanObserver;
+
+impl ScanObserver for MaintenanceScanObserver {
+    fn observe_work(&self, _units: u64) -> Result<(), ScanObservationFailureCode> {
+        Ok(())
+    }
+}
+
+fn map_log_compaction_failure(failure: positron_signals::LogStoreFailure) -> ServiceFailure {
+    match failure.code() {
+        LogStoreFailureCode::ResourceExhausted
+        | LogStoreFailureCode::ResourceAdmissionRefused
+        | LogStoreFailureCode::StorageExhausted
+        | LogStoreFailureCode::LimitExceeded
+        | LogStoreFailureCode::BudgetExhausted => ServiceFailure::CapacityUnavailable,
+        LogStoreFailureCode::StorageUnavailable => ServiceFailure::StorageUnavailable,
+        LogStoreFailureCode::Cancelled => ServiceFailure::Cancelled,
+        LogStoreFailureCode::StaleGeneration
+        | LogStoreFailureCode::ConcurrentWriter
+        | LogStoreFailureCode::IdempotencyConflict
+        | LogStoreFailureCode::SnapshotExpired
+        | LogStoreFailureCode::ClockUnavailable
+        | LogStoreFailureCode::ClockUncertain => ServiceFailure::CatalogUnavailable,
+        LogStoreFailureCode::InvalidInput
+        | LogStoreFailureCode::MalformedBlock
+        | LogStoreFailureCode::PhysicalScopeMismatch
+        | LogStoreFailureCode::IntegrityCorruption
+        | LogStoreFailureCode::AuthenticationFailed
+        | LogStoreFailureCode::UnsupportedFormat
+        | LogStoreFailureCode::RecoveryRequired
+        | LogStoreFailureCode::StaleResumeMarker => ServiceFailure::CorruptState,
+        LogStoreFailureCode::Internal => ServiceFailure::Internal,
+    }
+}
+
+fn map_trace_compaction_failure(failure: positron_signals::TraceStoreFailure) -> ServiceFailure {
+    match failure.code() {
+        TraceStoreFailureCode::ResourceExhausted
+        | TraceStoreFailureCode::ResourceAdmissionRefused
+        | TraceStoreFailureCode::StorageExhausted
+        | TraceStoreFailureCode::LimitExceeded
+        | TraceStoreFailureCode::BudgetExhausted => ServiceFailure::CapacityUnavailable,
+        TraceStoreFailureCode::StorageUnavailable => ServiceFailure::StorageUnavailable,
+        TraceStoreFailureCode::Cancelled => ServiceFailure::Cancelled,
+        TraceStoreFailureCode::StaleGeneration
+        | TraceStoreFailureCode::ConcurrentWriter
+        | TraceStoreFailureCode::IdempotencyConflict
+        | TraceStoreFailureCode::SnapshotExpired
+        | TraceStoreFailureCode::ClockUnavailable
+        | TraceStoreFailureCode::ClockUncertain => ServiceFailure::CatalogUnavailable,
+        TraceStoreFailureCode::InvalidInput
+        | TraceStoreFailureCode::MalformedBlock
+        | TraceStoreFailureCode::PhysicalScopeMismatch
+        | TraceStoreFailureCode::IntegrityCorruption
+        | TraceStoreFailureCode::AuthenticationFailed
+        | TraceStoreFailureCode::UnsupportedFormat
+        | TraceStoreFailureCode::RecoveryRequired
+        | TraceStoreFailureCode::StaleResumeMarker => ServiceFailure::CorruptState,
+        TraceStoreFailureCode::Internal => ServiceFailure::Internal,
+    }
 }
 
 fn discover_retention_publications(
@@ -506,5 +627,30 @@ fn map_failure(failure: MaintenanceFailure) -> ServiceFailure {
         | MaintenanceFailure::InvalidTransition
         | MaintenanceFailure::PreconditionFailed
         | MaintenanceFailure::Paused => ServiceFailure::Internal,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn poisoned_wake_preserves_the_next_runtime_notification() {
+        let wake = MaintenanceWake::for_instance(
+            positron_kernel::InstanceId::new([7; 16]).expect("instance"),
+        );
+        let state = Arc::clone(&wake.state);
+        let _ = std::panic::catch_unwind(move || {
+            let (generation, _) = &*state;
+            let _guard = generation.lock().expect("wake lock");
+            panic!("poison the wake lock");
+        });
+
+        wake.notify();
+        assert_eq!(
+            wake.generation(),
+            1,
+            "a poisoned wake cannot discard runtime work"
+        );
     }
 }

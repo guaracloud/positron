@@ -286,7 +286,9 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
                     Ok(cancellation) => cancellation,
                     Err(failure) => {
                         for cancellation in &expiry_cancellations {
-                            cancellation.discard(coordinator);
+                            cancellation.discard(coordinator).map_err(|_| {
+                                LedgerFailure::new(LedgerFailureCode::ConcurrentWriter)
+                            })?;
                         }
                         return Err(failure);
                     },
@@ -322,7 +324,9 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             Err(failure) => {
                 if let Some(coordinator) = coordinator {
                     for cancellation in &expiry_cancellations {
-                        cancellation.discard(coordinator);
+                        cancellation
+                            .discard(coordinator)
+                            .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
                     }
                 }
                 return Err(failure);
@@ -368,15 +372,17 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         })();
         if let Err(failure) = publication {
             if let Some(submission) = expiry_submission {
-                submission.discard(
-                    coordinator.ok_or_else(|| {
+                submission
+                    .discard(coordinator.ok_or_else(|| {
                         LedgerFailure::new(LedgerFailureCode::IntegrityCorruption)
-                    })?,
-                );
+                    })?)
+                    .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
             }
             if let Some(coordinator) = coordinator {
                 for cancellation in &expiry_cancellations {
-                    cancellation.discard(coordinator);
+                    cancellation
+                        .discard(coordinator)
+                        .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
                 }
             }
             if failure.completion_state() != LedgerCompletionState::CommitAmbiguous {
@@ -719,7 +725,9 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         let cancellation_object = match cancellation.catalog_object() {
             Ok(object) => object,
             Err(_) => {
-                cancellation.discard(coordinator);
+                cancellation
+                    .discard(coordinator)
+                    .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
                 return Err(LedgerFailure::new(LedgerFailureCode::StaleGeneration));
             },
         };
@@ -731,7 +739,9 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             cancellation_object,
         );
         if let Err(failure) = publication {
-            cancellation.discard(coordinator);
+            cancellation
+                .discard(coordinator)
+                .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
             return Err(failure);
         }
         cancellation
@@ -837,7 +847,9 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
         let terminal_object = match terminal.catalog_object() {
             Ok(object) => object,
             Err(_) => {
-                terminal.discard(coordinator);
+                terminal
+                    .discard(coordinator)
+                    .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
                 return Err(LedgerFailure::new(LedgerFailureCode::StaleGeneration));
             },
         };
@@ -848,7 +860,9 @@ impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
             task,
             terminal_object,
         ) {
-            terminal.discard(coordinator);
+            terminal
+                .discard(coordinator)
+                .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
             return Err(failure);
         }
         terminal

@@ -108,11 +108,17 @@ pub(super) fn task_bindings(
 }
 
 pub(in crate::active_segment_ledger) fn metadata_binding(
-    storage: &super::super::LedgerStorage,
+    _storage: &super::super::LedgerStorage,
+    metadata: super::super::format::SegmentMetadata,
+) -> Result<MaintenanceObjectId, LedgerFailure> {
+    metadata_binding_from_metadata(metadata)
+}
+
+pub(in crate::active_segment_ledger) fn metadata_binding_from_metadata(
     metadata: super::super::format::SegmentMetadata,
 ) -> Result<MaintenanceObjectId, LedgerFailure> {
     MaintenanceObjectId::new(
-        CatalogObject::new(storage.metadata_object(metadata))?
+        CatalogObject::new(super::super::format::encode_metadata(metadata))?
             .identity()
             .to_bytes(),
     )

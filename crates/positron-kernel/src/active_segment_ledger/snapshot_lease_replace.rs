@@ -212,7 +212,9 @@ impl<'lease, 'kernel, 'catalog> SnapshotLeaseReplacement<'lease, 'kernel, 'catal
         {
             Ok(submission) => submission,
             Err(failure) => {
-                cancellation.discard(coordinator);
+                cancellation
+                    .discard(coordinator)
+                    .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
                 return Err(failure);
             },
         };
@@ -220,15 +222,23 @@ impl<'lease, 'kernel, 'catalog> SnapshotLeaseReplacement<'lease, 'kernel, 'catal
         let transaction = LeaseReservationTransaction::begin(&mut state, self.old_identity)?;
         if let Err(failure) = transaction.resize(&mut state, amounts) {
             transaction.cancel(&mut state);
-            submission.discard(coordinator);
-            cancellation.discard(coordinator);
+            submission
+                .discard(coordinator)
+                .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
+            cancellation
+                .discard(coordinator)
+                .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
             return Err(failure);
         }
         let cancellation_object = match cancellation.catalog_object() {
             Ok(object) => object,
             Err(_) => {
-                submission.discard(coordinator);
-                cancellation.discard(coordinator);
+                submission
+                    .discard(coordinator)
+                    .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
+                cancellation
+                    .discard(coordinator)
+                    .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
                 return Err(rollback_after_replacement_failure(
                     &mut state,
                     transaction,
@@ -239,8 +249,12 @@ impl<'lease, 'kernel, 'catalog> SnapshotLeaseReplacement<'lease, 'kernel, 'catal
         let submission_object = match submission.catalog_object() {
             Ok(object) => object,
             Err(_) => {
-                submission.discard(coordinator);
-                cancellation.discard(coordinator);
+                submission
+                    .discard(coordinator)
+                    .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
+                cancellation
+                    .discard(coordinator)
+                    .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
                 return Err(rollback_after_replacement_failure(
                     &mut state,
                     transaction,
@@ -258,8 +272,12 @@ impl<'lease, 'kernel, 'catalog> SnapshotLeaseReplacement<'lease, 'kernel, 'catal
             submission_object,
         );
         if let Err(failure) = publication {
-            submission.discard(coordinator);
-            cancellation.discard(coordinator);
+            submission
+                .discard(coordinator)
+                .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
+            cancellation
+                .discard(coordinator)
+                .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
             return Err(rollback_after_replacement_failure(
                 &mut state,
                 transaction,

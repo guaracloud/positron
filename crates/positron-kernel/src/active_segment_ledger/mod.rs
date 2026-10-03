@@ -57,6 +57,7 @@ use protection::{map_frame_failure, object_context};
 use publication::{fresh_metadata, publish_segments};
 pub use reader::CommittedLedgerReader;
 use reconstruction::reconstruct;
+pub(crate) use retention_publication::reclamation_eligibility_is_durably_established;
 pub use snapshot_lease_attempt::SnapshotLeaseAttempt;
 pub use snapshot_lease_grant::SnapshotLeaseGrant;
 pub use snapshot_lease_record::{

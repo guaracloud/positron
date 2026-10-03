@@ -138,7 +138,7 @@ fn retention_reclamation_task(identity: u8) -> MaintenanceTask {
         MaintenanceTaskId::new(successor).expect("reclamation identity"),
         MaintenanceTaskClass::RetentionReclamation,
         publication.scope(),
-        MaintenanceTrigger::AgeDerived,
+        MaintenanceTrigger::Event,
         publication.preconditions(),
         publication.outputs().to_vec(),
         Vec::new(),
@@ -174,6 +174,21 @@ fn restore_rejects_noncanonical_reclamation_descriptors() {
         .expect("restored Reclamation");
     assert_eq!(status.phase(), MaintenanceTaskPhase::Queued);
     assert!(status.checkpoint().is_none());
+    let legacy = MaintenanceTask {
+        trigger: MaintenanceTrigger::AgeDerived,
+        ..task.clone()
+    };
+    assert_eq!(
+        MaintenanceCoordinator::restore([
+            encode_record(&queued_reclamation_state(legacy.clone())).expect("legacy queued record"),
+        ])
+        .expect("legacy descriptor restores")
+        .status(legacy.identity())
+        .expect("legacy reclamation")
+        .phase(),
+        MaintenanceTaskPhase::Queued,
+        "the unchanged durable record format retains legacy age-derived work conservatively"
+    );
     let tenant = TenantId::from_bytes([0x74; 16]).expect("tenant");
     let binding = MaintenanceObjectId::new([0x82; 32]).expect("output binding");
     let cases = [
@@ -202,16 +217,6 @@ fn restore_rejects_noncanonical_reclamation_descriptors() {
             TaskState {
                 task: MaintenanceTask {
                     scope: MaintenanceScope::Tenant(tenant),
-                    ..task.clone()
-                },
-                ..queued_reclamation_state(task.clone())
-            },
-        ),
-        (
-            "event trigger",
-            TaskState {
-                task: MaintenanceTask {
-                    trigger: MaintenanceTrigger::Event,
                     ..task.clone()
                 },
                 ..queued_reclamation_state(task.clone())
@@ -272,6 +277,27 @@ fn restore_rejects_noncanonical_reclamation_descriptors() {
             Ok(_) => panic!("{case} must fail restore"),
         }
     }
+}
+
+#[test]
+fn uncertain_clock_keeps_an_unpaired_legacy_reclamation_queued() {
+    let task = MaintenanceTask {
+        trigger: MaintenanceTrigger::AgeDerived,
+        ..retention_reclamation_task(0x8f)
+    };
+    let coordinator =
+        MaintenanceCoordinator::restore([
+            encode_record(&queued_reclamation_state(task)).expect("legacy queued record")
+        ])
+        .expect("an authenticated but unpaired legacy descriptor restores conservatively");
+    let (authority, _) = authority();
+    assert!(
+        coordinator
+            .start_next_with_reservation(&authority, 2, true)
+            .expect("unpaired scheduling check")
+            .is_none(),
+        "ClockUncertain must not turn an age-derived label into fresh destructive eligibility"
+    );
 }
 
 #[test]
@@ -566,7 +592,7 @@ fn retention_publication_completion_refuses_a_full_registry_without_corrupting_r
         MaintenanceTaskId::new([0x83; 16]).expect("reclamation identity"),
         MaintenanceTaskClass::RetentionReclamation,
         scope,
-        MaintenanceTrigger::AgeDerived,
+        MaintenanceTrigger::Event,
         publication.preconditions(),
         publication.outputs().to_vec(),
         Vec::new(),
@@ -656,7 +682,9 @@ fn retention_publication_completion_refuses_a_full_registry_without_corrupting_r
     ) {
         Err(error) => assert_eq!(error, MaintenanceFailure::CapacityExceeded),
         Ok(completion) => {
-            completion.discard(&coordinator);
+            completion
+                .discard(&coordinator)
+                .expect("discard speculative completion");
             panic!("a terminal publication plus queued reclamation cannot exceed 128 tasks");
         },
     }
@@ -734,7 +762,9 @@ fn retention_publication_refuses_a_successor_with_nonpublication_bindings() {
     ) {
         Err(error) => assert_eq!(error, MaintenanceFailure::PreconditionFailed),
         Ok(completion) => {
-            completion.discard(&coordinator);
+            completion
+                .discard(&coordinator)
+                .expect("discard malformed successor completion");
             panic!("reclamation must consume exactly the publication outputs");
         },
     }

@@ -86,6 +86,35 @@ pub struct RetentionBucket {
 }
 
 impl RetentionBucket {
+    pub(crate) fn from_bounds(
+        tenant: TenantId,
+        signal: SignalKind,
+        start: UnixNanoseconds,
+        end_exclusive: UnixNanoseconds,
+        duration_seconds: NonZeroU64,
+    ) -> Result<Self, LedgerFailure> {
+        let width = duration_seconds
+            .get()
+            .checked_mul(1_000_000_000)
+            .and_then(|value| i64::try_from(value).ok())
+            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+        if start.value().rem_euclid(width) != 0
+            || start
+                .value()
+                .checked_add(width)
+                .filter(|end| *end == end_exclusive.value())
+                .is_none()
+        {
+            return Err(LedgerFailure::new(LedgerFailureCode::InvalidInput));
+        }
+        Ok(Self {
+            tenant,
+            signal,
+            start,
+            end_exclusive,
+        })
+    }
+
     pub fn for_ingest_time(
         tenant: TenantId,
         signal: SignalKind,
