@@ -19,6 +19,7 @@ use signal_hook::iterator::Signals;
 
 mod config_cli;
 mod keys;
+mod maintenance_cli;
 mod policy;
 mod tenant_alias_cli;
 mod tenant_lifecycle;
@@ -58,6 +59,13 @@ pub fn run_native(
             },
             None => tenant_quotas::run(std::iter::empty()),
         };
+    }
+    if arguments
+        .peek()
+        .is_some_and(|argument| argument == "maintenance")
+    {
+        arguments.next();
+        return maintenance_cli::run(arguments);
     }
     if arguments
         .peek()
