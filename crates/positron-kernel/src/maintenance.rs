@@ -973,6 +973,27 @@ impl MaintenanceCoordinator {
         })
     }
 
+    /// Returns the complete bounded task view for authenticated administration
+    /// and diagnostics. The coordinator remains the only owner of task state.
+    pub fn statuses(&self) -> Result<Vec<MaintenanceTaskStatus>, MaintenanceFailure> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
+        Ok(state
+            .tasks
+            .values()
+            .map(|task| MaintenanceTaskStatus {
+                task: task.task.clone(),
+                phase: task.phase,
+                submitted_at: task.submitted_at,
+                checkpoint: task.checkpoint.clone(),
+                pause_until: task.pause_until,
+                cancellation_requested: task.cancellation_requested,
+            })
+            .collect())
+    }
+
     pub fn durable_records(&self) -> Result<Vec<MaintenanceTaskRecord>, MaintenanceFailure> {
         let state = self
             .state

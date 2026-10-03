@@ -36,6 +36,8 @@ mod cors;
 mod h2_protection;
 #[path = "native_transport/http2_api.rs"]
 mod http2_api;
+#[path = "native_transport/maintenance_routes.rs"]
+mod maintenance_routes;
 #[path = "native_transport/policy_routes.rs"]
 mod policy_routes;
 #[path = "native_transport/proxy_trust.rs"]

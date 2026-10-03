@@ -1,5 +1,5 @@
 {
-  "schema_digest": "f55d1ef754a0d1e1752a48851f259a025eb16cc91059f2daf2c668cd42ca0081",
+  "schema_digest": "be0a2a47aa3ecf9a44398003a7dfcb3f9013089b274e4d1c4d833f5460d9b2ec",
   "max_request_bytes": 64,
   "unknown_fields": "reject",
   "enums": {
@@ -614,6 +614,26 @@
         {"json":"retention_generation","type":"uint64","minimum":1,"description":"current retention generation"},
         {"json":"semantic_diff","type":"string","minimum_length":1,"maximum_length":1024,"description":"redacted retention change summary"}
       ]
+    },
+    {
+      "rpc": "positron.v1.MaintenanceService/Status",
+      "method": "POST",
+      "path": "/v1/maintenance:status",
+      "request": "MaintenanceStatusRequest",
+      "response": "MaintenanceStatusResponse",
+      "authentication": "Bearer SystemAdministration",
+      "max_request_bytes": 128,
+      "max_response_bytes": 65536,
+      "unknown_fields": "reject",
+      "request_fields": [],
+      "response_fields": [
+        {"proto":"tasks","json":"tasks","type":"MaintenanceTaskStatus","number":1,"deprecated":false,"repeated":true},
+        {"proto":"queued","json":"queued","type":"uint32","number":2,"deprecated":false},
+        {"proto":"running","json":"running","type":"uint32","number":3,"deprecated":false},
+        {"proto":"deferred","json":"deferred","type":"uint32","number":4,"deprecated":false},
+        {"proto":"terminal","json":"terminal","type":"uint32","number":5,"deprecated":false}
+      ],
+      "responses":{"200":"MaintenanceStatusResponse","400":"invalid_request","401":"authentication_rejected","503":"administration_unavailable"}
     },
     {
       "rpc": "positron.v1.PolicyService/Validate",

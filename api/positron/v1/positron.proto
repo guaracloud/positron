@@ -44,6 +44,12 @@ service TenantRetentionService {
   rpc Update(TenantRetentionUpdateRequest) returns (TenantRetentionUpdateResponse);
 }
 
+// Authenticated system-administration inspection of the one Storage Kernel
+// Maintenance Coordinator. Task control remains in the coordinator.
+service MaintenanceService {
+  rpc Status(MaintenanceStatusRequest) returns (MaintenanceStatusResponse);
+}
+
 // Authenticated system administration for explicit tenant registry entries.
 // Tenant identity is always explicit and is never inferred from a bearer.
 service TenantService {
@@ -351,6 +357,27 @@ message ApiKeyResponse {
 message CapabilityRequest {
   uint32 api_major = 1;
   Capability capability = 2;
+}
+
+message MaintenanceStatusRequest {}
+
+message MaintenanceTaskStatus {
+  string identity = 1;
+  string task_class = 2;
+  string scope = 3;
+  string phase = 4;
+  uint64 submitted_at_unix_seconds = 5;
+  optional uint64 checkpoint_sequence = 6;
+  optional uint64 pause_until_unix_seconds = 7;
+  bool cancellation_requested = 8;
+}
+
+message MaintenanceStatusResponse {
+  repeated MaintenanceTaskStatus tasks = 1;
+  uint32 queued = 2;
+  uint32 running = 3;
+  uint32 deferred = 4;
+  uint32 terminal = 5;
 }
 
 message CapabilityResponse {

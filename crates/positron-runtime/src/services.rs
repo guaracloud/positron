@@ -18,6 +18,7 @@ mod export_destinations;
 mod failure;
 mod ingest;
 mod maintenance;
+mod maintenance_api;
 mod otlp;
 pub(crate) mod policy;
 mod query;

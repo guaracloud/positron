@@ -3,7 +3,7 @@
   "info": {
     "title": "Positron API",
     "version": "v1",
-    "x-positron-schema-digest": "f55d1ef754a0d1e1752a48851f259a025eb16cc91059f2daf2c668cd42ca0081"
+    "x-positron-schema-digest": "be0a2a47aa3ecf9a44398003a7dfcb3f9013089b274e4d1c4d833f5460d9b2ec"
   },
   "paths": {
     "/v1/capabilities:negotiate": {
@@ -410,6 +410,21 @@
           "401": {"description": "System-administration authentication failed before request decoding."},
           "409": {"description": "The display generation is stale or the idempotency binding conflicts."},
           "503": {"description": "Tenant administration is unavailable."}
+        }
+      }
+    },
+    "/v1/maintenance:status": {
+      "post": {
+        "operationId": "StatusMaintenance",
+        "security": [{"apiKeyBearer": []}],
+        "x-positron-availability": "available",
+        "x-positron-max-request-bytes": 128,
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MaintenanceStatusRequest"}}}},
+        "responses": {
+          "200": {"description": "Bounded redacted Maintenance Coordinator task status.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MaintenanceStatusResponse"}}}},
+          "400": {"description": "Invalid bounded maintenance status request."},
+          "401": {"description": "System-administration authentication failed before request decoding."},
+          "503": {"description": "Maintenance administration is unavailable."}
         }
       }
     },
@@ -1196,6 +1211,34 @@
           "tenant": {"type": "string", "format": "uuid"},
           "display_generation": {"type": "integer", "minimum": 1},
           "audit_position": {"type": "integer", "minimum": 1}
+        }
+      },
+      "MaintenanceStatusRequest": {
+        "type": "object", "additionalProperties": false, "properties": {}
+      },
+      "MaintenanceTaskStatus": {
+        "type": "object", "additionalProperties": false,
+        "required": ["identity", "class", "scope", "phase", "submitted_at_unix_seconds", "cancellation_requested"],
+        "properties": {
+          "identity": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+          "class": {"type": "string", "minLength": 1, "maxLength": 64},
+          "scope": {"type": "string", "minLength": 1, "maxLength": 128},
+          "phase": {"type": "string", "enum": ["queued", "running", "deferred", "cancelled", "succeeded", "failed"]},
+          "submitted_at_unix_seconds": {"type": "integer", "minimum": 0},
+          "checkpoint_sequence": {"type": "integer", "minimum": 1},
+          "pause_until_unix_seconds": {"type": "integer", "minimum": 1},
+          "cancellation_requested": {"type": "boolean"}
+        }
+      },
+      "MaintenanceStatusResponse": {
+        "type": "object", "additionalProperties": false,
+        "required": ["tasks", "queued", "running", "deferred", "terminal"],
+        "properties": {
+          "tasks": {"type": "array", "maxItems": 128, "items": {"$ref": "#/components/schemas/MaintenanceTaskStatus"}},
+          "queued": {"type": "integer", "minimum": 0},
+          "running": {"type": "integer", "minimum": 0},
+          "deferred": {"type": "integer", "minimum": 0},
+          "terminal": {"type": "integer", "minimum": 0}
         }
       },
       "TenantRetentionPreviewRequest": {
