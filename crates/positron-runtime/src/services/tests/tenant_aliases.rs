@@ -132,6 +132,10 @@ fn alias_retry_survives_audit_reclamation_and_reopen() -> Result<(), Box<dyn Err
         ResourceGeneration::new(1)?,
         AdministrativeIdempotencyKey::new([0xb9; 16])?,
     )?;
+    assert!(
+        ServiceHandle::new(Arc::clone(&initialized))?.wake_maintenance_worker()?,
+        "the runtime maintenance worker reclaims the eligible audit prefix before replay"
+    );
     assert_eq!(initialized.governance_audit_for_test()?.len(), 1);
     drop(initialized);
 

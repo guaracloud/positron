@@ -17,6 +17,7 @@ use positron_kernel::{
 
 use super::super::{BootstrapFailureCode, InitializationPlan, InstanceBootstrap};
 use super::support::Roots;
+use crate::ServiceHandle;
 
 struct UncertainInstance {
     roots: Roots,
@@ -622,6 +623,7 @@ fn v1_receipt_without_its_retained_audit_fails_closed_after_reopen()
         MutableWallClock(Arc::new(Mutex::new(UnixNanoseconds::new(1_000_000_000)))),
         LifecycleClockPolicy::new(10)?,
     )?)?;
+    let instance = Arc::new(instance);
     instance
         .update_system_audit_retention(
             retention_administrator,
@@ -630,6 +632,10 @@ fn v1_receipt_without_its_retained_audit_fails_closed_after_reopen()
             AdministrativeIdempotencyKey::new([0xad; 16])?,
         )
         .map_err(|failure| format!("audit reclamation: {failure:?}"))?;
+    assert!(
+        ServiceHandle::new(Arc::clone(&instance))?.wake_maintenance_worker()?,
+        "the runtime maintenance worker reclaims the eligible audit prefix before reopen"
+    );
     install_v1_acceptance_receipt(&instance)?;
     drop(instance);
 
