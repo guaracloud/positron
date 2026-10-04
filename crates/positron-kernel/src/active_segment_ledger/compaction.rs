@@ -48,6 +48,43 @@ impl PreparedCompactionTask {
 }
 
 impl<'kernel, 'catalog> ActiveSegmentLedger<'kernel, 'catalog> {
+    /// Selects one authenticated ingest-time bucket from an existing sealed
+    /// source. Callers cannot supply a raw timestamp or retention bounds.
+    pub fn sealed_compaction_bucket(&self) -> Result<super::RetentionBucket, LedgerFailure> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::ConcurrentWriter))?;
+        state.require_healthy()?;
+        self.catalog.refresh_state()?;
+        let basis = self.catalog.pin()?;
+        let policy = basis.retention_policy(self.scope.signal_kind())?;
+        if policy.instance() != self.catalog.instance() || policy.tenant() != self.scope.tenant_id()
+        {
+            return Err(LedgerFailure::new(LedgerFailureCode::PhysicalScopeMismatch));
+        }
+        let metadata = self.storage.catalog_segments(&basis, self.scope)?;
+        let block = metadata
+            .iter()
+            .filter(|segment| segment.state == SegmentState::Sealed)
+            .find_map(|segment| {
+                state
+                    .blocks
+                    .iter()
+                    .find(|block| block.segment == segment.id)
+            })
+            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::InvalidInput))?;
+        let SegmentRetention::Complete(ingest_time) = block.block_retention else {
+            return Err(LedgerFailure::new(LedgerFailureCode::UnsupportedFormat));
+        };
+        super::RetentionBucket::for_ingest_time(
+            self.scope.tenant_id(),
+            self.scope.signal_kind(),
+            ingest_time,
+            policy.retention_seconds(),
+        )
+    }
+
     /// Creates the only durable descriptor for the complete currently-sealed
     /// source manifest and one caller-requested fixed retention bucket.
     ///

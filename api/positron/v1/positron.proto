@@ -49,6 +49,7 @@ service TenantRetentionService {
 service MaintenanceService {
   rpc Status(MaintenanceStatusRequest) returns (MaintenanceStatusResponse);
   rpc Explain(MaintenanceExplainRequest) returns (MaintenanceExplainResponse);
+  rpc Run(MaintenanceRunRequest) returns (MaintenanceRunResponse);
 }
 
 // Authenticated system administration for explicit tenant registry entries.
@@ -386,6 +387,22 @@ message MaintenanceExplainRequest {
 }
 
 message MaintenanceExplainResponse {
+  MaintenanceTaskStatus task = 1;
+}
+
+// An authenticated system-administration request for one explicit existing
+// scope. Release 1 accepts only compaction; the Storage Kernel selects a
+// sealed source and derives its retention bucket, inputs, preconditions, and
+// reservations from authenticated Catalog state.
+message MaintenanceRunRequest {
+  string task_class = 1;
+  string tenant = 2;
+  string signal = 3;
+  uint32 shard = 4;
+  string idempotency_key = 5;
+}
+
+message MaintenanceRunResponse {
   MaintenanceTaskStatus task = 1;
 }
 

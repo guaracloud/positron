@@ -11,7 +11,9 @@ pub use client::{MaintenanceServiceClient, MaintenanceServiceClientFailure};
 
 pub const STATUS_HTTP_PATH: &str = "/v1/maintenance:status";
 pub const EXPLAIN_HTTP_PATH: &str = "/v1/maintenance:explain";
+pub const RUN_HTTP_PATH: &str = "/v1/maintenance:run";
 pub const MAX_REQUEST_BYTES: usize = 128;
+pub const MAX_RUN_REQUEST_BYTES: usize = 256;
 pub const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 pub const MAX_TASKS: usize = 128;
 
@@ -32,6 +34,89 @@ impl MaintenanceStatusRequest {
 #[serde(deny_unknown_fields)]
 pub struct MaintenanceExplainRequest {
     pub identity: String,
+}
+
+/// A bounded operator request for the coordinator to prepare one already
+/// sealed source scope. The server chooses the authenticated retention bucket
+/// and derives every task precondition and reservation from Catalog state.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaintenanceRunRequest {
+    class: String,
+    tenant: String,
+    signal: String,
+    shard: u32,
+    idempotency_key: String,
+}
+
+impl MaintenanceRunRequest {
+    #[must_use]
+    pub fn new(
+        class: String,
+        tenant: String,
+        signal: String,
+        shard: u32,
+        idempotency_key: String,
+    ) -> Self {
+        Self {
+            class,
+            tenant,
+            signal,
+            shard,
+            idempotency_key,
+        }
+    }
+
+    pub fn decode(body: &[u8]) -> Result<Self, MaintenanceWireFailure> {
+        if body.len() > MAX_RUN_REQUEST_BYTES {
+            return Err(MaintenanceWireFailure);
+        }
+        let request: Self = serde_json::from_slice(body).map_err(|_| MaintenanceWireFailure)?;
+        request.validate()?;
+        Ok(request)
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>, MaintenanceWireFailure> {
+        self.validate()?;
+        serde_json::to_vec(self).map_err(|_| MaintenanceWireFailure)
+    }
+
+    #[must_use]
+    pub fn class(&self) -> &str {
+        &self.class
+    }
+
+    #[must_use]
+    pub fn tenant(&self) -> &str {
+        &self.tenant
+    }
+
+    #[must_use]
+    pub fn signal(&self) -> &str {
+        &self.signal
+    }
+
+    #[must_use]
+    pub const fn shard(&self) -> u32 {
+        self.shard
+    }
+
+    #[must_use]
+    pub fn idempotency_key(&self) -> &str {
+        &self.idempotency_key
+    }
+
+    pub fn validate(&self) -> Result<(), MaintenanceWireFailure> {
+        if self.class != "compaction"
+            || !identifier(&self.tenant)
+            || !matches!(self.signal.as_str(), "logs" | "traces")
+            || self.shard == 0
+            || !identifier(&self.idempotency_key)
+        {
+            return Err(MaintenanceWireFailure);
+        }
+        Ok(())
+    }
 }
 
 impl MaintenanceExplainRequest {
@@ -81,6 +166,38 @@ pub struct MaintenanceStatusResponse {
 #[serde(deny_unknown_fields)]
 pub struct MaintenanceExplainResponse {
     pub task: MaintenanceTaskStatus,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaintenanceRunResponse {
+    pub task: MaintenanceTaskStatus,
+}
+
+impl MaintenanceRunResponse {
+    pub fn decode(body: &[u8]) -> Result<Self, MaintenanceWireFailure> {
+        if body.len() > MAX_RESPONSE_BYTES {
+            return Err(MaintenanceWireFailure);
+        }
+        let response: Self = serde_json::from_slice(body).map_err(|_| MaintenanceWireFailure)?;
+        MaintenanceStatusResponse {
+            tasks: vec![response.task.clone()],
+            queued: u32::from(response.task.phase == "queued"),
+            running: u32::from(response.task.phase == "running"),
+            deferred: u32::from(response.task.phase == "deferred"),
+            terminal: u32::from(matches!(
+                response.task.phase.as_str(),
+                "cancelled" | "succeeded" | "failed"
+            )),
+        }
+        .validate()?;
+        Ok(response)
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>, MaintenanceWireFailure> {
+        Self::decode(&serde_json::to_vec(self).map_err(|_| MaintenanceWireFailure)?)?;
+        serde_json::to_vec(self).map_err(|_| MaintenanceWireFailure)
+    }
 }
 
 impl MaintenanceExplainResponse {
@@ -161,3 +278,17 @@ impl std::fmt::Display for MaintenanceWireFailure {
 }
 
 impl std::error::Error for MaintenanceWireFailure {}
+
+fn identifier(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')
+            }
+        })
+        && value
+            .bytes()
+            .any(|byte| matches!(byte, b'1'..=b'9' | b'a'..=b'f'))
+}

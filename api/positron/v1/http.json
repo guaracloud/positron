@@ -654,6 +654,28 @@
       "responses":{"200":"MaintenanceExplainResponse","400":"invalid_request","401":"authentication_rejected","404":"task_unavailable","503":"administration_unavailable"}
     },
     {
+      "rpc": "positron.v1.MaintenanceService/Run",
+      "method": "POST",
+      "path": "/v1/maintenance:run",
+      "request": "MaintenanceRunRequest",
+      "response": "MaintenanceRunResponse",
+      "authentication": "Bearer SystemAdministration",
+      "max_request_bytes": 256,
+      "max_response_bytes": 2048,
+      "unknown_fields": "reject",
+      "request_fields": [
+        {"proto":"task_class","json":"class","type":"string","number":1,"deprecated":false},
+        {"proto":"tenant","json":"tenant","type":"string","number":2,"deprecated":false},
+        {"proto":"signal","json":"signal","type":"string","number":3,"deprecated":false},
+        {"proto":"shard","json":"shard","type":"uint32","number":4,"deprecated":false},
+        {"proto":"idempotency_key","json":"idempotency_key","type":"string","number":5,"deprecated":false}
+      ],
+      "response_fields": [
+        {"proto":"task","json":"task","type":"MaintenanceTaskStatus","number":1,"deprecated":false}
+      ],
+      "responses":{"200":"MaintenanceRunResponse","400":"invalid_request","401":"authentication_rejected","404":"source_unavailable","409":"idempotency_conflict","503":"administration_unavailable"}
+    },
+    {
       "rpc": "positron.v1.PolicyService/Validate",
       "method": "POST",
       "path": "/v1/policies:validate",

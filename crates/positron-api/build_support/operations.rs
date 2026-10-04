@@ -74,6 +74,11 @@ const MAINTENANCE_METHODS: &[MethodSpec] = &[
         input: ".positron.v1.MaintenanceExplainRequest",
         output: ".positron.v1.MaintenanceExplainResponse",
     },
+    MethodSpec {
+        name: "Run",
+        input: ".positron.v1.MaintenanceRunRequest",
+        output: ".positron.v1.MaintenanceRunResponse",
+    },
 ];
 const POLICY_METHODS: &[MethodSpec] = &[
     MethodSpec {

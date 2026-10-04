@@ -32,7 +32,7 @@ use crate::{
     InstanceBootstrap, NativeBindings, NativeHost, ServeConfiguration, ShutdownTrigger,
 };
 
-type InitializedCredentials = (Arc<crate::InitializedInstance>, String, String, String);
+pub(crate) type InitializedCredentials = (Arc<crate::InitializedInstance>, String, String, String);
 
 #[test]
 fn service_startup_restores_catalog_backed_maintenance_before_serving() -> Result<(), Box<dyn Error>>
@@ -1274,7 +1274,7 @@ fn schema_audit_count(initialized: &crate::InitializedInstance) -> Result<usize,
         .count())
 }
 
-pub(super) fn open_catalog(
+pub(crate) fn open_catalog(
     initialized: &crate::InitializedInstance,
 ) -> Result<Catalog<'_>, Box<dyn Error>> {
     Ok(Catalog::open(
@@ -1284,7 +1284,7 @@ pub(super) fn open_catalog(
     )?)
 }
 
-pub(super) fn request(body: &str) -> ExportLogsServiceRequest {
+pub(crate) fn request(body: &str) -> ExportLogsServiceRequest {
     ExportLogsServiceRequest {
         resource_logs: vec![ResourceLogs {
             scope_logs: vec![ScopeLogs {
@@ -1317,12 +1317,12 @@ fn reserve_native_addresses() -> Result<[SocketAddr; 5], Box<dyn Error>> {
         .map_err(|_| "five native listener addresses".into())
 }
 
-pub(super) struct Fixture {
+pub(crate) struct Fixture {
     root: PathBuf,
 }
 
 impl Fixture {
-    pub(super) fn new() -> Result<Self, Box<dyn Error>> {
+    pub(crate) fn new() -> Result<Self, Box<dyn Error>> {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let root = std::env::temp_dir().join(format!(
             "positron-schema-maintenance-{}-{}",
@@ -1346,7 +1346,7 @@ impl Fixture {
         Ok((initialized, ingest, query))
     }
 
-    pub(super) fn initialized_with_admin(&self) -> Result<InitializedCredentials, Box<dyn Error>> {
+    pub(crate) fn initialized_with_admin(&self) -> Result<InitializedCredentials, Box<dyn Error>> {
         self.initialized_with_admin_max_registered_tenants(2)
     }
 
@@ -1379,7 +1379,7 @@ impl Fixture {
         ))
     }
 
-    pub(super) fn reopen(&self) -> Result<Arc<crate::InitializedInstance>, Box<dyn Error>> {
+    pub(crate) fn reopen(&self) -> Result<Arc<crate::InitializedInstance>, Box<dyn Error>> {
         let paths = BootstrapPaths::new(
             &self.root.join("data"),
             &self.root.join("secrets"),
