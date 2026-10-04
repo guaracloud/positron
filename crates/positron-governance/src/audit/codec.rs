@@ -8,6 +8,47 @@ impl GovernanceAuditEntry {
         transaction_id: [u8; 16],
         intent: &[u8],
     ) -> Result<Self, IdentityFailure> {
+        if intent.starts_with(&MAINTENANCE_CONTROL_AUDIT_MAGIC) {
+            let mut cursor = Cursor::new(intent);
+            if cursor.take_array::<8>()? != MAINTENANCE_CONTROL_AUDIT_MAGIC {
+                return Err(IdentityFailure);
+            }
+            let pause = match cursor.take_u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(IdentityFailure),
+            };
+            let actor =
+                PrincipalId::from_bytes(cursor.take_array()?).map_err(|_| IdentityFailure)?;
+            let idempotency_key = AdministrativeIdempotencyKey::new(cursor.take_array()?)
+                .map_err(|_| IdentityFailure)?;
+            let task = MaintenanceTaskId::new(cursor.take_array()?).map_err(|_| IdentityFailure)?;
+            let resource_generation = cursor.take_u64()?;
+            let duration_seconds = cursor.take_u64()?;
+            let pause_until_unix_seconds = cursor.take_u64()?;
+            if (pause
+                && (resource_generation == 0
+                    || duration_seconds == 0
+                    || pause_until_unix_seconds == 0))
+                || (!pause
+                    && (resource_generation != 0
+                        || duration_seconds != 0
+                        || pause_until_unix_seconds != 0))
+                || !cursor.is_empty()
+            {
+                return Err(IdentityFailure);
+            }
+            return Ok(Self::MaintenanceControl(MaintenanceControlAuditEntry {
+                position,
+                actor,
+                idempotency_key,
+                task,
+                pause,
+                resource_generation,
+                duration_seconds,
+                pause_until_unix_seconds,
+            }));
+        }
         if intent.starts_with(&TLS_MATERIAL_RELOAD_MAGIC) {
             return TlsMaterialReloadAuditRequest::decode(position, transaction_id, intent)
                 .map(Self::TlsMaterialReload);

@@ -1,4 +1,5 @@
 use super::*;
+use crate::AuditIntent;
 
 #[test]
 fn durable_checkpoint_restores_the_same_task_after_a_process_restart() {
@@ -344,6 +345,63 @@ fn catalog_pause_and_finite_window_survive_reopen_without_deferring_past_expiry(
         .expect("expiry admission")
         .expect("window expiry must make the queued task eligible");
     drop(execution);
+    Ok(())
+}
+
+#[test]
+fn audited_pause_publication_fault_keeps_the_task_queued_without_a_partial_audit()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = CatalogRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(&root.0, MountQualification::LocalHost)?;
+    let authority = crate::catalog::tests::support::establish_catalog_authority(volume)?;
+    let instance = InstanceId::new(nonzero_id(36))?;
+    let catalog = Catalog::open(
+        &authority,
+        instance,
+        CatalogSecret::from_owned(Box::new([0x86; 32]), Box::new([0x87; 32])),
+    )?;
+    catalog.commit(
+        catalog.pin()?.identity(),
+        CatalogProposal::new(
+            TransactionId::new(nonzero_id(37))?,
+            FormatEpoch::CATALOG_V1,
+            vec![CatalogObject::new(
+                b"audited maintenance pause basis".to_vec(),
+            )?],
+        )?,
+        None,
+    )?;
+    let coordinator = MaintenanceCoordinator::new();
+    let task = catalog_task(48);
+    let identity = task.identity();
+    coordinator
+        .submit_and_persist(&catalog, task, 7)
+        .expect("queued task must publish");
+    let result =
+        crate::catalog::with_catalog_fault(crate::catalog::CatalogFileEvent::WriteMarker, || {
+            coordinator.pause_and_persist_audited(
+                &catalog,
+                identity,
+                9,
+                12,
+                8,
+                AuditIntent::new(b"maintenance pause audit".to_vec())
+                    .map_err(|_| MaintenanceFailure::CatalogUnavailable)?,
+            )
+        });
+    assert_eq!(
+        result.expect_err("audited pause publication must fail"),
+        MaintenanceFailure::CatalogUnavailable
+    );
+    assert_eq!(
+        coordinator
+            .status(identity)
+            .expect("failed publication must retain queued task")
+            .phase(),
+        MaintenanceTaskPhase::Queued,
+        "the scheduler cannot observe a pause whose Catalog transaction failed"
+    );
+    assert!(catalog.governance_audit_records()?.is_empty());
     Ok(())
 }
 

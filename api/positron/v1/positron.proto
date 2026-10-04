@@ -50,6 +50,8 @@ service MaintenanceService {
   rpc Status(MaintenanceStatusRequest) returns (MaintenanceStatusResponse);
   rpc Explain(MaintenanceExplainRequest) returns (MaintenanceExplainResponse);
   rpc Run(MaintenanceRunRequest) returns (MaintenanceRunResponse);
+  rpc Pause(MaintenancePauseRequest) returns (MaintenanceControlResponse);
+  rpc Resume(MaintenanceResumeRequest) returns (MaintenanceControlResponse);
 }
 
 // Authenticated system administration for explicit tenant registry entries.
@@ -404,6 +406,27 @@ message MaintenanceRunRequest {
 
 message MaintenanceRunResponse {
   MaintenanceTaskStatus task = 1;
+}
+
+// Defers only one existing optional task for a bounded server-derived
+// duration. The resource generation fences the immutable task preconditions.
+message MaintenancePauseRequest {
+  string identity = 1;
+  uint64 resource_generation = 2;
+  uint64 duration_seconds = 3;
+  string idempotency_key = 4;
+}
+
+// Removes one existing durable pause. The server never accepts an expiry or
+// other scheduling input from a caller.
+message MaintenanceResumeRequest {
+  string identity = 1;
+  string idempotency_key = 2;
+}
+
+message MaintenanceControlResponse {
+  MaintenanceTaskStatus task = 1;
+  uint64 audit_position = 2;
 }
 
 message CapabilityResponse {

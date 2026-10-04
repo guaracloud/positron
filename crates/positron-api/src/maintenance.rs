@@ -12,8 +12,12 @@ pub use client::{MaintenanceServiceClient, MaintenanceServiceClientFailure};
 pub const STATUS_HTTP_PATH: &str = "/v1/maintenance:status";
 pub const EXPLAIN_HTTP_PATH: &str = "/v1/maintenance:explain";
 pub const RUN_HTTP_PATH: &str = "/v1/maintenance:run";
+pub const PAUSE_HTTP_PATH: &str = "/v1/maintenance:pause";
+pub const RESUME_HTTP_PATH: &str = "/v1/maintenance:resume";
 pub const MAX_REQUEST_BYTES: usize = 128;
 pub const MAX_RUN_REQUEST_BYTES: usize = 256;
+pub const MAX_CONTROL_REQUEST_BYTES: usize = 192;
+pub const MAX_PAUSE_DURATION_SECONDS: u64 = 86_400;
 pub const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 pub const MAX_TASKS: usize = 128;
 
@@ -47,6 +51,121 @@ pub struct MaintenanceRunRequest {
     signal: String,
     shard: u32,
     idempotency_key: String,
+}
+
+/// An authenticated finite deferral of one existing optional maintenance
+/// task. The server derives the deadline from its own lifecycle clock.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaintenancePauseRequest {
+    identity: String,
+    resource_generation: u64,
+    duration_seconds: u64,
+    idempotency_key: String,
+}
+
+/// An authenticated removal of one existing durable maintenance deferral.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaintenanceResumeRequest {
+    identity: String,
+    idempotency_key: String,
+}
+
+impl MaintenancePauseRequest {
+    #[must_use]
+    pub fn new(
+        identity: String,
+        resource_generation: u64,
+        duration_seconds: u64,
+        idempotency_key: String,
+    ) -> Self {
+        Self {
+            identity,
+            resource_generation,
+            duration_seconds,
+            idempotency_key,
+        }
+    }
+
+    pub fn decode(body: &[u8]) -> Result<Self, MaintenanceWireFailure> {
+        if body.len() > MAX_CONTROL_REQUEST_BYTES {
+            return Err(MaintenanceWireFailure);
+        }
+        let request: Self = serde_json::from_slice(body).map_err(|_| MaintenanceWireFailure)?;
+        request.validate()?;
+        Ok(request)
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>, MaintenanceWireFailure> {
+        self.validate()?;
+        serde_json::to_vec(self).map_err(|_| MaintenanceWireFailure)
+    }
+
+    #[must_use]
+    pub fn identity(&self) -> &str {
+        &self.identity
+    }
+    #[must_use]
+    pub const fn resource_generation(&self) -> u64 {
+        self.resource_generation
+    }
+    #[must_use]
+    pub const fn duration_seconds(&self) -> u64 {
+        self.duration_seconds
+    }
+    #[must_use]
+    pub fn idempotency_key(&self) -> &str {
+        &self.idempotency_key
+    }
+
+    pub fn validate(&self) -> Result<(), MaintenanceWireFailure> {
+        (valid_task_identity(&self.identity)
+            && self.resource_generation != 0
+            && (1..=MAX_PAUSE_DURATION_SECONDS).contains(&self.duration_seconds)
+            && identifier(&self.idempotency_key))
+        .then_some(())
+        .ok_or(MaintenanceWireFailure)
+    }
+}
+
+impl MaintenanceResumeRequest {
+    #[must_use]
+    pub fn new(identity: String, idempotency_key: String) -> Self {
+        Self {
+            identity,
+            idempotency_key,
+        }
+    }
+
+    pub fn decode(body: &[u8]) -> Result<Self, MaintenanceWireFailure> {
+        if body.len() > MAX_CONTROL_REQUEST_BYTES {
+            return Err(MaintenanceWireFailure);
+        }
+        let request: Self = serde_json::from_slice(body).map_err(|_| MaintenanceWireFailure)?;
+        request.validate()?;
+        Ok(request)
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>, MaintenanceWireFailure> {
+        self.validate()?;
+        serde_json::to_vec(self).map_err(|_| MaintenanceWireFailure)
+    }
+
+    #[must_use]
+    pub fn identity(&self) -> &str {
+        &self.identity
+    }
+    #[must_use]
+    pub fn idempotency_key(&self) -> &str {
+        &self.idempotency_key
+    }
+
+    pub fn validate(&self) -> Result<(), MaintenanceWireFailure> {
+        (valid_task_identity(&self.identity) && identifier(&self.idempotency_key))
+            .then_some(())
+            .ok_or(MaintenanceWireFailure)
+    }
 }
 
 impl MaintenanceRunRequest {
@@ -125,16 +244,15 @@ impl MaintenanceExplainRequest {
             return Err(MaintenanceWireFailure);
         }
         let request: Self = serde_json::from_slice(body).map_err(|_| MaintenanceWireFailure)?;
-        if request.identity.len() != 32
-            || !request
-                .identity
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit())
-        {
+        if !valid_task_identity(&request.identity) {
             return Err(MaintenanceWireFailure);
         }
         Ok(request)
     }
+}
+
+fn valid_task_identity(identity: &str) -> bool {
+    identity.len() == 32 && identity.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -174,6 +292,35 @@ pub struct MaintenanceRunResponse {
     pub task: MaintenanceTaskStatus,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaintenanceControlResponse {
+    pub task: MaintenanceTaskStatus,
+    pub audit_position: u64,
+}
+
+impl MaintenanceControlResponse {
+    pub fn decode(body: &[u8]) -> Result<Self, MaintenanceWireFailure> {
+        if body.len() > MAX_RESPONSE_BYTES {
+            return Err(MaintenanceWireFailure);
+        }
+        let response: Self = serde_json::from_slice(body).map_err(|_| MaintenanceWireFailure)?;
+        if response.audit_position == 0 {
+            return Err(MaintenanceWireFailure);
+        }
+        MaintenanceRunResponse {
+            task: response.task.clone(),
+        }
+        .encode()?;
+        Ok(response)
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>, MaintenanceWireFailure> {
+        Self::decode(&serde_json::to_vec(self).map_err(|_| MaintenanceWireFailure)?)?;
+        serde_json::to_vec(self).map_err(|_| MaintenanceWireFailure)
+    }
+}
+
 impl MaintenanceRunResponse {
     pub fn decode(body: &[u8]) -> Result<Self, MaintenanceWireFailure> {
         if body.len() > MAX_RESPONSE_BYTES {
@@ -201,18 +348,20 @@ impl MaintenanceRunResponse {
 }
 
 impl MaintenanceExplainResponse {
+    pub fn decode(body: &[u8]) -> Result<Self, MaintenanceWireFailure> {
+        if body.len() > MAX_RESPONSE_BYTES {
+            return Err(MaintenanceWireFailure);
+        }
+        let response: Self = serde_json::from_slice(body).map_err(|_| MaintenanceWireFailure)?;
+        MaintenanceRunResponse {
+            task: response.task.clone(),
+        }
+        .encode()?;
+        Ok(response)
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>, MaintenanceWireFailure> {
-        let response = MaintenanceStatusResponse {
-            tasks: vec![self.task.clone()],
-            queued: u32::from(self.task.phase == "queued"),
-            running: u32::from(self.task.phase == "running"),
-            deferred: u32::from(self.task.phase == "deferred"),
-            terminal: u32::from(matches!(
-                self.task.phase.as_str(),
-                "cancelled" | "succeeded" | "failed"
-            )),
-        };
-        response.validate()?;
+        Self::decode(&serde_json::to_vec(self).map_err(|_| MaintenanceWireFailure)?)?;
         serde_json::to_vec(self).map_err(|_| MaintenanceWireFailure)
     }
 }

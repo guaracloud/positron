@@ -79,6 +79,16 @@ const MAINTENANCE_METHODS: &[MethodSpec] = &[
         input: ".positron.v1.MaintenanceRunRequest",
         output: ".positron.v1.MaintenanceRunResponse",
     },
+    MethodSpec {
+        name: "Pause",
+        input: ".positron.v1.MaintenancePauseRequest",
+        output: ".positron.v1.MaintenanceControlResponse",
+    },
+    MethodSpec {
+        name: "Resume",
+        input: ".positron.v1.MaintenanceResumeRequest",
+        output: ".positron.v1.MaintenanceControlResponse",
+    },
 ];
 const POLICY_METHODS: &[MethodSpec] = &[
     MethodSpec {

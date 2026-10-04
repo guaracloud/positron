@@ -400,6 +400,7 @@ fn receipt_for_pruned_entry(
         | GovernanceAuditEntry::CatalogRootRotation(_)
         | GovernanceAuditEntry::SchemaCheckpoint(_)
         | GovernanceAuditEntry::DurableOperation(_)
+        | GovernanceAuditEntry::MaintenanceControl(_)
         | GovernanceAuditEntry::Configuration(_)
         | GovernanceAuditEntry::TlsMaterialReload(_) => return Ok(None),
         GovernanceAuditEntry::LifecycleClockAcceptance(entry) => (

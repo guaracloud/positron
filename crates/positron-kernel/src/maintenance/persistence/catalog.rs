@@ -2,7 +2,7 @@
 
 use super::super::*;
 use super::*;
-use crate::{Catalog, CatalogObject, CatalogProposal, TransactionId};
+use crate::{AuditIntent, Catalog, CatalogObject, CatalogProposal, TransactionId};
 
 pub(super) fn durable_retention_publication_pair_exists(
     catalog: &Catalog<'_>,
@@ -144,7 +144,15 @@ pub(super) fn persist_task_state(
     task: &TaskState,
     removed: Option<MaintenanceTaskId>,
 ) -> Result<(), MaintenanceFailure> {
-    persist_task_state_inner(catalog, task, removed, None)
+    persist_task_state_inner(catalog, task, removed, None, None)
+}
+
+pub(super) fn persist_task_state_audited(
+    catalog: &Catalog<'_>,
+    task: &TaskState,
+    audit: AuditIntent,
+) -> Result<(), MaintenanceFailure> {
+    persist_task_state_inner(catalog, task, None, None, Some(audit))
 }
 
 pub(super) fn persist_task_state_admitted(
@@ -153,7 +161,7 @@ pub(super) fn persist_task_state_admitted(
     removed: Option<MaintenanceTaskId>,
     execution: &MaintenanceExecution<'_>,
 ) -> Result<(), MaintenanceFailure> {
-    persist_task_state_inner(catalog, task, removed, Some(execution))
+    persist_task_state_inner(catalog, task, removed, Some(execution), None)
 }
 
 pub(super) fn persist_task_state_inner(
@@ -161,6 +169,7 @@ pub(super) fn persist_task_state_inner(
     task: &TaskState,
     removed: Option<MaintenanceTaskId>,
     execution: Option<&MaintenanceExecution<'_>>,
+    audit: Option<AuditIntent>,
 ) -> Result<(), MaintenanceFailure> {
     let record = encode_record(task)?;
     let snapshot = catalog.pin().map_err(map_catalog_failure)?;
@@ -205,7 +214,7 @@ pub(super) fn persist_task_state_inner(
         Some(execution) => {
             catalog.commit_admitted_maintenance_task_state(snapshot.identity(), proposal, execution)
         },
-        None => catalog.commit(snapshot.identity(), proposal, None),
+        None => catalog.commit(snapshot.identity(), proposal, audit),
     }
     .map_err(map_catalog_failure)?;
     Ok(())

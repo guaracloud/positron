@@ -3,7 +3,7 @@
   "info": {
     "title": "Positron API",
     "version": "v1",
-    "x-positron-schema-digest": "80969f89ccde5d38fe30ff515b6c0a34c261e2d6bda3fb0147a228338d942071"
+    "x-positron-schema-digest": "fc5e9eb8b6d0adca54a3715ce024653c8de55a38e9a144d0b71be37d438d332f"
   },
   "paths": {
     "/v1/capabilities:negotiate": {
@@ -457,6 +457,40 @@
           "401": {"description": "System-administration authentication failed before request decoding."},
           "404": {"description": "The explicit scope has no eligible sealed source."},
           "409": {"description": "The administrative idempotency key is already bound to another task."},
+          "503": {"description": "Maintenance administration is unavailable."}
+        }
+      }
+    },
+    "/v1/maintenance:pause": {
+      "post": {
+        "operationId": "PauseMaintenance",
+        "security": [{"apiKeyBearer": []}],
+        "x-positron-availability": "available",
+        "x-positron-max-request-bytes": 192,
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MaintenancePauseRequest"}}}},
+        "responses": {
+          "200": {"description": "Durable acknowledgement of one bounded optional-task pause.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MaintenanceControlResponse"}}}},
+          "400": {"description": "Invalid bounded maintenance pause request."},
+          "401": {"description": "System-administration authentication failed before request decoding."},
+          "404": {"description": "The task is unavailable."},
+          "409": {"description": "The task generation or transition precondition failed, or the idempotency binding conflicts."},
+          "503": {"description": "Maintenance administration is unavailable."}
+        }
+      }
+    },
+    "/v1/maintenance:resume": {
+      "post": {
+        "operationId": "ResumeMaintenance",
+        "security": [{"apiKeyBearer": []}],
+        "x-positron-availability": "available",
+        "x-positron-max-request-bytes": 192,
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MaintenanceResumeRequest"}}}},
+        "responses": {
+          "200": {"description": "Durable acknowledgement of one deferred-task resume.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MaintenanceControlResponse"}}}},
+          "400": {"description": "Invalid bounded maintenance resume request."},
+          "401": {"description": "System-administration authentication failed before request decoding."},
+          "404": {"description": "The task is unavailable."},
+          "409": {"description": "The task transition precondition failed, or the idempotency binding conflicts."},
           "503": {"description": "Maintenance administration is unavailable."}
         }
       }
@@ -1299,6 +1333,32 @@
         "type": "object", "additionalProperties": false,
         "required": ["task"],
         "properties": {"task": {"$ref": "#/components/schemas/MaintenanceTaskStatus"}}
+      },
+      "MaintenancePauseRequest": {
+        "type": "object", "additionalProperties": false,
+        "required": ["identity", "resource_generation", "duration_seconds", "idempotency_key"],
+        "properties": {
+          "identity": {"type": "string", "pattern": "^[0-9a-fA-F]{32}$", "minLength": 32, "maxLength": 32},
+          "resource_generation": {"type": "integer", "minimum": 1},
+          "duration_seconds": {"type": "integer", "minimum": 1, "maximum": 86400},
+          "idempotency_key": {"type": "string", "format": "uuid"}
+        }
+      },
+      "MaintenanceResumeRequest": {
+        "type": "object", "additionalProperties": false,
+        "required": ["identity", "idempotency_key"],
+        "properties": {
+          "identity": {"type": "string", "pattern": "^[0-9a-fA-F]{32}$", "minLength": 32, "maxLength": 32},
+          "idempotency_key": {"type": "string", "format": "uuid"}
+        }
+      },
+      "MaintenanceControlResponse": {
+        "type": "object", "additionalProperties": false,
+        "required": ["task", "audit_position"],
+        "properties": {
+          "task": {"$ref": "#/components/schemas/MaintenanceTaskStatus"},
+          "audit_position": {"type": "integer", "minimum": 1}
+        }
       },
       "TenantRetentionPreviewRequest": {
         "type": "object",

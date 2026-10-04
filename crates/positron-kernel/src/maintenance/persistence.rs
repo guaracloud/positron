@@ -357,6 +357,47 @@ impl MaintenanceCoordinator {
         Ok(())
     }
 
+    /// Publishes an operator-attributed finite pause jointly with its task
+    /// state. The caller supplies only an already-validated audit intent.
+    pub fn pause_and_persist_audited(
+        &self,
+        catalog: &Catalog<'_>,
+        identity: MaintenanceTaskId,
+        resource_generation: u64,
+        until: u64,
+        now: u64,
+        audit: crate::AuditIntent,
+    ) -> Result<(), MaintenanceFailure> {
+        if until <= now {
+            return Err(MaintenanceFailure::InvalidInput);
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
+        let mut next = state.clone();
+        let task = next
+            .tasks
+            .get_mut(&identity)
+            .ok_or(MaintenanceFailure::UnknownTask)?;
+        if !task.task.class.deferrable()
+            || task.task.preconditions.resource_generation != resource_generation
+        {
+            return Err(MaintenanceFailure::PreconditionFailed);
+        }
+        if !matches!(
+            task.phase,
+            MaintenanceTaskPhase::Queued | MaintenanceTaskPhase::Deferred
+        ) {
+            return Err(MaintenanceFailure::InvalidTransition);
+        }
+        task.phase = MaintenanceTaskPhase::Deferred;
+        task.pause_until = Some(until);
+        persist_task_state_audited(catalog, task, audit)?;
+        *state = next;
+        Ok(())
+    }
+
     /// Removes a durable pause before returning the task to the queue.
     pub fn resume_and_persist(
         &self,
@@ -378,6 +419,32 @@ impl MaintenanceCoordinator {
         task.phase = MaintenanceTaskPhase::Queued;
         task.pause_until = None;
         persist_task_state(catalog, task, None)?;
+        *state = next;
+        Ok(())
+    }
+
+    /// Publishes an operator-attributed resume jointly with its task state.
+    pub fn resume_and_persist_audited(
+        &self,
+        catalog: &Catalog<'_>,
+        identity: MaintenanceTaskId,
+        audit: crate::AuditIntent,
+    ) -> Result<(), MaintenanceFailure> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| MaintenanceFailure::ConcurrentAccess)?;
+        let mut next = state.clone();
+        let task = next
+            .tasks
+            .get_mut(&identity)
+            .ok_or(MaintenanceFailure::UnknownTask)?;
+        if task.phase != MaintenanceTaskPhase::Deferred {
+            return Err(MaintenanceFailure::InvalidTransition);
+        }
+        task.phase = MaintenanceTaskPhase::Queued;
+        task.pause_until = None;
+        persist_task_state_audited(catalog, task, audit)?;
         *state = next;
         Ok(())
     }

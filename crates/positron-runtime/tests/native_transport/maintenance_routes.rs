@@ -193,3 +193,121 @@ fn maintenance_run_authenticates_before_decoding_its_body() -> Result<(), Box<dy
     );
     Ok(())
 }
+
+#[test]
+fn system_administrator_gets_a_truthful_pause_unknown_task_response()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _guard = live_test_guard();
+    let roots = TestRoots::new("maintenance-pause")?;
+    let paths = roots.paths()?;
+    drop(InstanceBootstrap::initialize(
+        &paths,
+        positron_runtime::InitializationPlan::non_interactive(),
+    )?);
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let host = NativeHost::new(bindings(&roots, "maintenance-pause")?);
+    let process = ApplicationRuntime::start(
+        ServeConfiguration::new(paths, InitializationMode::ExistingOnly),
+        HostInputs::new(&host, &host),
+    )?;
+    let response = http(
+        address(
+            &process.bound_endpoints(),
+            positron_runtime::ListenerRole::Api,
+        )?,
+        "POST",
+        "/v1/maintenance:pause",
+        &[
+            ("Authorization", &format!("Bearer {}", claim.secret())),
+            ("Content-Type", "application/json"),
+        ],
+        br#"{"identity":"00000000000000000000000000000001","resource_generation":1,"duration_seconds":60,"idempotency_key":"00000000-0000-0000-0000-000000000001"}"#,
+    )?;
+    assert_status(response.clone(), 404);
+    assert!(response.contains("\"code\":\"task_unavailable\""));
+    assert_eq!(
+        process.shutdown(ShutdownTrigger::FirstSignal),
+        positron_runtime::ExitOutcome::Graceful
+    );
+    Ok(())
+}
+
+#[test]
+fn system_administrator_gets_a_truthful_resume_unknown_task_response()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _guard = live_test_guard();
+    let roots = TestRoots::new("maintenance-resume")?;
+    let paths = roots.paths()?;
+    drop(InstanceBootstrap::initialize(
+        &paths,
+        positron_runtime::InitializationPlan::non_interactive(),
+    )?);
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let host = NativeHost::new(bindings(&roots, "maintenance-resume")?);
+    let process = ApplicationRuntime::start(
+        ServeConfiguration::new(paths, InitializationMode::ExistingOnly),
+        HostInputs::new(&host, &host),
+    )?;
+    let response = http(
+        address(
+            &process.bound_endpoints(),
+            positron_runtime::ListenerRole::Api,
+        )?,
+        "POST",
+        "/v1/maintenance:resume",
+        &[
+            ("Authorization", &format!("Bearer {}", claim.secret())),
+            ("Content-Type", "application/json"),
+        ],
+        br#"{"identity":"00000000000000000000000000000001","idempotency_key":"00000000-0000-0000-0000-000000000001"}"#,
+    )?;
+    assert_status(response.clone(), 404);
+    assert!(response.contains("\"code\":\"task_unavailable\""));
+    assert_eq!(
+        process.shutdown(ShutdownTrigger::FirstSignal),
+        positron_runtime::ExitOutcome::Graceful
+    );
+    Ok(())
+}
+
+#[test]
+fn maintenance_controls_authenticate_before_decoding_their_bodies()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _guard = live_test_guard();
+    let roots = TestRoots::new("maintenance-controls-auth")?;
+    let paths = roots.paths()?;
+    drop(InstanceBootstrap::initialize(
+        &paths,
+        positron_runtime::InitializationPlan::non_interactive(),
+    )?);
+    let _claim = InstanceBootstrap::claim(&paths)?;
+    let host = NativeHost::new(bindings(&roots, "maintenance-controls-auth")?);
+    let process = ApplicationRuntime::start(
+        ServeConfiguration::new(paths, InitializationMode::ExistingOnly),
+        HostInputs::new(&host, &host),
+    )?;
+    let address = address(
+        &process.bound_endpoints(),
+        positron_runtime::ListenerRole::Api,
+    )?;
+    for path in [
+        positron_api::maintenance::PAUSE_HTTP_PATH,
+        positron_api::maintenance::RESUME_HTTP_PATH,
+    ] {
+        assert_status(
+            http(
+                address,
+                "POST",
+                path,
+                &[("Content-Type", "application/json")],
+                br#"{"unexpected":"body must remain unread"}"#,
+            )?,
+            401,
+        );
+    }
+    assert_eq!(
+        process.shutdown(ShutdownTrigger::FirstSignal),
+        positron_runtime::ExitOutcome::Graceful
+    );
+    Ok(())
+}

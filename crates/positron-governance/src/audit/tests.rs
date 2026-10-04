@@ -1,18 +1,57 @@
 use positron_domain::identity::{PrincipalId, TenantId, TenantSlug};
+use positron_kernel::MaintenanceTaskId;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use super::{
     CatalogRootRotationStage, GovernanceAuditEntry, InitializationAuditEntry,
-    schema_checkpoint_audit_intent,
+    MAINTENANCE_CONTROL_AUDIT_MAGIC, schema_checkpoint_audit_intent,
 };
+
+#[test]
+fn maintenance_control_audit_is_closed_bounded_and_backward_safe() {
+    let mut intent = Vec::with_capacity(81);
+    intent.extend_from_slice(&MAINTENANCE_CONTROL_AUDIT_MAGIC);
+    intent.push(1);
+    intent.extend_from_slice(&[1; 16]);
+    intent.extend_from_slice(&[2; 16]);
+    intent.extend_from_slice(&[3; 16]);
+    intent.extend_from_slice(&4_u64.to_be_bytes());
+    intent.extend_from_slice(&60_u64.to_be_bytes());
+    intent.extend_from_slice(&120_u64.to_be_bytes());
+    let entry = GovernanceAuditEntry::decode_fields(9, [4; 16], &intent)
+        .expect("current maintenance control audit");
+    let GovernanceAuditEntry::MaintenanceControl(entry) = entry else {
+        panic!("maintenance control audit entry");
+    };
+    assert!(entry.is_pause());
+    assert_eq!(entry.duration_seconds(), 60);
+    assert_eq!(entry.pause_until_unix_seconds(), 120);
+    for length in 0..intent.len() {
+        assert!(GovernanceAuditEntry::decode_fields(9, [4; 16], &intent[..length]).is_err());
+    }
+    let mut malformed = intent;
+    malformed[8] = 2;
+    assert!(GovernanceAuditEntry::decode_fields(9, [4; 16], &malformed).is_err());
+}
 use crate::{
-    ApiKeyLifecycleAction, ConfigurationAuditContext, ConfigurationAuditOutcome,
-    ConfigurationAuditRequest, ConfigurationWithPlaintextAuditRequest, DurableOperationKind,
-    DurableOperationPhase, DurableOperationStatus, InitialAuditContext, InitialGovernanceIntent,
-    InitialTenantIntent, ListenerTransportAuditEntry, ListenerTransportAuditRequest,
-    ListenerTransportConfigurationProvenance, ListenerTransportRole, ResourceGeneration,
-    TlsMaterialReloadAuditRequest, TlsMaterialReloadListenerSet, TlsMaterialReloadOutcome,
+    AdministrativeIdempotencyKey, ApiKeyLifecycleAction, ConfigurationAuditContext,
+    ConfigurationAuditOutcome, ConfigurationAuditRequest, ConfigurationWithPlaintextAuditRequest,
+    DurableOperationKind, DurableOperationPhase, DurableOperationStatus, InitialAuditContext,
+    InitialGovernanceIntent, InitialTenantIntent, ListenerTransportAuditEntry,
+    ListenerTransportAuditRequest, ListenerTransportConfigurationProvenance, ListenerTransportRole,
+    ResourceGeneration, TlsMaterialReloadAuditRequest, TlsMaterialReloadListenerSet,
+    TlsMaterialReloadOutcome, maintenance_control_audit_intent,
 };
+
+#[test]
+fn maintenance_control_audit_intent_rejects_unbound_action_fields() {
+    let actor = PrincipalId::from_bytes([1; 16]).expect("nonzero actor");
+    let key = AdministrativeIdempotencyKey::new([2; 16]).expect("nonzero idempotency key");
+    let task = MaintenanceTaskId::new([3; 16]).expect("nonzero task");
+    assert!(maintenance_control_audit_intent(actor, key, task, true, 4, 60, Some(120)).is_ok());
+    assert!(maintenance_control_audit_intent(actor, key, task, true, 0, 60, Some(120)).is_err());
+    assert!(maintenance_control_audit_intent(actor, key, task, false, 4, 0, None).is_err());
+}
 
 #[test]
 fn legacy_durable_operation_audit_remains_readable() {

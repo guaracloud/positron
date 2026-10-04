@@ -40,6 +40,10 @@ pub(super) fn api_body_limit(method: &str, path: &str) -> usize {
         positron_api::maintenance::RUN_HTTP_PATH => {
             positron_api::maintenance::MAX_RUN_REQUEST_BYTES
         },
+        positron_api::maintenance::PAUSE_HTTP_PATH
+        | positron_api::maintenance::RESUME_HTTP_PATH => {
+            positron_api::maintenance::MAX_CONTROL_REQUEST_BYTES
+        },
         positron_api::tenant_aliases::HTTP_PATH => positron_api::tenant_aliases::MAX_REQUEST_BYTES,
         positron_api::tenant_service::CREATE_HTTP_PATH
         | positron_api::tenant_service::INSPECT_HTTP_PATH
@@ -74,6 +78,8 @@ fn api_path_is_known(path: &str) -> bool {
             | positron_api::maintenance::STATUS_HTTP_PATH
             | positron_api::maintenance::EXPLAIN_HTTP_PATH
             | positron_api::maintenance::RUN_HTTP_PATH
+            | positron_api::maintenance::PAUSE_HTTP_PATH
+            | positron_api::maintenance::RESUME_HTTP_PATH
             | positron_api::tenant_aliases::HTTP_PATH
             | positron_api::tenant_service::CREATE_HTTP_PATH
             | positron_api::tenant_service::INSPECT_HTTP_PATH
@@ -221,6 +227,50 @@ pub(super) fn route_tls_api<S: Read + Write>(
                 positron_api::maintenance::MAX_RUN_REQUEST_BYTES,
             )?;
             match services.run_maintenance(&bearer, &body) {
+                Ok(response) => Ok(Response {
+                    status: 200,
+                    content_type: "application/json",
+                    body: response.encode().map_err(|_| Response::empty(503))?,
+                    retry_after_seconds: None,
+                }),
+                Err((status, code)) => {
+                    Ok(Response::json(status, format!("{{\"code\":\"{code}\"}}")))
+                },
+            }
+        },
+        ("POST", positron_api::maintenance::PAUSE_HTTP_PATH) => {
+            let services = services.ok_or_else(|| Response::empty(503))?;
+            let bearer = Zeroizing::new(head.bearer.take().ok_or_else(|| {
+                Response::json(401, "{\"code\":\"authentication_rejected\"}".to_owned())
+            })?);
+            let body = read_body(
+                stream,
+                head.content_length,
+                positron_api::maintenance::MAX_CONTROL_REQUEST_BYTES,
+            )?;
+            match services.pause_maintenance(&bearer, &body) {
+                Ok(response) => Ok(Response {
+                    status: 200,
+                    content_type: "application/json",
+                    body: response.encode().map_err(|_| Response::empty(503))?,
+                    retry_after_seconds: None,
+                }),
+                Err((status, code)) => {
+                    Ok(Response::json(status, format!("{{\"code\":\"{code}\"}}")))
+                },
+            }
+        },
+        ("POST", positron_api::maintenance::RESUME_HTTP_PATH) => {
+            let services = services.ok_or_else(|| Response::empty(503))?;
+            let bearer = Zeroizing::new(head.bearer.take().ok_or_else(|| {
+                Response::json(401, "{\"code\":\"authentication_rejected\"}".to_owned())
+            })?);
+            let body = read_body(
+                stream,
+                head.content_length,
+                positron_api::maintenance::MAX_CONTROL_REQUEST_BYTES,
+            )?;
+            match services.resume_maintenance(&bearer, &body) {
                 Ok(response) => Ok(Response {
                     status: 200,
                     content_type: "application/json",
@@ -512,6 +562,50 @@ pub(super) fn route<S: Read + Write>(
                 positron_api::maintenance::MAX_RUN_REQUEST_BYTES,
             )?;
             match services.run_maintenance(&bearer, &body) {
+                Ok(response) => Ok(Response {
+                    status: 200,
+                    content_type: "application/json",
+                    body: response.encode().map_err(|_| Response::empty(503))?,
+                    retry_after_seconds: None,
+                }),
+                Err((status, code)) => {
+                    Ok(Response::json(status, format!("{{\"code\":\"{code}\"}}")))
+                },
+            }
+        },
+        (ListenerRole::Api, "POST", positron_api::maintenance::PAUSE_HTTP_PATH) => {
+            let services = services.ok_or_else(|| Response::empty(503))?;
+            let bearer = Zeroizing::new(head.bearer.take().ok_or_else(|| {
+                Response::json(401, "{\"code\":\"authentication_rejected\"}".to_owned())
+            })?);
+            let body = read_body(
+                stream,
+                head.content_length,
+                positron_api::maintenance::MAX_CONTROL_REQUEST_BYTES,
+            )?;
+            match services.pause_maintenance(&bearer, &body) {
+                Ok(response) => Ok(Response {
+                    status: 200,
+                    content_type: "application/json",
+                    body: response.encode().map_err(|_| Response::empty(503))?,
+                    retry_after_seconds: None,
+                }),
+                Err((status, code)) => {
+                    Ok(Response::json(status, format!("{{\"code\":\"{code}\"}}")))
+                },
+            }
+        },
+        (ListenerRole::Api, "POST", positron_api::maintenance::RESUME_HTTP_PATH) => {
+            let services = services.ok_or_else(|| Response::empty(503))?;
+            let bearer = Zeroizing::new(head.bearer.take().ok_or_else(|| {
+                Response::json(401, "{\"code\":\"authentication_rejected\"}".to_owned())
+            })?);
+            let body = read_body(
+                stream,
+                head.content_length,
+                positron_api::maintenance::MAX_CONTROL_REQUEST_BYTES,
+            )?;
+            match services.resume_maintenance(&bearer, &body) {
                 Ok(response) => Ok(Response {
                     status: 200,
                     content_type: "application/json",
