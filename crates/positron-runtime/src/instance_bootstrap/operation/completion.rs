@@ -124,6 +124,7 @@ pub(super) fn outcome(
         #[cfg(any(test, fuzzing))]
         audit,
         _authority: authority,
+        maintenance: std::sync::Mutex::new(positron_kernel::MaintenanceCoordinator::new()),
         retention_time,
         instance: record.instance,
         tenant: record.tenant,

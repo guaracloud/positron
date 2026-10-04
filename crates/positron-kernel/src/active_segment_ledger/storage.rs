@@ -17,10 +17,10 @@ use super::io::{
     map_errno, map_io_error, open_existing_directory, open_or_create_directory, open_regular,
     synchronize,
 };
-use super::recovery::frontier_temporary_name;
 use super::recovery::{
     RecoveryMode, RecoveryState, frontier_name, publish_frontier, recover_with_mode, segment_name,
 };
+use super::recovery::{authenticated_frontier_bounds, frontier_temporary_name};
 use super::{
     LedgerFailure, LedgerFailureCode, SegmentId, SegmentProtectionKey, SegmentScope,
     map_frame_failure, object_context,
@@ -359,6 +359,85 @@ impl LedgerStorage {
             })
     }
 
+    pub(super) fn sealed_compaction_source_bound(
+        &self,
+        metadata: SegmentMetadata,
+        protection: &SegmentProtectionKey,
+        instance: InstanceId,
+    ) -> Result<Option<(usize, usize)>, LedgerFailure> {
+        if metadata.state != SegmentState::Sealed {
+            return Err(LedgerFailure::new(LedgerFailureCode::InvalidInput));
+        }
+        let mut file = open_regular(&self.sealed, &segment_name(metadata.id), false)?;
+        let mut header = vec![0_u8; MAX_HEADER_BYTES];
+        let header_bytes = file.read(&mut header).map_err(map_io_error)?;
+        header.truncate(header_bytes);
+        let decoded = decode_header(&header)?;
+        if decoded.route != protection.route {
+            return Err(LedgerFailure::new(LedgerFailureCode::AuthenticationFailed));
+        }
+        let object = object_context(metadata.scope, metadata.id)?;
+        let key = DataProtection::unwrap_segment_key_with_route(
+            &protection.key,
+            decoded.wrapped_key,
+            instance.to_bytes(),
+            object,
+            decoded.route,
+        )
+        .map_err(map_frame_failure)?;
+        let context = object
+            .frame(SegmentFramePurpose::SegmentMetadata, FrameSequence::new(0))
+            .map_err(map_frame_failure)?;
+        let verified = DataProtection::open_frame(
+            &key,
+            context,
+            decoded.encrypted_metadata,
+            FrameLimits::new(MAX_ENCRYPTED_METADATA_BYTES).map_err(map_frame_failure)?,
+        )
+        .map_err(map_frame_failure)?;
+        let physical = decode_metadata(verified.as_plaintext())?
+            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::AuthenticationFailed))?;
+        if physical.state != SegmentState::Active
+            || physical.scope != metadata.scope
+            || physical.id != metadata.id
+            || physical.base_position != metadata.base_position
+        {
+            return Err(LedgerFailure::new(LedgerFailureCode::AuthenticationFailed));
+        }
+        let file_bytes = file.metadata().map_err(map_io_error)?.len();
+        if !entry_exists(&self.sealed, &frontier_name(metadata.id))? {
+            let header_bytes = u64::try_from(decoded.encoded_bytes)
+                .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+            return if file_bytes == header_bytes {
+                Ok(None)
+            } else {
+                Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))
+            };
+        }
+        let (durable_bytes, blocks) =
+            authenticated_frontier_bounds(&self.sealed, metadata.id, &key)?;
+        if file_bytes != durable_bytes {
+            return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
+        }
+        let frontier_bytes = unix_fs::statat(
+            &self.sealed,
+            frontier_name(metadata.id),
+            AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(map_errno)?;
+        if !unix_fs::FileType::from_raw_mode(frontier_bytes.st_mode).is_file() {
+            return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
+        }
+        let total = usize::try_from(durable_bytes)
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?
+            .checked_add(
+                usize::try_from(frontier_bytes.st_size)
+                    .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?,
+            )
+            .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?;
+        Ok(Some((total, blocks)))
+    }
+
     pub(super) fn is_scope_metadata(&self, bytes: &[u8], scope: SegmentScope) -> bool {
         decode_metadata(bytes)
             .ok()
@@ -393,6 +472,8 @@ impl LedgerStorage {
         {
             return Err(LedgerFailure::new(LedgerFailureCode::IntegrityCorruption));
         }
+        #[cfg(any(test, fuzzing, feature = "test-support"))]
+        emit_event(LedgerFileEvent::BeforeReclaimRetiredSegment)?;
         let mut changed = false;
         for name in [segment_name(metadata.id), frontier_name(metadata.id)] {
             match unix_fs::unlinkat(&self.sealed, name, AtFlags::empty()) {

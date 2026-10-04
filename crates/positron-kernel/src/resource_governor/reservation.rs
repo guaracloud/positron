@@ -144,7 +144,7 @@ impl<'authority> ResourceReservation<'authority> {
                     tenant: reserved_tenant,
                     kind: WorkKind::Ingest,
                     ..
-                } if reserved_tenant == tenant
+                } if reserved_tenant == Some(tenant)
             )
             && self.amounts.get(ResourceDimension::MemoryBytes) >= memory_bytes
     }
@@ -161,7 +161,7 @@ impl<'authority> ResourceReservation<'authority> {
                 tenant: reserved_tenant,
                 kind: WorkKind::Ingest,
                 ..
-            } => reserved_tenant == tenant,
+            } => reserved_tenant == Some(tenant),
             ReservationIdentity::Recovery {
                 scope: RecoveryScope::Tenant(reserved_tenant),
                 kind: RecoveryWorkKind::Repair,
@@ -190,6 +190,40 @@ impl<'authority> ResourceReservation<'authority> {
                 ReservationIdentity::Recovery {
                     scope: super::RecoveryScope::Tenant(reserved_tenant),
                     kind: super::RecoveryWorkKind::EmergencyCompaction,
+                } if reserved_tenant == tenant
+            )
+    }
+
+    /// Confirms that this live grant is the tenant-scoped ordinary-maintenance
+    /// capability for a coordinator-dispatched compaction handler.
+    #[must_use]
+    pub(crate) fn authorizes_ordinary_compaction(
+        &self,
+        tenant: positron_domain::identity::TenantId,
+    ) -> bool {
+        self.active
+            && matches!(
+                self.identity,
+                ReservationIdentity::Ordinary {
+                    tenant: Some(reserved_tenant),
+                    kind: WorkKind::OrdinaryMaintenanceBackup,
+                    ..
+                } if reserved_tenant == tenant
+            )
+    }
+
+    /// Confirms that this live grant owns the tenant-scoped Retention
+    /// preparation capability before the ledger decodes publication metadata.
+    pub(crate) fn authorizes_retention_publication(
+        &self,
+        tenant: positron_domain::identity::TenantId,
+    ) -> bool {
+        self.active
+            && matches!(
+                self.identity,
+                ReservationIdentity::Recovery {
+                    scope: super::RecoveryScope::Tenant(reserved_tenant),
+                    kind: super::RecoveryWorkKind::Retention,
                 } if reserved_tenant == tenant
             )
     }

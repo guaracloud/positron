@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 use positron_governance::{
     AuthorizedContext, CompatibilityHints, Identity, PresentedCredential, RequestedIntent,
@@ -17,6 +17,8 @@ mod api_keys;
 mod export_destinations;
 mod failure;
 mod ingest;
+mod maintenance;
+mod maintenance_api;
 mod otlp;
 pub(crate) mod policy;
 mod query;
@@ -67,6 +69,11 @@ mod tests;
 pub struct ServiceHandle {
     schema_sessions: TenantSchemaRegistry,
     shutdown_schema_capacity: Arc<Mutex<Option<TransferredResourceReservation>>>,
+    // Catalog::open deliberately owns the Kernel's sole writer lease. Runtime
+    // entrypoints share this gate so foreground work and maintenance wait
+    // cooperatively instead of racing the lease and surfacing false outages.
+    catalog_operation: Arc<Mutex<()>>,
+    maintenance_wake: maintenance::MaintenanceWake,
     export_destination_resolver: Option<Arc<dyn positron_query::ExportDestinationResolver>>,
     #[cfg(test)]
     receiver_test_backend: Arc<Mutex<Option<Arc<dyn ReceiverTestBackend>>>>,
@@ -117,6 +124,54 @@ impl std::fmt::Debug for ServiceHandle {
 }
 
 impl ServiceHandle {
+    #[cfg(test)]
+    pub(crate) fn wake_maintenance_worker(&self) -> Result<bool, ServiceFailure> {
+        maintenance::wake_runtime_maintenance(self, None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wake_maintenance_worker_with_cancellation(
+        &self,
+        cancellation: &crate::TaskCancellation,
+    ) -> Result<bool, ServiceFailure> {
+        maintenance::wake_runtime_maintenance(self, Some(cancellation))
+    }
+
+    pub(crate) fn run_maintenance_worker(
+        &self,
+        cancellation: &crate::TaskCancellation,
+    ) -> Result<(), ServiceFailure> {
+        maintenance::run_runtime_maintenance_worker(self, cancellation, &self.maintenance_wake)
+    }
+
+    pub(crate) fn catalog_operation(&self) -> Result<MutexGuard<'_, ()>, ServiceFailure> {
+        self.catalog_operation
+            .lock()
+            .map_err(|_| ServiceFailure::Internal)
+    }
+
+    pub(crate) fn catalog_operation_gate(&self) -> Arc<Mutex<()>> {
+        Arc::clone(&self.catalog_operation)
+    }
+
+    pub(crate) fn try_catalog_operation(
+        &self,
+    ) -> Result<Option<MutexGuard<'_, ()>>, ServiceFailure> {
+        match self.catalog_operation.try_lock() {
+            Ok(operation) => Ok(Some(operation)),
+            Err(TryLockError::WouldBlock) => Ok(None),
+            Err(TryLockError::Poisoned(_)) => Err(ServiceFailure::Internal),
+        }
+    }
+
+    pub(crate) fn notify_maintenance_worker(&self) {
+        self.maintenance_wake.notify();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn maintenance_wake_generation(&self) -> u64 {
+        self.maintenance_wake.generation()
+    }
     #[allow(dead_code)]
     pub(crate) fn new(instance: Arc<InitializedInstance>) -> Result<Self, ServiceFailure> {
         Self::new_with_cancellation(instance, None)
@@ -134,6 +189,7 @@ impl ServiceHandle {
         cancellation: Option<&crate::TaskCancellation>,
         export_destination_resolver: Option<Arc<dyn positron_query::ExportDestinationResolver>>,
     ) -> Result<Self, ServiceFailure> {
+        maintenance::restore(&instance)?;
         let fallback = crate::TaskCancellation::new();
         let cancellation = cancellation.unwrap_or(&fallback);
         let recovered = schema_bootstrap::recover(&instance, cancellation)?;
@@ -149,6 +205,8 @@ impl ServiceHandle {
         Ok(Self {
             schema_sessions: recovered.registry,
             shutdown_schema_capacity: Arc::new(Mutex::new(None)),
+            catalog_operation: Arc::new(Mutex::new(())),
+            maintenance_wake: maintenance::MaintenanceWake::for_instance(instance.instance),
             export_destination_resolver,
             #[cfg(test)]
             receiver_test_backend: Arc::new(Mutex::new(None)),
@@ -164,6 +222,7 @@ impl ServiceHandle {
         if self.schema_session_with_checkpoint_changes()?.is_none() {
             return Ok(());
         }
+        let _catalog_operation = self.catalog_operation()?;
         let capacity = schema_maintenance::reserve_shutdown_capacity(&self.instance)?;
         *self
             .shutdown_schema_capacity
@@ -176,6 +235,7 @@ impl ServiceHandle {
         let Some(session) = self.schema_session_with_checkpoint_changes()? else {
             return Ok(());
         };
+        let _catalog_operation = self.catalog_operation()?;
         let capacity = self
             .shutdown_schema_capacity
             .lock()
@@ -192,8 +252,11 @@ impl ServiceHandle {
     ) -> Result<Option<TenantSchemaSession>, ServiceFailure> {
         let session = self
             .schema_sessions
-            .session(self.instance.tenant, self.instance.resource_governor())
+            .session_if_present(self.instance.tenant)
             .map_err(|_| ServiceFailure::CapacityUnavailable)?;
+        let Some(session) = session else {
+            return Ok(None);
+        };
         session
             .has_checkpoint_changes()
             .map(|changed| changed.then_some(session))
@@ -257,6 +320,7 @@ impl ServiceHandle {
         bearer: &str,
         hints: CompatibilityHints,
     ) -> Result<AuthorizedContext, ServiceFailure> {
+        let _catalog_operation = self.catalog_operation()?;
         let instance = &self.instance;
         let identity = instance
             .durable_identity()
@@ -481,6 +545,7 @@ impl ServiceHandle {
         &self,
         context: AuthorizedContext,
     ) -> Result<(), ServiceFailure> {
+        let _catalog_operation = self.catalog_operation()?;
         let identity = self
             .instance
             .durable_identity()

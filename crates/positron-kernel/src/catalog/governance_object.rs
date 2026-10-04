@@ -283,6 +283,36 @@ impl CatalogGovernanceObject {
         Ok(self.lifecycle_end)
     }
 
+    /// Produces a fixture-only successor with a different durable checkpoint
+    /// key fingerprint while preserving its verification public key and every
+    /// other governance authority.
+    #[cfg(feature = "test-support")]
+    pub fn with_fixture_integrity_key_fingerprint(
+        &self,
+        fingerprint: [u8; 32],
+    ) -> Result<Vec<u8>, CatalogFailure> {
+        if fingerprint.iter().all(|byte| *byte == 0) {
+            return Err(corrupt());
+        }
+        let mut encoded = self.with_credentials(self.credential_generation, &self.credentials)?;
+        let mut expected = [0_u8; 64];
+        expected[..32].copy_from_slice(&self.integrity_public_key);
+        expected[32..].copy_from_slice(&self.integrity_key_fingerprint);
+        let mut match_offset = None;
+        for (offset, candidate) in encoded.windows(expected.len()).enumerate() {
+            if candidate == expected && match_offset.replace(offset).is_some() {
+                return Err(corrupt());
+            }
+        }
+        let offset = match_offset.ok_or_else(corrupt)?;
+        let start = offset.checked_add(32).ok_or_else(corrupt)?;
+        let destination = encoded
+            .get_mut(start..start.checked_add(32).ok_or_else(corrupt)?)
+            .ok_or_else(corrupt)?;
+        destination.copy_from_slice(&fingerprint);
+        Ok(encoded)
+    }
+
     /// Encodes a successor credential set while preserving all non-credential
     /// governance authority verbatim.
     pub fn with_credentials(
@@ -683,6 +713,14 @@ pub struct CatalogLogRetentionPolicy {
 }
 
 impl CatalogLogRetentionPolicy {
+    /// The authenticated governance object from which this exact policy was
+    /// derived. A later object with the same duration is still a different
+    /// policy authority for an already-admitted maintenance task.
+    #[must_use]
+    pub const fn object_id(&self) -> CatalogObjectId {
+        self.object
+    }
+
     #[must_use]
     pub const fn instance(&self) -> InstanceId {
         self.instance

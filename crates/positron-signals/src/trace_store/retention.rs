@@ -55,6 +55,10 @@ impl TraceRetentionPolicy {
 pub struct TraceRetentionBucket(positron_kernel::RetentionBucket);
 
 impl TraceRetentionBucket {
+    pub(super) const fn from_kernel(bucket: positron_kernel::RetentionBucket) -> Self {
+        Self(bucket)
+    }
+
     #[must_use]
     pub const fn tenant(self) -> TenantId {
         self.0.tenant()

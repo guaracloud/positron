@@ -26,6 +26,9 @@ impl ServiceHandle {
         bearer: &str,
         body: &[u8],
     ) -> Result<TenantCreateResponse, TenantServiceHttpFailure> {
+        let _catalog_operation = self
+            .catalog_operation()
+            .map_err(|_| TenantServiceHttpFailure::Code(503, "administration_unavailable"))?;
         let actor = system_actor(self, bearer)?;
         let request = TenantCreateRequest::decode(body).map_err(invalid)?;
         let slug = TenantSlug::parse_canonical(request.slug()).map_err(invalid)?;
@@ -55,6 +58,9 @@ impl ServiceHandle {
         bearer: &str,
         body: &[u8],
     ) -> Result<TenantInspectResponse, TenantServiceHttpFailure> {
+        let _catalog_operation = self
+            .catalog_operation()
+            .map_err(|_| TenantServiceHttpFailure::Code(503, "administration_unavailable"))?;
         let actor = system_actor(self, bearer)?;
         let request = TenantInspectRequest::decode(body).map_err(invalid)?;
         let tenant = TenantId::parse_canonical(request.tenant()).map_err(invalid)?;
@@ -78,6 +84,9 @@ impl ServiceHandle {
         bearer: &str,
         body: &[u8],
     ) -> Result<TenantListResponse, TenantServiceHttpFailure> {
+        let _catalog_operation = self
+            .catalog_operation()
+            .map_err(|_| TenantServiceHttpFailure::Code(503, "administration_unavailable"))?;
         let actor = system_actor(self, bearer)?;
         let request = TenantListRequest::decode(body).map_err(invalid)?;
         let continuation = request.continuation().map(parse_continuation).transpose()?;
@@ -103,6 +112,9 @@ impl ServiceHandle {
         bearer: &str,
         body: &[u8],
     ) -> Result<TenantDisplayNameUpdateResponse, TenantServiceHttpFailure> {
+        let _catalog_operation = self
+            .catalog_operation()
+            .map_err(|_| TenantServiceHttpFailure::Code(503, "administration_unavailable"))?;
         let actor = system_actor(self, bearer)?;
         let request = TenantDisplayNameUpdateRequest::decode(body).map_err(invalid)?;
         let tenant = TenantId::parse_canonical(request.tenant()).map_err(invalid)?;

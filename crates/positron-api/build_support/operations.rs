@@ -63,6 +63,33 @@ const TENANT_ALIAS_METHODS: &[MethodSpec] = &[MethodSpec {
     input: ".positron.v1.TenantAliasBindRequest",
     output: ".positron.v1.TenantAliasBindResponse",
 }];
+const MAINTENANCE_METHODS: &[MethodSpec] = &[
+    MethodSpec {
+        name: "Status",
+        input: ".positron.v1.MaintenanceStatusRequest",
+        output: ".positron.v1.MaintenanceStatusResponse",
+    },
+    MethodSpec {
+        name: "Explain",
+        input: ".positron.v1.MaintenanceExplainRequest",
+        output: ".positron.v1.MaintenanceExplainResponse",
+    },
+    MethodSpec {
+        name: "Run",
+        input: ".positron.v1.MaintenanceRunRequest",
+        output: ".positron.v1.MaintenanceRunResponse",
+    },
+    MethodSpec {
+        name: "Pause",
+        input: ".positron.v1.MaintenancePauseRequest",
+        output: ".positron.v1.MaintenanceControlResponse",
+    },
+    MethodSpec {
+        name: "Resume",
+        input: ".positron.v1.MaintenanceResumeRequest",
+        output: ".positron.v1.MaintenanceControlResponse",
+    },
+];
 const POLICY_METHODS: &[MethodSpec] = &[
     MethodSpec {
         name: "Validate",
@@ -115,6 +142,10 @@ pub(crate) const SERVICES: &[ServiceSpec] = &[
     ServiceSpec {
         name: "TenantAliasService",
         methods: TENANT_ALIAS_METHODS,
+    },
+    ServiceSpec {
+        name: "MaintenanceService",
+        methods: MAINTENANCE_METHODS,
     },
     ServiceSpec {
         name: "PolicyService",

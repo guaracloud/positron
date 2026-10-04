@@ -234,16 +234,16 @@ fn second_signal_cleanup_overflow_is_bounded_and_deterministic()
     else {
         panic!("cleanup overflow must remain typed");
     };
-    assert_eq!(cleanup.task_failures(), 6);
+    assert_eq!(cleanup.task_failures(), 7);
     assert_eq!(cleanup.listener_failures(), 1);
     assert!(cleanup.overflowed());
     assert_eq!(
         cleanup.failed_roles().collect::<Vec<_>>(),
         [
+            positron_runtime::CleanupRole::Task(TaskRole::Maintenance),
             positron_runtime::CleanupRole::Task(TaskRole::LokiPush),
             positron_runtime::CleanupRole::Task(TaskRole::OtlpHttp),
             positron_runtime::CleanupRole::Task(TaskRole::OtlpGrpc),
-            positron_runtime::CleanupRole::Task(TaskRole::Api),
         ]
     );
     assert!(roots.acquire_volume_again().is_ok());
@@ -308,6 +308,7 @@ fn deadline_aborts_every_task_and_never_reports_graceful_completion()
             .cloned()
             .collect::<Vec<_>>(),
         [
+            TaskEvent::Aborted(TaskRole::Maintenance, ProcessPhase::Stopping, true),
             TaskEvent::Aborted(TaskRole::LokiPush, ProcessPhase::Stopping, true),
             TaskEvent::Aborted(TaskRole::OtlpHttp, ProcessPhase::Stopping, true),
             TaskEvent::Aborted(TaskRole::OtlpGrpc, ProcessPhase::Stopping, true),
@@ -432,10 +433,43 @@ fn first_signal_closes_admission_joins_registered_tasks_and_releases_ownership_l
     assert_eq!(health.readiness(), Readiness::NotReady);
     assert!(roots.acquire_volume_again().is_ok());
     let events = tasks.events.borrow();
-    assert_eq!(events.len(), 18);
+    assert_eq!(events.len(), 21);
+    let expected = [
+        TaskRole::Control,
+        TaskRole::Operations,
+        TaskRole::Api,
+        TaskRole::OtlpGrpc,
+        TaskRole::OtlpHttp,
+        TaskRole::LokiPush,
+        TaskRole::Maintenance,
+    ];
+    assert_eq!(
+        &events[..expected.len()],
+        expected.map(TaskEvent::Registered)
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter_map(|event| match event {
+                TaskEvent::Registered(role) => Some(*role),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        expected
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter_map(|event| match event {
+                TaskEvent::Spawned(role) => Some(*role),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        expected
+    );
     assert!(matches!(
         events.last(),
-        Some(TaskEvent::Joined(TaskRole::LokiPush, ..))
+        Some(TaskEvent::Joined(TaskRole::Maintenance, ..))
     ));
     Ok(())
 }

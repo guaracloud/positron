@@ -33,6 +33,17 @@ pub(super) fn api_body_limit(method: &str, path: &str) -> usize {
         | positron_api::tenant_retention::UPDATE_HTTP_PATH => {
             positron_api::tenant_retention::MAX_REQUEST_BYTES
         },
+        positron_api::maintenance::STATUS_HTTP_PATH
+        | positron_api::maintenance::EXPLAIN_HTTP_PATH => {
+            positron_api::maintenance::MAX_REQUEST_BYTES
+        },
+        positron_api::maintenance::RUN_HTTP_PATH => {
+            positron_api::maintenance::MAX_RUN_REQUEST_BYTES
+        },
+        positron_api::maintenance::PAUSE_HTTP_PATH
+        | positron_api::maintenance::RESUME_HTTP_PATH => {
+            positron_api::maintenance::MAX_CONTROL_REQUEST_BYTES
+        },
         positron_api::tenant_aliases::HTTP_PATH => positron_api::tenant_aliases::MAX_REQUEST_BYTES,
         positron_api::tenant_service::CREATE_HTTP_PATH
         | positron_api::tenant_service::INSPECT_HTTP_PATH
@@ -64,6 +75,11 @@ fn api_path_is_known(path: &str) -> bool {
             | positron_api::tenant_lifecycle::HTTP_PATH
             | positron_api::tenant_retention::PREVIEW_HTTP_PATH
             | positron_api::tenant_retention::UPDATE_HTTP_PATH
+            | positron_api::maintenance::STATUS_HTTP_PATH
+            | positron_api::maintenance::EXPLAIN_HTTP_PATH
+            | positron_api::maintenance::RUN_HTTP_PATH
+            | positron_api::maintenance::PAUSE_HTTP_PATH
+            | positron_api::maintenance::RESUME_HTTP_PATH
             | positron_api::tenant_aliases::HTTP_PATH
             | positron_api::tenant_service::CREATE_HTTP_PATH
             | positron_api::tenant_service::INSPECT_HTTP_PATH
@@ -155,6 +171,116 @@ pub(super) fn route_tls_api<S: Read + Write>(
                 positron_api::tenant_retention::MAX_REQUEST_BYTES,
             )?;
             tenant_retention_update_response(services, &bearer, &body)
+        },
+        ("POST", positron_api::maintenance::STATUS_HTTP_PATH) => {
+            let services = services.ok_or_else(|| Response::empty(503))?;
+            let bearer = Zeroizing::new(head.bearer.take().ok_or_else(|| {
+                Response::json(401, "{\"code\":\"authentication_rejected\"}".to_owned())
+            })?);
+            let body = read_body(
+                stream,
+                head.content_length,
+                positron_api::maintenance::MAX_REQUEST_BYTES,
+            )?;
+            match services.maintenance_status(&bearer, &body) {
+                Ok(response) => Ok(Response {
+                    status: 200,
+                    content_type: "application/json",
+                    body: response.encode().map_err(|_| Response::empty(503))?,
+                    retry_after_seconds: None,
+                }),
+                Err((status, code)) => {
+                    Ok(Response::json(status, format!("{{\"code\":\"{code}\"}}")))
+                },
+            }
+        },
+        ("POST", positron_api::maintenance::EXPLAIN_HTTP_PATH) => {
+            let services = services.ok_or_else(|| Response::empty(503))?;
+            let bearer = Zeroizing::new(head.bearer.take().ok_or_else(|| {
+                Response::json(401, "{\"code\":\"authentication_rejected\"}".to_owned())
+            })?);
+            let body = read_body(
+                stream,
+                head.content_length,
+                positron_api::maintenance::MAX_REQUEST_BYTES,
+            )?;
+            match services.explain_maintenance_task(&bearer, &body) {
+                Ok(response) => Ok(Response {
+                    status: 200,
+                    content_type: "application/json",
+                    body: response.encode().map_err(|_| Response::empty(503))?,
+                    retry_after_seconds: None,
+                }),
+                Err((status, code)) => {
+                    Ok(Response::json(status, format!("{{\"code\":\"{code}\"}}")))
+                },
+            }
+        },
+        ("POST", positron_api::maintenance::RUN_HTTP_PATH) => {
+            let services = services.ok_or_else(|| Response::empty(503))?;
+            let bearer = Zeroizing::new(head.bearer.take().ok_or_else(|| {
+                Response::json(401, "{\"code\":\"authentication_rejected\"}".to_owned())
+            })?);
+            let body = read_body(
+                stream,
+                head.content_length,
+                positron_api::maintenance::MAX_RUN_REQUEST_BYTES,
+            )?;
+            match services.run_maintenance(&bearer, &body) {
+                Ok(response) => Ok(Response {
+                    status: 200,
+                    content_type: "application/json",
+                    body: response.encode().map_err(|_| Response::empty(503))?,
+                    retry_after_seconds: None,
+                }),
+                Err((status, code)) => {
+                    Ok(Response::json(status, format!("{{\"code\":\"{code}\"}}")))
+                },
+            }
+        },
+        ("POST", positron_api::maintenance::PAUSE_HTTP_PATH) => {
+            let services = services.ok_or_else(|| Response::empty(503))?;
+            let bearer = Zeroizing::new(head.bearer.take().ok_or_else(|| {
+                Response::json(401, "{\"code\":\"authentication_rejected\"}".to_owned())
+            })?);
+            let body = read_body(
+                stream,
+                head.content_length,
+                positron_api::maintenance::MAX_CONTROL_REQUEST_BYTES,
+            )?;
+            match services.pause_maintenance(&bearer, &body) {
+                Ok(response) => Ok(Response {
+                    status: 200,
+                    content_type: "application/json",
+                    body: response.encode().map_err(|_| Response::empty(503))?,
+                    retry_after_seconds: None,
+                }),
+                Err((status, code)) => {
+                    Ok(Response::json(status, format!("{{\"code\":\"{code}\"}}")))
+                },
+            }
+        },
+        ("POST", positron_api::maintenance::RESUME_HTTP_PATH) => {
+            let services = services.ok_or_else(|| Response::empty(503))?;
+            let bearer = Zeroizing::new(head.bearer.take().ok_or_else(|| {
+                Response::json(401, "{\"code\":\"authentication_rejected\"}".to_owned())
+            })?);
+            let body = read_body(
+                stream,
+                head.content_length,
+                positron_api::maintenance::MAX_CONTROL_REQUEST_BYTES,
+            )?;
+            match services.resume_maintenance(&bearer, &body) {
+                Ok(response) => Ok(Response {
+                    status: 200,
+                    content_type: "application/json",
+                    body: response.encode().map_err(|_| Response::empty(503))?,
+                    retry_after_seconds: None,
+                }),
+                Err((status, code)) => {
+                    Ok(Response::json(status, format!("{{\"code\":\"{code}\"}}")))
+                },
+            }
         },
         ("POST", positron_api::tenant_aliases::HTTP_PATH) => {
             let services = services.ok_or_else(|| Response::empty(503))?;
@@ -381,6 +507,116 @@ pub(super) fn route<S: Read + Write>(
             )?;
             tenant_retention_update_response(services, &bearer, &body)
         },
+        (ListenerRole::Api, "POST", positron_api::maintenance::STATUS_HTTP_PATH) => {
+            let services = services.ok_or_else(|| Response::empty(503))?;
+            let bearer = Zeroizing::new(head.bearer.take().ok_or_else(|| {
+                Response::json(401, "{\"code\":\"authentication_rejected\"}".to_owned())
+            })?);
+            let body = read_body(
+                stream,
+                head.content_length,
+                positron_api::maintenance::MAX_REQUEST_BYTES,
+            )?;
+            match services.maintenance_status(&bearer, &body) {
+                Ok(response) => Ok(Response {
+                    status: 200,
+                    content_type: "application/json",
+                    body: response.encode().map_err(|_| Response::empty(503))?,
+                    retry_after_seconds: None,
+                }),
+                Err((status, code)) => {
+                    Ok(Response::json(status, format!("{{\"code\":\"{code}\"}}")))
+                },
+            }
+        },
+        (ListenerRole::Api, "POST", positron_api::maintenance::EXPLAIN_HTTP_PATH) => {
+            let services = services.ok_or_else(|| Response::empty(503))?;
+            let bearer = Zeroizing::new(head.bearer.take().ok_or_else(|| {
+                Response::json(401, "{\"code\":\"authentication_rejected\"}".to_owned())
+            })?);
+            let body = read_body(
+                stream,
+                head.content_length,
+                positron_api::maintenance::MAX_REQUEST_BYTES,
+            )?;
+            match services.explain_maintenance_task(&bearer, &body) {
+                Ok(response) => Ok(Response {
+                    status: 200,
+                    content_type: "application/json",
+                    body: response.encode().map_err(|_| Response::empty(503))?,
+                    retry_after_seconds: None,
+                }),
+                Err((status, code)) => {
+                    Ok(Response::json(status, format!("{{\"code\":\"{code}\"}}")))
+                },
+            }
+        },
+        (ListenerRole::Api, "POST", positron_api::maintenance::RUN_HTTP_PATH) => {
+            let services = services.ok_or_else(|| Response::empty(503))?;
+            let bearer = Zeroizing::new(head.bearer.take().ok_or_else(|| {
+                Response::json(401, "{\"code\":\"authentication_rejected\"}".to_owned())
+            })?);
+            let body = read_body(
+                stream,
+                head.content_length,
+                positron_api::maintenance::MAX_RUN_REQUEST_BYTES,
+            )?;
+            match services.run_maintenance(&bearer, &body) {
+                Ok(response) => Ok(Response {
+                    status: 200,
+                    content_type: "application/json",
+                    body: response.encode().map_err(|_| Response::empty(503))?,
+                    retry_after_seconds: None,
+                }),
+                Err((status, code)) => {
+                    Ok(Response::json(status, format!("{{\"code\":\"{code}\"}}")))
+                },
+            }
+        },
+        (ListenerRole::Api, "POST", positron_api::maintenance::PAUSE_HTTP_PATH) => {
+            let services = services.ok_or_else(|| Response::empty(503))?;
+            let bearer = Zeroizing::new(head.bearer.take().ok_or_else(|| {
+                Response::json(401, "{\"code\":\"authentication_rejected\"}".to_owned())
+            })?);
+            let body = read_body(
+                stream,
+                head.content_length,
+                positron_api::maintenance::MAX_CONTROL_REQUEST_BYTES,
+            )?;
+            match services.pause_maintenance(&bearer, &body) {
+                Ok(response) => Ok(Response {
+                    status: 200,
+                    content_type: "application/json",
+                    body: response.encode().map_err(|_| Response::empty(503))?,
+                    retry_after_seconds: None,
+                }),
+                Err((status, code)) => {
+                    Ok(Response::json(status, format!("{{\"code\":\"{code}\"}}")))
+                },
+            }
+        },
+        (ListenerRole::Api, "POST", positron_api::maintenance::RESUME_HTTP_PATH) => {
+            let services = services.ok_or_else(|| Response::empty(503))?;
+            let bearer = Zeroizing::new(head.bearer.take().ok_or_else(|| {
+                Response::json(401, "{\"code\":\"authentication_rejected\"}".to_owned())
+            })?);
+            let body = read_body(
+                stream,
+                head.content_length,
+                positron_api::maintenance::MAX_CONTROL_REQUEST_BYTES,
+            )?;
+            match services.resume_maintenance(&bearer, &body) {
+                Ok(response) => Ok(Response {
+                    status: 200,
+                    content_type: "application/json",
+                    body: response.encode().map_err(|_| Response::empty(503))?,
+                    retry_after_seconds: None,
+                }),
+                Err((status, code)) => {
+                    Ok(Response::json(status, format!("{{\"code\":\"{code}\"}}")))
+                },
+            }
+        },
         (ListenerRole::Api, "POST", positron_api::tenant_aliases::HTTP_PATH) => {
             let services = services.ok_or_else(|| Response::empty(503))?;
             let bearer = Zeroizing::new(head.bearer.take().ok_or_else(|| {
@@ -532,13 +768,13 @@ pub(super) fn route<S: Read + Write>(
                 Response::json(401, "{\"code\":\"authentication_rejected\"}".to_owned())
             })?);
             health
-                .authorize_configuration_status(&bearer)
-                .map_err(|_| {
-                    Response::json(401, "{\"code\":\"authentication_rejected\"}".to_owned())
-                })?;
-            health
-                .configuration_status()
-                .map_err(|_| Response::empty(503))?
+                .authorized_configuration_status(&bearer)
+                .map_err(|failure| match failure {
+                    crate::health::ConfigurationStatusFailure::AuthenticationRejected => {
+                        Response::json(401, "{\"code\":\"authentication_rejected\"}".to_owned())
+                    },
+                    crate::health::ConfigurationStatusFailure::Unavailable => Response::empty(503),
+                })?
                 .map_or_else(
                     || Ok(Response::empty(503)),
                     |status| Ok(configuration_status_response(health.phase(), &status)),
@@ -578,5 +814,95 @@ pub(super) fn route<S: Read + Write>(
             Ok(Response::empty(405))
         },
         (ListenerRole::Control, _, _) | (_, _, _) => Ok(Response::empty(404)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::io::Cursor;
+    use std::net::{Ipv4Addr, SocketAddr};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::{Arc, Barrier, mpsc};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use super::{RequestHead, route};
+    use positron_kernel::MountQualification;
+
+    use crate::{
+        BootstrapPaths, InitializationPlan, InstanceBootstrap, ListenerRole, ServiceHandle,
+        health::ProcessState,
+    };
+
+    #[test]
+    fn authenticated_status_waits_for_shared_catalog_ownership()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let root = std::env::temp_dir().join(format!("positron-status-ownership-{nonce}"));
+        let data = root.join("data");
+        let secrets = root.join("secrets");
+        fs::create_dir_all(&data)?;
+        fs::create_dir_all(&secrets)?;
+        #[cfg(unix)]
+        fs::set_permissions(&secrets, fs::Permissions::from_mode(0o700))?;
+        let paths = BootstrapPaths::new(&data, &secrets, MountQualification::LocalHost)?;
+        drop(InstanceBootstrap::initialize(
+            &paths,
+            InitializationPlan::non_interactive(),
+        )?);
+        let authorization = InstanceBootstrap::claim(&paths)?.secret().to_owned();
+        let instance = Arc::new(InstanceBootstrap::reopen(&paths)?);
+        let state = ProcessState::starting();
+        state.set_inspection_authority(Arc::clone(&instance))?;
+        let services = ServiceHandle::new(instance)?;
+        state.set_catalog_operation(services.catalog_operation_gate())?;
+        let catalog_operation = services.catalog_operation()?;
+        let barrier = Arc::new(Barrier::new(2));
+        let (result_sender, result_receiver) = mpsc::sync_channel(1);
+        let request_health = state.health();
+        let request_barrier = Arc::clone(&barrier);
+        let request = std::thread::spawn(move || {
+            request_barrier.wait();
+            let mut stream = Cursor::new(Vec::new());
+            let head = RequestHead {
+                method: "GET".to_owned(),
+                path: "/status".to_owned(),
+                content_length: 0,
+                bearer: Some(authorization),
+                content_type: None,
+                content_encoding: None,
+                tenant_hint: None,
+                forwarded_for: None,
+                forwarded_actor: None,
+            };
+            let response = match route(
+                &mut stream,
+                ListenerRole::Operations,
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 1)),
+                None,
+                head,
+                &request_health,
+                None,
+            ) {
+                Ok(response) | Err(response) => response.status(),
+            };
+            let _ = result_sender.send(response);
+        });
+        barrier.wait();
+        assert!(
+            result_receiver
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "authenticated status authorization bypassed shared catalog ownership"
+        );
+        drop(catalog_operation);
+        assert_eq!(result_receiver.recv_timeout(Duration::from_secs(1))?, 503);
+        request
+            .join()
+            .map_err(|_| "status request thread panicked")?;
+        drop(services);
+        fs::remove_dir_all(root)?;
+        Ok(())
     }
 }

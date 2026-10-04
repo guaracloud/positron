@@ -81,13 +81,24 @@ impl GrantRecord {
                     principal,
                     kind,
                 },
-            ) => (
-                u16::try_from(tenant_index).ok()?,
-                Some(tenant),
-                principal,
-                GrantKind::from_ordinary(kind),
-                owner.pools?.shared(),
-            ),
+            ) => {
+                if tenant.is_some() != tenant_index.is_some()
+                    || (tenant.is_none() && principal.is_some())
+                {
+                    return None;
+                }
+                (
+                    tenant_index
+                        .map(u16::try_from)
+                        .transpose()
+                        .ok()?
+                        .unwrap_or(SYSTEM_TENANT_INDEX),
+                    tenant,
+                    principal,
+                    GrantKind::from_ordinary(kind),
+                    owner.pools?.shared(),
+                )
+            },
             (
                 ChargeAttribution::Recovery { tenant_index },
                 ReservationIdentity::Recovery { kind, .. },
@@ -244,7 +255,7 @@ impl GrantRecord {
             let class_pool = OrdinaryPool::for_class(kind.class())?;
             Some(ChargeOwner {
                 attribution: ChargeAttribution::Ordinary {
-                    tenant_index: self.tenant_index()?,
+                    tenant_index: self.tenant_index(),
                 },
                 pools: Some(PoolCharge::new(class_pool, self.shared, protected)),
                 recovery_pools: None,

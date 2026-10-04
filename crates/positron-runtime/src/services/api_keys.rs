@@ -13,6 +13,9 @@ impl ServiceHandle {
         bearer: &str,
         body: &[u8],
     ) -> Result<ApiKeyResponse, (u16, &'static str)> {
+        let _catalog_operation = self
+            .catalog_operation()
+            .map_err(|_| (503, "administration_unavailable"))?;
         let actor = self
             .instance
             .attribute(

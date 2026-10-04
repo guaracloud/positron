@@ -3,7 +3,7 @@
   "info": {
     "title": "Positron API",
     "version": "v1",
-    "x-positron-schema-digest": "f55d1ef754a0d1e1752a48851f259a025eb16cc91059f2daf2c668cd42ca0081"
+    "x-positron-schema-digest": "fc5e9eb8b6d0adca54a3715ce024653c8de55a38e9a144d0b71be37d438d332f"
   },
   "paths": {
     "/v1/capabilities:negotiate": {
@@ -410,6 +410,88 @@
           "401": {"description": "System-administration authentication failed before request decoding."},
           "409": {"description": "The display generation is stale or the idempotency binding conflicts."},
           "503": {"description": "Tenant administration is unavailable."}
+        }
+      }
+    },
+    "/v1/maintenance:status": {
+      "post": {
+        "operationId": "StatusMaintenance",
+        "security": [{"apiKeyBearer": []}],
+        "x-positron-availability": "available",
+        "x-positron-max-request-bytes": 128,
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MaintenanceStatusRequest"}}}},
+        "responses": {
+          "200": {"description": "Bounded redacted Maintenance Coordinator task status.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MaintenanceStatusResponse"}}}},
+          "400": {"description": "Invalid bounded maintenance status request."},
+          "401": {"description": "System-administration authentication failed before request decoding."},
+          "503": {"description": "Maintenance administration is unavailable."}
+        }
+      }
+    },
+    "/v1/maintenance:explain": {
+      "post": {
+        "operationId": "ExplainMaintenance",
+        "security": [{"apiKeyBearer": []}],
+        "x-positron-availability": "available",
+        "x-positron-max-request-bytes": 128,
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MaintenanceExplainRequest"}}}},
+        "responses": {
+          "200": {"description": "One bounded redacted Maintenance Coordinator task.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MaintenanceExplainResponse"}}}},
+          "400": {"description": "Invalid bounded maintenance task identity."},
+          "401": {"description": "System-administration authentication failed before request decoding."},
+          "404": {"description": "The task is unavailable."},
+          "503": {"description": "Maintenance administration is unavailable."}
+        }
+      }
+    },
+    "/v1/maintenance:run": {
+      "post": {
+        "operationId": "RunMaintenance",
+        "security": [{"apiKeyBearer": []}],
+        "x-positron-availability": "available",
+        "x-positron-max-request-bytes": 256,
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MaintenanceRunRequest"}}}},
+        "responses": {
+          "200": {"description": "Durably acknowledged bounded compaction task.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MaintenanceRunResponse"}}}},
+          "400": {"description": "Invalid bounded compaction request."},
+          "401": {"description": "System-administration authentication failed before request decoding."},
+          "404": {"description": "The explicit scope has no eligible sealed source."},
+          "409": {"description": "The administrative idempotency key is already bound to another task."},
+          "503": {"description": "Maintenance administration is unavailable."}
+        }
+      }
+    },
+    "/v1/maintenance:pause": {
+      "post": {
+        "operationId": "PauseMaintenance",
+        "security": [{"apiKeyBearer": []}],
+        "x-positron-availability": "available",
+        "x-positron-max-request-bytes": 192,
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MaintenancePauseRequest"}}}},
+        "responses": {
+          "200": {"description": "Durable acknowledgement of one bounded optional-task pause.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MaintenanceControlResponse"}}}},
+          "400": {"description": "Invalid bounded maintenance pause request."},
+          "401": {"description": "System-administration authentication failed before request decoding."},
+          "404": {"description": "The task is unavailable."},
+          "409": {"description": "The task generation or transition precondition failed, or the idempotency binding conflicts."},
+          "503": {"description": "Maintenance administration is unavailable."}
+        }
+      }
+    },
+    "/v1/maintenance:resume": {
+      "post": {
+        "operationId": "ResumeMaintenance",
+        "security": [{"apiKeyBearer": []}],
+        "x-positron-availability": "available",
+        "x-positron-max-request-bytes": 192,
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MaintenanceResumeRequest"}}}},
+        "responses": {
+          "200": {"description": "Durable acknowledgement of one deferred-task resume.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MaintenanceControlResponse"}}}},
+          "400": {"description": "Invalid bounded maintenance resume request."},
+          "401": {"description": "System-administration authentication failed before request decoding."},
+          "404": {"description": "The task is unavailable."},
+          "409": {"description": "The task transition precondition failed, or the idempotency binding conflicts."},
+          "503": {"description": "Maintenance administration is unavailable."}
         }
       }
     },
@@ -1195,6 +1277,86 @@
         "properties": {
           "tenant": {"type": "string", "format": "uuid"},
           "display_generation": {"type": "integer", "minimum": 1},
+          "audit_position": {"type": "integer", "minimum": 1}
+        }
+      },
+      "MaintenanceStatusRequest": {
+        "type": "object", "additionalProperties": false, "properties": {}
+      },
+      "MaintenanceTaskStatus": {
+        "type": "object", "additionalProperties": false,
+        "required": ["identity", "class", "scope", "phase", "submitted_at_unix_seconds", "cancellation_requested"],
+        "properties": {
+          "identity": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+          "class": {"type": "string", "minLength": 1, "maxLength": 64},
+          "scope": {"type": "string", "minLength": 1, "maxLength": 128},
+          "phase": {"type": "string", "enum": ["queued", "running", "deferred", "cancelled", "succeeded", "failed"]},
+          "submitted_at_unix_seconds": {"type": "integer", "minimum": 0},
+          "checkpoint_sequence": {"type": "integer", "minimum": 1},
+          "pause_until_unix_seconds": {"type": "integer", "minimum": 1},
+          "cancellation_requested": {"type": "boolean"}
+        }
+      },
+      "MaintenanceStatusResponse": {
+        "type": "object", "additionalProperties": false,
+        "required": ["tasks", "queued", "running", "deferred", "terminal"],
+        "properties": {
+          "tasks": {"type": "array", "maxItems": 128, "items": {"$ref": "#/components/schemas/MaintenanceTaskStatus"}},
+          "queued": {"type": "integer", "minimum": 0},
+          "running": {"type": "integer", "minimum": 0},
+          "deferred": {"type": "integer", "minimum": 0},
+          "terminal": {"type": "integer", "minimum": 0}
+        }
+      },
+      "MaintenanceExplainRequest": {
+        "type": "object", "additionalProperties": false,
+        "required": ["identity"],
+        "properties": {"identity": {"type": "string", "pattern": "^[0-9a-fA-F]{32}$", "minLength": 32, "maxLength": 32}}
+      },
+      "MaintenanceExplainResponse": {
+        "type": "object", "additionalProperties": false,
+        "required": ["task"],
+        "properties": {"task": {"$ref": "#/components/schemas/MaintenanceTaskStatus"}}
+      },
+      "MaintenanceRunRequest": {
+        "type": "object", "additionalProperties": false,
+        "required": ["class", "tenant", "signal", "shard", "idempotency_key"],
+        "properties": {
+          "class": {"type": "string", "enum": ["compaction"]},
+          "tenant": {"type": "string", "format": "uuid"},
+          "signal": {"type": "string", "enum": ["logs", "traces"]},
+          "shard": {"type": "integer", "minimum": 1},
+          "idempotency_key": {"type": "string", "format": "uuid"}
+        }
+      },
+      "MaintenanceRunResponse": {
+        "type": "object", "additionalProperties": false,
+        "required": ["task"],
+        "properties": {"task": {"$ref": "#/components/schemas/MaintenanceTaskStatus"}}
+      },
+      "MaintenancePauseRequest": {
+        "type": "object", "additionalProperties": false,
+        "required": ["identity", "resource_generation", "duration_seconds", "idempotency_key"],
+        "properties": {
+          "identity": {"type": "string", "pattern": "^[0-9a-fA-F]{32}$", "minLength": 32, "maxLength": 32},
+          "resource_generation": {"type": "integer", "minimum": 1},
+          "duration_seconds": {"type": "integer", "minimum": 1, "maximum": 86400},
+          "idempotency_key": {"type": "string", "format": "uuid"}
+        }
+      },
+      "MaintenanceResumeRequest": {
+        "type": "object", "additionalProperties": false,
+        "required": ["identity", "idempotency_key"],
+        "properties": {
+          "identity": {"type": "string", "pattern": "^[0-9a-fA-F]{32}$", "minLength": 32, "maxLength": 32},
+          "idempotency_key": {"type": "string", "format": "uuid"}
+        }
+      },
+      "MaintenanceControlResponse": {
+        "type": "object", "additionalProperties": false,
+        "required": ["task", "audit_position"],
+        "properties": {
+          "task": {"$ref": "#/components/schemas/MaintenanceTaskStatus"},
           "audit_position": {"type": "integer", "minimum": 1}
         }
       },

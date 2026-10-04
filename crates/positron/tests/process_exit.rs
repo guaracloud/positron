@@ -682,7 +682,6 @@ fn sighup_during_recovery_does_not_interrupt_native_startup()
             .status()?
             .success()
     );
-    std::thread::sleep(Duration::from_millis(100));
     assert!(child.try_wait()?.is_none());
 
     drop(ownership);

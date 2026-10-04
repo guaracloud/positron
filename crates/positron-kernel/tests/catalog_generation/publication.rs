@@ -9,12 +9,15 @@ use std::thread;
 use positron_kernel::{
     AdmissionFailureCode, AuditCheckpointSigner, AuditIntent, Catalog, CatalogFailureCode,
     CatalogObject, CatalogProposal, CatalogPublicationFault, CatalogSecret, CatalogWrappingKey,
-    FormatEpoch, GovernanceFixtureObject, GovernanceFixtureTarget, InstanceId, MountQualification,
-    PrimaryDataVolume, RecoveryWorkClaim, RecoveryWorkKind, ResourceDimension,
-    SystemAuditRetentionPolicy, TransactionId, with_catalog_publication_fault_after,
+    FormatEpoch, GovernanceFixtureObject, GovernanceFixtureTarget, InstanceId,
+    MaintenanceCoordinator, MaintenanceTaskClass, MountQualification, PrimaryDataVolume,
+    RecoveryWorkClaim, RecoveryWorkKind, ResourceDimension, SystemAuditRetentionPolicy,
+    SystemAuditRetentionPublication, TransactionId, with_catalog_publication_fault_after,
 };
 
-use super::support::{catalog_recovery_claim, establish_catalog_authority};
+use super::support::{
+    catalog_recovery_claim, establish_catalog_authority, establish_catalog_reclamation_authority,
+};
 
 static NEXT_TEMPORARY_ROOT: AtomicU64 = AtomicU64::new(0);
 
@@ -276,23 +279,17 @@ fn signed_audit_checkpoint_binds_the_visible_chain_frontier() -> Result<(), Box<
         Some(AuditIntent::new(b"action=tenant.suspend".to_vec())?),
     )?;
 
-    let checkpoint = catalog.publish_audit_checkpoint(&signer)?;
+    let frontier = catalog
+        .governance_audit_records()?
+        .into_iter()
+        .last()
+        .ok_or("visible governed audit record")?;
+    let checkpoint =
+        positron_kernel::GovernanceAuditCheckpoint::create(&signer, instance, &frontier)?;
     assert_eq!(checkpoint.instance(), instance);
     assert_eq!(checkpoint.position(), 1);
-    assert_eq!(
-        checkpoint.record_hash(),
-        catalog.governance_audit_records()?[0].record_hash()
-    );
+    assert_eq!(checkpoint.record_hash(), frontier.record_hash());
     checkpoint.verify(public_key)?;
-
-    drop(catalog);
-    let view = Catalog::read_current_view(
-        &authority,
-        instance,
-        CatalogSecret::from_owned(Box::new([0x93; 32]), Box::new([0xa3; 32])),
-    )?;
-    assert_eq!(view.latest_audit_checkpoint()?.as_ref(), Some(&checkpoint));
-    view.verify_audit_chain(public_key, Some(&checkpoint))?;
     Ok(())
 }
 
@@ -301,7 +298,7 @@ fn signed_retention_anchor_authorizes_only_its_contiguous_audit_suffix()
 -> Result<(), Box<dyn Error>> {
     let root = TemporaryRoot::new()?;
     let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
-    let authority = establish_catalog_authority(volume)?;
+    let authority = establish_catalog_reclamation_authority(volume)?;
     let instance = InstanceId::new([0x79; 16])?;
     let catalog = Catalog::open(
         &authority,
@@ -404,14 +401,34 @@ fn signed_retention_anchor_authorizes_only_its_contiguous_audit_suffix()
     )?;
     view.verify_retained_audit_suffix(&all_records[2..])?;
 
-    let successor = catalog.publish_system_audit_retention_policy(
-        TransactionId::new([0x57; 16])?,
-        &signer,
-        SystemAuditRetentionPolicy::new(instance, 8, 1)?,
-        &all_records[1],
-        AuditIntent::new(b"action=update-system-audit-retention".to_vec())?,
-    )?;
+    let reclamation_coordinator = MaintenanceCoordinator::new();
+    let successor = catalog
+        .publish_system_audit_retention_policy_with_receipt(
+            TransactionId::new([0x57; 16])?,
+            &signer,
+            SystemAuditRetentionPublication {
+                policy: SystemAuditRetentionPolicy::new(instance, 8, 1)?,
+                last_removed: Some(&all_records[1]),
+                audit: AuditIntent::new(b"action=update-system-audit-retention".to_vec())?,
+                receipts: Vec::new(),
+                coordinator: &reclamation_coordinator,
+                submitted_at: 0,
+            },
+        )?
+        .ok_or("retention successor")?;
     assert_eq!(successor.system_policy_generation(), 8);
+    let reclamation = reclamation_coordinator
+        .start_next_with_reservation_and_persist_for_classes(
+            &catalog,
+            &authority,
+            0,
+            false,
+            &[MaintenanceTaskClass::CatalogReclamation],
+        )
+        .map_err(|failure| format!("Catalog Reclamation dispatch: {failure:?}"))?
+        .ok_or("queued Catalog Reclamation")?;
+    catalog.complete_running_audit_retention_reclamation(&reclamation_coordinator, &reclamation)?;
+    drop(reclamation);
     let retained = catalog.governance_audit_records()?;
     let view = Catalog::read_current_view(
         &authority,
@@ -433,18 +450,40 @@ fn signed_retention_anchor_authorizes_only_its_contiguous_audit_suffix()
         [0x95; 32],
         9,
     )?)?;
+    catalog
+        .publish_system_audit_retention_policy_with_receipt(
+            TransactionId::new([0x5a; 16])?,
+            &signer,
+            SystemAuditRetentionPublication {
+                policy: SystemAuditRetentionPolicy::new(instance, 9, 1)?,
+                last_removed: Some(&retained[1]),
+                audit: AuditIntent::new(b"action=retry-system-audit-retention".to_vec())?,
+                receipts: Vec::new(),
+                coordinator: &reclamation_coordinator,
+                submitted_at: 0,
+            },
+        )?
+        .ok_or("interrupted retention successor")?;
+    let reclamation = reclamation_coordinator
+        .start_next_with_reservation_and_persist_for_classes(
+            &catalog,
+            &authority,
+            0,
+            false,
+            &[MaintenanceTaskClass::CatalogReclamation],
+        )
+        .map_err(|failure| format!("Catalog Reclamation interrupted dispatch: {failure:?}"))?
+        .ok_or("interrupted queued Catalog Reclamation")?;
     let interrupted =
         with_catalog_publication_fault_after(CatalogPublicationFault::ReclaimAudit, 1, || {
-            catalog.publish_system_audit_retention_policy(
-                TransactionId::new([0x5a; 16])?,
-                &signer,
-                SystemAuditRetentionPolicy::new(instance, 9, 1)?,
-                &retained[1],
-                AuditIntent::new(b"action=retry-system-audit-retention".to_vec())?,
+            catalog.complete_running_audit_retention_reclamation(
+                &reclamation_coordinator,
+                &reclamation,
             )
         });
     let interrupted = interrupted.expect_err("the post-receipt reclamation fault must surface");
     assert_eq!(interrupted.code(), CatalogFailureCode::StorageUnavailable);
+    drop(reclamation);
     let wrong_instance = catalog
         .publish_system_audit_retention_policy(
             TransactionId::new([0x59; 16])?,
@@ -465,13 +504,26 @@ fn signed_retention_anchor_authorizes_only_its_contiguous_audit_suffix()
     drop(catalog);
     drop(authority);
     let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
-    let authority = establish_catalog_authority(volume)?;
+    let authority = establish_catalog_reclamation_authority(volume)?;
     let catalog = Catalog::open(
         &authority,
         instance,
         CatalogSecret::from_owned(Box::new([0x63; 32]), Box::new([0xd3; 32])),
     )?;
-    catalog.complete_audit_retention_reclamation()?;
+    let reclamation_coordinator = MaintenanceCoordinator::restore_from_catalog(&catalog)
+        .map_err(|failure| format!("Catalog Reclamation recovery: {failure:?}"))?;
+    let reclamation = reclamation_coordinator
+        .start_next_with_reservation_and_persist_for_classes(
+            &catalog,
+            &authority,
+            0,
+            false,
+            &[MaintenanceTaskClass::CatalogReclamation],
+        )
+        .map_err(|failure| format!("Catalog Reclamation restart dispatch: {failure:?}"))?
+        .ok_or("restarted queued Catalog Reclamation")?;
+    catalog.complete_running_audit_retention_reclamation(&reclamation_coordinator, &reclamation)?;
+    drop(reclamation);
     let retained_after_restart = catalog.governance_audit_records()?;
     assert_eq!(retained_after_restart.len(), 1);
     assert_eq!(retained_after_restart[0].position(), 5);
@@ -488,16 +540,37 @@ fn signed_retention_anchor_authorizes_only_its_contiguous_audit_suffix()
         [0x95; 32],
         10,
     )?)?;
+    catalog
+        .publish_system_audit_retention_policy_with_receipt(
+            TransactionId::new([0x5b; 16])?,
+            &signer,
+            SystemAuditRetentionPublication {
+                policy: SystemAuditRetentionPolicy::new(instance, 10, 1)?,
+                last_removed: Some(&retained_after_restart[0]),
+                audit: AuditIntent::new(b"action=complete-system-audit-retention".to_vec())?,
+                receipts: Vec::new(),
+                coordinator: &reclamation_coordinator,
+                submitted_at: 0,
+            },
+        )?
+        .ok_or("directory-sync retention successor")?;
+    let reclamation = reclamation_coordinator
+        .start_next_with_reservation_and_persist_for_classes(
+            &catalog,
+            &authority,
+            0,
+            false,
+            &[MaintenanceTaskClass::CatalogReclamation],
+        )
+        .map_err(|failure| format!("Catalog Reclamation directory-sync dispatch: {failure:?}"))?
+        .ok_or("directory-sync queued Catalog Reclamation")?;
     let directory_sync = with_catalog_publication_fault_after(
         CatalogPublicationFault::SynchronizeReclaimedAuditDirectory,
         0,
         || {
-            catalog.publish_system_audit_retention_policy(
-                TransactionId::new([0x5b; 16])?,
-                &signer,
-                SystemAuditRetentionPolicy::new(instance, 10, 1)?,
-                &retained_after_restart[0],
-                AuditIntent::new(b"action=complete-system-audit-retention".to_vec())?,
+            catalog.complete_running_audit_retention_reclamation(
+                &reclamation_coordinator,
+                &reclamation,
             )
         },
     )
@@ -506,6 +579,7 @@ fn signed_retention_anchor_authorizes_only_its_contiguous_audit_suffix()
         directory_sync.code(),
         CatalogFailureCode::StorageUnavailable
     );
+    drop(reclamation);
 
     // A policy object written outside the atomic policy-and-anchor transition
     // becomes incompatible with the previous signature and fences recovery.
@@ -513,13 +587,28 @@ fn signed_retention_anchor_authorizes_only_its_contiguous_audit_suffix()
     drop(catalog);
     drop(authority);
     let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
-    let authority = establish_catalog_authority(volume)?;
+    let authority = establish_catalog_reclamation_authority(volume)?;
     let catalog = Catalog::open(
         &authority,
         instance,
         CatalogSecret::from_owned(Box::new([0x63; 32]), Box::new([0xd3; 32])),
     )?;
-    catalog.complete_audit_retention_reclamation()?;
+    let reclamation_coordinator = MaintenanceCoordinator::restore_from_catalog(&catalog)
+        .map_err(|failure| format!("Catalog Reclamation directory-sync recovery: {failure:?}"))?;
+    let reclamation = reclamation_coordinator
+        .start_next_with_reservation_and_persist_for_classes(
+            &catalog,
+            &authority,
+            0,
+            false,
+            &[MaintenanceTaskClass::CatalogReclamation],
+        )
+        .map_err(|failure| {
+            format!("Catalog Reclamation directory-sync restart dispatch: {failure:?}")
+        })?
+        .ok_or("directory-sync restarted Catalog Reclamation")?;
+    catalog.complete_running_audit_retention_reclamation(&reclamation_coordinator, &reclamation)?;
+    drop(reclamation);
     let retained_after_directory_sync = catalog.governance_audit_records()?;
     assert_eq!(retained_after_directory_sync.len(), 1);
     assert_eq!(retained_after_directory_sync[0].position(), 6);

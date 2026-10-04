@@ -149,6 +149,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "maintenance_stateful"
+path = "fuzz_targets/maintenance_stateful.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "log_store_compaction_stateful"
 path = "fuzz_targets/log_store_compaction_stateful.rs"
 test = false

@@ -408,6 +408,20 @@ fn read_frontier(
     }))
 }
 
+pub(super) fn authenticated_frontier_bounds(
+    directory: &File,
+    id: SegmentId,
+    key: &ObjectDataKey,
+) -> Result<(u64, usize), LedgerFailure> {
+    let frontier = read_frontier(directory, id, key)?
+        .ok_or_else(|| LedgerFailure::new(LedgerFailureCode::IntegrityCorruption))?;
+    Ok((
+        frontier.durable_bytes,
+        usize::try_from(frontier.next_sequence)
+            .map_err(|_| LedgerFailure::new(LedgerFailureCode::LimitExceeded))?,
+    ))
+}
+
 fn decode_block_retention(bytes: &[u8]) -> Result<SegmentRetention, LedgerFailure> {
     let retention = decode_retention(bytes, 16, 17)?;
     match retention {

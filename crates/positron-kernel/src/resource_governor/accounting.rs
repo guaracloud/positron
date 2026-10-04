@@ -190,7 +190,7 @@ pub(super) struct ChargeOwner {
 
 #[derive(Clone, Copy)]
 pub(super) enum ChargeAttribution {
-    Ordinary { tenant_index: usize },
+    Ordinary { tenant_index: Option<usize> },
     Recovery { tenant_index: Option<usize> },
 }
 

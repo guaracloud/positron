@@ -1,5 +1,336 @@
 use super::*;
-use crate::active_segment_ledger::RetentionReclamationEstimate;
+use crate::active_segment_ledger::{RetentionReclamationEstimate, SegmentState};
+use crate::{MaintenanceCoordinator, MaintenanceTaskClass, MaintenanceTaskPhase};
+
+#[test]
+fn retention_publication_atomically_hides_protected_logs_and_queues_reclamation()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_authority(volume)?;
+    let instance = InstanceId::new([0x91; 16])?;
+    let catalog = Catalog::open(
+        &authority,
+        instance,
+        CatalogSecret::from_owned(Box::new([0x92; 32]), Box::new([0x93; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x64; 16])?;
+    install_governance_policy(&catalog, instance, tenant, 1, 0x94)?;
+    let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(91)?);
+    let (retention_time, elapsed) =
+        RetentionTimeAuthority::establish_with_manual_elapsed(UnixNanoseconds::new(10_000_000_000));
+    let key = || SegmentProtectionKey::from_owned(Box::new([0x95; 32]));
+    let sealed = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    let prepared = sealed.begin_store_block(
+        preparation_capacity(&authority, tenant)?,
+        StoreBlockIdentity::new([0x96; 16])?,
+    )?;
+    sealed.append(prepared.finish(b"protected retired log".to_vec())?)?;
+    sealed.seal()?;
+    elapsed.advance(2_000_000_000)?;
+
+    let active = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    let lease = active.create_snapshot_lease_for(12, NonZeroU64::new(100).ok_or("lease ttl")?)?;
+    let lease_identity = lease.identity();
+    drop(lease);
+    let coordinator = MaintenanceCoordinator::new();
+    let preparation = active.prepare_retention_publication()?;
+    let publication = preparation.task().clone();
+    let publication_id = publication.identity();
+    assert!(
+        !publication.inputs().is_empty(),
+        "publication must bind the sealed metadata it retires"
+    );
+    assert!(
+        !publication.outputs().is_empty(),
+        "publication must bind the retired metadata for reclamation"
+    );
+    preparation
+        .submit_and_persist(&coordinator, &catalog, 12)
+        .expect("publication task is durable");
+    let execution = coordinator
+        .start_next_with_reservation_and_persist(&catalog, &authority, 12, false)
+        .expect("publication dispatch")
+        .expect("retention publication was dispatched");
+    let admitted_recovery_memory = authority.governor().inspect()?.recovery_pool_usage(
+        crate::RecoveryWorkKind::Retention,
+        crate::ResourceDimension::MemoryBytes,
+    );
+
+    #[cfg(feature = "test-support")]
+    let reclamation_id = with_catalog_publication_fault_after(
+        CatalogPublicationFault::SynchronizeGenerationDirectory,
+        0,
+        || active.complete_running_retention_publication_task(&coordinator, &execution),
+    )?;
+    #[cfg(not(feature = "test-support"))]
+    let reclamation_id =
+        active.complete_running_retention_publication_task(&coordinator, &execution)?;
+
+    assert_eq!(
+        authority.governor().inspect()?.recovery_pool_usage(
+            crate::RecoveryWorkKind::Retention,
+            crate::ResourceDimension::MemoryBytes,
+        ),
+        admitted_recovery_memory,
+        "publication must consume its dispatch grant rather than reserve a second recovery claim"
+    );
+
+    assert!(active.snapshot()?.blocks().is_empty());
+    let resumed = active.resume_snapshot_lease(lease_identity, 12)?;
+    assert_eq!(resumed.identity(), lease_identity);
+    assert_eq!(
+        resumed
+            .snapshot()
+            .blocks()
+            .first()
+            .map(|block| block.payload()),
+        Some(b"protected retired log".as_slice()),
+        "the protected lease must still expose its original snapshot payload"
+    );
+    assert_eq!(
+        coordinator
+            .status(publication_id)
+            .expect("terminal publication")
+            .phase(),
+        MaintenanceTaskPhase::Succeeded
+    );
+    let live_reclamation = coordinator
+        .status(reclamation_id)
+        .expect("queued reclamation");
+    assert_eq!(live_reclamation.phase(), MaintenanceTaskPhase::Queued);
+    assert_eq!(
+        live_reclamation.task().class(),
+        MaintenanceTaskClass::RetentionReclamation
+    );
+    let restored = MaintenanceCoordinator::restore_from_catalog(&catalog).expect("restore");
+    assert_eq!(
+        restored
+            .status(publication_id)
+            .expect("restored publication")
+            .phase(),
+        MaintenanceTaskPhase::Succeeded
+    );
+    let reclamation = restored
+        .status(reclamation_id)
+        .expect("restored reclamation");
+    assert_eq!(reclamation.phase(), MaintenanceTaskPhase::Queued);
+    assert_eq!(
+        reclamation.task().class(),
+        MaintenanceTaskClass::RetentionReclamation
+    );
+    assert_eq!(
+        reclamation.task().inputs(),
+        publication.outputs(),
+        "the queued reclamation must bind the retired metadata produced by publication"
+    );
+    drop(execution);
+    let reclamation_execution = coordinator
+        .start_next_with_reservation_and_persist(&catalog, &authority, 12, false)
+        .expect("reclamation dispatch admission")
+        .expect("queued reclamation dispatch");
+    active.complete_running_retention_reclamation_task(&coordinator, &reclamation_execution)?;
+    assert_eq!(
+        coordinator
+            .status(reclamation_id)
+            .expect("protected reclamation")
+            .phase(),
+        MaintenanceTaskPhase::Queued,
+        "a durable snapshot lease must requeue its exact protected reclamation"
+    );
+    assert_eq!(
+        MaintenanceCoordinator::restore_from_catalog(&catalog)
+            .expect("protected reclamation restores")
+            .status(reclamation_id)
+            .expect("durable protected reclamation")
+            .phase(),
+        MaintenanceTaskPhase::Queued,
+        "the protected retry must be durable rather than only in-memory"
+    );
+    assert_eq!(
+        active.resume_snapshot_lease(lease_identity, 12)?.identity(),
+        lease_identity,
+        "protected reclamation cannot remove the durable lease payload"
+    );
+    let retired_metadata = active
+        .storage
+        .catalog_segments(&catalog.pin()?, scope)?
+        .into_iter()
+        .find(|metadata| metadata.state == SegmentState::Retired)
+        .ok_or("published retired metadata")?;
+
+    drop(reclamation_execution);
+    active.release_snapshot_lease(lease_identity)?;
+    let in_process_execution = coordinator
+        .start_next_with_reservation_and_persist(&catalog, &authority, 12, false)
+        .expect("in-process protected reclamation dispatch admission")
+        .expect("in-process protected reclamation dispatch");
+    active.complete_running_retention_reclamation_task(&coordinator, &in_process_execution)?;
+    assert_eq!(
+        coordinator
+            .status(reclamation_id)
+            .expect("in-process protected reclamation")
+            .phase(),
+        MaintenanceTaskPhase::Queued,
+        "the still-live snapshot must protect retired bytes after its durable lease is released"
+    );
+    assert!(
+        active.resume_snapshot_lease(lease_identity, 12).is_err(),
+        "the second protection result cannot come from the released durable lease"
+    );
+
+    drop(in_process_execution);
+    drop(resumed);
+    let physical_execution = coordinator
+        .start_next_with_reservation_and_persist(&catalog, &authority, 12, false)
+        .expect("released reclamation dispatch admission")
+        .expect("released reclamation dispatch");
+    active.complete_running_retention_reclamation_task(&coordinator, &physical_execution)?;
+    assert_eq!(
+        coordinator
+            .status(reclamation_id)
+            .expect("physically reclaimed task")
+            .phase(),
+        MaintenanceTaskPhase::Succeeded,
+        "releasing the durable lease must permit physical reclamation"
+    );
+    assert!(
+        active.resume_snapshot_lease(lease_identity, 12).is_err(),
+        "physical reclamation follows durable lease release"
+    );
+    assert!(
+        !active.storage.reclaim_retired(retired_metadata)?,
+        "a second reclaim must find no retained payload files after physical success"
+    );
+    assert_eq!(
+        MaintenanceCoordinator::restore_from_catalog(&catalog)
+            .expect("physical terminal restores")
+            .status(reclamation_id)
+            .expect("restored terminal reclamation")
+            .phase(),
+        MaintenanceTaskPhase::Succeeded
+    );
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn rejected_retention_publication_keeps_the_lease_and_running_task_authoritative()
+-> Result<(), Box<dyn Error>> {
+    let root = TemporaryRoot::new()?;
+    let volume = PrimaryDataVolume::acquire(root.path(), MountQualification::LocalHost)?;
+    let authority = establish_authority(volume)?;
+    let instance = InstanceId::new([0xa1; 16])?;
+    let catalog = Catalog::open(
+        &authority,
+        instance,
+        CatalogSecret::from_owned(Box::new([0xa2; 32]), Box::new([0xa3; 32])),
+    )?;
+    let tenant = TenantId::from_bytes([0x64; 16])?;
+    install_governance_policy(&catalog, instance, tenant, 1, 0xa4)?;
+    let scope = SegmentScope::new(tenant, SignalKind::Logs, VirtualShardId::new(92)?);
+    let (retention_time, elapsed) =
+        RetentionTimeAuthority::establish_with_manual_elapsed(UnixNanoseconds::new(10_000_000_000));
+    let key = || SegmentProtectionKey::from_owned(Box::new([0xa5; 32]));
+    let sealed = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    let prepared = sealed.begin_store_block(
+        preparation_capacity(&authority, tenant)?,
+        StoreBlockIdentity::new([0xa6; 16])?,
+    )?;
+    sealed.append(prepared.finish(b"fault-protected retired log".to_vec())?)?;
+    sealed.seal()?;
+    elapsed.advance(2_000_000_000)?;
+    let active = ActiveSegmentLedger::open_with_retention_time(
+        &authority,
+        &retention_time,
+        &catalog,
+        scope,
+        key(),
+    )?;
+    let lease = active.create_snapshot_lease_for(12, NonZeroU64::new(100).ok_or("lease ttl")?)?;
+    let lease_identity = lease.identity();
+    drop(lease);
+    let coordinator = MaintenanceCoordinator::new();
+    let preparation = active.prepare_retention_publication()?;
+    let publication = preparation.task().clone();
+    let publication_id = publication.identity();
+    preparation
+        .submit_and_persist(&coordinator, &catalog, 12)
+        .expect("publication task is durable");
+    let execution = coordinator
+        .start_next_with_reservation_and_persist(&catalog, &authority, 12, false)
+        .expect("publication dispatch")
+        .ok_or("publication dispatch")?;
+
+    let failure =
+        with_catalog_publication_fault_after(CatalogPublicationFault::SynchronizeCommit, 0, || {
+            active.complete_running_retention_publication_task(&coordinator, &execution)
+        })
+        .expect_err("pre-commit failure must reject the coupled publication");
+    assert_eq!(failure.code(), LedgerFailureCode::StorageUnavailable);
+    assert_eq!(
+        coordinator
+            .status(publication_id)
+            .expect("running publication")
+            .phase(),
+        MaintenanceTaskPhase::Running,
+        "the publication cannot terminalize before its Catalog proposal commits"
+    );
+    assert_eq!(
+        active
+            .snapshot()?
+            .blocks()
+            .first()
+            .map(|block| block.payload()),
+        Some(b"fault-protected retired log".as_slice())
+    );
+    let resumed = active.resume_snapshot_lease(lease_identity, 12)?;
+    assert_eq!(
+        resumed
+            .snapshot()
+            .blocks()
+            .first()
+            .map(|block| block.payload()),
+        Some(b"fault-protected retired log".as_slice())
+    );
+    assert_eq!(
+        catalog
+            .pin()?
+            .plaintext_objects()
+            .filter(|bytes| bytes.starts_with(b"PMTC"))
+            .count(),
+        1,
+        "a rejected publication cannot expose its reclamation successor"
+    );
+    assert_eq!(
+        MaintenanceCoordinator::restore_from_catalog(&catalog)
+            .expect("restore")
+            .status(publication_id)
+            .expect("durable publication")
+            .phase(),
+        MaintenanceTaskPhase::Queued,
+        "restore must recover the abandoned running publication without observing a successor"
+    );
+    Ok(())
+}
 
 #[test]
 fn sealed_nonempty_segment_expires_only_after_authoritative_elapsed_time()

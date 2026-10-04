@@ -18,6 +18,9 @@ impl ServiceHandle {
         bearer: &str,
         body: &[u8],
     ) -> Result<TenantQuotaUpdateResponse, TenantQuotaHttpFailure> {
+        let _catalog_operation = self
+            .catalog_operation()
+            .map_err(|_| TenantQuotaHttpFailure::Code(503, "administration_unavailable"))?;
         let actor = self
             .instance
             .attribute(
@@ -126,7 +129,8 @@ fn map_failure(failure: crate::BootstrapFailure) -> TenantQuotaHttpFailure {
         },
         BootstrapFailureCode::DurableOperationLookupExpired
         | BootstrapFailureCode::DurableOperationUnknown
-        | BootstrapFailureCode::DurableOperationCancellationUnavailable => {
+        | BootstrapFailureCode::DurableOperationCancellationUnavailable
+        | BootstrapFailureCode::GovernanceAuditCheckpointInProgress => {
             TenantQuotaHttpFailure::Code(503, "administration_unavailable")
         },
     }

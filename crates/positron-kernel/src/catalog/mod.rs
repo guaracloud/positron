@@ -14,15 +14,17 @@ mod storage;
 mod types;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::sync::{Arc, Mutex};
 
+use sha2::{Digest, Sha256};
+
 use budget::{
-    audit_checkpoint_resource_claim, commit_resource_claim, recovery_resource_claim,
-    reserve_history, retained_artifact_bytes,
+    audit_checkpoint_resource_claim, audit_reclamation_resource_claim, commit_resource_claim,
+    recovery_resource_claim, reserve_history, retained_artifact_bytes,
 };
 use codec::{
     CommitRecord, encode_commit, generation_identity, object_set_digest, prepare_audit,
@@ -34,9 +36,13 @@ use recovery::recover;
 use storage::{CatalogStorage, PreparedLookup};
 
 use crate::data_protection::ControlTokenProtector;
+use crate::maintenance::durable_task_record_identity;
 use crate::resource_governor::CatalogWriterLease;
 use crate::{
-    RecoveryWorkClaim, RecoveryWorkKind, ResourceAmounts, StorageKernelResourceAuthority,
+    GovernanceAuditCheckpointBinding, MaintenanceCoordinator, MaintenanceExecution,
+    MaintenanceObjectId, MaintenancePreconditions, MaintenanceScope, MaintenanceTask,
+    MaintenanceTaskClass, MaintenanceTaskId, MaintenanceTrigger, RecoveryWorkClaim,
+    RecoveryWorkKind, ResourceAmounts, ResourceDimension, StorageKernelResourceAuthority,
     WorkClaim, WorkKind,
 };
 
@@ -55,15 +61,16 @@ pub use storage::{
     with_catalog_publication_ambiguity_hook_after, with_catalog_publication_fault_after,
     with_catalog_publication_fault_sequence_after, with_catalog_publication_hook_after,
 };
+use types::AuditFrontier;
 #[cfg(feature = "test-support")]
 pub use types::GovernanceFixtureObject;
-use types::{AuditFrontier, MAX_CATALOG_OBJECTS};
 pub use types::{
     AuditIntent, CatalogCommit, CatalogFailure, CatalogFailureCode, CatalogGenerationId,
     CatalogObject, CatalogObjectId, CatalogProposal, CatalogRotation, CatalogSecret,
     CatalogSnapshot, CatalogWrappingKey, FormatEpoch, GovernanceAuditRecord, InstanceId,
     TransactionId,
 };
+pub(crate) use types::{MAX_CATALOG_OBJECTS, MAX_CATALOG_TOTAL_BYTES};
 
 #[cfg(any(test, fuzzing))]
 pub(crate) use storage::with_catalog_fault;
@@ -135,6 +142,17 @@ pub struct Catalog<'authority> {
     operation: Mutex<()>,
     pub(crate) export_output_operation: Mutex<()>,
     state: Mutex<CatalogState>,
+}
+
+/// The caller-owned inputs that must reach one joint system audit-retention
+/// Catalog publication, including its coordinator-owned reclamation draft.
+pub struct SystemAuditRetentionPublication<'a> {
+    pub policy: SystemAuditRetentionPolicy,
+    pub last_removed: Option<&'a GovernanceAuditRecord>,
+    pub audit: AuditIntent,
+    pub receipts: Vec<CatalogObject>,
+    pub coordinator: &'a MaintenanceCoordinator,
+    pub submitted_at: u64,
 }
 
 struct CatalogState {
@@ -252,6 +270,55 @@ impl std::fmt::Debug for Catalog<'_> {
 }
 
 impl<'authority> Catalog<'authority> {
+    /// Builds the sole durable coordinator task contract for a checkpoint of
+    /// one already-visible Governance Audit frontier.
+    pub fn governance_audit_checkpoint_task(
+        frontier: &GovernanceAuditRecord,
+        integrity_key_fingerprint: [u8; 32],
+    ) -> Result<(MaintenanceTask, GovernanceAuditCheckpointBinding), CatalogFailure> {
+        let binding = GovernanceAuditCheckpointBinding::new(
+            frontier.position(),
+            frontier.record_hash(),
+            integrity_key_fingerprint,
+        )
+        .map_err(|_| CatalogFailure::new(CatalogFailureCode::InvalidInput))?;
+        let mut digest = Sha256::new();
+        digest.update(b"positron-governance-audit-checkpoint-task-v1\\0");
+        digest.update(frontier.position().to_be_bytes());
+        digest.update(frontier.record_hash());
+        digest.update(integrity_key_fingerprint);
+        let digest = digest.finalize();
+        let identity = MaintenanceTaskId::new(
+            digest
+                .get(..16)
+                .and_then(|bytes| bytes.try_into().ok())
+                .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?,
+        )
+        .map_err(|_| CatalogFailure::new(CatalogFailureCode::InvalidInput))?;
+        let task = MaintenanceTask::with_contract(
+            identity,
+            MaintenanceTaskClass::GovernanceAuditCheckpoint,
+            MaintenanceScope::System,
+            MaintenanceTrigger::Event,
+            // The signed record is the complete durable frontier contract.
+            // An incidental Catalog generation change must not turn a retry of
+            // that same frontier into a conflicting task.
+            MaintenancePreconditions::new(frontier.position(), 1)
+                .map_err(|_| CatalogFailure::new(CatalogFailureCode::InvalidInput))?,
+            vec![
+                MaintenanceObjectId::new(frontier.record_hash())
+                    .map_err(|_| CatalogFailure::new(CatalogFailureCode::InvalidInput))?,
+            ],
+            vec![
+                MaintenanceObjectId::new(integrity_key_fingerprint)
+                    .map_err(|_| CatalogFailure::new(CatalogFailureCode::InvalidInput))?,
+            ],
+            audit_checkpoint_resource_claim(),
+        )
+        .map_err(|_| CatalogFailure::new(CatalogFailureCode::InvalidInput))?;
+        Ok((task, binding))
+    }
+
     pub(crate) const fn control_tokens(&self) -> ControlTokenProtector<'_> {
         ControlTokenProtector::new(&self.secret)
     }
@@ -473,6 +540,27 @@ impl<'authority> Catalog<'authority> {
             storage::after_ambiguous_publication(self);
         }
         result
+    }
+
+    pub(crate) fn commit_admitted_maintenance_task_state(
+        &self,
+        expected: CatalogGenerationId,
+        proposal: CatalogProposal,
+        execution: &MaintenanceExecution<'_>,
+    ) -> Result<CatalogCommit, CatalogFailure> {
+        let required = commit_resource_claim(&proposal, None)?;
+        if ResourceDimension::ALL.iter().any(|dimension| {
+            execution.reservation().granted().get(*dimension) < required.get(*dimension)
+        }) {
+            return Err(CatalogFailure::new(
+                CatalogFailureCode::ResourceAdmissionRefused,
+            ));
+        }
+        let _operation = self
+            .operation
+            .lock()
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
+        self.commit_unreserved(expected, proposal, None, None)
     }
 
     /// Publishes an administrative proposal whose retry identity is fixed before
@@ -895,6 +983,17 @@ impl<'authority> Catalog<'authority> {
             .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))
     }
 
+    /// Returns the most recent durable signed audit-chain anchor published by
+    /// the system maintenance path.
+    pub fn latest_audit_checkpoint(
+        &self,
+    ) -> Result<Option<GovernanceAuditCheckpoint>, CatalogFailure> {
+        self.state
+            .lock()
+            .map(|state| state.audit_checkpoint.clone())
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))
+    }
+
     /// Returns the current Administration-owned system audit-retention policy.
     pub fn system_audit_retention_policy(
         &self,
@@ -902,10 +1001,80 @@ impl<'authority> Catalog<'authority> {
         audit_checkpoint::retention_policy(&self.pin()?)
     }
 
-    /// Persists a signed anchor for the currently visible Governance Audit
-    /// frontier. It is idempotent for the same frontier and key, and never
-    /// changes Catalog generation visibility.
-    pub fn publish_audit_checkpoint(
+    /// Persists the exact signed Governance Audit frontier admitted by the
+    /// sole Maintenance Coordinator. The execution's reservation is the only
+    /// capacity authority for this write; this Catalog path never self-admits.
+    pub fn publish_admitted_audit_checkpoint(
+        &self,
+        execution: &MaintenanceExecution<'_>,
+        signer: &AuditCheckpointSigner,
+        integrity_key_fingerprint: [u8; 32],
+    ) -> Result<GovernanceAuditCheckpoint, CatalogFailure> {
+        if execution.task().class() != MaintenanceTaskClass::GovernanceAuditCheckpoint {
+            return Err(CatalogFailure::new(CatalogFailureCode::InvalidInput));
+        }
+        let binding =
+            GovernanceAuditCheckpointBinding::from_checkpoint(execution.task_checkpoint())
+                .map_err(|_| CatalogFailure::new(CatalogFailureCode::InvalidInput))?;
+        if execution.task().inputs().len() != 1
+            || execution.task().inputs()[0].to_bytes() != binding.record_hash()
+            || execution.task().outputs().len() != 1
+            || execution.task().outputs()[0].to_bytes() != binding.integrity_key_fingerprint()
+        {
+            return Err(CatalogFailure::new(CatalogFailureCode::InvalidInput));
+        }
+        let snapshot = self.pin()?;
+        let (_, governance) = snapshot.governance_object()?;
+        if binding.integrity_key_fingerprint() != integrity_key_fingerprint
+            || binding.integrity_key_fingerprint() != governance.integrity_key_fingerprint()
+            || signer.public_key() != governance.integrity_public_key()
+        {
+            return Err(CatalogFailure::new(
+                CatalogFailureCode::AuthenticationFailed,
+            ));
+        }
+        let _operation = self
+            .operation
+            .lock()
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
+        let secret = self
+            .secret
+            .lock()
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
+        let frontier = state
+            .audit
+            .iter()
+            .find(|record| {
+                record.position() == binding.position()
+                    && record.record_hash() == binding.record_hash()
+            })
+            .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::InvalidInput))?;
+        if let Some(existing) = state.audit_checkpoint.as_ref()
+            && existing.position() == frontier.position()
+            && existing.record_hash() == frontier.record_hash()
+        {
+            existing.verify(signer.public_key())?;
+            return Ok(existing.clone());
+        }
+        let checkpoint = GovernanceAuditCheckpoint::create(signer, self.instance, frontier)?;
+        self.storage
+            .publish_audit_checkpoint(&secret, self.instance, &checkpoint)?;
+        if state
+            .audit_checkpoint
+            .as_ref()
+            .is_none_or(|current| checkpoint.position() > current.position())
+        {
+            state.audit_checkpoint = Some(checkpoint.clone());
+        }
+        Ok(checkpoint)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publish_audit_checkpoint_for_test(
         &self,
         signer: &AuditCheckpointSigner,
     ) -> Result<GovernanceAuditCheckpoint, CatalogFailure> {
@@ -1041,13 +1210,18 @@ impl<'authority> Catalog<'authority> {
         last_removed: &GovernanceAuditRecord,
         audit: AuditIntent,
     ) -> Result<AuditRetentionAnchor, CatalogFailure> {
+        let coordinator = MaintenanceCoordinator::new();
         self.publish_system_audit_retention_policy_with_receipt(
             transaction,
             signer,
-            policy,
-            Some(last_removed),
-            audit,
-            Vec::new(),
+            SystemAuditRetentionPublication {
+                policy,
+                last_removed: Some(last_removed),
+                audit,
+                receipts: Vec::new(),
+                coordinator: &coordinator,
+                submitted_at: 0,
+            },
         )?
         .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::IntegrityCorruption))
     }
@@ -1061,15 +1235,16 @@ impl<'authority> Catalog<'authority> {
         &self,
         transaction: TransactionId,
         signer: &AuditCheckpointSigner,
-        policy: SystemAuditRetentionPolicy,
-        last_removed: Option<&GovernanceAuditRecord>,
-        audit: AuditIntent,
-        receipts: Vec<CatalogObject>,
+        publication: SystemAuditRetentionPublication<'_>,
     ) -> Result<Option<AuditRetentionAnchor>, CatalogFailure> {
         let basis = self.pin()?;
-        let trust = audit_checkpoint::retention_trust_for_policy(&basis, self.instance, policy)?;
+        let trust = audit_checkpoint::retention_trust_for_policy(
+            &basis,
+            self.instance,
+            publication.policy,
+        )?;
         let records = self.governance_audit_records()?;
-        let anchor = match last_removed {
+        let anchor = match publication.last_removed {
             Some(record) => {
                 if !records.iter().any(|candidate| {
                     candidate.position == record.position && candidate.hash == record.hash
@@ -1083,10 +1258,43 @@ impl<'authority> Catalog<'authority> {
                 .map(|previous| previous.rebind(signer, trust))
                 .transpose()?,
         };
+        let predecessor_identity = audit_checkpoint::retention_anchor(&basis)?
+            .as_ref()
+            .map(Self::audit_retention_reclamation_task)
+            .transpose()?
+            .map(|task| task.identity());
+        let mut predecessor_record = None;
+        for identity in basis.object_identities() {
+            let object = basis
+                .object(identity)?
+                .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::StorageUnavailable))?;
+            if durable_task_record_identity(object)
+                .map_err(|_| CatalogFailure::new(CatalogFailureCode::IntegrityCorruption))?
+                .is_some_and(|identity| Some(identity) == predecessor_identity)
+                && predecessor_record.replace(object).is_some()
+            {
+                return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
+            }
+        }
+        let queued_reclamation = anchor
+            .as_ref()
+            .map(|anchor| {
+                Self::audit_retention_reclamation_task(anchor).and_then(|task| {
+                    publication
+                        .coordinator
+                        .prepare_catalog_reclamation(
+                            task,
+                            publication.submitted_at,
+                            predecessor_record,
+                        )
+                        .map_err(|_| CatalogFailure::new(CatalogFailureCode::LimitExceeded))
+                })
+            })
+            .transpose()?;
         let capacity = basis
             .plaintext_object_count()
-            .checked_add(3)
-            .and_then(|value| value.checked_add(receipts.len()))
+            .checked_add(4)
+            .and_then(|value| value.checked_add(publication.receipts.len()))
             .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?;
         let mut objects = Vec::new();
         objects
@@ -1099,19 +1307,27 @@ impl<'authority> Catalog<'authority> {
             if AuditRetentionAnchor::is_encoded(object)
                 || SystemAuditRetentionPolicy::is_encoded(object)
                 || audit_checkpoint::AuditRetentionReclamationReceipt::is_encoded(object)
+                || predecessor_record.is_some_and(|predecessor| predecessor == object)
             {
                 continue;
             }
             objects.push(CatalogObject::new(object.to_vec())?);
         }
-        objects.push(policy.into_catalog_object()?);
+        objects.push(publication.policy.into_catalog_object()?);
         if let Some(anchor) = &anchor {
             objects.push(CatalogObject::new(anchor.encode())?);
             objects.push(CatalogObject::new(
                 audit_checkpoint::AuditRetentionReclamationReceipt::new(anchor).encode(),
             )?);
         }
-        for receipt in receipts {
+        if let Some(queued) = &queued_reclamation {
+            objects.push(
+                queued
+                    .catalog_object()
+                    .map_err(|_| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?,
+            );
+        }
+        for receipt in publication.receipts {
             objects.push(receipt);
         }
         let format_epoch = basis
@@ -1120,7 +1336,7 @@ impl<'authority> Catalog<'authority> {
         let proposal = CatalogProposal::new(transaction, format_epoch, objects)?;
         let durability_claim = RecoveryWorkClaim::system(
             RecoveryWorkKind::DurabilityCompletion,
-            commit_resource_claim(&proposal, Some(&audit))?,
+            commit_resource_claim(&proposal, Some(&publication.audit))?,
         )
         .map_err(|_| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?;
         let reservation = self
@@ -1133,7 +1349,7 @@ impl<'authority> Catalog<'authority> {
                 .operation
                 .lock()
                 .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
-            self.commit_unreserved(basis.identity(), proposal, Some(audit), None)
+            self.commit_unreserved(basis.identity(), proposal, Some(publication.audit), None)
         };
         drop(reservation);
         #[cfg(any(test, feature = "test-support"))]
@@ -1143,11 +1359,57 @@ impl<'authority> Catalog<'authority> {
         {
             storage::after_ambiguous_publication(self);
         }
-        result?;
-        if anchor.is_some() {
-            self.complete_audit_retention_reclamation()?;
+        if let Err(failure) = result {
+            if let Some(queued) = queued_reclamation {
+                queued
+                    .discard(publication.coordinator)
+                    .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
+            }
+            return Err(failure);
+        }
+        if let Some(queued) = queued_reclamation {
+            queued
+                .install(publication.coordinator)
+                .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
         }
         Ok(anchor)
+    }
+
+    fn audit_retention_reclamation_task(
+        anchor: &AuditRetentionAnchor,
+    ) -> Result<MaintenanceTask, CatalogFailure> {
+        let anchor_object = CatalogObject::new(anchor.encode())?;
+        let receipt_object = CatalogObject::new(
+            audit_checkpoint::AuditRetentionReclamationReceipt::new(anchor).encode(),
+        )?;
+        let mut digest = Sha256::new();
+        digest.update(b"positron.audit-retention-reclamation-task.v1\0");
+        digest.update(anchor_object.identity().to_bytes());
+        digest.update(receipt_object.identity().to_bytes());
+        let bytes: [u8; 16] = digest
+            .finalize()
+            .get(..16)
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?;
+        MaintenanceTask::with_contract(
+            MaintenanceTaskId::new(bytes)
+                .map_err(|_| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?,
+            MaintenanceTaskClass::CatalogReclamation,
+            MaintenanceScope::System,
+            MaintenanceTrigger::Event,
+            MaintenancePreconditions::new(anchor.system_policy_generation(), 1)
+                .map_err(|_| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?,
+            vec![
+                MaintenanceObjectId::new(anchor_object.identity().to_bytes())
+                    .map_err(|_| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?,
+            ],
+            vec![
+                MaintenanceObjectId::new(receipt_object.identity().to_bytes())
+                    .map_err(|_| CatalogFailure::new(CatalogFailureCode::LimitExceeded))?,
+            ],
+            audit_reclamation_resource_claim()?,
+        )
+        .map_err(|_| CatalogFailure::new(CatalogFailureCode::LimitExceeded))
     }
 
     /// Completes an already-published, receipt-bound Governance Audit
@@ -1199,6 +1461,138 @@ impl<'authority> Catalog<'authority> {
         state
             .audit
             .retain(|record| record.position() > anchor.position());
+        Ok(())
+    }
+
+    /// Executes the sole system audit-reclamation capability after the
+    /// coordinator has durably marked its exact descriptor Running.  The
+    /// descriptor's anchor and receipt object identities are checked again
+    /// while holding the Catalog operation lease, before any audit frame can
+    /// be removed.
+    pub fn complete_running_audit_retention_reclamation(
+        &self,
+        coordinator: &MaintenanceCoordinator,
+        execution: &MaintenanceExecution<'_>,
+    ) -> Result<(), CatalogFailure> {
+        let mut physically_started = false;
+        let mut cancelled_before_physical_work = false;
+        let reclaimed = (|| {
+            let _operation = self
+                .operation
+                .lock()
+                .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
+            let secret = self
+                .secret
+                .lock()
+                .map_err(|_| CatalogFailure::new(CatalogFailureCode::ConcurrentWriter))?;
+            let anchor = audit_checkpoint::retention_anchor(&state.current)?
+                .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::InvalidInput))?;
+            let trust = audit_checkpoint::retention_trust(&state.current, self.instance)?;
+            anchor.verify(trust)?;
+            if audit_checkpoint::retention_reclamation_receipt(&state.current, &anchor)?.is_none() {
+                return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
+            }
+            let expected = Self::audit_retention_reclamation_task(&anchor)?;
+            if execution.task() != &expected {
+                return Err(CatalogFailure::new(CatalogFailureCode::InvalidInput));
+            }
+            let mut durable_record = None;
+            for object in state.current.plaintext_objects() {
+                if durable_task_record_identity(object)
+                    .map_err(|_| CatalogFailure::new(CatalogFailureCode::IntegrityCorruption))?
+                    == Some(expected.identity())
+                    && durable_record.replace(object).is_some()
+                {
+                    return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
+                }
+            }
+            let durable_record = durable_record
+                .ok_or_else(|| CatalogFailure::new(CatalogFailureCode::IntegrityCorruption))?;
+            execution
+                .verify_running_catalog_reclamation(coordinator, durable_record)
+                .map_err(|_| CatalogFailure::new(CatalogFailureCode::InvalidInput))?;
+            if execution
+                .catalog_reclamation_cancellation_requested(coordinator)
+                .map_err(|_| CatalogFailure::new(CatalogFailureCode::StorageUnavailable))?
+            {
+                cancelled_before_physical_work = true;
+                return Ok(());
+            }
+
+            for record in state
+                .audit
+                .iter()
+                .filter(|record| record.position() <= anchor.position())
+            {
+                if self
+                    .storage
+                    .audit_exists(record.position(), record.record_hash())?
+                {
+                    let encoded = self.storage.read_audit(
+                        &secret,
+                        self.instance,
+                        record.position(),
+                        record.record_hash(),
+                    )?;
+                    if codec::decode_audit(&encoded)? != *record {
+                        return Err(CatalogFailure::new(CatalogFailureCode::IntegrityCorruption));
+                    }
+                    physically_started = true;
+                    self.storage
+                        .reclaim_audit(record.position(), record.record_hash())?;
+                }
+            }
+            self.storage.synchronize_reclaimed_audit()?;
+            state
+                .audit
+                .retain(|record| record.position() > anchor.position());
+            Ok(())
+        })();
+        if let Err(failure) = reclaimed {
+            if physically_started {
+                execution
+                    .requeue_catalog_reclamation_and_persist(coordinator, self)
+                    .map_err(|_| CatalogFailure::new(CatalogFailureCode::StorageUnavailable))?;
+            }
+            return Err(failure);
+        }
+        if cancelled_before_physical_work {
+            if execution
+                .complete_catalog_reclamation_and_persist(coordinator, self)
+                .is_err()
+            {
+                execution
+                    .reconcile_cancelled_catalog_reclamation_after_terminal_failure(
+                        coordinator,
+                        self,
+                    )
+                    .map_err(|_| CatalogFailure::new(CatalogFailureCode::StorageUnavailable))?;
+                return Err(CatalogFailure::new(CatalogFailureCode::StorageUnavailable));
+            }
+            return Ok(());
+        }
+        if execution
+            .catalog_reclamation_cancellation_requested(coordinator)
+            .map_err(|_| CatalogFailure::new(CatalogFailureCode::StorageUnavailable))?
+        {
+            execution
+                .requeue_catalog_reclamation_and_persist(coordinator, self)
+                .map_err(|_| CatalogFailure::new(CatalogFailureCode::StorageUnavailable))?;
+            return Err(CatalogFailure::new(CatalogFailureCode::StorageUnavailable));
+        }
+        if execution
+            .complete_catalog_reclamation_and_persist(coordinator, self)
+            .is_err()
+        {
+            execution
+                .requeue_catalog_reclamation_and_persist(coordinator, self)
+                .map_err(|_| CatalogFailure::new(CatalogFailureCode::StorageUnavailable))?;
+            return Err(CatalogFailure::new(CatalogFailureCode::StorageUnavailable));
+        }
         Ok(())
     }
 

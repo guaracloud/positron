@@ -10,9 +10,10 @@ use positron_domain::lifecycle::TenantLifecycleState;
 use positron_domain::routing::SignalKind;
 use positron_kernel::{
     AuditIntent, BootstrapKeyCustody, Catalog, CatalogFailureCode, CatalogProposal,
-    CommittedLedgerReader, FormatEpoch, InstanceBootstrapStorage, InstanceId, MountQualification,
-    OwnedPrimaryDataVolume, ResourceAmounts, RetentionImpactPreview, RetentionReclamationEstimate,
-    RetentionTimeAuthority, StorageKernelResourceAuthority, TransactionId,
+    CommittedLedgerReader, FormatEpoch, InstanceBootstrapStorage, InstanceId, MaintenanceFailure,
+    MaintenanceTaskId, MaintenanceTaskPhase, MountQualification, OwnedPrimaryDataVolume,
+    ResourceAmounts, RetentionImpactPreview, RetentionReclamationEstimate, RetentionTimeAuthority,
+    StorageKernelResourceAuthority, TransactionId,
 };
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;

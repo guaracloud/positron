@@ -1,7 +1,7 @@
 use std::fs;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{Mutex, MutexGuard, mpsc};
 use std::thread::JoinHandle;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -17,12 +17,15 @@ use tonic::Request;
 
 pub(super) type TestError = Box<dyn std::error::Error>;
 
+static LIVE_GRPC_TEST: Mutex<()> = Mutex::new(());
+
 pub(super) struct LiveGrpcHarness {
     process: Option<RunningProcess>,
     endpoint: SocketAddr,
     bearer: String,
     query_secret: String,
     _roots: TestRoots,
+    _test_guard: MutexGuard<'static, ()>,
 }
 
 pub(super) struct ForcedGrpcHarness {
@@ -32,10 +35,12 @@ pub(super) struct ForcedGrpcHarness {
     trigger: mpsc::SyncSender<ShutdownTrigger>,
     outcome: mpsc::Receiver<ExitOutcome>,
     server: Option<JoinHandle<()>>,
+    _test_guard: MutexGuard<'static, ()>,
 }
 
 impl ForcedGrpcHarness {
     pub(super) fn start(label: &str) -> Result<Self, TestError> {
+        let test_guard = lock_live_grpc_test();
         let roots = TestRoots::new(label)?;
         let paths = roots.paths()?;
         drop(InstanceBootstrap::initialize(
@@ -72,8 +77,11 @@ impl ForcedGrpcHarness {
             };
             let _ = outcome_sender.send(process.shutdown(trigger));
         });
-        let endpoint = endpoint_receiver.recv_timeout(std::time::Duration::from_secs(2))?;
+        let endpoint = endpoint_receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .map_err(|error| format!("forced runtime did not report its OTLP endpoint: {error}"))?;
         Ok(Self {
+            _test_guard: test_guard,
             roots,
             endpoint,
             bearer,
@@ -121,6 +129,7 @@ impl LiveGrpcHarness {
         label: &str,
         configure: impl FnOnce(NativeBindings) -> NativeBindings,
     ) -> Result<Self, TestError> {
+        let test_guard = lock_live_grpc_test();
         let roots = TestRoots::new(label)?;
         let paths = roots.paths()?;
         drop(InstanceBootstrap::initialize(
@@ -147,6 +156,7 @@ impl LiveGrpcHarness {
             positron_runtime::ListenerRole::OtlpGrpc,
         )?;
         Ok(Self {
+            _test_guard: test_guard,
             process: Some(process),
             endpoint,
             bearer,
@@ -159,6 +169,7 @@ impl LiveGrpcHarness {
         label: &str,
         configure: impl FnOnce(ServeConfiguration) -> ServeConfiguration,
     ) -> Result<Self, TestError> {
+        let test_guard = lock_live_grpc_test();
         let roots = TestRoots::new(label)?;
         let paths = roots.paths()?;
         drop(InstanceBootstrap::initialize(
@@ -185,6 +196,7 @@ impl LiveGrpcHarness {
             positron_runtime::ListenerRole::OtlpGrpc,
         )?;
         Ok(Self {
+            _test_guard: test_guard,
             process: Some(process),
             endpoint,
             bearer,
@@ -252,6 +264,13 @@ impl LiveGrpcHarness {
         )?;
         self.process = Some(process);
         Ok(())
+    }
+}
+
+fn lock_live_grpc_test() -> MutexGuard<'static, ()> {
+    match LIVE_GRPC_TEST.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
     }
 }
 

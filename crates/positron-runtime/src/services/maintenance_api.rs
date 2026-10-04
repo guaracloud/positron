@@ -1,0 +1,778 @@
+use std::fmt::Write;
+
+use sha2::{Digest, Sha256};
+
+use positron_api::maintenance::{
+    MaintenanceControlResponse, MaintenanceExplainRequest, MaintenanceExplainResponse,
+    MaintenancePauseRequest, MaintenanceResumeRequest, MaintenanceRunRequest,
+    MaintenanceRunResponse, MaintenanceStatusRequest, MaintenanceStatusResponse,
+    MaintenanceTaskStatus,
+};
+use positron_domain::{
+    identity::{PrincipalId, TenantId},
+    routing::{SignalKind, VirtualShardId},
+};
+use positron_governance::{
+    AdministrativeIdempotencyKey, AuthorizedContext, CompatibilityHints, GovernanceAuditEntry,
+    Identity, PresentedCredential, RequestedIntent, maintenance_control_audit_intent,
+};
+use positron_kernel::{
+    ActiveSegmentLedger, Catalog, LedgerFailure, LedgerFailureCode, MaintenanceFailure,
+    MaintenanceScope, MaintenanceTaskClass, MaintenanceTaskId, MaintenanceTaskPhase, SegmentScope,
+};
+
+use crate::ServiceHandle;
+
+impl ServiceHandle {
+    /// Authenticates a system administrator before decoding the bounded
+    /// inspection request. The response is derived solely from the runtime's
+    /// one coordinator and contains no credentials or immutable input bytes.
+    pub(crate) fn maintenance_status(
+        &self,
+        bearer: &str,
+        body: &[u8],
+    ) -> Result<MaintenanceStatusResponse, (u16, &'static str)> {
+        let _catalog_operation = self
+            .catalog_operation()
+            .map_err(|_| (503, "administration_unavailable"))?;
+        self.authorize_system_administration(bearer)?;
+        MaintenanceStatusRequest::decode(body).map_err(|_| (400, "invalid_request"))?;
+        let statuses = self
+            .instance
+            .maintenance_coordinator()
+            .lock()
+            .map_err(|_| (503, "administration_unavailable"))?
+            .statuses()
+            .map_err(|_| (503, "administration_unavailable"))?;
+        let mut response = MaintenanceStatusResponse {
+            tasks: Vec::with_capacity(statuses.len()),
+            queued: 0,
+            running: 0,
+            deferred: 0,
+            terminal: 0,
+        };
+        for status in statuses {
+            match status.phase() {
+                MaintenanceTaskPhase::Queued => response.queued += 1,
+                MaintenanceTaskPhase::Running => response.running += 1,
+                MaintenanceTaskPhase::Deferred => response.deferred += 1,
+                MaintenanceTaskPhase::Cancelled
+                | MaintenanceTaskPhase::Succeeded
+                | MaintenanceTaskPhase::Failed => response.terminal += 1,
+            }
+            response.tasks.push(task_status(status));
+        }
+        response
+            .validate()
+            .map_err(|_| (503, "administration_unavailable"))?;
+        Ok(response)
+    }
+
+    pub(crate) fn explain_maintenance_task(
+        &self,
+        bearer: &str,
+        body: &[u8],
+    ) -> Result<MaintenanceExplainResponse, (u16, &'static str)> {
+        let _catalog_operation = self
+            .catalog_operation()
+            .map_err(|_| (503, "administration_unavailable"))?;
+        self.authorize_system_administration(bearer)?;
+        let request =
+            MaintenanceExplainRequest::decode(body).map_err(|_| (400, "invalid_request"))?;
+        let identity = task_identity(&request.identity).ok_or((400, "invalid_request"))?;
+        let status = self
+            .instance
+            .maintenance_coordinator()
+            .lock()
+            .map_err(|_| (503, "administration_unavailable"))?
+            .status(identity)
+            .map_err(|_| (404, "task_unavailable"))?;
+        Ok(MaintenanceExplainResponse {
+            task: task_status(status),
+        })
+    }
+
+    /// Submits only the kernel-produced Compaction descriptor for one explicit
+    /// sealed signal scope. Callers provide no source objects, retention
+    /// bounds, reservations, preconditions, or task descriptor fields.
+    pub(crate) fn run_maintenance(
+        &self,
+        bearer: &str,
+        body: &[u8],
+    ) -> Result<MaintenanceRunResponse, (u16, &'static str)> {
+        let _catalog_operation = self
+            .catalog_operation()
+            .map_err(|_| (503, "administration_unavailable"))?;
+        let actor = self.authorize_system_administration(bearer)?;
+        let request = MaintenanceRunRequest::decode(body).map_err(|_| (400, "invalid_request"))?;
+        let tenant =
+            TenantId::parse_canonical(request.tenant()).map_err(|_| (400, "invalid_request"))?;
+        let signal = signal(request.signal()).ok_or((400, "invalid_request"))?;
+        let shard = VirtualShardId::new(request.shard()).map_err(|_| (400, "invalid_request"))?;
+        let idempotency = PrincipalId::parse_canonical(request.idempotency_key())
+            .map_err(|_| (400, "invalid_request"))?;
+        let task_identity = maintenance_task_id(actor.principal_id(), idempotency)?;
+        let instance = &self.instance;
+        let catalog = Catalog::open(
+            &instance._authority,
+            instance.instance,
+            instance
+                .key
+                .catalog_secret(instance.instance)
+                .map_err(|_| (503, "administration_unavailable"))?,
+        )
+        .map_err(|_| (503, "administration_unavailable"))?;
+        let snapshot = catalog
+            .pin()
+            .map_err(|_| (503, "administration_unavailable"))?;
+        let identity =
+            Identity::open(&snapshot).map_err(|_| (503, "administration_unavailable"))?;
+        let scope = SegmentScope::new(tenant, signal, shard);
+        let expected_scope = MaintenanceScope::segment(tenant, signal, shard);
+        if !snapshot
+            .reachable_ledger_scopes(tenant, signal)
+            .map_err(|_| (503, "administration_unavailable"))?
+            .into_iter()
+            .any(|candidate| candidate == scope)
+        {
+            return Err((404, "source_unavailable"));
+        }
+        let coordinator = instance
+            .maintenance_coordinator()
+            .lock()
+            .map_err(|_| (503, "administration_unavailable"))?;
+        match coordinator.status(task_identity) {
+            Ok(status)
+                if status.task().class() == MaintenanceTaskClass::Compaction
+                    && status.task().scope() == expected_scope =>
+            {
+                return Ok(MaintenanceRunResponse {
+                    task: task_status(status),
+                });
+            },
+            Ok(_) => return Err((409, "idempotency_conflict")),
+            Err(positron_kernel::MaintenanceFailure::UnknownTask) => {},
+            Err(_) => return Err((503, "administration_unavailable")),
+        }
+        let key = super::tenant_segment_key(instance, &identity, scope)
+            .map_err(|_| (503, "administration_unavailable"))?;
+        let ledger = ActiveSegmentLedger::open_for_maintenance_with_retention_time(
+            &instance._authority,
+            &instance.retention_time,
+            &catalog,
+            scope,
+            key,
+        )
+        .map_err(|_| (503, "administration_unavailable"))?;
+        let bucket = ledger.sealed_compaction_bucket().map_err(source_failure)?;
+        let task = ledger
+            .prepare_compaction_task(bucket, task_identity)
+            .map_err(|_| (503, "administration_unavailable"))?;
+        let now = instance
+            .retention_time
+            .governance_now_seconds()
+            .map_err(|_| (503, "administration_unavailable"))?;
+        let submitted = task
+            .submit_and_persist(&coordinator, &catalog, now)
+            .map_err(|_| (503, "administration_unavailable"))?;
+        let status = coordinator
+            .status(submitted.identity())
+            .map_err(|_| (503, "administration_unavailable"))?;
+        drop(coordinator);
+        drop(ledger);
+        drop(catalog);
+        drop(_catalog_operation);
+        self.notify_maintenance_worker();
+        Ok(MaintenanceRunResponse {
+            task: task_status(status),
+        })
+    }
+
+    pub(crate) fn pause_maintenance(
+        &self,
+        bearer: &str,
+        body: &[u8],
+    ) -> Result<MaintenanceControlResponse, (u16, &'static str)> {
+        let _catalog_operation = self
+            .catalog_operation()
+            .map_err(|_| (503, "administration_unavailable"))?;
+        let actor = self.authorize_system_administration(bearer)?;
+        let request =
+            MaintenancePauseRequest::decode(body).map_err(|_| (400, "invalid_request"))?;
+        let identity = task_identity(request.identity()).ok_or((400, "invalid_request"))?;
+        let idempotency = PrincipalId::parse_canonical(request.idempotency_key())
+            .map_err(|_| (400, "invalid_request"))?;
+        let catalog = self.open_maintenance_catalog()?;
+        if let Some(audit_position) = maintenance_control_replay(
+            &catalog,
+            actor.principal_id(),
+            idempotency,
+            identity,
+            true,
+            request.resource_generation(),
+            request.duration_seconds(),
+        )? {
+            let status = self
+                .instance
+                .maintenance_coordinator()
+                .lock()
+                .map_err(|_| (503, "administration_unavailable"))?
+                .status(identity)
+                .map_err(control_failure)?;
+            return Ok(MaintenanceControlResponse {
+                task: task_status(status),
+                audit_position,
+            });
+        }
+        let now = self
+            .instance
+            .retention_time
+            .governance_now_seconds()
+            .map_err(|_| (503, "administration_unavailable"))?;
+        let until = now
+            .checked_add(request.duration_seconds())
+            .ok_or((400, "invalid_request"))?;
+        let audit = maintenance_control_audit_intent(
+            actor.principal_id(),
+            administrative_key(idempotency)?,
+            identity,
+            true,
+            request.resource_generation(),
+            request.duration_seconds(),
+            Some(until),
+        )
+        .map_err(|_| (503, "administration_unavailable"))?;
+        let coordinator = self
+            .instance
+            .maintenance_coordinator()
+            .lock()
+            .map_err(|_| (503, "administration_unavailable"))?;
+        coordinator
+            .pause_and_persist_audited(
+                &catalog,
+                identity,
+                request.resource_generation(),
+                until,
+                now,
+                audit,
+            )
+            .map_err(control_failure)?;
+        let status = coordinator.status(identity).map_err(control_failure)?;
+        drop(coordinator);
+        let audit_position = latest_control_audit_position(&catalog)?;
+        drop(catalog);
+        drop(_catalog_operation);
+        self.notify_maintenance_worker();
+        Ok(MaintenanceControlResponse {
+            task: task_status(status),
+            audit_position,
+        })
+    }
+
+    pub(crate) fn resume_maintenance(
+        &self,
+        bearer: &str,
+        body: &[u8],
+    ) -> Result<MaintenanceControlResponse, (u16, &'static str)> {
+        let _catalog_operation = self
+            .catalog_operation()
+            .map_err(|_| (503, "administration_unavailable"))?;
+        let actor = self.authorize_system_administration(bearer)?;
+        let request =
+            MaintenanceResumeRequest::decode(body).map_err(|_| (400, "invalid_request"))?;
+        let identity = task_identity(request.identity()).ok_or((400, "invalid_request"))?;
+        let idempotency = PrincipalId::parse_canonical(request.idempotency_key())
+            .map_err(|_| (400, "invalid_request"))?;
+        let catalog = self.open_maintenance_catalog()?;
+        if let Some(audit_position) = maintenance_control_replay(
+            &catalog,
+            actor.principal_id(),
+            idempotency,
+            identity,
+            false,
+            0,
+            0,
+        )? {
+            let status = self
+                .instance
+                .maintenance_coordinator()
+                .lock()
+                .map_err(|_| (503, "administration_unavailable"))?
+                .status(identity)
+                .map_err(control_failure)?;
+            return Ok(MaintenanceControlResponse {
+                task: task_status(status),
+                audit_position,
+            });
+        }
+        let audit = maintenance_control_audit_intent(
+            actor.principal_id(),
+            administrative_key(idempotency)?,
+            identity,
+            false,
+            0,
+            0,
+            None,
+        )
+        .map_err(|_| (503, "administration_unavailable"))?;
+        let coordinator = self
+            .instance
+            .maintenance_coordinator()
+            .lock()
+            .map_err(|_| (503, "administration_unavailable"))?;
+        coordinator
+            .resume_and_persist_audited(&catalog, identity, audit)
+            .map_err(control_failure)?;
+        let status = coordinator.status(identity).map_err(control_failure)?;
+        drop(coordinator);
+        let audit_position = latest_control_audit_position(&catalog)?;
+        drop(catalog);
+        drop(_catalog_operation);
+        self.notify_maintenance_worker();
+        Ok(MaintenanceControlResponse {
+            task: task_status(status),
+            audit_position,
+        })
+    }
+
+    fn open_maintenance_catalog(&self) -> Result<Catalog<'_>, (u16, &'static str)> {
+        let instance = &self.instance;
+        Catalog::open(
+            &instance._authority,
+            instance.instance,
+            instance
+                .key
+                .catalog_secret(instance.instance)
+                .map_err(|_| (503, "administration_unavailable"))?,
+        )
+        .map_err(|_| (503, "administration_unavailable"))
+    }
+
+    fn authorize_system_administration(
+        &self,
+        bearer: &str,
+    ) -> Result<AuthorizedContext, (u16, &'static str)> {
+        self.instance
+            .attribute(
+                PresentedCredential::parse(bearer).map_err(|_| (401, "authentication_rejected"))?,
+                RequestedIntent::SystemAdministration,
+                CompatibilityHints::none(),
+            )
+            .map_err(|_| (401, "authentication_rejected"))
+    }
+}
+
+fn signal(value: &str) -> Option<SignalKind> {
+    match value {
+        "logs" => Some(SignalKind::Logs),
+        "traces" => Some(SignalKind::Traces),
+        _ => None,
+    }
+}
+
+fn source_failure(failure: LedgerFailure) -> (u16, &'static str) {
+    match failure.code() {
+        LedgerFailureCode::InvalidInput | LedgerFailureCode::PhysicalScopeMismatch => {
+            (404, "source_unavailable")
+        },
+        _ => (503, "administration_unavailable"),
+    }
+}
+
+fn maintenance_task_id(
+    principal: PrincipalId,
+    idempotency: PrincipalId,
+) -> Result<MaintenanceTaskId, (u16, &'static str)> {
+    let mut digest = Sha256::new();
+    digest.update(b"positron-maintenance-run-v1");
+    digest.update(principal.to_bytes());
+    digest.update(idempotency.to_bytes());
+    let digest: [u8; 32] = digest.finalize().into();
+    let mut identity = [0_u8; 16];
+    identity.copy_from_slice(
+        digest
+            .get(..16)
+            .ok_or((503, "administration_unavailable"))?,
+    );
+    MaintenanceTaskId::new(identity).map_err(|_| (503, "administration_unavailable"))
+}
+
+fn administrative_key(
+    idempotency: PrincipalId,
+) -> Result<AdministrativeIdempotencyKey, (u16, &'static str)> {
+    AdministrativeIdempotencyKey::new(idempotency.to_bytes()).map_err(|_| (400, "invalid_request"))
+}
+
+fn maintenance_control_replay(
+    catalog: &Catalog<'_>,
+    actor: PrincipalId,
+    idempotency: PrincipalId,
+    identity: MaintenanceTaskId,
+    pause: bool,
+    resource_generation: u64,
+    duration_seconds: u64,
+) -> Result<Option<u64>, (u16, &'static str)> {
+    let records = catalog
+        .governance_audit_records()
+        .map_err(|_| (503, "administration_unavailable"))?;
+    for record in records {
+        let entry = GovernanceAuditEntry::decode(&record)
+            .map_err(|_| (503, "administration_unavailable"))?;
+        let GovernanceAuditEntry::MaintenanceControl(candidate) = entry else {
+            continue;
+        };
+        if candidate.idempotency_key().to_bytes() != idempotency.to_bytes()
+            || candidate.actor() != actor
+        {
+            continue;
+        }
+        if candidate.task() != identity
+            || candidate.is_pause() != pause
+            || candidate.resource_generation() != resource_generation
+            || candidate.duration_seconds() != duration_seconds
+        {
+            return Err((409, "idempotency_conflict"));
+        }
+        return Ok(Some(candidate.position()));
+    }
+    Ok(None)
+}
+
+fn latest_control_audit_position(catalog: &Catalog<'_>) -> Result<u64, (u16, &'static str)> {
+    catalog
+        .governance_audit_records()
+        .map_err(|_| (503, "administration_unavailable"))?
+        .last()
+        .map(positron_kernel::GovernanceAuditRecord::position)
+        .ok_or((503, "administration_unavailable"))
+}
+
+fn control_failure(failure: MaintenanceFailure) -> (u16, &'static str) {
+    match failure {
+        MaintenanceFailure::UnknownTask => (404, "task_unavailable"),
+        MaintenanceFailure::PreconditionFailed
+        | MaintenanceFailure::InvalidTransition
+        | MaintenanceFailure::InvalidInput => (409, "precondition_failed"),
+        _ => (503, "administration_unavailable"),
+    }
+}
+
+fn task_status(status: positron_kernel::MaintenanceTaskStatus) -> MaintenanceTaskStatus {
+    MaintenanceTaskStatus {
+        identity: hex(status.task().identity().to_bytes()),
+        class: class_name(status.task().class()).to_owned(),
+        scope: scope_name(status.task().scope()),
+        phase: phase_name(status.phase()).to_owned(),
+        submitted_at_unix_seconds: status.submitted_at(),
+        checkpoint_sequence: status.checkpoint().map(|checkpoint| checkpoint.sequence()),
+        pause_until_unix_seconds: status.pause_until(),
+        cancellation_requested: status.cancellation_requested(),
+    }
+}
+
+fn task_identity(value: &str) -> Option<positron_kernel::MaintenanceTaskId> {
+    let mut bytes = [0_u8; 16];
+    for (slot, pair) in bytes.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
+        let high = hex_value(*pair.first()?)?;
+        let low = hex_value(*pair.get(1)?)?;
+        *slot = (high << 4) | low;
+    }
+    positron_kernel::MaintenanceTaskId::new(bytes).ok()
+}
+
+const fn hex_value(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn hex(bytes: [u8; 16]) -> String {
+    let mut rendered = String::with_capacity(32);
+    for byte in bytes {
+        let _ = write!(rendered, "{byte:02x}");
+    }
+    rendered
+}
+
+fn scope_name(scope: MaintenanceScope) -> String {
+    match scope {
+        MaintenanceScope::System => "system".to_owned(),
+        MaintenanceScope::Tenant(tenant) => format!("tenant:{}", tenant.to_canonical_text()),
+        MaintenanceScope::Segment {
+            tenant,
+            signal,
+            shard,
+        } => format!(
+            "segment:{}:{}:{}",
+            tenant.to_canonical_text(),
+            signal.as_str(),
+            shard.value()
+        ),
+    }
+}
+
+const fn phase_name(phase: MaintenanceTaskPhase) -> &'static str {
+    match phase {
+        MaintenanceTaskPhase::Queued => "queued",
+        MaintenanceTaskPhase::Running => "running",
+        MaintenanceTaskPhase::Deferred => "deferred",
+        MaintenanceTaskPhase::Cancelled => "cancelled",
+        MaintenanceTaskPhase::Succeeded => "succeeded",
+        MaintenanceTaskPhase::Failed => "failed",
+    }
+}
+
+const fn class_name(class: MaintenanceTaskClass) -> &'static str {
+    match class {
+        MaintenanceTaskClass::ActiveSegmentRoll => "active_segment_roll",
+        MaintenanceTaskClass::Compaction => "compaction",
+        MaintenanceTaskClass::RetentionPublication => "retention_publication",
+        MaintenanceTaskClass::RetentionReclamation => "retention_reclamation",
+        MaintenanceTaskClass::CatalogReclamation => "catalog_reclamation",
+        MaintenanceTaskClass::OrphanReclamation => "orphan_reclamation",
+        MaintenanceTaskClass::IntegrityScrub => "integrity_scrub",
+        MaintenanceTaskClass::QuarantineFollowUp => "quarantine_follow_up",
+        MaintenanceTaskClass::SchemaStatistics => "schema_statistics",
+        MaintenanceTaskClass::SchemaPromotion => "schema_promotion",
+        MaintenanceTaskClass::SchemaDemotion => "schema_demotion",
+        MaintenanceTaskClass::GovernanceAuditCheckpoint => "governance_audit_checkpoint",
+        MaintenanceTaskClass::KeyRewrap => "key_rewrap",
+        MaintenanceTaskClass::EnvelopeVerification => "envelope_verification",
+        MaintenanceTaskClass::Migration => "migration",
+        MaintenanceTaskClass::RepositoryVerification => "repository_verification",
+        MaintenanceTaskClass::RepositoryCleanup => "repository_cleanup",
+        MaintenanceTaskClass::BackupSnapshot => "backup_snapshot",
+        MaintenanceTaskClass::DurableExport => "durable_export",
+        MaintenanceTaskClass::SnapshotLeaseExpiry => "snapshot_lease_expiry",
+        MaintenanceTaskClass::CompletedOperationExpiry => "completed_operation_expiry",
+        MaintenanceTaskClass::TenantPurge => "tenant_purge",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Barrier, mpsc};
+    use std::time::Duration;
+
+    use positron_api::maintenance::{
+        MaintenancePauseRequest, MaintenanceResumeRequest, MaintenanceRunRequest,
+    };
+    use positron_domain::routing::SignalKind;
+    use positron_kernel::{ActiveSegmentLedger, MaintenanceTaskPhase};
+    use prost::Message;
+
+    use super::super::ServiceHandle;
+    use super::super::tests::schema_maintenance::{Fixture, open_catalog, request};
+
+    #[test]
+    fn authenticated_maintenance_status_waits_for_catalog_ownership_before_attribution()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new()?;
+        let (initialized, _, _, administrator) = fixture.initialized_with_admin()?;
+        let services = Arc::new(ServiceHandle::new(initialized)?);
+        let catalog_operation = services.catalog_operation()?;
+        let barrier = Arc::new(Barrier::new(2));
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let request_services = Arc::clone(&services);
+        let request_barrier = Arc::clone(&barrier);
+        let request = std::thread::spawn(move || {
+            request_barrier.wait();
+            let result = request_services
+                .maintenance_status(&administrator, br"{}")
+                .map(|_| ());
+            let _ = sender.send(result);
+        });
+        barrier.wait();
+        assert!(
+            receiver.recv_timeout(Duration::from_millis(100)).is_err(),
+            "maintenance attribution bypassed the catalog-operation gate"
+        );
+        drop(catalog_operation);
+        assert_eq!(
+            receiver
+                .recv_timeout(Duration::from_secs(1))
+                .map_err(|_| "maintenance request did not resume")?,
+            Ok(())
+        );
+        request
+            .join()
+            .map_err(|_| "maintenance request thread panicked")?;
+        Ok(())
+    }
+
+    #[test]
+    fn authenticated_run_prepares_one_sealed_compaction_task_and_replays_after_reopen()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new()?;
+        let (initialized, ingest, _, administrator) = fixture.initialized_with_admin()?;
+        let services = ServiceHandle::new(Arc::clone(&initialized))?;
+        services.ingest_otlp_logs(&ingest, request("run-api-sealed-source").encode_to_vec())?;
+        let catalog = open_catalog(&initialized)?;
+        let scope = catalog
+            .pin()?
+            .reachable_ledger_scopes(initialized.default_tenant_id(), SignalKind::Logs)?
+            .into_iter()
+            .next()
+            .ok_or("log scope")?;
+        ActiveSegmentLedger::open_for_maintenance_with_retention_time(
+            &initialized._authority,
+            &initialized.retention_time,
+            &catalog,
+            scope,
+            initialized.tenant_segment_key_for_test(scope)?,
+        )?
+        .seal()?;
+        drop(catalog);
+        let request = MaintenanceRunRequest::new(
+            "compaction".to_owned(),
+            initialized.default_tenant_id().to_canonical_text(),
+            "logs".to_owned(),
+            scope.shard_id().value(),
+            "00000000-0000-0000-0000-000000000001".to_owned(),
+        );
+        let body = request.encode()?;
+        let first = services
+            .run_maintenance(&administrator, &body)
+            .map_err(|failure| format!("first run: {failure:?}"))?;
+        assert_eq!(first.task.class, "compaction");
+        assert_eq!(first.task.phase, "queued");
+        let replay = services
+            .run_maintenance(&administrator, &body)
+            .map_err(|failure| format!("replayed run: {failure:?}"))?;
+        assert_eq!(replay, first, "retry attaches to the durable task");
+        let identity = super::task_identity(&first.task.identity).ok_or("task identity")?;
+        drop(services);
+        drop(initialized);
+
+        let reopened = fixture.reopen()?;
+        let _restored_services = ServiceHandle::new(Arc::clone(&reopened))?;
+        assert_eq!(
+            reopened
+                .maintenance_coordinator()
+                .lock()
+                .map_err(|_| "maintenance coordinator")?
+                .status(identity)
+                .map_err(|failure| format!("restored task: {failure:?}"))?
+                .phase(),
+            MaintenanceTaskPhase::Queued,
+            "the acknowledged run remains durably queued after reopen"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn maintenance_run_rejects_unauthenticated_requests_before_decoding()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new()?;
+        let (initialized, _, _, _) = fixture.initialized_with_admin()?;
+        let services = ServiceHandle::new(initialized)?;
+        assert_eq!(
+            services.run_maintenance("not-a-credential", br#"{\"unknown\":true}"#),
+            Err((401, "authentication_rejected")),
+            "authentication precedes decoding"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn authenticated_pause_and_resume_replay_durably_after_reopen()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new()?;
+        let (initialized, ingest, _, administrator) = fixture.initialized_with_admin()?;
+        let services = ServiceHandle::new(Arc::clone(&initialized))?;
+        services.ingest_otlp_logs(&ingest, request("pause-api-sealed-source").encode_to_vec())?;
+        let catalog = open_catalog(&initialized)?;
+        let scope = catalog
+            .pin()?
+            .reachable_ledger_scopes(initialized.default_tenant_id(), SignalKind::Logs)?
+            .into_iter()
+            .next()
+            .ok_or("log scope")?;
+        ActiveSegmentLedger::open_for_maintenance_with_retention_time(
+            &initialized._authority,
+            &initialized.retention_time,
+            &catalog,
+            scope,
+            initialized.tenant_segment_key_for_test(scope)?,
+        )?
+        .seal()?;
+        drop(catalog);
+        let run = MaintenanceRunRequest::new(
+            "compaction".to_owned(),
+            initialized.default_tenant_id().to_canonical_text(),
+            "logs".to_owned(),
+            scope.shard_id().value(),
+            "00000000-0000-0000-0000-000000000011".to_owned(),
+        );
+        let task = services
+            .run_maintenance(&administrator, &run.encode()?)
+            .map_err(|failure| format!("run task: {failure:?}"))?
+            .task;
+        let pause = MaintenancePauseRequest::new(
+            task.identity.clone(),
+            1,
+            60,
+            "00000000-0000-0000-0000-000000000012".to_owned(),
+        );
+        let paused = services
+            .pause_maintenance(&administrator, &pause.encode()?)
+            .map_err(|failure| format!("pause task: {failure:?}"))?;
+        assert_eq!(paused.task.phase, "deferred");
+        assert!(paused.task.pause_until_unix_seconds.is_some());
+        assert_ne!(paused.audit_position, 0);
+        assert_eq!(
+            services
+                .pause_maintenance(&administrator, &pause.encode()?)
+                .map_err(|failure| format!("replay pause: {failure:?}"))?,
+            paused,
+            "an exact operator retry replays its acknowledged durable pause"
+        );
+        let conflicting_pause = MaintenancePauseRequest::new(
+            task.identity.clone(),
+            1,
+            61,
+            "00000000-0000-0000-0000-000000000012".to_owned(),
+        );
+        assert_eq!(
+            services.pause_maintenance(&administrator, &conflicting_pause.encode()?),
+            Err((409, "idempotency_conflict"))
+        );
+        let identity = super::task_identity(&task.identity).ok_or("task identity")?;
+        drop(services);
+        drop(initialized);
+
+        let reopened = fixture.reopen()?;
+        let services = ServiceHandle::new(Arc::clone(&reopened))?;
+        let reopened_phase = {
+            let coordinator_handle = reopened.maintenance_coordinator();
+            let coordinator = coordinator_handle
+                .lock()
+                .map_err(|_| "maintenance coordinator")?;
+            coordinator
+                .status(identity)
+                .map_err(|failure| format!("reopened task: {failure:?}"))?
+                .phase()
+        };
+        assert_eq!(reopened_phase, MaintenanceTaskPhase::Deferred);
+        let resume = MaintenanceResumeRequest::new(
+            task.identity,
+            "00000000-0000-0000-0000-000000000013".to_owned(),
+        );
+        let resumed = services
+            .resume_maintenance(&administrator, &resume.encode()?)
+            .map_err(|failure| format!("resume task: {failure:?}"))?;
+        assert_eq!(resumed.task.phase, "queued");
+        assert_eq!(resumed.task.pause_until_unix_seconds, None);
+        assert_eq!(
+            services
+                .resume_maintenance(&administrator, &resume.encode()?)
+                .map_err(|failure| format!("replay resume: {failure:?}"))?,
+            resumed,
+            "an exact operator retry replays its acknowledged durable resume"
+        );
+        Ok(())
+    }
+}

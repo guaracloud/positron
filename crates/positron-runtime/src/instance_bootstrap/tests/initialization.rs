@@ -3,6 +3,7 @@ use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Barrier};
 
 use crate::{
     BootstrapFailureCode, BootstrapPaths, BootstrapState, InitializationPlan, InstanceBootstrap,
@@ -14,10 +15,12 @@ use positron_domain::time::UnixNanoseconds;
 use positron_governance::{AdministrativeIdempotencyKey, ResourceGeneration};
 use positron_governance::{CompatibilityHints, PresentedCredential, RequestedIntent};
 #[cfg(feature = "test-support")]
+use positron_kernel::MaintenanceTaskPhase;
+#[cfg(feature = "test-support")]
 use positron_kernel::RetentionTimeAuthority;
 use positron_kernel::{
     CatalogPublicationFault, MountQualification, PrimaryDataVolume,
-    with_catalog_publication_fault_after,
+    with_catalog_publication_fault_after, with_catalog_publication_fault_sequence_after,
 };
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
@@ -119,7 +122,285 @@ fn system_administrator_publishes_and_verifies_a_bootstrap_bound_audit_checkpoin
     let checkpoint = instance.publish_governance_audit_checkpoint(administrator()?)?;
     assert_eq!(checkpoint.position(), 1);
     assert_eq!(checkpoint.instance(), instance.instance_id());
+    assert_eq!(
+        instance.publish_governance_audit_checkpoint(administrator()?)?,
+        checkpoint,
+        "a completed checkpoint is a durable public result, even after its task record advances the Catalog generation"
+    );
     instance.verify_governance_audit_history(administrator()?, Some(&checkpoint))?;
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn delayed_audit_checkpoint_keeps_the_newer_live_and_recovered_frontier()
+-> Result<(), Box<dyn Error>> {
+    let roots = Roots::new()?;
+    let paths = roots.paths().map_err(|code| format!("paths: {code:?}"))?;
+    drop(InstanceBootstrap::initialize(
+        &paths,
+        InitializationPlan::non_interactive(),
+    )?);
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    let administrator = || {
+        instance.attribute(
+            PresentedCredential::parse(claim.secret()).expect("claim syntax"),
+            RequestedIntent::SystemAdministration,
+            CompatibilityHints::none(),
+        )
+    };
+
+    let older_task = instance.queue_governance_audit_checkpoint_for_test()?;
+    instance.update_tenant_display_name(
+        administrator()?,
+        instance.default_tenant_id(),
+        ResourceGeneration::new(1)?,
+        "Checkpoint frontier successor",
+        AdministrativeIdempotencyKey::new([0x73; 16])?,
+    )?;
+    let newer_task = instance.queue_governance_audit_checkpoint_for_test()?;
+
+    let newer = instance.complete_queued_governance_audit_checkpoint_for_test(newer_task)?;
+    let (older, live_latest) =
+        instance.complete_queued_governance_audit_checkpoint_and_read_live_for_test(older_task)?;
+    assert!(older.position() < newer.position());
+    assert_eq!(
+        instance.governance_audit_checkpoint_phase_for_test(older_task)?,
+        MaintenanceTaskPhase::Succeeded,
+        "the delayed task still terminalizes after publishing its exact frontier"
+    );
+    assert_eq!(
+        instance.governance_audit_checkpoint_phase_for_test(newer_task)?,
+        MaintenanceTaskPhase::Succeeded
+    );
+
+    assert_eq!(
+        live_latest,
+        Some(newer.clone()),
+        "the live cache keeps the greatest persisted checkpoint frontier"
+    );
+    drop(instance);
+
+    let reopened = InstanceBootstrap::reopen(&paths)?;
+    assert_eq!(
+        reopened.latest_governance_audit_checkpoint_for_test()?,
+        Some(newer),
+        "recovery and the live Catalog agree on the greatest persisted checkpoint frontier"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn non_administrator_cannot_create_audit_checkpoint_artifact_or_task() -> Result<(), Box<dyn Error>>
+{
+    let roots = Roots::new()?;
+    let paths = roots.paths().map_err(|code| format!("paths: {code:?}"))?;
+    drop(InstanceBootstrap::initialize(
+        &paths,
+        InitializationPlan::non_interactive(),
+    )?);
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    let administrator = || {
+        instance.attribute(
+            PresentedCredential::parse(claim.secret()).expect("claim syntax"),
+            RequestedIntent::SystemAdministration,
+            CompatibilityHints::none(),
+        )
+    };
+    let query_secret = instance
+        .create_api_key(
+            administrator()?,
+            Scope::Query,
+            None,
+            ResourceGeneration::new(1)?,
+            AdministrativeIdempotencyKey::new([0xd0; 16])?,
+        )?
+        .secret()
+        .ok_or("query credential")?
+        .to_owned();
+    let query = instance.attribute(
+        PresentedCredential::parse(&query_secret)?,
+        RequestedIntent::Query,
+        CompatibilityHints::none(),
+    )?;
+    let rejected = instance
+        .publish_governance_audit_checkpoint(query)
+        .expect_err("a tenant query principal cannot request system audit maintenance");
+    assert_eq!(rejected.code(), BootstrapFailureCode::ApiKeyUnauthorized);
+    assert_eq!(
+        instance.governance_audit_checkpoint_state_for_test()?,
+        (false, 0)
+    );
+
+    instance.publish_governance_audit_checkpoint(administrator()?)?;
+    assert_eq!(
+        instance.governance_audit_checkpoint_state_for_test()?,
+        (true, 1)
+    );
+    Ok(())
+}
+
+#[test]
+fn concurrent_system_administrators_attach_to_one_audit_checkpoint_result()
+-> Result<(), Box<dyn Error>> {
+    let roots = Roots::new()?;
+    let paths = roots.paths().map_err(|code| format!("paths: {code:?}"))?;
+    drop(InstanceBootstrap::initialize(
+        &paths,
+        InitializationPlan::non_interactive(),
+    )?);
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = Arc::new(InstanceBootstrap::reopen(&paths)?);
+    let barrier = Arc::new(Barrier::new(3));
+    let first_actor = instance.attribute(
+        PresentedCredential::parse(claim.secret())?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let second_actor = instance.attribute(
+        PresentedCredential::parse(claim.secret())?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let first_instance = Arc::clone(&instance);
+    let first_barrier = Arc::clone(&barrier);
+    let first = std::thread::spawn(move || -> Result<_, std::io::Error> {
+        first_barrier.wait();
+        first_instance
+            .publish_governance_audit_checkpoint(first_actor)
+            .map_err(|failure| std::io::Error::other(failure.to_string()))
+    });
+    let second_instance = Arc::clone(&instance);
+    let second_barrier = Arc::clone(&barrier);
+    let second = std::thread::spawn(move || -> Result<_, std::io::Error> {
+        second_barrier.wait();
+        second_instance
+            .publish_governance_audit_checkpoint(second_actor)
+            .map_err(|failure| std::io::Error::other(failure.to_string()))
+    });
+    barrier.wait();
+    let first = first
+        .join()
+        .map_err(|_| "first checkpoint caller panicked")??;
+    let second = second
+        .join()
+        .map_err(|_| "second checkpoint caller panicked")??;
+    assert_eq!(first, second);
+    Ok(())
+}
+
+#[test]
+fn audit_checkpoint_retries_its_terminal_record_after_the_artifact_is_durable()
+-> Result<(), Box<dyn Error>> {
+    let roots = Roots::new()?;
+    let paths = roots.paths().map_err(|code| format!("paths: {code:?}"))?;
+    drop(InstanceBootstrap::initialize(
+        &paths,
+        InitializationPlan::non_interactive(),
+    )?);
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    let administrator = || {
+        instance.attribute(
+            PresentedCredential::parse(claim.secret()).expect("claim syntax"),
+            RequestedIntent::SystemAdministration,
+            CompatibilityHints::none(),
+        )
+    };
+
+    let actor = administrator()?;
+    let checkpoint = with_catalog_publication_fault_after(
+        CatalogPublicationFault::SynchronizeCommit,
+        2,
+        || instance.publish_governance_audit_checkpoint(actor),
+    )?;
+    assert_eq!(checkpoint.position(), 1);
+    assert_eq!(
+        instance.publish_governance_audit_checkpoint(administrator()?)?,
+        checkpoint,
+        "the terminal record retry leaves one durable signed artifact and one public result"
+    );
+    Ok(())
+}
+
+#[test]
+fn audit_checkpoint_reopens_and_reconciles_after_artifact_and_terminal_faults()
+-> Result<(), Box<dyn Error>> {
+    let roots = Roots::new()?;
+    let paths = roots.paths().map_err(|code| format!("paths: {code:?}"))?;
+    drop(InstanceBootstrap::initialize(
+        &paths,
+        InitializationPlan::non_interactive(),
+    )?);
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let instance = InstanceBootstrap::reopen(&paths)?;
+    let administrator = || {
+        instance.attribute(
+            PresentedCredential::parse(claim.secret()).expect("claim syntax"),
+            RequestedIntent::SystemAdministration,
+            CompatibilityHints::none(),
+        )
+    };
+
+    let actor = administrator()?;
+    with_catalog_publication_fault_sequence_after(
+        &[
+            (CatalogPublicationFault::SynchronizeCommit, 2),
+            (CatalogPublicationFault::SynchronizeCommit, 0),
+            (CatalogPublicationFault::SynchronizeCommit, 0),
+        ],
+        || instance.publish_governance_audit_checkpoint(actor),
+    )
+    .expect_err("terminal and durable-requeue failures leave the signed artifact recoverable");
+    let same_process = instance.publish_governance_audit_checkpoint(administrator()?)?;
+    assert_eq!(same_process.position(), 1);
+    drop(instance);
+
+    let reopened = InstanceBootstrap::reopen(&paths)?;
+    let actor = reopened.attribute(
+        PresentedCredential::parse(claim.secret())?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let checkpoint = reopened.publish_governance_audit_checkpoint(actor)?;
+    assert_eq!(checkpoint, same_process);
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn queued_audit_checkpoint_key_change_fails_durably_and_new_binding_progresses()
+-> Result<(), Box<dyn Error>> {
+    let roots = Roots::new()?;
+    let paths = roots.paths().map_err(|code| format!("paths: {code:?}"))?;
+    drop(InstanceBootstrap::initialize(
+        &paths,
+        InitializationPlan::non_interactive(),
+    )?);
+    let claim = InstanceBootstrap::claim(&paths)?;
+    let mut instance = InstanceBootstrap::reopen(&paths)?;
+    let new_fingerprint = [0xa5; 32];
+    let task_id = instance.queue_governance_audit_checkpoint_for_test()?;
+    instance.rotate_governance_audit_fingerprint_for_test(new_fingerprint)?;
+    let failure = instance
+        .complete_queued_governance_audit_checkpoint_for_test(task_id)
+        .expect_err("a queued checkpoint bound to the retired fingerprint must terminalize");
+    assert_eq!(failure.code(), BootstrapFailureCode::IdentityMismatch);
+    assert_eq!(
+        instance.governance_audit_checkpoint_phase_for_test(task_id)?,
+        MaintenanceTaskPhase::Failed
+    );
+
+    let actor = instance.attribute(
+        PresentedCredential::parse(claim.secret())?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let checkpoint = instance.publish_governance_audit_checkpoint(actor)?;
+    assert_eq!(checkpoint.position(), 1);
     Ok(())
 }
 

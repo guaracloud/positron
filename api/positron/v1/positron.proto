@@ -44,6 +44,16 @@ service TenantRetentionService {
   rpc Update(TenantRetentionUpdateRequest) returns (TenantRetentionUpdateResponse);
 }
 
+// Authenticated system-administration inspection of the one Storage Kernel
+// Maintenance Coordinator. Task control remains in the coordinator.
+service MaintenanceService {
+  rpc Status(MaintenanceStatusRequest) returns (MaintenanceStatusResponse);
+  rpc Explain(MaintenanceExplainRequest) returns (MaintenanceExplainResponse);
+  rpc Run(MaintenanceRunRequest) returns (MaintenanceRunResponse);
+  rpc Pause(MaintenancePauseRequest) returns (MaintenanceControlResponse);
+  rpc Resume(MaintenanceResumeRequest) returns (MaintenanceControlResponse);
+}
+
 // Authenticated system administration for explicit tenant registry entries.
 // Tenant identity is always explicit and is never inferred from a bearer.
 service TenantService {
@@ -351,6 +361,72 @@ message ApiKeyResponse {
 message CapabilityRequest {
   uint32 api_major = 1;
   Capability capability = 2;
+}
+
+message MaintenanceStatusRequest {}
+
+message MaintenanceTaskStatus {
+  string identity = 1;
+  string task_class = 2;
+  string scope = 3;
+  string phase = 4;
+  uint64 submitted_at_unix_seconds = 5;
+  optional uint64 checkpoint_sequence = 6;
+  optional uint64 pause_until_unix_seconds = 7;
+  bool cancellation_requested = 8;
+}
+
+message MaintenanceStatusResponse {
+  repeated MaintenanceTaskStatus tasks = 1;
+  uint32 queued = 2;
+  uint32 running = 3;
+  uint32 deferred = 4;
+  uint32 terminal = 5;
+}
+
+message MaintenanceExplainRequest {
+  string identity = 1;
+}
+
+message MaintenanceExplainResponse {
+  MaintenanceTaskStatus task = 1;
+}
+
+// An authenticated system-administration request for one explicit existing
+// scope. Release 1 accepts only compaction; the Storage Kernel selects a
+// sealed source and derives its retention bucket, inputs, preconditions, and
+// reservations from authenticated Catalog state.
+message MaintenanceRunRequest {
+  string task_class = 1;
+  string tenant = 2;
+  string signal = 3;
+  uint32 shard = 4;
+  string idempotency_key = 5;
+}
+
+message MaintenanceRunResponse {
+  MaintenanceTaskStatus task = 1;
+}
+
+// Defers only one existing optional task for a bounded server-derived
+// duration. The resource generation fences the immutable task preconditions.
+message MaintenancePauseRequest {
+  string identity = 1;
+  uint64 resource_generation = 2;
+  uint64 duration_seconds = 3;
+  string idempotency_key = 4;
+}
+
+// Removes one existing durable pause. The server never accepts an expiry or
+// other scheduling input from a caller.
+message MaintenanceResumeRequest {
+  string identity = 1;
+  string idempotency_key = 2;
+}
+
+message MaintenanceControlResponse {
+  MaintenanceTaskStatus task = 1;
+  uint64 audit_position = 2;
 }
 
 message CapabilityResponse {

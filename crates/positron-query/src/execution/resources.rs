@@ -130,6 +130,7 @@ impl ExecutionResources {
         mut self,
         ledger: &ActiveSegmentLedger<'_, '_>,
         target_ledger: Option<&ActiveSegmentLedger<'_, '_>>,
+        maintenance: Option<&std::sync::Mutex<positron_kernel::MaintenanceCoordinator>>,
         state: &crate::cursor::CursorState,
         primary: QueryFailure,
     ) -> QueryFailure {
@@ -141,17 +142,17 @@ impl ExecutionResources {
         // same strongest-failure selection as every other cleanup path.
         let target_cleanup = usage_failure.is_none().then(|| {
             self.target_lease.as_ref().map(|target| {
-                target_ledger
-                    .ok_or_else(|| QueryFailure::new(crate::QueryFailureCode::Internal))?
-                    .release_snapshot_lease(target.identity)
-                    .map_err(map_ledger_failure)
+                super::lifecycle::release_lease(
+                    target_ledger
+                        .ok_or_else(|| QueryFailure::new(crate::QueryFailureCode::Internal))?,
+                    maintenance,
+                    target.identity,
+                )
             })
         });
-        let cleanup = usage_failure.is_none().then(|| {
-            ledger
-                .release_snapshot_lease(self.lease)
-                .map_err(map_ledger_failure)
-        });
+        let cleanup = usage_failure
+            .is_none()
+            .then(|| super::lifecycle::release_lease(ledger, maintenance, self.lease));
         drop(self.admission);
         let mut selected = primary;
         if let Some(failure) = usage_failure {
@@ -184,6 +185,7 @@ impl ExecutionResources {
         self,
         ledger: &ActiveSegmentLedger<'_, '_>,
         target_ledger: Option<&ActiveSegmentLedger<'_, '_>>,
+        maintenance: Option<&std::sync::Mutex<positron_kernel::MaintenanceCoordinator>>,
         state: &crate::cursor::CursorState,
         expected: [u8; 16],
     ) -> Result<Self, QueryFailure> {
@@ -193,6 +195,7 @@ impl ExecutionResources {
         Err(self.fail_before_stream(
             ledger,
             target_ledger,
+            maintenance,
             state,
             QueryFailure::new(crate::QueryFailureCode::Internal),
         ))

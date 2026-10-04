@@ -51,7 +51,7 @@ pub use fault::{
 
 pub(super) const FRAME_OVERHEAD_BYTES: usize = 315;
 const MAX_COMMIT_FRAME_BYTES: usize = 262_144;
-const MAX_AUDIT_FRAME_BYTES: usize = MAX_AUDIT_RECORD_BYTES + FRAME_OVERHEAD_BYTES;
+pub(super) const MAX_AUDIT_FRAME_BYTES: usize = MAX_AUDIT_RECORD_BYTES + FRAME_OVERHEAD_BYTES;
 const MAX_AUDIT_CHECKPOINT_FRAME_BYTES: usize = 512 + FRAME_OVERHEAD_BYTES;
 const PREPARED_NAME: &str = "prepared.manifest";
 const PREPARED_IDENTITY_BYTES: usize = 32;
@@ -850,6 +850,7 @@ impl CatalogStorage {
         let mut authentication_failures = 0_usize;
         let mut entry_count = 0_usize;
         let mut name_bytes = 0_usize;
+        emit_event(CatalogFileEvent::ReadGenerationDirectory)?;
         let mut directory = Dir::read_from(&self.generations)
             .map_err(|_| CatalogFailure::new(CatalogFailureCode::StorageUnavailable))?;
         while let Some(entry) = directory.read() {

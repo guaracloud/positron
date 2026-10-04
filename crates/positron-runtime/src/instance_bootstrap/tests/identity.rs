@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use positron_domain::identity::{PrincipalId, Scope};
 use positron_domain::routing::{SignalKind, VirtualShardId};
@@ -20,7 +21,7 @@ use super::super::InitializationPlan;
 use super::super::operation::governance_audit_records;
 use super::super::resources;
 use super::support::Roots;
-use crate::{InstanceBootstrap, PublicPlaintextApiStartupIntent};
+use crate::{InstanceBootstrap, PublicPlaintextApiStartupIntent, ServiceHandle};
 
 #[test]
 fn identity_failures_do_not_enumerate_or_expose_secret_material()
@@ -237,7 +238,7 @@ fn plaintext_listener_activation_replays_after_audit_reclamation_and_reopen()
         InitializationPlan::non_interactive(),
     )?);
     let claim = InstanceBootstrap::claim(&paths)?;
-    let initialized = InstanceBootstrap::reopen(&paths)?;
+    let initialized = Arc::new(InstanceBootstrap::reopen(&paths)?);
     let configured = PublicPlaintextApiStartupIntent::configuration_file(SocketAddr::from((
         Ipv4Addr::new(198, 51, 100, 25),
         8_080,
@@ -254,6 +255,10 @@ fn plaintext_listener_activation_replays_after_audit_reclamation_and_reopen()
         ResourceGeneration::new(1)?,
         AdministrativeIdempotencyKey::new([0xf3; 16])?,
     )?;
+    assert!(
+        ServiceHandle::new(Arc::clone(&initialized))?.wake_maintenance_worker()?,
+        "the runtime maintenance worker reclaims the eligible audit prefix before replay"
+    );
     drop(initialized);
 
     let reopened = InstanceBootstrap::reopen(&paths)?;

@@ -353,6 +353,18 @@ impl LogStore {
     ) -> Result<LogCompactionOutcome, LogStoreFailure> {
         compaction::compact(ledger, tenant, policy, bucket, cancellation, observer)
     }
+
+    /// Executes one already-admitted coordinator Compaction with its durable
+    /// binding as the only source and bucket authority.
+    pub fn compact_with_maintenance<'kernel, 'catalog>(
+        &self,
+        ledger: &positron_kernel::ActiveSegmentLedger<'kernel, 'catalog>,
+        tenant: TenantId,
+        policy: LogRetentionPolicy,
+        execution: &crate::MaintenanceCompactionExecution<'_, 'kernel>,
+    ) -> Result<LogCompactionOutcome, LogStoreFailure> {
+        compaction::compact_with_maintenance(ledger, tenant, policy, execution)
+    }
 }
 
 const SCANNED_RECORD_SLOT_BYTES: u64 = 512;

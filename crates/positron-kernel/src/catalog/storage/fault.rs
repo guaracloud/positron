@@ -37,6 +37,7 @@ pub(crate) enum CatalogFileEvent {
     SynchronizeMarker,
     RenameMarker,
     SynchronizeGenerationDirectory,
+    ReadGenerationDirectory,
     PartialRewrapWrite,
     SynchronizeRewrap,
     SynchronizeRewrapDirectory,
@@ -203,6 +204,7 @@ pub enum CatalogPublicationFault {
     SynchronizeReclaimedAuditDirectory,
     SynchronizeCommit,
     SynchronizeGenerationDirectory,
+    ReadGenerationDirectory,
 }
 
 #[cfg(feature = "test-support")]
@@ -217,6 +219,7 @@ impl CatalogPublicationFault {
             Self::SynchronizeGenerationDirectory => {
                 CatalogFileEvent::SynchronizeGenerationDirectory
             },
+            Self::ReadGenerationDirectory => CatalogFileEvent::ReadGenerationDirectory,
         }
     }
 }

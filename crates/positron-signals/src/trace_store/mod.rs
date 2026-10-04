@@ -183,6 +183,18 @@ impl TraceStore {
         compaction::compact(ledger, tenant, policy, bucket, cancellation, observer)
     }
 
+    /// Executes one already-admitted coordinator Compaction with its durable
+    /// binding as the only source and bucket authority.
+    pub fn compact_with_maintenance<'kernel, 'catalog>(
+        &self,
+        ledger: &positron_kernel::ActiveSegmentLedger<'kernel, 'catalog>,
+        tenant: positron_domain::identity::TenantId,
+        policy: TraceRetentionPolicy,
+        execution: &crate::MaintenanceCompactionExecution<'_, 'kernel>,
+    ) -> Result<TraceCompactionOutcome, TraceStoreFailure> {
+        compaction::compact_with_maintenance(ledger, tenant, policy, execution)
+    }
+
     /// Prepares a retention-ineligible block for deterministic store tests.
     #[cfg(any(test, fuzzing))]
     #[doc(hidden)]

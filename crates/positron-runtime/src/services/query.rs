@@ -43,6 +43,7 @@ pub(super) fn query_events_for_test(
     budget: QueryBudget,
     page_limit: Option<u16>,
 ) -> Result<QueryTestOutcome, ServiceFailure> {
+    let _catalog_operation = services.catalog_operation()?;
     let instance = &services.instance;
     let catalog = Catalog::open(
         &instance._authority,
@@ -107,6 +108,7 @@ pub(super) fn resume_query_events_for_test(
     shard: positron_domain::routing::VirtualShardId,
     batch_limit: u16,
 ) -> Result<QueryTestOutcome, ServiceFailure> {
+    let _catalog_operation = services.catalog_operation()?;
     let instance = &services.instance;
     let catalog = Catalog::open(
         &instance._authority,
@@ -154,6 +156,7 @@ pub(super) fn query_log_bodies(
     source: &str,
     budget: QueryBudget,
 ) -> Result<Vec<String>, ServiceFailure> {
+    let _catalog_operation = services.catalog_operation()?;
     let instance = &services.instance;
     let initial_identity = instance
         .durable_identity()
@@ -195,7 +198,8 @@ pub(super) fn query_log_bodies(
         protection,
     )
     .map_err(|failure| classify_ledger_failure_code(failure.code()))?;
-    let service = QueryService::new(instance._authority.governor(), &ledger, 100);
+    let service = QueryService::new(instance._authority.governor(), &ledger, 100)
+        .with_maintenance_coordinator(instance.maintenance_coordinator());
     let service = match &services.export_destination_resolver {
         Some(resolver) => service.with_export_destination_resolver(Arc::clone(resolver)),
         None => service,
@@ -218,5 +222,9 @@ pub(super) fn query_log_bodies(
         })
         .map_err(schema_bootstrap::classify_replay_failure)?
         .map_err(|failure| map_query_failure(&failure))?;
+    // QueryService publishes the source lease and its expiry task atomically
+    // before yielding this stream. Wake only after that durable transition so
+    // the registered worker cannot consume a pre-publication signal.
+    services.notify_maintenance_worker();
     collect_query_bodies(events)
 }

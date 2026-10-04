@@ -43,6 +43,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 return Err(resources.fail_before_stream(
                     self.ledger,
                     self.trace_ledger,
+                    self.maintenance,
                     &state,
                     failure,
                 ));
@@ -64,6 +65,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 return Err(resources.fail_before_stream(
                     self.ledger,
                     self.trace_ledger,
+                    self.maintenance,
                     &state,
                     failure,
                 ));
@@ -75,6 +77,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 return Err(resources.fail_before_stream(
                     self.ledger,
                     self.trace_ledger,
+                    self.maintenance,
                     &state,
                     failure,
                 ));
@@ -100,6 +103,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                 return Err(resources.fail_before_stream(
                     self.ledger,
                     self.trace_ledger,
+                    self.maintenance,
                     &state,
                     QueryFailure::new(QueryFailureCode::Internal),
                 ));

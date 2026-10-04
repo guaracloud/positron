@@ -14,6 +14,8 @@ mod tests;
 pub enum TaskRole {
     Control,
     Operations,
+    /// Internal Storage Kernel maintenance work; it owns no listener.
+    Maintenance,
     Api,
     OtlpGrpc,
     OtlpHttp,

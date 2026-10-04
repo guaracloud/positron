@@ -18,9 +18,9 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         source_lease: SnapshotLeaseId,
         primary: QueryFailure,
     ) -> QueryFailure {
-        match self.ledger.release_snapshot_lease(source_lease) {
+        match super::lifecycle::release_lease(self.ledger, self.maintenance, source_lease) {
             Ok(()) => primary,
-            Err(cleanup) => crate::failure::stronger_failure(primary, map_ledger_failure(cleanup)),
+            Err(cleanup) => crate::failure::stronger_failure(primary, cleanup),
         }
     }
 
@@ -43,9 +43,9 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         let Ok(identity) = SnapshotLeaseId::new(identity) else {
             return primary;
         };
-        match ledger.release_snapshot_lease(identity) {
+        match super::lifecycle::release_lease(ledger, self.maintenance, identity) {
             Ok(()) => primary,
-            Err(cleanup) => crate::failure::stronger_failure(primary, map_ledger_failure(cleanup)),
+            Err(cleanup) => crate::failure::stronger_failure(primary, cleanup),
         }
     }
 
@@ -118,14 +118,29 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         };
         // PlannedQuery still owns its admitted CPU reservation while the
         // separately scoped immutable source snapshots are constructed.
-        let lease = self
-            .ledger
-            .create_snapshot_lease_for_at_catalog(
-                now,
-                remaining_ttl(now, expiry)?,
-                catalog_identity,
-            )
-            .map_err(map_ledger_failure)?;
+        let lease = match self.maintenance {
+            Some(maintenance) => {
+                let coordinator = maintenance
+                    .lock()
+                    .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
+                self.ledger
+                    .create_snapshot_lease_for_at_catalog_with_expiry_task(
+                        &coordinator,
+                        now,
+                        remaining_ttl(now, expiry)?,
+                        catalog_identity,
+                    )
+                    .map_err(map_ledger_failure)?
+            },
+            None => self
+                .ledger
+                .create_snapshot_lease_for_at_catalog(
+                    now,
+                    remaining_ttl(now, expiry)?,
+                    catalog_identity,
+                )
+                .map_err(map_ledger_failure)?,
+        };
         let trace_lease = match trace_ledger {
             Some(trace_ledger) => {
                 let (reauthorized_tenant, trace_catalog_identity, _) =
@@ -139,11 +154,25 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
                     let failure = QueryFailure::new(QueryFailureCode::AuthorizationChanged);
                     return Err(self.fail_after_source_lease(lease.identity(), failure));
                 }
-                match trace_ledger.create_snapshot_lease_for_at_catalog(
-                    now,
-                    remaining_ttl(now, expiry)?,
-                    trace_catalog_identity,
-                ) {
+                let trace_result = match self.maintenance {
+                    Some(maintenance) => {
+                        let coordinator = maintenance
+                            .lock()
+                            .map_err(|_| QueryFailure::new(QueryFailureCode::Internal))?;
+                        trace_ledger.create_snapshot_lease_for_at_catalog_with_expiry_task(
+                            &coordinator,
+                            now,
+                            remaining_ttl(now, expiry)?,
+                            trace_catalog_identity,
+                        )
+                    },
+                    None => trace_ledger.create_snapshot_lease_for_at_catalog(
+                        now,
+                        remaining_ttl(now, expiry)?,
+                        trace_catalog_identity,
+                    ),
+                };
+                match trace_result {
                     Ok(lease) => Some(lease),
                     Err(failure) => {
                         let primary = map_ledger_failure(failure);
@@ -261,9 +290,7 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
         let attempt = match lease.take_attempt() {
             Some(attempt) => attempt,
             None => {
-                self.ledger
-                    .release_snapshot_lease(lease.identity())
-                    .map_err(map_ledger_failure)?;
+                super::lifecycle::release_lease(self.ledger, self.maintenance, lease.identity())?;
                 return Err(QueryFailure::new(QueryFailureCode::Internal));
             },
         };
@@ -326,155 +353,171 @@ impl<'kernel, 'catalog, 'ledger> QueryService<'kernel, 'catalog, 'ledger> {
             return Err(resources.fail_before_stream(
                 self.ledger,
                 self.trace_ledger,
+                self.maintenance,
                 &state,
                 primary,
             ));
         }
-        let (trace_snapshot, trace_lease_identity, resources) = if state
-            .plan
-            .is_log_to_trace_correlation()
-        {
-            let (
-                Some(trace_catalog_identity),
-                Some(trace_catalog_generation),
-                Some(trace_frontier),
-                Some(trace_lease_identity),
-            ) = (
-                state.trace_catalog_identity,
-                state.trace_catalog_generation,
-                state.trace_frontier,
-                state.trace_lease_identity,
-            )
-            else {
-                return Err(resources.fail_before_stream(
-                    self.ledger,
-                    self.trace_ledger,
-                    &state,
-                    QueryFailure::new(QueryFailureCode::InvalidCursor),
-                ));
-            };
-            let trace_ledger = match self.trace_ledger {
-                Some(ledger)
-                    if ledger.scope().tenant_id() == tenant
-                        && ledger.scope().signal_kind()
-                            == positron_domain::routing::SignalKind::Traces =>
-                {
-                    ledger
-                },
-                Some(_) => {
+        let (trace_snapshot, trace_lease_identity, resources) =
+            if state.plan.is_log_to_trace_correlation() {
+                let (
+                    Some(trace_catalog_identity),
+                    Some(trace_catalog_generation),
+                    Some(trace_frontier),
+                    Some(trace_lease_identity),
+                ) = (
+                    state.trace_catalog_identity,
+                    state.trace_catalog_generation,
+                    state.trace_frontier,
+                    state.trace_lease_identity,
+                )
+                else {
                     return Err(resources.fail_before_stream(
                         self.ledger,
                         self.trace_ledger,
+                        self.maintenance,
                         &state,
-                        QueryFailure::new(QueryFailureCode::Unauthorized),
+                        QueryFailure::new(QueryFailureCode::InvalidCursor),
                     ));
-                },
-                None => {
-                    return Err(resources.fail_before_stream(
-                        self.ledger,
-                        None,
-                        &state,
-                        QueryFailure::new(QueryFailureCode::StoreUnavailable),
-                    ));
-                },
-            };
-            let (_, target_catalog_identity, target_catalog_generation) =
-                match self.current_query_catalog(context) {
-                    Ok(current) => current,
+                };
+                let trace_ledger = match self.trace_ledger {
+                    Some(ledger)
+                        if ledger.scope().tenant_id() == tenant
+                            && ledger.scope().signal_kind()
+                                == positron_domain::routing::SignalKind::Traces =>
+                    {
+                        ledger
+                    },
+                    Some(_) => {
+                        return Err(resources.fail_before_stream(
+                            self.ledger,
+                            self.trace_ledger,
+                            self.maintenance,
+                            &state,
+                            QueryFailure::new(QueryFailureCode::Unauthorized),
+                        ));
+                    },
+                    None => {
+                        return Err(resources.fail_before_stream(
+                            self.ledger,
+                            None,
+                            self.maintenance,
+                            &state,
+                            QueryFailure::new(QueryFailureCode::StoreUnavailable),
+                        ));
+                    },
+                };
+                let (_, target_catalog_identity, target_catalog_generation) =
+                    match self.current_query_catalog(context) {
+                        Ok(current) => current,
+                        Err(failure) => {
+                            return Err(resources.fail_before_stream(
+                                self.ledger,
+                                self.trace_ledger,
+                                self.maintenance,
+                                &state,
+                                failure,
+                            ));
+                        },
+                    };
+                let target_lease_id = match SnapshotLeaseId::new(trace_lease_identity) {
+                    Ok(identity) => identity,
+                    Err(_) => {
+                        return Err(resources.fail_before_stream(
+                            self.ledger,
+                            self.trace_ledger,
+                            self.maintenance,
+                            &state,
+                            QueryFailure::new(QueryFailureCode::InvalidCursor),
+                        ));
+                    },
+                };
+                let mut target_lease = match trace_ledger
+                    .resume_snapshot_lease_with_marker_at_catalog(
+                        target_lease_id,
+                        now_seconds,
+                        state.sequence,
+                        state.prior_digest,
+                        target_catalog_identity,
+                        target_catalog_generation,
+                    ) {
+                    Ok(lease) => lease,
                     Err(failure) => {
                         return Err(resources.fail_before_stream(
                             self.ledger,
                             self.trace_ledger,
+                            self.maintenance,
                             &state,
-                            failure,
+                            map_ledger_failure(failure),
                         ));
                     },
                 };
-            let target_lease_id = match SnapshotLeaseId::new(trace_lease_identity) {
-                Ok(identity) => identity,
-                Err(_) => {
-                    return Err(resources.fail_before_stream(
-                        self.ledger,
-                        self.trace_ledger,
-                        &state,
-                        QueryFailure::new(QueryFailureCode::InvalidCursor),
-                    ));
-                },
-            };
-            let mut target_lease = match trace_ledger.resume_snapshot_lease_with_marker_at_catalog(
-                target_lease_id,
-                now_seconds,
-                state.sequence,
-                state.prior_digest,
-                target_catalog_identity,
-                target_catalog_generation,
-            ) {
-                Ok(lease) => lease,
-                Err(failure) => {
-                    return Err(resources.fail_before_stream(
-                        self.ledger,
-                        self.trace_ledger,
-                        &state,
-                        map_ledger_failure(failure),
-                    ));
-                },
-            };
-            if target_lease.snapshot().catalog_identity().to_bytes() != trace_catalog_identity
-                || target_lease.snapshot().catalog_generation() != trace_catalog_generation
-                || target_lease.snapshot().frontier().value() != trace_frontier
-            {
-                let primary = match trace_ledger.release_snapshot_lease(target_lease.identity()) {
-                    Ok(()) => QueryFailure::new(QueryFailureCode::InvalidCursor),
-                    Err(failure) => crate::failure::stronger_failure(
-                        QueryFailure::new(QueryFailureCode::InvalidCursor),
-                        map_ledger_failure(failure),
-                    ),
-                };
-                return Err(resources.fail_before_stream(
-                    self.ledger,
-                    self.trace_ledger,
-                    &state,
-                    primary,
-                ));
-            }
-            let target_attempt = match target_lease.take_attempt() {
-                Some(attempt) => attempt,
-                None => {
-                    let primary = match trace_ledger.release_snapshot_lease(target_lease.identity())
-                    {
-                        Ok(()) => QueryFailure::new(QueryFailureCode::Internal),
+                if target_lease.snapshot().catalog_identity().to_bytes() != trace_catalog_identity
+                    || target_lease.snapshot().catalog_generation() != trace_catalog_generation
+                    || target_lease.snapshot().frontier().value() != trace_frontier
+                {
+                    let primary = match super::lifecycle::release_lease(
+                        trace_ledger,
+                        self.maintenance,
+                        target_lease.identity(),
+                    ) {
+                        Ok(()) => QueryFailure::new(QueryFailureCode::InvalidCursor),
                         Err(failure) => crate::failure::stronger_failure(
-                            QueryFailure::new(QueryFailureCode::Internal),
-                            map_ledger_failure(failure),
+                            QueryFailure::new(QueryFailureCode::InvalidCursor),
+                            failure,
                         ),
                     };
                     return Err(resources.fail_before_stream(
                         self.ledger,
                         self.trace_ledger,
+                        self.maintenance,
                         &state,
                         primary,
                     ));
-                },
+                }
+                let target_attempt = match target_lease.take_attempt() {
+                    Some(attempt) => attempt,
+                    None => {
+                        let primary = match super::lifecycle::release_lease(
+                            trace_ledger,
+                            self.maintenance,
+                            target_lease.identity(),
+                        ) {
+                            Ok(()) => QueryFailure::new(QueryFailureCode::Internal),
+                            Err(failure) => crate::failure::stronger_failure(
+                                QueryFailure::new(QueryFailureCode::Internal),
+                                failure,
+                            ),
+                        };
+                        return Err(resources.fail_before_stream(
+                            self.ledger,
+                            self.trace_ledger,
+                            self.maintenance,
+                            &state,
+                            primary,
+                        ));
+                    },
+                };
+                let identity = target_lease.identity();
+                let resources =
+                    resources.with_target_attempt(identity, target_lease.usage(), target_attempt);
+                (Some(target_lease), Some(identity), resources)
+            } else {
+                if state.trace_catalog_identity.is_some()
+                    || state.trace_catalog_generation.is_some()
+                    || state.trace_frontier.is_some()
+                    || state.trace_lease_identity.is_some()
+                {
+                    return Err(resources.fail_before_stream(
+                        self.ledger,
+                        self.trace_ledger,
+                        self.maintenance,
+                        &state,
+                        QueryFailure::new(QueryFailureCode::InvalidCursor),
+                    ));
+                }
+                (None, None, resources)
             };
-            let identity = target_lease.identity();
-            let resources =
-                resources.with_target_attempt(identity, target_lease.usage(), target_attempt);
-            (Some(target_lease), Some(identity), resources)
-        } else {
-            if state.trace_catalog_identity.is_some()
-                || state.trace_catalog_generation.is_some()
-                || state.trace_frontier.is_some()
-                || state.trace_lease_identity.is_some()
-            {
-                return Err(resources.fail_before_stream(
-                    self.ledger,
-                    self.trace_ledger,
-                    &state,
-                    QueryFailure::new(QueryFailureCode::InvalidCursor),
-                ));
-            }
-            (None, None, resources)
-        };
         let mut state = state;
         state.resume_count = lease.resume_count();
         state.repeated_batch_count = lease.repeated_batch_count();
