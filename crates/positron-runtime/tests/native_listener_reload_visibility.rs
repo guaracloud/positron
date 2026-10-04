@@ -5,7 +5,12 @@ mod roots;
 
 use std::num::NonZeroU64;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use positron_api::maintenance::{
+    MaintenanceExplainRequest, MaintenanceServiceClient, MaintenanceStatusRequest,
+    MaintenanceTransport,
+};
 use positron_config::{CommandLineOverrides, ConfigurationInputs, EnvironmentOverrides, resolve};
 use positron_governance::{
     AdministrativeIdempotencyKey, CompatibilityHints, ConfigurationAuditOutcome,
@@ -168,21 +173,6 @@ fn native_listener_reload_updates_visible_plaintext_generation_and_rejected_stag
         ResourceGeneration::new(1)?,
         AdministrativeIdempotencyKey::new([0x77; 16])?,
     )?;
-    let retained_audit_administrator = reopened.attribute(
-        PresentedCredential::parse(claim.secret())?,
-        RequestedIntent::SystemAdministration,
-        CompatibilityHints::none(),
-    )?;
-    let retained_history =
-        reopened.inspect_governance_audit_history(retained_audit_administrator)?;
-    assert!(retained_history.retention_anchor_position().is_some());
-    assert!(
-        retained_history
-            .records()
-            .iter()
-            .all(|entry| entry.as_configuration().is_none()),
-        "retention must prune the composite plaintext configuration evidence"
-    );
     drop(reopened);
     let resumed_host = NativeHost::new(NativeBindings::from_effective(&plaintext)?);
     let resumed = ApplicationRuntime::start(
@@ -192,7 +182,83 @@ fn native_listener_reload_updates_visible_plaintext_generation_and_rejected_stag
     )?;
     assert_eq!(resumed.health().phase(), ProcessPhase::Serving);
     assert_eq!(resumed.health().readiness(), Readiness::Ready);
-    let _restart_shutdown = resumed.shutdown(ShutdownTrigger::FirstSignal);
+    let api_endpoint = resumed
+        .bound_endpoints()
+        .into_iter()
+        .find(|endpoint| endpoint.role() == ListenerRole::Api)
+        .and_then(|endpoint| endpoint.socket_address())
+        .ok_or("resumed API endpoint unavailable")?;
+    let maintenance_client =
+        MaintenanceServiceClient::new(MaintenanceTransport::PlaintextOptOut {
+            endpoint: api_endpoint,
+        })?;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let task_identity = loop {
+        let status = maintenance_client.status(claim.secret(), &MaintenanceStatusRequest {})?;
+        let tasks = status
+            .tasks
+            .into_iter()
+            .filter(|task| task.class == "catalog_reclamation" && task.scope == "system")
+            .collect::<Vec<_>>();
+        if let [task] = tasks.as_slice() {
+            break task.identity.clone();
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "expected exactly one system catalog reclamation task, found {}",
+                tasks.len()
+            )
+            .into());
+        }
+        std::thread::yield_now();
+    };
+    loop {
+        let task = maintenance_client
+            .explain(
+                claim.secret(),
+                &MaintenanceExplainRequest {
+                    identity: task_identity.clone(),
+                },
+            )?
+            .task;
+        match task.phase.as_str() {
+            "succeeded" => break,
+            "failed" | "cancelled" => {
+                return Err(format!(
+                    "system catalog reclamation task reached terminal phase {}",
+                    task.phase
+                )
+                .into());
+            },
+            _ if Instant::now() >= deadline => {
+                return Err(
+                    "system catalog reclamation task did not succeed before deadline".into(),
+                );
+            },
+            _ => std::thread::yield_now(),
+        }
+    }
+    assert_eq!(
+        resumed.shutdown(ShutdownTrigger::FirstSignal),
+        positron_runtime::ExitOutcome::Graceful
+    );
+    drop(roots.acquire_volume_again()?);
+    let retained = InstanceBootstrap::reopen(&paths)?;
+    let retained_audit_administrator = retained.attribute(
+        PresentedCredential::parse(claim.secret())?,
+        RequestedIntent::SystemAdministration,
+        CompatibilityHints::none(),
+    )?;
+    let retained_history =
+        retained.inspect_governance_audit_history(retained_audit_administrator)?;
+    assert!(retained_history.retention_anchor_position().is_some());
+    assert!(
+        retained_history
+            .records()
+            .iter()
+            .all(|entry| entry.as_configuration().is_none()),
+        "retention must prune the composite plaintext configuration evidence"
+    );
     Ok(())
 }
 
